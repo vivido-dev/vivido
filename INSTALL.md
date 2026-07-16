@@ -14,7 +14,7 @@ suffix on Windows).
 To install from the repository root with Cargo:
 
 ```sh
-cargo install --path vivido/vivido
+cargo install --path .
 ```
 
 This installs both `vivido` and its `vvssh` companion command. Do not select only the `vivido`
