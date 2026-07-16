@@ -2879,6 +2879,7 @@ name = "vivido"
 version = "0.1.0"
 dependencies = [
  "ahash",
+ "base64",
  "bitflags 2.9.4",
  "bytemuck",
  "clap",
@@ -2891,20 +2892,28 @@ dependencies = [
  "image",
  "libc",
  "log",
+ "miow",
  "notify",
  "objc2 0.6.4",
  "objc2-app-kit 0.3.2",
  "objc2-foundation 0.3.2",
  "parking_lot",
  "parley",
+ "piper",
  "pkg-config",
  "polling",
  "pollster",
+ "proc-macro2",
+ "quote",
+ "regex-automata",
+ "rustix 1.1.2",
+ "rustix-openpty",
  "serde",
  "serde_json",
  "serde_yaml",
  "sha2",
  "signal-hook",
+ "syn",
  "tempfile",
  "toml 1.1.3+spec-1.1.0",
  "toml_edit 0.25.13+spec-1.1.0",
@@ -2912,60 +2921,11 @@ dependencies = [
  "unicode-width",
  "vello",
  "vivid_protocol",
- "vivido_config",
- "vivido_config_derive",
- "vivido_terminal",
+ "vte",
  "wgpu",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
  "winit",
  "xdg",
-]
-
-[[package]]
-name = "vivido_config"
-version = "0.1.0"
-dependencies = [
- "log",
- "serde",
- "toml 1.1.3+spec-1.1.0",
- "vivido_config_derive",
-]
-
-[[package]]
-name = "vivido_config_derive"
-version = "0.1.0"
-dependencies = [
- "log",
- "proc-macro2",
- "quote",
- "serde",
- "syn",
- "toml 1.1.3+spec-1.1.0",
- "vivido_config",
-]
-
-[[package]]
-name = "vivido_terminal"
-version = "0.1.0"
-dependencies = [
- "base64",
- "bitflags 2.9.4",
- "home",
- "libc",
- "log",
- "miow",
- "parking_lot",
- "piper",
- "polling",
- "regex-automata",
- "rustix 1.1.2",
- "rustix-openpty",
- "serde",
- "serde_json",
- "signal-hook",
- "unicode-width",
- "vte",
- "windows-sys 0.61.2",
 ]
 
 [[package]]
