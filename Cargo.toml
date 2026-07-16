@@ -1,0 +1,16 @@
+[workspace]
+members = ["vivido", "vivido_terminal", "vivido_config", "vivido_config_derive"]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.88.0"
+
+[profile.release]
+lto = "thin"
+debug = 1
+incremental = false
+
+[workspace.dependencies]
+toml = "1.1"
+toml_edit = "0.25"

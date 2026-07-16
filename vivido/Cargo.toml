@@ -1,0 +1,129 @@
+[package]
+name = "vivido"
+version = "0.1.0"
+authors = ["Wensheng Wang <wenshengwang@gmail.com>"]
+license = "Apache-2.0"
+description = "A fast cross-platform terminal emulator with protocol-neutral media hooks"
+readme = "README.md"
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "vivido"
+path = "src/main.rs"
+
+[[bin]]
+name = "vvssh"
+path = "src/bin/vvssh.rs"
+
+[dependencies.vivido_terminal]
+path = "../vivido_terminal"
+version = "0.1.0"
+
+[dependencies.vivido_config_derive]
+path = "../vivido_config_derive"
+version = "0.1.0"
+
+[dependencies.vivido_config]
+path = "../vivido_config"
+version = "0.1.0"
+
+[dependencies]
+ahash = { version = "0.8.6", features = ["no-rng"] }
+bitflags = "2.2.1"
+bytemuck = { version = "1.24", features = ["derive"] }
+clap = { version = "4.2.7", features = ["derive", "env"] }
+copypasta = { version = "0.10.1", default-features = false }
+getrandom = "0.4"
+home = "0.5.5"
+image = { version = "0.25", default-features = false, features = [
+  "png",
+  "jpeg",
+] }
+libc = "0.2"
+log = { version = "0.4", features = ["std", "serde"] }
+notify = "8.0.0"
+parking_lot = "0.12.0"
+parley = "0.11"
+polling = "3.11.0"
+pollster = "1.0"
+serde_json = "1"
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9.25"
+sha2 = "0.11"
+signal-hook = { version = "0.4.3", default-features = false }
+tempfile = "3.12.0"
+toml.workspace = true
+toml_edit.workspace = true
+unicode-width = "0.2.0"
+unicode-script = "0.5"
+vivid_protocol = "1.1"
+vello = { version = "0.9.0", default-features = false, features = ["wgpu"] }
+winit = { version = "0.30.9", default-features = false, features = [
+  "rwh_06",
+  "serde",
+] }
+
+[build-dependencies]
+pkg-config = "0.3"
+
+[dev-dependencies]
+clap_complete = "4.2.3"
+
+[target.'cfg(not(windows))'.dependencies]
+xdg = "3.0.0"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6.1"
+objc2-foundation = { version = "0.3.1", default-features = false, features = [
+  "std",
+  "NSString",
+  "NSLocale",
+  "NSUserDefaults",
+] }
+objc2-app-kit = { version = "0.3.1", default-features = false, features = [
+  "std",
+  "NSColorSpace",
+  "NSResponder",
+  "NSView",
+  "NSWindow",
+] }
+wgpu = { version = "29.0.1", default-features = false, features = [
+  "metal",
+  "std",
+  "wgsl",
+] }
+
+[target.'cfg(windows)'.dependencies]
+dirs = "6.0.0"
+windows-sys = { version = "0.59", features = [
+  "Win32_UI_WindowsAndMessaging",
+  "Win32_System_Threading",
+  "Win32_System_Console",
+  "Win32_Foundation",
+] }
+wgpu = { version = "29.0.1", default-features = false, features = [
+  "dx12",
+  "std",
+  "wgsl",
+] }
+
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+wgpu = { version = "29.0.1", default-features = false, features = [
+  "std",
+  "vulkan",
+  "wgsl",
+] }
+
+[target.'cfg(windows)'.build-dependencies]
+embed-resource = "3.0.2"
+
+[features]
+default = ["wayland"]
+wayland = [
+  "copypasta/wayland",
+  "winit/wayland",
+  "winit/wayland-dlopen",
+  "winit/wayland-csd-adwaita",
+]
+nightly = []

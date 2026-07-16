@@ -1,0 +1,322 @@
+#compdef vivido
+
+autoload -U is-at-least
+
+_vivido() {
+    typeset -A opt_args
+    typeset -a _arguments_options
+    local ret=1
+
+    if is-at-least 5.2; then
+        _arguments_options=(-s -S -C)
+    else
+        _arguments_options=(-s -C)
+    fi
+
+    local context curcontext="$curcontext" state line
+    _arguments "${_arguments_options[@]}" : \
+'--config-file=[Specify alternative configuration file \[default\: \$HOME/.config/vivido/vivido.toml\]]:CONFIG_FILE:_files' \
+'--socket=[Path for IPC socket creation]:SOCKET:_files' \
+'--working-directory=[Start the shell in the specified working directory]:WORKING_DIRECTORY:_files' \
+'*-e+[Command and args to execute (must be last argument)]:COMMAND:_default' \
+'*--command=[Command and args to execute (must be last argument)]:COMMAND:_default' \
+'-T+[Defines the window title \[default\: Vivido\]]:TITLE:_default' \
+'--title=[Defines the window title \[default\: Vivido\]]:TITLE:_default' \
+'--class=[Defines the Wayland app_id \[default\: Vivido\]]:general> | <general>,<instance:_default' \
+'*-o+[Override configuration file options \[example\: '\''cursor.style="Beam"'\''\]]:OPTION:_default' \
+'*--option=[Override configuration file options \[example\: '\''cursor.style="Beam"'\''\]]:OPTION:_default' \
+'--print-events[Print all events to STDOUT]' \
+'(--daemon)--ref-test[Generates ref test]' \
+'(-v)*-q[Reduces the level of verbosity (the min level is -qq)]' \
+'(-q)*-v[Increases the level of verbosity (the max level is -vvv)]' \
+'--daemon[Do not spawn an initial window]' \
+'--hold[Remain open after child process exit]' \
+'-h[Print help]' \
+'--help[Print help]' \
+'-V[Print version]' \
+'--version[Print version]' \
+":: :_vivido_commands" \
+"*::: :->vivido" \
+&& ret=0
+    case $state in
+    (vivido)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:vivido-command-$line[1]:"
+        case $line[1] in
+            (msg)
+_arguments "${_arguments_options[@]}" : \
+'-s+[IPC socket connection path override]:SOCKET:_files' \
+'--socket=[IPC socket connection path override]:SOCKET:_files' \
+'-h[Print help]' \
+'--help[Print help]' \
+":: :_vivido__msg_commands" \
+"*::: :->msg" \
+&& ret=0
+
+    case $state in
+    (msg)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:vivido-msg-command-$line[1]:"
+        case $line[1] in
+            (create-window)
+_arguments "${_arguments_options[@]}" : \
+'--working-directory=[Start the shell in the specified working directory]:WORKING_DIRECTORY:_files' \
+'*-e+[Command and args to execute (must be last argument)]:COMMAND:_default' \
+'*--command=[Command and args to execute (must be last argument)]:COMMAND:_default' \
+'-T+[Defines the window title \[default\: Vivido\]]:TITLE:_default' \
+'--title=[Defines the window title \[default\: Vivido\]]:TITLE:_default' \
+'--class=[Defines the Wayland app_id \[default\: Vivido\]]:general> | <general>,<instance:_default' \
+'*-o+[Override configuration file options \[example\: '\''cursor.style="Beam"'\''\]]:OPTION:_default' \
+'*--option=[Override configuration file options \[example\: '\''cursor.style="Beam"'\''\]]:OPTION:_default' \
+'--hold[Remain open after child process exit]' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(config)
+_arguments "${_arguments_options[@]}" : \
+'-w+[Window ID for the new config]:WINDOW_ID:_default' \
+'--window-id=[Window ID for the new config]:WINDOW_ID:_default' \
+'()-r[Clear all runtime configuration changes]' \
+'()--reset[Clear all runtime configuration changes]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+'*::options -- Configuration file options \[example\: '\''cursor.style="Beam"'\''\]:_default' \
+&& ret=0
+;;
+(get-config)
+_arguments "${_arguments_options[@]}" : \
+'-w+[Window ID for the config request]:WINDOW_ID:_default' \
+'--window-id=[Window ID for the config request]:WINDOW_ID:_default' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+":: :_vivido__msg__help_commands" \
+"*::: :->help" \
+&& ret=0
+
+    case $state in
+    (help)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:vivido-msg-help-command-$line[1]:"
+        case $line[1] in
+            (create-window)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(config)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(get-config)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+        esac
+    ;;
+esac
+;;
+(migrate)
+_arguments "${_arguments_options[@]}" : \
+'-c+[Path to the configuration file]:CONFIG_FILE:_files' \
+'--config-file=[Path to the configuration file]:CONFIG_FILE:_files' \
+'-d[Only output TOML config to STDOUT]' \
+'--dry-run[Only output TOML config to STDOUT]' \
+'-i[Do not recurse over imports]' \
+'--skip-imports[Do not recurse over imports]' \
+'--skip-renames[Do not move renamed fields to their new location]' \
+'-s[Do not output to STDOUT]' \
+'--silent[Do not output to STDOUT]' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+":: :_vivido__help_commands" \
+"*::: :->help" \
+&& ret=0
+
+    case $state in
+    (help)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:vivido-help-command-$line[1]:"
+        case $line[1] in
+            (msg)
+_arguments "${_arguments_options[@]}" : \
+":: :_vivido__help__msg_commands" \
+"*::: :->msg" \
+&& ret=0
+
+    case $state in
+    (msg)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:vivido-help-msg-command-$line[1]:"
+        case $line[1] in
+            (create-window)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(config)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(get-config)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+(migrate)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+        esac
+    ;;
+esac
+}
+
+(( $+functions[_vivido_commands] )) ||
+_vivido_commands() {
+    local commands; commands=(
+'msg:Send a message to the Vivido socket' \
+'migrate:Migrate the configuration file' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'vivido commands' commands "$@"
+}
+(( $+functions[_vivido__help_commands] )) ||
+_vivido__help_commands() {
+    local commands; commands=(
+'msg:Send a message to the Vivido socket' \
+'migrate:Migrate the configuration file' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'vivido help commands' commands "$@"
+}
+(( $+functions[_vivido__help__help_commands] )) ||
+_vivido__help__help_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido help help commands' commands "$@"
+}
+(( $+functions[_vivido__help__migrate_commands] )) ||
+_vivido__help__migrate_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido help migrate commands' commands "$@"
+}
+(( $+functions[_vivido__help__msg_commands] )) ||
+_vivido__help__msg_commands() {
+    local commands; commands=(
+'create-window:Create a new window in the same Vivido process' \
+'config:Update the Vivido configuration' \
+'get-config:Read runtime Vivido configuration' \
+    )
+    _describe -t commands 'vivido help msg commands' commands "$@"
+}
+(( $+functions[_vivido__help__msg__config_commands] )) ||
+_vivido__help__msg__config_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido help msg config commands' commands "$@"
+}
+(( $+functions[_vivido__help__msg__create-window_commands] )) ||
+_vivido__help__msg__create-window_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido help msg create-window commands' commands "$@"
+}
+(( $+functions[_vivido__help__msg__get-config_commands] )) ||
+_vivido__help__msg__get-config_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido help msg get-config commands' commands "$@"
+}
+(( $+functions[_vivido__migrate_commands] )) ||
+_vivido__migrate_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido migrate commands' commands "$@"
+}
+(( $+functions[_vivido__msg_commands] )) ||
+_vivido__msg_commands() {
+    local commands; commands=(
+'create-window:Create a new window in the same Vivido process' \
+'config:Update the Vivido configuration' \
+'get-config:Read runtime Vivido configuration' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'vivido msg commands' commands "$@"
+}
+(( $+functions[_vivido__msg__config_commands] )) ||
+_vivido__msg__config_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg config commands' commands "$@"
+}
+(( $+functions[_vivido__msg__create-window_commands] )) ||
+_vivido__msg__create-window_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg create-window commands' commands "$@"
+}
+(( $+functions[_vivido__msg__get-config_commands] )) ||
+_vivido__msg__get-config_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg get-config commands' commands "$@"
+}
+(( $+functions[_vivido__msg__help_commands] )) ||
+_vivido__msg__help_commands() {
+    local commands; commands=(
+'create-window:Create a new window in the same Vivido process' \
+'config:Update the Vivido configuration' \
+'get-config:Read runtime Vivido configuration' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'vivido msg help commands' commands "$@"
+}
+(( $+functions[_vivido__msg__help__config_commands] )) ||
+_vivido__msg__help__config_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg help config commands' commands "$@"
+}
+(( $+functions[_vivido__msg__help__create-window_commands] )) ||
+_vivido__msg__help__create-window_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg help create-window commands' commands "$@"
+}
+(( $+functions[_vivido__msg__help__get-config_commands] )) ||
+_vivido__msg__help__get-config_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg help get-config commands' commands "$@"
+}
+(( $+functions[_vivido__msg__help__help_commands] )) ||
+_vivido__msg__help__help_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg help help commands' commands "$@"
+}
+
+if [ "$funcstack[1]" = "_vivido" ]; then
+    _vivido "$@"
+else
+    compdef _vivido vivido
+fi
