@@ -1,0 +1,30 @@
+[?2004h[kchibisov@NightLord vivido]$ [K[kchibisov@NightLord vivido]$ [K[kchibisov@NightLord vivido]$ echo -e "\033[?3h"printf "\e[31;1;7;4;9mTEST asd\n"
+[?2004l[31;1;7;4;9mTEST asd
+[?2004h[kchibisov@NightLord vivido]$ 
+[?2004l[?2004h[kchibisov@NightLord vivido]$ 
+[?2004l[?2004h[kchibisov@NightLord vivido]$ 
+[?2004l[?2004h[kchibisov@NightLord vivido]$ 
+[?2004l[?2004h[kchibisov@NightLord vivido]$ 
+[?2004l[?2004h[kchibisov@NightLord vivido]$ 
+[?2004l[?2004h[kchibisov@NightLord vivido]$ 
+[?2004l[?2004h[kchibisov@NightLord vivido]$ 
+[?2004l[?2004h[kchibisov@NightLord vivido]$ 
+[?2004l[?2004h[kchibisov@NightLord vivido]$ 
+[?2004l[?2004h[kchibisov@NightLord vivido]$ 
+[?2004l[?2004h[kchibisov@NightLord vivido]$ 
+[?2004l[?2004h[kchibisov@NightLord vivido]$ 
+[?2004l[?2004h[kchibisov@NightLord vivido]$ 
+[?2004l[?2004h[kchibisov@NightLord vivido]$ 
+[?2004l[?2004h[kchibisov@NightLord vivido]$ 
+[?2004l[?2004h[kchibisov@NightLord vivido]$ 
+[?2004l[?2004h[kchibisov@NightLord vivido]$ 
+[?2004l[?2004h[kchibisov@NightLord vivido]$ 
+[?2004l[?2004h[kchibisov@NightLord vivido]$ 
+[?2004l[?2004h[kchibisov@NightLord vivido]$ 
+[?2004l[?2004h[kchibisov@NightLord vivido]$ 
+[?2004l[?2004h[kchibisov@NightLord vivido]$ 
+[?2004l[?2004h[kchibisov@NightLord vivido]$ 
+[?2004l[?2004h[kchibisov@NightLord vivido]$ 
+[?2004l[?2004h[kchibisov@NightLord vivido]$ printf "\e[31;1;7;4;9mTEST asd\n"[15Pecho -e "\033[?3h"
+[?2004l[?3h
+[?2004h[kchibisov@NightLord vivido]$ 

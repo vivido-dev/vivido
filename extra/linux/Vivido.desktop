@@ -1,0 +1,18 @@
+[Desktop Entry]
+Type=Application
+TryExec=vivido
+Exec=vivido
+Icon=Vivido
+Terminal=false
+Categories=System;TerminalEmulator;
+
+Name=Vivido
+GenericName=Terminal
+Comment=A fast Vello/WebGPU terminal emulator
+StartupNotify=true
+StartupWMClass=Vivido
+Actions=New;
+
+[Desktop Action New]
+Name=New Terminal
+Exec=vivido

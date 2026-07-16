@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<component type="desktop-application">
+  <id>org.vivido.Vivido</id>
+
+  <developer_name>Christian Duerr</developer_name>
+  <developer id="org.vivido">
+    <name>Christian Duerr</name>
+  </developer>
+
+  <name>Vivido</name>
+
+  <project_license>Apache-2.0</project_license>
+
+  <summary>A fast Vello/WebGPU terminal emulator</summary>
+  <description>
+    <p>
+      Vivido is a modern terminal emulator that comes with sensible defaults,
+      but allows for extensive configuration. By integrating with other
+      applications, rather than reimplementing their functionality, it manages
+      to provide a flexible set of features with high performance.
+    </p>
+    <ul>
+      <li>Wayland native</li>
+      <li>Wayland-only on Linux</li>
+      <li>DE agnostic</li>
+    </ul>
+  </description>
+
+  <categories>
+    <category>TerminalEmulator</category>
+  </categories>
+
+  <screenshots>
+    <screenshot type="default">
+      <image>https://raw.githubusercontent.com/vivido/vivido/0a1e735cf6b13da1dbe5d161d17c8aa6c1692204/extra/promo/vivido-readme.png</image>
+      <caption>Vivido with default theme showing neovim</caption>
+    </screenshot>
+  </screenshots>
+
+  <url type="homepage">https://github.com/vivido/vivido</url>
+  <url type="bugtracker">https://github.com/vivido/vivido/issues</url>
+
+  <launchable type="desktop-id">Vivido.desktop</launchable>
+
+  <content_rating type="oars-1.0" />
+</component>
