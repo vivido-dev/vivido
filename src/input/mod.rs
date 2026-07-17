@@ -12,7 +12,7 @@ use std::ffi::OsStr;
 use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::mem;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use log::debug;
 use winit::dpi::PhysicalPosition;
@@ -40,7 +40,7 @@ use crate::config::{Action, BindingMode, MouseEvent, SearchAction, UiConfig};
 use crate::display::hint::HintMatch;
 use crate::display::window::{ImeInhibitor, Window};
 use crate::display::{Display, SizeInfo};
-use crate::event::{Event, EventType, Mouse, TouchPurpose, TouchZoom};
+use crate::event::{ClickState, Event, EventType, Mouse, TouchPurpose, TouchZoom};
 use crate::message_bar::{self, Message};
 use crate::scheduler::{Scheduler, TimerId, Topic};
 
@@ -60,6 +60,33 @@ const SELECTION_SCROLLING_STEP: f64 = 20.;
 
 /// Distance before a touch input is considered a drag.
 const MAX_TAP_DISTANCE: f64 = 20.;
+
+/// Maximum delay between two clicks in a double-click sequence.
+const CLICK_THRESHOLD: Duration = Duration::from_millis(400);
+
+const SELECTION_CLIPBOARDS: [ClipboardType; 2] =
+    [ClipboardType::Selection, ClipboardType::Clipboard];
+
+fn next_click_state(mouse: &Mouse, button: MouseButton, point: Point, now: Instant) -> ClickState {
+    let elapsed = now.saturating_duration_since(mouse.last_click_timestamp);
+    let same_target = mouse.last_click_button == button && mouse.last_click_point == Some(point);
+
+    match mouse.click_state {
+        ClickState::Click if same_target && elapsed < CLICK_THRESHOLD => ClickState::DoubleClick,
+        _ => ClickState::Click,
+    }
+}
+
+fn selection_clipboards(button: MouseButton) -> &'static [ClipboardType] {
+    match button {
+        MouseButton::Left | MouseButton::Right => &SELECTION_CLIPBOARDS,
+        _ => &[],
+    }
+}
+
+fn report_mouse_to_application(mouse_mode: bool, shift: bool) -> bool {
+    mouse_mode && !shift
+}
 
 /// Processes input from winit.
 ///
@@ -425,7 +452,12 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
 
     fn on_mouse_press(&mut self, button: MouseButton) {
         // Handle mouse mode.
-        if !self.ctx.modifiers().state().shift_key() && self.ctx.mouse_mode() {
+        if report_mouse_to_application(
+            self.ctx.mouse_mode(),
+            self.ctx.modifiers().state().shift_key(),
+        ) {
+            self.ctx.mouse_mut().click_state = ClickState::None;
+
             let code = match button {
                 MouseButton::Left => 0,
                 MouseButton::Middle => 1,
@@ -440,6 +472,17 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
             let display_offset = self.ctx.terminal().grid().display_offset();
             let point = self.ctx.mouse().point(&self.ctx.size_info(), display_offset);
 
+            // Update click state before processing the press, so the second click can expand the
+            // selection immediately.
+            let now = Instant::now();
+            let click_state = next_click_state(self.ctx.mouse(), button, point, now);
+
+            let mouse = self.ctx.mouse_mut();
+            mouse.last_click_timestamp = now;
+            mouse.last_click_button = button;
+            mouse.last_click_point = Some(point);
+            mouse.click_state = click_state;
+
             if let MouseButton::Left = button {
                 self.on_left_click(point)
             }
@@ -451,19 +494,31 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
         let side = self.ctx.mouse().cell_side;
         let control = self.ctx.modifiers().state().control_key();
 
-        // Don't launch URLs if this click cleared the selection.
-        self.ctx.mouse_mut().block_hint_launcher = !self.ctx.selection_is_empty();
-        self.ctx.clear_selection();
+        match self.ctx.mouse().click_state {
+            ClickState::Click => {
+                // Don't launch URLs if this click cleared the selection.
+                self.ctx.mouse_mut().block_hint_launcher = !self.ctx.selection_is_empty();
+                self.ctx.clear_selection();
 
-        if control {
-            self.ctx.start_selection(SelectionType::Block, point, side);
-        } else {
-            self.ctx.start_selection(SelectionType::Simple, point, side);
+                if control {
+                    self.ctx.start_selection(SelectionType::Block, point, side);
+                } else {
+                    self.ctx.start_selection(SelectionType::Simple, point, side);
+                }
+            },
+            ClickState::DoubleClick if !control => {
+                self.ctx.mouse_mut().block_hint_launcher = true;
+                self.ctx.start_selection(SelectionType::Semantic, point, side);
+            },
+            ClickState::None | ClickState::DoubleClick => (),
         }
     }
 
     fn on_mouse_release(&mut self, button: MouseButton) {
-        if !self.ctx.modifiers().state().shift_key() && self.ctx.mouse_mode() {
+        if report_mouse_to_application(
+            self.ctx.mouse_mode(),
+            self.ctx.modifiers().state().shift_key(),
+        ) {
             let code = match button {
                 MouseButton::Left => 0,
                 MouseButton::Middle => 1,
@@ -485,9 +540,9 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
         let timer_id = TimerId::new(Topic::SelectionScrolling, self.ctx.window().id());
         self.ctx.scheduler_mut().unschedule(timer_id);
 
-        if let MouseButton::Left | MouseButton::Right = button {
-            // Copy selection on release, to prevent flooding the display server.
-            self.ctx.copy_selection(ClipboardType::Selection);
+        // Copy selection on release, to prevent flooding the display server.
+        for &clipboard_type in selection_clipboards(button) {
+            self.ctx.copy_selection(clipboard_type);
         }
     }
 
@@ -924,7 +979,67 @@ mod tests {
     use winit::keyboard::Key;
 
     use crate::config::Binding;
+    use crate::terminal::index::Line;
     const KEY: Key<&'static str> = Key::Character("0");
+
+    #[test]
+    fn click_state_detects_same_cell_double_click() {
+        let point = Point::new(Line(2), Column(3));
+        let now = Instant::now();
+        let mouse = Mouse {
+            click_state: ClickState::Click,
+            last_click_timestamp: now - Duration::from_millis(100),
+            last_click_button: MouseButton::Left,
+            last_click_point: Some(point),
+            ..Mouse::default()
+        };
+
+        assert_eq!(
+            next_click_state(&mouse, MouseButton::Left, point, now),
+            ClickState::DoubleClick
+        );
+    }
+
+    #[test]
+    fn click_state_rejects_timeout_button_and_cell_changes() {
+        let point = Point::new(Line(2), Column(3));
+        let now = Instant::now();
+        let mut mouse = Mouse {
+            click_state: ClickState::Click,
+            last_click_timestamp: now - CLICK_THRESHOLD,
+            last_click_button: MouseButton::Left,
+            last_click_point: Some(point),
+            ..Mouse::default()
+        };
+
+        assert_eq!(next_click_state(&mouse, MouseButton::Left, point, now), ClickState::Click);
+
+        mouse.last_click_timestamp = now - Duration::from_millis(100);
+        assert_eq!(next_click_state(&mouse, MouseButton::Right, point, now), ClickState::Click);
+        assert_eq!(
+            next_click_state(
+                &mouse,
+                MouseButton::Left,
+                Point::new(point.line, point.column + 1),
+                now,
+            ),
+            ClickState::Click
+        );
+    }
+
+    #[test]
+    fn mouse_release_targets_primary_and_system_clipboards() {
+        assert_eq!(selection_clipboards(MouseButton::Left), &SELECTION_CLIPBOARDS);
+        assert_eq!(selection_clipboards(MouseButton::Right), &SELECTION_CLIPBOARDS);
+        assert!(selection_clipboards(MouseButton::Middle).is_empty());
+    }
+
+    #[test]
+    fn shift_overrides_application_mouse_reporting() {
+        assert!(report_mouse_to_application(true, false));
+        assert!(!report_mouse_to_application(true, true));
+        assert!(!report_mouse_to_application(false, false));
+    }
 
     macro_rules! test_process_binding {
         {

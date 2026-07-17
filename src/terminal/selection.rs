@@ -93,6 +93,7 @@ impl SelectionRange {
 pub enum SelectionType {
     Simple,
     Block,
+    Semantic,
 }
 
 /// Describes a region of a 2-dimensional area.
@@ -204,6 +205,7 @@ impl Selection {
                         && start.side == Side::Left
                         && end.side == Side::Right)
             },
+            SelectionType::Semantic => false,
         }
     }
 
@@ -273,7 +275,15 @@ impl Selection {
         match self.ty {
             SelectionType::Simple => self.range_simple(start, end, columns),
             SelectionType::Block => self.range_block(start, end),
+            SelectionType::Semantic => Some(Self::range_semantic(term, start.point, end.point)),
         }
+    }
+
+    fn range_semantic<T>(term: &Term<T>, start: Point, end: Point) -> SelectionRange {
+        let start = term.semantic_search_left(start);
+        let end = term.semantic_search_right(end);
+
+        SelectionRange { start, end, is_block: false }
     }
 
     fn range_simple(

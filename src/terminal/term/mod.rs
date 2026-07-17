@@ -41,6 +41,9 @@ pub const MIN_SCREEN_LINES: usize = 1;
 /// Max size of the window title stack.
 const TITLE_STACK_MAX_DEPTH: usize = 4096;
 
+/// Characters which terminate terminal-friendly semantic token selection.
+const SEMANTIC_ESCAPE_CHARS: &str = ",│`|:\"' ()[]{}<>\t";
+
 /// Max size of the keyboard modes.
 const KEYBOARD_MODE_STACK_MAX_DEPTH: usize = TITLE_STACK_MAX_DEPTH;
 
@@ -1662,6 +1665,14 @@ impl<T: EventListener> Handler for Term<T> {
 
         let screen_lines = self.screen_lines();
 
+        // ConPTY translates Win32 screen-buffer clears, including `cmd.exe`'s `cls`, into ED3
+        // followed by cursor-home. ED3 normally clears only scrollback, but the Windows console
+        // operation also invalidates media anchored to the old viewport contents.
+        #[cfg(windows)]
+        let clears_vivid_scene = matches!(mode, ansi::ClearMode::All | ansi::ClearMode::Saved);
+        #[cfg(not(windows))]
+        let clears_vivid_scene = matches!(mode, ansi::ClearMode::All);
+
         match mode {
             ansi::ClearMode::Above => {
                 let cursor = self.grid.cursor.point;
@@ -1702,7 +1713,6 @@ impl<T: EventListener> Handler for Term<T> {
                 }
 
                 self.selection = None;
-                self.event_proxy.send_event(Event::VividClear);
             },
             ansi::ClearMode::Saved if self.history_size() > 0 => {
                 self.grid.clear_history();
@@ -1711,6 +1721,10 @@ impl<T: EventListener> Handler for Term<T> {
             },
             // We have no history to clear.
             ansi::ClearMode::Saved => (),
+        }
+
+        if clears_vivid_scene {
+            self.event_proxy.send_event(Event::VividClear);
         }
 
         self.mark_fully_damaged();
@@ -2403,6 +2417,11 @@ pub mod test {
 mod tests {
     use super::*;
 
+    #[cfg(windows)]
+    use std::sync::Arc;
+    #[cfg(windows)]
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use crate::terminal::event::VoidListener;
     #[cfg(feature = "serde")]
     use crate::terminal::grid::Grid;
@@ -2412,8 +2431,36 @@ mod tests {
     #[cfg(feature = "serde")]
     use crate::terminal::term::cell::Cell;
     use crate::terminal::term::cell::Flags;
-    use crate::terminal::term::test::TermSize;
+    use crate::terminal::term::test::{TermSize, mock_term};
     use crate::terminal::vte::ansi::{self, CharsetIndex, Handler, StandardCharset};
+
+    #[cfg(windows)]
+    #[derive(Clone, Default)]
+    struct VividClearListener(Arc<AtomicUsize>);
+
+    #[cfg(windows)]
+    impl EventListener for VividClearListener {
+        fn send_event(&self, event: Event) {
+            if matches!(event, Event::VividClear) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn conpty_cls_notifies_vivid_scene() {
+        let size = TermSize::new(25, 80);
+        let listener = VividClearListener::default();
+        let clear_count = listener.0.clone();
+        let mut term = Term::new(Config::default(), &size, listener);
+        let mut parser: ansi::Processor = ansi::Processor::new();
+
+        // ConPTY's translation of `cmd.exe`'s `cls` operation.
+        parser.advance(&mut term, b"\x1b[3J\x1b[H");
+
+        assert_eq!(clear_count.load(Ordering::Relaxed), 1);
+    }
 
     #[test]
     fn scroll_display_page_up() {
@@ -2508,6 +2555,57 @@ mod tests {
             s.update(Point { line: Line(3), column: Column(4) }, Side::Right);
         }
         assert_eq!(term.selection_to_string(), Some(String::from(" aaa  aaa\"")));
+    }
+
+    #[test]
+    fn semantic_selection_uses_terminal_token_boundaries() {
+        let mut term = mock_term("echo path/to/my-file.txt, next");
+        term.selection = Some(Selection::new(
+            SelectionType::Semantic,
+            Point::new(Line(0), Column(12)),
+            Side::Left,
+        ));
+
+        assert_eq!(term.selection_to_string().as_deref(), Some("path/to/my-file.txt"));
+
+        term.selection = Some(Selection::new(
+            SelectionType::Semantic,
+            Point::new(Line(0), Column(24)),
+            Side::Left,
+        ));
+
+        assert_eq!(term.selection_to_string().as_deref(), Some(","));
+    }
+
+    #[test]
+    fn semantic_selection_respects_hard_and_wrapped_line_breaks() {
+        let mut wrapped = mock_term("abc\ndef");
+        wrapped.selection = Some(Selection::new(
+            SelectionType::Semantic,
+            Point::new(Line(1), Column(1)),
+            Side::Left,
+        ));
+        assert_eq!(wrapped.selection_to_string().as_deref(), Some("abcdef"));
+
+        let mut hard_break = mock_term("abc\r\ndef");
+        hard_break.selection = Some(Selection::new(
+            SelectionType::Semantic,
+            Point::new(Line(1), Column(1)),
+            Side::Left,
+        ));
+        assert_eq!(hard_break.selection_to_string().as_deref(), Some("def"));
+    }
+
+    #[test]
+    fn semantic_selection_keeps_wide_characters_intact() {
+        let mut term = mock_term("foo🦇bar baz");
+        term.selection = Some(Selection::new(
+            SelectionType::Semantic,
+            Point::new(Line(0), Column(4)),
+            Side::Left,
+        ));
+
+        assert_eq!(term.selection_to_string().as_deref(), Some("foo🦇bar"));
     }
 
     #[test]

@@ -4,7 +4,8 @@ use std::time::{Duration, Instant};
 
 use vivid_protocol::media;
 use vivid_protocol::messages::{
-    ImageSourceConfig, ParsedNodeConfig, ParsedVideoSourceConfig, RasterSourceConfig,
+    ImageSourceConfig, ParsedAudioSourceConfig, ParsedNodeConfig, ParsedVideoSourceConfig,
+    RasterSourceConfig,
 };
 
 pub type SessionId = u64;
@@ -22,6 +23,7 @@ pub enum SourceConfig {
     Raster(RasterSourceConfig),
     Video(ParsedVideoSourceConfig),
     Image(ImageSourceConfig),
+    Audio(ParsedAudioSourceConfig),
 }
 
 impl SourceConfig {
@@ -30,6 +32,7 @@ impl SourceConfig {
             Self::Raster(config) => (config.width, config.height),
             Self::Video(config) => (config.width, config.height),
             Self::Image(config) => (config.width, config.height),
+            Self::Audio(_) => (0, 0),
         }
     }
 
@@ -42,6 +45,9 @@ impl SourceConfig {
                 media::video_body_len(config.max_access_unit_bytes).ok().map(u64::from)
             },
             Self::Image(config) => Some(u64::from(config.encoded_length)),
+            Self::Audio(config) => {
+                media::audio_body_len(config.max_access_unit_bytes).ok().map(u64::from)
+            },
         }
     }
 }
@@ -185,7 +191,9 @@ impl SharedScene {
             return Err("source quota exceeded");
         }
         let (width, height) = config.dimensions();
-        if width == 0 || height == 0 || width > 8192 || height > 8192 {
+        if !matches!(config, SourceConfig::Audio(_))
+            && (width == 0 || height == 0 || width > 8192 || height > 8192)
+        {
             return Err("source dimensions are outside limits");
         }
         let requested_pixels = u64::from(width) * u64::from(height);
@@ -244,8 +252,8 @@ impl SharedScene {
     pub fn pause_playback(&self, key: SourceKey) -> Result<(), &'static str> {
         let mut state = self.lock();
         let source = state.sources.get_mut(&key).ok_or("source does not exist")?;
-        if !matches!(source.config, SourceConfig::Video(_)) {
-            return Err("PAUSE applies only to video");
+        if !matches!(source.config, SourceConfig::Video(_) | SourceConfig::Audio(_)) {
+            return Err("PAUSE applies only to video or audio");
         }
         if let Some(started) = source.play_started.take() {
             source.played_before_pause =
@@ -258,8 +266,10 @@ impl SharedScene {
     pub fn flush_playback(&self, key: SourceKey, epoch: u32) -> Result<(), &'static str> {
         let mut state = self.lock();
         let source = state.sources.get_mut(&key).ok_or("source does not exist")?;
-        if !matches!(source.config, SourceConfig::Video(_)) || epoch <= source.last_epoch {
-            return Err("FLUSH requires a video source and a greater epoch");
+        if !matches!(source.config, SourceConfig::Video(_) | SourceConfig::Audio(_))
+            || epoch <= source.last_epoch
+        {
+            return Err("FLUSH requires a media source and a greater epoch");
         }
         source.last_epoch = epoch;
         source.play_started = None;
@@ -287,6 +297,21 @@ impl SharedScene {
 
     pub fn source_epoch(&self, key: SourceKey) -> Option<u32> {
         self.lock().sources.get(&key).map(|source| source.last_epoch)
+    }
+
+    pub fn linked_audio_sources(&self, video: SourceKey) -> Vec<SourceKey> {
+        self.lock()
+            .sources
+            .iter()
+            .filter_map(|(&key, source)| match &source.config {
+                SourceConfig::Audio(config)
+                    if key.0 == video.0 && config.linked_video_source_id == Some(video.1) =>
+                {
+                    Some(key)
+                },
+                _ => None,
+            })
+            .collect()
     }
 
     pub fn wait_for_presentation(&self, key: SourceKey, pts_us: i64) -> bool {

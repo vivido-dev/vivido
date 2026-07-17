@@ -1,6 +1,6 @@
 [package]
 name = "vivido"
-version = "0.1.0"
+version = "0.1.1"
 authors = ["Wensheng Wang <wenshengwang@gmail.com>"]
 license = "Apache-2.0"
 description = "A fast cross-platform terminal emulator with protocol-neutral media hooks"
@@ -63,7 +63,7 @@ toml = "1.1"
 toml_edit = "0.25"
 unicode-width = "0.2.0"
 unicode-script = "0.5"
-vivid_protocol = "1.1.0"
+vivid_protocol = { version = "1.2.0", path = "../vivid_protocol" }
 vte = { version = "0.15.0", default-features = false, features = ["std", "ansi", "serde"] }
 vello = { version = "0.9.0", default-features = false, features = ["wgpu"] }
 winit = { version = "0.30.9", default-features = false, features = [
@@ -79,6 +79,10 @@ clap_complete = "4.2.3"
 
 [target.'cfg(not(windows))'.dependencies]
 xdg = "3.0.0"
+
+[target.'cfg(any(target_os = "macos", target_os = "linux", windows))'.dependencies]
+cpal = "0.17"
+ringbuf = "0.5"
 
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1.0.0", default-features = false, features = ["std"] }

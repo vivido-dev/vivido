@@ -1,3 +1,4 @@
+use std::cmp::max;
 use std::error::Error;
 use std::mem;
 use std::ops::RangeInclusive;
@@ -11,8 +12,8 @@ use regex_automata::{Anchored, Input, MatchKind};
 
 use crate::terminal::grid::{BidirectionalIterator, Dimensions, GridIterator, Indexed};
 use crate::terminal::index::{Boundary, Column, Direction, Point, Side};
-use crate::terminal::term::Term;
 use crate::terminal::term::cell::{Cell, Flags};
+use crate::terminal::term::{SEMANTIC_ESCAPE_CHARS, Term};
 
 pub type Match = RangeInclusive<Point>;
 
@@ -462,6 +463,105 @@ impl<T> Term<T> {
             },
             _ => (),
         }
+    }
+
+    /// Find the left edge of the terminal-friendly token containing `point`.
+    #[must_use]
+    pub fn semantic_search_left(&self, point: Point) -> Point {
+        let point = self.semantic_search_point(point);
+
+        if SEMANTIC_ESCAPE_CHARS.contains(self.grid[point].c) {
+            return point;
+        }
+
+        match self.inline_search_left(point, SEMANTIC_ESCAPE_CHARS) {
+            // Move one cell back toward the token, skipping wide-cell spacers.
+            Ok(point) => {
+                let wide_spacer = Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER;
+                self.grid
+                    .iter_from(point)
+                    .find(|cell| !cell.flags.intersects(wide_spacer))
+                    .map_or(point, |cell| cell.point)
+            },
+            Err(point) => point,
+        }
+    }
+
+    /// Find the right edge of the terminal-friendly token containing `point`.
+    #[must_use]
+    pub fn semantic_search_right(&self, point: Point) -> Point {
+        let point = self.semantic_search_point(point);
+
+        if SEMANTIC_ESCAPE_CHARS.contains(self.grid[point].c) {
+            return point;
+        }
+
+        match self.inline_search_right(point, SEMANTIC_ESCAPE_CHARS) {
+            Ok(point) => self.grid.iter_from(point).prev().map_or(point, |cell| cell.point),
+            Err(point) => point,
+        }
+    }
+
+    /// Resolve spacer cells to the fullwidth character they represent.
+    fn semantic_search_point(&self, point: Point) -> Point {
+        let flags = self.grid[point].flags;
+
+        if flags.contains(Flags::WIDE_CHAR_SPACER) {
+            point.sub(self, Boundary::Grid, 1)
+        } else if flags.contains(Flags::LEADING_WIDE_CHAR_SPACER) {
+            point.add(self, Boundary::None, 2)
+        } else {
+            point
+        }
+    }
+
+    /// Search left for the next character in `needles` without crossing a hard line break.
+    fn inline_search_left(&self, mut point: Point, needles: &str) -> Result<Point, Point> {
+        point.line = max(point.line, self.topmost_line());
+
+        let mut iter = self.grid.iter_from(point);
+        let last_column = self.columns() - 1;
+        let wide_spacer = Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER;
+
+        while let Some(cell) = iter.prev() {
+            if cell.point.column == last_column && !cell.flags.contains(Flags::WRAPLINE) {
+                break;
+            }
+
+            point = cell.point;
+
+            if !cell.flags.intersects(wide_spacer) && needles.contains(cell.c) {
+                return Ok(point);
+            }
+        }
+
+        Err(point)
+    }
+
+    /// Search right for the next character in `needles` without crossing a hard line break.
+    fn inline_search_right(&self, mut point: Point, needles: &str) -> Result<Point, Point> {
+        point.line = max(point.line, self.topmost_line());
+
+        let wide_spacer = Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER;
+        let last_column = self.columns() - 1;
+
+        if point.column == last_column && !self.grid[point].flags.contains(Flags::WRAPLINE) {
+            return Err(point);
+        }
+
+        for cell in self.grid.iter_from(point) {
+            point = cell.point;
+
+            if !cell.flags.intersects(wide_spacer) && needles.contains(cell.c) {
+                return Ok(point);
+            }
+
+            if point.column == last_column && !cell.flags.contains(Flags::WRAPLINE) {
+                break;
+            }
+        }
+
+        Err(point)
     }
 
     /// Find the beginning of the current line across linewraps.

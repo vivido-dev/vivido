@@ -1,5 +1,6 @@
 //! Per-window Vivid Protocol endpoint, session manager, and media dispatch.
 
+mod audio;
 mod decoder;
 pub mod scene;
 mod transport;
@@ -30,6 +31,7 @@ use vivid_protocol::messages::{self, Credits, DisplayChanged};
 use vivid_protocol::wire::{ConnectionKind, RECORD_OPTIONAL, Record};
 
 use crate::event::{EventProxy, EventType};
+use crate::vivid::audio::AudioOutput;
 use crate::vivid::decoder::Decoder;
 use crate::vivid::scene::{
     Frame, SceneMutation, SceneNode, SessionId, SharedScene, SourceConfig, SourceKey,
@@ -90,6 +92,7 @@ struct ServiceShared {
     registry: Mutex<Registry>,
     metrics: Mutex<DisplayMetrics>,
     active_connections: AtomicUsize,
+    audio_outputs: Mutex<HashMap<SourceKey, Arc<AudioOutput>>>,
     wake: Arc<dyn Fn() + Send + Sync>,
 }
 
@@ -129,6 +132,7 @@ impl VividService {
             registry: Mutex::new(Registry::default()),
             metrics: Mutex::new(metrics),
             active_connections: AtomicUsize::new(0),
+            audio_outputs: Mutex::new(HashMap::new()),
             wake,
         });
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -364,9 +368,10 @@ fn handle_connection(stream: LocalStream, shared: Arc<ServiceShared>) -> io::Res
     let (mut reader, preface) = Reader::new(stream)?;
     match preface.kind {
         ConnectionKind::Control => handle_control(&mut reader, shared),
-        ConnectionKind::Raster | ConnectionKind::Video | ConnectionKind::Blob => {
-            handle_media(&mut reader, preface.kind, shared)
-        },
+        ConnectionKind::Raster
+        | ConnectionKind::Video
+        | ConnectionKind::Blob
+        | ConnectionKind::Audio => handle_media(&mut reader, preface.kind, shared),
         _ => Err(io::Error::new(
             ErrorKind::Unsupported,
             "this Vivid channel kind is not implemented",
@@ -534,6 +539,7 @@ fn is_supported_feature(feature: u64) -> bool {
             | messages::FEATURE_VIDEO_ACCESS_UNIT_V1
             | messages::FEATURE_VIDEO_CONTROL_V1
             | messages::FEATURE_TEXT_ANCHORS_V2
+            | messages::FEATURE_AUDIO_ACCESS_UNIT_V1
     )
 }
 
@@ -551,6 +557,26 @@ fn negotiated(shared: &Arc<ServiceShared>, session_id: SessionId, feature: u64) 
         .sessions
         .get(&session_id)
         .is_some_and(|session| session.accepted_features.contains(&feature))
+}
+
+fn audio_group(shared: &Arc<ServiceShared>, source: SourceKey) -> Vec<Arc<AudioOutput>> {
+    let mut keys = if matches!(shared.scene.source_config(source), Some(SourceConfig::Audio(_))) {
+        vec![source]
+    } else {
+        shared.scene.linked_audio_sources(source)
+    };
+    keys.sort_unstable();
+    let outputs = shared.audio_outputs.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    keys.into_iter().filter_map(|key| outputs.get(&key).cloned()).collect()
+}
+
+fn wait_for_media_time(shared: &Arc<ServiceShared>, source: SourceKey, pts_us: i64) -> bool {
+    if let Some(output) = audio_group(shared, source).into_iter().next()
+        && output.wait_until_pts(pts_us)
+    {
+        return true;
+    }
+    shared.scene.wait_for_presentation(source, pts_us)
 }
 
 enum ControlAction {
@@ -596,6 +622,28 @@ fn dispatch_control(
                     &messages::video_support(envelope.request_id, supported, &config.codec),
                 )
                 .map_err(|_| bad("could not send VIDEO_SUPPORT"))?;
+        },
+        messages::PROBE_AUDIO_CONFIG => {
+            if !negotiated(shared, session_id, messages::FEATURE_AUDIO_ACCESS_UNIT_V1) {
+                return Err(ProtocolError {
+                    code: messages::ERROR_UNSUPPORTED_FEATURE,
+                    message: "audio access units were not negotiated",
+                    fatal: false,
+                });
+            }
+            let (envelope, config) = messages::parse_create_audio(&record.body)
+                .map_err(|_| bad("invalid PROBE_AUDIO_CONFIG"))?;
+            if record.object_id != 0 || config.source_id != 0 {
+                return Err(bad("PROBE_AUDIO_CONFIG must be session-level"));
+            }
+            let supported = messages::audio_config_supported(&config) && audio::supports(&config);
+            writer
+                .write_record(
+                    messages::AUDIO_SUPPORT,
+                    0,
+                    &messages::audio_support(envelope.request_id, supported, &config.codec),
+                )
+                .map_err(|_| bad("could not send AUDIO_SUPPORT"))?;
         },
         messages::CREATE_RASTER => {
             let (envelope, config) = messages::parse_create_raster(&record.body)
@@ -694,6 +742,79 @@ fn dispatch_control(
             )
             .map_err(|_| bad("could not create video media ticket"))?;
         },
+        messages::CREATE_AUDIO => {
+            if !negotiated(shared, session_id, messages::FEATURE_AUDIO_ACCESS_UNIT_V1) {
+                return Err(ProtocolError {
+                    code: messages::ERROR_UNSUPPORTED_FEATURE,
+                    message: "audio access units were not negotiated",
+                    fatal: false,
+                });
+            }
+            let (envelope, config) = messages::parse_create_audio(&record.body)
+                .map_err(|_| bad("invalid CREATE_AUDIO"))?;
+            if config.source_id == 0 || record.object_id != config.source_id {
+                return Err(bad("CREATE_AUDIO object ID mismatch"));
+            }
+            if !messages::audio_config_supported(&config) {
+                return Err(ProtocolError {
+                    code: messages::ERROR_UNSUPPORTED_CONFIG,
+                    message: "unsupported audio codec, layout, or size",
+                    fatal: false,
+                });
+            }
+            if let Some(video_id) = config.linked_video_source_id
+                && !matches!(
+                    shared.scene.source_config((session_id, video_id)),
+                    Some(SourceConfig::Video(_))
+                )
+            {
+                return Err(ProtocolError {
+                    code: messages::ERROR_NOT_FOUND,
+                    message: "linked video source does not exist",
+                    fatal: false,
+                });
+            }
+            if !audio::supports(&config) {
+                return Err(ProtocolError {
+                    code: messages::ERROR_UNSUPPORTED_CONFIG,
+                    message: "audio decoder configuration is unavailable",
+                    fatal: false,
+                });
+            }
+            let max_body =
+                media::audio_body_len(config.max_access_unit_bytes).map_err(|_| ProtocolError {
+                    code: messages::ERROR_LIMIT_EXCEEDED,
+                    message: "maximum audio access unit exceeds the media-body limit",
+                    fatal: false,
+                })?;
+            let output = AudioOutput::open().map_err(|_| ProtocolError {
+                code: messages::ERROR_DEVICE_LOST,
+                message: "default audio output is unavailable",
+                fatal: false,
+            })?;
+            shared
+                .scene
+                .add_source(session_id, config.source_id, SourceConfig::Audio(config.clone()))
+                .map_err(|message| ProtocolError {
+                    code: messages::ERROR_LIMIT_EXCEEDED,
+                    message,
+                    fatal: false,
+                })?;
+            shared
+                .audio_outputs
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert((session_id, config.source_id), output);
+            issue_source_ready(
+                shared,
+                writer,
+                envelope.request_id,
+                (session_id, config.source_id),
+                ConnectionKind::Audio,
+                max_body,
+            )
+            .map_err(|_| bad("could not create audio media ticket"))?;
+        },
         messages::CREATE_IMAGE => {
             let (envelope, config) = messages::parse_create_image(&record.body)
                 .map_err(|_| bad("invalid CREATE_IMAGE"))?;
@@ -746,6 +867,14 @@ fn dispatch_control(
             shared.scene.remove_source((session_id, source_id)).map_err(|message| {
                 ProtocolError { code: messages::ERROR_NOT_FOUND, message, fatal: false }
             })?;
+            if let Some(output) = shared
+                .audio_outputs
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(&(session_id, source_id))
+            {
+                output.stop();
+            }
             lock_registry(shared)
                 .tickets
                 .retain(|_, ticket| ticket.source_key != (session_id, source_id));
@@ -913,17 +1042,20 @@ fn dispatch_control(
             }
             if !matches!(
                 shared.scene.source_config((session_id, source_id)),
-                Some(SourceConfig::Video(_))
+                Some(SourceConfig::Video(_) | SourceConfig::Audio(_))
             ) {
                 return Err(ProtocolError {
                     code: messages::ERROR_BAD_STATE,
-                    message: "PLAY applies only to video",
+                    message: "PLAY applies only to video or audio",
                     fatal: false,
                 });
             }
             shared.scene.start_playback((session_id, source_id)).map_err(|message| {
                 ProtocolError { code: messages::ERROR_NOT_FOUND, message, fatal: false }
             })?;
+            for output in audio_group(shared, (session_id, source_id)) {
+                output.start();
+            }
             writer
                 .write_record(messages::OK, source_id, &messages::ok(envelope.request_id))
                 .map_err(|_| bad("could not acknowledge PLAY"))?;
@@ -944,6 +1076,9 @@ fn dispatch_control(
             shared.scene.pause_playback((session_id, source_id)).map_err(|message| {
                 ProtocolError { code: messages::ERROR_BAD_STATE, message, fatal: false }
             })?;
+            for output in audio_group(shared, (session_id, source_id)) {
+                output.pause();
+            }
             writer
                 .write_record(messages::OK, source_id, &messages::ok(envelope.request_id))
                 .map_err(|_| bad("could not acknowledge PAUSE"))?;
@@ -961,9 +1096,23 @@ fn dispatch_control(
             if source_id != record.object_id {
                 return Err(bad("FLUSH object ID mismatch"));
             }
-            shared.scene.flush_playback((session_id, source_id), epoch).map_err(|message| {
-                ProtocolError { code: messages::ERROR_BAD_STATE, message, fatal: false }
+            let key = (session_id, source_id);
+            let linked_audio = shared.scene.linked_audio_sources(key);
+            shared.scene.flush_playback(key, epoch).map_err(|message| ProtocolError {
+                code: messages::ERROR_BAD_STATE,
+                message,
+                fatal: false,
             })?;
+            for audio_key in linked_audio {
+                shared.scene.flush_playback(audio_key, epoch).map_err(|message| ProtocolError {
+                    code: messages::ERROR_BAD_STATE,
+                    message,
+                    fatal: false,
+                })?;
+            }
+            for output in audio_group(shared, key) {
+                output.flush();
+            }
             writer
                 .write_record(messages::OK, source_id, &messages::ok(envelope.request_id))
                 .map_err(|_| bad("could not acknowledge FLUSH"))?;
@@ -974,12 +1123,59 @@ fn dispatch_control(
             if record.object_id != source_id {
                 return Err(bad("EOS object ID mismatch"));
             }
-            shared.scene.signal_eos((session_id, source_id), epoch).map_err(|message| {
-                ProtocolError { code: messages::ERROR_STALE_EPOCH, message, fatal: false }
+            let key = (session_id, source_id);
+            let linked_audio = shared.scene.linked_audio_sources(key);
+            shared.scene.signal_eos(key, epoch).map_err(|message| ProtocolError {
+                code: messages::ERROR_STALE_EPOCH,
+                message,
+                fatal: false,
             })?;
+            for audio_key in linked_audio {
+                shared.scene.signal_eos(audio_key, epoch).map_err(|message| ProtocolError {
+                    code: messages::ERROR_STALE_EPOCH,
+                    message,
+                    fatal: false,
+                })?;
+            }
+            for output in audio_group(shared, key) {
+                output.signal_eos();
+            }
             writer
                 .write_record(messages::OK, source_id, &messages::ok(envelope.request_id))
                 .map_err(|_| bad("could not acknowledge EOS"))?;
+        },
+        messages::DRAIN => {
+            if !negotiated(shared, session_id, messages::FEATURE_AUDIO_ACCESS_UNIT_V1) {
+                return Err(ProtocolError {
+                    code: messages::ERROR_UNSUPPORTED_FEATURE,
+                    message: "audio drain was not negotiated",
+                    fatal: false,
+                });
+            }
+            let (envelope, source_id) = messages::parse_object_id(&record.body, "source ID")
+                .map_err(|_| bad("invalid DRAIN"))?;
+            if record.object_id != source_id {
+                return Err(bad("DRAIN object ID mismatch"));
+            }
+            let output = shared
+                .audio_outputs
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(&(session_id, source_id))
+                .cloned()
+                .ok_or(ProtocolError {
+                    code: messages::ERROR_NOT_FOUND,
+                    message: "audio source does not exist",
+                    fatal: false,
+                })?;
+            output.wait_drained().map_err(|_| ProtocolError {
+                code: messages::ERROR_DEVICE_LOST,
+                message: "audio output failed while draining",
+                fatal: false,
+            })?;
+            writer
+                .write_record(messages::OK, source_id, &messages::ok(envelope.request_id))
+                .map_err(|_| bad("could not acknowledge DRAIN"))?;
         },
         messages::GOODBYE => {
             let envelope =
@@ -1068,6 +1264,8 @@ fn handle_media(
         Some(SourceConfig::Video(config)) => media::video_body_len(config.max_access_unit_bytes)
             .map_err(|_| invalid("invalid video source size"))?,
         Some(SourceConfig::Image(config)) => config.encoded_length,
+        Some(SourceConfig::Audio(config)) => media::audio_body_len(config.max_access_unit_bytes)
+            .map_err(|_| invalid("invalid audio source size"))?,
         None => return Err(invalid("media ticket references a missing source")),
     };
     reader.set_maximum(max_media_body);
@@ -1077,10 +1275,19 @@ fn handle_media(
         ConnectionKind::Raster => handle_raster(reader, &shared, &writer, ticket.source_key),
         ConnectionKind::Video => handle_video(reader, &shared, &writer, ticket.source_key),
         ConnectionKind::Blob => handle_image(reader, &shared, &writer, ticket.source_key),
+        ConnectionKind::Audio => handle_audio(reader, &shared, &writer, ticket.source_key),
         _ => unreachable!(),
     };
     if let Err(error) = result {
         let _ = shared.scene.remove_source(source_key);
+        if let Some(output) = shared
+            .audio_outputs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&source_key)
+        {
+            output.stop();
+        }
         let diagnostic = error.to_string();
         let code = if diagnostic.contains("hash mismatch") {
             messages::ERROR_HASH_MISMATCH
@@ -1241,7 +1448,7 @@ fn handle_video(
             },
         };
         for decoded in decoded_frames {
-            if !shared.scene.wait_for_presentation(key, decoded.pts_us) {
+            if !wait_for_media_time(shared, key, decoded.pts_us) {
                 return Ok(());
             }
             frame_id = frame_id.saturating_add(1);
@@ -1266,7 +1473,7 @@ fn handle_video(
         }
     }
     for decoded in decoder.finish()? {
-        if !shared.scene.wait_for_presentation(key, decoded.pts_us) {
+        if !wait_for_media_time(shared, key, decoded.pts_us) {
             break;
         }
         frame_id = frame_id.saturating_add(1);
@@ -1290,6 +1497,65 @@ fn handle_video(
         wake(shared);
     }
     Ok(())
+}
+
+fn handle_audio(
+    reader: &mut Reader,
+    shared: &Arc<ServiceShared>,
+    writer: &Arc<Writer>,
+    key: SourceKey,
+) -> io::Result<()> {
+    let config = match shared.scene.source_config(key) {
+        Some(SourceConfig::Audio(config)) => config,
+        _ => return Err(invalid("audio ticket references a non-audio source")),
+    };
+    let output = shared
+        .audio_outputs
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(&key)
+        .cloned()
+        .ok_or_else(|| invalid("audio output is missing"))?;
+    let result = (|| {
+        let mut decoder = output.decoder(&config)?;
+        let mut sequence = media::MediaSequence::default();
+        let mut decoder_epoch = None;
+        loop {
+            if !reader.wait_readable(Duration::from_millis(50))? {
+                if shared.scene.eos_epoch(key).is_some() {
+                    break;
+                }
+                continue;
+            }
+            let record = match reader.read_record() {
+                Ok(record) => record,
+                Err(error) if error.kind() == ErrorKind::UnexpectedEof => break,
+                Err(error) => return Err(error),
+            };
+            let _charge = ChargedBody::new(writer, key.1, record.body.len() as u64);
+            if record.record_type != messages::AUDIO_PACKET || record.object_id != key.1 {
+                return Err(invalid("unexpected record on audio media channel"));
+            }
+            let packet = media::parse_audio_packet(&record.body)?;
+            sequence.accept(packet.packet_id, packet.epoch)?;
+            if packet.epoch < shared.scene.source_epoch(key).unwrap_or(packet.epoch) {
+                continue;
+            }
+            if decoder_epoch != Some(packet.epoch) {
+                decoder = output.decoder(&config)?;
+                decoder_epoch = Some(packet.epoch);
+            }
+            if packet.data.len() > config.max_access_unit_bytes as usize {
+                return Err(invalid("audio packet exceeds its declared bound"));
+            }
+            output.observe_audio_pts(packet.pts_us);
+            output.push(&decoder.push(packet)?)?;
+        }
+        output.push(&decoder.finish()?)?;
+        Ok(())
+    })();
+    output.finish_decode();
+    result
 }
 
 fn handle_image(
@@ -1460,6 +1726,15 @@ fn cleanup_session(shared: &Arc<ServiceShared>, session_id: SessionId) {
     registry.sessions.remove(&session_id);
     registry.tickets.retain(|_, ticket| ticket.session_id != session_id);
     drop(registry);
+    let outputs = {
+        let mut outputs =
+            shared.audio_outputs.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let keys = outputs.keys().copied().filter(|key| key.0 == session_id).collect::<Vec<_>>();
+        keys.into_iter().filter_map(|key| outputs.remove(&key)).collect::<Vec<_>>()
+    };
+    for output in outputs {
+        output.stop();
+    }
     shared.scene.detach_session(session_id);
 }
 

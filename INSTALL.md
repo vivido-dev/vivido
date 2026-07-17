@@ -1,6 +1,8 @@
 # Installing Vivido
 
-Vivido requires Rust 1.88 or newer and a Vulkan, Metal, or DirectX 12 adapter supported by wgpu.
+Vivido requires Rust 1.88 or newer, FFmpeg (`avcodec`, `avutil`, and `swresample`), and a Vulkan,
+Metal, or DirectX 12 adapter supported by wgpu. Audio output uses CPAL's system-default CoreAudio,
+ALSA, or WASAPI device.
 
 ## Build from source
 
@@ -49,12 +51,15 @@ Build from a Visual Studio Developer Command Prompt with the Rust MSVC toolchain
 ```powershell
 $env:VCPKG_ROOT = "C:\path\to\vcpkg"
 vcpkg install ffmpeg:x64-windows
+$env:VCPKG_DEFAULT_TRIPLET = "x64-windows"
 $env:PATH = "$env:VCPKG_ROOT\installed\x64-windows\bin;$env:PATH"
 cargo build --release
 ```
 
-Vivido discovers the FFmpeg import libraries from `VCPKG_ROOT`. The `PATH` entry is also required
-when running Vivido because the `x64-windows` triplet supplies FFmpeg as DLLs.
+Vivido discovers the FFmpeg import libraries, including `swresample.lib`, from `VCPKG_ROOT` and the
+selected vcpkg triplet. The `PATH` entry is also required when running Vivido because the
+`x64-windows` triplet supplies FFmpeg as DLLs. WASAPI support is provided by CPAL and needs no
+PulseAudio installation.
 
 ## Tests
 
