@@ -23,7 +23,8 @@ use ahash::RandomState;
 use log::{debug, error, info, warn};
 use winit::application::ApplicationHandler;
 use winit::event::{
-    ElementState, Event as WinitEvent, Ime, Modifiers, StartCause, Touch as TouchEvent, WindowEvent,
+    ElementState, Event as WinitEvent, Ime, Modifiers, MouseButton, StartCause,
+    Touch as TouchEvent, WindowEvent,
 };
 use winit::event_loop::{ActiveEventLoop, ControlFlow, DeviceEvents, EventLoop, EventLoopProxy};
 use winit::raw_window_handle::HasDisplayHandle;
@@ -1389,6 +1390,10 @@ pub struct Mouse {
     pub left_button_state: ElementState,
     pub middle_button_state: ElementState,
     pub right_button_state: ElementState,
+    pub last_click_timestamp: Instant,
+    pub last_click_button: MouseButton,
+    pub last_click_point: Option<Point>,
+    pub click_state: ClickState,
     pub accumulated_scroll: AccumulatedScroll,
     pub cell_side: Side,
     pub block_hint_launcher: bool,
@@ -1401,9 +1406,13 @@ pub struct Mouse {
 impl Default for Mouse {
     fn default() -> Mouse {
         Mouse {
+            last_click_timestamp: Instant::now(),
+            last_click_button: MouseButton::Left,
+            last_click_point: None,
             left_button_state: ElementState::Released,
             middle_button_state: ElementState::Released,
             right_button_state: ElementState::Released,
+            click_state: ClickState::None,
             cell_side: Side::Left,
             hint_highlight_dirty: Default::default(),
             block_hint_launcher: Default::default(),
@@ -1413,6 +1422,13 @@ impl Default for Mouse {
             y: Default::default(),
         }
     }
+}
+
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub enum ClickState {
+    None,
+    Click,
+    DoubleClick,
 }
 
 impl Mouse {

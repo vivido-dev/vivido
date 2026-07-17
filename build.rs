@@ -35,7 +35,13 @@ fn link_ffmpeg() {
         println!("cargo:rerun-if-env-changed={variable}");
     }
 
-    let libraries = ["libavcodec", "libavutil", "libswscale"];
+    #[cfg(windows)]
+    if env::var_os("VCPKG_ROOT").is_some() {
+        link_vcpkg_ffmpeg();
+        return;
+    }
+
+    let libraries = ["libavcodec", "libavutil", "libswscale", "libswresample"];
     let detected = libraries
         .iter()
         .map(|library| pkg_config::Config::new().cargo_metadata(false).probe(library))
@@ -53,7 +59,6 @@ fn link_ffmpeg() {
     #[cfg(windows)]
     {
         link_vcpkg_ffmpeg();
-        return;
     }
 
     #[cfg(not(windows))]
@@ -69,7 +74,7 @@ fn link_vcpkg_ffmpeg() {
         .or_else(|_| env::var("VCPKG_DEFAULT_TRIPLET"))
         .unwrap_or_else(|_| default_windows_triplet());
     let library_directory = root.join("installed").join(&triplet).join("lib");
-    for library in ["avcodec", "avutil", "swscale"] {
+    for library in ["avcodec", "avutil", "swscale", "swresample"] {
         let import_library = library_directory.join(format!("{library}.lib"));
         assert!(
             import_library.is_file(),
@@ -79,7 +84,7 @@ fn link_vcpkg_ffmpeg() {
         );
     }
     println!("cargo:rustc-link-search=native={}", library_directory.display());
-    for library in ["avcodec", "avutil", "swscale"] {
+    for library in ["avcodec", "avutil", "swscale", "swresample"] {
         println!("cargo:rustc-link-lib=dylib={library}");
     }
 }
