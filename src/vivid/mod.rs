@@ -5,7 +5,7 @@ mod decoder;
 pub mod scene;
 mod transport;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 #[cfg(unix)]
 use std::fs;
 use std::io::{self, Cursor, ErrorKind};
@@ -32,7 +32,7 @@ use vivid_protocol::wire::{ConnectionKind, RECORD_OPTIONAL, Record};
 
 use crate::event::{EventProxy, EventType};
 use crate::vivid::audio::AudioOutput;
-use crate::vivid::decoder::Decoder;
+use crate::vivid::decoder::{DecodedFrame, Decoder};
 use crate::vivid::scene::{
     Frame, SceneMutation, SceneNode, SessionId, SharedScene, SourceConfig, SourceKey,
 };
@@ -93,6 +93,10 @@ struct ServiceShared {
     metrics: Mutex<DisplayMetrics>,
     active_connections: AtomicUsize,
     audio_outputs: Mutex<HashMap<SourceKey, Arc<AudioOutput>>>,
+    /// Last `(renderable, display_offset)` reported by the UI thread. Cached so scene changes
+    /// applied on the control-dispatcher thread (e.g. a newly committed node) can recompute
+    /// source visibility without the UI-thread inputs directly at hand.
+    render_state: Mutex<(bool, usize)>,
     wake: Arc<dyn Fn() + Send + Sync>,
 }
 
@@ -133,6 +137,7 @@ impl VividService {
             metrics: Mutex::new(metrics),
             active_connections: AtomicUsize::new(0),
             audio_outputs: Mutex::new(HashMap::new()),
+            render_state: Mutex::new((true, 0)),
             wake,
         });
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -208,7 +213,7 @@ impl VividService {
         }
     }
 
-    pub fn handle_terminal_marker(&self, marker: &str, line: i32, column: usize) {
+    pub fn handle_terminal_marker(&self, marker: &str, line: i32, column: usize, alternate: bool) {
         let Ok(marker) = anchor::parse_marker(marker) else {
             return;
         };
@@ -234,7 +239,9 @@ impl VividService {
             return;
         };
         let anchor_id = marker.anchor_id;
-        if let Err(error) = self.scene.add_anchor(session_id, anchor_id, column, line) {
+        if let Err(error) =
+            self.scene.add_anchor_for_screen(session_id, anchor_id, column, line, alternate)
+        {
             log::debug!("Rejected Vivid text anchor {anchor_id}: {error}");
             return;
         }
@@ -245,6 +252,10 @@ impl VividService {
         ) {
             log::debug!("Could not acknowledge Vivid text anchor {anchor_id}: {error}");
         }
+        // With the ConPTY transport, a node commit can overtake its terminal marker. The commit
+        // therefore evaluates the anchored source as hidden; re-evaluate now that the marker has
+        // supplied the node's terminal position so timed producers are released from that state.
+        emit_visibility(&self.shared);
         wake(&self.shared);
     }
 
@@ -260,30 +271,17 @@ impl VividService {
         wake(&self.shared);
     }
 
+    /// The terminal switched between the primary and alternate screens. Anchored media on the
+    /// inactive screen is hidden; anchors created on the alternate screen are gone once it exits.
+    pub fn handle_screen_swap(&self, alternate: bool) {
+        let removed = self.scene.set_alternate_screen(alternate);
+        self.notify_anchor_events(messages::ANCHOR_GONE, removed);
+        wake(&self.shared);
+    }
+
     pub fn update_visibility(&self, renderable: bool, display_offset: usize) {
-        let metrics = *lock_metrics(&self.shared);
-        let states = self.scene.aggregate_visibility(
-            metrics.columns,
-            metrics.rows,
-            display_offset,
-            renderable,
-        );
-        let mut registry = lock_registry(&self.shared);
-        for ((session_id, source_id), visible, reasons) in states {
-            let Some(session) = registry.sessions.get_mut(&session_id) else { continue };
-            if !session.accepted_features.contains(&messages::FEATURE_VISIBILITY_EVENTS_V1) {
-                continue;
-            }
-            if session.last_visibility.insert(source_id, visible) == Some(visible) {
-                continue;
-            }
-            let Some(writer) = session.writer.upgrade() else { continue };
-            let _ = writer.write_record(
-                messages::VISIBILITY,
-                source_id,
-                &messages::visibility(source_id, visible, reasons, metrics.generation),
-            );
-        }
+        *lock_render_state(&self.shared) = (renderable, display_offset);
+        emit_visibility(&self.shared);
     }
 
     fn notify_anchor_events(&self, record_type: u16, anchors: Vec<scene::AnchorKey>) {
@@ -540,6 +538,7 @@ fn is_supported_feature(feature: u64) -> bool {
             | messages::FEATURE_VIDEO_CONTROL_V1
             | messages::FEATURE_TEXT_ANCHORS_V2
             | messages::FEATURE_AUDIO_ACCESS_UNIT_V1
+            | messages::FEATURE_NODE_CLIP_RECT_V1
     )
 }
 
@@ -570,13 +569,16 @@ fn audio_group(shared: &Arc<ServiceShared>, source: SourceKey) -> Vec<Arc<AudioO
     keys.into_iter().filter_map(|key| outputs.get(&key).cloned()).collect()
 }
 
-fn wait_for_media_time(shared: &Arc<ServiceShared>, source: SourceKey, pts_us: i64) -> bool {
-    if let Some(output) = audio_group(shared, source).into_iter().next()
-        && output.wait_until_pts(pts_us)
-    {
-        return true;
+fn media_time_reached(shared: &Arc<ServiceShared>, source: SourceKey, pts_us: i64) -> Option<bool> {
+    if let Some(output) = audio_group(shared, source).into_iter().next() {
+        if output.video_gate_stalled() {
+            // A producer that never sends linked audio must not freeze video forever. Once audio
+            // arrives, this condition clears and the linked audio clock becomes authoritative.
+            return shared.scene.presentation_due(source, pts_us);
+        }
+        return Some(output.pts_reached(pts_us));
     }
-    shared.scene.wait_for_presentation(source, pts_us)
+    shared.scene.presentation_due(source, pts_us)
 }
 
 enum ControlAction {
@@ -603,6 +605,9 @@ fn dispatch_control(
         messages::PING => {
             let envelope =
                 messages::decode_control(&record.body).map_err(|_| bad("invalid PING"))?;
+            if record.object_id != 0 || envelope.request_id == 0 {
+                return Err(bad("PING is not a correlated session-level request"));
+            }
             writer
                 .write_record(messages::PONG, 0, &messages::ok(envelope.request_id))
                 .map_err(|_| bad("could not send PONG"))?;
@@ -905,9 +910,19 @@ fn dispatch_control(
                 .map_err(|_| bad("could not acknowledge transaction"))?;
         },
         messages::CREATE_NODE => {
-            let (envelope, config) = messages::parse_create_node(&record.body)
-                .map_err(|_| bad("invalid CREATE_NODE"))?;
-            if record.object_id != config.node_id || config.context_id != root_context_id {
+            let (envelope, config) =
+                messages::parse_scene_node(&record.body).map_err(|_| bad("invalid CREATE_NODE"))?;
+            if config.clip.is_some()
+                && !negotiated(shared, session_id, messages::FEATURE_NODE_CLIP_RECT_V1)
+            {
+                return Err(ProtocolError {
+                    code: messages::ERROR_UNSUPPORTED_FEATURE,
+                    message: "node clipping was not negotiated",
+                    fatal: false,
+                });
+            }
+            if record.object_id != config.node.node_id || config.node.context_id != root_context_id
+            {
                 return Err(bad("CREATE_NODE object or context ID mismatch"));
             }
             let transaction_id =
@@ -923,9 +938,19 @@ fn dispatch_control(
                 .map_err(|_| bad("could not acknowledge node"))?;
         },
         messages::UPDATE_NODE => {
-            let (envelope, config) = messages::parse_update_node(&record.body)
+            let (envelope, config) = messages::parse_update_scene_node(&record.body)
                 .map_err(|_| bad("invalid UPDATE_NODE"))?;
-            if record.object_id != config.node_id || config.context_id != root_context_id {
+            if config.clip.is_some()
+                && !negotiated(shared, session_id, messages::FEATURE_NODE_CLIP_RECT_V1)
+            {
+                return Err(ProtocolError {
+                    code: messages::ERROR_UNSUPPORTED_FEATURE,
+                    message: "node clipping was not negotiated",
+                    fatal: false,
+                });
+            }
+            if record.object_id != config.node.node_id || config.node.context_id != root_context_id
+            {
                 return Err(bad("UPDATE_NODE object or context ID mismatch"));
             }
             let transaction_id =
@@ -1002,6 +1027,10 @@ fn dispatch_control(
             writer
                 .write_record(messages::PRESENTED, 0, &messages::ok(envelope.request_id))
                 .map_err(|_| bad("could not acknowledge scene commit"))?;
+            // A newly committed node may make a previously off-screen source visible (or vice
+            // versa). Visibility is otherwise only recomputed on screen-swap/occlusion/scroll, so
+            // without this a source evaluated as hidden before its node existed stays hidden.
+            emit_visibility(shared);
             wake(shared);
         },
         messages::ABORT_TXN => {
@@ -1030,13 +1059,9 @@ fn dispatch_control(
                     fatal: false,
                 });
             }
-            let envelope =
-                messages::decode_control(&record.body).map_err(|_| bad("invalid PLAY"))?;
-            let source_id = envelope
-                .payload
-                .map_value(0)
-                .and_then(|value| value.as_u64())
-                .ok_or_else(|| bad("PLAY has no source ID"))?;
+            let (envelope, play) =
+                messages::parse_play(&record.body).map_err(|_| bad("invalid PLAY"))?;
+            let source_id = play.source_id;
             if source_id != record.object_id {
                 return Err(bad("PLAY object ID mismatch"));
             }
@@ -1050,10 +1075,11 @@ fn dispatch_control(
                     fatal: false,
                 });
             }
-            shared.scene.start_playback((session_id, source_id)).map_err(|message| {
+            shared.scene.start_playback((session_id, source_id), play).map_err(|message| {
                 ProtocolError { code: messages::ERROR_NOT_FOUND, message, fatal: false }
             })?;
             for output in audio_group(shared, (session_id, source_id)) {
+                output.configure_play(play.start_pts_us, play.minimum_buffer_us);
                 output.start();
             }
             writer
@@ -1363,6 +1389,87 @@ fn handle_raster(
     }
 }
 
+const MAX_QUEUED_VIDEO_FRAMES: usize = 32;
+
+struct QueuedVideoFrame {
+    epoch: u32,
+    frame: Option<Frame>,
+    pixels: u64,
+    scene: SharedScene,
+}
+
+impl Drop for QueuedVideoFrame {
+    fn drop(&mut self) {
+        if self.pixels != 0 {
+            self.scene.release_queued_pixels(self.pixels);
+        }
+    }
+}
+
+fn queue_decoded_video_frame(
+    shared: &Arc<ServiceShared>,
+    key: SourceKey,
+    epoch: u32,
+    config: &messages::ParsedVideoSourceConfig,
+    frame_id: &mut u64,
+    decoded: DecodedFrame,
+    pending: &mut VecDeque<QueuedVideoFrame>,
+) -> io::Result<()> {
+    shared.scene.observe_buffered_pts(key, decoded.pts_us).map_err(invalid)?;
+    *frame_id = frame_id.saturating_add(1);
+    let pixels = u64::from(decoded.width)
+        .checked_mul(u64::from(decoded.height))
+        .ok_or_else(|| invalid("decoded frame pixel count overflow"))?;
+    if !shared.scene.reserve_queued_pixels(pixels) {
+        return Err(io::Error::new(
+            ErrorKind::OutOfMemory,
+            "aggregate queued video-frame quota exceeded",
+        ));
+    }
+    pending.push_back(QueuedVideoFrame {
+        epoch,
+        frame: Some(Frame {
+            frame_id: *frame_id,
+            pts_us: decoded.pts_us,
+            width: decoded.width,
+            height: decoded.height,
+            rgba: Arc::from(decoded.rgba),
+            alpha_mode: messages::ALPHA_STRAIGHT,
+            sar_num: config.sar_num,
+            sar_den: config.sar_den,
+        }),
+        pixels,
+        scene: shared.scene.clone(),
+    });
+    Ok(())
+}
+
+fn present_ready_video_frames(
+    shared: &Arc<ServiceShared>,
+    key: SourceKey,
+    pending: &mut VecDeque<QueuedVideoFrame>,
+) -> io::Result<bool> {
+    loop {
+        let Some(queued) = pending.front() else {
+            return Ok(true);
+        };
+        let frame = queued.frame.as_ref().unwrap();
+        match media_time_reached(shared, key, frame.pts_us) {
+            None => return Ok(false),
+            Some(false) => return Ok(true),
+            Some(true) => {},
+        }
+        let mut queued = pending.pop_front().unwrap();
+        let frame = queued.frame.take().unwrap();
+        if shared.scene.is_before_play_start(key, frame.pts_us) {
+            continue;
+        }
+        let pixels = std::mem::take(&mut queued.pixels);
+        shared.scene.publish_queued_frame(key, queued.epoch, frame, pixels).map_err(invalid)?;
+        wake(shared);
+    }
+}
+
 fn handle_video(
     reader: &mut Reader,
     shared: &Arc<ServiceShared>,
@@ -1377,8 +1484,16 @@ fn handle_video(
     let mut current_epoch = None;
     let mut sequence = media::MediaSequence::default();
     let mut frame_id = 0_u64;
+    let mut pending = VecDeque::with_capacity(MAX_QUEUED_VIDEO_FRAMES);
     loop {
-        if !reader.wait_readable(Duration::from_millis(50))? {
+        if !present_ready_video_frames(shared, key, &mut pending)? {
+            return Ok(());
+        }
+        if pending.len() >= MAX_QUEUED_VIDEO_FRAMES {
+            thread::sleep(Duration::from_millis(2));
+            continue;
+        }
+        if !reader.wait_readable(Duration::from_millis(10))? {
             if shared.scene.eos_epoch(key).is_some() {
                 break;
             }
@@ -1448,53 +1563,51 @@ fn handle_video(
             },
         };
         for decoded in decoded_frames {
-            if !wait_for_media_time(shared, key, decoded.pts_us) {
-                return Ok(());
+            while pending.len() >= MAX_QUEUED_VIDEO_FRAMES {
+                if !present_ready_video_frames(shared, key, &mut pending)? {
+                    return Ok(());
+                }
+                if pending.len() >= MAX_QUEUED_VIDEO_FRAMES {
+                    thread::sleep(Duration::from_millis(2));
+                }
             }
-            frame_id = frame_id.saturating_add(1);
-            shared
-                .scene
-                .publish_frame(
-                    key,
-                    epoch,
-                    Frame {
-                        frame_id,
-                        pts_us: decoded.pts_us,
-                        width: decoded.width,
-                        height: decoded.height,
-                        rgba: Arc::from(decoded.rgba),
-                        alpha_mode: messages::ALPHA_STRAIGHT,
-                        sar_num: config.sar_num,
-                        sar_den: config.sar_den,
-                    },
-                )
-                .map_err(invalid)?;
-            wake(shared);
+            queue_decoded_video_frame(
+                shared,
+                key,
+                epoch,
+                &config,
+                &mut frame_id,
+                decoded,
+                &mut pending,
+            )?;
         }
     }
     for decoded in decoder.finish()? {
-        if !wait_for_media_time(shared, key, decoded.pts_us) {
+        while pending.len() >= MAX_QUEUED_VIDEO_FRAMES {
+            if !present_ready_video_frames(shared, key, &mut pending)? {
+                return Ok(());
+            }
+            if pending.len() >= MAX_QUEUED_VIDEO_FRAMES {
+                thread::sleep(Duration::from_millis(2));
+            }
+        }
+        queue_decoded_video_frame(
+            shared,
+            key,
+            current_epoch.unwrap_or(1),
+            &config,
+            &mut frame_id,
+            decoded,
+            &mut pending,
+        )?;
+    }
+    while !pending.is_empty() {
+        if !present_ready_video_frames(shared, key, &mut pending)? {
             break;
         }
-        frame_id = frame_id.saturating_add(1);
-        shared
-            .scene
-            .publish_frame(
-                key,
-                current_epoch.unwrap_or(1),
-                Frame {
-                    frame_id,
-                    pts_us: decoded.pts_us,
-                    width: decoded.width,
-                    height: decoded.height,
-                    rgba: Arc::from(decoded.rgba),
-                    alpha_mode: messages::ALPHA_STRAIGHT,
-                    sar_num: config.sar_num,
-                    sar_den: config.sar_den,
-                },
-            )
-            .map_err(invalid)?;
-        wake(shared);
+        if !pending.is_empty() {
+            thread::sleep(Duration::from_millis(2));
+        }
     }
     Ok(())
 }
@@ -1548,8 +1661,12 @@ fn handle_audio(
             if packet.data.len() > config.max_access_unit_bytes as usize {
                 return Err(invalid("audio packet exceeds its declared bound"));
             }
-            output.observe_audio_pts(packet.pts_us);
-            output.push(&decoder.push(packet)?)?;
+            let mut samples = decoder.push(packet)?;
+            output.trim_before_start(packet.pts_us, packet.duration_us, &mut samples);
+            if !samples.is_empty() {
+                output.observe_audio_pts(packet.pts_us);
+                output.push(&samples)?;
+            }
         }
         output.push(&decoder.finish()?)?;
         Ok(())
@@ -1746,6 +1863,42 @@ fn lock_metrics(shared: &Arc<ServiceShared>) -> std::sync::MutexGuard<'_, Displa
     shared.metrics.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+fn lock_render_state(shared: &Arc<ServiceShared>) -> std::sync::MutexGuard<'_, (bool, usize)> {
+    shared.render_state.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Recompute per-source visibility from the current scene and the last render state reported by the
+/// UI thread, emitting `VISIBILITY` records only for sources whose state changed. Callable from the
+/// control-dispatcher thread so a source evaluated as hidden before its scene node existed becomes
+/// visible once the node is committed; visibility is otherwise only recomputed on
+/// screen-swap/occlusion/scroll.
+fn emit_visibility(shared: &Arc<ServiceShared>) {
+    let (renderable, display_offset) = *lock_render_state(shared);
+    let metrics = *lock_metrics(shared);
+    let states = shared.scene.aggregate_visibility(
+        metrics.columns,
+        metrics.rows,
+        display_offset,
+        renderable,
+    );
+    let mut registry = lock_registry(shared);
+    for ((session_id, source_id), visible, reasons) in states {
+        let Some(session) = registry.sessions.get_mut(&session_id) else { continue };
+        if !session.accepted_features.contains(&messages::FEATURE_VISIBILITY_EVENTS_V1) {
+            continue;
+        }
+        if session.last_visibility.insert(source_id, visible) == Some(visible) {
+            continue;
+        }
+        let Some(writer) = session.writer.upgrade() else { continue };
+        let _ = writer.write_record(
+            messages::VISIBILITY,
+            source_id,
+            &messages::visibility(source_id, visible, reasons, metrics.generation),
+        );
+    }
+}
+
 fn wake(shared: &ServiceShared) {
     (shared.wake)();
 }
@@ -1894,6 +2047,120 @@ mod tests {
         (client, server)
     }
 
+    fn linked_av_shared() -> (Arc<ServiceShared>, Arc<AudioOutput>) {
+        let scene = SharedScene::default();
+        scene
+            .add_source(
+                1,
+                10,
+                SourceConfig::Video(messages::ParsedVideoSourceConfig {
+                    source_id: 10,
+                    codec: "h264".into(),
+                    packetization: "h264-annexb-au-v1".into(),
+                    extradata: Vec::new(),
+                    width: 1,
+                    height: 1,
+                    profile: 0,
+                    level: 0,
+                    bitrate: 0,
+                    color_primaries: 1,
+                    transfer: 1,
+                    matrix: 1,
+                    range: 1,
+                    sar_num: 1,
+                    sar_den: 1,
+                    max_access_unit_bytes: 1024,
+                }),
+            )
+            .unwrap();
+        scene
+            .add_source(
+                1,
+                11,
+                SourceConfig::Audio(messages::ParsedAudioSourceConfig {
+                    source_id: 11,
+                    linked_video_source_id: Some(10),
+                    codec: "pcm_s16le".into(),
+                    packetization: "pcm-packet-v1".into(),
+                    extradata: Vec::new(),
+                    sample_rate: 48_000,
+                    channels: 2,
+                    channel_mask: 3,
+                    bitrate: 1_536_000,
+                    max_access_unit_bytes: 4096,
+                }),
+            )
+            .unwrap();
+        scene.start_playback((1, 10), messages::PlayRequest::baseline(10, 0)).unwrap();
+        let output = AudioOutput::test_output();
+        output.configure_play(0, 100_000);
+        output.start();
+        let shared = Arc::new(ServiceShared {
+            token: [0; 32],
+            scene,
+            registry: Mutex::new(Registry::default()),
+            metrics: Mutex::new(DisplayMetrics {
+                viewport_width: 1,
+                viewport_height: 1,
+                columns: 1,
+                rows: 1,
+                cell_width: 1,
+                cell_height: 1,
+                generation: 1,
+            }),
+            active_connections: AtomicUsize::new(0),
+            audio_outputs: Mutex::new(HashMap::from([((1, 11), output.clone())])),
+            render_state: Mutex::new((true, 0)),
+            wake: Arc::new(|| {}),
+        });
+        (shared, output)
+    }
+
+    fn one_pending_frame(scene: &SharedScene) -> VecDeque<QueuedVideoFrame> {
+        assert!(scene.reserve_queued_pixels(1));
+        VecDeque::from([QueuedVideoFrame {
+            epoch: 0,
+            frame: Some(Frame {
+                frame_id: 1,
+                pts_us: 0,
+                width: 1,
+                height: 1,
+                rgba: Arc::from([0, 0, 0, 255]),
+                alpha_mode: messages::ALPHA_STRAIGHT,
+                sar_num: 1,
+                sar_den: 1,
+            }),
+            pixels: 1,
+            scene: scene.clone(),
+        }])
+    }
+
+    #[test]
+    fn linked_video_falls_back_after_empty_audio_stall_and_rejoins_audio_clock() {
+        let (shared, output) = linked_av_shared();
+        let mut pending = one_pending_frame(&shared.scene);
+        assert!(present_ready_video_frames(&shared, (1, 10), &mut pending).unwrap());
+        assert_eq!(pending.len(), 1);
+
+        output.force_video_gate_stall_for_test();
+        assert!(present_ready_video_frames(&shared, (1, 10), &mut pending).unwrap());
+        assert!(pending.is_empty());
+
+        let mut pending = one_pending_frame(&shared.scene);
+        output.push(&[0.0, 0.0]).unwrap();
+        assert!(present_ready_video_frames(&shared, (1, 10), &mut pending).unwrap());
+        assert_eq!(pending.len(), 1);
+
+        shared.scene.remove_source((1, 11)).unwrap();
+        shared
+            .audio_outputs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&(1, 11));
+        assert!(present_ready_video_frames(&shared, (1, 10), &mut pending).unwrap());
+        assert!(pending.is_empty());
+    }
+
     #[test]
     fn capability_tokens_are_hex_and_compared_without_early_exit() {
         let token = [0xab; 32];
@@ -2031,8 +2298,8 @@ mod tests {
         let key = anchor::derive_key(&token, &tag);
         let marker = anchor::encode_marker(&key, &tag, 77).unwrap();
         let marker = &marker[2..marker.len() - 2];
-        service.handle_terminal_marker(marker, 1, 2);
-        service.handle_terminal_marker(marker, 9, 9);
+        service.handle_terminal_marker(marker, 1, 2, false);
+        service.handle_terminal_marker(marker, 9, 9, false);
         assert_eq!(
             lock_registry(&service.shared)
                 .sessions
@@ -2122,6 +2389,90 @@ mod tests {
             assert!(std::time::Instant::now() < deadline, "raster frame was not delivered");
             thread::sleep(Duration::from_millis(5));
         }
+
+        control.write_record(messages::GOODBYE, 0, 0, &messages::goodbye(6)).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn conpty_anchor_arrival_recomputes_visibility_after_early_node_commit() {
+        let service = VividService::start_with_wake(
+            DisplayMetrics {
+                viewport_width: 800,
+                viewport_height: 600,
+                columns: 80,
+                rows: 30,
+                cell_width: 10,
+                cell_height: 20,
+                generation: 1,
+            },
+            Arc::new(|| {}),
+        )
+        .unwrap();
+        let endpoint = Endpoint::parse(service.endpoint()).unwrap();
+        let mut control = Connection::open(&endpoint, ConnectionKind::Control).unwrap();
+        control.write_record(messages::HELLO, 0, 0, &messages::hello(1, service.token())).unwrap();
+        let welcome = parse_welcome(&control.read_record().unwrap().body).unwrap();
+
+        let token: [u8; 32] = *anchor::decode_token(service.token()).unwrap();
+        let tag: [u8; 16] = welcome.session_tag.as_slice().try_into().unwrap();
+        let key = anchor::derive_key(&token, &tag);
+        let marker = anchor::encode_marker(&key, &tag, 77).unwrap();
+        let marker = &marker[2..marker.len() - 2];
+
+        control
+            .write_record(messages::CREATE_RASTER, 0, 1, &messages::create_raster(2, 1, 2, 1))
+            .unwrap();
+        assert_eq!(control.read_record().unwrap().record_type, messages::SOURCE_READY);
+        control
+            .write_record(messages::BEGIN_TXN, 0, 0, &messages::begin_transaction(3, 3))
+            .unwrap();
+        assert_eq!(control.read_record().unwrap().record_type, messages::OK);
+        control
+            .write_record(
+                messages::CREATE_NODE,
+                0,
+                2,
+                &messages::create_node(
+                    4,
+                    3,
+                    NodeConfig {
+                        node_id: 2,
+                        source_id: 1,
+                        context_id: welcome.root_context_id,
+                        columns: 2,
+                        rows: 1,
+                        anchor_id: Some(77),
+                    },
+                ),
+            )
+            .unwrap();
+        assert_eq!(control.read_record().unwrap().record_type, messages::OK);
+        control
+            .write_record(
+                messages::COMMIT_TXN,
+                0,
+                0,
+                &messages::commit_transaction(5, 3, welcome.display_generation),
+            )
+            .unwrap();
+        assert_eq!(control.read_record().unwrap().record_type, messages::PRESENTED);
+
+        let hidden = control.read_record().unwrap();
+        assert_eq!((hidden.record_type, hidden.object_id), (messages::VISIBILITY, 1));
+        assert!(!messages::parse_visibility(&hidden.body).unwrap().visible);
+
+        // ConPTY can deliver the control-channel commit before the earlier alternate-screen swap,
+        // full-screen clear, and marker reach the UI. The clear must preserve the hidden pending
+        // node, and accepting its marker must make the source visible without an unrelated event.
+        service.handle_screen_swap(true);
+        service.update_visibility(true, 0);
+        service.handle_terminal_clear();
+        service.handle_terminal_marker(marker, 1, 2, true);
+        assert_eq!(control.read_record().unwrap().record_type, messages::ANCHOR_READY);
+        let visible = control.read_record().unwrap();
+        assert_eq!((visible.record_type, visible.object_id), (messages::VISIBILITY, 1));
+        assert!(messages::parse_visibility(&visible.body).unwrap().visible);
 
         control.write_record(messages::GOODBYE, 0, 0, &messages::goodbye(6)).unwrap();
     }

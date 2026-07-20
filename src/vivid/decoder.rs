@@ -12,9 +12,10 @@ const AV_INPUT_BUFFER_PADDING_SIZE: usize = 64;
 const AV_PKT_FLAG_KEY: c_int = 1;
 const AVERROR_EOF: c_int = -541_478_725;
 const SWS_BILINEAR: c_int = 2;
+const PACKET_TIME_BASE: AVRational = AVRational { num: 1, den: 1_000_000 };
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct AVRational {
     num: c_int,
     den: c_int,
@@ -161,6 +162,9 @@ impl Decoder {
             check_ffmpeg("could not configure decoder", unsafe {
                 avcodec_parameters_to_context(context, parameters)
             })?;
+            check_ffmpeg("could not set decoder packet time base", unsafe {
+                av_opt_set_q(context, c"pkt_timebase".as_ptr(), PACKET_TIME_BASE, 0)
+            })?;
             check_ffmpeg("could not open decoder", unsafe {
                 avcodec_open2(context, codec, ptr::null_mut())
             })?;
@@ -239,7 +243,7 @@ impl Decoder {
         } else {
             0
         };
-        av_packet.time_base = AVRational { num: 1, den: 1_000_000 };
+        av_packet.time_base = PACKET_TIME_BASE;
 
         let send_result = unsafe { avcodec_send_packet(self.context, self.packet) };
         unsafe { av_packet_unref(self.packet) };
@@ -350,6 +354,15 @@ impl Decoder {
         }
         Ok(DecodedFrame { pts_us: frame.pts, width, height, rgba })
     }
+
+    #[cfg(test)]
+    fn packet_time_base(&self) -> io::Result<AVRational> {
+        let mut time_base = AVRational { num: 0, den: 0 };
+        check_ffmpeg("could not read decoder packet time base", unsafe {
+            av_opt_get_q(self.context, c"pkt_timebase".as_ptr(), 0, &mut time_base)
+        })?;
+        Ok(time_base)
+    }
 }
 
 impl Drop for Decoder {
@@ -418,6 +431,19 @@ unsafe extern "C" {
     fn av_frame_free(frame: *mut *mut c_void);
     fn av_frame_unref(frame: *mut c_void);
     fn av_mallocz(size: usize) -> *mut c_void;
+    fn av_opt_set_q(
+        object: *mut c_void,
+        name: *const c_char,
+        value: AVRational,
+        flags: c_int,
+    ) -> c_int;
+    #[cfg(test)]
+    fn av_opt_get_q(
+        object: *mut c_void,
+        name: *const c_char,
+        flags: c_int,
+        output: *mut AVRational,
+    ) -> c_int;
     fn av_get_pix_fmt(name: *const c_char) -> c_int;
     fn av_strerror(error: c_int, buffer: *mut c_char, buffer_size: usize) -> c_int;
     fn sws_getContext(
@@ -453,4 +479,34 @@ unsafe extern "C" {
         saturation: c_int,
     ) -> c_int;
     fn sws_freeContext(context: *mut c_void);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decoder_context_uses_protocol_packet_time_base() {
+        let decoder = Decoder::new(&ParsedVideoSourceConfig {
+            source_id: 1,
+            codec: "h264".into(),
+            packetization: "h264-annexb-au-v1".into(),
+            extradata: Vec::new(),
+            width: 16,
+            height: 16,
+            profile: 0,
+            level: 0,
+            bitrate: 0,
+            color_primaries: 1,
+            transfer: 1,
+            matrix: 1,
+            range: 1,
+            sar_num: 1,
+            sar_den: 1,
+            max_access_unit_bytes: 1024,
+        })
+        .unwrap();
+
+        assert_eq!(decoder.packet_time_base().unwrap(), PACKET_TIME_BASE);
+    }
 }

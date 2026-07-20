@@ -1,6 +1,6 @@
 [package]
 name = "vivido"
-version = "0.1.1"
+version = "0.1.2"
 authors = ["Wensheng Wang <wenshengwang@gmail.com>"]
 license = "Apache-2.0"
 description = "A fast cross-platform terminal emulator with protocol-neutral media hooks"
@@ -52,7 +52,7 @@ serde = { version = "1", features = ["derive", "rc"] }
 serde_yaml = "0.9.25"
 sha2 = "0.11"
 signal-hook = { version = "0.4.3", default-features = false }
-syn = { version = "2.0.16", default-features = false, features = [
+syn = { version = "3.0", default-features = false, features = [
   "derive",
   "parsing",
   "proc-macro",
@@ -63,8 +63,12 @@ toml = "1.1"
 toml_edit = "0.25"
 unicode-width = "0.2.0"
 unicode-script = "0.5"
-vivid_protocol = { version = "1.2.0", path = "../vivid_protocol" }
-vte = { version = "0.15.0", default-features = false, features = ["std", "ansi", "serde"] }
+vivid_protocol = { version = "1.2.1", path = "../vivid_protocol" }
+vte = { version = "0.15.0", default-features = false, features = [
+  "std",
+  "ansi",
+  "serde",
+] }
 vello = { version = "0.9.0", default-features = false, features = ["wgpu"] }
 winit = { version = "0.30.9", default-features = false, features = [
   "rwh_06",
@@ -81,7 +85,7 @@ clap_complete = "4.2.3"
 xdg = "3.0.0"
 
 [target.'cfg(any(target_os = "macos", target_os = "linux", windows))'.dependencies]
-cpal = "0.17"
+cpal = "0.18"
 ringbuf = "0.5"
 
 [target.'cfg(unix)'.dependencies]

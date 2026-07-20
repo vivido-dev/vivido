@@ -55,14 +55,17 @@ pub enum Event {
     /// Protocol-neutral image, animation, or video operation.
     Graphics(GraphicsCommand),
 
-    /// Authenticated Vivid APC marker observed at a terminal text position.
-    VividMarker { marker: String, line: i32, column: usize },
+    /// Authenticated Vivid marker observed at a terminal text position.
+    VividMarker { marker: String, line: i32, column: usize, alternate: bool },
 
     /// Text-model rows moved within a terminal scroll region. Positive values move text upward.
     VividGridScroll { origin: i32, end: i32, lines: i32, history_size: usize },
 
     /// The live terminal viewport was cleared.
     VividClear,
+
+    /// The terminal switched between the primary and alternate screens.
+    VividScreenSwap { alternate: bool },
 
     /// Shutdown request.
     Exit,
@@ -86,13 +89,16 @@ impl Debug for Event {
             Event::Wakeup => write!(f, "Wakeup"),
             Event::Bell => write!(f, "Bell"),
             Event::Graphics(command) => write!(f, "Graphics({command:?})"),
-            Event::VividMarker { marker, line, column } => {
-                write!(f, "VividMarker({marker:?}, {line}, {column})")
+            Event::VividMarker { marker, line, column, alternate } => {
+                write!(f, "VividMarker({marker:?}, {line}, {column}, alternate={alternate})")
             },
             Event::VividGridScroll { origin, end, lines, history_size } => {
                 write!(f, "VividGridScroll({origin}..{end}, {lines}, history={history_size})")
             },
             Event::VividClear => write!(f, "VividClear"),
+            Event::VividScreenSwap { alternate } => {
+                write!(f, "VividScreenSwap(alternate={alternate})")
+            },
             Event::Exit => write!(f, "Exit"),
             Event::ChildExit(status) => write!(f, "ChildExit({status:?})"),
         }

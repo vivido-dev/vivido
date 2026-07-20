@@ -247,15 +247,22 @@ impl VividMediaRenderer {
         }
         self.ensure_target(device, renderer, size.width() as u32, size.height() as u32);
 
-        let active = items.iter().map(|item| item.source_key).collect::<HashSet<_>>();
+        let rendered = items
+            .iter()
+            .filter_map(|item| {
+                vertices(item, size, display_offset).map(|vertices| (item, vertices))
+            })
+            .collect::<Vec<_>>();
+        let active = rendered.iter().map(|(item, _)| item.source_key).collect::<HashSet<_>>();
         self.sources.retain(|key, _| active.contains(key));
-        for item in &items {
+        for (item, _) in &rendered {
             self.upload_source(device, queue, item.source_key, item);
         }
 
-        let vertices =
-            items.iter().flat_map(|item| vertices(item, size, display_offset)).collect::<Vec<_>>();
-        queue.write_buffer(&self.vertex_buffer, 0, bytemuck::cast_slice(&vertices));
+        let vertex_data = rendered.iter().flat_map(|(_, vertices)| *vertices).collect::<Vec<_>>();
+        if !vertex_data.is_empty() {
+            queue.write_buffer(&self.vertex_buffer, 0, bytemuck::cast_slice(&vertex_data));
+        }
 
         let target = self.target.as_ref().expect("media target initialized");
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -280,7 +287,7 @@ impl VividMediaRenderer {
             });
             pass.set_pipeline(&self.pipeline);
             pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-            for (index, item) in items.iter().enumerate() {
+            for (index, (item, _)) in rendered.iter().enumerate() {
                 if let Some(source) = self.sources.get(&item.source_key) {
                     pass.set_bind_group(0, &source.bind_group, &[]);
                     let start = (index * 6) as u32;
@@ -417,7 +424,7 @@ impl VividMediaRenderer {
     }
 }
 
-fn vertices(item: &RenderItem, size: &SizeInfo, display_offset: usize) -> [Vertex; 6] {
+fn vertices(item: &RenderItem, size: &SizeInfo, display_offset: usize) -> Option<[Vertex; 6]> {
     let x = size.padding_x() + fixed_to_f32(item.x) * size.cell_width();
     let scroll = if item.text_anchored { display_offset as f32 } else { 0.0 };
     let y = size.padding_y() + (fixed_to_f32(item.y) + scroll) * size.cell_height();
@@ -429,20 +436,49 @@ fn vertices(item: &RenderItem, size: &SizeInfo, display_offset: usize) -> [Verte
         (output_width / display_width).min(output_height / item.frame.height as f32).max(0.0);
     let width = display_width * scale;
     let height = item.frame.height as f32 * scale;
-    let x = x + (output_width - width) * 0.5;
-    let y = y + (output_height - height) * 0.5;
-    let left = x / size.width() * 2.0 - 1.0;
-    let right = (x + width) / size.width() * 2.0 - 1.0;
-    let top = 1.0 - y / size.height() * 2.0;
-    let bottom = 1.0 - (y + height) / size.height() * 2.0;
-    [
-        Vertex { position: [left, top], tex_coord: [0.0, 0.0] },
-        Vertex { position: [left, bottom], tex_coord: [0.0, 1.0] },
-        Vertex { position: [right, top], tex_coord: [1.0, 0.0] },
-        Vertex { position: [right, top], tex_coord: [1.0, 0.0] },
-        Vertex { position: [left, bottom], tex_coord: [0.0, 1.0] },
-        Vertex { position: [right, bottom], tex_coord: [1.0, 1.0] },
-    ]
+    let quad_left = x + (output_width - width) * 0.5;
+    let quad_top = y + (output_height - height) * 0.5;
+    let quad_right = quad_left + width;
+    let quad_bottom = quad_top + height;
+    if width <= 0.0 || height <= 0.0 {
+        return None;
+    }
+
+    let (clip_left, clip_top, clip_right, clip_bottom) =
+        item.clip.map_or((0.0, 0.0, size.width(), size.height()), |clip| {
+            let left = size.padding_x() + fixed_to_f32(clip.x) * size.cell_width();
+            let top = size.padding_y() + (fixed_to_f32(clip.y) + scroll) * size.cell_height();
+            (
+                left.max(0.0),
+                top.max(0.0),
+                (left + fixed_to_f32(clip.width) * size.cell_width()).min(size.width()),
+                (top + fixed_to_f32(clip.height) * size.cell_height()).min(size.height()),
+            )
+        });
+    let pixel_left = quad_left.max(clip_left).max(0.0);
+    let pixel_top = quad_top.max(clip_top).max(0.0);
+    let pixel_right = quad_right.min(clip_right).min(size.width());
+    let pixel_bottom = quad_bottom.min(clip_bottom).min(size.height());
+    if pixel_left >= pixel_right || pixel_top >= pixel_bottom {
+        return None;
+    }
+
+    let u0 = (pixel_left - quad_left) / width;
+    let v0 = (pixel_top - quad_top) / height;
+    let u1 = (pixel_right - quad_left) / width;
+    let v1 = (pixel_bottom - quad_top) / height;
+    let left = pixel_left / size.width() * 2.0 - 1.0;
+    let right = pixel_right / size.width() * 2.0 - 1.0;
+    let top = 1.0 - pixel_top / size.height() * 2.0;
+    let bottom = 1.0 - pixel_bottom / size.height() * 2.0;
+    Some([
+        Vertex { position: [left, top], tex_coord: [u0, v0] },
+        Vertex { position: [left, bottom], tex_coord: [u0, v1] },
+        Vertex { position: [right, top], tex_coord: [u1, v0] },
+        Vertex { position: [right, top], tex_coord: [u1, v0] },
+        Vertex { position: [left, bottom], tex_coord: [u0, v1] },
+        Vertex { position: [right, bottom], tex_coord: [u1, v1] },
+    ])
 }
 
 fn fixed_to_f32(value: i64) -> f32 {
@@ -461,12 +497,14 @@ mod tests {
     #[cfg(unix)]
     use vello::{AaConfig, RenderParams, Renderer, RendererOptions, Scene, wgpu};
     #[cfg(unix)]
-    use vivid_protocol::messages::RasterSourceConfig;
+    use vivid_protocol::messages::{ClipRect, RasterSourceConfig};
 
     #[cfg(unix)]
     use crate::display::SizeInfo;
     #[cfg(unix)]
-    use crate::vivid::scene::{Frame, SceneMutation, SceneNode, SharedScene, SourceConfig};
+    use crate::vivid::scene::{
+        Frame, RenderItem, SceneMutation, SceneNode, SharedScene, SourceConfig,
+    };
 
     #[cfg(unix)]
     use super::VividMediaRenderer;
@@ -476,6 +514,50 @@ mod tests {
     fn fixed_point_cell_coordinates_are_fractional() {
         assert_eq!(fixed_to_f32(2_i64 << 32), 2.0);
         assert_eq!(fixed_to_f32(1_i64 << 31), 0.5);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn node_clip_crops_geometry_and_uv_without_refitting() {
+        let item = RenderItem {
+            source_key: (1, 1),
+            node_id: 1,
+            frame: Frame {
+                frame_id: 1,
+                pts_us: 0,
+                width: 4,
+                height: 2,
+                rgba: Arc::from(vec![255; 4 * 2 * 4]),
+                alpha_mode: vivid_protocol::messages::ALPHA_STRAIGHT,
+                sar_num: 1,
+                sar_den: 1,
+            },
+            x: 0,
+            y: 0,
+            width: 4_i64 << 32,
+            height: 2_i64 << 32,
+            text_layer: 1,
+            z_index: 0,
+            text_anchored: false,
+            clip: Some(ClipRect { x: 1_i64 << 32, y: 0, width: 2_i64 << 32, height: 2_i64 << 32 }),
+        };
+        let size = SizeInfo::new(4.0, 2.0, 1.0, 1.0, 0.0, 0.0, false);
+        let clipped = super::vertices(&item, &size, 0).unwrap();
+        assert_eq!(clipped[0].position, [-0.5, 1.0]);
+        assert_eq!(clipped[5].position, [0.5, -1.0]);
+        assert_eq!(clipped[0].tex_coord, [0.25, 0.0]);
+        assert_eq!(clipped[5].tex_coord, [0.75, 1.0]);
+
+        let hidden = RenderItem {
+            clip: Some(ClipRect {
+                x: -(2_i64 << 32),
+                y: 0,
+                width: 1_i64 << 32,
+                height: 1_i64 << 32,
+            }),
+            ..item
+        };
+        assert!(super::vertices(&hidden, &size, 0).is_none());
     }
 
     #[cfg(unix)]
@@ -546,6 +628,7 @@ mod tests {
                             z_index: node_id as i64,
                             visible: true,
                             anchor_id: Some(1),
+                            clip: None,
                         })
                     })
                     .collect(),
@@ -644,6 +727,7 @@ mod tests {
                     z_index: 0,
                     visible: true,
                     anchor_id: Some(1),
+                    clip: None,
                 })],
             )
             .unwrap();
