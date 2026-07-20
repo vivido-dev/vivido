@@ -415,10 +415,14 @@ impl DerefMut for ParsedOptions {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     use std::fs::File;
+    #[cfg(unix)]
     use std::io::{Read, Write};
 
+    #[cfg(unix)]
     use clap::CommandFactory;
+    #[cfg(unix)]
     use clap_complete::Shell;
     use toml::Table;
 
@@ -499,6 +503,10 @@ mod tests {
         assert!(class.is_err());
     }
 
+    // The checked-in completion files describe the Unix-only socket and `msg`
+    // surface, so generating them from the reduced Windows CLI is not a valid
+    // snapshot comparison.
+    #[cfg(unix)]
     #[test]
     fn completions() {
         let mut clap = Options::command();

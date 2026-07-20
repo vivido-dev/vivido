@@ -676,7 +676,10 @@ impl<T> Term<T> {
     }
 
     /// Swap primary and alternate screen buffer.
-    pub fn swap_alt(&mut self) {
+    pub fn swap_alt(&mut self)
+    where
+        T: EventListener,
+    {
         if !self.mode.contains(TermMode::ALT_SCREEN) {
             // Set alt screen cursor to the current primary screen cursor.
             self.inactive_grid.cursor = self.grid.cursor.clone();
@@ -696,6 +699,9 @@ impl<T> Term<T> {
         mem::swap(&mut self.grid, &mut self.inactive_grid);
         self.mode ^= TermMode::ALT_SCREEN;
         self.selection = None;
+        self.event_proxy.send_event(Event::VividScreenSwap {
+            alternate: self.mode.contains(TermMode::ALT_SCREEN),
+        });
         self.mark_fully_damaged();
     }
 
@@ -796,6 +802,7 @@ impl<T> Term<T> {
             marker,
             line: point.line.0,
             column: point.column.0,
+            alternate: self.mode.contains(TermMode::ALT_SCREEN),
         });
     }
 
@@ -2439,12 +2446,40 @@ mod tests {
     struct VividClearListener(Arc<AtomicUsize>);
 
     #[cfg(windows)]
+    #[derive(Clone, Default)]
+    struct VividMarkerListener(Arc<std::sync::Mutex<Vec<bool>>>);
+
+    #[cfg(windows)]
     impl EventListener for VividClearListener {
         fn send_event(&self, event: Event) {
             if matches!(event, Event::VividClear) {
                 self.0.fetch_add(1, Ordering::Relaxed);
             }
         }
+    }
+
+    #[cfg(windows)]
+    impl EventListener for VividMarkerListener {
+        fn send_event(&self, event: Event) {
+            if let Event::VividMarker { alternate, .. } = event {
+                self.0.lock().unwrap().push(alternate);
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn conpty_marker_reports_its_terminal_screen() {
+        let size = TermSize::new(25, 80);
+        let listener = VividMarkerListener::default();
+        let marker_screens = listener.0.clone();
+        let mut term = Term::new(Config::default(), &size, listener);
+        let mut parser: ansi::Processor = ansi::Processor::new();
+
+        parser.advance(&mut term, b"\x1b[?1049h");
+        term.vivid_marker("test-marker".into());
+
+        assert_eq!(*marker_screens.lock().unwrap(), vec![true]);
     }
 
     #[cfg(windows)]
@@ -3140,7 +3175,7 @@ mod tests {
 
     #[test]
     fn parse_cargo_version() {
-        assert_eq!(version_number(env!("CARGO_PKG_VERSION")), 1_01);
+        assert_eq!(version_number(env!("CARGO_PKG_VERSION")), 1_02);
         assert_eq!(version_number("0.0.1-dev"), 1);
         assert_eq!(version_number("0.1.2-dev"), 1_02);
         assert_eq!(version_number("1.2.3-dev"), 1_02_03);

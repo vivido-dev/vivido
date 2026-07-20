@@ -1524,8 +1524,10 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                         self.ctx.display.submit_graphics(command);
                         self.ctx.mark_dirty();
                     },
-                    TerminalEvent::VividMarker { marker, line, column } => {
-                        self.ctx.vivid_service.handle_terminal_marker(&marker, line, column);
+                    TerminalEvent::VividMarker { marker, line, column, alternate } => {
+                        self.ctx
+                            .vivid_service
+                            .handle_terminal_marker(&marker, line, column, alternate);
                         self.ctx.mark_dirty();
                     },
                     TerminalEvent::VividGridScroll { origin, end, lines, history_size } => {
@@ -1534,6 +1536,14 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                     },
                     TerminalEvent::VividClear => {
                         self.ctx.vivid_service.handle_terminal_clear();
+                        self.ctx.mark_dirty();
+                    },
+                    TerminalEvent::VividScreenSwap { alternate } => {
+                        self.ctx.vivid_service.handle_screen_swap(alternate);
+                        self.ctx.vivid_service.update_visibility(
+                            !*self.ctx.occluded,
+                            self.ctx.terminal.grid().display_offset(),
+                        );
                         self.ctx.mark_dirty();
                     },
                     TerminalEvent::ClipboardStore(clipboard_type, content) => {

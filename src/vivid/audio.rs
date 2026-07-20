@@ -4,7 +4,7 @@ use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, I24, SampleFormat, SizedSample, Stream, StreamConfig, U24};
@@ -17,9 +17,11 @@ const AVMEDIA_TYPE_AUDIO: c_int = 1;
 const AV_INPUT_BUFFER_PADDING_SIZE: usize = 64;
 const AV_SAMPLE_FMT_FLT: c_int = 3;
 const AVERROR_EOF: c_int = -541_478_725;
+const PACKET_TIME_BASE: AVRational = AVRational { num: 1, den: 1_000_000 };
 const RING_BUFFER_SECONDS: usize = 2;
 const PREBUFFER_MILLISECONDS: u64 = 100;
 const POLL_INTERVAL: Duration = Duration::from_millis(2);
+const LINKED_AUDIO_STALL_FALLBACK: Duration = Duration::from_secs(2);
 const UNSET_PTS: i64 = i64::MIN;
 
 pub fn supports(config: &ParsedAudioSourceConfig) -> bool {
@@ -27,6 +29,7 @@ pub fn supports(config: &ParsedAudioSourceConfig) -> bool {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct AVRational {
     num: c_int,
     den: c_int,
@@ -100,6 +103,7 @@ struct AVChannelLayout {
 struct Shared {
     enabled: AtomicBool,
     prebuffered: AtomicBool,
+    received_samples: AtomicBool,
     stopped: AtomicBool,
     decode_done: AtomicBool,
     eos_observed: AtomicBool,
@@ -110,7 +114,9 @@ struct Shared {
     timeline_origin_us: AtomicI64,
     first_audio_pts_us: AtomicI64,
     leading_silence_samples: AtomicU64,
-    prebuffer_samples: u64,
+    prebuffer_samples: AtomicU64,
+    requested_start_pts_us: AtomicI64,
+    play_configured_at: Mutex<Option<Instant>>,
     error: Mutex<Option<String>>,
 }
 
@@ -130,7 +136,7 @@ impl Shared {
 pub struct AudioOutput {
     shared: Arc<Shared>,
     producer: Mutex<HeapProd<f32>>,
-    _stream: Stream,
+    _stream: Option<Stream>,
     sample_rate: u32,
     channels: u16,
 }
@@ -149,6 +155,7 @@ impl AudioOutput {
         let shared = Arc::new(Shared {
             enabled: AtomicBool::new(false),
             prebuffered: AtomicBool::new(false),
+            received_samples: AtomicBool::new(false),
             stopped: AtomicBool::new(false),
             decode_done: AtomicBool::new(false),
             eos_observed: AtomicBool::new(false),
@@ -159,10 +166,14 @@ impl AudioOutput {
             timeline_origin_us: AtomicI64::new(UNSET_PTS),
             first_audio_pts_us: AtomicI64::new(UNSET_PTS),
             leading_silence_samples: AtomicU64::new(0),
-            prebuffer_samples: u64::from(config.sample_rate)
-                .saturating_mul(u64::from(config.channels))
-                .saturating_mul(PREBUFFER_MILLISECONDS)
-                / 1_000,
+            prebuffer_samples: AtomicU64::new(
+                u64::from(config.sample_rate)
+                    .saturating_mul(u64::from(config.channels))
+                    .saturating_mul(PREBUFFER_MILLISECONDS)
+                    / 1_000,
+            ),
+            requested_start_pts_us: AtomicI64::new(UNSET_PTS),
+            play_configured_at: Mutex::new(None),
             error: Mutex::new(None),
         });
         let ring = HeapRb::<f32>::new(
@@ -193,10 +204,47 @@ impl AudioOutput {
         Ok(Arc::new(Self {
             shared,
             producer: Mutex::new(producer),
-            _stream: stream,
+            _stream: Some(stream),
             sample_rate: config.sample_rate,
             channels: config.channels,
         }))
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_output() -> Arc<Self> {
+        let shared = Arc::new(Shared {
+            enabled: AtomicBool::new(false),
+            prebuffered: AtomicBool::new(false),
+            received_samples: AtomicBool::new(false),
+            stopped: AtomicBool::new(false),
+            decode_done: AtomicBool::new(false),
+            eos_observed: AtomicBool::new(false),
+            queued_samples: AtomicU64::new(0),
+            played_samples: AtomicU64::new(0),
+            discard_samples: AtomicU64::new(0),
+            rendered_samples: AtomicU64::new(0),
+            timeline_origin_us: AtomicI64::new(UNSET_PTS),
+            first_audio_pts_us: AtomicI64::new(UNSET_PTS),
+            leading_silence_samples: AtomicU64::new(0),
+            prebuffer_samples: AtomicU64::new(0),
+            requested_start_pts_us: AtomicI64::new(UNSET_PTS),
+            play_configured_at: Mutex::new(None),
+            error: Mutex::new(None),
+        });
+        let (producer, _consumer) = HeapRb::<f32>::new(32).split();
+        Arc::new(Self {
+            shared,
+            producer: Mutex::new(producer),
+            _stream: None,
+            sample_rate: 48_000,
+            channels: 2,
+        })
+    }
+
+    #[cfg(test)]
+    pub(super) fn force_video_gate_stall_for_test(&self) {
+        *self.shared.play_configured_at.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some(Instant::now() - LINKED_AUDIO_STALL_FALLBACK - Duration::from_millis(1));
     }
 
     pub fn decoder(&self, config: &ParsedAudioSourceConfig) -> io::Result<AudioDecoder> {
@@ -205,6 +253,21 @@ impl AudioOutput {
 
     pub fn start(&self) {
         self.shared.enabled.store(true, Ordering::SeqCst);
+    }
+
+    pub fn configure_play(&self, start_pts_us: i64, minimum_buffer_us: u64) {
+        self.shared.requested_start_pts_us.store(start_pts_us, Ordering::SeqCst);
+        self.shared.timeline_origin_us.store(start_pts_us, Ordering::SeqCst);
+        self.shared.prebuffer_samples.store(
+            u64::from(self.sample_rate)
+                .saturating_mul(u64::from(self.channels))
+                .saturating_mul(minimum_buffer_us)
+                / 1_000_000,
+            Ordering::SeqCst,
+        );
+        self.shared.prebuffered.store(false, Ordering::SeqCst);
+        *self.shared.play_configured_at.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some(Instant::now());
     }
 
     pub fn pause(&self) {
@@ -220,16 +283,23 @@ impl AudioOutput {
             .saturating_sub(self.shared.played_samples.load(Ordering::SeqCst));
         self.shared.discard_samples.store(outstanding, Ordering::SeqCst);
         self.shared.prebuffered.store(false, Ordering::SeqCst);
+        self.shared.received_samples.store(false, Ordering::SeqCst);
         self.shared.decode_done.store(false, Ordering::SeqCst);
         self.shared.eos_observed.store(false, Ordering::SeqCst);
         self.shared.rendered_samples.store(0, Ordering::SeqCst);
         self.shared.timeline_origin_us.store(UNSET_PTS, Ordering::SeqCst);
+        self.shared.requested_start_pts_us.store(UNSET_PTS, Ordering::SeqCst);
         self.shared.first_audio_pts_us.store(UNSET_PTS, Ordering::SeqCst);
         self.shared.leading_silence_samples.store(0, Ordering::SeqCst);
+        *self.shared.play_configured_at.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            None;
     }
 
     fn observe_timeline_pts(&self, pts_us: i64) {
         if pts_us == UNSET_PTS {
+            return;
+        }
+        if self.shared.requested_start_pts_us.load(Ordering::SeqCst) != UNSET_PTS {
             return;
         }
         let mut current = self.shared.timeline_origin_us.load(Ordering::SeqCst);
@@ -268,38 +338,58 @@ impl AudioOutput {
         self.observe_timeline_pts(pts_us);
     }
 
-    pub fn wait_until_pts(&self, pts_us: i64) -> bool {
-        self.observe_timeline_pts(pts_us);
-        loop {
-            if self.shared.stopped.load(Ordering::SeqCst) {
-                return false;
-            }
-            let origin = self.shared.timeline_origin_us.load(Ordering::SeqCst);
-            if origin != UNSET_PTS {
-                let current_pts = rendered_pts_us(
+    pub fn trim_before_start(&self, pts_us: i64, duration_us: u64, samples: &mut Vec<f32>) {
+        let start = self.shared.requested_start_pts_us.load(Ordering::SeqCst);
+        if start == UNSET_PTS || pts_us >= start || samples.is_empty() {
+            return;
+        }
+        let packet_end = pts_us.saturating_add(i64::try_from(duration_us).unwrap_or(i64::MAX));
+        if packet_end <= start || duration_us == 0 {
+            samples.clear();
+            return;
+        }
+        let discard_us = start.saturating_sub(pts_us) as u64;
+        let discard = u64::from(self.sample_rate)
+            .saturating_mul(u64::from(self.channels))
+            .saturating_mul(discard_us)
+            / 1_000_000;
+        let discard = usize::try_from(discard).unwrap_or(usize::MAX).min(samples.len());
+        samples.drain(..discard);
+    }
+
+    pub fn pts_reached(&self, pts_us: i64) -> bool {
+        if !self.shared.enabled.load(Ordering::SeqCst)
+            || !self.shared.prebuffered.load(Ordering::SeqCst)
+        {
+            return false;
+        }
+        let origin = self.shared.timeline_origin_us.load(Ordering::SeqCst);
+        origin != UNSET_PTS
+            && pts_us
+                <= rendered_pts_us(
                     origin,
                     self.shared.rendered_samples.load(Ordering::SeqCst),
                     self.sample_rate,
                     self.channels,
-                );
-                if pts_us <= current_pts {
-                    return true;
-                }
-            }
-            if self.shared.decode_done.load(Ordering::SeqCst)
-                && self.shared.played_samples.load(Ordering::SeqCst)
-                    >= self.shared.queued_samples.load(Ordering::SeqCst)
-            {
-                return true;
-            }
-            if self.shared.error().is_some() {
-                return false;
-            }
-            thread::sleep(POLL_INTERVAL);
-        }
+                )
+    }
+
+    pub fn video_gate_stalled(&self) -> bool {
+        self.shared.enabled.load(Ordering::SeqCst)
+            && !self.shared.prebuffered.load(Ordering::SeqCst)
+            && !self.shared.received_samples.load(Ordering::SeqCst)
+            && self
+                .shared
+                .play_configured_at
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_some_and(|configured| configured.elapsed() > LINKED_AUDIO_STALL_FALLBACK)
     }
 
     pub fn push(&self, samples: &[f32]) -> io::Result<()> {
+        if !samples.is_empty() {
+            self.shared.received_samples.store(true, Ordering::SeqCst);
+        }
         let mut producer = self.producer.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         for &sample in samples {
             let mut sample = sample;
@@ -352,7 +442,10 @@ impl AudioOutput {
 
     pub fn stop(&self) {
         self.shared.stopped.store(true, Ordering::SeqCst);
-        self.shared.enabled.store(true, Ordering::SeqCst);
+        // Session teardown must silence the device immediately. The stopped flag unblocks
+        // decoders and waiters; leaving enabled set would let the callback continue draining
+        // already queued samples after the source and its nodes had been removed.
+        self.shared.enabled.store(false, Ordering::SeqCst);
     }
 }
 
@@ -369,7 +462,7 @@ where
     let error_shared = shared.clone();
     device
         .build_output_stream(
-            config,
+            *config,
             move |output: &mut [T], _| {
                 let mut discarded = 0_u64;
                 while discarded < output.len() as u64 {
@@ -400,7 +493,7 @@ where
                         .queued_samples
                         .load(Ordering::SeqCst)
                         .saturating_sub(shared.played_samples.load(Ordering::SeqCst));
-                    if buffered < shared.prebuffer_samples
+                    if buffered < shared.prebuffer_samples.load(Ordering::SeqCst)
                         && !shared.decode_done.load(Ordering::SeqCst)
                     {
                         output.fill_with(|| T::from_sample(0.0));
@@ -501,6 +594,9 @@ impl AudioDecoder {
             check_ffmpeg("could not configure audio decoder", unsafe {
                 avcodec_parameters_to_context(context, parameters as *const _ as *const c_void)
             })?;
+            check_ffmpeg("could not set audio packet time base", unsafe {
+                av_opt_set_q(context, c"pkt_timebase".as_ptr(), PACKET_TIME_BASE, 0)
+            })?;
             let ar = c"ar";
             check_ffmpeg("could not set audio sample rate", unsafe {
                 av_opt_set_int(context, ar.as_ptr(), i64::from(config.sample_rate), 0)
@@ -568,7 +664,7 @@ impl AudioDecoder {
         av_packet.pts = packet.pts_us;
         av_packet.dts = packet.dts_us;
         av_packet.duration = i64::try_from(packet.duration_us).unwrap_or(i64::MAX);
-        av_packet.time_base = AVRational { num: 1, den: 1_000_000 };
+        av_packet.time_base = PACKET_TIME_BASE;
         let result = unsafe { avcodec_send_packet(self.context, self.packet) };
         unsafe { av_packet_unref(self.packet) };
         check_ffmpeg("audio decoder rejected packet", result)?;
@@ -692,6 +788,15 @@ impl AudioDecoder {
         }
         check_ffmpeg("could not allocate audio resampler", result)?;
         check_ffmpeg("could not initialize audio resampler", unsafe { swr_init(self.resampler) })
+    }
+
+    #[cfg(test)]
+    fn packet_time_base(&self) -> io::Result<AVRational> {
+        let mut time_base = AVRational { num: 0, den: 0 };
+        check_ffmpeg("could not read audio packet time base", unsafe {
+            av_opt_get_q(self.context, c"pkt_timebase".as_ptr(), 0, &mut time_base)
+        })?;
+        Ok(time_base)
     }
 }
 
@@ -820,6 +925,19 @@ unsafe extern "C" {
     fn av_frame_free(frame: *mut *mut c_void);
     fn av_frame_unref(frame: *mut c_void);
     fn av_mallocz(size: usize) -> *mut c_void;
+    fn av_opt_set_q(
+        object: *mut c_void,
+        name: *const c_char,
+        value: AVRational,
+        flags: c_int,
+    ) -> c_int;
+    #[cfg(test)]
+    fn av_opt_get_q(
+        object: *mut c_void,
+        name: *const c_char,
+        flags: c_int,
+        output: *mut AVRational,
+    ) -> c_int;
     fn av_opt_set_int(object: *mut c_void, name: *const c_char, value: i64, flags: c_int) -> c_int;
     fn av_opt_set_chlayout(
         object: *mut c_void,
@@ -855,12 +973,38 @@ unsafe extern "C" {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        AudioDecoder, leading_silence_sample_count, rendered_pts_us, supports,
-        trim_pending_samples, trim_samples,
-    };
+    use super::*;
     use vivid_protocol::media::ParsedAudioPacket;
     use vivid_protocol::messages::ParsedAudioSourceConfig;
+
+    #[test]
+    fn video_gate_stall_requires_enabled_and_empty_ingress() {
+        let output = AudioOutput::test_output();
+        assert!(!output.video_gate_stalled());
+
+        output.configure_play(0, 100_000);
+        output.start();
+        assert!(!output.video_gate_stalled());
+        *output.shared.play_configured_at.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some(Instant::now() - LINKED_AUDIO_STALL_FALLBACK - Duration::from_millis(1));
+        assert!(output.video_gate_stalled());
+
+        output.push(&[0.0, 0.0]).unwrap();
+        assert!(!output.video_gate_stalled());
+        output.pause();
+        assert!(!output.video_gate_stalled());
+        output.flush();
+        assert!(!output.video_gate_stalled());
+        assert!(!output.shared.received_samples.load(Ordering::SeqCst));
+        assert!(
+            output
+                .shared
+                .play_configured_at
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_none()
+        );
+    }
 
     #[test]
     fn trim_is_rescaled_and_channel_aligned() {
@@ -907,6 +1051,7 @@ mod tests {
         let encoded = vec![0_u8; 480 * 2 * 2];
         assert!(supports(&config));
         let mut decoder = AudioDecoder::new(&config, 48_000, 2).unwrap();
+        assert_eq!(decoder.packet_time_base().unwrap(), PACKET_TIME_BASE);
         let mut samples = decoder
             .push(ParsedAudioPacket {
                 epoch: 1,
