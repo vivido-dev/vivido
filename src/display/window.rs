@@ -204,9 +204,12 @@ impl Window {
         self.window.set_visible(visibility);
     }
 
-    #[cfg(target_os = "macos")]
     #[inline]
     pub fn focus_window(&self) {
+        // Direct focus is intentionally a no-op on Wayland. Winit's attention request uses
+        // xdg_activation_v1 to obtain and apply a compositor-approved activation token.
+        #[cfg(target_os = "linux")]
+        self.window.request_user_attention(Some(UserAttentionType::Critical));
         self.window.focus_window();
     }
 

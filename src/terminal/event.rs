@@ -49,6 +49,18 @@ pub enum Event {
     /// New terminal content available.
     Wakeup,
 
+    /// Sanitized PTY bytes were retained at this absolute transcript range.
+    #[cfg(unix)]
+    PtyOutput { start: u64, end: u64 },
+
+    /// A tagged IPC input buffer was completely written to the PTY master.
+    #[cfg(unix)]
+    PtyWriteComplete(u64),
+
+    /// A tagged IPC resize was applied to the PTY master.
+    #[cfg(unix)]
+    PtyResizeComplete(u64),
+
     /// Terminal bell ring.
     Bell,
 
@@ -87,6 +99,12 @@ impl Debug for Event {
             Event::MouseCursorDirty => write!(f, "MouseCursorDirty"),
             Event::ResetTitle => write!(f, "ResetTitle"),
             Event::Wakeup => write!(f, "Wakeup"),
+            #[cfg(unix)]
+            Event::PtyOutput { start, end } => write!(f, "PtyOutput({start}..{end})"),
+            #[cfg(unix)]
+            Event::PtyWriteComplete(token) => write!(f, "PtyWriteComplete({token})"),
+            #[cfg(unix)]
+            Event::PtyResizeComplete(token) => write!(f, "PtyResizeComplete({token})"),
             Event::Bell => write!(f, "Bell"),
             Event::Graphics(command) => write!(f, "Graphics({command:?})"),
             Event::VividMarker { marker, line, column, alternate } => {

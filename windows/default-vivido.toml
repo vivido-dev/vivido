@@ -1,0 +1,5 @@
+# Vivido user configuration.
+# This file is preserved during upgrades and uninstall.
+
+[terminal]
+shell = "pwsh.exe"

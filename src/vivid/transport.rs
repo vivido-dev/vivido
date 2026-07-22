@@ -14,7 +14,7 @@ type LocalStream = UnixStream;
 use vivid_protocol::wire::{
     HEADER_SIZE, PREFACE_SIZE, Preface, RECORD_KNOWN_FLAGS, Record, RecordHeader,
 };
-use vivid_protocol::{CONTROL_MAX_RECORD_BODY, FRAMING_MAJOR, FRAMING_MINOR, HARD_MAX_RECORD_BODY};
+use vivid_protocol::{CONTROL_MAX_RECORD_BODY, HARD_MAX_RECORD_BODY, VIVID_MAJOR, VIVID_MINOR};
 
 pub struct Reader {
     stream: LocalStream,
@@ -28,7 +28,7 @@ impl Reader {
         let mut bytes = [0_u8; PREFACE_SIZE];
         stream.read_exact(&mut bytes)?;
         let preface = Preface::decode(bytes)?;
-        if preface.major != FRAMING_MAJOR || preface.minor != FRAMING_MINOR {
+        if preface.major != VIVID_MAJOR || preface.minor != VIVID_MINOR {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("unsupported Vivid major version {}", preface.major),

@@ -14,6 +14,8 @@ Vi mode and vi-specific search commands are not part of Vivido.
 Drag the primary mouse button to create a simple character selection. Hold Control while
 dragging for a rectangular block selection. Double/triple-click semantic or line selection,
 right-click expansion, and all other selection-expansion modes are intentionally absent.
+On Windows, right-click pastes the system clipboard when terminal mouse reporting is inactive;
+hold Shift to use this terminal-side paste while an application has enabled mouse reporting.
 
 ## Hints
 

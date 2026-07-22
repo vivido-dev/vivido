@@ -61,6 +61,9 @@ mod rects;
 mod renderer;
 mod text;
 
+#[cfg(unix)]
+pub(crate) use renderer::{ScreenshotError, ScreenshotPixels, ScreenshotReadback};
+
 /// Label for the forward terminal search bar.
 const FORWARD_SEARCH_LABEL: &str = "Search: ";
 
@@ -313,6 +316,25 @@ impl Display {
         self.damage_tracker.frame().mark_fully_damaged();
     }
 
+    #[cfg(unix)]
+    pub fn begin_screenshot(&self) -> Result<ScreenshotReadback, ScreenshotError> {
+        self.scene_renderer.begin_screenshot()
+    }
+
+    #[cfg(unix)]
+    pub fn poll_screenshot(
+        &self,
+        readback: &ScreenshotReadback,
+    ) -> Result<Option<ScreenshotPixels>, ScreenshotError> {
+        self.scene_renderer.poll_screenshot(readback)
+    }
+
+    #[cfg(unix)]
+    pub fn supports_render_size(&self, width: u32, height: u32) -> bool {
+        self.scene_renderer.clamp_render_size(PhysicalSize::new(width, height))
+            == PhysicalSize::new(width, height)
+    }
+
     pub fn new(window: Window, config: &UiConfig, _tabbed: bool) -> Result<Display, Error> {
         let scale_factor = window.scale_factor as f32;
         let font_size = config.font.size().scale(scale_factor);
@@ -332,7 +354,11 @@ impl Display {
             window.request_inner_size(viewport_size);
         }
 
-        let scene_renderer = SceneRenderer::new(window.winit_window(), viewport_size)?;
+        let scene_renderer = SceneRenderer::new(
+            window.winit_window(),
+            viewport_size,
+            config.window_opacity() < 1.0,
+        )?;
         let viewport_size = scene_renderer.clamp_render_size(viewport_size);
         let padding = config.window.padding(window.scale_factor as f32);
         let size_info = SizeInfo::new(
@@ -487,7 +513,7 @@ impl Display {
         message_buffer: &MessageBuffer,
         config: &UiConfig,
         search_state: &mut SearchState,
-    ) {
+    ) -> bool {
         let mut content = RenderableContent::new(config, self, &terminal, search_state);
         let mut grid_cells = Vec::new();
         for cell in &mut content {
@@ -688,12 +714,14 @@ impl Display {
             background_color.b,
             (config.window_opacity() * 255.) as u8,
         );
-        if let Err(err) = self.scene_renderer.render(&scene, base_color) {
-            panic!("renderer stopped after a fatal GPU error: {err}");
-        }
+        let presented = self
+            .scene_renderer
+            .render(&scene, base_color)
+            .unwrap_or_else(|err| panic!("renderer stopped after a fatal GPU error: {err}"));
 
         self.request_frame(scheduler);
         self.damage_tracker.swap_damage();
+        presented
     }
 
     pub fn update_config(&mut self, config: &UiConfig) {

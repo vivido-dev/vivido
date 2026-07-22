@@ -1,0 +1,63 @@
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:bal="http://wixtoolset.org/schemas/v4/wxs/bal"
+     xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
+  <Bundle Name="Vivido Suite"
+          Manufacturer="$(var.Publisher)"
+          Version="$(var.VividoVersion)"
+          UpgradeCode="6a93bc38-e3c7-44a0-a879-c71f2b67d3da"
+          Compressed="yes"
+          IconSourceFile="$(var.SourceRoot)\vivido.ico">
+    <bal:Condition Condition="VersionNT64 AND WindowsBuildNumber &gt;= 22000"
+                   Message="Vivido Suite requires 64-bit Windows 11 (build 22000 or newer)." />
+    <BootstrapperApplication>
+      <bal:WixStandardBootstrapperApplication Theme="rtfLicense"
+                                               LicenseFile="$(var.SourceRoot)\wix\license.rtf"
+                                               LaunchTarget="[AppDataFolder]Microsoft\Windows\Start Menu\Programs\Vivido\Vivido WSL.lnk" />
+    </BootstrapperApplication>
+
+    <util:RegistrySearch Id="PowerShell7Search"
+                         Root="HKLM"
+                         Key="SOFTWARE\Microsoft\PowerShellCore\InstalledVersions\{1D00683B-0F84-4DB8-BC0F-4B8BF632AC8E}"
+                         Value="InstallLocation"
+                         Result="value"
+                         Variable="PowerShell7InstallLocation"
+                         Bitness="always64" />
+    <util:FileSearch Id="PowerShell7VersionSearch"
+                     After="PowerShell7Search"
+                     Condition="PowerShell7InstallLocation"
+                     Path="[PowerShell7InstallLocation]pwsh.exe"
+                     Result="version"
+                     Variable="PowerShell7FileVersion" />
+
+    <Chain>
+      <MsiPackage Id="PowerShell7Lts"
+                  SourceFile="$(var.PowerShellMsi)"
+                  DisplayName="PowerShell 7 LTS"
+                  InstallCondition="NOT PowerShell7FileVersion OR PowerShell7FileVersion &lt; v7.4.0"
+                  Permanent="yes"
+                  Vital="yes"
+                  Visible="yes">
+        <MsiProperty Name="ADD_PATH" Value="1" />
+        <MsiProperty Name="USE_MU" Value="1" />
+        <MsiProperty Name="ENABLE_MU" Value="1" />
+        <MsiProperty Name="REGISTER_MANIFEST" Value="1" />
+      </MsiPackage>
+
+      <ExePackage Id="WslUbuntuSetup"
+                  SourceFile="$(var.SetupHelper)"
+                  InstallArguments="wsl-install"
+                  RepairArguments="wsl-install"
+                  PerMachine="yes"
+                  Permanent="yes"
+                  Vital="yes">
+        <ExitCode Value="3010" Behavior="scheduleReboot" />
+      </ExePackage>
+
+      <MsiPackage Id="VividoSuiteMsi"
+                  SourceFile="$(var.SuiteMsi)"
+                  DisplayName="Vivido Suite"
+                  Vital="yes"
+                  Visible="no" />
+    </Chain>
+  </Bundle>
+</Wix>

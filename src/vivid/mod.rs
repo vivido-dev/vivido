@@ -29,6 +29,7 @@ use vivid_protocol::anchor::{self, AnchorKey};
 use vivid_protocol::media::{self, VIDEO_PACKET_KEY};
 use vivid_protocol::messages::{self, Credits, DisplayChanged};
 use vivid_protocol::wire::{ConnectionKind, RECORD_OPTIONAL, Record};
+use vivid_protocol::{VIVID_MAJOR, VIVID_MINOR};
 
 use crate::event::{EventProxy, EventType};
 use crate::vivid::audio::AudioOutput;
@@ -397,17 +398,21 @@ fn handle_control(reader: &mut Reader, shared: Arc<ServiceShared>) -> io::Result
         )?;
         return Ok(());
     }
-    let unsupported_feature =
-        hello.required_features.iter().any(|feature| !is_supported_feature(*feature));
-    let supports_1_1 = offers_protocol_1_1(
+    let negotiated = messages::negotiate_features(
+        &hello.required_features,
+        &hello.optional_features,
+        is_supported_feature,
+    );
+    let unsupported_feature = negotiated.is_err();
+    let supports_current_version = offers_vivid_version(
         hello.minimum_major,
         hello.minimum_minor,
         hello.maximum_major,
         hello.maximum_minor,
     );
-    if !supports_1_1 || hello.maximum_record_body == 0 || unsupported_feature {
-        let (code, diagnostic) = if !supports_1_1 {
-            (messages::ERROR_UNSUPPORTED_VERSION, "Vivid protocol 1.1 is required")
+    if !supports_current_version || hello.maximum_record_body == 0 || unsupported_feature {
+        let (code, diagnostic) = if !supports_current_version {
+            (messages::ERROR_UNSUPPORTED_VERSION, "Vivid 1.0 is required")
         } else if hello.maximum_record_body == 0 {
             (messages::ERROR_BAD_MESSAGE, "maximum record body is zero")
         } else {
@@ -417,11 +422,7 @@ fn handle_control(reader: &mut Reader, shared: Arc<ServiceShared>) -> io::Result
         return Ok(());
     }
 
-    let mut accepted_features = hello.required_features.clone();
-    accepted_features.extend(hello.optional_features.iter().copied());
-    accepted_features.retain(|feature| is_supported_feature(*feature));
-    accepted_features.sort_unstable();
-    accepted_features.dedup();
+    let accepted_features = negotiated.unwrap_or_default();
 
     let (session_id, session_tag, root_context_id) = {
         let mut registry = lock_registry(&shared);
@@ -539,16 +540,18 @@ fn is_supported_feature(feature: u64) -> bool {
             | messages::FEATURE_TEXT_ANCHORS_V2
             | messages::FEATURE_AUDIO_ACCESS_UNIT_V1
             | messages::FEATURE_NODE_CLIP_RECT_V1
+            | messages::FEATURE_DECODER_DESCRIPTION_V1
     )
 }
 
-fn offers_protocol_1_1(
+fn offers_vivid_version(
     minimum_major: u64,
     minimum_minor: u64,
     maximum_major: u64,
     maximum_minor: u64,
 ) -> bool {
-    (minimum_major, minimum_minor) <= (1, 1) && (maximum_major, maximum_minor) >= (1, 1)
+    let current = (u64::from(VIVID_MAJOR), u64::from(VIVID_MINOR));
+    (minimum_major, minimum_minor) <= current && (maximum_major, maximum_minor) >= current
 }
 
 fn negotiated(shared: &Arc<ServiceShared>, session_id: SessionId, feature: u64) -> bool {
@@ -1118,7 +1121,7 @@ fn dispatch_control(
                 });
             }
             let (envelope, source_id, epoch) =
-                messages::parse_eos(&record.body).map_err(|_| bad("invalid FLUSH"))?;
+                messages::parse_flush(&record.body).map_err(|_| bad("invalid FLUSH"))?;
             if source_id != record.object_id {
                 return Err(bad("FLUSH object ID mismatch"));
             }
@@ -1528,7 +1531,12 @@ fn handle_video(
                 writer.write_record(
                     messages::NEED_KEYFRAME,
                     key.1,
-                    &messages::need_keyframe(key.1, packet.epoch, 1, None),
+                    &messages::need_keyframe(
+                        key.1,
+                        packet.epoch,
+                        messages::KEYFRAME_REASON_INITIAL,
+                        None,
+                    ),
                 )?;
                 continue;
             },
@@ -1539,7 +1547,12 @@ fn handle_video(
                 writer.write_record(
                     messages::NEED_KEYFRAME,
                     key.1,
-                    &messages::need_keyframe(key.1, packet.epoch, 3, Some(packet.packet_id)),
+                    &messages::need_keyframe(
+                        key.1,
+                        packet.epoch,
+                        messages::KEYFRAME_REASON_EPOCH_DISCONTINUITY,
+                        Some(packet.packet_id),
+                    ),
                 )?;
                 continue;
             },
@@ -1555,7 +1568,12 @@ fn handle_video(
                 writer.write_record(
                     messages::NEED_KEYFRAME,
                     key.1,
-                    &messages::need_keyframe(key.1, minimum_epoch, 2, Some(packet.packet_id)),
+                    &messages::need_keyframe(
+                        key.1,
+                        minimum_epoch,
+                        messages::KEYFRAME_REASON_DECODER_ERROR,
+                        Some(packet.packet_id),
+                    ),
                 )?;
                 decoder = Decoder::new(&config)?;
                 current_epoch = None;
@@ -2070,6 +2088,8 @@ mod tests {
                     sar_num: 1,
                     sar_den: 1,
                     max_access_unit_bytes: 1024,
+                    codec_string: None,
+                    decoder_config: None,
                 }),
             )
             .unwrap();
@@ -2088,6 +2108,7 @@ mod tests {
                     channel_mask: 3,
                     bitrate: 1_536_000,
                     max_access_unit_bytes: 4096,
+                    codec_string: None,
                 }),
             )
             .unwrap();
@@ -2180,11 +2201,11 @@ mod tests {
     }
 
     #[test]
-    fn protocol_selection_rejects_1_0_only_ranges() {
-        assert!(!offers_protocol_1_1(1, 0, 1, 0));
-        assert!(offers_protocol_1_1(1, 0, 1, 1));
-        assert!(offers_protocol_1_1(1, 1, 1, 1));
-        assert!(!offers_protocol_1_1(1, 2, 2, 0));
+    fn vivid_version_selection_accepts_only_ranges_containing_1_0() {
+        assert!(!offers_vivid_version(0, 9, 0, 9));
+        assert!(offers_vivid_version(1, 0, 1, 0));
+        assert!(offers_vivid_version(0, 9, 1, 0));
+        assert!(!offers_vivid_version(1, 1, 2, 0));
     }
 
     #[test]
@@ -2259,7 +2280,7 @@ mod tests {
         .unwrap();
         let endpoint = Endpoint::parse(service.endpoint()).unwrap();
 
-        let mut legacy = Connection::open(&endpoint, ConnectionKind::Control).unwrap();
+        let mut unsupported = Connection::open(&endpoint, ConnectionKind::Control).unwrap();
         let mut hello = vivid_protocol::cbor::Encoder::new();
         hello.map(2);
         hello.u64(0);
@@ -2269,25 +2290,26 @@ mod tests {
         hello.u64(0);
         hello.u64(1);
         hello.u64(1);
-        hello.u64(0);
+        hello.u64(1);
         hello.u64(2);
         hello.u64(1);
         hello.u64(3);
-        hello.u64(0);
+        hello.u64(1);
         hello.u64(4);
         hello.text(service.token());
         hello.u64(5);
-        hello.text("legacy-test");
+        hello.text("unsupported-version-test");
         hello.u64(6);
-        hello.text("1.0");
+        hello.text("unsupported");
         hello.u64(7);
         hello.array(0);
         hello.u64(8);
         hello.array(0);
         hello.u64(9);
         hello.u64(u64::from(vivid_protocol::CONTROL_MAX_RECORD_BODY));
-        legacy.write_record(messages::HELLO, 0, 0, &hello.into_vec()).unwrap();
-        let rejection = messages::parse_error_reply(&legacy.read_record().unwrap().body).unwrap();
+        unsupported.write_record(messages::HELLO, 0, 0, &hello.into_vec()).unwrap();
+        let rejection =
+            messages::parse_error_reply(&unsupported.read_record().unwrap().body).unwrap();
         assert_eq!(rejection.code, messages::ERROR_UNSUPPORTED_VERSION);
 
         let mut control = Connection::open(&endpoint, ConnectionKind::Control).unwrap();

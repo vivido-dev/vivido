@@ -15,8 +15,10 @@ _vivido() {
 
     local context curcontext="$curcontext" state line
     _arguments "${_arguments_options[@]}" : \
-'--config-file=[Specify alternative configuration file \[default\: \$HOME/.config/vivido/vivido.toml\]]:CONFIG_FILE:_files' \
+'--config-file=[Specify alternative configuration file \[default\: \$XDG_CONFIG_HOME/vivido/vivido.toml\]]:CONFIG_FILE:_files' \
 '--socket=[Path for IPC socket creation]:SOCKET:_files' \
+'-w+[Stable IPC ID assigned to this window]:WINDOW_ID:_default' \
+'--window-id=[Stable IPC ID assigned to this window]:WINDOW_ID:_default' \
 '--working-directory=[Start the shell in the specified working directory]:WORKING_DIRECTORY:_files' \
 '*-e+[Command and args to execute (must be last argument)]:COMMAND:_default' \
 '*--command=[Command and args to execute (must be last argument)]:COMMAND:_default' \
@@ -31,8 +33,8 @@ _vivido() {
 '(-q)*-v[Increases the level of verbosity (the max level is -vvv)]' \
 '--daemon[Do not spawn an initial window]' \
 '--hold[Remain open after child process exit]' \
-'-h[Print help]' \
-'--help[Print help]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
 '-V[Print version]' \
 '--version[Print version]' \
 ":: :_vivido_commands" \
@@ -62,6 +64,8 @@ _arguments "${_arguments_options[@]}" : \
         case $line[1] in
             (create-window)
 _arguments "${_arguments_options[@]}" : \
+'-w+[Stable IPC ID assigned to this window]:WINDOW_ID:_default' \
+'--window-id=[Stable IPC ID assigned to this window]:WINDOW_ID:_default' \
 '--working-directory=[Start the shell in the specified working directory]:WORKING_DIRECTORY:_files' \
 '*-e+[Command and args to execute (must be last argument)]:COMMAND:_default' \
 '*--command=[Command and args to execute (must be last argument)]:COMMAND:_default' \
@@ -71,8 +75,8 @@ _arguments "${_arguments_options[@]}" : \
 '*-o+[Override configuration file options \[example\: '\''cursor.style="Beam"'\''\]]:OPTION:_default' \
 '*--option=[Override configuration file options \[example\: '\''cursor.style="Beam"'\''\]]:OPTION:_default' \
 '--hold[Remain open after child process exit]' \
-'-h[Print help]' \
-'--help[Print help]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
 ;;
 (config)
@@ -92,6 +96,443 @@ _arguments "${_arguments_options[@]}" : \
 '--window-id=[Window ID for the config request]:WINDOW_ID:_default' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(typing)
+_arguments "${_arguments_options[@]}" : \
+'-w+[Window ID for terminal input]:WINDOW_ID:_default' \
+'--window-id=[Window ID for terminal input]:WINDOW_ID:_default' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+':text -- Literal UTF-8 text to write to the terminal PTY:_default' \
+&& ret=0
+;;
+(get-text)
+_arguments "${_arguments_options[@]}" : \
+'--rows=[Number of latest physical terminal rows to return]:ROWS:_default' \
+'-w+[Window ID for terminal text]:WINDOW_ID:_default' \
+'--window-id=[Window ID for terminal text]:WINDOW_ID:_default' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(screenshot)
+_arguments "${_arguments_options[@]}" : \
+'-w+[Window ID for the screenshot]:WINDOW_ID:_default' \
+'--window-id=[Window ID for the screenshot]:WINDOW_ID:_default' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(capabilities)
+_arguments "${_arguments_options[@]}" : \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(key)
+_arguments "${_arguments_options[@]}" : \
+'*--mods=[Comma-separated Ctrl, Alt, Shift, and Super modifiers]:MODS:_default' \
+'--repeat=[Number of key presses to send]:REPEAT:_default' \
+'--route=[Input routing mode]:ROUTE:((application\:"Bypass Vivido bindings and encode input for the terminal application"
+ui\:"Process input through Vivido'\''s normal UI input pipeline"))' \
+'-w+[Window ID. The focused window is used when this is omitted]:WINDOW_ID:_default' \
+'--window-id=[Window ID. The focused window is used when this is omitted]:WINDOW_ID:_default' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+':key -- Unicode scalar or named key (Enter, Escape, ArrowUp, F1, and so on):_default' \
+&& ret=0
+;;
+(paste)
+_arguments "${_arguments_options[@]}" : \
+'--route=[Input routing mode]:ROUTE:((application\:"Bypass Vivido bindings and encode input for the terminal application"
+ui\:"Process input through Vivido'\''s normal UI input pipeline"))' \
+'-w+[Window ID. The focused window is used when this is omitted]:WINDOW_ID:_default' \
+'--window-id=[Window ID. The focused window is used when this is omitted]:WINDOW_ID:_default' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+':text -- Literal UTF-8 text to paste:_default' \
+&& ret=0
+;;
+(mouse)
+_arguments "${_arguments_options[@]}" : \
+'-h[Print help]' \
+'--help[Print help]' \
+":: :_vivido__msg__mouse_commands" \
+"*::: :->mouse" \
+&& ret=0
+
+    case $state in
+    (mouse)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:vivido-msg-mouse-command-$line[1]:"
+        case $line[1] in
+            (move)
+_arguments "${_arguments_options[@]}" : \
+'(--x --y)--cell-column=[Zero-based terminal cell column]:CELL_COLUMN:_default' \
+'(--x --y)--cell-row=[Zero-based terminal cell row]:CELL_ROW:_default' \
+'(--cell-column --cell-row)--x=[Physical-pixel X coordinate in the client area]:X:_default' \
+'(--cell-column --cell-row)--y=[Physical-pixel Y coordinate in the client area]:Y:_default' \
+'*--mods=[Comma-separated Ctrl, Alt, Shift, and Super modifiers]:MODS:_default' \
+'--route=[Input routing mode]:ROUTE:((application\:"Bypass Vivido bindings and encode input for the terminal application"
+ui\:"Process input through Vivido'\''s normal UI input pipeline"))' \
+'-w+[Window ID. The focused window is used when this is omitted]:WINDOW_ID:_default' \
+'--window-id=[Window ID. The focused window is used when this is omitted]:WINDOW_ID:_default' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(click)
+_arguments "${_arguments_options[@]}" : \
+'--button=[Mouse button]:BUTTON:(left middle right)' \
+'(--x --y)--cell-column=[Zero-based terminal cell column]:CELL_COLUMN:_default' \
+'(--x --y)--cell-row=[Zero-based terminal cell row]:CELL_ROW:_default' \
+'(--cell-column --cell-row)--x=[Physical-pixel X coordinate in the client area]:X:_default' \
+'(--cell-column --cell-row)--y=[Physical-pixel Y coordinate in the client area]:Y:_default' \
+'*--mods=[Comma-separated Ctrl, Alt, Shift, and Super modifiers]:MODS:_default' \
+'--route=[Input routing mode]:ROUTE:((application\:"Bypass Vivido bindings and encode input for the terminal application"
+ui\:"Process input through Vivido'\''s normal UI input pipeline"))' \
+'-w+[Window ID. The focused window is used when this is omitted]:WINDOW_ID:_default' \
+'--window-id=[Window ID. The focused window is used when this is omitted]:WINDOW_ID:_default' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(double-click)
+_arguments "${_arguments_options[@]}" : \
+'--button=[Mouse button]:BUTTON:(left middle right)' \
+'(--x --y)--cell-column=[Zero-based terminal cell column]:CELL_COLUMN:_default' \
+'(--x --y)--cell-row=[Zero-based terminal cell row]:CELL_ROW:_default' \
+'(--cell-column --cell-row)--x=[Physical-pixel X coordinate in the client area]:X:_default' \
+'(--cell-column --cell-row)--y=[Physical-pixel Y coordinate in the client area]:Y:_default' \
+'*--mods=[Comma-separated Ctrl, Alt, Shift, and Super modifiers]:MODS:_default' \
+'--route=[Input routing mode]:ROUTE:((application\:"Bypass Vivido bindings and encode input for the terminal application"
+ui\:"Process input through Vivido'\''s normal UI input pipeline"))' \
+'-w+[Window ID. The focused window is used when this is omitted]:WINDOW_ID:_default' \
+'--window-id=[Window ID. The focused window is used when this is omitted]:WINDOW_ID:_default' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(down)
+_arguments "${_arguments_options[@]}" : \
+'--button=[Mouse button]:BUTTON:(left middle right)' \
+'(--x --y)--cell-column=[Zero-based terminal cell column]:CELL_COLUMN:_default' \
+'(--x --y)--cell-row=[Zero-based terminal cell row]:CELL_ROW:_default' \
+'(--cell-column --cell-row)--x=[Physical-pixel X coordinate in the client area]:X:_default' \
+'(--cell-column --cell-row)--y=[Physical-pixel Y coordinate in the client area]:Y:_default' \
+'*--mods=[Comma-separated Ctrl, Alt, Shift, and Super modifiers]:MODS:_default' \
+'--route=[Input routing mode]:ROUTE:((application\:"Bypass Vivido bindings and encode input for the terminal application"
+ui\:"Process input through Vivido'\''s normal UI input pipeline"))' \
+'-w+[Window ID. The focused window is used when this is omitted]:WINDOW_ID:_default' \
+'--window-id=[Window ID. The focused window is used when this is omitted]:WINDOW_ID:_default' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(up)
+_arguments "${_arguments_options[@]}" : \
+'--button=[Mouse button]:BUTTON:(left middle right)' \
+'(--x --y)--cell-column=[Zero-based terminal cell column]:CELL_COLUMN:_default' \
+'(--x --y)--cell-row=[Zero-based terminal cell row]:CELL_ROW:_default' \
+'(--cell-column --cell-row)--x=[Physical-pixel X coordinate in the client area]:X:_default' \
+'(--cell-column --cell-row)--y=[Physical-pixel Y coordinate in the client area]:Y:_default' \
+'*--mods=[Comma-separated Ctrl, Alt, Shift, and Super modifiers]:MODS:_default' \
+'--route=[Input routing mode]:ROUTE:((application\:"Bypass Vivido bindings and encode input for the terminal application"
+ui\:"Process input through Vivido'\''s normal UI input pipeline"))' \
+'-w+[Window ID. The focused window is used when this is omitted]:WINDOW_ID:_default' \
+'--window-id=[Window ID. The focused window is used when this is omitted]:WINDOW_ID:_default' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(drag)
+_arguments "${_arguments_options[@]}" : \
+'--button=[Mouse button]:BUTTON:(left middle right)' \
+'(--x --y)--cell-column=[Zero-based terminal cell column]:CELL_COLUMN:_default' \
+'(--x --y)--cell-row=[Zero-based terminal cell row]:CELL_ROW:_default' \
+'(--cell-column --cell-row)--x=[Physical-pixel X coordinate in the client area]:X:_default' \
+'(--cell-column --cell-row)--y=[Physical-pixel Y coordinate in the client area]:Y:_default' \
+'*--mods=[Comma-separated Ctrl, Alt, Shift, and Super modifiers]:MODS:_default' \
+'--route=[Input routing mode]:ROUTE:((application\:"Bypass Vivido bindings and encode input for the terminal application"
+ui\:"Process input through Vivido'\''s normal UI input pipeline"))' \
+'-w+[Window ID. The focused window is used when this is omitted]:WINDOW_ID:_default' \
+'--window-id=[Window ID. The focused window is used when this is omitted]:WINDOW_ID:_default' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(scroll)
+_arguments "${_arguments_options[@]}" : \
+'--vertical=[Vertical scroll amount; positive values scroll up]:VERTICAL:_default' \
+'--horizontal=[Horizontal scroll amount; positive values scroll left]:HORIZONTAL:_default' \
+'(--x --y)--cell-column=[Zero-based terminal cell column]:CELL_COLUMN:_default' \
+'(--x --y)--cell-row=[Zero-based terminal cell row]:CELL_ROW:_default' \
+'(--cell-column --cell-row)--x=[Physical-pixel X coordinate in the client area]:X:_default' \
+'(--cell-column --cell-row)--y=[Physical-pixel Y coordinate in the client area]:Y:_default' \
+'*--mods=[Comma-separated Ctrl, Alt, Shift, and Super modifiers]:MODS:_default' \
+'--route=[Input routing mode]:ROUTE:((application\:"Bypass Vivido bindings and encode input for the terminal application"
+ui\:"Process input through Vivido'\''s normal UI input pipeline"))' \
+'-w+[Window ID. The focused window is used when this is omitted]:WINDOW_ID:_default' \
+'--window-id=[Window ID. The focused window is used when this is omitted]:WINDOW_ID:_default' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+":: :_vivido__msg__mouse__help_commands" \
+"*::: :->help" \
+&& ret=0
+
+    case $state in
+    (help)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:vivido-msg-mouse-help-command-$line[1]:"
+        case $line[1] in
+            (move)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(click)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(double-click)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(down)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(up)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(drag)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(scroll)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+        esac
+    ;;
+esac
+;;
+(resize)
+_arguments "${_arguments_options[@]}" : \
+'(--width --height)--columns=[Exact terminal grid column count]:COLUMNS:_default' \
+'(--width --height)--rows=[Exact terminal grid row count]:ROWS:_default' \
+'(--columns --rows)--width=[Exact physical client width in pixels]:WIDTH:_default' \
+'(--columns --rows)--height=[Exact physical client height in pixels]:HEIGHT:_default' \
+'-w+[Window ID. The focused window is used when this is omitted]:WINDOW_ID:_default' \
+'--window-id=[Window ID. The focused window is used when this is omitted]:WINDOW_ID:_default' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(focus)
+_arguments "${_arguments_options[@]}" : \
+'-w+[Window ID. The focused window is used when this is omitted]:WINDOW_ID:_default' \
+'--window-id=[Window ID. The focused window is used when this is omitted]:WINDOW_ID:_default' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(signal)
+_arguments "${_arguments_options[@]}" : \
+'-w+[Window ID. The focused window is used when this is omitted]:WINDOW_ID:_default' \
+'--window-id=[Window ID. The focused window is used when this is omitted]:WINDOW_ID:_default' \
+'-h[Print help]' \
+'--help[Print help]' \
+':signal -- Signal name without a SIG prefix:(int term hup quit tstp cont winch kill stop)' \
+&& ret=0
+;;
+(list-windows)
+_arguments "${_arguments_options[@]}" : \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(inspect)
+_arguments "${_arguments_options[@]}" : \
+'-w+[Window ID. The focused window is used when this is omitted]:WINDOW_ID:_default' \
+'--window-id=[Window ID. The focused window is used when this is omitted]:WINDOW_ID:_default' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(get-grid)
+_arguments "${_arguments_options[@]}" : \
+'(--since-screen)--start-line=[First signed physical grid line in retained scrollback/live-screen coordinates]:START_LINE:_default' \
+'(--since-screen)--row-count=[Number of physical rows to return]:ROW_COUNT:_default' \
+'--since-screen=[Return current viewport row replacements changed after this screen sequence]:SINCE_SCREEN:_default' \
+'-w+[Window ID. The focused window is used when this is omitted]:WINDOW_ID:_default' \
+'--window-id=[Window ID. The focused window is used when this is omitted]:WINDOW_ID:_default' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(wait)
+_arguments "${_arguments_options[@]}" : \
+'-h[Print help]' \
+'--help[Print help]' \
+":: :_vivido__msg__wait_commands" \
+"*::: :->wait" \
+&& ret=0
+
+    case $state in
+    (wait)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:vivido-msg-wait-command-$line[1]:"
+        case $line[1] in
+            (text)
+_arguments "${_arguments_options[@]}" : \
+'--after-screen=[]:AFTER_SCREEN:_default' \
+'--timeout=[Maximum wait (for example 500ms, 30s, 2m, or 1h)]:TIMEOUT:_default' \
+'-w+[Window ID. The focused window is used when this is omitted]:WINDOW_ID:_default' \
+'--window-id=[Window ID. The focused window is used when this is omitted]:WINDOW_ID:_default' \
+'--regex[]' \
+'-h[Print help]' \
+'--help[Print help]' \
+':text:_default' \
+&& ret=0
+;;
+(output)
+_arguments "${_arguments_options[@]}" : \
+'--after-offset=[]:AFTER_OFFSET:_default' \
+'--timeout=[Maximum wait (for example 500ms, 30s, 2m, or 1h)]:TIMEOUT:_default' \
+'-w+[Window ID. The focused window is used when this is omitted]:WINDOW_ID:_default' \
+'--window-id=[Window ID. The focused window is used when this is omitted]:WINDOW_ID:_default' \
+'(--base64)--regex[]' \
+'(--regex)--base64[]' \
+'-h[Print help]' \
+'--help[Print help]' \
+':pattern:_default' \
+&& ret=0
+;;
+(screen-change)
+_arguments "${_arguments_options[@]}" : \
+'--after-screen=[]:AFTER_SCREEN:_default' \
+'--timeout=[Maximum wait (for example 500ms, 30s, 2m, or 1h)]:TIMEOUT:_default' \
+'-w+[Window ID. The focused window is used when this is omitted]:WINDOW_ID:_default' \
+'--window-id=[Window ID. The focused window is used when this is omitted]:WINDOW_ID:_default' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(screen-stable)
+_arguments "${_arguments_options[@]}" : \
+'--quiet=[Required period without semantic screen changes]:QUIET:_default' \
+'--after-screen=[]:AFTER_SCREEN:_default' \
+'--timeout=[Maximum wait (for example 500ms, 30s, 2m, or 1h)]:TIMEOUT:_default' \
+'-w+[Window ID. The focused window is used when this is omitted]:WINDOW_ID:_default' \
+'--window-id=[Window ID. The focused window is used when this is omitted]:WINDOW_ID:_default' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(frame)
+_arguments "${_arguments_options[@]}" : \
+'--after-frame=[]:AFTER_FRAME:_default' \
+'--timeout=[Maximum wait (for example 500ms, 30s, 2m, or 1h)]:TIMEOUT:_default' \
+'-w+[Window ID. The focused window is used when this is omitted]:WINDOW_ID:_default' \
+'--window-id=[Window ID. The focused window is used when this is omitted]:WINDOW_ID:_default' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(exit)
+_arguments "${_arguments_options[@]}" : \
+'--timeout=[Maximum wait (for example 500ms, 30s, 2m, or 1h)]:TIMEOUT:_default' \
+'-w+[Window ID. The focused window is used when this is omitted]:WINDOW_ID:_default' \
+'--window-id=[Window ID. The focused window is used when this is omitted]:WINDOW_ID:_default' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+":: :_vivido__msg__wait__help_commands" \
+"*::: :->help" \
+&& ret=0
+
+    case $state in
+    (help)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:vivido-msg-wait-help-command-$line[1]:"
+        case $line[1] in
+            (text)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(output)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(screen-change)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(screen-stable)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(frame)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(exit)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+        esac
+    ;;
+esac
+;;
+(transcript)
+_arguments "${_arguments_options[@]}" : \
+'--after-offset=[First retained byte offset. Omit to request the newest bytes]:AFTER_OFFSET:_default' \
+'--max-bytes=[Maximum returned byte count]:MAX_BYTES:_default' \
+'-w+[Window ID. The focused window is used when this is omitted]:WINDOW_ID:_default' \
+'--window-id=[Window ID. The focused window is used when this is omitted]:WINDOW_ID:_default' \
+'--raw[Write exact decoded bytes instead of JSON metadata]' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(subscribe)
+_arguments "${_arguments_options[@]}" : \
+'(--all)-w+[Window ID. The focused window is used when omitted]:WINDOW_ID:_default' \
+'(--all)--window-id=[Window ID. The focused window is used when omitted]:WINDOW_ID:_default' \
+'*--events=[Comma-separated event kinds. Omit for all kinds]:EVENTS:_default' \
+'--since-event=[Replay matching events newer than this global event sequence]:SINCE_EVENT:_default' \
+'(-w --window-id)--all[Subscribe to every window and process lifecycle event]' \
+'-h[Print help]' \
+'--help[Print help]' \
 && ret=0
 ;;
 (help)
@@ -115,6 +556,146 @@ _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
 (get-config)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(typing)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(get-text)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(screenshot)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(capabilities)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(key)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(paste)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(mouse)
+_arguments "${_arguments_options[@]}" : \
+":: :_vivido__msg__help__mouse_commands" \
+"*::: :->mouse" \
+&& ret=0
+
+    case $state in
+    (mouse)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:vivido-msg-help-mouse-command-$line[1]:"
+        case $line[1] in
+            (move)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(click)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(double-click)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(down)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(up)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(drag)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(scroll)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+(resize)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(focus)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(signal)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(list-windows)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(inspect)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(get-grid)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(wait)
+_arguments "${_arguments_options[@]}" : \
+":: :_vivido__msg__help__wait_commands" \
+"*::: :->wait" \
+&& ret=0
+
+    case $state in
+    (wait)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:vivido-msg-help-wait-command-$line[1]:"
+        case $line[1] in
+            (text)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(output)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(screen-change)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(screen-stable)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(frame)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(exit)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+(transcript)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(subscribe)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
@@ -181,6 +762,146 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
+(typing)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(get-text)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(screenshot)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(capabilities)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(key)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(paste)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(mouse)
+_arguments "${_arguments_options[@]}" : \
+":: :_vivido__help__msg__mouse_commands" \
+"*::: :->mouse" \
+&& ret=0
+
+    case $state in
+    (mouse)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:vivido-help-msg-mouse-command-$line[1]:"
+        case $line[1] in
+            (move)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(click)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(double-click)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(down)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(up)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(drag)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(scroll)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+(resize)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(focus)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(signal)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(list-windows)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(inspect)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(get-grid)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(wait)
+_arguments "${_arguments_options[@]}" : \
+":: :_vivido__help__msg__wait_commands" \
+"*::: :->wait" \
+&& ret=0
+
+    case $state in
+    (wait)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:vivido-help-msg-wait-command-$line[1]:"
+        case $line[1] in
+            (text)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(output)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(screen-change)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(screen-stable)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(frame)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(exit)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+(transcript)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(subscribe)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
         esac
     ;;
 esac
@@ -236,8 +957,29 @@ _vivido__help__msg_commands() {
 'create-window:Create a new window in the same Vivido process' \
 'config:Update the Vivido configuration' \
 'get-config:Read runtime Vivido configuration' \
+'typing:Type literal text into a terminal' \
+'get-text:Read terminal text' \
+'screenshot:Capture the last displayed terminal frame' \
+'capabilities:Print supported automation methods, events, and limits' \
+'key:Send one mode-aware key to a terminal' \
+'paste:Paste literal text into a terminal' \
+'mouse:Send a mouse action to a terminal or Vivido UI' \
+'resize:Resize a terminal window' \
+'focus:Request real operating-system focus for a window' \
+'signal:Send an explicit signal to the foreground process group' \
+'list-windows:List all windows in deterministic creation order' \
+'inspect:Inspect one terminal window' \
+'get-grid:Read a structured terminal grid snapshot or delta' \
+'wait:Wait for terminal state or output' \
+'transcript:Read retained sanitized PTY output' \
+'subscribe:Stream automation events until interrupted' \
     )
     _describe -t commands 'vivido help msg commands' commands "$@"
+}
+(( $+functions[_vivido__help__msg__capabilities_commands] )) ||
+_vivido__help__msg__capabilities_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido help msg capabilities commands' commands "$@"
 }
 (( $+functions[_vivido__help__msg__config_commands] )) ||
 _vivido__help__msg__config_commands() {
@@ -249,10 +991,165 @@ _vivido__help__msg__create-window_commands() {
     local commands; commands=()
     _describe -t commands 'vivido help msg create-window commands' commands "$@"
 }
+(( $+functions[_vivido__help__msg__focus_commands] )) ||
+_vivido__help__msg__focus_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido help msg focus commands' commands "$@"
+}
 (( $+functions[_vivido__help__msg__get-config_commands] )) ||
 _vivido__help__msg__get-config_commands() {
     local commands; commands=()
     _describe -t commands 'vivido help msg get-config commands' commands "$@"
+}
+(( $+functions[_vivido__help__msg__get-grid_commands] )) ||
+_vivido__help__msg__get-grid_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido help msg get-grid commands' commands "$@"
+}
+(( $+functions[_vivido__help__msg__get-text_commands] )) ||
+_vivido__help__msg__get-text_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido help msg get-text commands' commands "$@"
+}
+(( $+functions[_vivido__help__msg__inspect_commands] )) ||
+_vivido__help__msg__inspect_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido help msg inspect commands' commands "$@"
+}
+(( $+functions[_vivido__help__msg__key_commands] )) ||
+_vivido__help__msg__key_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido help msg key commands' commands "$@"
+}
+(( $+functions[_vivido__help__msg__list-windows_commands] )) ||
+_vivido__help__msg__list-windows_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido help msg list-windows commands' commands "$@"
+}
+(( $+functions[_vivido__help__msg__mouse_commands] )) ||
+_vivido__help__msg__mouse_commands() {
+    local commands; commands=(
+'move:Mouse coordinate and modifier arguments' \
+'click:Mouse arguments requiring a button' \
+'double-click:Mouse arguments requiring a button' \
+'down:Mouse arguments requiring a button' \
+'up:Mouse arguments requiring a button' \
+'drag:Mouse arguments requiring a button' \
+'scroll:Mouse scrolling arguments' \
+    )
+    _describe -t commands 'vivido help msg mouse commands' commands "$@"
+}
+(( $+functions[_vivido__help__msg__mouse__click_commands] )) ||
+_vivido__help__msg__mouse__click_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido help msg mouse click commands' commands "$@"
+}
+(( $+functions[_vivido__help__msg__mouse__double-click_commands] )) ||
+_vivido__help__msg__mouse__double-click_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido help msg mouse double-click commands' commands "$@"
+}
+(( $+functions[_vivido__help__msg__mouse__down_commands] )) ||
+_vivido__help__msg__mouse__down_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido help msg mouse down commands' commands "$@"
+}
+(( $+functions[_vivido__help__msg__mouse__drag_commands] )) ||
+_vivido__help__msg__mouse__drag_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido help msg mouse drag commands' commands "$@"
+}
+(( $+functions[_vivido__help__msg__mouse__move_commands] )) ||
+_vivido__help__msg__mouse__move_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido help msg mouse move commands' commands "$@"
+}
+(( $+functions[_vivido__help__msg__mouse__scroll_commands] )) ||
+_vivido__help__msg__mouse__scroll_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido help msg mouse scroll commands' commands "$@"
+}
+(( $+functions[_vivido__help__msg__mouse__up_commands] )) ||
+_vivido__help__msg__mouse__up_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido help msg mouse up commands' commands "$@"
+}
+(( $+functions[_vivido__help__msg__paste_commands] )) ||
+_vivido__help__msg__paste_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido help msg paste commands' commands "$@"
+}
+(( $+functions[_vivido__help__msg__resize_commands] )) ||
+_vivido__help__msg__resize_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido help msg resize commands' commands "$@"
+}
+(( $+functions[_vivido__help__msg__screenshot_commands] )) ||
+_vivido__help__msg__screenshot_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido help msg screenshot commands' commands "$@"
+}
+(( $+functions[_vivido__help__msg__signal_commands] )) ||
+_vivido__help__msg__signal_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido help msg signal commands' commands "$@"
+}
+(( $+functions[_vivido__help__msg__subscribe_commands] )) ||
+_vivido__help__msg__subscribe_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido help msg subscribe commands' commands "$@"
+}
+(( $+functions[_vivido__help__msg__transcript_commands] )) ||
+_vivido__help__msg__transcript_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido help msg transcript commands' commands "$@"
+}
+(( $+functions[_vivido__help__msg__typing_commands] )) ||
+_vivido__help__msg__typing_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido help msg typing commands' commands "$@"
+}
+(( $+functions[_vivido__help__msg__wait_commands] )) ||
+_vivido__help__msg__wait_commands() {
+    local commands; commands=(
+'text:Text wait parameters' \
+'output:Output wait parameters' \
+'screen-change:Screen/frame sequence wait parameters' \
+'screen-stable:Screen stability wait parameters' \
+'frame:Frame wait parameters' \
+'exit:Common timeout for wait commands, represented as milliseconds on the wire' \
+    )
+    _describe -t commands 'vivido help msg wait commands' commands "$@"
+}
+(( $+functions[_vivido__help__msg__wait__exit_commands] )) ||
+_vivido__help__msg__wait__exit_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido help msg wait exit commands' commands "$@"
+}
+(( $+functions[_vivido__help__msg__wait__frame_commands] )) ||
+_vivido__help__msg__wait__frame_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido help msg wait frame commands' commands "$@"
+}
+(( $+functions[_vivido__help__msg__wait__output_commands] )) ||
+_vivido__help__msg__wait__output_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido help msg wait output commands' commands "$@"
+}
+(( $+functions[_vivido__help__msg__wait__screen-change_commands] )) ||
+_vivido__help__msg__wait__screen-change_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido help msg wait screen-change commands' commands "$@"
+}
+(( $+functions[_vivido__help__msg__wait__screen-stable_commands] )) ||
+_vivido__help__msg__wait__screen-stable_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido help msg wait screen-stable commands' commands "$@"
+}
+(( $+functions[_vivido__help__msg__wait__text_commands] )) ||
+_vivido__help__msg__wait__text_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido help msg wait text commands' commands "$@"
 }
 (( $+functions[_vivido__migrate_commands] )) ||
 _vivido__migrate_commands() {
@@ -265,9 +1162,30 @@ _vivido__msg_commands() {
 'create-window:Create a new window in the same Vivido process' \
 'config:Update the Vivido configuration' \
 'get-config:Read runtime Vivido configuration' \
+'typing:Type literal text into a terminal' \
+'get-text:Read terminal text' \
+'screenshot:Capture the last displayed terminal frame' \
+'capabilities:Print supported automation methods, events, and limits' \
+'key:Send one mode-aware key to a terminal' \
+'paste:Paste literal text into a terminal' \
+'mouse:Send a mouse action to a terminal or Vivido UI' \
+'resize:Resize a terminal window' \
+'focus:Request real operating-system focus for a window' \
+'signal:Send an explicit signal to the foreground process group' \
+'list-windows:List all windows in deterministic creation order' \
+'inspect:Inspect one terminal window' \
+'get-grid:Read a structured terminal grid snapshot or delta' \
+'wait:Wait for terminal state or output' \
+'transcript:Read retained sanitized PTY output' \
+'subscribe:Stream automation events until interrupted' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'vivido msg commands' commands "$@"
+}
+(( $+functions[_vivido__msg__capabilities_commands] )) ||
+_vivido__msg__capabilities_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg capabilities commands' commands "$@"
 }
 (( $+functions[_vivido__msg__config_commands] )) ||
 _vivido__msg__config_commands() {
@@ -279,10 +1197,25 @@ _vivido__msg__create-window_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg create-window commands' commands "$@"
 }
+(( $+functions[_vivido__msg__focus_commands] )) ||
+_vivido__msg__focus_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg focus commands' commands "$@"
+}
 (( $+functions[_vivido__msg__get-config_commands] )) ||
 _vivido__msg__get-config_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg get-config commands' commands "$@"
+}
+(( $+functions[_vivido__msg__get-grid_commands] )) ||
+_vivido__msg__get-grid_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg get-grid commands' commands "$@"
+}
+(( $+functions[_vivido__msg__get-text_commands] )) ||
+_vivido__msg__get-text_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg get-text commands' commands "$@"
 }
 (( $+functions[_vivido__msg__help_commands] )) ||
 _vivido__msg__help_commands() {
@@ -290,9 +1223,30 @@ _vivido__msg__help_commands() {
 'create-window:Create a new window in the same Vivido process' \
 'config:Update the Vivido configuration' \
 'get-config:Read runtime Vivido configuration' \
+'typing:Type literal text into a terminal' \
+'get-text:Read terminal text' \
+'screenshot:Capture the last displayed terminal frame' \
+'capabilities:Print supported automation methods, events, and limits' \
+'key:Send one mode-aware key to a terminal' \
+'paste:Paste literal text into a terminal' \
+'mouse:Send a mouse action to a terminal or Vivido UI' \
+'resize:Resize a terminal window' \
+'focus:Request real operating-system focus for a window' \
+'signal:Send an explicit signal to the foreground process group' \
+'list-windows:List all windows in deterministic creation order' \
+'inspect:Inspect one terminal window' \
+'get-grid:Read a structured terminal grid snapshot or delta' \
+'wait:Wait for terminal state or output' \
+'transcript:Read retained sanitized PTY output' \
+'subscribe:Stream automation events until interrupted' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'vivido msg help commands' commands "$@"
+}
+(( $+functions[_vivido__msg__help__capabilities_commands] )) ||
+_vivido__msg__help__capabilities_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg help capabilities commands' commands "$@"
 }
 (( $+functions[_vivido__msg__help__config_commands] )) ||
 _vivido__msg__help__config_commands() {
@@ -304,15 +1258,414 @@ _vivido__msg__help__create-window_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg help create-window commands' commands "$@"
 }
+(( $+functions[_vivido__msg__help__focus_commands] )) ||
+_vivido__msg__help__focus_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg help focus commands' commands "$@"
+}
 (( $+functions[_vivido__msg__help__get-config_commands] )) ||
 _vivido__msg__help__get-config_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg help get-config commands' commands "$@"
 }
+(( $+functions[_vivido__msg__help__get-grid_commands] )) ||
+_vivido__msg__help__get-grid_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg help get-grid commands' commands "$@"
+}
+(( $+functions[_vivido__msg__help__get-text_commands] )) ||
+_vivido__msg__help__get-text_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg help get-text commands' commands "$@"
+}
 (( $+functions[_vivido__msg__help__help_commands] )) ||
 _vivido__msg__help__help_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg help help commands' commands "$@"
+}
+(( $+functions[_vivido__msg__help__inspect_commands] )) ||
+_vivido__msg__help__inspect_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg help inspect commands' commands "$@"
+}
+(( $+functions[_vivido__msg__help__key_commands] )) ||
+_vivido__msg__help__key_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg help key commands' commands "$@"
+}
+(( $+functions[_vivido__msg__help__list-windows_commands] )) ||
+_vivido__msg__help__list-windows_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg help list-windows commands' commands "$@"
+}
+(( $+functions[_vivido__msg__help__mouse_commands] )) ||
+_vivido__msg__help__mouse_commands() {
+    local commands; commands=(
+'move:Mouse coordinate and modifier arguments' \
+'click:Mouse arguments requiring a button' \
+'double-click:Mouse arguments requiring a button' \
+'down:Mouse arguments requiring a button' \
+'up:Mouse arguments requiring a button' \
+'drag:Mouse arguments requiring a button' \
+'scroll:Mouse scrolling arguments' \
+    )
+    _describe -t commands 'vivido msg help mouse commands' commands "$@"
+}
+(( $+functions[_vivido__msg__help__mouse__click_commands] )) ||
+_vivido__msg__help__mouse__click_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg help mouse click commands' commands "$@"
+}
+(( $+functions[_vivido__msg__help__mouse__double-click_commands] )) ||
+_vivido__msg__help__mouse__double-click_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg help mouse double-click commands' commands "$@"
+}
+(( $+functions[_vivido__msg__help__mouse__down_commands] )) ||
+_vivido__msg__help__mouse__down_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg help mouse down commands' commands "$@"
+}
+(( $+functions[_vivido__msg__help__mouse__drag_commands] )) ||
+_vivido__msg__help__mouse__drag_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg help mouse drag commands' commands "$@"
+}
+(( $+functions[_vivido__msg__help__mouse__move_commands] )) ||
+_vivido__msg__help__mouse__move_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg help mouse move commands' commands "$@"
+}
+(( $+functions[_vivido__msg__help__mouse__scroll_commands] )) ||
+_vivido__msg__help__mouse__scroll_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg help mouse scroll commands' commands "$@"
+}
+(( $+functions[_vivido__msg__help__mouse__up_commands] )) ||
+_vivido__msg__help__mouse__up_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg help mouse up commands' commands "$@"
+}
+(( $+functions[_vivido__msg__help__paste_commands] )) ||
+_vivido__msg__help__paste_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg help paste commands' commands "$@"
+}
+(( $+functions[_vivido__msg__help__resize_commands] )) ||
+_vivido__msg__help__resize_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg help resize commands' commands "$@"
+}
+(( $+functions[_vivido__msg__help__screenshot_commands] )) ||
+_vivido__msg__help__screenshot_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg help screenshot commands' commands "$@"
+}
+(( $+functions[_vivido__msg__help__signal_commands] )) ||
+_vivido__msg__help__signal_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg help signal commands' commands "$@"
+}
+(( $+functions[_vivido__msg__help__subscribe_commands] )) ||
+_vivido__msg__help__subscribe_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg help subscribe commands' commands "$@"
+}
+(( $+functions[_vivido__msg__help__transcript_commands] )) ||
+_vivido__msg__help__transcript_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg help transcript commands' commands "$@"
+}
+(( $+functions[_vivido__msg__help__typing_commands] )) ||
+_vivido__msg__help__typing_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg help typing commands' commands "$@"
+}
+(( $+functions[_vivido__msg__help__wait_commands] )) ||
+_vivido__msg__help__wait_commands() {
+    local commands; commands=(
+'text:Text wait parameters' \
+'output:Output wait parameters' \
+'screen-change:Screen/frame sequence wait parameters' \
+'screen-stable:Screen stability wait parameters' \
+'frame:Frame wait parameters' \
+'exit:Common timeout for wait commands, represented as milliseconds on the wire' \
+    )
+    _describe -t commands 'vivido msg help wait commands' commands "$@"
+}
+(( $+functions[_vivido__msg__help__wait__exit_commands] )) ||
+_vivido__msg__help__wait__exit_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg help wait exit commands' commands "$@"
+}
+(( $+functions[_vivido__msg__help__wait__frame_commands] )) ||
+_vivido__msg__help__wait__frame_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg help wait frame commands' commands "$@"
+}
+(( $+functions[_vivido__msg__help__wait__output_commands] )) ||
+_vivido__msg__help__wait__output_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg help wait output commands' commands "$@"
+}
+(( $+functions[_vivido__msg__help__wait__screen-change_commands] )) ||
+_vivido__msg__help__wait__screen-change_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg help wait screen-change commands' commands "$@"
+}
+(( $+functions[_vivido__msg__help__wait__screen-stable_commands] )) ||
+_vivido__msg__help__wait__screen-stable_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg help wait screen-stable commands' commands "$@"
+}
+(( $+functions[_vivido__msg__help__wait__text_commands] )) ||
+_vivido__msg__help__wait__text_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg help wait text commands' commands "$@"
+}
+(( $+functions[_vivido__msg__inspect_commands] )) ||
+_vivido__msg__inspect_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg inspect commands' commands "$@"
+}
+(( $+functions[_vivido__msg__key_commands] )) ||
+_vivido__msg__key_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg key commands' commands "$@"
+}
+(( $+functions[_vivido__msg__list-windows_commands] )) ||
+_vivido__msg__list-windows_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg list-windows commands' commands "$@"
+}
+(( $+functions[_vivido__msg__mouse_commands] )) ||
+_vivido__msg__mouse_commands() {
+    local commands; commands=(
+'move:Mouse coordinate and modifier arguments' \
+'click:Mouse arguments requiring a button' \
+'double-click:Mouse arguments requiring a button' \
+'down:Mouse arguments requiring a button' \
+'up:Mouse arguments requiring a button' \
+'drag:Mouse arguments requiring a button' \
+'scroll:Mouse scrolling arguments' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'vivido msg mouse commands' commands "$@"
+}
+(( $+functions[_vivido__msg__mouse__click_commands] )) ||
+_vivido__msg__mouse__click_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg mouse click commands' commands "$@"
+}
+(( $+functions[_vivido__msg__mouse__double-click_commands] )) ||
+_vivido__msg__mouse__double-click_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg mouse double-click commands' commands "$@"
+}
+(( $+functions[_vivido__msg__mouse__down_commands] )) ||
+_vivido__msg__mouse__down_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg mouse down commands' commands "$@"
+}
+(( $+functions[_vivido__msg__mouse__drag_commands] )) ||
+_vivido__msg__mouse__drag_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg mouse drag commands' commands "$@"
+}
+(( $+functions[_vivido__msg__mouse__help_commands] )) ||
+_vivido__msg__mouse__help_commands() {
+    local commands; commands=(
+'move:Mouse coordinate and modifier arguments' \
+'click:Mouse arguments requiring a button' \
+'double-click:Mouse arguments requiring a button' \
+'down:Mouse arguments requiring a button' \
+'up:Mouse arguments requiring a button' \
+'drag:Mouse arguments requiring a button' \
+'scroll:Mouse scrolling arguments' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'vivido msg mouse help commands' commands "$@"
+}
+(( $+functions[_vivido__msg__mouse__help__click_commands] )) ||
+_vivido__msg__mouse__help__click_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg mouse help click commands' commands "$@"
+}
+(( $+functions[_vivido__msg__mouse__help__double-click_commands] )) ||
+_vivido__msg__mouse__help__double-click_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg mouse help double-click commands' commands "$@"
+}
+(( $+functions[_vivido__msg__mouse__help__down_commands] )) ||
+_vivido__msg__mouse__help__down_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg mouse help down commands' commands "$@"
+}
+(( $+functions[_vivido__msg__mouse__help__drag_commands] )) ||
+_vivido__msg__mouse__help__drag_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg mouse help drag commands' commands "$@"
+}
+(( $+functions[_vivido__msg__mouse__help__help_commands] )) ||
+_vivido__msg__mouse__help__help_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg mouse help help commands' commands "$@"
+}
+(( $+functions[_vivido__msg__mouse__help__move_commands] )) ||
+_vivido__msg__mouse__help__move_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg mouse help move commands' commands "$@"
+}
+(( $+functions[_vivido__msg__mouse__help__scroll_commands] )) ||
+_vivido__msg__mouse__help__scroll_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg mouse help scroll commands' commands "$@"
+}
+(( $+functions[_vivido__msg__mouse__help__up_commands] )) ||
+_vivido__msg__mouse__help__up_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg mouse help up commands' commands "$@"
+}
+(( $+functions[_vivido__msg__mouse__move_commands] )) ||
+_vivido__msg__mouse__move_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg mouse move commands' commands "$@"
+}
+(( $+functions[_vivido__msg__mouse__scroll_commands] )) ||
+_vivido__msg__mouse__scroll_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg mouse scroll commands' commands "$@"
+}
+(( $+functions[_vivido__msg__mouse__up_commands] )) ||
+_vivido__msg__mouse__up_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg mouse up commands' commands "$@"
+}
+(( $+functions[_vivido__msg__paste_commands] )) ||
+_vivido__msg__paste_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg paste commands' commands "$@"
+}
+(( $+functions[_vivido__msg__resize_commands] )) ||
+_vivido__msg__resize_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg resize commands' commands "$@"
+}
+(( $+functions[_vivido__msg__screenshot_commands] )) ||
+_vivido__msg__screenshot_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg screenshot commands' commands "$@"
+}
+(( $+functions[_vivido__msg__signal_commands] )) ||
+_vivido__msg__signal_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg signal commands' commands "$@"
+}
+(( $+functions[_vivido__msg__subscribe_commands] )) ||
+_vivido__msg__subscribe_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg subscribe commands' commands "$@"
+}
+(( $+functions[_vivido__msg__transcript_commands] )) ||
+_vivido__msg__transcript_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg transcript commands' commands "$@"
+}
+(( $+functions[_vivido__msg__typing_commands] )) ||
+_vivido__msg__typing_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg typing commands' commands "$@"
+}
+(( $+functions[_vivido__msg__wait_commands] )) ||
+_vivido__msg__wait_commands() {
+    local commands; commands=(
+'text:Text wait parameters' \
+'output:Output wait parameters' \
+'screen-change:Screen/frame sequence wait parameters' \
+'screen-stable:Screen stability wait parameters' \
+'frame:Frame wait parameters' \
+'exit:Common timeout for wait commands, represented as milliseconds on the wire' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'vivido msg wait commands' commands "$@"
+}
+(( $+functions[_vivido__msg__wait__exit_commands] )) ||
+_vivido__msg__wait__exit_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg wait exit commands' commands "$@"
+}
+(( $+functions[_vivido__msg__wait__frame_commands] )) ||
+_vivido__msg__wait__frame_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg wait frame commands' commands "$@"
+}
+(( $+functions[_vivido__msg__wait__help_commands] )) ||
+_vivido__msg__wait__help_commands() {
+    local commands; commands=(
+'text:Text wait parameters' \
+'output:Output wait parameters' \
+'screen-change:Screen/frame sequence wait parameters' \
+'screen-stable:Screen stability wait parameters' \
+'frame:Frame wait parameters' \
+'exit:Common timeout for wait commands, represented as milliseconds on the wire' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'vivido msg wait help commands' commands "$@"
+}
+(( $+functions[_vivido__msg__wait__help__exit_commands] )) ||
+_vivido__msg__wait__help__exit_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg wait help exit commands' commands "$@"
+}
+(( $+functions[_vivido__msg__wait__help__frame_commands] )) ||
+_vivido__msg__wait__help__frame_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg wait help frame commands' commands "$@"
+}
+(( $+functions[_vivido__msg__wait__help__help_commands] )) ||
+_vivido__msg__wait__help__help_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg wait help help commands' commands "$@"
+}
+(( $+functions[_vivido__msg__wait__help__output_commands] )) ||
+_vivido__msg__wait__help__output_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg wait help output commands' commands "$@"
+}
+(( $+functions[_vivido__msg__wait__help__screen-change_commands] )) ||
+_vivido__msg__wait__help__screen-change_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg wait help screen-change commands' commands "$@"
+}
+(( $+functions[_vivido__msg__wait__help__screen-stable_commands] )) ||
+_vivido__msg__wait__help__screen-stable_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg wait help screen-stable commands' commands "$@"
+}
+(( $+functions[_vivido__msg__wait__help__text_commands] )) ||
+_vivido__msg__wait__help__text_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg wait help text commands' commands "$@"
+}
+(( $+functions[_vivido__msg__wait__output_commands] )) ||
+_vivido__msg__wait__output_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg wait output commands' commands "$@"
+}
+(( $+functions[_vivido__msg__wait__screen-change_commands] )) ||
+_vivido__msg__wait__screen-change_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg wait screen-change commands' commands "$@"
+}
+(( $+functions[_vivido__msg__wait__screen-stable_commands] )) ||
+_vivido__msg__wait__screen-stable_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg wait screen-stable commands' commands "$@"
+}
+(( $+functions[_vivido__msg__wait__text_commands] )) ||
+_vivido__msg__wait__text_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg wait text commands' commands "$@"
 }
 
 if [ "$funcstack[1]" = "_vivido" ]; then

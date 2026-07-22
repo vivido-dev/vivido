@@ -7,6 +7,8 @@ use std::fs::File;
 use std::io::{self, ErrorKind, Read, Write};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
+#[cfg(unix)]
+use std::sync::Mutex;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread::JoinHandle;
 use std::time::Instant;
@@ -14,6 +16,8 @@ use std::time::Instant;
 use log::error;
 use polling::{Event as PollingEvent, Events, PollMode, Poller};
 
+#[cfg(unix)]
+use crate::automation::Transcript;
 use crate::terminal::event::{self, Event, EventListener, WindowSize};
 use crate::terminal::sync::FairMutex;
 use crate::terminal::term::Term;
@@ -30,13 +34,13 @@ const MAX_LOCKED_READ: usize = u16::MAX as usize;
 #[derive(Debug)]
 pub enum Msg {
     /// Data that should be written to the PTY.
-    Input(Cow<'static, [u8]>),
+    Input { bytes: Cow<'static, [u8]>, completion: Option<u64> },
 
     /// Indicates that the `EventLoop` should shut down, as Vivido is shutting down.
     Shutdown,
 
     /// Instruction to resize the PTY.
-    Resize(WindowSize),
+    Resize { window_size: WindowSize, completion: Option<u64> },
 }
 
 /// The main event loop.
@@ -52,6 +56,8 @@ pub struct EventLoop<T: tty::EventedPty, U: EventListener> {
     event_proxy: U,
     drain_on_exit: bool,
     ref_test: bool,
+    #[cfg(unix)]
+    transcript: Arc<Mutex<Transcript>>,
 }
 
 impl<T, U> EventLoop<T, U>
@@ -66,6 +72,7 @@ where
         pty: T,
         drain_on_exit: bool,
         ref_test: bool,
+        #[cfg(unix)] transcript: Arc<Mutex<Transcript>>,
     ) -> io::Result<EventLoop<T, U>> {
         let (tx, rx) = mpsc::channel();
         let poll = Poller::new()?.into();
@@ -78,6 +85,8 @@ where
             event_proxy,
             drain_on_exit,
             ref_test,
+            #[cfg(unix)]
+            transcript,
         })
     }
 
@@ -91,8 +100,15 @@ where
     fn drain_recv_channel(&mut self, state: &mut State) -> bool {
         while let Some(msg) = self.rx.recv() {
             match msg {
-                Msg::Input(input) => state.write_list.push_back(input),
-                Msg::Resize(window_size) => self.pty.on_resize(window_size),
+                Msg::Input { bytes, completion } => {
+                    state.write_list.push_back(PendingInput { bytes, completion });
+                },
+                Msg::Resize { window_size, completion } => {
+                    self.pty.on_resize(window_size);
+                    if let Some(token) = completion {
+                        self.event_proxy.send_event(Event::PtyResizeComplete(token));
+                    }
+                },
                 Msg::Shutdown => return false,
             }
         }
@@ -152,7 +168,16 @@ where
 
             // Parse the incoming bytes, observing only the bounded authenticated-marker envelope.
             // The complete APC is still passed to VTE, which keeps it zero-width and invisible.
-            processed += state.advance(&mut **terminal, &buf[..unprocessed]);
+            processed += state.advance(
+                &mut **terminal,
+                &buf[..unprocessed],
+                #[cfg(unix)]
+                &self.transcript,
+            );
+            #[cfg(unix)]
+            if let Some((start, end)) = state.take_output_range() {
+                self.event_proxy.send_event(Event::PtyOutput { start, end });
+            }
             unprocessed = 0;
 
             // Assure we're not blocking the terminal too long unnecessarily.
@@ -183,6 +208,9 @@ where
                     Ok(n) => {
                         current.advance(n);
                         if current.finished() {
+                            if let Some(token) = current.completion {
+                                self.event_proxy.send_event(Event::PtyWriteComplete(token));
+                            }
                             state.goto_next();
                             break 'write_one;
                         }
@@ -326,6 +354,12 @@ where
 struct Writing {
     source: Cow<'static, [u8]>,
     written: usize,
+    completion: Option<u64>,
+}
+
+struct PendingInput {
+    bytes: Cow<'static, [u8]>,
+    completion: Option<u64>,
 }
 
 pub struct Notifier(pub EventLoopSender);
@@ -341,13 +375,13 @@ impl event::Notify for Notifier {
             return;
         }
 
-        let _ = self.0.send(Msg::Input(bytes));
+        let _ = self.0.send(Msg::Input { bytes, completion: None });
     }
 }
 
 impl event::OnResize for Notifier {
     fn on_resize(&mut self, window_size: WindowSize) {
-        let _ = self.0.send(Msg::Resize(window_size));
+        let _ = self.0.send(Msg::Resize { window_size, completion: None });
     }
 }
 
@@ -397,19 +431,34 @@ impl EventLoopSender {
 /// would otherwise be mutated on the `EventLoop` goes here.
 #[derive(Default)]
 pub struct State {
-    write_list: VecDeque<Cow<'static, [u8]>>,
+    write_list: VecDeque<PendingInput>,
     writing: Option<Writing>,
     parser: ansi::Processor,
     vivid_markers: VividMarkerScanner,
+    #[cfg(unix)]
+    output_range: Option<(u64, u64)>,
 }
 
 impl State {
-    fn advance<T: EventListener>(&mut self, terminal: &mut Term<T>, bytes: &[u8]) -> usize {
+    fn advance<T: EventListener>(
+        &mut self,
+        terminal: &mut Term<T>,
+        bytes: &[u8],
+        #[cfg(unix)] transcript: &Arc<Mutex<Transcript>>,
+    ) -> usize {
         let mut processed = 0;
         for chunk in self.vivid_markers.push(bytes) {
             match chunk {
                 VividChunk::Bytes(bytes) => {
                     processed += bytes.len();
+                    #[cfg(unix)]
+                    {
+                        let (start, end) = transcript.lock().unwrap().append(&bytes);
+                        self.output_range = Some(match self.output_range {
+                            Some((existing, _)) => (existing, end),
+                            None => (start, end),
+                        });
+                    }
                     self.parser.advance(terminal, &bytes);
                 },
                 VividChunk::Marker { raw, marker } => {
@@ -421,6 +470,11 @@ impl State {
             }
         }
         processed
+    }
+
+    #[cfg(unix)]
+    fn take_output_range(&mut self) -> Option<(u64, u64)> {
+        self.output_range.take()
     }
 
     #[inline]
@@ -555,8 +609,8 @@ fn partial_prefix_len(bytes: &[u8], prefix: &[u8]) -> usize {
 
 impl Writing {
     #[inline]
-    fn new(c: Cow<'static, [u8]>) -> Writing {
-        Writing { source: c, written: 0 }
+    fn new(input: PendingInput) -> Writing {
+        Writing { source: input.bytes, written: 0, completion: input.completion }
     }
 
     #[inline]

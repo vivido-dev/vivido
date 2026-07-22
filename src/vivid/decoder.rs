@@ -504,6 +504,8 @@ mod tests {
             sar_num: 1,
             sar_den: 1,
             max_access_unit_bytes: 1024,
+            codec_string: None,
+            decoder_config: None,
         })
         .unwrap();
 

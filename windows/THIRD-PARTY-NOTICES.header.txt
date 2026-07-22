@@ -1,0 +1,11 @@
+Vivido Suite third-party notices
+================================
+
+This Windows package dynamically links the FFmpeg libraries selected by
+vivido/windows/vcpkg.json. GPL, nonfree, FDK-AAC, and unrelated optional FFmpeg
+features are intentionally disabled. The exact resolved package copyrights are
+collected below from the pinned vcpkg installation during the release build.
+
+PowerShell is distributed as an unmodified, Microsoft-signed prerequisite MSI.
+Its source and license are available from https://github.com/PowerShell/PowerShell.
+

@@ -543,6 +543,30 @@ impl<T> Term<T> {
         res.strip_suffix('\n').map(str::to_owned).unwrap_or(res)
     }
 
+    /// Convert the currently visible terminal viewport to logical text.
+    pub fn visible_text(&self) -> String {
+        let display_offset = self.grid.display_offset() as i32;
+        let start_line = Line(-display_offset);
+        let end_line = start_line + self.screen_lines() as i32 - 1;
+        self.bounds_to_string(
+            Point::new(start_line, Column(0)),
+            Point::new(end_line, self.last_column()),
+        )
+    }
+
+    /// Convert the latest physical terminal rows to logical text.
+    pub fn latest_text(&self, rows: usize) -> String {
+        debug_assert!(rows > 0);
+
+        let rows = cmp::min(rows, self.grid.total_lines());
+        let end_line = self.grid.bottommost_line();
+        let start_line = end_line - (rows as i32 - 1);
+        self.bounds_to_string(
+            Point::new(start_line, Column(0)),
+            Point::new(end_line, self.last_column()),
+        )
+    }
+
     /// Convert a single line in the grid to a String.
     fn line_to_string(
         &self,
@@ -2547,6 +2571,28 @@ mod tests {
     }
 
     #[test]
+    fn visible_text_uses_logical_wrapping() {
+        let term = mock_term("abc\nDEF\r\n今x");
+
+        assert_eq!(term.visible_text(), "abcDEF\n今x");
+        assert_eq!(term.latest_text(2), "DEF\n今x");
+    }
+
+    #[test]
+    fn latest_text_ignores_display_offset() {
+        let size = TermSize::new(5, 3);
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+        let mut parser: ansi::Processor = ansi::Processor::new();
+        parser.advance(&mut term, b"one\r\ntwo\r\nthree\r\nfour");
+
+        assert_eq!(term.visible_text(), "two\nthree\nfour");
+        term.scroll_display(Scroll::Top);
+        assert_eq!(term.visible_text(), "one\ntwo\nthree");
+        assert_eq!(term.latest_text(2), "three\nfour");
+        assert_eq!(term.latest_text(1000), "one\ntwo\nthree\nfour");
+    }
+
+    #[test]
     fn simple_selection_works() {
         let size = TermSize::new(5, 5);
         let mut term = Term::new(Config::default(), &size, VoidListener);
@@ -3175,7 +3221,7 @@ mod tests {
 
     #[test]
     fn parse_cargo_version() {
-        assert_eq!(version_number(env!("CARGO_PKG_VERSION")), 1_02);
+        assert_eq!(version_number(env!("CARGO_PKG_VERSION")), 2_00);
         assert_eq!(version_number("0.0.1-dev"), 1);
         assert_eq!(version_number("0.1.2-dev"), 1_02);
         assert_eq!(version_number("1.2.3-dev"), 1_02_03);

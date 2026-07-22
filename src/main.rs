@@ -29,6 +29,8 @@ use winit::event_loop::EventLoop;
 
 use crate::terminal::tty;
 
+#[cfg(unix)]
+mod automation;
 mod cli;
 mod clipboard;
 mod config;
@@ -46,6 +48,8 @@ mod panic;
 #[cfg(unix)]
 mod polling;
 mod scheduler;
+#[cfg(unix)]
+mod screenshot;
 mod serde_replace;
 mod string;
 pub mod terminal;
@@ -101,7 +105,7 @@ fn msg(mut options: MessageOptions) -> Result<(), Box<dyn Error>> {
         window_options.activation_token =
             env::var("XDG_ACTIVATION_TOKEN").or_else(|_| env::var("DESKTOP_STARTUP_ID")).ok();
     }
-    ipc::send_message(options.socket, options.message).map_err(|err| err.into())
+    ipc::send_message(options).map_err(|err| err.into())
 }
 
 /// Temporary files stored for Vivido.

@@ -1,0 +1,14 @@
+{
+  "architecture": "x64",
+  "minimum_windows_build": 22000,
+  "rust_toolchain": "1.88.0",
+  "vcpkg_tag": "2026.05.25",
+  "vcpkg_commit": "d015e31e90838a4c9dfa3eed45979bc70d9357fc",
+  "wix_version": "7.0.0",
+  "powershell": {
+    "version": "7.6.3",
+    "file": "PowerShell-7.6.3-win-x64.msi",
+    "url": "https://github.com/PowerShell/PowerShell/releases/download/v7.6.3/PowerShell-7.6.3-win-x64.msi",
+    "sha256": "4F574FDDB567F4D0756094424A1E4E2B2BBDDE21DE9F0965C0F988D24DC658E4"
+  }
+}

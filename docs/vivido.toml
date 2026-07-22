@@ -1,0 +1,341 @@
+# Example Vivido configuration.
+#
+# Copy this to one of:
+#   Linux/BSD : ~/.config/vivido/vivido.toml
+#   macOS     : ~/.config/vivido/vivido.toml
+#   Windows   : %APPDATA%\vivido\vivido.toml
+#
+# Every value shown is the built-in DEFAULT. Uncomment and edit only what you
+# want to change; missing keys keep their defaults. See configuration.md for the
+# full reference. The Vivid Protocol media path is configured through the
+# environment, not this file.
+
+# ─────────────────────────────────────────────────────────────────────────────
+# general
+# ─────────────────────────────────────────────────────────────────────────────
+[general]
+# Additional config files merged in (absolute, ~/-relative, or file-relative).
+# Later entries and this file override earlier ones. Nests up to 5 levels.
+import = []
+
+# Directory the shell starts in. Unset inherits Vivido's working directory.
+# working_directory = "~/work"
+
+# Reapply the config automatically when the file changes.
+live_config_reload = true
+
+# Offer IPC over a Unix socket (`vivido msg …`). Unix only; ignored on Windows.
+ipc_socket = true
+
+# ─────────────────────────────────────────────────────────────────────────────
+# env — environment variables exported to spawned processes
+# ─────────────────────────────────────────────────────────────────────────────
+[env]
+# TERM = "vivido"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# window
+# ─────────────────────────────────────────────────────────────────────────────
+[window]
+# Blank space around the grid, in pixels (scaled by DPI).
+padding = { x = 0, y = 0 }
+
+# Distribute leftover space evenly as extra padding.
+dynamic_padding = false
+
+# Full | None | Transparent | Buttonless
+decorations = "Full"
+
+# Background opacity, 0.0–1.0. Requires a compositor that honors it.
+opacity = 1.0
+
+# Request background blur (macOS and KDE Wayland).
+blur = false
+
+# Windowed | Maximized | Fullscreen | SimpleFullscreen
+startup_mode = "Windowed"
+
+# Initial window title.
+title = "Vivido"
+
+# Let applications change the title via escape sequences.
+dynamic_title = true
+
+# Snap resizes to whole cells.
+resize_increments = false
+
+# Normal | AlwaysOnTop
+level = "Normal"
+
+# macOS only: which Option key acts as Alt. OnlyLeft | OnlyRight | Both | None
+option_as_alt = "None"
+
+# Force server-side decoration theme: "Light" or "Dark". Unset follows system.
+# decorations_theme_variant = "Dark"
+
+# Startup position in physical pixels. Unset lets the WM decide.
+# position = { x = 0, y = 0 }
+
+# Initial size in cells. BOTH must be non-zero to take effect.
+[window.dimensions]
+columns = 0
+lines = 0
+
+# Wayland app_id / window class. A bare string sets `instance`.
+[window.class]
+general = "Vivido"
+instance = "Vivido"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# scrolling
+# ─────────────────────────────────────────────────────────────────────────────
+[scrolling]
+# Scrollback lines retained. Maximum 100000.
+history = 10000
+
+# Lines scrolled per wheel/step increment.
+multiplier = 3
+
+# ─────────────────────────────────────────────────────────────────────────────
+# font
+# ─────────────────────────────────────────────────────────────────────────────
+[font]
+# Font size in points.
+size = 11.25
+
+# Extra spacing added around each cell.
+offset = { x = 0, y = 0 }
+
+# Shift the glyph within its cell.
+glyph_offset = { x = 0, y = 0 }
+
+# Base face. Family default: monospace (Linux), Menlo (macOS), Consolas (Windows).
+[font.normal]
+family = "monospace"
+# style = "Regular"
+
+# Secondary faces fall back to font.normal.family when `family` is omitted.
+[font.bold]
+style = "Bold"
+
+[font.italic]
+style = "Italic"
+
+[font.bold_italic]
+style = "Bold Italic"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# colors  (base16-style default scheme)
+# ─────────────────────────────────────────────────────────────────────────────
+[colors]
+# Apply window.opacity to cells with an explicit background color too.
+transparent_background_colors = false
+
+# Render bold text using the bright palette.
+draw_bold_text_with_bright_colors = false
+
+[colors.primary]
+foreground = "#d8d8d8"
+background = "#181818"
+# bright_foreground = "#ffffff"   # used with draw_bold_text_with_bright_colors
+# dim_foreground   = "#828482"
+
+# Cursor colors. `text`/`cursor` also accept "CellForeground"/"CellBackground".
+[colors.cursor]
+text = "CellBackground"
+cursor = "CellForeground"
+
+[colors.selection]
+text = "CellBackground"
+background = "CellForeground"
+
+[colors.normal]
+black = "#181818"
+red = "#ac4242"
+green = "#90a959"
+yellow = "#f4bf75"
+blue = "#6a9fb5"
+magenta = "#aa759f"
+cyan = "#75b5aa"
+white = "#d8d8d8"
+
+[colors.bright]
+black = "#6b6b6b"
+red = "#c55555"
+green = "#aac474"
+yellow = "#feca88"
+blue = "#82b8c8"
+magenta = "#c28cb8"
+cyan = "#93d3c3"
+white = "#f8f8f8"
+
+# `dim` is auto-derived from `normal` if omitted.
+# [colors.dim]
+# black = "#0f0f0f"
+# ...
+
+[colors.search.matches]
+foreground = "#181818"
+background = "#ac4242"
+
+[colors.search.focused_match]
+foreground = "#181818"
+background = "#f4bf75"
+
+[colors.hints.start]
+foreground = "#181818"
+background = "#f4bf75"
+
+[colors.hints.end]
+foreground = "#181818"
+background = "#ac4242"
+
+# Footer bar (search/message line).
+# [colors.footer_bar]
+# foreground = "#181818"
+# background = "#d8d8d8"
+
+# Extend the 256-color palette; index must be 16–255.
+# [[colors.indexed_colors]]
+# index = 16
+# color = "#ff8700"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# bell
+# ─────────────────────────────────────────────────────────────────────────────
+[bell]
+# Ease | EaseOut | EaseOutSine | EaseOutQuad | EaseOutCubic | EaseOutQuart
+# | EaseOutQuint | EaseOutExpo | EaseOutCirc | Linear
+animation = "Linear"
+
+# Visual flash duration in ms. 0 disables the visual bell.
+duration = 0
+
+# Flash color.
+color = "#ffffff"
+
+# Command run when the bell rings.
+# command = { program = "paplay", args = ["/usr/share/sounds/freedesktop/stereo/bell.oga"] }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# selection
+# ─────────────────────────────────────────────────────────────────────────────
+[selection]
+# Copy selections to the system clipboard automatically.
+save_to_clipboard = false
+
+# ─────────────────────────────────────────────────────────────────────────────
+# cursor
+# ─────────────────────────────────────────────────────────────────────────────
+[cursor]
+# Draw a hollow cursor when the window loses focus.
+unfocused_hollow = true
+
+# Beam/underline thickness relative to the cell, 0.0–1.0.
+thickness = 0.15
+
+# Time between blinks in ms (floor of 10).
+blink_interval = 750
+
+# Stop blinking after this many idle seconds. 0 blinks forever.
+blink_timeout = 5
+
+[cursor.style]
+# Block | Underline | Beam
+shape = "Block"
+# Never | Off | On | Always
+blinking = "Off"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# terminal
+# ─────────────────────────────────────────────────────────────────────────────
+[terminal]
+# Clipboard access via OSC 52: disabled | onlycopy | onlypaste | copypaste
+osc52 = "onlycopy"
+
+# Shell to launch instead of the login shell.
+# shell = { program = "/usr/bin/fish", args = ["--login"] }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# mouse
+# ─────────────────────────────────────────────────────────────────────────────
+[mouse]
+# Hide the pointer while typing.
+hide_when_typing = false
+
+# Custom mouse bindings are merged over the defaults.
+# [[mouse.bindings]]
+# mouse = "Middle"
+# action = "PasteSelection"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# hints — regex/hyperlink matches you can open or act on
+# ─────────────────────────────────────────────────────────────────────────────
+[hints]
+# Label keys. At least 2 width-1 characters.
+alphabet = "jfkdls;ahgurieowpq"
+
+# Default hint: open URLs (and OSC 8 hyperlinks) with the system opener,
+# triggered by Control+Shift+O or the mouse.
+[[hints.enabled]]
+hyperlinks = true
+post_processing = true
+persist = false
+# Regex is optional when hyperlinks = true; set one to match plain text too.
+# regex = "..."
+mouse = { enabled = true, mods = "None" }
+binding = { key = "O", mods = "Control|Shift" }
+# One of `action` (Copy | Paste | Select) or `command`:
+command = "xdg-open"          # Linux
+# command = "open"            # macOS
+
+# Example: copy any word ending in .rs with Control+Shift+R.
+# [[hints.enabled]]
+# regex = "[^ ]+\\.rs"
+# post_processing = true
+# action = "Copy"
+# binding = { key = "R", mods = "Control|Shift" }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# keyboard — bindings merged over the defaults
+# ─────────────────────────────────────────────────────────────────────────────
+# key   : character ("a"), named key ("F5", "Home", "Enter"), or scancode.
+# mods  : |-joined subset of Control, Shift, Alt/Option, Super/Command. "None" = no mods.
+# mode  : AppCursor | AppKeypad | Alt | Search; prefix ~ to require the mode OFF.
+# one of: action | chars | command.
+#
+# Actions include: Copy, Paste, CopySelection, PasteSelection, ClearSelection,
+# IncreaseFontSize, DecreaseFontSize, ResetFontSize, Scroll*{LineUp,PageDown,ToTop,…},
+# SearchForward, SearchBackward, ToggleFullscreen, ToggleMaximized, SpawnNewInstance,
+# CreateNewWindow, Quit, Hide, Minimize, ClearHistory, ReceiveChar, None, …
+# (See configuration.md for the complete list. Vivido has no vi-mode actions.)
+
+# [[keyboard.bindings]]
+# key = "N"
+# mods = "Control|Shift"
+# action = "SpawnNewInstance"
+
+# Neutralize a default binding:
+# [[keyboard.bindings]]
+# key = "V"
+# mods = "Control|Shift"
+# action = "ReceiveChar"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# debug — diagnostics; most users never touch these
+# ─────────────────────────────────────────────────────────────────────────────
+[debug]
+# Off | Error | Warn | Info | Debug | Trace
+log_level = "Warn"
+
+# Log window and input events.
+print_events = false
+
+# Keep the log file after exit.
+persistent_logging = false
+
+# Overlay per-frame render time.
+render_timer = false
+
+# Tint redrawn (damaged) regions.
+highlight_damage = false

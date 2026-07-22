@@ -1,60 +1,125 @@
-<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs" xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
-   <Package Name="Vivido" UpgradeCode="87c21c74-dbd5-4584-89d5-46d9cd0c40a7" Language="1033" Codepage="1252" Version="0.18.0-dev" Manufacturer="Vivido" InstallerVersion="200">
-      <MajorUpgrade AllowSameVersionUpgrades="yes" DowngradeErrorMessage="A newer version of [ProductName] is already installed." />
-      <Icon Id="VividoIco" SourceFile=".\vivido\windows\vivido.ico" />
-      <WixVariable Id="WixUILicenseRtf" Value=".\vivido\windows\wix\license.rtf" />
-      <Property Id="ARPPRODUCTICON" Value="VividoIco" />
-      <MediaTemplate EmbedCab="yes" />
-      <ui:WixUI Id="WixUI_Minimal" />
-      <Feature Id="ProductFeature" Title="ConsoleApp" Level="1">
-         <ComponentRef Id="VividoExe" />
-         <ComponentRef Id="VividoShortcut" />
-         <ComponentRef Id="ModifyPathEnv" />
-         <ComponentRef Id="ContextMenu" />
-         <ComponentRef Id="ContextMenuFolder" />
-      </Feature>
-      <!-- Application binaries -->
-      <DirectoryRef Id="VividoProgramFiles">
-         <Component Id="VividoExe">
-            <File Id="VividoExeFile" Source=".\target\release\vivido.exe" Name="vivido.exe" KeyPath="yes" />
-         </Component>
-      </DirectoryRef>
-      <DirectoryRef Id="VividoProgramMenu">
-         <!-- Application shortcut -->
-         <Component Id="VividoShortcut" Guid="aa36e61a-23cd-4383-b744-2f78e912f0dc">
-            <Shortcut Id="VividoShortcutFile" Name="Vivido" Description="A cross-platform, GPU-accelerated terminal emulator" Target="[VividoProgramFiles]vivido.exe" />
-            <RemoveFolder Id="VividoProgramMenu" On="uninstall" />
-            <RegistryValue Root="HKCU" Key="Software\Microsoft\Vivido" Name="installed" Type="integer" Value="1" KeyPath="yes" />
-         </Component>
-      </DirectoryRef>
-      <DirectoryRef Id="VividoProgramFiles">
-         <!-- Add to PATH -->
-         <Component Id="ModifyPathEnv" Guid="edf0b679-9eb6-46f7-a5d1-5160f30acb34" KeyPath="yes">
-            <Environment Id="PathEnv" Value="[VividoProgramFiles]" Name="PATH" Permanent="no" Part="first" Action="set" System="yes" />
-         </Component>
-      </DirectoryRef>
-      <StandardDirectory Id="ProgramFiles64Folder">
-         <Directory Id="VividoProgramFiles" Name="Vivido" />
-      </StandardDirectory>
-      <StandardDirectory Id="ProgramMenuFolder">
-         <Directory Id="VividoProgramMenu" Name="Vivido" />
-      </StandardDirectory>
-      <!-- Add context menu -->
-      <Component Id="ContextMenu" Guid="449f9121-f7b9-41fe-82da-52349ea8ff91" Directory="TARGETDIR">
-         <RegistryKey Root="HKCU" Key="Software\Classes\Directory\Background\shell\Open Vivido here\command">
-            <RegistryValue Type="string" Value='[VividoProgramFiles]vivido.exe --working-directory "%v"' KeyPath="yes" />
-         </RegistryKey>
-         <RegistryKey Root="HKCU" Key="Software\Classes\Directory\Background\shell\Open Vivido here">
-            <RegistryValue Type="string" Name="Icon" Value="[VividoProgramFiles]vivido.exe" />
-         </RegistryKey>
-      </Component>
-      <Component Id="ContextMenuFolder" Guid="69483b38-a267-433f-9395-60827963347a" Directory="TARGETDIR">
-         <RegistryKey Root="HKCU" Key="Software\Classes\Directory\shell\Open Vivido here\command">
-            <RegistryValue Type="string" Value='[VividoProgramFiles]vivido.exe --working-directory "%v"' KeyPath="yes" />
-         </RegistryKey>
-         <RegistryKey Root="HKCU" Key="Software\Classes\Directory\shell\Open Vivido here">
-            <RegistryValue Type="string" Name="Icon" Value="[VividoProgramFiles]vivido.exe" />
-         </RegistryKey>
-      </Component>
-   </Package>
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
+  <Package Name="Vivido Suite"
+           Manufacturer="$(var.Publisher)"
+           Version="$(var.VividoVersion)"
+           UpgradeCode="87c21c74-dbd5-4584-89d5-46d9cd0c40a7"
+           Scope="perUser"
+           Language="1033"
+           Codepage="65001"
+           InstallerVersion="500">
+    <SummaryInformation Description="Vivido terminal media suite for Windows 11 x64" />
+    <MajorUpgrade AllowSameVersionUpgrades="no"
+                  Schedule="afterInstallInitialize"
+                  DowngradeErrorMessage="A newer version of [ProductName] is already installed." />
+    <Upgrade Id="87c21c74-dbd5-4584-89d5-46d9cd0c40a7">
+      <UpgradeVersion Minimum="$(var.VividoVersion)"
+                      IncludeMinimum="yes"
+                      OnlyDetect="yes"
+                      Property="VIVIDO_SAME_OR_NEWER_FOUND" />
+    </Upgrade>
+    <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
+
+    <Icon Id="VividoIco" SourceFile="$(var.SourceRoot)\vivido.ico" />
+    <Property Id="ARPPRODUCTICON" Value="VividoIco" />
+    <Property Id="ARPURLINFOABOUT" Value="https://vivido.dev" />
+    <Property Id="VIVIDOUSERPROFILE" Value="%USERPROFILE%" />
+    <WixVariable Id="WixUILicenseRtf" Value="$(var.SourceRoot)\wix\license.rtf" />
+    <ui:WixUI Id="WixUI_Minimal" />
+
+    <Launch Condition="VersionNT64 AND WindowsBuild &gt;= 22000"
+            Message="Vivido Suite requires 64-bit Windows 11 (build 22000 or newer)." />
+    <Launch Condition="Installed OR NOT VIVIDO_SAME_OR_NEWER_FOUND"
+            Message="The same or a newer version of Vivido Suite is already installed. Use Repair for the existing installation." />
+
+    <Feature Id="ProductFeature" Title="Vivido Suite" Level="1">
+      <ComponentGroupRef Id="SuiteFiles" />
+      <ComponentRef Id="SetupHelperComponent" />
+      <ComponentRef Id="UserPathComponent" />
+      <ComponentRef Id="StartMenuComponent" />
+    </Feature>
+
+    <StandardDirectory Id="PerUserProgramFilesFolder">
+      <Directory Id="INSTALLFOLDER" Name="Vivido">
+        <Directory Id="LicensesFolder" Name="LICENSES" />
+        <Directory Id="InstallerHelperFolder" Name="installer" />
+      </Directory>
+    </StandardDirectory>
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="ApplicationProgramsFolder" Name="Vivido" />
+    </StandardDirectory>
+
+    <Component Id="SetupHelperComponent" Directory="InstallerHelperFolder" Guid="*">
+      <File Id="SetupHelperFile"
+            Source="$(var.StageDir)\installer\vivido-windows-setup.exe"
+            Name="vivido-windows-setup.exe" />
+      <RegistryValue Root="HKCU"
+                     Key="Software\Vivido\Suite\Components"
+                     Name="SetupHelper"
+                     Type="integer"
+                     Value="1"
+                     KeyPath="yes" />
+    </Component>
+
+    <Component Id="UserPathComponent" Directory="INSTALLFOLDER" Guid="*">
+      <Environment Id="UserPath"
+                   Name="PATH"
+                   Value="[INSTALLFOLDER]"
+                   Action="set"
+                   Part="last"
+                   Permanent="no"
+                   System="no" />
+      <RegistryValue Root="HKCU"
+                     Key="Software\Vivido\Suite"
+                     Name="PathInstalled"
+                     Type="integer"
+                     Value="1"
+                     KeyPath="yes" />
+    </Component>
+
+    <Component Id="StartMenuComponent" Directory="ApplicationProgramsFolder" Guid="*">
+      <Shortcut Id="VividoPowerShellShortcut"
+                Name="Vivido PowerShell"
+                Description="Start Vivido with PowerShell 7"
+                Target="[INSTALLFOLDER]vivido.exe"
+                Arguments="-e pwsh.exe"
+                WorkingDirectory="VIVIDOUSERPROFILE"
+                Icon="VividoIco" />
+      <Shortcut Id="VividoWslShortcut"
+                Name="Vivido WSL"
+                Description="Start Vivido with the default WSL distribution"
+                Target="[INSTALLFOLDER]vivido.exe"
+                Arguments="-e wsl.exe"
+                WorkingDirectory="VIVIDOUSERPROFILE"
+                Icon="VividoIco" />
+      <RemoveFolder Id="RemoveApplicationProgramsFolder" On="uninstall" />
+      <RegistryValue Root="HKCU"
+                     Key="Software\Vivido\Suite"
+                     Name="ShortcutsInstalled"
+                     Type="integer"
+                     Value="1"
+                     KeyPath="yes" />
+    </Component>
+
+    <CustomAction Id="InitializeUserConfig"
+                  FileRef="SetupHelperFile"
+                  ExeCommand="config-init"
+                  Execute="deferred"
+                  Impersonate="yes"
+                  Return="check" />
+    <CustomAction Id="RefuseLiveVvmuxSessions"
+                  FileRef="SetupHelperFile"
+                  ExeCommand="vvmux-check"
+                  Execute="deferred"
+                  Impersonate="yes"
+                  Return="check" />
+    <InstallExecuteSequence>
+      <Custom Action="InitializeUserConfig"
+              After="InstallFiles"
+              Condition="NOT Installed" />
+      <Custom Action="RefuseLiveVvmuxSessions"
+              Before="RemoveFiles"
+              Condition="REMOVE~=&quot;ALL&quot;" />
+    </InstallExecuteSequence>
+  </Package>
 </Wix>

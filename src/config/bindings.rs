@@ -329,9 +329,24 @@ macro_rules! trigger {
 }
 
 pub fn default_mouse_bindings() -> Vec<MouseBinding> {
-    bindings!(
+    // Extended only by the Windows-specific bindings below.
+    #[cfg_attr(not(target_os = "windows"), allow(unused_mut))]
+    let mut bindings = bindings!(
         MouseBinding;
         MouseButton::Middle; Action::PasteSelection;
+    );
+
+    #[cfg(target_os = "windows")]
+    bindings.extend(windows_mouse_bindings());
+
+    bindings
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn windows_mouse_bindings() -> Vec<MouseBinding> {
+    bindings!(
+        MouseBinding;
+        MouseButton::Right; Action::Paste;
     )
 }
 
@@ -385,7 +400,7 @@ pub fn default_key_bindings() -> Vec<KeyBinding> {
     bindings
 }
 
-#[cfg(not(any(target_os = "macos", test)))]
+#[cfg(any(not(target_os = "macos"), test))]
 fn common_keybindings() -> Vec<KeyBinding> {
     bindings!(
         KeyBinding;
@@ -410,12 +425,18 @@ pub fn platform_key_bindings() -> Vec<KeyBinding> {
 
 #[cfg(all(target_os = "windows", not(test)))]
 pub fn platform_key_bindings() -> Vec<KeyBinding> {
-    let mut bindings = bindings!(
-        KeyBinding;
-        Enter, ModifiersState::ALT; Action::ToggleFullscreen;
-    );
+    let mut bindings = windows_keybindings();
     bindings.extend(common_keybindings());
     bindings
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn windows_keybindings() -> Vec<KeyBinding> {
+    bindings!(
+        KeyBinding;
+        Enter, ModifiersState::ALT;     Action::ToggleFullscreen;
+        "v",   ModifiersState::CONTROL; Action::Paste;
+    )
 }
 
 #[cfg(all(target_os = "macos", not(test)))]
@@ -1251,5 +1272,47 @@ mod tests {
         assert!(binding.is_triggered_by(BindingMode::SEARCH, mods, &t));
         assert!(!binding.is_triggered_by(BindingMode::ALT_SCREEN, mods, &t));
         assert!(!binding.is_triggered_by(BindingMode::ALT_SCREEN | BindingMode::SEARCH, mods, &t));
+    }
+
+    #[test]
+    fn windows_paste_defaults_use_system_clipboard() {
+        let key =
+            BindingKey::Keycode { key: Key::Character("v".into()), location: KeyLocation::Any };
+        let keyboard = windows_keybindings();
+        assert!(keyboard.iter().any(|binding| {
+            binding.trigger == key
+                && binding.mods == ModifiersState::CONTROL
+                && binding.action == Action::Paste
+        }));
+        assert!(common_keybindings().iter().any(|binding| {
+            binding.trigger == key
+                && binding.mods == ModifiersState::CONTROL | ModifiersState::SHIFT
+                && binding.action == Action::Paste
+        }));
+
+        let mouse = windows_mouse_bindings();
+        assert!(mouse.iter().any(|binding| {
+            binding.trigger == MouseEvent::Button(MouseButton::Right)
+                && binding.mods.is_empty()
+                && binding.action == Action::Paste
+        }));
+    }
+
+    #[test]
+    fn custom_ctrl_v_binding_replaces_windows_default() {
+        let mut defaults = windows_keybindings();
+        let custom = KeyBinding {
+            trigger: BindingKey::Keycode {
+                key: Key::Character("v".into()),
+                location: KeyLocation::Any,
+            },
+            mods: ModifiersState::CONTROL,
+            action: Action::ReceiveChar,
+            mode: BindingMode::empty(),
+            notmode: BindingMode::empty(),
+        };
+
+        defaults.retain(|binding| !binding.triggers_match(&custom));
+        assert!(!defaults.iter().any(|binding| binding.triggers_match(&custom)));
     }
 }

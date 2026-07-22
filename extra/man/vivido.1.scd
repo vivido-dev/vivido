@@ -88,6 +88,18 @@ set of features with high performance.
 
 	Path for IPC socket creation.
 
+*-w, --window-id* _<WINDOW_ID>_
+
+	Assign a stable IPC ID to the initial window. Vivido exports this value as
+	_$VIVIDO_WINDOW_ID_ inside the window, and *vivido msg* accepts it for explicit
+	window targeting. When omitted, the platform window ID is used.
+
+	A launching shell can choose both IPC environment values before startup:
+
+		export VIVIDO_SOCKET="${TMPDIR:-/tmp}/vivido-$$.sock"
+		export VIVIDO_WINDOW_ID="$$"
+		vivido --socket "$VIVIDO_SOCKET" --window-id "$VIVIDO_WINDOW_ID" &
+
 *-T, --title* _<TITLE>_
 
 	Defines the window title.

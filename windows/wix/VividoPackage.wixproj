@@ -1,0 +1,20 @@
+<Project Sdk="WixToolset.Sdk/7.0.0">
+  <PropertyGroup>
+    <EnableDefaultItems>false</EnableDefaultItems>
+    <InstallerPlatform>x64</InstallerPlatform>
+    <OutputName>Vivido-$(VividoVersion)-x64</OutputName>
+    <OutputPath>$(ArtifactsDir)</OutputPath>
+    <AcceptEula Condition="'$(WixEulaId)' == 'wix7'">$(WixEulaId)</AcceptEula>
+    <DefineConstants>
+      VividoVersion=$(VividoVersion);
+      Publisher=$(Publisher);
+      SourceRoot=$(SourceRoot);
+      StageDir=$(StageDir)
+    </DefineConstants>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="vivido.wxs" />
+    <Compile Include="$(StagingFragment)" Link="staging-files.generated.wxs" />
+    <PackageReference Include="WixToolset.UI.wixext" Version="7.0.0" />
+  </ItemGroup>
+</Project>
