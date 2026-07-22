@@ -10,17 +10,15 @@ use std::ffi::OsStr;
 use std::fmt::Debug;
 #[cfg(not(windows))]
 use std::os::unix::io::RawFd;
-#[cfg(unix)]
-use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::rc::Rc;
-#[cfg(unix)]
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 use std::{env, f32, mem};
 
 use ahash::RandomState;
 use log::{debug, error, info, warn};
+#[cfg(unix)]
+use serde::de::DeserializeOwned;
 use winit::application::ApplicationHandler;
 use winit::event::{
     ElementState, Event as WinitEvent, Ime, Modifiers, MouseButton, StartCause,
@@ -40,7 +38,11 @@ use crate::terminal::term::{self, ClipboardType, Term, TermMode};
 use crate::terminal::vte::ansi::NamedColor;
 
 #[cfg(unix)]
-use crate::cli::{IpcConfig, ParsedOptions};
+use crate::automation::{AutomationHub, SubscriptionRequest};
+#[cfg(unix)]
+use crate::automation::{PendingWrite, WaitKind, Waiter};
+#[cfg(unix)]
+use crate::cli::ParsedOptions;
 use crate::cli::{Options as CliOptions, WindowOptions};
 use crate::clipboard::Clipboard;
 use crate::config::font::FontSize;
@@ -57,7 +59,9 @@ use crate::input::{self, ActionContext as _, FONT_SIZE_STEP};
 use crate::logging::{LOG_TARGET_CONFIG, LOG_TARGET_WINIT};
 use crate::message_bar::{Message, MessageBuffer};
 #[cfg(unix)]
-use crate::polling::ipc::{self, SocketReply};
+use crate::polling::ipc::IpcRequest;
+#[cfg(unix)]
+use crate::polling::ipc::{IpcError, MAX_INPUT_BYTES, MAX_IPC_TEXT_BYTES};
 use crate::scheduler::{Scheduler, TimerId, Topic};
 use crate::vivid::VividService;
 use crate::window_context::WindowContext;
@@ -92,6 +96,8 @@ pub struct Processor {
     proxy: EventLoopProxy<Event>,
     #[cfg(unix)]
     global_ipc_options: ParsedOptions,
+    #[cfg(unix)]
+    automation: AutomationHub,
     cli_options: CliOptions,
     config: Rc<UiConfig>,
 }
@@ -135,6 +141,8 @@ impl Processor {
             windows: Default::default(),
             #[cfg(unix)]
             global_ipc_options: Default::default(),
+            #[cfg(unix)]
+            automation: Default::default(),
             config_monitor,
         }
     }
@@ -144,17 +152,33 @@ impl Processor {
         &mut self,
         event_loop: &ActiveEventLoop,
         window_options: WindowOptions,
-    ) -> Result<(), Box<dyn Error>> {
-        let window_context = WindowContext::initial(
+    ) -> Result<u64, Box<dyn Error>> {
+        let mut window_context = WindowContext::initial(
             event_loop,
             self.proxy.clone(),
             self.config.clone(),
             window_options,
         )?;
 
-        self.windows.insert(window_context.id(), window_context);
+        #[cfg(unix)]
+        {
+            window_context.automation.creation_index = self.automation.next_creation_index();
+        }
+        let platform_id = window_context.id();
+        #[cfg(unix)]
+        let ipc_window_id = window_context.ipc_window_id();
+        #[cfg(not(unix))]
+        let ipc_window_id = u64::from(platform_id);
+        self.windows.insert(platform_id, window_context);
 
-        Ok(())
+        #[cfg(unix)]
+        self.automation.emit(
+            Some(ipc_window_id),
+            "window_created",
+            serde_json::json!({"window_id": ipc_window_id}),
+        );
+
+        Ok(ipc_window_id)
     }
 
     /// Create a new terminal window.
@@ -162,7 +186,20 @@ impl Processor {
         &mut self,
         event_loop: &ActiveEventLoop,
         options: WindowOptions,
-    ) -> Result<(), Box<dyn Error>> {
+    ) -> Result<u64, Box<dyn Error>> {
+        #[cfg(unix)]
+        if let Some(ipc_window_id) = options.ipc_window_id
+            && self
+                .windows
+                .values()
+                .any(|window_context| window_context.ipc_window_id() == ipc_window_id)
+        {
+            return Err(std::io::Error::other(format!(
+                "IPC window ID {ipc_window_id} is already in use"
+            ))
+            .into());
+        }
+
         // Override config with CLI/IPC options.
         let mut config_overrides = options.config_overrides();
         #[cfg(unix)]
@@ -170,7 +207,7 @@ impl Processor {
         let mut config = self.config.clone();
         config = config_overrides.override_config_rc(config);
 
-        let window_context = WindowContext::additional(
+        let mut window_context = WindowContext::additional(
             event_loop,
             self.proxy.clone(),
             config,
@@ -178,8 +215,36 @@ impl Processor {
             config_overrides,
         )?;
 
-        self.windows.insert(window_context.id(), window_context);
-        Ok(())
+        #[cfg(unix)]
+        if self
+            .windows
+            .values()
+            .any(|existing| existing.ipc_window_id() == window_context.ipc_window_id())
+        {
+            return Err(std::io::Error::other(format!(
+                "IPC window ID {} is already in use",
+                window_context.ipc_window_id()
+            ))
+            .into());
+        }
+
+        #[cfg(unix)]
+        {
+            window_context.automation.creation_index = self.automation.next_creation_index();
+        }
+        let platform_id = window_context.id();
+        #[cfg(unix)]
+        let ipc_window_id = window_context.ipc_window_id();
+        #[cfg(not(unix))]
+        let ipc_window_id = u64::from(platform_id);
+        self.windows.insert(platform_id, window_context);
+        #[cfg(unix)]
+        self.automation.emit(
+            Some(ipc_window_id),
+            "window_created",
+            serde_json::json!({"window_id": ipc_window_id}),
+        );
+        Ok(ipc_window_id)
     }
 
     /// Run the event loop.
@@ -212,6 +277,1219 @@ impl Processor {
                 | WindowEvent::HoveredFile(_)
                 | WindowEvent::Moved(_)
         )
+    }
+
+    /// Resolve the public stable window ID or focused-window fallback.
+    #[cfg(unix)]
+    fn resolve_ipc_target(&self, requested: Option<u64>) -> Result<WindowId, IpcError> {
+        match requested {
+            Some(requested) => self
+                .windows
+                .iter()
+                .find_map(|(id, window)| (window.ipc_window_id() == requested).then_some(*id))
+                .ok_or_else(|| {
+                    IpcError::new(
+                        "window_not_found",
+                        format!("no Vivido window with ID {requested}"),
+                    )
+                }),
+            None => self
+                .windows
+                .iter()
+                .find_map(|(id, window)| window.is_focused().then_some(*id))
+                .ok_or_else(|| IpcError::new("no_focused_window", "no focused Vivido window")),
+        }
+    }
+
+    #[cfg(unix)]
+    fn handle_ipc_request(&mut self, event_loop: &ActiveEventLoop, request: IpcRequest) {
+        use crate::cli::{
+            IpcConfig, IpcGetConfig, IpcGetGrid, IpcGetText, IpcInputRoute, IpcKey, IpcMouse,
+            IpcPaste, IpcResize, IpcScreenshot, IpcSignal, IpcSubscribe, IpcTarget, IpcTranscript,
+            IpcTyping, IpcWaitCommon, IpcWaitFrame, IpcWaitOutput, IpcWaitSequence, IpcWaitStable,
+            IpcWaitText, WindowOptions,
+        };
+
+        let result = match request.method.as_str() {
+            "ping" => {
+                request.connection.reply(request.id, serde_json::json!({"pong": true}));
+                return;
+            },
+            "unsubscribe" => {
+                #[derive(serde::Deserialize)]
+                struct Params {
+                    subscription_id: u64,
+                }
+                let params: Params = match decode_ipc_params(&request) {
+                    Ok(params) => params,
+                    Err(error) => {
+                        request.connection.error(request.id, error);
+                        return;
+                    },
+                };
+                if self.automation.unsubscribe(request.connection.id(), params.subscription_id) {
+                    request.connection.reply(request.id, serde_json::json!({}));
+                } else {
+                    request.connection.error(
+                        request.id,
+                        IpcError::new("invalid_params", "unknown subscription ID"),
+                    );
+                }
+                return;
+            },
+            "create_window" => {
+                let options: WindowOptions = match decode_ipc_params(&request) {
+                    Ok(options) => options,
+                    Err(error) => {
+                        request.connection.error(request.id, error);
+                        return;
+                    },
+                };
+                let created = if self.windows.is_empty() {
+                    self.create_initial_window(event_loop, options)
+                } else {
+                    self.create_window(event_loop, options)
+                };
+                match created {
+                    Ok(window_id) => request
+                        .connection
+                        .reply(request.id, serde_json::json!({"window_id": window_id})),
+                    Err(error) => request.connection.error(
+                        request.id,
+                        IpcError::new(
+                            "invalid_params",
+                            format!("failed to create window: {error}"),
+                        ),
+                    ),
+                }
+                return;
+            },
+            "config" => {
+                let params: IpcConfig = match decode_ipc_params(&request) {
+                    Ok(params) => params,
+                    Err(error) => {
+                        request.connection.error(request.id, error);
+                        return;
+                    },
+                };
+                let requested = match params.window_id {
+                    Some(-1) | None => None,
+                    Some(id) => match u64::try_from(id) {
+                        Ok(id) => Some(id),
+                        Err(_) => {
+                            request.connection.error(
+                                request.id,
+                                IpcError::new("invalid_params", "window ID must be -1 or unsigned"),
+                            );
+                            return;
+                        },
+                    },
+                };
+                let mut options = ParsedOptions::from_options(&params.options);
+                let mut matched = requested.is_none();
+                for window in self
+                    .windows
+                    .values_mut()
+                    .filter(|window| requested.is_none_or(|id| id == window.ipc_window_id()))
+                {
+                    matched = true;
+                    if params.reset {
+                        window.reset_window_config(self.config.clone());
+                    } else {
+                        window.add_window_config(self.config.clone(), &options);
+                    }
+                }
+                if matched {
+                    if requested.is_none() {
+                        if params.reset {
+                            self.global_ipc_options.clear();
+                        } else {
+                            self.global_ipc_options.append(&mut options);
+                        }
+                    }
+                    Ok(serde_json::json!({}))
+                } else {
+                    Err(IpcError::new("window_not_found", "configuration target does not exist"))
+                }
+            },
+            "get_config" => {
+                let params: IpcGetConfig = match decode_ipc_params(&request) {
+                    Ok(params) => params,
+                    Err(error) => {
+                        request.connection.error(request.id, error);
+                        return;
+                    },
+                };
+                let config = match params.window_id {
+                    Some(-1) | None => {
+                        self.global_ipc_options.override_config_rc(self.config.clone())
+                    },
+                    Some(id) => {
+                        let id = match u64::try_from(id) {
+                            Ok(id) => id,
+                            Err(_) => {
+                                request.connection.error(
+                                    request.id,
+                                    IpcError::new(
+                                        "invalid_params",
+                                        "window ID must be -1 or unsigned",
+                                    ),
+                                );
+                                return;
+                            },
+                        };
+                        match self.windows.values().find(|window| window.ipc_window_id() == id) {
+                            Some(window) => Rc::new(window.config().clone()),
+                            None => {
+                                request.connection.error(
+                                    request.id,
+                                    IpcError::new(
+                                        "window_not_found",
+                                        format!("no Vivido window with ID {id}"),
+                                    ),
+                                );
+                                return;
+                            },
+                        }
+                    },
+                };
+                match serde_json::to_value(&*config) {
+                    Ok(config) => Ok(serde_json::json!({"config": config})),
+                    Err(error) => Err(IpcError::new(
+                        "unsupported",
+                        format!("failed to serialize configuration: {error}"),
+                    )),
+                }
+            },
+            "typing" => {
+                let params: IpcTyping = match decode_ipc_params(&request) {
+                    Ok(params) => params,
+                    Err(error) => {
+                        request.connection.error(request.id, error);
+                        return;
+                    },
+                };
+                self.queue_ipc_input(params.window_id, params.text.into_bytes(), &request);
+                return;
+            },
+            "key" => {
+                let params: IpcKey = match decode_ipc_params(&request) {
+                    Ok(params) => params,
+                    Err(error) => {
+                        request.connection.error(request.id, error);
+                        return;
+                    },
+                };
+                let target = match self.resolve_ipc_target(params.target.window_id) {
+                    Ok(target) => target,
+                    Err(error) => {
+                        request.connection.error(request.id, error);
+                        return;
+                    },
+                };
+                if !(1..=1000).contains(&params.repeat) {
+                    request.connection.error(
+                        request.id,
+                        IpcError::new("invalid_params", "key repeat must be 1 through 1000"),
+                    );
+                    return;
+                }
+                let mut bytes = Vec::new();
+                for repeat_index in 0..params.repeat {
+                    let encoded = match params.route {
+                        IpcInputRoute::Application => crate::input::keyboard::encode_ipc_key_event(
+                            &params.key,
+                            &params.mods,
+                            self.windows[&target].terminal_mode(),
+                            repeat_index > 0,
+                        ),
+                        IpcInputRoute::Ui => self.windows.get_mut(&target).unwrap().ui_key(
+                            &params,
+                            repeat_index > 0,
+                            #[cfg(target_os = "macos")]
+                            event_loop,
+                            &self.proxy,
+                            &mut self.clipboard,
+                            &mut self.scheduler,
+                        ),
+                    };
+                    match encoded {
+                        Ok(encoded) => bytes.extend(encoded),
+                        Err(error) => {
+                            request.connection.error(request.id, error);
+                            return;
+                        },
+                    }
+                }
+                if bytes.is_empty() {
+                    request.connection.reply(request.id, serde_json::json!({"written_bytes": 0}));
+                } else {
+                    let window_id = self.windows[&target].ipc_window_id();
+                    self.queue_ipc_input(Some(window_id), bytes, &request);
+                }
+                return;
+            },
+            "paste" => {
+                let params: IpcPaste = match decode_ipc_params(&request) {
+                    Ok(params) => params,
+                    Err(error) => {
+                        request.connection.error(request.id, error);
+                        return;
+                    },
+                };
+                if params.text.len() > MAX_INPUT_BYTES {
+                    Err(IpcError::new("limit_exceeded", "paste payload exceeds 1 MiB"))
+                } else {
+                    let target = match self.resolve_ipc_target(params.target.window_id) {
+                        Ok(target) => target,
+                        Err(error) => {
+                            request.connection.error(request.id, error);
+                            return;
+                        },
+                    };
+                    let bytes = match params.route {
+                        IpcInputRoute::Application => {
+                            self.windows[&target].application_paste(&params.text)
+                        },
+                        IpcInputRoute::Ui => self.windows.get_mut(&target).unwrap().ui_paste(
+                            &params.text,
+                            #[cfg(target_os = "macos")]
+                            event_loop,
+                            &self.proxy,
+                            &mut self.clipboard,
+                            &mut self.scheduler,
+                        ),
+                    };
+                    if bytes.is_empty() {
+                        request.connection.reply(request.id, serde_json::json!({}));
+                    } else {
+                        let window_id = self.windows[&target].ipc_window_id();
+                        self.queue_ipc_input(Some(window_id), bytes, &request);
+                    }
+                    return;
+                }
+            },
+            "mouse" => {
+                let params: IpcMouse = match decode_ipc_params(&request) {
+                    Ok(params) => params,
+                    Err(error) => {
+                        request.connection.error(request.id, error);
+                        return;
+                    },
+                };
+                let position = match &params.action {
+                    crate::cli::IpcMouseAction::Move(position) => position,
+                    crate::cli::IpcMouseAction::Click(action)
+                    | crate::cli::IpcMouseAction::DoubleClick(action)
+                    | crate::cli::IpcMouseAction::Down(action)
+                    | crate::cli::IpcMouseAction::Up(action)
+                    | crate::cli::IpcMouseAction::Drag(action) => &action.position,
+                    crate::cli::IpcMouseAction::Scroll(action) => &action.position,
+                };
+                let target = match self.resolve_ipc_target(position.target.window_id) {
+                    Ok(target) => target,
+                    Err(error) => {
+                        request.connection.error(request.id, error);
+                        return;
+                    },
+                };
+                match position.route {
+                    IpcInputRoute::Application => {
+                        match self.windows[&target].application_mouse(&params) {
+                            Ok(bytes) => {
+                                let window_id = self.windows[&target].ipc_window_id();
+                                self.queue_ipc_input(Some(window_id), bytes, &request);
+                            },
+                            Err(error) => request.connection.error(request.id, error),
+                        }
+                    },
+                    IpcInputRoute::Ui => {
+                        let result = self.windows.get_mut(&target).unwrap().ui_mouse(
+                            &params,
+                            #[cfg(target_os = "macos")]
+                            event_loop,
+                            &self.proxy,
+                            &mut self.clipboard,
+                            &mut self.scheduler,
+                        );
+                        match result {
+                            Ok(bytes) if bytes.is_empty() => {
+                                request.connection.reply(request.id, serde_json::json!({}));
+                            },
+                            Ok(bytes) => {
+                                let window_id = self.windows[&target].ipc_window_id();
+                                self.queue_ipc_input(Some(window_id), bytes, &request);
+                            },
+                            Err(error) => request.connection.error(request.id, error),
+                        }
+                    },
+                }
+                return;
+            },
+            "resize" => {
+                let params: IpcResize = match decode_ipc_params(&request) {
+                    Ok(params) => params,
+                    Err(error) => {
+                        request.connection.error(request.id, error);
+                        return;
+                    },
+                };
+                let target = match self.resolve_ipc_target(params.target.window_id) {
+                    Ok(target) => target,
+                    Err(error) => {
+                        request.connection.error(request.id, error);
+                        return;
+                    },
+                };
+                if self.windows[&target]
+                    .automation
+                    .waiters
+                    .iter()
+                    .any(|waiter| matches!(waiter.kind, WaitKind::Resize { .. }))
+                {
+                    Err(IpcError::new(
+                        "limit_exceeded",
+                        "a resize is already pending for this window",
+                    ))
+                } else {
+                    let after_resize = self.windows[&target].automation.resize_confirmation;
+                    match self.windows[&target].request_automation_resize(
+                        params.columns,
+                        params.rows,
+                        params.width,
+                        params.height,
+                    ) {
+                        Ok((width, height, grid)) => {
+                            let (columns, rows) =
+                                grid.map_or((None, None), |(c, r)| (Some(c), Some(r)));
+                            self.register_wait_for_target(
+                                target,
+                                5_000,
+                                WaitKind::Resize {
+                                    columns,
+                                    rows,
+                                    width,
+                                    height,
+                                    after_resize,
+                                    pty_token: None,
+                                    pty_complete: false,
+                                },
+                                &request,
+                            );
+                            return;
+                        },
+                        Err(error) => Err(error),
+                    }
+                }
+            },
+            "signal" => {
+                let params: IpcSignal = match decode_ipc_params(&request) {
+                    Ok(params) => params,
+                    Err(error) => {
+                        request.connection.error(request.id, error);
+                        return;
+                    },
+                };
+                self.resolve_ipc_target(params.target.window_id).and_then(|target| {
+                    self.windows[&target]
+                        .signal_process_group(params.signal)
+                        .map(|process_group| serde_json::json!({"process_group_id": process_group}))
+                })
+            },
+            "get_text" => {
+                let params: IpcGetText = match decode_ipc_params(&request) {
+                    Ok(params) => params,
+                    Err(error) => {
+                        request.connection.error(request.id, error);
+                        return;
+                    },
+                };
+                if params.rows.is_some_and(|rows| rows == 0 || rows > 1000) {
+                    Err(IpcError::new("invalid_params", "rows must be 1 through 1000"))
+                } else {
+                    self.resolve_ipc_target(params.window_id).and_then(|id| {
+                        let text = self.windows[&id].text(params.rows);
+                        if text.len() > MAX_IPC_TEXT_BYTES {
+                            Err(IpcError::new("limit_exceeded", "terminal text exceeds 16 MiB"))
+                        } else {
+                            Ok(serde_json::json!({"text": text}))
+                        }
+                    })
+                }
+            },
+            "screenshot" => {
+                let params: IpcScreenshot = match decode_ipc_params(&request) {
+                    Ok(params) => params,
+                    Err(error) => {
+                        request.connection.error(request.id, error);
+                        return;
+                    },
+                };
+                let target = match self.resolve_ipc_target(params.window_id) {
+                    Ok(target) => target,
+                    Err(error) => {
+                        request.connection.error(request.id, error);
+                        return;
+                    },
+                };
+                match self.windows.get_mut(&target).unwrap().request_screenshot(
+                    request.connection.clone(),
+                    request.id,
+                    &mut self.scheduler,
+                ) {
+                    Ok(()) => return,
+                    Err(message) => Err(IpcError::new("unsupported", message)),
+                }
+            },
+            "list_windows" => {
+                let mut windows: Vec<_> =
+                    self.windows.values().map(WindowContext::automation_summary).collect();
+                windows.sort_by_key(|window| window["creation_index"].as_u64().unwrap_or(0));
+                Ok(serde_json::json!({"windows": windows}))
+            },
+            "inspect" => {
+                let params: IpcTarget = match decode_ipc_params(&request) {
+                    Ok(params) => params,
+                    Err(error) => {
+                        request.connection.error(request.id, error);
+                        return;
+                    },
+                };
+                self.resolve_ipc_target(params.window_id).map(|target| {
+                    self.windows[&target].automation_inspect(self.automation.event_sequence())
+                })
+            },
+            "get_grid" => {
+                let params: IpcGetGrid = match decode_ipc_params(&request) {
+                    Ok(params) => params,
+                    Err(error) => {
+                        request.connection.error(request.id, error);
+                        return;
+                    },
+                };
+                self.resolve_ipc_target(params.target.window_id).and_then(|target| {
+                    self.windows[&target].automation_grid(
+                        params.start_line,
+                        params.row_count,
+                        params.since_screen,
+                    )
+                })
+            },
+            "transcript" => {
+                let params: IpcTranscript = match decode_ipc_params(&request) {
+                    Ok(params) => params,
+                    Err(error) => {
+                        request.connection.error(request.id, error);
+                        return;
+                    },
+                };
+                if params.max_bytes == 0
+                    || params.max_bytes as usize > crate::automation::TRANSCRIPT_CAPACITY
+                {
+                    Err(IpcError::new("invalid_params", "max_bytes must be 1 through 1048576"))
+                } else {
+                    self.resolve_ipc_target(params.target.window_id).and_then(|target| {
+                        self.windows[&target]
+                            .automation
+                            .transcript
+                            .lock()
+                            .unwrap()
+                            .snapshot(params.after_offset, params.max_bytes as usize)
+                            .map(|snapshot| snapshot.json())
+                    })
+                }
+            },
+            "subscribe" => {
+                let params: IpcSubscribe = match decode_ipc_params(&request) {
+                    Ok(params) => params,
+                    Err(error) => {
+                        request.connection.error(request.id, error);
+                        return;
+                    },
+                };
+                let target = if params.all {
+                    None
+                } else {
+                    match self.resolve_ipc_target(params.window_id) {
+                        Ok(target) => Some(self.windows[&target].ipc_window_id()),
+                        Err(error) => {
+                            request.connection.error(request.id, error);
+                            return;
+                        },
+                    }
+                };
+                let current_sequences = serde_json::Value::Array(
+                    self.windows
+                        .values()
+                        .map(|window| {
+                            serde_json::json!({
+                                "window_id": window.ipc_window_id(),
+                                "screen_sequence": window.automation.screen_sequence,
+                                "frame_sequence": window.automation.frame_sequence,
+                                "output_offset": window
+                                    .automation
+                                    .transcript
+                                    .lock()
+                                    .unwrap()
+                                    .end_offset(),
+                            })
+                        })
+                        .collect(),
+                );
+                let kinds = params.events.into_iter().collect();
+                match self.automation.subscribe(
+                    request.connection.clone(),
+                    request.id,
+                    SubscriptionRequest {
+                        target,
+                        all_windows: params.all,
+                        kinds,
+                        since_event: params.since_event,
+                        current_sequences,
+                    },
+                ) {
+                    Ok(_) => (),
+                    Err(error) => request.connection.error(request.id, error),
+                }
+                return;
+            },
+            "wait_text" => {
+                let params: IpcWaitText = match decode_ipc_params(&request) {
+                    Ok(params) => params,
+                    Err(error) => {
+                        request.connection.error(request.id, error);
+                        return;
+                    },
+                };
+                if params.text.len() > 8192 {
+                    Err(IpcError::new("limit_exceeded", "wait pattern exceeds 8 KiB"))
+                } else if params.regex {
+                    match compile_regex(&params.text) {
+                        Ok(()) => {
+                            self.register_wait(
+                                params.common.target.window_id,
+                                params.common.timeout,
+                                WaitKind::Text {
+                                    pattern: params.text,
+                                    regex: true,
+                                    after_screen: params.after_screen,
+                                },
+                                &request,
+                            );
+                            return;
+                        },
+                        Err(error) => Err(error),
+                    }
+                } else {
+                    self.register_wait(
+                        params.common.target.window_id,
+                        params.common.timeout,
+                        WaitKind::Text {
+                            pattern: params.text,
+                            regex: false,
+                            after_screen: params.after_screen,
+                        },
+                        &request,
+                    );
+                    return;
+                }
+            },
+            "wait_output" => {
+                let params: IpcWaitOutput = match decode_ipc_params(&request) {
+                    Ok(params) => params,
+                    Err(error) => {
+                        request.connection.error(request.id, error);
+                        return;
+                    },
+                };
+                let pattern = if params.base64 {
+                    use base64::Engine;
+                    match base64::engine::general_purpose::STANDARD.decode(&params.pattern) {
+                        Ok(pattern) => pattern,
+                        Err(error) => {
+                            request.connection.error(
+                                request.id,
+                                IpcError::new(
+                                    "invalid_params",
+                                    format!("invalid base64 output pattern: {error}"),
+                                ),
+                            );
+                            return;
+                        },
+                    }
+                } else {
+                    params.pattern.into_bytes()
+                };
+                let regex_validation = params
+                    .regex
+                    .then(|| {
+                        std::str::from_utf8(&pattern)
+                            .map_err(|error| IpcError::new("regex_invalid", error.to_string()))
+                            .and_then(compile_regex)
+                    })
+                    .transpose();
+                if pattern.len() > 8192 {
+                    Err(IpcError::new("limit_exceeded", "wait pattern exceeds 8 KiB"))
+                } else if let Err(error) = regex_validation {
+                    Err(error)
+                } else {
+                    let target = match self.resolve_ipc_target(params.common.target.window_id) {
+                        Ok(target) => target,
+                        Err(error) => {
+                            request.connection.error(request.id, error);
+                            return;
+                        },
+                    };
+                    let transcript = self.windows[&target].automation.transcript.lock().unwrap();
+                    let start_offset =
+                        params.after_offset.unwrap_or_else(|| transcript.end_offset());
+                    if let Err(error) = transcript.range(start_offset, 0) {
+                        request.connection.error(request.id, error);
+                        return;
+                    }
+                    drop(transcript);
+                    self.register_wait_for_target(
+                        target,
+                        params.common.timeout,
+                        WaitKind::Output { pattern, regex: params.regex, start_offset },
+                        &request,
+                    );
+                    return;
+                }
+            },
+            "wait_screen_change" => {
+                let params: IpcWaitSequence = match decode_ipc_params(&request) {
+                    Ok(params) => params,
+                    Err(error) => {
+                        request.connection.error(request.id, error);
+                        return;
+                    },
+                };
+                let target = match self.resolve_ipc_target(params.common.target.window_id) {
+                    Ok(target) => target,
+                    Err(error) => {
+                        request.connection.error(request.id, error);
+                        return;
+                    },
+                };
+                let after =
+                    params.after_screen.unwrap_or(self.windows[&target].automation.screen_sequence);
+                self.register_wait_for_target(
+                    target,
+                    params.common.timeout,
+                    WaitKind::ScreenChange { after },
+                    &request,
+                );
+                return;
+            },
+            "wait_screen_stable" => {
+                let params: IpcWaitStable = match decode_ipc_params(&request) {
+                    Ok(params) => params,
+                    Err(error) => {
+                        request.connection.error(request.id, error);
+                        return;
+                    },
+                };
+                if params.quiet == 0 || params.quiet > 86_400_000 {
+                    Err(IpcError::new(
+                        "invalid_params",
+                        "quiet duration must be 1 ms through 24 hours",
+                    ))
+                } else {
+                    self.register_wait(
+                        params.common.target.window_id,
+                        params.common.timeout,
+                        WaitKind::ScreenStable {
+                            quiet: Duration::from_millis(params.quiet),
+                            after_screen: params.after_screen,
+                        },
+                        &request,
+                    );
+                    return;
+                }
+            },
+            "wait_frame" => {
+                let params: IpcWaitFrame = match decode_ipc_params(&request) {
+                    Ok(params) => params,
+                    Err(error) => {
+                        request.connection.error(request.id, error);
+                        return;
+                    },
+                };
+                let target = match self.resolve_ipc_target(params.common.target.window_id) {
+                    Ok(target) => target,
+                    Err(error) => {
+                        request.connection.error(request.id, error);
+                        return;
+                    },
+                };
+                let after =
+                    params.after_frame.unwrap_or(self.windows[&target].automation.frame_sequence);
+                self.register_wait_for_target(
+                    target,
+                    params.common.timeout,
+                    WaitKind::Frame { after },
+                    &request,
+                );
+                return;
+            },
+            "wait_exit" => {
+                let params: IpcWaitCommon = match decode_ipc_params(&request) {
+                    Ok(params) => params,
+                    Err(error) => {
+                        request.connection.error(request.id, error);
+                        return;
+                    },
+                };
+                self.register_wait(
+                    params.target.window_id,
+                    params.timeout,
+                    WaitKind::Exit,
+                    &request,
+                );
+                return;
+            },
+            "focus" => {
+                let params: IpcTarget = match decode_ipc_params(&request) {
+                    Ok(params) => params,
+                    Err(error) => {
+                        request.connection.error(request.id, error);
+                        return;
+                    },
+                };
+                match self.resolve_ipc_target(params.window_id) {
+                    Ok(target) => {
+                        if self.windows[&target]
+                            .automation
+                            .waiters
+                            .iter()
+                            .any(|waiter| matches!(waiter.kind, WaitKind::Focus { .. }))
+                        {
+                            Err(IpcError::new(
+                                "limit_exceeded",
+                                "a focus request is already pending for this window",
+                            ))
+                        } else {
+                            let after_focus = self.windows[&target].automation.focus_confirmation;
+                            self.windows[&target].request_automation_focus();
+                            self.register_wait_for_target(
+                                target,
+                                2_000,
+                                WaitKind::Focus { after_focus },
+                                &request,
+                            );
+                            return;
+                        }
+                    },
+                    Err(error) => Err(error),
+                }
+            },
+            _ => Err(IpcError::new(
+                "unsupported",
+                format!("unsupported IPC method {:?}", request.method),
+            )),
+        };
+
+        match result {
+            Ok(result) => request.connection.reply(request.id, result),
+            Err(error) => request.connection.error(request.id, error),
+        }
+    }
+
+    #[cfg(unix)]
+    fn queue_ipc_input(&mut self, requested: Option<u64>, bytes: Vec<u8>, request: &IpcRequest) {
+        if bytes.len() > MAX_INPUT_BYTES + 16 {
+            request
+                .connection
+                .error(request.id, IpcError::new("limit_exceeded", "terminal input exceeds 1 MiB"));
+            return;
+        }
+        if bytes.is_empty() {
+            request.connection.reply(request.id, serde_json::json!({"written_bytes": 0}));
+            return;
+        }
+        let target = match self.resolve_ipc_target(requested) {
+            Ok(target) => target,
+            Err(error) => {
+                request.connection.error(request.id, error);
+                return;
+            },
+        };
+        let token = self.automation.next_write_token();
+        let window = self.windows.get_mut(&target).unwrap();
+        let length = bytes.len();
+        if let Err(error) = window.write_to_pty_with_completion(bytes, token) {
+            warn!("failed to queue IPC terminal input: {error}");
+            request
+                .connection
+                .error(request.id, IpcError::new("pty_closed", "failed to queue terminal input"));
+            return;
+        }
+        window.automation.pending_writes.push(PendingWrite {
+            token,
+            bytes: length,
+            connection: request.connection.clone(),
+            request_id: request.id,
+            deadline: Instant::now() + Duration::from_secs(5),
+        });
+        self.schedule_automation_timer(target);
+    }
+
+    #[cfg(unix)]
+    fn handle_ipc_disconnect(&mut self, connection_id: u64) {
+        self.automation.disconnect(connection_id);
+        for window in self.windows.values_mut() {
+            if window.cancel_automation_connection(connection_id) {
+                self.scheduler.unschedule(TimerId::new(Topic::ScreenshotReadback, window.id()));
+            }
+        }
+        let window_ids: Vec<_> = self.windows.keys().copied().collect();
+        for window_id in window_ids {
+            self.schedule_automation_timer(window_id);
+        }
+    }
+
+    #[cfg(unix)]
+    fn register_wait(
+        &mut self,
+        requested: Option<u64>,
+        timeout_ms: u64,
+        kind: WaitKind,
+        request: &IpcRequest,
+    ) {
+        match self.resolve_ipc_target(requested) {
+            Ok(target) => self.register_wait_for_target(target, timeout_ms, kind, request),
+            Err(error) => request.connection.error(request.id, error),
+        }
+    }
+
+    #[cfg(unix)]
+    fn register_wait_for_target(
+        &mut self,
+        target: WindowId,
+        timeout_ms: u64,
+        kind: WaitKind,
+        request: &IpcRequest,
+    ) {
+        if !(1..=86_400_000).contains(&timeout_ms) {
+            request.connection.error(
+                request.id,
+                IpcError::new("invalid_params", "timeout must be 1 ms through 24 hours"),
+            );
+            return;
+        }
+        self.windows.get_mut(&target).unwrap().automation.waiters.push(Waiter {
+            connection: request.connection.clone(),
+            request_id: request.id,
+            deadline: Instant::now() + Duration::from_millis(timeout_ms),
+            kind,
+        });
+        self.evaluate_waiters(target);
+        self.schedule_automation_timer(target);
+    }
+
+    #[cfg(unix)]
+    fn automation_tick(&mut self, window_id: WindowId) {
+        let Some(window) = self.windows.get_mut(&window_id) else {
+            return;
+        };
+        let now = Instant::now();
+        let mut index = 0;
+        while index < window.automation.pending_writes.len() {
+            if window.automation.pending_writes[index].deadline <= now {
+                let pending = window.automation.pending_writes.swap_remove(index);
+                pending.connection.error(
+                    pending.request_id,
+                    IpcError::new("timeout", "PTY write did not complete within five seconds"),
+                );
+            } else {
+                index += 1;
+            }
+        }
+        let _ = window;
+        self.evaluate_waiters(window_id);
+        self.schedule_automation_timer(window_id);
+    }
+
+    /// Keep exactly one timer at the nearest automation deadline for this window.
+    #[cfg(unix)]
+    fn schedule_automation_timer(&mut self, window_id: WindowId) {
+        let timer_id = TimerId::new(Topic::Automation, window_id);
+        self.scheduler.unschedule(timer_id);
+        let Some(window) = self.windows.get(&window_id) else {
+            return;
+        };
+        let mut deadline = window
+            .automation
+            .pending_writes
+            .iter()
+            .map(|pending| pending.deadline)
+            .chain(window.automation.waiters.iter().map(|waiter| waiter.deadline))
+            .min();
+        for waiter in &window.automation.waiters {
+            if let WaitKind::ScreenStable { quiet, after_screen } = &waiter.kind {
+                let eligible =
+                    after_screen.is_none_or(|after| window.automation.screen_sequence > after);
+                if eligible {
+                    let stable = window.automation.last_screen_change + *quiet;
+                    deadline = Some(deadline.map_or(stable, |current| current.min(stable)));
+                }
+            }
+        }
+        let Some(deadline) = deadline else {
+            return;
+        };
+        self.scheduler.schedule(
+            Event::new(EventType::AutomationTick, window_id),
+            deadline.saturating_duration_since(Instant::now()),
+            false,
+            timer_id,
+        );
+    }
+
+    /// Apply focus/resize confirmations after batched winit events have updated window state.
+    #[cfg(unix)]
+    fn apply_automation_confirmations(&mut self, window_id: WindowId) {
+        let Some(window) = self.windows.get_mut(&window_id) else {
+            return;
+        };
+        window.automation.focus_confirmation = window
+            .automation
+            .focus_confirmation
+            .saturating_add(std::mem::take(&mut window.automation.pending_focus_confirmations));
+        let resize_confirmations =
+            std::mem::take(&mut window.automation.pending_resize_confirmations);
+        window.automation.resize_confirmation =
+            window.automation.resize_confirmation.saturating_add(resize_confirmations);
+        if resize_confirmations == 0 {
+            return;
+        }
+
+        let pending = window.automation.waiters.iter().find_map(|waiter| {
+            if let WaitKind::Resize {
+                columns,
+                rows,
+                width,
+                height,
+                after_resize,
+                pty_token: None,
+                ..
+            } = &waiter.kind
+                && window.automation.resize_confirmation > *after_resize
+                && window.automation_size_matches(*columns, *rows, *width, *height)
+            {
+                Some(waiter.request_id)
+            } else {
+                None
+            }
+        });
+        let Some(request_id) = pending else {
+            return;
+        };
+        let token = self.automation.next_write_token();
+        match window.write_pty_resize_with_completion(token) {
+            Ok(()) => {
+                if let Some(waiter) = window
+                    .automation
+                    .waiters
+                    .iter_mut()
+                    .find(|waiter| waiter.request_id == request_id)
+                    && let WaitKind::Resize { pty_token, .. } = &mut waiter.kind
+                {
+                    *pty_token = Some(token);
+                }
+            },
+            Err(_) => {
+                if let Some(index) = window
+                    .automation
+                    .waiters
+                    .iter()
+                    .position(|waiter| waiter.request_id == request_id)
+                {
+                    let waiter = window.automation.waiters.swap_remove(index);
+                    waiter.connection.error(
+                        waiter.request_id,
+                        IpcError::new("pty_closed", "failed to apply terminal resize"),
+                    );
+                }
+            },
+        }
+    }
+
+    #[cfg(unix)]
+    fn evaluate_waiters(&mut self, window_id: WindowId) {
+        use std::os::unix::process::ExitStatusExt;
+
+        let Some(window) = self.windows.get_mut(&window_id) else {
+            return;
+        };
+        let now = Instant::now();
+        let waiters = std::mem::take(&mut window.automation.waiters);
+        let visible_text = window.text(None);
+        let screen_sequence = window.automation.screen_sequence;
+        let frame_sequence = window.automation.frame_sequence;
+        let last_screen_change = window.automation.last_screen_change;
+        let exit_status = window.automation.exit_status;
+
+        for waiter in waiters {
+            if !waiter.connection.is_alive() {
+                continue;
+            }
+            if waiter.deadline <= now {
+                let error = match &waiter.kind {
+                    WaitKind::Resize { columns, rows, width, height, .. } => {
+                        let size = window.display.size_info;
+                        let pixels = window.display.window.inner_size();
+                        IpcError::new(
+                            "resize_mismatch",
+                            "window did not reach the requested size within five seconds",
+                        )
+                        .with_data(serde_json::json!({
+                            "requested": {
+                                "columns": columns,
+                                "rows": rows,
+                                "width": width,
+                                "height": height,
+                            },
+                            "actual": {
+                                "columns": size.columns(),
+                                "rows": size.screen_lines(),
+                                "width": pixels.width,
+                                "height": pixels.height,
+                            },
+                        }))
+                    },
+                    WaitKind::Focus { .. } => IpcError::new(
+                        "focus_denied",
+                        "window system did not confirm focus within two seconds",
+                    ),
+                    _ => IpcError::new("timeout", "IPC wait timed out"),
+                };
+                waiter.connection.error(waiter.request_id, error);
+                continue;
+            }
+
+            let result = match &waiter.kind {
+                WaitKind::Text { pattern, regex, after_screen } => {
+                    let eligible = after_screen.is_none_or(|after| screen_sequence > after);
+                    if eligible
+                        && pattern_find(visible_text.as_bytes(), pattern.as_bytes(), *regex)
+                            .is_some()
+                    {
+                        Some(Ok(serde_json::json!({
+                            "matched": true,
+                            "screen_sequence": screen_sequence,
+                        })))
+                    } else {
+                        None
+                    }
+                },
+                WaitKind::Output { pattern, regex, start_offset } => {
+                    let transcript = window.automation.transcript.lock().unwrap();
+                    match transcript.range(*start_offset, crate::automation::TRANSCRIPT_CAPACITY) {
+                        Ok(bytes) => pattern_find(&bytes, pattern, *regex).map(|(start, end)| {
+                            Ok(serde_json::json!({
+                                "matched": true,
+                                "start_offset": start_offset.saturating_add(start as u64),
+                                "end_offset": start_offset.saturating_add(end as u64),
+                                "output_offset": transcript.end_offset(),
+                            }))
+                        }),
+                        Err(error) => Some(Err(error)),
+                    }
+                },
+                WaitKind::ScreenChange { after } => (screen_sequence > *after)
+                    .then(|| Ok(serde_json::json!({"screen_sequence": screen_sequence}))),
+                WaitKind::ScreenStable { quiet, after_screen } => {
+                    let eligible = after_screen.is_none_or(|after| screen_sequence > after);
+                    (eligible && now.duration_since(last_screen_change) >= *quiet).then(|| {
+                        Ok(serde_json::json!({
+                            "screen_sequence": screen_sequence,
+                            "stable_for_ms": now.duration_since(last_screen_change).as_millis(),
+                        }))
+                    })
+                },
+                WaitKind::Frame { after } => (frame_sequence > *after)
+                    .then(|| Ok(serde_json::json!({"frame_sequence": frame_sequence}))),
+                WaitKind::Exit => exit_status.map(|status| {
+                    Ok(serde_json::json!({
+                        "exited": true,
+                        "code": status.code(),
+                        "signal": status.signal(),
+                        "core_dumped": status.core_dumped(),
+                    }))
+                }),
+                WaitKind::Resize {
+                    columns,
+                    rows,
+                    width,
+                    height,
+                    after_resize,
+                    pty_complete,
+                    ..
+                } => {
+                    let size = window.display.size_info;
+                    let pixels = window.display.window.inner_size();
+                    let grid_matches = columns.is_none_or(|columns| {
+                        size.columns() == usize::from(columns)
+                            && rows.is_some_and(|rows| size.screen_lines() == usize::from(rows))
+                    });
+                    (window.automation.resize_confirmation > *after_resize
+                        && *pty_complete
+                        && grid_matches
+                        && pixels.width == *width
+                        && pixels.height == *height)
+                        .then(|| {
+                            Ok(serde_json::json!({
+                                "columns": size.columns(),
+                                "rows": size.screen_lines(),
+                                "width": pixels.width,
+                                "height": pixels.height,
+                            }))
+                        })
+                },
+                WaitKind::Focus { after_focus } => {
+                    (window.automation.focus_confirmation > *after_focus && window.is_focused())
+                        .then(|| Ok(serde_json::json!({"focused": true})))
+                },
+            };
+
+            match result {
+                Some(Ok(result)) => waiter.connection.reply(waiter.request_id, result),
+                Some(Err(error)) => waiter.connection.error(waiter.request_id, error),
+                None => window.automation.waiters.push(waiter),
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn decode_ipc_params<T: DeserializeOwned>(request: &IpcRequest) -> Result<T, IpcError> {
+    serde_json::from_value(request.params.clone()).map_err(|error| {
+        IpcError::new("invalid_params", format!("invalid {} parameters: {error}", request.method))
+    })
+}
+
+#[cfg(unix)]
+fn compile_regex(pattern: &str) -> Result<(), IpcError> {
+    regex_automata::meta::Regex::new(pattern)
+        .map(|_| ())
+        .map_err(|error| IpcError::new("regex_invalid", error.to_string()))
+}
+
+#[cfg(unix)]
+fn pattern_find(haystack: &[u8], needle: &[u8], regex: bool) -> Option<(usize, usize)> {
+    if regex {
+        let pattern = std::str::from_utf8(needle).ok()?;
+        let regex = regex_automata::meta::Regex::new(pattern).ok()?;
+        regex.find(haystack).map(|found| (found.start(), found.end()))
+    } else if needle.is_empty() {
+        Some((0, 0))
+    } else {
+        haystack
+            .windows(needle.len())
+            .position(|window| window == needle)
+            .map(|start| (start, start + needle.len()))
     }
 }
 
@@ -255,6 +1533,20 @@ impl ApplicationHandler<Event> for Processor {
         };
 
         let is_redraw = matches!(event, WindowEvent::RedrawRequested);
+        #[cfg(unix)]
+        let focus_confirmed = matches!(&event, WindowEvent::Focused(true));
+        #[cfg(unix)]
+        let resize_confirmed = matches!(&event, WindowEvent::Resized(_));
+        #[cfg(unix)]
+        let automation_event = match &event {
+            WindowEvent::Focused(focused) => {
+                Some(("focus_changed", serde_json::json!({"focused": focused})))
+            },
+            WindowEvent::Resized(size) => {
+                Some(("resized", serde_json::json!({"width": size.width, "height": size.height})))
+            },
+            _ => None,
+        };
 
         window_context.handle_event(
             #[cfg(target_os = "macos")]
@@ -265,8 +1557,42 @@ impl ApplicationHandler<Event> for Processor {
             WinitEvent::WindowEvent { window_id, event },
         );
 
+        #[cfg(unix)]
+        if focus_confirmed {
+            window_context.automation.pending_focus_confirmations =
+                window_context.automation.pending_focus_confirmations.saturating_add(1);
+        }
+
+        #[cfg(unix)]
+        if resize_confirmed {
+            window_context.automation.pending_resize_confirmations =
+                window_context.automation.pending_resize_confirmations.saturating_add(1);
+        }
+
+        #[cfg(unix)]
+        if let Some((kind, data)) = automation_event {
+            self.automation.emit(Some(window_context.ipc_window_id()), kind, data);
+        }
+
         if is_redraw {
-            window_context.draw(&mut self.scheduler);
+            let presented = window_context.draw(&mut self.scheduler);
+            #[cfg(unix)]
+            if presented {
+                let ipc_window_id = window_context.ipc_window_id();
+                let frame_sequence = window_context.automation.record_frame();
+                self.automation.emit(
+                    Some(ipc_window_id),
+                    "frame_presented",
+                    serde_json::json!({"frame_sequence": frame_sequence}),
+                );
+            }
+        }
+
+        #[cfg(unix)]
+        {
+            let _ = window_context;
+            self.evaluate_waiters(window_id);
+            self.schedule_automation_timer(window_id);
         }
     }
 
@@ -277,57 +1603,26 @@ impl ApplicationHandler<Event> for Processor {
 
         // Handle events which don't mandate the WindowId.
         match (event.payload, event.window_id.as_ref()) {
-            // Process IPC config update.
             #[cfg(unix)]
-            (EventType::IpcConfig(ipc_config), window_id) => {
-                // Try and parse options as toml.
-                let mut options = ParsedOptions::from_options(&ipc_config.options);
-
-                // Override IPC config for each window with matching ID.
-                for (_, window_context) in self
-                    .windows
-                    .iter_mut()
-                    .filter(|(id, _)| window_id.is_none() || window_id == Some(*id))
-                {
-                    if ipc_config.reset {
-                        window_context.reset_window_config(self.config.clone());
-                    } else {
-                        window_context.add_window_config(self.config.clone(), &options);
-                    }
-                }
-
-                // Persist global options for future windows.
-                if window_id.is_none() {
-                    if ipc_config.reset {
-                        self.global_ipc_options.clear();
-                    } else {
-                        self.global_ipc_options.append(&mut options);
-                    }
+            (EventType::IpcRequest(request), _) => self.handle_ipc_request(event_loop, request),
+            #[cfg(unix)]
+            (EventType::IpcDisconnect(connection_id), _) => {
+                self.handle_ipc_disconnect(connection_id);
+            },
+            #[cfg(unix)]
+            (EventType::ScreenshotReadback, Some(window_id)) => {
+                if let Some(window_context) = self.windows.get_mut(window_id) {
+                    window_context.poll_screenshot(&mut self.scheduler, &self.proxy);
                 }
             },
-            // Process IPC config requests.
             #[cfg(unix)]
-            (EventType::IpcGetConfig(stream), window_id) => {
-                // Get the config for the requested window ID.
-                let config = match self.windows.iter().find(|(id, _)| window_id == Some(*id)) {
-                    Some((_, window_context)) => window_context.config(),
-                    None => &self.global_ipc_options.override_config_rc(self.config.clone()),
-                };
-
-                // Convert config to JSON format.
-                let config_json = match serde_json::to_string(&config) {
-                    Ok(config_json) => config_json,
-                    Err(err) => {
-                        error!("Failed config serialization: {err}");
-                        return;
-                    },
-                };
-
-                // Send JSON config to the socket.
-                if let Ok(mut stream) = stream.try_clone() {
-                    ipc::send_reply(&mut stream, SocketReply::GetConfig(config_json));
+            (EventType::ScreenshotComplete, Some(window_id)) => {
+                if let Some(window_context) = self.windows.get_mut(window_id) {
+                    window_context.complete_screenshot();
                 }
             },
+            #[cfg(unix)]
+            (EventType::AutomationTick, Some(window_id)) => self.automation_tick(*window_id),
             (EventType::ConfigReload(path), _) => {
                 // Clear config logs from message bar for all terminals.
                 for window_context in self.windows.values_mut() {
@@ -386,6 +1681,73 @@ impl ApplicationHandler<Event> for Processor {
                     );
                 }
             },
+            #[cfg(unix)]
+            (EventType::Terminal(TerminalEvent::Title(title)), Some(window_id)) => {
+                self.automation.emit(
+                    self.windows.get(window_id).map(WindowContext::ipc_window_id),
+                    "title_changed",
+                    serde_json::json!({"title": title}),
+                );
+                if let Some(window_context) = self.windows.get_mut(window_id) {
+                    window_context.handle_event(
+                        #[cfg(target_os = "macos")]
+                        event_loop,
+                        &self.proxy,
+                        &mut self.clipboard,
+                        &mut self.scheduler,
+                        WinitEvent::UserEvent(Event::new(
+                            EventType::Terminal(TerminalEvent::Title(title)),
+                            *window_id,
+                        )),
+                    );
+                }
+            },
+            #[cfg(unix)]
+            (EventType::Terminal(TerminalEvent::ResetTitle), Some(window_id)) => {
+                let title = self
+                    .windows
+                    .get(window_id)
+                    .map(|window| window.config().window.identity.title.clone());
+                self.automation.emit(
+                    self.windows.get(window_id).map(WindowContext::ipc_window_id),
+                    "title_changed",
+                    serde_json::json!({"title": title}),
+                );
+                if let Some(window_context) = self.windows.get_mut(window_id) {
+                    window_context.handle_event(
+                        #[cfg(target_os = "macos")]
+                        event_loop,
+                        &self.proxy,
+                        &mut self.clipboard,
+                        &mut self.scheduler,
+                        WinitEvent::UserEvent(Event::new(
+                            EventType::Terminal(TerminalEvent::ResetTitle),
+                            *window_id,
+                        )),
+                    );
+                }
+            },
+            #[cfg(unix)]
+            (EventType::Terminal(TerminalEvent::Bell), Some(window_id)) => {
+                self.automation.emit(
+                    self.windows.get(window_id).map(WindowContext::ipc_window_id),
+                    "bell",
+                    serde_json::json!({}),
+                );
+                if let Some(window_context) = self.windows.get_mut(window_id) {
+                    window_context.handle_event(
+                        #[cfg(target_os = "macos")]
+                        event_loop,
+                        &self.proxy,
+                        &mut self.clipboard,
+                        &mut self.scheduler,
+                        WinitEvent::UserEvent(Event::new(
+                            EventType::Terminal(TerminalEvent::Bell),
+                            *window_id,
+                        )),
+                    );
+                }
+            },
             (EventType::Terminal(TerminalEvent::Wakeup), Some(window_id)) => {
                 if let Some(window_context) = self.windows.get_mut(window_id) {
                     window_context.dirty = true;
@@ -393,6 +1755,50 @@ impl ApplicationHandler<Event> for Processor {
                         window_context.display.window.request_redraw();
                     }
                 }
+            },
+            #[cfg(unix)]
+            (EventType::Terminal(TerminalEvent::PtyOutput { start, end }), Some(window_id)) => {
+                if let Some(window) = self.windows.get(window_id) {
+                    let transcript = window.automation.transcript.lock().unwrap();
+                    if let Ok(bytes) = transcript.range(start, end.saturating_sub(start) as usize) {
+                        self.automation.emit_output(window.ipc_window_id(), start, &bytes);
+                    }
+                }
+                self.evaluate_waiters(*window_id);
+                self.schedule_automation_timer(*window_id);
+            },
+            #[cfg(unix)]
+            (EventType::Terminal(TerminalEvent::PtyWriteComplete(token)), Some(window_id)) => {
+                if let Some(window) = self.windows.get_mut(window_id)
+                    && let Some(index) = window
+                        .automation
+                        .pending_writes
+                        .iter()
+                        .position(|pending| pending.token == token)
+                {
+                    let pending = window.automation.pending_writes.swap_remove(index);
+                    pending.connection.reply(
+                        pending.request_id,
+                        serde_json::json!({"written_bytes": pending.bytes}),
+                    );
+                }
+                self.schedule_automation_timer(*window_id);
+            },
+            #[cfg(unix)]
+            (EventType::Terminal(TerminalEvent::PtyResizeComplete(token)), Some(window_id)) => {
+                if let Some(window) = self.windows.get_mut(window_id)
+                    && let Some(waiter) = window.automation.waiters.iter_mut().find(|waiter| {
+                        matches!(
+                            waiter.kind,
+                            WaitKind::Resize { pty_token: Some(expected), .. } if expected == token
+                        )
+                    })
+                    && let WaitKind::Resize { pty_complete, .. } = &mut waiter.kind
+                {
+                    *pty_complete = true;
+                }
+                self.evaluate_waiters(*window_id);
+                self.schedule_automation_timer(*window_id);
             },
             (EventType::VividFrame, Some(window_id)) => {
                 if let Some(window_context) = self.windows.get_mut(window_id) {
@@ -403,9 +1809,28 @@ impl ApplicationHandler<Event> for Processor {
                     }
                 }
             },
+            #[cfg(unix)]
+            (EventType::Terminal(TerminalEvent::ChildExit(status)), Some(window_id)) => {
+                if let Some(window) = self.windows.get_mut(window_id) {
+                    use std::os::unix::process::ExitStatusExt;
+
+                    window.automation.exit_status = Some(status);
+                    self.automation.emit(
+                        Some(window.ipc_window_id()),
+                        "child_exit",
+                        serde_json::json!({
+                            "code": status.code(),
+                            "signal": status.signal(),
+                            "core_dumped": status.core_dumped(),
+                        }),
+                    );
+                    self.evaluate_waiters(*window_id);
+                    self.schedule_automation_timer(*window_id);
+                }
+            },
             (EventType::Terminal(TerminalEvent::Exit), Some(window_id)) => {
                 // Remove the closed terminal.
-                let window_context = match self.windows.entry(*window_id) {
+                let mut window_context = match self.windows.entry(*window_id) {
                     // Don't exit when terminal exits if user asked to hold the window.
                     Entry::Occupied(window_context)
                         if !window_context.get().display.window.hold =>
@@ -414,6 +1839,17 @@ impl ApplicationHandler<Event> for Processor {
                     },
                     _ => return,
                 };
+
+                #[cfg(unix)]
+                {
+                    let ipc_window_id = window_context.ipc_window_id();
+                    window_context.fail_automation_requests("pty_closed", "terminal window closed");
+                    self.automation.emit(
+                        Some(ipc_window_id),
+                        "window_closed",
+                        serde_json::json!({"window_id": ipc_window_id}),
+                    );
+                }
 
                 // Unschedule pending events.
                 self.scheduler.unschedule_window(window_context.id());
@@ -469,6 +1905,46 @@ impl ApplicationHandler<Event> for Processor {
             );
         }
 
+        #[cfg(unix)]
+        {
+            let window_ids: Vec<_> = self.windows.keys().copied().collect();
+            for window_id in &window_ids {
+                self.apply_automation_confirmations(*window_id);
+            }
+            let mut changes = Vec::new();
+            for (platform_id, window) in &mut self.windows {
+                if let Some((screen_sequence, rows)) = window.sync_automation_screen() {
+                    let grid = window
+                        .automation_grid(None, None, Some(screen_sequence.saturating_sub(1)))
+                        .ok();
+                    changes.push((
+                        *platform_id,
+                        window.ipc_window_id(),
+                        screen_sequence,
+                        rows,
+                        grid,
+                    ));
+                }
+            }
+            for (_platform_id, window_id, screen_sequence, rows, grid) in changes {
+                let full = rows.is_none();
+                self.automation.emit(
+                    Some(window_id),
+                    "screen_changed",
+                    serde_json::json!({
+                        "screen_sequence": screen_sequence,
+                        "full": full,
+                        "rows": rows,
+                        "grid": grid,
+                    }),
+                );
+            }
+            for window_id in window_ids {
+                self.evaluate_waiters(window_id);
+                self.schedule_automation_timer(window_id);
+            }
+        }
+
         // Update the scheduler after event processing to ensure
         // the event loop deadline is as accurate as possible.
         let control_flow = match self.scheduler.update() {
@@ -483,6 +1959,10 @@ impl ApplicationHandler<Event> for Processor {
             info!("Exiting the event loop");
         }
 
+        #[cfg(unix)]
+        for window in self.windows.values_mut() {
+            window.fail_automation_requests("pty_closed", "Vivido event loop is shutting down");
+        }
         self.windows.clear();
 
         // SAFETY: The clipboard must be dropped before the event loop, so use the nop clipboard
@@ -523,9 +2003,15 @@ pub enum EventType {
     Scroll(Scroll),
     CreateWindow(WindowOptions),
     #[cfg(unix)]
-    IpcConfig(IpcConfig),
+    IpcRequest(IpcRequest),
     #[cfg(unix)]
-    IpcGetConfig(Arc<UnixStream>),
+    IpcDisconnect(u64),
+    #[cfg(unix)]
+    ScreenshotReadback,
+    #[cfg(unix)]
+    ScreenshotComplete,
+    #[cfg(unix)]
+    AutomationTick,
     BlinkCursor,
     BlinkCursorTimeout,
     SearchNext,
@@ -1574,9 +3060,18 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                     TerminalEvent::MouseCursorDirty => self.reset_mouse_cursor(),
                     TerminalEvent::CursorBlinkingChange => self.ctx.update_cursor_blinking(),
                     TerminalEvent::Exit | TerminalEvent::ChildExit(_) | TerminalEvent::Wakeup => (),
+                    #[cfg(unix)]
+                    TerminalEvent::PtyOutput { .. }
+                    | TerminalEvent::PtyWriteComplete(_)
+                    | TerminalEvent::PtyResizeComplete(_) => (),
                 },
                 #[cfg(unix)]
-                EventType::IpcConfig(_) | EventType::IpcGetConfig(..) | EventType::Shutdown => (),
+                EventType::IpcRequest(_)
+                | EventType::IpcDisconnect(_)
+                | EventType::ScreenshotReadback
+                | EventType::ScreenshotComplete
+                | EventType::AutomationTick
+                | EventType::Shutdown => (),
                 EventType::Message(_)
                 | EventType::ConfigReload(_)
                 | EventType::CreateWindow(_)
@@ -1741,5 +3236,17 @@ impl EventProxy {
 impl EventListener for EventProxy {
     fn send_event(&self, event: TerminalEvent) {
         let _ = self.proxy.send_event(Event::new(event.into(), self.window_id));
+    }
+}
+
+#[cfg(all(test, unix))]
+mod ipc_wait_tests {
+    use super::pattern_find;
+
+    #[test]
+    fn literal_and_regex_wait_matching_report_byte_ranges() {
+        assert_eq!(pattern_find(b"before ready> after", b"ready>", false), Some((7, 13)));
+        assert_eq!(pattern_find(b"status=1234", br"status=\d+", true), Some((0, 11)));
+        assert_eq!(pattern_find("界面 ready".as_bytes(), "界面".as_bytes(), false), Some((0, 6)));
     }
 }

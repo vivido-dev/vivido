@@ -1047,6 +1047,7 @@ mod tests {
             channel_mask: 3,
             bitrate: 1_536_000,
             max_access_unit_bytes: 4_096,
+            codec_string: None,
         };
         let encoded = vec![0_u8; 480 * 2 * 2];
         assert!(supports(&config));

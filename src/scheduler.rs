@@ -29,6 +29,10 @@ pub enum Topic {
     BlinkCursor,
     BlinkTimeout,
     Frame,
+    #[cfg(unix)]
+    ScreenshotReadback,
+    #[cfg(unix)]
+    Automation,
 }
 
 /// Event scheduled to be emitted at a specific time.

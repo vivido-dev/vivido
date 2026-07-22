@@ -4,8 +4,9 @@ use std::time::{Duration, Instant};
 
 use vivid_protocol::media;
 use vivid_protocol::messages::{
-    ClipRect, ImageSourceConfig, ParsedAudioSourceConfig, ParsedSceneNode, ParsedVideoSourceConfig,
-    PlayRequest, RasterSourceConfig,
+    ClipRect, ImageSourceConfig, MAX_SCENE_NODES, ParsedAudioSourceConfig, ParsedSceneNode,
+    ParsedVideoSourceConfig, PlayRequest, RasterSourceConfig, SceneValidationKey,
+    SceneValidationNode, SceneValidationSource, validate_scene_snapshot,
 };
 
 pub type SessionId = u64;
@@ -13,7 +14,6 @@ pub type SourceKey = (SessionId, u64);
 pub type AnchorKey = (SessionId, u64);
 
 const MAX_SOURCES: usize = 64;
-const MAX_NODES: usize = 256;
 const MAX_DECODED_PIXELS: u64 = 8192 * 8192 * 2;
 const MAX_RESERVED_INGRESS_BYTES: u64 = 256 * 1024 * 1024;
 const RESERVED_INGRESS_WINDOW: u64 = 4 * 1024 * 1024;
@@ -176,7 +176,7 @@ fn insert_anchor(
     if anchor_id == 0 {
         return Err("anchor ID is zero");
     }
-    if state.anchors.len() >= MAX_NODES {
+    if state.anchors.len() >= MAX_SCENE_NODES {
         return Err("anchor quota exceeded");
     }
     if state
@@ -564,9 +564,7 @@ impl SharedScene {
                 },
             }
         }
-        if nodes.len() > MAX_NODES {
-            return Err("node quota exceeded");
-        }
+        validate_scene_structure(&state, &nodes)?;
         state.nodes = nodes;
         state.revision = state.revision.wrapping_add(1);
         Ok(())
@@ -831,21 +829,42 @@ fn validate_node(
         #[cfg(not(windows))]
         return Err("node anchor does not exist");
     }
-    if node.width <= 0 || node.height <= 0 {
-        return Err("node output rectangle is empty");
-    }
-    if node.x.checked_add(node.width).is_none() || node.y.checked_add(node.height).is_none() {
-        return Err("node output rectangle overflows coordinate space");
-    }
-    if let Some(clip) = node.clip
-        && (clip.width <= 0
-            || clip.height <= 0
-            || clip.x.checked_add(clip.width).is_none()
-            || clip.y.checked_add(clip.height).is_none())
-    {
-        return Err("node clip rectangle is invalid");
-    }
     Ok(())
+}
+
+fn validate_scene_structure(
+    state: &State,
+    nodes: &HashMap<(SessionId, u64), SceneNode>,
+) -> Result<(), &'static str> {
+    let sources = state
+        .sources
+        .iter()
+        .map(|(&(session_id, source_id), source)| SceneValidationSource {
+            key: SceneValidationKey { owner_id: session_id, object_id: source_id },
+            is_video: matches!(source.config, SourceConfig::Video(_)),
+            linked_video: match &source.config {
+                SourceConfig::Audio(config) => config.linked_video_source_id.map(|source_id| {
+                    SceneValidationKey { owner_id: session_id, object_id: source_id }
+                }),
+                _ => None,
+            },
+        })
+        .collect::<Vec<_>>();
+    let nodes = nodes
+        .values()
+        .map(|node| SceneValidationNode {
+            owner_id: node.session_id,
+            node_id: node.node_id,
+            fragment_id: 0,
+            source: SceneValidationKey { owner_id: node.session_id, object_id: node.source_id },
+            x: node.x,
+            y: node.y,
+            width: node.width,
+            height: node.height,
+            clip: node.clip,
+        })
+        .collect::<Vec<_>>();
+    validate_scene_snapshot(&sources, &nodes).map_err(|_| "scene structure is invalid")
 }
 
 fn gc_detached_sources(state: &mut State) {
@@ -891,6 +910,8 @@ mod tests {
                     sar_num: 1,
                     sar_den: 1,
                     max_access_unit_bytes: 1024,
+                    codec_string: None,
+                    decoder_config: None,
                 }),
             )
             .unwrap();

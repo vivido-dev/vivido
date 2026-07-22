@@ -269,6 +269,75 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
             }
         }
     }
+
+    /// Process a neutral IPC key through Vivido bindings/search/hints without mutating the
+    /// persistent physical modifier state. Bytes that fall through are returned for tagged PTY
+    /// delivery by the automation layer.
+    #[cfg(unix)]
+    pub fn ipc_key_input(
+        &mut self,
+        key: &str,
+        modifiers: &[String],
+        repeated: bool,
+    ) -> Result<Option<Vec<u8>>, crate::polling::ipc::IpcError> {
+        let mods = ipc_modifier_state(modifiers)?;
+        let (logical_key, location) = ipc_logical_key(key)?;
+        let mode = *self.ctx.terminal().mode();
+        let text = match &logical_key {
+            Key::Character(text) => text.to_string(),
+            Key::Named(named) => named.to_text().unwrap_or_default().to_owned(),
+            _ => String::new(),
+        };
+
+        if self.ctx.display().hint_state.active() {
+            for character in text.chars() {
+                self.ctx.hint_input(character);
+            }
+            return Ok(None);
+        }
+
+        self.reset_search_delay();
+        let binding_mode = BindingMode::new(self.ctx.terminal().mode(), self.ctx.search_active());
+        let binding_key = match logical_key {
+            Key::Character(character) => Key::Character(character.to_lowercase().into()),
+            logical_key => logical_key,
+        };
+        let trigger = BindingKey::Keycode { key: binding_key, location: location.into() };
+        let bindings = self.ctx.config().key_bindings().to_vec();
+        let hint_bindings: Vec<_> = self
+            .ctx
+            .config()
+            .hints
+            .enabled
+            .iter()
+            .filter_map(|hint| {
+                hint.binding.as_ref().map(|binding| binding.key_binding(hint).clone())
+            })
+            .collect();
+        let mut suppress = None;
+        for binding in bindings.into_iter().chain(hint_bindings) {
+            if binding.is_triggered_by(binding_mode, mods, &trigger) {
+                *suppress.get_or_insert(true) &= binding.action != Action::ReceiveChar;
+                binding.action.execute(&mut self.ctx);
+            }
+        }
+        if suppress == Some(true) {
+            return Ok(None);
+        }
+
+        if self.ctx.search_active() {
+            for character in text.chars() {
+                self.ctx.search_input(character);
+            }
+            return Ok(None);
+        }
+
+        let bytes = encode_ipc_key_event(key, modifiers, mode, repeated)?;
+        if !bytes.is_empty() {
+            self.ctx.on_terminal_input_start();
+        }
+        Ok(Some(bytes))
+    }
 }
 
 /// Build a key's keyboard escape sequence based on the given `key`, `mods`, and `mode`.
@@ -699,4 +768,417 @@ fn is_control_character(text: &str) -> bool {
     // does not match the reported text (`^H`), despite not technically being part of C0 or C1.
     let codepoint = text.bytes().next().unwrap();
     text.len() == 1 && (codepoint < 0x20 || (0x7f..=0x9f).contains(&codepoint))
+}
+
+/// Encode a protocol-neutral IPC key for the current terminal keyboard modes.
+#[cfg(unix)]
+pub fn encode_ipc_key_event(
+    key: &str,
+    modifiers: &[String],
+    mode: TermMode,
+    repeated: bool,
+) -> Result<Vec<u8>, crate::polling::ipc::IpcError> {
+    let mods = ipc_modifiers(modifiers)?;
+    let modifier_parameter = mods.bits() + 1;
+    let kitty = mode.intersects(
+        TermMode::REPORT_ALL_KEYS_AS_ESC
+            | TermMode::DISAMBIGUATE_ESC_CODES
+            | TermMode::REPORT_EVENT_TYPES,
+    );
+
+    let character = {
+        let mut chars = key.chars();
+        match (chars.next(), chars.next()) {
+            (Some(character), None) => Some(character),
+            _ => None,
+        }
+    };
+    if let Some(mut character) = character {
+        if mods.contains(SequenceModifiers::CONTROL) {
+            character = character.to_ascii_lowercase();
+            let control = match character {
+                '@' | ' ' => Some(0),
+                'a'..='z' => Some(character as u8 - b'a' + 1),
+                '[' => Some(27),
+                '\\' => Some(28),
+                ']' => Some(29),
+                '^' => Some(30),
+                '_' | '?' => Some(31),
+                _ => None,
+            };
+            if let Some(control) = control
+                && !kitty
+            {
+                let mut bytes = Vec::with_capacity(2);
+                if mods.contains(SequenceModifiers::ALT) {
+                    bytes.push(b'\x1b');
+                }
+                bytes.push(control);
+                return Ok(bytes);
+            }
+        }
+        if kitty && (!mods.is_empty() || mode.contains(TermMode::REPORT_ALL_KEYS_AS_ESC)) {
+            let modifiers = kitty_modifiers(modifier_parameter, mode, repeated);
+            return Ok(format!("\x1b[{};{modifiers}u", u32::from(character)).into_bytes());
+        }
+        let mut bytes = Vec::with_capacity(character.len_utf8() + 1);
+        if mods.contains(SequenceModifiers::ALT) {
+            bytes.push(b'\x1b');
+        }
+        let mut encoded = [0; 4];
+        bytes.extend_from_slice(character.encode_utf8(&mut encoded).as_bytes());
+        return Ok(bytes);
+    }
+
+    let normalized = key.to_ascii_lowercase().replace(['-', '_'], "");
+    let control = match normalized.as_str() {
+        "enter" | "return" => Some((13, b'\r')),
+        "escape" | "esc" => Some((27, b'\x1b')),
+        "tab" => Some((9, b'\t')),
+        "backspace" => Some((127, b'\x7f')),
+        _ => None,
+    };
+    if let Some((codepoint, byte)) = control {
+        let disambiguate = mode.contains(TermMode::REPORT_ALL_KEYS_AS_ESC)
+            || (mode.contains(TermMode::DISAMBIGUATE_ESC_CODES) && !mods.is_empty());
+        if kitty && (disambiguate || repeated) {
+            let modifiers = kitty_modifiers(modifier_parameter, mode, repeated);
+            return Ok(format!("\x1b[{codepoint};{modifiers}u").into_bytes());
+        }
+        if normalized == "tab" && mods.contains(SequenceModifiers::SHIFT) {
+            let mut bytes = Vec::with_capacity(4);
+            if mods.contains(SequenceModifiers::ALT) {
+                bytes.push(b'\x1b');
+            }
+            bytes.extend_from_slice(b"\x1b[Z");
+            return Ok(bytes);
+        }
+        let mut bytes = Vec::with_capacity(2);
+        if mods.contains(SequenceModifiers::ALT) {
+            bytes.push(b'\x1b');
+        }
+        bytes.push(byte);
+        return Ok(bytes);
+    }
+
+    let cursor_final = match normalized.as_str() {
+        "arrowup" | "up" => Some('A'),
+        "arrowdown" | "down" => Some('B'),
+        "arrowright" | "right" => Some('C'),
+        "arrowleft" | "left" => Some('D'),
+        "home" => Some('H'),
+        "end" => Some('F'),
+        _ => None,
+    };
+    if let Some(final_byte) = cursor_final {
+        if repeated && mode.contains(TermMode::REPORT_EVENT_TYPES) {
+            let modifiers = kitty_modifiers(modifier_parameter, mode, true);
+            return Ok(format!("\x1b[1;{modifiers}{final_byte}").into_bytes());
+        }
+        if mods.is_empty() {
+            let introducer = if mode.contains(TermMode::APP_CURSOR) { "\x1bO" } else { "\x1b[" };
+            return Ok(format!("{introducer}{final_byte}").into_bytes());
+        }
+        return Ok(format!("\x1b[1;{modifier_parameter}{final_byte}").into_bytes());
+    }
+
+    let tilde_code = match normalized.as_str() {
+        "insert" => Some(2),
+        "delete" | "del" => Some(3),
+        "pageup" => Some(5),
+        "pagedown" => Some(6),
+        _ => None,
+    };
+    if let Some(code) = tilde_code {
+        let modifiers = kitty_modifiers(modifier_parameter, mode, repeated);
+        return if mods.is_empty() {
+            if repeated && mode.contains(TermMode::REPORT_EVENT_TYPES) {
+                Ok(format!("\x1b[{code};{modifiers}~").into_bytes())
+            } else {
+                Ok(format!("\x1b[{code}~").into_bytes())
+            }
+        } else {
+            Ok(format!("\x1b[{code};{modifiers}~").into_bytes())
+        };
+    }
+
+    if let Some(number) = normalized.strip_prefix('f').and_then(|number| number.parse::<u8>().ok())
+        && (1..=35).contains(&number)
+    {
+        if number <= 4 {
+            let final_byte = char::from(b'P' + number - 1);
+            let modifiers = kitty_modifiers(modifier_parameter, mode, repeated);
+            return if mods.is_empty() {
+                if repeated && mode.contains(TermMode::REPORT_EVENT_TYPES) {
+                    Ok(format!("\x1b[1;{modifiers}{final_byte}").into_bytes())
+                } else {
+                    Ok(format!("\x1bO{final_byte}").into_bytes())
+                }
+            } else {
+                Ok(format!("\x1b[1;{modifiers}{final_byte}").into_bytes())
+            };
+        }
+        let normal_codes = [15, 17, 18, 19, 20, 21, 23, 24, 25, 26, 28, 29, 31, 32, 33, 34];
+        if number <= 20 {
+            let code = normal_codes[usize::from(number - 5)];
+            let modifiers = kitty_modifiers(modifier_parameter, mode, repeated);
+            return if mods.is_empty() {
+                if repeated && mode.contains(TermMode::REPORT_EVENT_TYPES) {
+                    Ok(format!("\x1b[{code};{modifiers}~").into_bytes())
+                } else {
+                    Ok(format!("\x1b[{code}~").into_bytes())
+                }
+            } else {
+                Ok(format!("\x1b[{code};{modifiers}~").into_bytes())
+            };
+        }
+        if kitty {
+            let code = 57375 + u32::from(number - 12);
+            let modifiers = kitty_modifiers(modifier_parameter, mode, repeated);
+            return Ok(format!("\x1b[{code};{modifiers}u").into_bytes());
+        }
+        let code = 42 + u32::from(number - 21);
+        return if mods.is_empty() {
+            Ok(format!("\x1b[{code}~").into_bytes())
+        } else {
+            Ok(format!("\x1b[{code};{modifier_parameter}~").into_bytes())
+        };
+    }
+
+    let keypad = match normalized.as_str() {
+        "keypad0" => Some((57399, b'0', 'p')),
+        "keypad1" => Some((57400, b'1', 'q')),
+        "keypad2" => Some((57401, b'2', 'r')),
+        "keypad3" => Some((57402, b'3', 's')),
+        "keypad4" => Some((57403, b'4', 't')),
+        "keypad5" => Some((57404, b'5', 'u')),
+        "keypad6" => Some((57405, b'6', 'v')),
+        "keypad7" => Some((57406, b'7', 'w')),
+        "keypad8" => Some((57407, b'8', 'x')),
+        "keypad9" => Some((57408, b'9', 'y')),
+        "keypaddecimal" => Some((57409, b'.', 'n')),
+        "keypaddivide" => Some((57410, b'/', 'o')),
+        "keypadmultiply" => Some((57411, b'*', 'j')),
+        "keypadsubtract" => Some((57412, b'-', 'm')),
+        "keypadadd" => Some((57413, b'+', 'k')),
+        "keypadenter" => Some((57414, b'\r', 'M')),
+        "keypadequal" => Some((57415, b'=', 'X')),
+        _ => None,
+    };
+    if let Some((code, literal, application_final)) = keypad {
+        if kitty {
+            let modifiers = kitty_modifiers(modifier_parameter, mode, repeated);
+            return Ok(format!("\x1b[{code};{modifiers}u").into_bytes());
+        }
+        if mode.contains(TermMode::APP_KEYPAD) {
+            return if mods.is_empty() {
+                Ok(format!("\x1bO{application_final}").into_bytes())
+            } else {
+                Ok(format!("\x1b[1;{modifier_parameter}{application_final}").into_bytes())
+            };
+        }
+        let mut bytes = Vec::with_capacity(2);
+        if mods.contains(SequenceModifiers::ALT) {
+            bytes.push(b'\x1b');
+        }
+        bytes.push(literal);
+        return Ok(bytes);
+    }
+
+    Err(crate::polling::ipc::IpcError::new("invalid_params", format!("unknown key {key:?}")))
+}
+
+#[cfg(unix)]
+fn kitty_modifiers(modifier_parameter: u8, mode: TermMode, repeated: bool) -> String {
+    if repeated && mode.contains(TermMode::REPORT_EVENT_TYPES) {
+        format!("{modifier_parameter}:2")
+    } else {
+        modifier_parameter.to_string()
+    }
+}
+
+#[cfg(unix)]
+fn ipc_modifiers(modifiers: &[String]) -> Result<SequenceModifiers, crate::polling::ipc::IpcError> {
+    let mut result = SequenceModifiers::empty();
+    for modifier in modifiers {
+        match modifier.to_ascii_lowercase().as_str() {
+            "shift" => result.insert(SequenceModifiers::SHIFT),
+            "alt" | "option" => result.insert(SequenceModifiers::ALT),
+            "ctrl" | "control" => result.insert(SequenceModifiers::CONTROL),
+            "super" | "command" | "cmd" => result.insert(SequenceModifiers::SUPER),
+            _ => {
+                return Err(crate::polling::ipc::IpcError::new(
+                    "invalid_params",
+                    format!("unknown modifier {modifier:?}"),
+                ));
+            },
+        }
+    }
+    Ok(result)
+}
+
+#[cfg(unix)]
+pub fn ipc_modifier_state(
+    modifiers: &[String],
+) -> Result<ModifiersState, crate::polling::ipc::IpcError> {
+    let mut result = ModifiersState::empty();
+    for modifier in modifiers {
+        match modifier.to_ascii_lowercase().as_str() {
+            "shift" => result.insert(ModifiersState::SHIFT),
+            "alt" | "option" => result.insert(ModifiersState::ALT),
+            "ctrl" | "control" => result.insert(ModifiersState::CONTROL),
+            "super" | "command" | "cmd" => result.insert(ModifiersState::SUPER),
+            _ => {
+                return Err(crate::polling::ipc::IpcError::new(
+                    "invalid_params",
+                    format!("unknown modifier {modifier:?}"),
+                ));
+            },
+        }
+    }
+    Ok(result)
+}
+
+#[cfg(unix)]
+fn ipc_logical_key(key: &str) -> Result<(Key, KeyLocation), crate::polling::ipc::IpcError> {
+    let mut characters = key.chars();
+    if let (Some(character), None) = (characters.next(), characters.next()) {
+        return Ok((Key::Character(character.to_string().into()), KeyLocation::Standard));
+    }
+
+    let normalized = key.to_ascii_lowercase().replace(['-', '_'], "");
+    let named = match normalized.as_str() {
+        "enter" | "return" | "keypadenter" => NamedKey::Enter,
+        "escape" | "esc" => NamedKey::Escape,
+        "tab" => NamedKey::Tab,
+        "backspace" => NamedKey::Backspace,
+        "arrowup" | "up" => NamedKey::ArrowUp,
+        "arrowdown" | "down" => NamedKey::ArrowDown,
+        "arrowleft" | "left" => NamedKey::ArrowLeft,
+        "arrowright" | "right" => NamedKey::ArrowRight,
+        "home" => NamedKey::Home,
+        "end" => NamedKey::End,
+        "insert" => NamedKey::Insert,
+        "delete" | "del" => NamedKey::Delete,
+        "pageup" => NamedKey::PageUp,
+        "pagedown" => NamedKey::PageDown,
+        "f1" => NamedKey::F1,
+        "f2" => NamedKey::F2,
+        "f3" => NamedKey::F3,
+        "f4" => NamedKey::F4,
+        "f5" => NamedKey::F5,
+        "f6" => NamedKey::F6,
+        "f7" => NamedKey::F7,
+        "f8" => NamedKey::F8,
+        "f9" => NamedKey::F9,
+        "f10" => NamedKey::F10,
+        "f11" => NamedKey::F11,
+        "f12" => NamedKey::F12,
+        "f13" => NamedKey::F13,
+        "f14" => NamedKey::F14,
+        "f15" => NamedKey::F15,
+        "f16" => NamedKey::F16,
+        "f17" => NamedKey::F17,
+        "f18" => NamedKey::F18,
+        "f19" => NamedKey::F19,
+        "f20" => NamedKey::F20,
+        "f21" => NamedKey::F21,
+        "f22" => NamedKey::F22,
+        "f23" => NamedKey::F23,
+        "f24" => NamedKey::F24,
+        "f25" => NamedKey::F25,
+        "f26" => NamedKey::F26,
+        "f27" => NamedKey::F27,
+        "f28" => NamedKey::F28,
+        "f29" => NamedKey::F29,
+        "f30" => NamedKey::F30,
+        "f31" => NamedKey::F31,
+        "f32" => NamedKey::F32,
+        "f33" => NamedKey::F33,
+        "f34" => NamedKey::F34,
+        "f35" => NamedKey::F35,
+        _ if normalized.starts_with("keypad") => {
+            let character = match normalized.strip_prefix("keypad").unwrap_or_default() {
+                "0" => "0",
+                "1" => "1",
+                "2" => "2",
+                "3" => "3",
+                "4" => "4",
+                "5" => "5",
+                "6" => "6",
+                "7" => "7",
+                "8" => "8",
+                "9" => "9",
+                "decimal" => ".",
+                "divide" => "/",
+                "multiply" => "*",
+                "subtract" => "-",
+                "add" => "+",
+                "equal" => "=",
+                _ => {
+                    return Err(crate::polling::ipc::IpcError::new(
+                        "invalid_params",
+                        format!("unknown key {key:?}"),
+                    ));
+                },
+            };
+            return Ok((Key::Character(character.into()), KeyLocation::Numpad));
+        },
+        _ => {
+            return Err(crate::polling::ipc::IpcError::new(
+                "invalid_params",
+                format!("unknown key {key:?}"),
+            ));
+        },
+    };
+    let location =
+        if normalized.starts_with("keypad") { KeyLocation::Numpad } else { KeyLocation::Standard };
+    Ok((Key::Named(named), location))
+}
+
+#[cfg(all(test, unix))]
+mod ipc_tests {
+    use super::encode_ipc_key_event;
+    use crate::terminal::term::TermMode;
+
+    fn encode_ipc_key(
+        key: &str,
+        modifiers: &[String],
+        mode: TermMode,
+    ) -> Result<Vec<u8>, crate::polling::ipc::IpcError> {
+        encode_ipc_key_event(key, modifiers, mode, false)
+    }
+
+    #[test]
+    fn encodes_application_cursor_and_keypad_modes() {
+        assert_eq!(encode_ipc_key("ArrowUp", &[], TermMode::APP_CURSOR).unwrap(), b"\x1bOA");
+        assert_eq!(encode_ipc_key("Keypad7", &[], TermMode::APP_KEYPAD).unwrap(), b"\x1bOw");
+        assert_eq!(encode_ipc_key("Keypad7", &[], TermMode::empty()).unwrap(), b"7");
+    }
+
+    #[test]
+    fn encodes_shift_tab_and_high_function_keys() {
+        assert_eq!(
+            encode_ipc_key("Tab", &[String::from("Shift")], TermMode::empty()).unwrap(),
+            b"\x1b[Z"
+        );
+        assert_eq!(encode_ipc_key("F35", &[], TermMode::empty()).unwrap(), b"\x1b[56~");
+    }
+
+    #[test]
+    fn encodes_control_unicode_and_kitty_keys() {
+        assert_eq!(
+            encode_ipc_key("c", &[String::from("Ctrl")], TermMode::empty()).unwrap(),
+            b"\x03"
+        );
+        assert_eq!(encode_ipc_key("界", &[], TermMode::empty()).unwrap(), "界".as_bytes());
+        assert_eq!(
+            encode_ipc_key("F21", &[], TermMode::REPORT_ALL_KEYS_AS_ESC).unwrap(),
+            b"\x1b[57384;1u"
+        );
+        assert_eq!(
+            encode_ipc_key_event("F5", &[], TermMode::REPORT_EVENT_TYPES, true).unwrap(),
+            b"\x1b[15;1:2~"
+        );
+    }
 }

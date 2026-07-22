@@ -94,6 +94,7 @@ fn report_mouse_to_application(mouse_mode: bool, shift: bool) -> bool {
 /// are activated.
 pub struct Processor<T: EventListener, A: ActionContext<T>> {
     pub ctx: A,
+    modifier_override: Option<ModifiersState>,
     _phantom: PhantomData<T>,
 }
 
@@ -283,7 +284,17 @@ impl<T: EventListener> Execute<T> for Action {
 
 impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
     pub fn new(ctx: A) -> Self {
-        Self { ctx, _phantom: Default::default() }
+        Self { ctx, modifier_override: None, _phantom: Default::default() }
+    }
+
+    /// Temporarily use a neutral automation modifier state without changing physical key state.
+    #[cfg(unix)]
+    pub fn set_modifier_override(&mut self, modifiers: ModifiersState) {
+        self.modifier_override = Some(modifiers);
+    }
+
+    fn modifiers_state(&mut self) -> ModifiersState {
+        self.modifier_override.unwrap_or_else(|| self.ctx.modifiers().state())
     }
 
     #[inline]
@@ -334,7 +345,7 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
         self.ctx.mouse_mut().block_hint_launcher = true;
 
         if (lmb_pressed || rmb_pressed)
-            && (self.ctx.modifiers().state().shift_key() || !self.ctx.mouse_mode())
+            && (self.modifiers_state().shift_key() || !self.ctx.mouse_mode())
         {
             self.ctx.update_selection(point, cell_side);
         } else if cell_changed
@@ -385,7 +396,7 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
 
         // Calculate modifiers value.
         let mut mods = 0;
-        let modifiers = self.ctx.modifiers().state();
+        let modifiers = self.modifiers_state();
         if modifiers.shift_key() {
             mods += 4;
         }
@@ -452,10 +463,7 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
 
     fn on_mouse_press(&mut self, button: MouseButton) {
         // Handle mouse mode.
-        if report_mouse_to_application(
-            self.ctx.mouse_mode(),
-            self.ctx.modifiers().state().shift_key(),
-        ) {
+        if report_mouse_to_application(self.ctx.mouse_mode(), self.modifiers_state().shift_key()) {
             self.ctx.mouse_mut().click_state = ClickState::None;
 
             let code = match button {
@@ -492,7 +500,7 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
     /// Handle left click selection.
     fn on_left_click(&mut self, point: Point) {
         let side = self.ctx.mouse().cell_side;
-        let control = self.ctx.modifiers().state().control_key();
+        let control = self.modifiers_state().control_key();
 
         match self.ctx.mouse().click_state {
             ClickState::Click => {
@@ -515,10 +523,7 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
     }
 
     fn on_mouse_release(&mut self, button: MouseButton) {
-        if report_mouse_to_application(
-            self.ctx.mouse_mode(),
-            self.ctx.modifiers().state().shift_key(),
-        ) {
+        if report_mouse_to_application(self.ctx.mouse_mode(), self.modifiers_state().shift_key()) {
             let code = match button {
                 MouseButton::Left => 0,
                 MouseButton::Middle => 1,
@@ -621,7 +626,7 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
             .terminal()
             .mode()
             .contains(TermMode::ALT_SCREEN | TermMode::ALTERNATE_SCROLL)
-            && !self.ctx.modifiers().state().shift_key()
+            && !self.modifiers_state().shift_key()
         {
             // The chars here are the same as for the respective arrow keys.
             let line_cmd = if is_scroll_up { b'A' } else { b'B' };
@@ -863,7 +868,7 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
     fn process_mouse_bindings(&mut self, event: MouseEvent) -> bool {
         let mode = BindingMode::new(self.ctx.terminal().mode(), self.ctx.search_active());
         let mouse_mode = self.ctx.mouse_mode();
-        let mods = self.ctx.modifiers().state();
+        let mods = self.modifiers_state();
         let mouse_bindings = self.ctx.config().mouse_bindings().to_owned();
 
         // If mouse mode is active, also look for bindings without shift.
@@ -929,7 +934,7 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
             mouse_state
         } else if self.ctx.display().highlighted_hint.as_ref().is_some_and(hint_highlighted) {
             CursorIcon::Pointer
-        } else if !self.ctx.modifiers().state().shift_key() && self.ctx.mouse_mode() {
+        } else if !self.modifiers_state().shift_key() && self.ctx.mouse_mode() {
             CursorIcon::Default
         } else {
             CursorIcon::Text

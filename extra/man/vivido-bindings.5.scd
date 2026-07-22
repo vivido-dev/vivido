@@ -27,10 +27,14 @@ Primary-button drag creates a simple mouse selection. Control-drag creates a blo
 Middle-click pastes the primary selection on platforms that provide it. Vivido has no
 selection-expansion binding or vi selection mode.
 
+On Windows, right-click pastes the system clipboard when terminal mouse reporting is inactive.
+Hold Shift to use terminal-side right-click paste while an application has enabled mouse
+reporting.
+
 # COMMON ACTIONS
 
 *Control+Shift+C* / *Control+Shift+V* (Linux/Windows)
-: Copy / paste.
+: Copy / paste. Windows also accepts *Control+V* for paste.
 
 *Command+C* / *Command+V* (macOS)
 : Copy / paste.

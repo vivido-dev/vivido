@@ -119,11 +119,9 @@ impl From<YamlError> for Error {
 
 /// Load the configuration file.
 pub fn load(options: &mut Options) -> UiConfig {
-    let config_path = options
-        .config_file
-        .clone()
-        .or_else(|| installed_config("toml"))
-        .or_else(|| installed_config("yml"));
+    let config_path = select_config_path(options.config_file.clone(), || {
+        installed_config("toml").or_else(|| installed_config("yml"))
+    });
 
     // Load the config using the following fallback behavior:
     //  - Config path + CLI overrides
@@ -144,6 +142,13 @@ pub fn load(options: &mut Options) -> UiConfig {
     after_loading(&mut config, options);
 
     config
+}
+
+fn select_config_path<F>(explicit: Option<PathBuf>, discover_installed: F) -> Option<PathBuf>
+where
+    F: FnOnce() -> Option<PathBuf>,
+{
+    explicit.or_else(discover_installed)
 }
 
 /// Attempt to reload the configuration file.
@@ -397,17 +402,81 @@ pub fn installed_config(suffix: &str) -> Option<PathBuf> {
 
 #[cfg(windows)]
 pub fn installed_config(suffix: &str) -> Option<PathBuf> {
+    let user_profile = env::var_os("USERPROFILE").map(PathBuf::from).or_else(home::home_dir);
+    first_existing_windows_config(windows_config_candidates(
+        user_profile,
+        dirs::config_dir(),
+        suffix,
+    ))
+}
+
+#[cfg(any(windows, test))]
+fn first_existing_windows_config(candidates: Vec<PathBuf>) -> Option<PathBuf> {
+    candidates.into_iter().find(|path| path.exists())
+}
+
+/// Return Windows configuration candidates in lookup order.
+///
+/// `%USERPROFILE%\vivido` is authoritative for new installs. The roaming
+/// `%APPDATA%\vivido` location remains a read-only compatibility fallback.
+#[cfg(any(windows, test))]
+fn windows_config_candidates(
+    home_dir: Option<PathBuf>,
+    roaming_config_dir: Option<PathBuf>,
+    suffix: &str,
+) -> Vec<PathBuf> {
     let file_name = format!("vivido.{suffix}");
-    dirs::config_dir().map(|path| path.join("vivido").join(file_name)).filter(|new| new.exists())
+    let mut candidates = Vec::with_capacity(2);
+
+    if suffix == "toml"
+        && let Some(home_dir) = home_dir
+    {
+        candidates.push(home_dir.join("vivido").join(&file_name));
+    }
+    if let Some(roaming_config_dir) = roaming_config_dir {
+        let legacy = roaming_config_dir.join("vivido").join(file_name);
+        if !candidates.contains(&legacy) {
+            candidates.push(legacy);
+        }
+    }
+
+    candidates
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn empty_config() {
         toml::from_str::<UiConfig>("").unwrap();
+    }
+
+    #[test]
+    fn explicit_config_has_precedence_without_discovery() {
+        let discovery_called = Cell::new(false);
+        let explicit = PathBuf::from("explicit.toml");
+        let selected = select_config_path(Some(explicit.clone()), || {
+            discovery_called.set(true);
+            Some(PathBuf::from("installed.toml"))
+        });
+
+        assert_eq!(selected, Some(explicit));
+        assert!(!discovery_called.get());
+    }
+
+    #[test]
+    fn malformed_config_returns_parse_error_for_unicode_path() {
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let directory = env::temp_dir().join(format!("vivido-config-José Example-{nonce}"));
+        let path = directory.join("vivido.toml");
+        fs::create_dir(&directory).unwrap();
+        fs::write(&path, "[terminal\nshell =").unwrap();
+
+        assert!(matches!(deserialize_config(&path, false), Err(Error::Toml(_))));
+        fs::remove_dir_all(directory).unwrap();
     }
 
     fn yaml_to_toml(contents: &str) -> String {
@@ -447,5 +516,50 @@ window = "Hello""#
         "#;
         let toml = yaml_to_toml(contents);
         assert!(toml.is_empty());
+    }
+
+    #[test]
+    fn windows_config_prefers_user_profile_and_keeps_legacy_fallback() {
+        let home = PathBuf::from("profile/José Example");
+        let roaming = PathBuf::from("profile/José Example/AppData/Roaming");
+        let candidates =
+            windows_config_candidates(Some(home.clone()), Some(roaming.clone()), "toml");
+
+        assert_eq!(
+            candidates,
+            [home.join("vivido").join("vivido.toml"), roaming.join("vivido").join("vivido.toml"),]
+        );
+    }
+
+    #[test]
+    fn windows_yaml_only_uses_legacy_roaming_location() {
+        let home = PathBuf::from("profile/Example");
+        let roaming = home.join("AppData/Roaming");
+        let candidates = windows_config_candidates(Some(home), Some(roaming.clone()), "yml");
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0], roaming.join("vivido").join("vivido.yml"));
+    }
+
+    #[test]
+    fn windows_config_discovers_new_path_before_legacy_and_falls_back() {
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let root = env::temp_dir().join(format!("vivido-config-discovery-José-{nonce}"));
+        let profile = root.join("profile");
+        let roaming = root.join("roaming");
+        let new_path = profile.join("vivido/vivido.toml");
+        let legacy_path = roaming.join("vivido/vivido.toml");
+        fs::create_dir_all(new_path.parent().unwrap()).unwrap();
+        fs::create_dir_all(legacy_path.parent().unwrap()).unwrap();
+        fs::write(&legacy_path, "legacy = true\n").unwrap();
+
+        let candidates =
+            windows_config_candidates(Some(profile.clone()), Some(roaming.clone()), "toml");
+        assert_eq!(first_existing_windows_config(candidates), Some(legacy_path.clone()));
+
+        fs::write(&new_path, "new = true\n").unwrap();
+        let candidates = windows_config_candidates(Some(profile), Some(roaming), "toml");
+        assert_eq!(first_existing_windows_config(candidates), Some(new_path));
+        fs::remove_dir_all(root).unwrap();
     }
 }
