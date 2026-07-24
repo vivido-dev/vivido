@@ -3,11 +3,9 @@ use std::path::{Path, PathBuf};
 use std::result::Result as StdResult;
 use std::{env, fs, io};
 
-use log::{debug, error, info, warn};
+use log::{debug, error, info};
 use serde::Deserialize;
-use serde_yaml::Error as YamlError;
 use toml::de::Error as TomlError;
-use toml::ser::Error as TomlSeError;
 use toml::{Table, Value};
 
 pub mod bell;
@@ -53,12 +51,6 @@ pub enum Error {
 
     /// Invalid toml.
     Toml(TomlError),
-
-    /// Failed toml serialization.
-    TomlSe(TomlSeError),
-
-    /// Invalid yaml.
-    Yaml(YamlError),
 }
 
 impl std::error::Error for Error {
@@ -67,8 +59,6 @@ impl std::error::Error for Error {
             Error::ReadingEnvHome(err) => err.source(),
             Error::Io(err) => err.source(),
             Error::Toml(err) => err.source(),
-            Error::TomlSe(err) => err.source(),
-            Error::Yaml(err) => err.source(),
         }
     }
 }
@@ -81,8 +71,6 @@ impl Display for Error {
             },
             Error::Io(err) => write!(f, "Error reading config file: {err}"),
             Error::Toml(err) => write!(f, "Config error: {err}"),
-            Error::TomlSe(err) => write!(f, "Yaml conversion error: {err}"),
-            Error::Yaml(err) => write!(f, "Config error: {err}"),
         }
     }
 }
@@ -105,23 +93,9 @@ impl From<TomlError> for Error {
     }
 }
 
-impl From<TomlSeError> for Error {
-    fn from(val: TomlSeError) -> Self {
-        Error::TomlSe(val)
-    }
-}
-
-impl From<YamlError> for Error {
-    fn from(val: YamlError) -> Self {
-        Error::Yaml(val)
-    }
-}
-
 /// Load the configuration file.
 pub fn load(options: &mut Options) -> UiConfig {
-    let config_path = select_config_path(options.config_file.clone(), || {
-        installed_config("toml").or_else(|| installed_config("yml"))
-    });
+    let config_path = select_config_path(options.config_file.clone(), installed_config);
 
     // Load the config using the following fallback behavior:
     //  - Config path + CLI overrides
@@ -205,7 +179,7 @@ fn parse_config(
     config_paths.push(path.to_owned());
 
     // Deserialize the configuration file.
-    let config = deserialize_config(path, false)?;
+    let config = deserialize_config(path)?;
 
     // Merge config with imports.
     let imports = load_imports(&config, path, config_paths, recursion_limit);
@@ -213,22 +187,12 @@ fn parse_config(
 }
 
 /// Deserialize a configuration file.
-pub fn deserialize_config(path: &Path, warn_pruned: bool) -> Result<Value> {
+pub fn deserialize_config(path: &Path) -> Result<Value> {
     let mut contents = fs::read_to_string(path)?;
 
     // Remove UTF-8 BOM.
     if contents.starts_with('\u{FEFF}') {
         contents = contents.split_off(3);
-    }
-
-    // Convert YAML to TOML as a transitionary fallback mechanism.
-    let extension = path.extension().unwrap_or_default();
-    if (extension == "yaml" || extension == "yml") && !contents.trim().is_empty() {
-        warn!("YAML config {path:?} is deprecated, please migrate to TOML using `vivido migrate`");
-
-        let mut value: serde_yaml::Value = serde_yaml::from_str(&contents)?;
-        prune_yaml_nulls(&mut value, warn_pruned);
-        contents = toml::to_string(&value)?;
     }
 
     // Load configuration file as Value.
@@ -335,35 +299,6 @@ pub fn normalize_import(base_config_path: &Path, import_path: impl Into<PathBuf>
     import_path
 }
 
-/// Prune the nulls from the YAML to ensure TOML compatibility.
-fn prune_yaml_nulls(value: &mut serde_yaml::Value, warn_pruned: bool) {
-    fn walk(value: &mut serde_yaml::Value, warn_pruned: bool) -> bool {
-        match value {
-            serde_yaml::Value::Sequence(sequence) => {
-                sequence.retain_mut(|value| !walk(value, warn_pruned));
-                sequence.is_empty()
-            },
-            serde_yaml::Value::Mapping(mapping) => {
-                mapping.retain(|key, value| {
-                    let retain = !walk(value, warn_pruned);
-                    if let Some(key_name) = key.as_str().filter(|_| !retain && warn_pruned) {
-                        eprintln!("Removing null key \"{key_name}\" from the end config");
-                    }
-                    retain
-                });
-                mapping.is_empty()
-            },
-            serde_yaml::Value::Null => true,
-            _ => false,
-        }
-    }
-
-    if walk(value, warn_pruned) {
-        // When the value itself is null return the mapping.
-        *value = serde_yaml::Value::Mapping(Default::default());
-    }
-}
-
 /// Get the location of the first found default config file paths
 /// according to the following order:
 ///
@@ -373,8 +308,8 @@ fn prune_yaml_nulls(value: &mut serde_yaml::Value, warn_pruned: bool) {
 /// 4. $HOME/.vivido.toml
 /// 5. /etc/vivido/vivido.toml
 #[cfg(not(windows))]
-pub fn installed_config(suffix: &str) -> Option<PathBuf> {
-    let file_name = format!("vivido.{suffix}");
+pub fn installed_config() -> Option<PathBuf> {
+    let file_name = String::from("vivido.toml");
 
     // Try using XDG location by default.
     xdg::BaseDirectories::with_prefix("vivido")
@@ -401,13 +336,9 @@ pub fn installed_config(suffix: &str) -> Option<PathBuf> {
 }
 
 #[cfg(windows)]
-pub fn installed_config(suffix: &str) -> Option<PathBuf> {
+pub fn installed_config() -> Option<PathBuf> {
     let user_profile = env::var_os("USERPROFILE").map(PathBuf::from).or_else(home::home_dir);
-    first_existing_windows_config(windows_config_candidates(
-        user_profile,
-        dirs::config_dir(),
-        suffix,
-    ))
+    first_existing_windows_config(windows_config_candidates(user_profile, dirs::config_dir()))
 }
 
 #[cfg(any(windows, test))]
@@ -423,15 +354,12 @@ fn first_existing_windows_config(candidates: Vec<PathBuf>) -> Option<PathBuf> {
 fn windows_config_candidates(
     home_dir: Option<PathBuf>,
     roaming_config_dir: Option<PathBuf>,
-    suffix: &str,
 ) -> Vec<PathBuf> {
-    let file_name = format!("vivido.{suffix}");
+    let file_name = "vivido.toml";
     let mut candidates = Vec::with_capacity(2);
 
-    if suffix == "toml"
-        && let Some(home_dir) = home_dir
-    {
-        candidates.push(home_dir.join("vivido").join(&file_name));
+    if let Some(home_dir) = home_dir {
+        candidates.push(home_dir.join("vivido").join(file_name));
     }
     if let Some(roaming_config_dir) = roaming_config_dir {
         let legacy = roaming_config_dir.join("vivido").join(file_name);
@@ -475,70 +403,20 @@ mod tests {
         fs::create_dir(&directory).unwrap();
         fs::write(&path, "[terminal\nshell =").unwrap();
 
-        assert!(matches!(deserialize_config(&path, false), Err(Error::Toml(_))));
+        assert!(matches!(deserialize_config(&path), Err(Error::Toml(_))));
         fs::remove_dir_all(directory).unwrap();
-    }
-
-    fn yaml_to_toml(contents: &str) -> String {
-        let mut value: serde_yaml::Value = serde_yaml::from_str(contents).unwrap();
-        prune_yaml_nulls(&mut value, false);
-        toml::to_string(&value).unwrap()
-    }
-
-    #[test]
-    fn yaml_with_nulls() {
-        let contents = r#"
-        window:
-            blinking: Always
-            cursor:
-            not_blinking: Always
-            some_array:
-              - { window: }
-              - { window: "Hello" }
-
-        "#;
-        let toml = yaml_to_toml(contents);
-        assert_eq!(
-            toml.trim(),
-            r#"[window]
-blinking = "Always"
-not_blinking = "Always"
-
-[[window.some_array]]
-window = "Hello""#
-        );
-    }
-
-    #[test]
-    fn empty_yaml_to_toml() {
-        let contents = r#"
-
-        "#;
-        let toml = yaml_to_toml(contents);
-        assert!(toml.is_empty());
     }
 
     #[test]
     fn windows_config_prefers_user_profile_and_keeps_legacy_fallback() {
         let home = PathBuf::from("profile/José Example");
         let roaming = PathBuf::from("profile/José Example/AppData/Roaming");
-        let candidates =
-            windows_config_candidates(Some(home.clone()), Some(roaming.clone()), "toml");
+        let candidates = windows_config_candidates(Some(home.clone()), Some(roaming.clone()));
 
         assert_eq!(
             candidates,
             [home.join("vivido").join("vivido.toml"), roaming.join("vivido").join("vivido.toml"),]
         );
-    }
-
-    #[test]
-    fn windows_yaml_only_uses_legacy_roaming_location() {
-        let home = PathBuf::from("profile/Example");
-        let roaming = home.join("AppData/Roaming");
-        let candidates = windows_config_candidates(Some(home), Some(roaming.clone()), "yml");
-
-        assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0], roaming.join("vivido").join("vivido.yml"));
     }
 
     #[test]
@@ -553,12 +431,11 @@ window = "Hello""#
         fs::create_dir_all(legacy_path.parent().unwrap()).unwrap();
         fs::write(&legacy_path, "legacy = true\n").unwrap();
 
-        let candidates =
-            windows_config_candidates(Some(profile.clone()), Some(roaming.clone()), "toml");
+        let candidates = windows_config_candidates(Some(profile.clone()), Some(roaming.clone()));
         assert_eq!(first_existing_windows_config(candidates), Some(legacy_path.clone()));
 
         fs::write(&new_path, "new = true\n").unwrap();
-        let candidates = windows_config_candidates(Some(profile), Some(roaming), "toml");
+        let candidates = windows_config_candidates(Some(profile), Some(roaming));
         assert_eq!(first_existing_windows_config(candidates), Some(new_path));
         fs::remove_dir_all(root).unwrap();
     }

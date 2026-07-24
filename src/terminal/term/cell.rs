@@ -126,6 +126,11 @@ pub struct CellExtra {
     zerowidth: Vec<char>,
     underline_color: Option<Color>,
     hyperlink: Option<Hyperlink>,
+    /// Temporary indices used to carry authenticated Vivid anchors through grid resize/reflow.
+    ///
+    /// These never survive a resize operation and are not part of serialized terminal state.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    vivid_resize_tracking: Vec<usize>,
 }
 
 /// Content and attributes of a single cell in the terminal grid.
@@ -166,6 +171,28 @@ impl Cell {
         Arc::make_mut(extra).zerowidth.push(character);
     }
 
+    /// Attach a temporary Vivid anchor index before terminal resize/reflow.
+    pub(crate) fn push_vivid_resize_tracking(&mut self, index: usize) {
+        let extra = self.extra.get_or_insert(Default::default());
+        Arc::make_mut(extra).vivid_resize_tracking.push(index);
+    }
+
+    /// Remove and return temporary Vivid anchor indices after terminal resize/reflow.
+    pub(crate) fn take_vivid_resize_tracking(&mut self) -> Vec<usize> {
+        let Some(extra) = self.extra.as_mut() else {
+            return Vec::new();
+        };
+        let extra = Arc::make_mut(extra);
+        let tracking = std::mem::take(&mut extra.vivid_resize_tracking);
+        if extra.zerowidth.is_empty()
+            && extra.underline_color.is_none()
+            && extra.hyperlink.is_none()
+        {
+            self.extra = None;
+        }
+        tracking
+    }
+
     /// Remove all wide char data from a cell.
     #[inline(never)]
     pub fn clear_wide(&mut self) {
@@ -180,10 +207,11 @@ impl Cell {
     pub fn set_underline_color(&mut self, color: Option<Color>) {
         // If we reset color and we don't have zerowidth we should drop extra storage.
         if color.is_none()
-            && self
-                .extra
-                .as_ref()
-                .is_none_or(|extra| extra.zerowidth.is_empty() && extra.hyperlink.is_none())
+            && self.extra.as_ref().is_none_or(|extra| {
+                extra.zerowidth.is_empty()
+                    && extra.hyperlink.is_none()
+                    && extra.vivid_resize_tracking.is_empty()
+            })
         {
             self.extra = None;
         } else {
@@ -201,10 +229,11 @@ impl Cell {
     /// Set hyperlink.
     pub fn set_hyperlink(&mut self, hyperlink: Option<Hyperlink>) {
         let should_drop = hyperlink.is_none()
-            && self
-                .extra
-                .as_ref()
-                .is_none_or(|extra| extra.zerowidth.is_empty() && extra.underline_color.is_none());
+            && self.extra.as_ref().is_none_or(|extra| {
+                extra.zerowidth.is_empty()
+                    && extra.underline_color.is_none()
+                    && extra.vivid_resize_tracking.is_empty()
+            });
 
         if should_drop {
             self.extra = None;
@@ -236,6 +265,7 @@ impl GridCell for Cell {
                     | Flags::LEADING_WIDE_CHAR_SPACER,
             )
             && self.extra.as_ref().map(|extra| extra.zerowidth.is_empty()) != Some(false)
+            && self.extra.as_ref().is_none_or(|extra| extra.vivid_resize_tracking.is_empty())
     }
 
     #[inline]

@@ -191,6 +191,54 @@ fn insert_anchor(
 }
 
 impl SharedScene {
+    pub fn anchor_positions(&self) -> Vec<(AnchorKey, usize, i32, bool)> {
+        let state = self.lock();
+        state
+            .anchors
+            .iter()
+            .map(|(&key, anchor)| (key, anchor.column, anchor.line, anchor.alternate))
+            .collect()
+    }
+
+    /// Apply terminal resize/reflow results and remove anchors whose semantic positions vanished.
+    pub fn apply_anchor_resize(
+        &self,
+        positions: impl IntoIterator<Item = (AnchorKey, Option<(usize, i32, bool)>)>,
+    ) -> Vec<AnchorKey> {
+        let mut state = self.lock();
+        let mut removed = Vec::new();
+        let mut changed = false;
+        for (key, position) in positions {
+            let Some(anchor) = state.anchors.get_mut(&key) else {
+                continue;
+            };
+            match position {
+                Some((column, line, alternate)) => {
+                    changed |= anchor.column != column
+                        || anchor.line != line
+                        || anchor.alternate != alternate;
+                    *anchor = TextAnchor { column, line, alternate };
+                },
+                None => removed.push(key),
+            }
+        }
+
+        if !removed.is_empty() {
+            let removed_set = removed.iter().copied().collect::<HashSet<_>>();
+            state.anchors.retain(|key, _| !removed_set.contains(key));
+            state.nodes.retain(|(session_id, _), node| {
+                node.anchor_id
+                    .is_none_or(|anchor_id| !removed_set.contains(&(*session_id, anchor_id)))
+            });
+            gc_detached_sources(&mut state);
+            changed = true;
+        }
+        if changed {
+            state.revision = state.revision.wrapping_add(1);
+        }
+        removed
+    }
+
     #[cfg(test)]
     pub fn add_anchor(
         &self,
@@ -1086,6 +1134,17 @@ mod tests {
         assert_eq!(scene.clear_terminal(), vec![(4, 7)]);
         assert!(scene.snapshot().1.is_empty());
         assert!(scene.source_config((4, 1)).is_none());
+    }
+
+    #[test]
+    fn anchor_resize_updates_positions_and_removes_evicted_anchors() {
+        let scene = SharedScene::default();
+        scene.add_anchor(4, 7, 2, 5).unwrap();
+        scene.add_anchor(4, 8, 3, 6).unwrap();
+
+        let removed = scene.apply_anchor_resize([((4, 7), Some((9, -2, false))), ((4, 8), None)]);
+        assert_eq!(removed, vec![(4, 8)]);
+        assert_eq!(scene.anchor_positions(), vec![((4, 7), 9, -2, false)]);
     }
 
     #[cfg(windows)]
