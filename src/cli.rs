@@ -66,6 +66,7 @@ pub struct Options {
     pub window_options: WindowOptions,
 
     /// Subcommand passed to the CLI.
+    #[cfg(unix)]
     #[clap(subcommand)]
     pub subcommands: Option<Subcommands>,
 }
@@ -213,11 +214,10 @@ impl WindowIdentity {
 }
 
 /// Available CLI subcommands.
+#[cfg(unix)]
 #[derive(Subcommand, Debug)]
 pub enum Subcommands {
-    #[cfg(unix)]
     Msg(MessageOptions),
-    Migrate(MigrateOptions),
 }
 
 /// Send a message to the Vivido socket.
@@ -293,30 +293,6 @@ pub enum SocketMessage {
 
     /// Stream automation events until interrupted.
     Subscribe(IpcSubscribe),
-}
-
-/// Migrate the configuration file.
-#[derive(Args, Clone, Debug)]
-pub struct MigrateOptions {
-    /// Path to the configuration file.
-    #[clap(short, long, value_hint = ValueHint::FilePath)]
-    pub config_file: Option<PathBuf>,
-
-    /// Only output TOML config to STDOUT.
-    #[clap(short, long)]
-    pub dry_run: bool,
-
-    /// Do not recurse over imports.
-    #[clap(short = 'i', long)]
-    pub skip_imports: bool,
-
-    /// Do not move renamed fields to their new location.
-    #[clap(long)]
-    pub skip_renames: bool,
-
-    #[clap(short, long)]
-    /// Do not output to STDOUT.
-    pub silent: bool,
 }
 
 /// Subset of options that we pass to 'create-window' IPC subcommand.

@@ -32,6 +32,10 @@ use vivid_protocol::wire::{ConnectionKind, RECORD_OPTIONAL, Record};
 use vivid_protocol::{VIVID_MAJOR, VIVID_MINOR};
 
 use crate::event::{EventProxy, EventType};
+use crate::terminal::event::EventListener;
+use crate::terminal::grid::Dimensions;
+use crate::terminal::index::{Column, Line, Point};
+use crate::terminal::term::{ResizePoint, Term};
 use crate::vivid::audio::AudioOutput;
 use crate::vivid::decoder::{DecodedFrame, Decoder};
 use crate::vivid::scene::{
@@ -212,6 +216,37 @@ impl VividService {
                 log::debug!("Could not notify Vivid session of display change: {error}");
             }
         }
+        emit_visibility(&self.shared);
+        wake(&self.shared);
+    }
+
+    /// Resize the terminal while preserving authenticated anchors through grid reflow.
+    pub fn resize_terminal<T, S>(&self, terminal: &mut Term<T>, size: S)
+    where
+        T: EventListener,
+        S: Dimensions,
+    {
+        let anchors = self.scene.anchor_positions();
+        let mut positions = anchors
+            .iter()
+            .map(|(_, column, line, alternate)| {
+                Some(ResizePoint {
+                    point: Point::new(Line(*line), Column(*column)),
+                    alternate: *alternate,
+                })
+            })
+            .collect::<Vec<_>>();
+        terminal.resize_with_tracking(size, &mut positions);
+        let updates = anchors.into_iter().zip(positions).map(|((key, _, _, _), position)| {
+            (
+                key,
+                position.map(|position| {
+                    (position.point.column.0, position.point.line.0, position.alternate)
+                }),
+            )
+        });
+        let removed = self.scene.apply_anchor_resize(updates);
+        self.notify_anchor_events(messages::ANCHOR_GONE, removed);
     }
 
     pub fn handle_terminal_marker(&self, marker: &str, line: i32, column: usize, alternate: bool) {

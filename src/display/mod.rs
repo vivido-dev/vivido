@@ -46,6 +46,7 @@ use crate::event::{Event, EventType, Mouse, SearchState};
 use crate::message_bar::{MessageBuffer, MessageType};
 use crate::scheduler::{Scheduler, TimerId, Topic};
 use crate::string::{ShortenDirection, StrShortener};
+use crate::vivid::VividService;
 
 pub mod color;
 pub mod content;
@@ -428,6 +429,7 @@ impl Display {
     pub fn handle_update<T>(
         &mut self,
         terminal: &mut Term<T>,
+        vivid_service: &VividService,
         pty_resize_handle: &mut dyn OnResize,
         message_buffer: &MessageBuffer,
         search_state: &mut SearchState,
@@ -476,7 +478,7 @@ impl Display {
             || self.size_info.columns() != new_size.columns()
         {
             pty_resize_handle.on_resize(new_size.into());
-            terminal.resize(new_size);
+            vivid_service.resize_terminal(terminal, new_size);
             self.damage_tracker.resize(new_size.screen_lines(), new_size.columns());
         }
 

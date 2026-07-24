@@ -46,12 +46,21 @@ and Intel Rust targets are installed.
 
 ### Windows
 
+The signed Windows suite installer writes the user configuration to
+`%USERPROFILE%\vivido\vivido.toml`. Vivido still reads the former
+`%APPDATA%\vivido\vivido.toml` location when the new path does not exist.
+The consumer EXE also installs PowerShell 7 LTS when absent and provisions WSL with Ubuntu; the
+standalone MSI is intended for managed systems where those prerequisites already exist. See
+[`windows/README.md`](windows/README.md) for signing, packaging, silent-install, and release steps.
+See [`windows/LOCAL-TESTING.md`](windows/LOCAL-TESTING.md) for a complete local Windows build and
+installation-verification procedure.
+
 Build from a Visual Studio Developer Command Prompt with the Rust MSVC toolchain:
 
 ```powershell
 $env:VCPKG_ROOT = "C:\path\to\vcpkg"
-vcpkg install ffmpeg:x64-windows
 $env:VCPKG_DEFAULT_TRIPLET = "x64-windows"
+vcpkg install --triplet x64-windows --x-manifest-root="$PWD\windows"
 $env:PATH = "$env:VCPKG_ROOT\installed\x64-windows\bin;$env:PATH"
 cargo build --release
 ```

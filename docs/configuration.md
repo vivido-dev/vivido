@@ -41,9 +41,8 @@ Vivido looks for `vivido.toml` in the first of these locations that exists:
 | macOS | `$XDG_CONFIG_HOME/vivido/vivido.toml`, then the same fallbacks as Linux |
 | Windows | `%APPDATA%\vivido\vivido.toml` |
 
-A legacy `vivido.yml` (YAML) file is accepted as a transitional fallback and converted to TOML
-internally, but TOML is the supported format and the only one written by tooling. Point Vivido at an
-explicit file with `vivido --config-file <path>`.
+TOML is the only supported configuration format. Point Vivido at an explicit file with
+`vivido --config-file <path>`.
 
 Every section is optional; unset fields use the defaults documented below. A ready-to-copy,
 fully-commented starter file with every default in place ships alongside this guide as

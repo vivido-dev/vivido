@@ -537,15 +537,32 @@ impl WindowContext {
 
         // Process DisplayUpdate events.
         if self.display.pending_update.dirty {
-            Self::submit_display_update(
+            // Compute cursor positions before resize.
+            let num_lines = terminal.screen_lines();
+            let cursor_at_bottom = terminal.grid().cursor.point.line + 1 == num_lines;
+            let origin_at_bottom = self.search_state.direction == Direction::Left;
+
+            self.display.handle_update(
                 &mut terminal,
-                &mut self.display,
+                &self.vivid_service,
                 &mut self.notifier,
                 &self.message_buffer,
                 &mut self.search_state,
-                old_is_searching,
                 &self.config,
             );
+
+            let new_is_searching = self.search_state.history_index.is_some();
+            if !old_is_searching && new_is_searching {
+                // Scroll on search start to make sure origin is visible with minimal viewport
+                // motion.
+                let display_offset = terminal.grid().display_offset();
+                if display_offset == 0 && cursor_at_bottom && !origin_at_bottom {
+                    terminal.scroll_display(Scroll::Delta(1));
+                } else if display_offset != 0 && origin_at_bottom {
+                    terminal.scroll_display(Scroll::Delta(-1));
+                }
+            }
+
             self.dirty = true;
             let size = self.display.size_info;
             self.vivid_service.update_metrics(DisplayMetrics {
@@ -1624,35 +1641,6 @@ impl WindowContext {
         File::create("./config.json")
             .and_then(|mut f| f.write_all(serialized_config.as_bytes()))
             .expect("write config.json");
-    }
-
-    /// Submit the pending changes to the `Display`.
-    fn submit_display_update(
-        terminal: &mut Term<EventProxy>,
-        display: &mut Display,
-        notifier: &mut Notifier,
-        message_buffer: &MessageBuffer,
-        search_state: &mut SearchState,
-        old_is_searching: bool,
-        config: &UiConfig,
-    ) {
-        // Compute cursor positions before resize.
-        let num_lines = terminal.screen_lines();
-        let cursor_at_bottom = terminal.grid().cursor.point.line + 1 == num_lines;
-        let origin_at_bottom = search_state.direction == Direction::Left;
-
-        display.handle_update(terminal, notifier, message_buffer, search_state, config);
-
-        let new_is_searching = search_state.history_index.is_some();
-        if !old_is_searching && new_is_searching {
-            // Scroll on search start to make sure origin is visible with minimal viewport motion.
-            let display_offset = terminal.grid().display_offset();
-            if display_offset == 0 && cursor_at_bottom && !origin_at_bottom {
-                terminal.scroll_display(Scroll::Delta(1));
-            } else if display_offset != 0 && origin_at_bottom {
-                terminal.scroll_display(Scroll::Delta(-1));
-            }
-        }
     }
 }
 

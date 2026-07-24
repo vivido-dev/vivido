@@ -123,6 +123,11 @@ impl<T> Row<T> {
     }
 
     #[inline]
+    pub(crate) fn occupied_len(&self) -> usize {
+        self.occ
+    }
+
+    #[inline]
     pub fn last(&self) -> Option<&T> {
         self.inner.last()
     }

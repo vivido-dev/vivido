@@ -68,7 +68,7 @@ acknowledgement is absent; the repository does not record acceptance automatical
 ## Configuration ownership and upgrades
 
 Vivido now looks first for `%USERPROFILE%\vivido\vivido.toml`, then falls back to the former
-`%APPDATA%\vivido` TOML/YAML locations. On a first MSI install the signed setup helper:
+`%APPDATA%\vivido` TOML location. On a first MSI install the signed setup helper:
 
 1. leaves an existing new-path TOML untouched;
 2. copies the legacy roaming TOML when only that file exists; or

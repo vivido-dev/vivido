@@ -325,6 +325,13 @@ pub struct Term<T> {
     config: Config,
 }
 
+/// A semantic terminal position carried through one grid resize/reflow.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ResizePoint {
+    pub point: Point,
+    pub alternate: bool,
+}
+
 /// Configuration options for the [`Term`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
@@ -691,6 +698,65 @@ impl<T> Term<T> {
 
         // Resize damage information.
         self.damage.resize(num_cols, num_lines);
+    }
+
+    /// Resize the terminal while carrying semantic positions through the exact grid operations.
+    ///
+    /// Positions which are erased or evicted during resize are returned as `None`.
+    pub fn resize_with_tracking<S: Dimensions>(
+        &mut self,
+        size: S,
+        positions: &mut [Option<ResizePoint>],
+    ) {
+        if positions.is_empty() {
+            self.resize(size);
+            return;
+        }
+
+        let active_is_alternate = self.mode.contains(TermMode::ALT_SCREEN);
+        for (index, position) in positions.iter_mut().enumerate() {
+            let Some(tracked) = *position else {
+                continue;
+            };
+            let grid = if tracked.alternate == active_is_alternate {
+                &mut self.grid
+            } else {
+                &mut self.inactive_grid
+            };
+            if tracked.point.line < grid.topmost_line()
+                || tracked.point.line > grid.bottommost_line()
+                || tracked.point.column >= grid.columns()
+            {
+                *position = None;
+                continue;
+            }
+            grid[tracked.point].push_vivid_resize_tracking(index);
+        }
+
+        self.resize(size);
+        positions.fill(None);
+
+        Self::collect_resize_tracking(&mut self.grid, active_is_alternate, positions);
+        Self::collect_resize_tracking(&mut self.inactive_grid, !active_is_alternate, positions);
+    }
+
+    fn collect_resize_tracking(
+        grid: &mut Grid<Cell>,
+        alternate: bool,
+        positions: &mut [Option<ResizePoint>],
+    ) {
+        for line in grid.topmost_line().0..=grid.bottommost_line().0 {
+            let line = Line(line);
+            let occupied = grid[line].occupied_len();
+            for column in 0..occupied {
+                let point = Point::new(line, Column(column));
+                for index in grid[point].take_vivid_resize_tracking() {
+                    if let Some(position) = positions.get_mut(index) {
+                        *position = Some(ResizePoint { point, alternate });
+                    }
+                }
+            }
+        }
     }
 
     /// Active terminal modes.
@@ -2865,6 +2931,89 @@ mod tests {
 
         assert_eq!(term.history_size(), 0);
         assert_eq!(term.grid.cursor.point, Point::new(Line(19), Column(0)));
+    }
+
+    #[test]
+    fn resize_tracking_follows_height_growth_and_shrinkage() {
+        let mut size = TermSize::new(100, 10);
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+        for _ in 0..19 {
+            term.newline();
+        }
+
+        let mut positions = [
+            Some(ResizePoint { point: Point::new(Line(-1), Column(0)), alternate: false }),
+            Some(ResizePoint { point: Point::new(Line(5), Column(0)), alternate: false }),
+        ];
+        size.screen_lines = 30;
+        term.resize_with_tracking(size, &mut positions);
+        assert_eq!(
+            positions,
+            [
+                Some(ResizePoint { point: Point::new(Line(9), Column(0)), alternate: false }),
+                Some(ResizePoint { point: Point::new(Line(15), Column(0)), alternate: false }),
+            ]
+        );
+
+        term.resize_with_tracking(TermSize::new(100, 5), &mut positions);
+        assert_eq!(
+            positions,
+            [
+                Some(ResizePoint { point: Point::new(Line(-6), Column(0)), alternate: false }),
+                Some(ResizePoint { point: Point::new(Line(0), Column(0)), alternate: false }),
+            ]
+        );
+    }
+
+    #[test]
+    fn resize_tracking_discards_rows_removed_from_bottom() {
+        let mut term = Term::new(Config::default(), &TermSize::new(10, 10), VoidListener);
+        let mut positions =
+            [Some(ResizePoint { point: Point::new(Line(8), Column(0)), alternate: false })];
+
+        term.resize_with_tracking(TermSize::new(10, 5), &mut positions);
+        assert_eq!(positions, [None]);
+    }
+
+    #[test]
+    fn resize_tracking_follows_width_reflow_in_both_directions() {
+        let mut growing = mock_term("12\n3");
+        let mut growing_position =
+            [Some(ResizePoint { point: Point::new(Line(1), Column(0)), alternate: false })];
+        growing.resize_with_tracking(TermSize::new(3, 2), &mut growing_position);
+        assert_eq!(
+            growing_position,
+            [Some(ResizePoint { point: Point::new(Line(0), Column(2)), alternate: false })]
+        );
+
+        let mut shrinking = mock_term("12345");
+        let mut shrinking_position =
+            [Some(ResizePoint { point: Point::new(Line(0), Column(4)), alternate: false })];
+        shrinking.resize_with_tracking(TermSize::new(2, 1), &mut shrinking_position);
+        assert_eq!(
+            shrinking_position,
+            [Some(ResizePoint { point: Point::new(Line(0), Column(0)), alternate: false })]
+        );
+    }
+
+    #[test]
+    fn resize_tracking_preserves_primary_and_alternate_screen_identity() {
+        let mut term = Term::new(Config::default(), &TermSize::new(10, 10), VoidListener);
+        term.grid.cursor.point.line = Line(9);
+        term.swap_alt();
+        let mut positions = [
+            Some(ResizePoint { point: Point::new(Line(5), Column(0)), alternate: false }),
+            Some(ResizePoint { point: Point::new(Line(5), Column(0)), alternate: true }),
+        ];
+
+        term.resize_with_tracking(TermSize::new(10, 5), &mut positions);
+        assert_eq!(
+            positions,
+            [
+                Some(ResizePoint { point: Point::new(Line(0), Column(0)), alternate: false }),
+                Some(ResizePoint { point: Point::new(Line(0), Column(0)), alternate: true }),
+            ]
+        );
     }
 
     #[test]

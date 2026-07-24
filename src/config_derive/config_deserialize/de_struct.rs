@@ -155,7 +155,7 @@ fn field_deserializer(field_streams: &mut FieldStreams, field: &Field) -> Result
                 if let Some(warning) = parsed.param {
                     message = format!("{}; {}", message, warning.value());
                 }
-                message.push_str("\nUse `vivido migrate` to automatically resolve it");
+                message.push_str("\nUpdate your configuration file to resolve it");
 
                 // Append stream to log deprecation/removal warning.
                 match_assignment_stream.extend(quote! {

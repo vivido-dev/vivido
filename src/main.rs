@@ -42,7 +42,6 @@ mod logging;
 #[cfg(target_os = "macos")]
 mod macos;
 mod message_bar;
-mod migrate;
 #[cfg(windows)]
 mod panic;
 #[cfg(unix)]
@@ -60,9 +59,11 @@ pub use crate::serde_replace::SerdeReplace;
 
 #[cfg(unix)]
 use crate::cli::MessageOptions;
+use crate::cli::Options;
 #[cfg(not(any(target_os = "macos", windows)))]
 use crate::cli::SocketMessage;
-use crate::cli::{Options, Subcommands};
+#[cfg(unix)]
+use crate::cli::Subcommands;
 use crate::config::UiConfig;
 use crate::config::monitor::ConfigMonitor;
 use crate::event::{Event, Processor};
@@ -86,12 +87,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     // Load command line options.
     let options = Options::new();
 
+    #[cfg(unix)]
     match options.subcommands {
-        #[cfg(unix)]
         Some(Subcommands::Msg(options)) => msg(options)?,
-        Some(Subcommands::Migrate(options)) => migrate::migrate(options),
         None => vivido(options)?,
     }
+
+    #[cfg(not(unix))]
+    vivido(options)?;
 
     Ok(())
 }
