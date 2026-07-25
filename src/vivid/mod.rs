@@ -486,18 +486,6 @@ fn handle_control(reader: &mut Reader, shared: Arc<ServiceShared>) -> io::Result
     let (request_id, hello) = messages::parse_hello(&hello_record.body)?;
     let writer = Arc::new(reader.writer()?);
     writer.set_maximum(hello.maximum_record_body)?;
-    if hello.validate_authentication_kind(false).is_err() {
-        writer.write_record(
-            messages::ERROR,
-            0,
-            &messages::error(
-                request_id,
-                messages::ERROR_UNSUPPORTED_FEATURE,
-                "HELLO authentication kind is unsupported",
-            ),
-        )?;
-        return Ok(());
-    }
     if !constant_time_token_eq(&shared.token, hello.token.as_bytes()) {
         writer.write_record(
             messages::ERROR,
@@ -524,7 +512,7 @@ fn handle_control(reader: &mut Reader, shared: Arc<ServiceShared>) -> io::Result
     );
     if !supports_current_version || hello.maximum_record_body == 0 || unsupported_feature {
         let (code, diagnostic) = if !supports_current_version {
-            (messages::ERROR_UNSUPPORTED_VERSION, "Vivid 1.1 is required")
+            (messages::ERROR_UNSUPPORTED_VERSION, "Vivid 1.0 is required")
         } else if hello.maximum_record_body == 0 {
             (messages::ERROR_BAD_MESSAGE, "maximum record body is zero")
         } else {
@@ -2629,12 +2617,11 @@ mod tests {
     }
 
     #[test]
-    fn vivid_version_selection_accepts_only_ranges_containing_1_1() {
+    fn vivid_version_selection_accepts_only_ranges_containing_1_0() {
         assert!(!offers_vivid_version(0, 9, 0, 9));
-        assert!(!offers_vivid_version(1, 0, 1, 0));
-        assert!(offers_vivid_version(1, 1, 1, 1));
-        assert!(offers_vivid_version(1, 0, 1, 1));
-        assert!(!offers_vivid_version(1, 2, 2, 0));
+        assert!(offers_vivid_version(1, 0, 1, 0));
+        assert!(offers_vivid_version(0, 9, 1, 0));
+        assert!(!offers_vivid_version(1, 1, 2, 0));
     }
 
     #[test]
@@ -2715,15 +2702,15 @@ mod tests {
         hello.u64(0);
         hello.u64(1);
         hello.u64(3);
-        hello.map(11);
+        hello.map(10);
         hello.u64(0);
         hello.u64(1);
         hello.u64(1);
-        hello.u64(0);
+        hello.u64(1);
         hello.u64(2);
         hello.u64(1);
         hello.u64(3);
-        hello.u64(0);
+        hello.u64(1);
         hello.u64(4);
         hello.text(service.token());
         hello.u64(5);
@@ -2736,8 +2723,6 @@ mod tests {
         hello.array(0);
         hello.u64(9);
         hello.u64(u64::from(vivid_protocol::CONTROL_MAX_RECORD_BODY));
-        hello.u64(10);
-        hello.u64(messages::AUTHENTICATION_WINDOW_ROOT);
         unsupported.write_record(messages::HELLO, 0, 0, &hello.into_vec()).unwrap();
         let rejection =
             messages::parse_error_reply(&unsupported.read_record().unwrap().body).unwrap();

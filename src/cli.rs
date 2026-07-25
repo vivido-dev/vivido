@@ -4,7 +4,9 @@ use std::ops::{Deref, DerefMut};
 use std::path::PathBuf;
 use std::rc::Rc;
 
-use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum, ValueHint};
+use clap::{ArgAction, Args, Parser, ValueHint};
+#[cfg(unix)]
+use clap::{Subcommand, ValueEnum};
 use log::{LevelFilter, error};
 use serde::{Deserialize, Serialize};
 use toml::Value;
@@ -662,6 +664,7 @@ pub struct IpcGetGrid {
     pub target: IpcTarget,
 }
 
+#[cfg(unix)]
 fn parse_ipc_duration(value: &str) -> Result<u64, String> {
     let value = value.trim();
     let (number, multiplier) = if let Some(number) = value.strip_suffix("ms") {

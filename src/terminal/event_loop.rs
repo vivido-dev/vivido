@@ -34,13 +34,21 @@ const MAX_LOCKED_READ: usize = u16::MAX as usize;
 #[derive(Debug)]
 pub enum Msg {
     /// Data that should be written to the PTY.
-    Input { bytes: Cow<'static, [u8]>, completion: Option<u64> },
+    Input {
+        bytes: Cow<'static, [u8]>,
+        #[cfg(unix)]
+        completion: Option<u64>,
+    },
 
     /// Indicates that the `EventLoop` should shut down, as Vivido is shutting down.
     Shutdown,
 
     /// Instruction to resize the PTY.
-    Resize { window_size: WindowSize, completion: Option<u64> },
+    Resize {
+        window_size: WindowSize,
+        #[cfg(unix)]
+        completion: Option<u64>,
+    },
 }
 
 /// The main event loop.
@@ -100,11 +108,24 @@ where
     fn drain_recv_channel(&mut self, state: &mut State) -> bool {
         while let Some(msg) = self.rx.recv() {
             match msg {
-                Msg::Input { bytes, completion } => {
-                    state.write_list.push_back(PendingInput { bytes, completion });
+                Msg::Input {
+                    bytes,
+                    #[cfg(unix)]
+                    completion,
+                } => {
+                    state.write_list.push_back(PendingInput {
+                        bytes,
+                        #[cfg(unix)]
+                        completion,
+                    });
                 },
-                Msg::Resize { window_size, completion } => {
+                Msg::Resize {
+                    window_size,
+                    #[cfg(unix)]
+                    completion,
+                } => {
                     self.pty.on_resize(window_size);
+                    #[cfg(unix)]
                     if let Some(token) = completion {
                         self.event_proxy.send_event(Event::PtyResizeComplete(token));
                     }
@@ -208,6 +229,7 @@ where
                     Ok(n) => {
                         current.advance(n);
                         if current.finished() {
+                            #[cfg(unix)]
                             if let Some(token) = current.completion {
                                 self.event_proxy.send_event(Event::PtyWriteComplete(token));
                             }
@@ -354,11 +376,13 @@ where
 struct Writing {
     source: Cow<'static, [u8]>,
     written: usize,
+    #[cfg(unix)]
     completion: Option<u64>,
 }
 
 struct PendingInput {
     bytes: Cow<'static, [u8]>,
+    #[cfg(unix)]
     completion: Option<u64>,
 }
 
@@ -375,13 +399,21 @@ impl event::Notify for Notifier {
             return;
         }
 
-        let _ = self.0.send(Msg::Input { bytes, completion: None });
+        let _ = self.0.send(Msg::Input {
+            bytes,
+            #[cfg(unix)]
+            completion: None,
+        });
     }
 }
 
 impl event::OnResize for Notifier {
     fn on_resize(&mut self, window_size: WindowSize) {
-        let _ = self.0.send(Msg::Resize { window_size, completion: None });
+        let _ = self.0.send(Msg::Resize {
+            window_size,
+            #[cfg(unix)]
+            completion: None,
+        });
     }
 }
 
@@ -610,7 +642,12 @@ fn partial_prefix_len(bytes: &[u8], prefix: &[u8]) -> usize {
 impl Writing {
     #[inline]
     fn new(input: PendingInput) -> Writing {
-        Writing { source: input.bytes, written: 0, completion: input.completion }
+        Writing {
+            source: input.bytes,
+            written: 0,
+            #[cfg(unix)]
+            completion: input.completion,
+        }
     }
 
     #[inline]

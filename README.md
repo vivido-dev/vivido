@@ -14,7 +14,7 @@ Local peer origin and the per-window token are verified before session resources
 
 Portable video includes H.264/HEVC Annex B, VP9 frames, and AV1 low-overhead temporal units.
 Portable audio includes MP3, AAC, ALAC, PCM, Opus, Vorbis, and FLAC. Opus, Vorbis, and FLAC require
-the canonical container-independent initialization defined by Vivid 1.1; Vivido validates it before
+the canonical container-independent initialization defined by Vivid 1.0; Vivido validates it before
 decoder or device allocation and applies trim/pre-skip exactly once.
 
 `PLAY` retains all existing protocol fields, starts at the exact requested PTS after its minimum
