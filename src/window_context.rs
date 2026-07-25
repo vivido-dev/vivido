@@ -86,6 +86,8 @@ use crate::scheduler::{TimerId, Topic};
 use crate::screenshot;
 #[cfg(unix)]
 use crate::terminal::thread;
+#[cfg(unix)]
+use crate::vivid::scene::SourceWaitEvaluation;
 use crate::vivid::{DisplayMetrics, VividService};
 
 #[cfg(unix)]
@@ -1285,6 +1287,89 @@ impl WindowContext {
         })
     }
 
+    #[cfg(unix)]
+    pub fn automation_vivid_sources(&self) -> Value {
+        let sources = self
+            .vivid_service
+            .automation_source_keys()
+            .into_iter()
+            .filter_map(|(session_id, source_id)| {
+                self.vivid_service
+                    .automation_source_status(session_id, source_id)
+                    .map(|status| vivid_source_status_json(self.ipc_window_id, session_id, &status))
+            })
+            .collect::<Vec<_>>();
+        json_value!({"window_id": self.ipc_window_id, "sources": sources})
+    }
+
+    #[cfg(unix)]
+    pub fn automation_vivid_source(
+        &self,
+        session_id: u64,
+        source_id: u64,
+    ) -> Result<Value, IpcError> {
+        self.vivid_service
+            .automation_source_status(session_id, source_id)
+            .map(|status| vivid_source_status_json(self.ipc_window_id, session_id, &status))
+            .ok_or_else(|| IpcError::new("source_not_found", "Vivid source does not exist"))
+    }
+
+    #[cfg(unix)]
+    pub fn automation_vivid_scene(
+        &self,
+        session_id: u64,
+        maximum_nodes: u64,
+    ) -> Result<Value, IpcError> {
+        if maximum_nodes == 0 || maximum_nodes > vivid_protocol::messages::MAX_SCENE_NODES as u64 {
+            return Err(IpcError::new("invalid_params", "maximum_nodes must be 1 through 256"));
+        }
+        let status = self.vivid_service.automation_scene_status(session_id, maximum_nodes);
+        let nodes = status
+            .nodes
+            .into_iter()
+            .map(|node| {
+                json_value!({
+                    "node_id": node.node.node_id,
+                    "source_id": node.node.source_id,
+                    "context_id": node.node.context_id,
+                    "x": node.node.x,
+                    "y": node.node.y,
+                    "width": node.node.width,
+                    "height": node.node.height,
+                    "text_layer": node.node.text_layer,
+                    "z_index": node.node.z_index,
+                    "visible": node.node.visible,
+                    "anchor_id": node.node.anchor_id,
+                    "clip": node.clip.map(|clip| json_value!({
+                        "x": clip.x,
+                        "y": clip.y,
+                        "width": clip.width,
+                        "height": clip.height,
+                    })),
+                })
+            })
+            .collect::<Vec<_>>();
+        Ok(json_value!({
+            "window_id": self.ipc_window_id,
+            "session_id": session_id,
+            "scene_revision": status.scene_revision.get(),
+            "total_nodes": status.total_nodes,
+            "nodes": nodes,
+            "truncated": status.cursor.is_some(),
+        }))
+    }
+
+    #[cfg(unix)]
+    pub fn automation_vivid_wait(
+        &self,
+        session_id: u64,
+        source_id: u64,
+        condition: u64,
+        value: Option<u64>,
+    ) -> SourceWaitEvaluation {
+        self.vivid_service.automation_evaluate_wait(session_id, source_id, condition, value)
+    }
+
     /// Structured physical-cell grid snapshot or current-state delta.
     #[cfg(unix)]
     pub fn automation_grid(
@@ -1672,6 +1757,54 @@ fn exit_status_json(status: Option<&std::process::ExitStatus>) -> Value {
         }),
         None => json_value!({"state": "running"}),
     }
+}
+
+#[cfg(unix)]
+fn vivid_source_status_json(
+    window_id: u64,
+    session_id: u64,
+    status: &vivid_protocol::messages::SourceStatus,
+) -> Value {
+    let playback = status.playback.map(|playback| {
+        json_value!({
+            "state": playback.state,
+            "clock_pts_us": playback.clock_pts_us,
+            "epoch": playback.epoch,
+            "buffered_ahead_us": playback.buffered_ahead_us,
+            "underrun_count": playback.underrun_count,
+            "late_drop_count": playback.late_drop_count,
+            "eos_state": playback.eos_state,
+        })
+    });
+    json_value!({
+        "window_id": window_id,
+        "session_id": session_id,
+        "source_id": status.source_id,
+        "source_revision": status.source_revision.get(),
+        "kind": status.kind,
+        "lifecycle": status.lifecycle,
+        "epoch": status.epoch,
+        "attachment": {
+            "state": status.attachment_state,
+            "generation": status.attachment_generation,
+        },
+        "last_media_id": status.last_media_id,
+        "last_media_sequence": status.last_media_sequence,
+        "last_decoded_pts_us": status.last_decoded_pts_us,
+        "last_presented_pts_us": status.last_presented_pts_us,
+        "last_presentation_id": status.last_presentation_id,
+        "visible": status.visible,
+        "capture_policy": status.capture_policy,
+        "linked_source_id": status.linked_source_id,
+        "milestones": status.milestones,
+        "credits": {
+            "bytes": status.outstanding_byte_credit,
+            "packets": status.outstanding_packet_credit,
+        },
+        "ingress_queue_depth": status.ingress_queue_depth,
+        "playback": playback,
+        "terminal_loss_code": status.terminal_loss_code,
+    })
 }
 
 #[cfg(all(unix, target_os = "linux"))]

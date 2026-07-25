@@ -4,9 +4,10 @@ use std::time::{Duration, Instant};
 
 use vivid_protocol::media;
 use vivid_protocol::messages::{
-    self, ClipRect, ImageSourceConfig, MAX_SCENE_NODES, ParsedAudioSourceConfig, ParsedSceneNode,
-    ParsedVideoSourceConfig, PlayRequest, RasterSourceConfig, SceneValidationKey,
-    SceneValidationNode, SceneValidationSource, validate_scene_snapshot,
+    self, ClipRect, ImageSourceConfig, MAX_SCENE_NODES, ParsedAudioSourceConfig, ParsedNodeConfig,
+    ParsedSceneNode, ParsedVideoSourceConfig, PlayRequest, PlaybackSnapshot, RasterSourceConfig,
+    SceneCursor, SceneQuery, SceneStatus, SceneValidationKey, SceneValidationNode,
+    SceneValidationSource, SourceStatus, WaitSatisfied, validate_scene_snapshot,
 };
 use vivid_protocol::revision::{SceneRevision, SourceRevision};
 
@@ -51,6 +52,22 @@ impl SourceConfig {
             Self::Audio(config) => {
                 media::audio_body_len(config.max_access_unit_bytes).ok().map(u64::from)
             },
+        }
+    }
+
+    fn kind(&self) -> u64 {
+        match self {
+            Self::Video(_) => messages::SOURCE_KIND_VIDEO,
+            Self::Raster(_) => messages::SOURCE_KIND_RASTER,
+            Self::Image(_) => messages::SOURCE_KIND_IMAGE,
+            Self::Audio(_) => messages::SOURCE_KIND_AUDIO,
+        }
+    }
+
+    fn linked_source_id(&self) -> u64 {
+        match self {
+            Self::Audio(config) => config.linked_video_source_id.unwrap_or(0),
+            _ => 0,
         }
     }
 }
@@ -138,6 +155,7 @@ pub struct RenderItem {
 struct Source {
     config: SourceConfig,
     revision: SourceRevision,
+    field_revisions: [u64; 9],
     lifecycle: u64,
     milestones: u64,
     attachment_state: u64,
@@ -146,6 +164,7 @@ struct Source {
     last_media_sequence: u64,
     last_decoded_pts_us: i64,
     last_presented_pts_us: i64,
+    last_presented_media_id: u64,
     last_presentation_id: u64,
     visible: bool,
     latest_frame: Option<Frame>,
@@ -161,7 +180,9 @@ struct Source {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SourceObservation {
     pub revision: SourceRevision,
+    pub field_revisions: [u64; 9],
     pub lifecycle: u64,
+    pub kind: u64,
     pub milestones: u64,
     pub epoch: u32,
     pub attachment_state: u64,
@@ -170,7 +191,9 @@ pub struct SourceObservation {
     pub last_media_sequence: u64,
     pub last_decoded_pts_us: i64,
     pub last_presented_pts_us: i64,
+    pub last_presented_media_id: u64,
     pub last_presentation_id: u64,
+    pub linked_source_id: u64,
     pub visible: bool,
     pub terminal_loss_code: Option<u64>,
 }
@@ -188,12 +211,43 @@ struct State {
     tombstone_order: VecDeque<SourceKey>,
     nodes: HashMap<(SessionId, u64), SceneNode>,
     anchors: HashMap<AnchorKey, TextAnchor>,
+    gone_anchors: HashSet<AnchorKey>,
+    gone_anchor_order: VecDeque<AnchorKey>,
     detached_sessions: HashSet<SessionId>,
     decoded_pixels: u64,
     queued_pixels: u64,
     revision: u64,
     scene_revisions: HashMap<SessionId, SceneRevision>,
+    scene_change_reasons: HashMap<SessionId, u64>,
     alternate_screen: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionObservationSnapshot {
+    pub scene_revision: SceneRevision,
+    pub scene_change_reasons: u64,
+    pub sources: Vec<(u64, SourceObservation, Option<PlaybackSnapshot>)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceWaitEvaluation {
+    Satisfied(WaitSatisfied),
+    Pending,
+    NotVisible,
+    NotFound,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SceneCounts {
+    pub sources: u64,
+    pub nodes: u64,
+    pub anchors: u64,
+    pub retained_pixels: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SceneQueryPrecondition {
+    pub current_revision: SceneRevision,
 }
 
 #[derive(Debug, Default)]
@@ -208,24 +262,38 @@ pub struct SharedScene(Arc<Inner>);
 fn advance_scene_revision(
     state: &mut State,
     session_id: SessionId,
+    reason: u64,
 ) -> Result<SceneRevision, &'static str> {
     let revision = state.scene_revisions.entry(session_id).or_default();
     *revision = revision.advance().map_err(|_| "scene revision exhausted")?;
+    *state.scene_change_reasons.entry(session_id).or_default() |= reason;
     Ok(*revision)
 }
 
 fn advance_changed_scenes(
     state: &mut State,
     sessions: impl IntoIterator<Item = SessionId>,
+    reason: u64,
 ) -> Result<(), &'static str> {
     for session_id in sessions.into_iter().collect::<HashSet<_>>() {
-        advance_scene_revision(state, session_id)?;
+        advance_scene_revision(state, session_id, reason)?;
     }
     Ok(())
 }
 
-fn advance_source_revision(source: &mut Source) -> Result<SourceRevision, &'static str> {
+fn advance_source_revision(
+    source: &mut Source,
+    changed_fields: u64,
+) -> Result<SourceRevision, &'static str> {
+    if changed_fields == 0 || changed_fields & !messages::SOURCE_CHANGED_FIELD_MASK != 0 {
+        return Err("source revision requires valid changed fields");
+    }
     source.revision = source.revision.advance().map_err(|_| "source revision exhausted")?;
+    for (bit, revision) in source.field_revisions.iter_mut().enumerate() {
+        if changed_fields & (1 << bit) != 0 {
+            *revision = source.revision.get();
+        }
+    }
     Ok(source.revision)
 }
 
@@ -235,10 +303,16 @@ fn set_milestone(source: &mut Source, milestone: u64) -> bool {
     source.milestones != previous
 }
 
+const fn changed_field(changed: bool, field: u64) -> u64 {
+    if changed { field } else { 0 }
+}
+
 fn observation(source: &Source, terminal_loss_code: Option<u64>) -> SourceObservation {
     SourceObservation {
         revision: source.revision,
+        field_revisions: source.field_revisions,
         lifecycle: source.lifecycle,
+        kind: source.config.kind(),
         milestones: source.milestones,
         epoch: source.last_epoch,
         attachment_state: source.attachment_state,
@@ -247,7 +321,9 @@ fn observation(source: &Source, terminal_loss_code: Option<u64>) -> SourceObserv
         last_media_sequence: source.last_media_sequence,
         last_decoded_pts_us: source.last_decoded_pts_us,
         last_presented_pts_us: source.last_presented_pts_us,
+        last_presented_media_id: source.last_presented_media_id,
         last_presentation_id: source.last_presentation_id,
+        linked_source_id: source.config.linked_source_id(),
         visible: source.visible,
         terminal_loss_code,
     }
@@ -286,8 +362,23 @@ fn insert_anchor(
     {
         return Err("anchor ID already exists");
     }
+    state.gone_anchors.remove(&(session_id, anchor_id));
+    state.gone_anchor_order.retain(|key| *key != (session_id, anchor_id));
     state.revision = state.revision.wrapping_add(1);
     Ok(())
+}
+
+fn retain_gone_anchors(state: &mut State, removed: &[AnchorKey]) {
+    for key in removed {
+        if state.gone_anchors.insert(*key) {
+            state.gone_anchor_order.push_back(*key);
+        }
+    }
+    while state.gone_anchor_order.len() > MAX_SCENE_NODES {
+        if let Some(key) = state.gone_anchor_order.pop_front() {
+            state.gone_anchors.remove(&key);
+        }
+    }
 }
 
 impl SharedScene {
@@ -334,8 +425,13 @@ impl SharedScene {
                         .then_some(session_id)
                 })
                 .collect::<Vec<_>>();
-            advance_changed_scenes(&mut state, changed_sessions)?;
+            advance_changed_scenes(
+                &mut state,
+                changed_sessions,
+                messages::SCENE_CHANGED_ANCHOR_GONE,
+            )?;
             state.anchors.retain(|key, _| !removed_set.contains(key));
+            retain_gone_anchors(&mut state, &removed);
             state.nodes.retain(|(session_id, _), node| {
                 node.anchor_id
                     .is_none_or(|anchor_id| !removed_set.contains(&(*session_id, anchor_id)))
@@ -404,8 +500,13 @@ impl SharedScene {
                             .then_some(session_id)
                     })
                     .collect::<Vec<_>>();
-                advance_changed_scenes(&mut state, changed_sessions)?;
+                advance_changed_scenes(
+                    &mut state,
+                    changed_sessions,
+                    messages::SCENE_CHANGED_ANCHOR_GONE,
+                )?;
                 state.anchors.retain(|key, _| !removed_set.contains(key));
+                retain_gone_anchors(&mut state, &removed);
                 state.nodes.retain(|(session_id, _), node| {
                     node.anchor_id
                         .is_none_or(|anchor_id| !removed_set.contains(&(*session_id, anchor_id)))
@@ -470,6 +571,7 @@ impl SharedScene {
             Source {
                 config,
                 revision: SourceRevision::new(1),
+                field_revisions: [1, 0, 0, 0, 0, 0, 0, 0, 0],
                 lifecycle: messages::SOURCE_LIFECYCLE_CREATED,
                 milestones: 0,
                 attachment_state: messages::ATTACHMENT_NEVER,
@@ -478,6 +580,7 @@ impl SharedScene {
                 last_media_sequence: 0,
                 last_decoded_pts_us: 0,
                 last_presented_pts_us: 0,
+                last_presented_media_id: 0,
                 last_presentation_id: 0,
                 visible: false,
                 latest_frame: None,
@@ -511,6 +614,247 @@ impl SharedScene {
             .or_else(|| state.tombstones.get(&key).map(|tombstone| tombstone.observation))
     }
 
+    pub fn take_observation_snapshot(&self, session_id: SessionId) -> SessionObservationSnapshot {
+        let mut state = self.lock();
+        let now = Instant::now();
+        purge_expired_tombstones(&mut state, now);
+        let scene_revision = state.scene_revisions.get(&session_id).copied().unwrap_or_default();
+        let scene_change_reasons = state.scene_change_reasons.remove(&session_id).unwrap_or(0);
+        let mut sources = state
+            .sources
+            .iter()
+            .filter(|((owner, _), _)| *owner == session_id)
+            .map(|((_, source_id), source)| {
+                (*source_id, observation(source, None), timed_playback_snapshot(source, now))
+            })
+            .chain(state.tombstones.iter().filter_map(|(&(owner, source_id), tombstone)| {
+                (owner == session_id).then_some((
+                    source_id,
+                    tombstone.observation,
+                    tombstone_playback_snapshot(tombstone.observation),
+                ))
+            }))
+            .collect::<Vec<_>>();
+        sources.sort_by_key(|(source_id, _, _)| *source_id);
+        SessionObservationSnapshot { scene_revision, scene_change_reasons, sources }
+    }
+
+    pub fn source_status(
+        &self,
+        key: SourceKey,
+        outstanding_byte_credit: u64,
+        outstanding_packet_credit: u64,
+    ) -> Option<SourceStatus> {
+        let mut state = self.lock();
+        let now = Instant::now();
+        purge_expired_tombstones(&mut state, now);
+        if let Some(source) = state.sources.get(&key) {
+            let observed = observation(source, None);
+            return Some(source_status_from_observation(
+                key.1,
+                observed,
+                outstanding_byte_credit.max(source.config.maximum_body().unwrap_or(0)),
+                outstanding_packet_credit,
+                timed_playback_snapshot(source, now),
+            ));
+        }
+        state.tombstones.get(&key).map(|tombstone| {
+            source_status_from_observation(
+                key.1,
+                tombstone.observation,
+                0,
+                0,
+                tombstone_playback_snapshot(tombstone.observation),
+            )
+        })
+    }
+
+    pub fn source_keys(&self) -> Vec<SourceKey> {
+        let mut state = self.lock();
+        purge_expired_tombstones(&mut state, Instant::now());
+        let mut keys =
+            state.sources.keys().chain(state.tombstones.keys()).copied().collect::<Vec<_>>();
+        keys.sort_unstable();
+        keys
+    }
+
+    pub fn scene_status(
+        &self,
+        session_id: SessionId,
+        query: &SceneQuery,
+    ) -> Result<SceneStatus, SceneQueryPrecondition> {
+        let state = self.lock();
+        let revision = state.scene_revisions.get(&session_id).copied().unwrap_or_default();
+        if query.expected_revision.is_some_and(|expected| expected != revision)
+            || query.cursor.is_some_and(|cursor| cursor.scene_revision != revision)
+        {
+            return Err(SceneQueryPrecondition { current_revision: revision });
+        }
+        let mut nodes = state
+            .nodes
+            .iter()
+            .filter(|((owner, _), _)| *owner == session_id)
+            .map(|(_, node)| ParsedSceneNode {
+                node: ParsedNodeConfig {
+                    node_id: node.node_id,
+                    source_id: node.source_id,
+                    context_id: (session_id << 32) | 1,
+                    x: node.x,
+                    y: node.y,
+                    width: node.width,
+                    height: node.height,
+                    text_layer: node.text_layer,
+                    z_index: node.z_index,
+                    visible: node.visible,
+                    anchor_id: node.anchor_id,
+                },
+                clip: node.clip,
+            })
+            .collect::<Vec<_>>();
+        nodes.sort_by_key(|node| node.node.node_id);
+        let total_nodes = nodes.len() as u64;
+        let offset = query.cursor.map_or(0, |cursor| cursor.offset);
+        let start = usize::try_from(offset).unwrap_or(usize::MAX).min(nodes.len());
+        let maximum = query.maximum_nodes.unwrap_or(64).min(MAX_SCENE_NODES as u64) as usize;
+        let end = start.saturating_add(maximum).min(nodes.len());
+        let page = nodes[start..end].to_vec();
+        let cursor = (end < nodes.len())
+            .then_some(SceneCursor { scene_revision: revision, offset: end as u64 });
+        Ok(SceneStatus { scene_revision: revision, nodes: page, cursor, total_nodes })
+    }
+
+    pub fn anchor_status(
+        &self,
+        session_id: SessionId,
+        anchor_id: u64,
+        columns: u32,
+        rows: u32,
+        display_offset: usize,
+        display_generation: u64,
+    ) -> messages::AnchorStatus {
+        let state = self.lock();
+        let Some(anchor) = state.anchors.get(&(session_id, anchor_id)) else {
+            return messages::AnchorStatus {
+                anchor_id,
+                state: if state.gone_anchors.contains(&(session_id, anchor_id)) {
+                    messages::ANCHOR_STATE_GONE
+                } else {
+                    messages::ANCHOR_STATE_UNKNOWN
+                },
+                column: 0,
+                row: 0,
+                visible: false,
+                display_generation,
+            };
+        };
+        let viewport_row = i64::from(anchor.line).saturating_add(display_offset as i64);
+        let visible = anchor.alternate == state.alternate_screen
+            && anchor.column < columns as usize
+            && (0..i64::from(rows)).contains(&viewport_row);
+        messages::AnchorStatus {
+            anchor_id,
+            state: messages::ANCHOR_STATE_READY,
+            column: anchor.column as u64,
+            row: viewport_row.max(0) as u64,
+            visible,
+            display_generation,
+        }
+    }
+
+    pub fn counts(&self, session_id: SessionId) -> SceneCounts {
+        let state = self.lock();
+        SceneCounts {
+            sources: state.sources.keys().filter(|(owner, _)| *owner == session_id).count() as u64,
+            nodes: state.nodes.keys().filter(|(owner, _)| *owner == session_id).count() as u64,
+            anchors: state.anchors.keys().filter(|(owner, _)| *owner == session_id).count() as u64,
+            retained_pixels: state
+                .sources
+                .iter()
+                .filter(|((owner, _), _)| *owner == session_id)
+                .filter_map(|(_, source)| source.latest_frame.as_ref())
+                .map(|frame| u64::from(frame.width) * u64::from(frame.height))
+                .sum(),
+        }
+    }
+
+    pub fn evaluate_wait(
+        &self,
+        key: SourceKey,
+        condition: u64,
+        value: Option<u64>,
+    ) -> SourceWaitEvaluation {
+        let mut state = self.lock();
+        purge_expired_tombstones(&mut state, Instant::now());
+        let observed = state
+            .sources
+            .get(&key)
+            .map(|source| observation(source, None))
+            .or_else(|| state.tombstones.get(&key).map(|tombstone| tombstone.observation));
+        let Some(observed) = observed else {
+            return SourceWaitEvaluation::NotFound;
+        };
+        let satisfied = match condition {
+            messages::WAIT_SOURCE_REVISION => (observed.revision.get() > value.unwrap_or(u64::MAX))
+                .then_some(observed.revision.get()),
+            messages::WAIT_FIRST_VISIBLE_PRESENTATION => {
+                (observed.milestones & messages::MILESTONE_FIRST_VISIBLE_PRESENTATION != 0)
+                    .then_some(observed.last_presentation_id)
+            },
+            messages::WAIT_RASTER_FRAME => (observed.kind == messages::SOURCE_KIND_RASTER
+                && observed.last_presented_media_id >= value.unwrap_or(u64::MAX))
+            .then_some(observed.last_presented_media_id),
+            messages::WAIT_VIDEO_PTS => value
+                .and_then(|value| i64::try_from(value).ok())
+                .filter(|value| {
+                    observed.kind == messages::SOURCE_KIND_VIDEO
+                        && observed.last_presented_pts_us >= *value
+                })
+                .map(|_| observed.last_presented_pts_us.max(0) as u64),
+            messages::WAIT_PLAYBACK_STARTED => {
+                (observed.milestones & messages::MILESTONE_PLAYBACK_STARTED != 0).then_some(0)
+            },
+            messages::WAIT_PLAYBACK_ENDED => {
+                (observed.milestones & messages::MILESTONE_PLAYBACK_ENDED != 0).then_some(0)
+            },
+            messages::WAIT_MEDIA_ATTACHED => {
+                (observed.milestones & messages::MILESTONE_MEDIA_ATTACHED != 0)
+                    .then_some(observed.attachment_generation)
+            },
+            messages::WAIT_MEDIA_CLOSED => (observed.attachment_state
+                == messages::ATTACHMENT_CLOSED)
+                .then_some(observed.attachment_generation),
+            messages::WAIT_SOURCE_LOST => (observed.milestones & messages::MILESTONE_SOURCE_LOST
+                != 0)
+                .then_some(observed.terminal_loss_code.unwrap_or(0)),
+            _ => None,
+        };
+        if let Some(observed_value) = satisfied {
+            return SourceWaitEvaluation::Satisfied(WaitSatisfied {
+                source_id: key.1,
+                source_revision: observed.revision,
+                condition,
+                observed_value: matches!(
+                    condition,
+                    messages::WAIT_SOURCE_REVISION
+                        | messages::WAIT_RASTER_FRAME
+                        | messages::WAIT_VIDEO_PTS
+                )
+                .then_some(observed_value),
+            });
+        }
+        if matches!(
+            condition,
+            messages::WAIT_FIRST_VISIBLE_PRESENTATION
+                | messages::WAIT_RASTER_FRAME
+                | messages::WAIT_VIDEO_PTS
+        ) && !observed.visible
+        {
+            SourceWaitEvaluation::NotVisible
+        } else {
+            SourceWaitEvaluation::Pending
+        }
+    }
+
     pub fn mark_attached(&self, key: SourceKey) -> Result<SourceObservation, &'static str> {
         let mut state = self.lock();
         let source = state.sources.get_mut(&key).ok_or("source does not exist")?;
@@ -519,7 +863,12 @@ impl SharedScene {
         source.attachment_state = messages::ATTACHMENT_ATTACHED;
         source.lifecycle = messages::SOURCE_LIFECYCLE_ATTACHED;
         set_milestone(source, messages::MILESTONE_MEDIA_ATTACHED);
-        advance_source_revision(source)?;
+        advance_source_revision(
+            source,
+            messages::SOURCE_CHANGED_LIFECYCLE
+                | messages::SOURCE_CHANGED_ATTACHMENT
+                | messages::SOURCE_CHANGED_MILESTONES,
+        )?;
         Ok(observation(source, None))
     }
 
@@ -528,7 +877,7 @@ impl SharedScene {
         let source = state.sources.get_mut(&key).ok_or("source does not exist")?;
         if source.attachment_state != messages::ATTACHMENT_CLOSED {
             source.attachment_state = messages::ATTACHMENT_CLOSED;
-            advance_source_revision(source)?;
+            advance_source_revision(source, messages::SOURCE_CHANGED_ATTACHMENT)?;
         }
         Ok(())
     }
@@ -546,18 +895,21 @@ impl SharedScene {
         if epoch < source.last_epoch {
             return Err("stale source epoch");
         }
-        let mut changed = source.last_epoch != epoch;
+        let epoch_changed = source.last_epoch != epoch;
         source.last_epoch = epoch;
         source.last_media_id = media_id;
         source.last_media_sequence = record_sequence;
-        changed |= source.lifecycle != messages::SOURCE_LIFECYCLE_ACTIVE;
+        let lifecycle_changed = source.lifecycle != messages::SOURCE_LIFECYCLE_ACTIVE;
         source.lifecycle = messages::SOURCE_LIFECYCLE_ACTIVE;
-        changed |= set_milestone(source, messages::MILESTONE_FIRST_MEDIA_RECORD);
+        let mut milestone_changed = set_milestone(source, messages::MILESTONE_FIRST_MEDIA_RECORD);
         if random_access {
-            changed |= set_milestone(source, messages::MILESTONE_RANDOM_ACCESS_ACCEPTED);
+            milestone_changed |= set_milestone(source, messages::MILESTONE_RANDOM_ACCESS_ACCEPTED);
         }
-        if changed {
-            advance_source_revision(source)?;
+        let changed_fields = changed_field(epoch_changed, messages::SOURCE_CHANGED_EPOCH)
+            | changed_field(lifecycle_changed, messages::SOURCE_CHANGED_LIFECYCLE)
+            | changed_field(milestone_changed, messages::SOURCE_CHANGED_MILESTONES);
+        if changed_fields != 0 {
+            advance_source_revision(source, changed_fields)?;
         }
         Ok(())
     }
@@ -571,7 +923,7 @@ impl SharedScene {
         let source = state.sources.get_mut(&key).ok_or("source does not exist")?;
         source.last_decoded_pts_us = pts_us;
         if set_milestone(source, messages::MILESTONE_FIRST_DECODED_OUTPUT) {
-            advance_source_revision(source)?;
+            advance_source_revision(source, messages::SOURCE_CHANGED_MILESTONES)?;
         }
         self.0.playback_changed.notify_all();
         Ok(())
@@ -580,6 +932,7 @@ impl SharedScene {
     pub fn mark_presented(
         &self,
         key: SourceKey,
+        media_id: u64,
         pts_us: i64,
         visible: bool,
     ) -> Result<(), &'static str> {
@@ -587,9 +940,10 @@ impl SharedScene {
         let source = state.sources.get_mut(&key).ok_or("source does not exist")?;
         source.last_presentation_id =
             source.last_presentation_id.checked_add(1).ok_or("presentation ID exhausted")?;
+        source.last_presented_media_id = media_id;
         source.last_presented_pts_us = pts_us;
         if visible && set_milestone(source, messages::MILESTONE_FIRST_VISIBLE_PRESENTATION) {
-            advance_source_revision(source)?;
+            advance_source_revision(source, messages::SOURCE_CHANGED_MILESTONES)?;
         }
         self.0.playback_changed.notify_all();
         Ok(())
@@ -602,7 +956,12 @@ impl SharedScene {
         let milestone_changed = set_milestone(source, messages::MILESTONE_PLAYBACK_ENDED);
         source.lifecycle = messages::SOURCE_LIFECYCLE_ENDED;
         if lifecycle_changed || milestone_changed {
-            advance_source_revision(source)?;
+            advance_source_revision(
+                source,
+                messages::SOURCE_CHANGED_LIFECYCLE
+                    | messages::SOURCE_CHANGED_PLAYBACK
+                    | messages::SOURCE_CHANGED_MILESTONES,
+            )?;
         }
         self.0.playback_changed.notify_all();
         Ok(())
@@ -612,7 +971,7 @@ impl SharedScene {
     pub fn mark_policy_changed(&self, key: SourceKey) -> Result<(), &'static str> {
         let mut state = self.lock();
         let source = state.sources.get_mut(&key).ok_or("source does not exist")?;
-        advance_source_revision(source)?;
+        advance_source_revision(source, messages::SOURCE_CHANGED_CAPTURE_POLICY)?;
         Ok(())
     }
 
@@ -620,7 +979,7 @@ impl SharedScene {
     pub fn mark_descriptor_changed(&self, key: SourceKey) -> Result<(), &'static str> {
         let mut state = self.lock();
         let source = state.sources.get_mut(&key).ok_or("source does not exist")?;
-        advance_source_revision(source)?;
+        advance_source_revision(source, messages::SOURCE_CHANGED_DESCRIPTOR)?;
         Ok(())
     }
 
@@ -628,7 +987,7 @@ impl SharedScene {
         let mut state = self.lock();
         let source = state.sources.get_mut(&key).ok_or("source does not exist")?;
         if set_milestone(source, milestone) {
-            advance_source_revision(source)?;
+            advance_source_revision(source, messages::SOURCE_CHANGED_MILESTONES)?;
         }
         Ok(())
     }
@@ -655,7 +1014,12 @@ impl SharedScene {
         if started {
             set_milestone(source, messages::MILESTONE_PLAYBACK_STARTED);
         }
-        advance_source_revision(source)?;
+        let mut changed_fields =
+            messages::SOURCE_CHANGED_LIFECYCLE | messages::SOURCE_CHANGED_PLAYBACK;
+        if started {
+            changed_fields |= messages::SOURCE_CHANGED_MILESTONES;
+        }
+        advance_source_revision(source, changed_fields)?;
         self.0.playback_changed.notify_all();
         Ok(())
     }
@@ -668,7 +1032,10 @@ impl SharedScene {
             Some(source.buffered_until_pts_us.map_or(pts_us, |current| current.max(pts_us)));
         if maybe_start_buffered(source) {
             set_milestone(source, messages::MILESTONE_PLAYBACK_STARTED);
-            advance_source_revision(source)?;
+            advance_source_revision(
+                source,
+                messages::SOURCE_CHANGED_PLAYBACK | messages::SOURCE_CHANGED_MILESTONES,
+            )?;
         }
         self.0.playback_changed.notify_all();
         Ok(())
@@ -693,7 +1060,10 @@ impl SharedScene {
                 source.played_before_pause.saturating_add(started.elapsed());
         }
         source.lifecycle = messages::SOURCE_LIFECYCLE_PAUSED;
-        advance_source_revision(source)?;
+        advance_source_revision(
+            source,
+            messages::SOURCE_CHANGED_LIFECYCLE | messages::SOURCE_CHANGED_PLAYBACK,
+        )?;
         self.0.playback_changed.notify_all();
         Ok(())
     }
@@ -714,7 +1084,12 @@ impl SharedScene {
         source.buffered_until_pts_us = None;
         source.eos_epoch = None;
         source.lifecycle = messages::SOURCE_LIFECYCLE_PAUSED;
-        advance_source_revision(source)?;
+        advance_source_revision(
+            source,
+            messages::SOURCE_CHANGED_LIFECYCLE
+                | messages::SOURCE_CHANGED_EPOCH
+                | messages::SOURCE_CHANGED_PLAYBACK,
+        )?;
         self.0.playback_changed.notify_all();
         Ok(())
     }
@@ -735,7 +1110,14 @@ impl SharedScene {
             set_milestone(source, messages::MILESTONE_PLAYBACK_STARTED);
         }
         if epoch_changed || eos_changed || eos_milestone_changed || playback_started {
-            advance_source_revision(source)?;
+            let mut changed_fields = messages::SOURCE_CHANGED_PLAYBACK;
+            if epoch_changed {
+                changed_fields |= messages::SOURCE_CHANGED_EPOCH;
+            }
+            if eos_milestone_changed || playback_started {
+                changed_fields |= messages::SOURCE_CHANGED_MILESTONES;
+            }
+            advance_source_revision(source, changed_fields)?;
         }
         self.0.playback_changed.notify_all();
         Ok(())
@@ -809,7 +1191,9 @@ impl SharedScene {
         let milestone_changed = set_milestone(source, messages::MILESTONE_FIRST_DECODED_OUTPUT);
         source.latest_frame = Some(frame);
         if epoch_changed || milestone_changed {
-            advance_source_revision(source)?;
+            let changed_fields = changed_field(epoch_changed, messages::SOURCE_CHANGED_EPOCH)
+                | changed_field(milestone_changed, messages::SOURCE_CHANGED_MILESTONES);
+            advance_source_revision(source, changed_fields)?;
         }
         state.decoded_pixels = decoded_pixels;
         state.revision = state.revision.wrapping_add(1);
@@ -875,7 +1259,9 @@ impl SharedScene {
         let milestone_changed = set_milestone(source, messages::MILESTONE_FIRST_DECODED_OUTPUT);
         source.latest_frame = Some(frame);
         if epoch_changed || milestone_changed {
-            advance_source_revision(source)?;
+            let changed_fields = changed_field(epoch_changed, messages::SOURCE_CHANGED_EPOCH)
+                | changed_field(milestone_changed, messages::SOURCE_CHANGED_MILESTONES);
+            advance_source_revision(source, changed_fields)?;
         }
         state.decoded_pixels = decoded_pixels;
         state.revision = state.revision.wrapping_add(1);
@@ -915,7 +1301,11 @@ impl SharedScene {
             }
         }
         validate_scene_structure(&state, &nodes)?;
-        let scene_revision = advance_scene_revision(&mut state, session_id)?;
+        let scene_revision = advance_scene_revision(
+            &mut state,
+            session_id,
+            messages::SCENE_CHANGED_PRODUCER_COMMIT,
+        )?;
         state.nodes = nodes;
         state.revision = state.revision.wrapping_add(1);
         Ok(scene_revision)
@@ -926,7 +1316,7 @@ impl SharedScene {
         let removes_nodes =
             state.nodes.values().any(|node| (node.session_id, node.source_id) == key);
         if removes_nodes {
-            advance_scene_revision(&mut state, key.0)?;
+            advance_scene_revision(&mut state, key.0, messages::SCENE_CHANGED_POLICY_TEARDOWN)?;
         }
         let source = state.sources.remove(&key).ok_or("source does not exist")?;
         if let Some(frame) = source.latest_frame {
@@ -949,13 +1339,18 @@ impl SharedScene {
         let removes_nodes =
             state.nodes.values().any(|node| (node.session_id, node.source_id) == key);
         if removes_nodes {
-            advance_scene_revision(&mut state, key.0)?;
+            advance_scene_revision(&mut state, key.0, messages::SCENE_CHANGED_SOURCE_LOSS)?;
         }
         let mut source = state.sources.remove(&key).ok_or("source does not exist")?;
         source.lifecycle = messages::SOURCE_LIFECYCLE_TOMBSTONE;
         source.attachment_state = messages::ATTACHMENT_CLOSED;
         set_milestone(&mut source, messages::MILESTONE_SOURCE_LOST);
-        advance_source_revision(&mut source)?;
+        advance_source_revision(
+            &mut source,
+            messages::SOURCE_CHANGED_LIFECYCLE
+                | messages::SOURCE_CHANGED_ATTACHMENT
+                | messages::SOURCE_CHANGED_MILESTONES,
+        )?;
         if let Some(frame) = source.latest_frame.take() {
             let pixels = u64::from(frame.width) * u64::from(frame.height);
             state.decoded_pixels = state.decoded_pixels.saturating_sub(pixels);
@@ -1095,7 +1490,7 @@ impl SharedScene {
             let source = state.sources.get_mut(key).expect("source key was just enumerated");
             if source.visible != *visible {
                 source.visible = *visible;
-                advance_source_revision(source)?;
+                advance_source_revision(source, messages::SOURCE_CHANGED_VISIBILITY)?;
             }
         }
         Ok(states)
@@ -1157,9 +1552,14 @@ impl SharedScene {
                             .then_some(session_id)
                     })
                     .collect::<Vec<_>>();
-                advance_changed_scenes(&mut state, changed_sessions)?;
+                advance_changed_scenes(
+                    &mut state,
+                    changed_sessions,
+                    messages::SCENE_CHANGED_ANCHOR_GONE,
+                )?;
             }
             state.anchors.retain(|key, _| !removed_set.contains(key));
+            retain_gone_anchors(&mut state, &removed);
             state.nodes.retain(|(session_id, _), node| {
                 node.anchor_id
                     .is_none_or(|anchor_id| !removed_set.contains(&(*session_id, anchor_id)))
@@ -1177,9 +1577,14 @@ impl SharedScene {
         if !state.nodes.is_empty() {
             let changed_sessions =
                 state.nodes.keys().map(|(session_id, _)| *session_id).collect::<Vec<_>>();
-            advance_changed_scenes(&mut state, changed_sessions)?;
+            advance_changed_scenes(
+                &mut state,
+                changed_sessions,
+                messages::SCENE_CHANGED_ANCHOR_GONE,
+            )?;
         }
         state.anchors.clear();
+        retain_gone_anchors(&mut state, &removed);
 
         // A ConPTY producer cannot wait for its terminal marker acknowledgement: doing so can
         // stop ConPTY from flushing the marker. Its later control-channel node commit can
@@ -1211,7 +1616,11 @@ impl SharedScene {
             .iter()
             .any(|((owner, _), node)| *owner == session_id && node.anchor_id.is_none())
         {
-            advance_scene_revision(&mut state, session_id)?;
+            advance_scene_revision(
+                &mut state,
+                session_id,
+                messages::SCENE_CHANGED_CONTEXT_REVOKED,
+            )?;
         }
         state.nodes.retain(|(owner, _), node| *owner != session_id || node.anchor_id.is_some());
         gc_detached_sources(&mut state);
@@ -1222,6 +1631,106 @@ impl SharedScene {
 
     fn lock(&self) -> MutexGuard<'_, State> {
         self.0.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+fn timed_playback_snapshot(source: &Source, now: Instant) -> Option<PlaybackSnapshot> {
+    if !matches!(source.config, SourceConfig::Video(_) | SourceConfig::Audio(_)) {
+        return None;
+    }
+    let state = match source.lifecycle {
+        messages::SOURCE_LIFECYCLE_PAUSED => messages::PLAYBACK_PAUSED,
+        messages::SOURCE_LIFECYCLE_ENDED => messages::PLAYBACK_ENDED,
+        messages::SOURCE_LIFECYCLE_LOST | messages::SOURCE_LIFECYCLE_TOMBSTONE => {
+            messages::PLAYBACK_LOST
+        },
+        _ if source.play_request.is_some() && source.play_started.is_none() => {
+            messages::PLAYBACK_BUFFERING
+        },
+        _ if source.play_started.is_some() => messages::PLAYBACK_PLAYING,
+        _ => messages::PLAYBACK_IDLE,
+    };
+    let elapsed = source
+        .play_started
+        .map(|started| now.saturating_duration_since(started))
+        .unwrap_or_default()
+        .saturating_add(source.played_before_pause);
+    let clock_pts_us = source
+        .first_pts_us
+        .unwrap_or(0)
+        .saturating_add(i64::try_from(elapsed.as_micros()).unwrap_or(i64::MAX));
+    let buffered_ahead_us = source
+        .buffered_until_pts_us
+        .map(|end| end.saturating_sub(clock_pts_us).max(0) as u64)
+        .unwrap_or(0);
+    let eos_state = if source.milestones & messages::MILESTONE_PLAYBACK_ENDED != 0 {
+        messages::EOS_APPLIED
+    } else if source.eos_epoch.is_some() {
+        messages::EOS_ACCEPTED
+    } else {
+        messages::EOS_NOT_RECEIVED
+    };
+    Some(PlaybackSnapshot {
+        state,
+        clock_pts_us,
+        epoch: source.last_epoch,
+        buffered_ahead_us,
+        underrun_count: 0,
+        late_drop_count: 0,
+        eos_state,
+    })
+}
+
+fn tombstone_playback_snapshot(observed: SourceObservation) -> Option<PlaybackSnapshot> {
+    matches!(observed.kind, messages::SOURCE_KIND_VIDEO | messages::SOURCE_KIND_AUDIO).then_some(
+        PlaybackSnapshot {
+            state: messages::PLAYBACK_LOST,
+            clock_pts_us: observed.last_presented_pts_us,
+            epoch: observed.epoch,
+            buffered_ahead_us: 0,
+            underrun_count: 0,
+            late_drop_count: 0,
+            eos_state: if observed.milestones & messages::MILESTONE_PLAYBACK_ENDED != 0 {
+                messages::EOS_APPLIED
+            } else if observed.milestones & messages::MILESTONE_EOS_ACCEPTED != 0 {
+                messages::EOS_ACCEPTED
+            } else {
+                messages::EOS_NOT_RECEIVED
+            },
+        },
+    )
+}
+
+fn source_status_from_observation(
+    source_id: u64,
+    observed: SourceObservation,
+    outstanding_byte_credit: u64,
+    outstanding_packet_credit: u64,
+    playback: Option<PlaybackSnapshot>,
+) -> SourceStatus {
+    SourceStatus {
+        source_id,
+        source_revision: observed.revision,
+        kind: observed.kind,
+        lifecycle: observed.lifecycle,
+        epoch: observed.epoch,
+        attachment_state: observed.attachment_state,
+        attachment_generation: observed.attachment_generation,
+        last_media_id: observed.last_media_id,
+        last_media_sequence: observed.last_media_sequence,
+        last_decoded_pts_us: observed.last_decoded_pts_us,
+        last_presented_pts_us: observed.last_presented_pts_us,
+        last_presentation_id: observed.last_presentation_id,
+        visible: observed.visible,
+        capture_policy: 0,
+        linked_source_id: observed.linked_source_id,
+        milestones: observed.milestones,
+        outstanding_byte_credit,
+        outstanding_packet_credit,
+        ingress_queue_depth: messages::QUEUE_DEPTH_EMPTY,
+        descriptor: None,
+        playback,
+        terminal_loss_code: observed.terminal_loss_code,
     }
 }
 
@@ -1438,9 +1947,9 @@ mod tests {
         assert_eq!(revision(&scene), 8);
         scene.aggregate_visibility(80, 24, 0, true).unwrap();
         assert_eq!(revision(&scene), 8);
-        scene.mark_presented(key, 2_000, true).unwrap();
+        scene.mark_presented(key, 12, 2_000, true).unwrap();
         assert_eq!(revision(&scene), 9);
-        scene.mark_presented(key, 2_000, true).unwrap();
+        scene.mark_presented(key, 12, 2_000, true).unwrap();
         assert_eq!(revision(&scene), 9, "presentation IDs are independent counters");
 
         let request = PlayRequest {
@@ -1624,6 +2133,181 @@ mod tests {
                 }),
             )
             .unwrap();
+    }
+
+    #[test]
+    fn status_queries_are_bounded_revision_consistent_and_secret_free() {
+        let scene = SharedScene::default();
+        add_video(&scene, 40);
+        add_video(&scene, 41);
+        scene
+            .commit_mutations(
+                1,
+                vec![
+                    SceneMutation::Create(video_node(1, 40, 1)),
+                    SceneMutation::Create(video_node(1, 41, 2)),
+                ],
+            )
+            .unwrap();
+        let first = scene
+            .scene_status(
+                1,
+                &SceneQuery {
+                    expected_revision: Some(SceneRevision::new(1)),
+                    cursor: None,
+                    maximum_nodes: Some(1),
+                },
+            )
+            .unwrap();
+        assert_eq!(first.nodes.len(), 1);
+        assert_eq!(first.total_nodes, 2);
+        let cursor = first.cursor.unwrap();
+        let second = scene
+            .scene_status(
+                1,
+                &SceneQuery {
+                    expected_revision: Some(SceneRevision::new(1)),
+                    cursor: Some(cursor),
+                    maximum_nodes: Some(1),
+                },
+            )
+            .unwrap();
+        assert_eq!(second.nodes[0].node.node_id, 2);
+        assert!(second.cursor.is_none());
+
+        scene.commit_mutations(1, Vec::new()).unwrap();
+        let stale = scene
+            .scene_status(
+                1,
+                &SceneQuery {
+                    expected_revision: None,
+                    cursor: Some(cursor),
+                    maximum_nodes: Some(1),
+                },
+            )
+            .unwrap_err();
+        assert_eq!(stale.current_revision, SceneRevision::new(2));
+
+        let status = scene.source_status((1, 40), 4096, 4).unwrap();
+        let encoded = messages::source_status(7, &status).unwrap();
+        assert!(encoded.len() <= messages::MAX_STATUS_REPLY_BODY);
+        for forbidden in [b"VIVID_TOKEN".as_slice(), b"media_ticket", b"/tmp/"] {
+            assert!(!encoded.windows(forbidden.len()).any(|window| window == forbidden));
+        }
+    }
+
+    #[test]
+    fn maximum_scene_page_fits_the_status_reply_cap() {
+        let scene = SharedScene::default();
+        add_video(&scene, 40);
+        scene
+            .commit_mutations(
+                1,
+                (1..=MAX_SCENE_NODES as u64)
+                    .map(|node_id| SceneMutation::Create(video_node(1, 40, node_id)))
+                    .collect(),
+            )
+            .unwrap();
+
+        let status = scene
+            .scene_status(
+                1,
+                &SceneQuery {
+                    expected_revision: Some(SceneRevision::new(1)),
+                    cursor: None,
+                    maximum_nodes: Some(MAX_SCENE_NODES as u64),
+                },
+            )
+            .unwrap();
+        assert_eq!(status.nodes.len(), MAX_SCENE_NODES);
+        assert!(status.cursor.is_none());
+        let encoded = messages::scene_status(7, &status).unwrap();
+        assert!(encoded.len() <= messages::MAX_STATUS_REPLY_BODY);
+    }
+
+    #[test]
+    fn anchor_status_distinguishes_ready_gone_and_unknown() {
+        let scene = SharedScene::default();
+        scene.add_anchor(1, 7, 3, 4).unwrap();
+        let ready = scene.anchor_status(1, 7, 80, 24, 0, 9);
+        assert_eq!(ready.state, messages::ANCHOR_STATE_READY);
+        assert!(ready.visible);
+        scene.apply_anchor_resize([((1, 7), None)]).unwrap();
+        assert_eq!(scene.anchor_status(1, 7, 80, 24, 0, 9).state, messages::ANCHOR_STATE_GONE);
+        assert_eq!(scene.anchor_status(1, 8, 80, 24, 0, 9).state, messages::ANCHOR_STATE_UNKNOWN);
+    }
+
+    #[test]
+    fn every_source_wait_condition_uses_authoritative_state() {
+        let scene = SharedScene::default();
+        add_video(&scene, 50);
+        let video = (1, 50);
+        let expect_satisfied = |evaluation| {
+            assert!(matches!(evaluation, SourceWaitEvaluation::Satisfied(_)));
+        };
+
+        assert_eq!(
+            scene.evaluate_wait(video, messages::WAIT_FIRST_VISIBLE_PRESENTATION, None),
+            SourceWaitEvaluation::NotVisible
+        );
+        scene.mark_attached(video).unwrap();
+        expect_satisfied(scene.evaluate_wait(video, messages::WAIT_MEDIA_ATTACHED, None));
+        scene.mark_attachment_closed(video).unwrap();
+        expect_satisfied(scene.evaluate_wait(video, messages::WAIT_MEDIA_CLOSED, None));
+        let revision = scene.source_observation(video).unwrap().revision.get();
+        expect_satisfied(scene.evaluate_wait(
+            video,
+            messages::WAIT_SOURCE_REVISION,
+            Some(revision - 1),
+        ));
+
+        scene.commit_mutations(1, vec![SceneMutation::Create(video_node(1, 50, 50))]).unwrap();
+        scene.aggregate_visibility(80, 24, 0, true).unwrap();
+        scene.mark_presented(video, 10, 9_000, true).unwrap();
+        expect_satisfied(scene.evaluate_wait(
+            video,
+            messages::WAIT_FIRST_VISIBLE_PRESENTATION,
+            None,
+        ));
+        expect_satisfied(scene.evaluate_wait(video, messages::WAIT_VIDEO_PTS, Some(8_000)));
+
+        scene
+            .start_playback(
+                video,
+                PlayRequest {
+                    source_id: 50,
+                    start_pts_us: 0,
+                    minimum_buffer_us: 100,
+                    ..PlayRequest::baseline(50, 100)
+                },
+            )
+            .unwrap();
+        scene.observe_buffered_pts(video, 100).unwrap();
+        expect_satisfied(scene.evaluate_wait(video, messages::WAIT_PLAYBACK_STARTED, None));
+        scene.signal_eos(video, 0).unwrap();
+        scene.mark_playback_ended(video).unwrap();
+        expect_satisfied(scene.evaluate_wait(video, messages::WAIT_PLAYBACK_ENDED, None));
+        scene.lose_source(video, messages::ERROR_DEVICE_LOST).unwrap();
+        expect_satisfied(scene.evaluate_wait(video, messages::WAIT_SOURCE_LOST, None));
+
+        scene
+            .add_source(
+                1,
+                51,
+                SourceConfig::Raster(RasterSourceConfig {
+                    source_id: 51,
+                    width: 1,
+                    height: 1,
+                    alpha_mode: messages::ALPHA_STRAIGHT,
+                    compression_mode: messages::COMPRESSION_NONE,
+                }),
+            )
+            .unwrap();
+        let raster = (1, 51);
+        scene.commit_mutations(1, vec![SceneMutation::Create(video_node(1, 51, 51))]).unwrap();
+        scene.aggregate_visibility(80, 24, 0, true).unwrap();
+        scene.mark_presented(raster, 55, 0, true).unwrap();
+        expect_satisfied(scene.evaluate_wait(raster, messages::WAIT_RASTER_FRAME, Some(55)));
     }
 
     #[test]

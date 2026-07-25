@@ -239,6 +239,12 @@ pub enum WaitKind {
     Frame {
         after: u64,
     },
+    VividSource {
+        session_id: u64,
+        source_id: u64,
+        condition: u64,
+        value: Option<u64>,
+    },
     Exit,
     Resize {
         columns: Option<u16>,
