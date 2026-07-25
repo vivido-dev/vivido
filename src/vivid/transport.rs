@@ -1,4 +1,4 @@
-use std::io::{self, Read, Write};
+use std::io::{self, IoSlice, Read, Write};
 #[cfg(windows)]
 use std::net::TcpStream as LocalStream;
 #[cfg(unix)]
@@ -11,8 +11,9 @@ use std::time::Duration;
 #[cfg(unix)]
 type LocalStream = UnixStream;
 
+use vivid_protocol::messages;
 use vivid_protocol::wire::{
-    HEADER_SIZE, PREFACE_SIZE, Preface, RECORD_KNOWN_FLAGS, Record, RecordHeader,
+    BorrowedRecord, HEADER_SIZE, PREFACE_SIZE, Preface, RECORD_KNOWN_FLAGS, Record, RecordHeader,
 };
 use vivid_protocol::{CONTROL_MAX_RECORD_BODY, HARD_MAX_RECORD_BODY, VIVID_MAJOR, VIVID_MINOR};
 
@@ -49,6 +50,32 @@ impl Reader {
     }
 
     pub fn read_record(&mut self) -> io::Result<Record> {
+        let mut body = Vec::new();
+        let header = self.read_record_body_into(&mut body)?;
+        Ok(Record {
+            record_type: header.record_type,
+            flags: header.flags,
+            object_id: header.object_id,
+            sequence: header.sequence,
+            body,
+        })
+    }
+
+    pub fn read_record_into<'a>(
+        &mut self,
+        body: &'a mut Vec<u8>,
+    ) -> io::Result<BorrowedRecord<'a>> {
+        let header = self.read_record_body_into(body)?;
+        Ok(BorrowedRecord {
+            record_type: header.record_type,
+            flags: header.flags,
+            object_id: header.object_id,
+            sequence: header.sequence,
+            body,
+        })
+    }
+
+    fn read_record_body_into(&mut self, body: &mut Vec<u8>) -> io::Result<RecordHeader> {
         let mut bytes = [0_u8; HEADER_SIZE];
         self.stream.read_exact(&mut bytes)?;
         let header = RecordHeader::decode(bytes);
@@ -74,15 +101,9 @@ impl Reader {
             ));
         }
         self.sequence = header.sequence;
-        let mut body = vec![0_u8; header.body_length as usize];
-        self.stream.read_exact(&mut body)?;
-        Ok(Record {
-            record_type: header.record_type,
-            flags: header.flags,
-            object_id: header.object_id,
-            sequence: header.sequence,
-            body,
-        })
+        body.resize(header.body_length as usize, 0);
+        self.stream.read_exact(body)?;
+        Ok(header)
     }
 
     pub fn writer(&self) -> io::Result<Writer> {
@@ -92,6 +113,7 @@ impl Reader {
                 maximum: CONTROL_MAX_RECORD_BODY,
                 sequence: 0,
             }),
+            control_body: Mutex::new(Vec::with_capacity(64)),
         })
     }
 
@@ -140,6 +162,7 @@ const fn c_int_max() -> libc::c_int {
 
 pub struct Writer {
     inner: Mutex<WriterInner>,
+    control_body: Mutex<Vec<u8>>,
 }
 
 struct WriterInner {
@@ -162,7 +185,21 @@ impl Writer {
     }
 
     pub fn write_record(&self, record_type: u16, object_id: u64, body: &[u8]) -> io::Result<()> {
-        let body_length = u32::try_from(body.len())
+        self.write_record_parts(record_type, object_id, &[body])
+    }
+
+    pub fn write_record_parts(
+        &self,
+        record_type: u16,
+        object_id: u64,
+        parts: &[&[u8]],
+    ) -> io::Result<()> {
+        let body_length = parts.iter().try_fold(0_usize, |total, part| {
+            total.checked_add(part.len()).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "record body length overflows")
+            })
+        })?;
+        let body_length = u32::try_from(body_length)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "record body exceeds u32"))?;
         let mut inner = self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         if body_length > inner.maximum || body_length > HARD_MAX_RECORD_BODY {
@@ -181,10 +218,79 @@ impl Writer {
             object_id,
             sequence: inner.sequence,
         };
-        inner.stream.write_all(&header.encode())?;
-        inner.stream.write_all(body)?;
+        write_parts(&mut inner.stream, &header.encode(), parts)?;
         inner.stream.flush()
     }
+
+    pub fn write_ok(&self, record_type: u16, object_id: u64, request_id: u64) -> io::Result<()> {
+        let mut body = self.control_body.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        messages::ok_into(&mut body, request_id);
+        self.write_record(record_type, object_id, &body)
+    }
+
+    pub fn write_pong(&self, request_id: u64) -> io::Result<()> {
+        let mut body = self.control_body.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        messages::pong_into(&mut body, request_id);
+        self.write_record(messages::PONG, 0, &body)
+    }
+
+    pub fn write_credit(
+        &self,
+        object_id: u64,
+        bytes: u64,
+        packets: u64,
+        fragments: u64,
+    ) -> io::Result<()> {
+        let mut body = self.control_body.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        messages::credit_into(&mut body, bytes, packets, fragments);
+        self.write_record(messages::CREDIT, object_id, &body)
+    }
+}
+
+fn write_parts(stream: &mut LocalStream, header: &[u8], parts: &[&[u8]]) -> io::Result<()> {
+    let mut part_index = 0;
+    let mut part_offset = 0;
+    while part_index <= parts.len() {
+        let mut slices = [IoSlice::new(&[]); 16];
+        let mut slice_count = 0;
+        for logical_index in part_index..=parts.len() {
+            let part = if logical_index == 0 { header } else { parts[logical_index - 1] };
+            let offset = if logical_index == part_index { part_offset } else { 0 };
+            if offset < part.len() {
+                slices[slice_count] = IoSlice::new(&part[offset..]);
+                slice_count += 1;
+                if slice_count == slices.len() {
+                    break;
+                }
+            }
+        }
+        if slice_count == 0 {
+            return Ok(());
+        }
+        let written = stream.write_vectored(&slices[..slice_count])?;
+        if written == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "failed to write Vivid record parts",
+            ));
+        }
+        let mut remaining = written;
+        while part_index <= parts.len() {
+            let part = if part_index == 0 { header } else { parts[part_index - 1] };
+            let available = part.len().saturating_sub(part_offset);
+            if remaining < available {
+                part_offset += remaining;
+                break;
+            }
+            remaining -= available;
+            part_index += 1;
+            part_offset = 0;
+            if remaining == 0 {
+                break;
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -226,6 +332,35 @@ mod tests {
             .unwrap();
         let (mut reader, _) = Reader::new(server).unwrap();
         assert!(reader.read_record().is_err());
+    }
+
+    #[test]
+    fn read_record_into_reuses_body_capacity() {
+        let (mut client, server) = stream_pair();
+        client.write_all(&encode_preface(ConnectionKind::Raster, 1024)).unwrap();
+        for sequence in 1..=2 {
+            client
+                .write_all(
+                    &RecordHeader {
+                        body_length: 128,
+                        record_type: 1,
+                        flags: 0,
+                        object_id: 7,
+                        sequence,
+                    }
+                    .encode(),
+                )
+                .unwrap();
+            client.write_all(&[sequence as u8; 128]).unwrap();
+        }
+        let (mut reader, _) = Reader::new(server).unwrap();
+        let mut body = Vec::new();
+        let first = reader.read_record_into(&mut body).unwrap();
+        assert_eq!(first.body, &[1; 128]);
+        let pointer = first.body.as_ptr();
+        let second = reader.read_record_into(&mut body).unwrap();
+        assert_eq!(second.body, &[2; 128]);
+        assert_eq!(second.body.as_ptr(), pointer);
     }
 
     #[test]
