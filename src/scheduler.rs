@@ -29,6 +29,7 @@ pub enum Topic {
     BlinkCursor,
     BlinkTimeout,
     Frame,
+    VividResizeSettled,
     #[cfg(unix)]
     ScreenshotReadback,
     #[cfg(unix)]
