@@ -848,17 +848,10 @@ fn spawn_audio_source_open(
                 if let Ok(output) = opened {
                     output.stop();
                 }
+                let _ = worker_shared.scene.remove_source((session_id, source_id));
                 return;
             }
             let result = opened.and_then(|output| {
-                worker_shared
-                    .scene
-                    .add_source(session_id, source_id, SourceConfig::Audio(config.clone()))
-                    .map_err(|message| ProtocolError {
-                        code: messages::ERROR_LIMIT_EXCEEDED,
-                        message,
-                        fatal: false,
-                    })?;
                 worker_shared
                     .audio_outputs
                     .lock()
@@ -892,6 +885,14 @@ fn spawn_audio_source_open(
                     },
                 }
             });
+            if result.is_err() {
+                worker_shared
+                    .audio_outputs
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .remove(&(session_id, source_id));
+                let _ = worker_shared.scene.remove_source((session_id, source_id));
+            }
             let write_result = match result {
                 Ok(reply) => {
                     worker_writer.write_record(reply.record_type, reply.object_id, &reply.body)
@@ -1128,7 +1129,18 @@ fn dispatch_control(
                     message: "maximum audio access unit exceeds the media-body limit",
                     fatal: false,
                 })?;
-            spawn_audio_source_open(
+            // Reserve the source in receive order before device opening yields to a worker. The
+            // worker may finish out of order, but it only completes the admitted operation and
+            // issues its ticket; it does not reorder the source-creation mutation.
+            shared
+                .scene
+                .add_source(session_id, config.source_id, SourceConfig::Audio(config.clone()))
+                .map_err(|message| ProtocolError {
+                    code: messages::ERROR_LIMIT_EXCEEDED,
+                    message,
+                    fatal: false,
+                })?;
+            if let Err(error) = spawn_audio_source_open(
                 pending,
                 writer,
                 shared,
@@ -1136,7 +1148,10 @@ fn dispatch_control(
                 envelope.request_id,
                 config,
                 max_body,
-            )?;
+            ) {
+                let _ = shared.scene.remove_source((session_id, record.object_id));
+                return Err(error);
+            }
         },
         messages::CREATE_IMAGE => {
             let (envelope, config) = messages::parse_create_image(&record.body)
@@ -2423,7 +2438,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_drain_does_not_block_ping_dispatch() {
+    fn stalled_drain_preserves_control_liveness_and_unrelated_credit() {
         let (shared, output) = linked_av_shared();
         let (mut client, server) = stream_pair();
         client
@@ -2469,12 +2484,29 @@ mod tests {
             1
         );
 
+        writer.write_credit(12, 4096, 1, 0).unwrap();
+        dispatch_control(
+            &Record {
+                record_type: messages::BEGIN_TXN,
+                flags: 0,
+                object_id: 0,
+                sequence: 2,
+                body: messages::begin_transaction(43, 7),
+            },
+            1,
+            1,
+            &shared,
+            &writer,
+            &pending,
+            &mut transactions,
+        )
+        .unwrap();
         dispatch_control(
             &Record {
                 record_type: messages::PING,
                 flags: 0,
                 object_id: 0,
-                sequence: 2,
+                sequence: 3,
                 body: messages::ping(42),
             },
             1,
@@ -2485,13 +2517,28 @@ mod tests {
             &mut transactions,
         )
         .unwrap();
-        let mut header = [0; vivid_protocol::wire::HEADER_SIZE];
-        client.read_exact(&mut header).unwrap();
-        let header = vivid_protocol::wire::RecordHeader::decode(header);
-        assert_eq!((header.record_type, header.object_id), (messages::PONG, 0));
-        let mut body = vec![0; header.body_length as usize];
-        client.read_exact(&mut body).unwrap();
-        assert_eq!(messages::request_id(&body).unwrap(), 42);
+        let mut replies = Vec::new();
+        for _ in 0..3 {
+            let mut header = [0; vivid_protocol::wire::HEADER_SIZE];
+            client.read_exact(&mut header).unwrap();
+            let header = vivid_protocol::wire::RecordHeader::decode(header);
+            let mut body = vec![0; header.body_length as usize];
+            client.read_exact(&mut body).unwrap();
+            replies.push((
+                header.record_type,
+                header.object_id,
+                messages::request_id(&body).unwrap(),
+            ));
+        }
+        assert_eq!(
+            replies,
+            [(messages::CREDIT, 12, 0), (messages::OK, 0, 43), (messages::PONG, 0, 42),]
+        );
+        assert_eq!(
+            pending.entries.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).len(),
+            1,
+            "the DRAIN must remain outstanding throughout unrelated work"
+        );
 
         pending.cancel_all();
         output.stop();
