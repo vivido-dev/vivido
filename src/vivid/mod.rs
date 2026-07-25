@@ -62,12 +62,23 @@ const MAX_PENDING_OPERATIONS: usize = 64;
 const MAX_TRANSACTIONS: usize = 64;
 const MAX_REGISTERED_WAITS: usize = 64;
 const MAX_IDEMPOTENCY_ENTRIES: usize = 256;
+const MAX_CONTEXT_CAPABILITIES: usize = 256;
 const MAX_PENDING_REQUESTS: usize = MAX_PENDING_OPERATIONS + MAX_REGISTERED_WAITS;
 const MAX_OBSERVATION_QUEUE: usize = 64;
 const MAX_OBSERVATIONS_PER_TICK: usize = 8;
 const PENDING_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 const CONTROL_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+fn root_context_quotas() -> messages::ContextQuotas {
+    messages::ContextQuotas {
+        maximum_sources: 64,
+        maximum_nodes: messages::MAX_SCENE_NODES as u64,
+        maximum_retained_pixels: 8192 * 8192 * 2,
+        maximum_media_bytes: 256 * 1024 * 1024,
+        maximum_media_connections: MAX_CONNECTIONS as u64,
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct DisplayMetrics {
@@ -121,6 +132,35 @@ struct SessionRuntime {
     seen_anchors: HashSet<u64>,
     last_visibility: HashMap<u64, bool>,
     accepted_features: HashSet<u64>,
+    authority_root_session: SessionId,
+    bound_context_id: u64,
+    context_class_mask: u64,
+    context_quotas: messages::ContextQuotas,
+    active_media_connections: u64,
+    revoked: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct ContextKey {
+    authority_root_session: SessionId,
+    context_id: u64,
+}
+
+struct ContextEntry {
+    parent: Option<ContextKey>,
+    class_mask: u64,
+    quotas: messages::ContextQuotas,
+    _label: String,
+    expires_at: Option<Instant>,
+    revoked: bool,
+}
+
+struct CapabilityBinding {
+    verifier: [u8; 32],
+    context: ContextKey,
+    class_mask: u64,
+    quotas: messages::ContextQuotas,
+    expires_at: Option<Instant>,
 }
 
 #[derive(Default)]
@@ -128,6 +168,8 @@ struct Registry {
     next_session_id: u64,
     sessions: HashMap<SessionId, SessionRuntime>,
     tickets: HashMap<Vec<u8>, Ticket>,
+    contexts: HashMap<ContextKey, ContextEntry>,
+    capabilities: Vec<CapabilityBinding>,
 }
 
 struct ServiceShared {
@@ -932,18 +974,6 @@ fn handle_control(reader: &mut Reader, shared: Arc<ServiceShared>) -> io::Result
     let (request_id, hello) = messages::parse_hello(&hello_record.body)?;
     let writer = Arc::new(reader.writer()?);
     writer.set_maximum(hello.maximum_record_body)?;
-    if !constant_time_token_eq(&shared.token, hello.token.as_bytes()) {
-        writer.write_record(
-            messages::ERROR,
-            0,
-            &messages::error(
-                request_id,
-                messages::ERROR_AUTH_FAILED,
-                "Vivid authentication failed",
-            ),
-        )?;
-        return Ok(());
-    }
     let negotiated = messages::negotiate_features(
         &hello.required_features,
         &hello.optional_features,
@@ -956,7 +986,11 @@ fn handle_control(reader: &mut Reader, shared: Arc<ServiceShared>) -> io::Result
         hello.maximum_major,
         hello.maximum_minor,
     );
-    if !supports_current_version || hello.maximum_record_body == 0 || unsupported_feature {
+    if !supports_current_version
+        || hello.maximum_record_body == 0
+        || unsupported_feature
+        || hello.validate_authentication_kind(true).is_err()
+    {
         let (code, diagnostic) = if !supports_current_version {
             (messages::ERROR_UNSUPPORTED_VERSION, "Vivid 1.1 is required")
         } else if hello.maximum_record_body == 0 {
@@ -978,6 +1012,76 @@ fn handle_control(reader: &mut Reader, shared: Arc<ServiceShared>) -> io::Result
     }
 
     let accepted_features = negotiated.unwrap_or_default();
+    let credential = match anchor::decode_token(&hello.token) {
+        Ok(credential) => credential,
+        Err(_) => {
+            writer.write_record(
+                messages::ERROR,
+                0,
+                &messages::error(
+                    request_id,
+                    messages::ERROR_AUTH_FAILED,
+                    "Vivid authentication failed",
+                ),
+            )?;
+            return Ok(());
+        },
+    };
+    let delegated_binding = match hello.authentication_kind {
+        messages::AUTHENTICATION_WINDOW_ROOT => {
+            if !constant_time_eq(&shared.token, &credential) {
+                writer.write_record(
+                    messages::ERROR,
+                    0,
+                    &messages::error(
+                        request_id,
+                        messages::ERROR_AUTH_FAILED,
+                        "Vivid authentication failed",
+                    ),
+                )?;
+                return Ok(());
+            }
+            None
+        },
+        messages::AUTHENTICATION_DELEGATED_CONTEXT => {
+            let candidate: [u8; 32] = Sha256::digest(credential.as_slice()).into();
+            let now = Instant::now();
+            let registry = lock_registry(&shared);
+            let mut matched = None;
+            for binding in &registry.capabilities {
+                let equal = constant_time_eq(&binding.verifier, &candidate);
+                if equal
+                    && binding.expires_at.is_none_or(|expires_at| expires_at > now)
+                    && registry.contexts.get(&binding.context).is_some_and(|context| {
+                        !context.revoked
+                            && context.expires_at.is_none_or(|expires_at| expires_at > now)
+                    })
+                {
+                    matched = Some((
+                        binding.context,
+                        binding.class_mask,
+                        binding.quotas,
+                        binding.expires_at,
+                    ));
+                }
+            }
+            drop(registry);
+            let Some(binding) = matched else {
+                writer.write_record(
+                    messages::ERROR,
+                    0,
+                    &messages::error(
+                        request_id,
+                        messages::ERROR_AUTH_FAILED,
+                        "Vivid authentication failed",
+                    ),
+                )?;
+                return Ok(());
+            };
+            Some(binding)
+        },
+        _ => unreachable!("authentication kind was validated"),
+    };
 
     let (session_id, session_tag, root_context_id) = {
         let mut registry = lock_registry(&shared);
@@ -1009,7 +1113,28 @@ fn handle_control(reader: &mut Reader, shared: Arc<ServiceShared>) -> io::Result
         getrandom::fill(&mut tag).map_err(|error| {
             io::Error::other(format!("could not generate session tag: {error}"))
         })?;
-        let anchor_key = anchor::derive_key(&shared.token, &tag);
+        let anchor_key = anchor::derive_key(&credential, &tag);
+        let (authority_root_session, root_context_id, context_class_mask) =
+            if let Some((context, class_mask, _, _)) = delegated_binding {
+                (context.authority_root_session, context.context_id, class_mask)
+            } else {
+                let root_context_id = session_id
+                    .checked_shl(32)
+                    .and_then(|value| value.checked_add(1))
+                    .ok_or_else(|| io::Error::other("root context ID space exhausted"))?;
+                registry.contexts.insert(
+                    ContextKey { authority_root_session: session_id, context_id: root_context_id },
+                    ContextEntry {
+                        parent: None,
+                        class_mask: messages::CONTEXT_CLASS_MASK,
+                        quotas: root_context_quotas(),
+                        _label: "root".into(),
+                        expires_at: None,
+                        revoked: false,
+                    },
+                );
+                (session_id, root_context_id, messages::CONTEXT_CLASS_MASK)
+            };
         registry.sessions.insert(
             session_id,
             SessionRuntime {
@@ -1019,9 +1144,17 @@ fn handle_control(reader: &mut Reader, shared: Arc<ServiceShared>) -> io::Result
                 seen_anchors: HashSet::new(),
                 last_visibility: HashMap::new(),
                 accepted_features: accepted_features.iter().copied().collect(),
+                authority_root_session,
+                bound_context_id: root_context_id,
+                context_class_mask,
+                context_quotas: delegated_binding
+                    .map(|(_, _, quotas, _)| quotas)
+                    .unwrap_or_else(root_context_quotas),
+                active_media_connections: 0,
+                revoked: false,
             },
         );
-        (session_id, tag, (session_id << 32) | 1)
+        (session_id, tag, root_context_id)
     };
 
     let metrics = *lock_metrics(&shared);
@@ -1057,6 +1190,42 @@ fn handle_control(reader: &mut Reader, shared: Arc<ServiceShared>) -> io::Result
     let mut observations = ObservationTracker::default();
     observations.configure(0, shared.scene.take_observation_snapshot(session_id));
     let result = 'control: loop {
+        let unavailable = {
+            let mut registry = lock_registry(&shared);
+            let Some(session) = registry.sessions.get(&session_id) else {
+                break 'control Ok(());
+            };
+            let context_key = ContextKey {
+                authority_root_session: session.authority_root_session,
+                context_id: session.bound_context_id,
+            };
+            let expired = registry.contexts.get(&context_key).is_some_and(|context| {
+                context.expires_at.is_some_and(|expires_at| expires_at <= Instant::now())
+            });
+            if expired {
+                if let Some(context) = registry.contexts.get_mut(&context_key) {
+                    context.revoked = true;
+                }
+                registry.capabilities.retain(|binding| binding.context != context_key);
+                if let Some(session) = registry.sessions.get_mut(&session_id) {
+                    session.revoked = true;
+                }
+            }
+            registry.sessions.get(&session_id).is_none_or(|session| session.revoked)
+        };
+        if unavailable {
+            let _ = writer.write_record(messages::INPUT_RESET, 0, &messages::input_reset());
+            let body = messages::error_with_detail(
+                0,
+                messages::ERROR_CONTEXT_REVOKED,
+                true,
+                &messages::ErrorDetail::new(),
+                "delegated context expired or was revoked",
+            )?;
+            let _ = writer.write_record(messages::ERROR, root_context_id, &body);
+            cleanup_revoked_session(&shared, session_id);
+            break Ok(());
+        }
         for (request_id, object_id) in pending.expire(Instant::now()) {
             if let Err(error) = writer.write_record(
                 messages::ERROR,
@@ -1256,6 +1425,7 @@ fn is_supported_feature(feature: u64) -> bool {
             | messages::FEATURE_DECODER_DESCRIPTION_V1
             | messages::FEATURE_OBSERVABILITY_CORE_V1
             | messages::FEATURE_ATOMIC_CONTROL_V1
+            | messages::FEATURE_DELEGATED_CONTEXT_V1
     )
 }
 
@@ -1274,6 +1444,117 @@ fn negotiated(shared: &Arc<ServiceShared>, session_id: SessionId, feature: u64) 
         .sessions
         .get(&session_id)
         .is_some_and(|session| session.accepted_features.contains(&feature))
+}
+
+fn session_quotas(
+    shared: &Arc<ServiceShared>,
+    session_id: SessionId,
+) -> Option<messages::ContextQuotas> {
+    lock_registry(shared).sessions.get(&session_id).map(|session| session.context_quotas)
+}
+
+fn required_context_class(record_type: u16) -> Option<u64> {
+    match record_type {
+        messages::SET_OBSERVATION
+        | messages::QUERY_SOURCE
+        | messages::QUERY_SCENE
+        | messages::WAIT_SOURCE
+        | messages::CANCEL_WAIT => Some(messages::CONTEXT_CLASS_OBSERVE),
+        messages::CREATE_RASTER
+        | messages::CREATE_VIDEO
+        | messages::CREATE_AUDIO
+        | messages::CREATE_IMAGE
+        | messages::DESTROY_SOURCE
+        | messages::SET_SOURCE_POLICY
+        | messages::UPDATE_SOURCE_DESCRIPTOR
+        | messages::PLAY
+        | messages::PAUSE
+        | messages::FLUSH
+        | messages::DRAIN
+        | messages::EOS => Some(messages::CONTEXT_CLASS_CREATE_SOURCE),
+        messages::BEGIN_TXN
+        | messages::CREATE_NODE
+        | messages::UPDATE_NODE
+        | messages::DELETE_NODE
+        | messages::COMMIT_TXN
+        | messages::ABORT_TXN => Some(messages::CONTEXT_CLASS_MUTATE_SCENE),
+        messages::CREATE_CONTEXT | messages::DELEGATE_CONTEXT | messages::REVOKE_CONTEXT => {
+            Some(messages::CONTEXT_CLASS_ADMINISTER)
+        },
+        _ => None,
+    }
+}
+
+fn context_is_descendant(registry: &Registry, candidate: ContextKey, ancestor: ContextKey) -> bool {
+    let mut current = Some(candidate);
+    for _ in 0..=messages::MAX_CONTEXTS_PER_SESSION {
+        let Some(key) = current else { return false };
+        if key == ancestor {
+            return true;
+        }
+        current = registry.contexts.get(&key).and_then(|context| context.parent);
+    }
+    false
+}
+
+fn context_expiry_us(expires_at: Option<Instant>, now: Instant) -> u64 {
+    expires_at
+        .map(|expires_at| {
+            u64::try_from(expires_at.saturating_duration_since(now).as_micros()).unwrap_or(u64::MAX)
+        })
+        .unwrap_or(0)
+}
+
+fn enforce_context_source_capacity(
+    shared: &Arc<ServiceShared>,
+    session_id: SessionId,
+    retained_pixels: u64,
+    maximum_media_body: u32,
+) -> Result<(), ProtocolError> {
+    let quotas = session_quotas(shared, session_id).ok_or(ProtocolError {
+        code: messages::ERROR_CONTEXT_REVOKED,
+        message: "session context was revoked",
+        fatal: true,
+    })?;
+    if u64::from(maximum_media_body) > quotas.maximum_media_bytes {
+        return Err(ProtocolError {
+            code: messages::ERROR_LIMIT_EXCEEDED,
+            message: "delegated context media-byte quota is smaller than one packet",
+            fatal: false,
+        });
+    }
+    if shared
+        .scene
+        .configured_pixel_capacity(session_id)
+        .checked_add(retained_pixels)
+        .is_none_or(|projected| projected > quotas.maximum_retained_pixels)
+    {
+        return Err(ProtocolError {
+            code: messages::ERROR_LIMIT_EXCEEDED,
+            message: "delegated context retained-pixel quota exceeded",
+            fatal: false,
+        });
+    }
+    Ok(())
+}
+
+fn cleanup_revoked_session(shared: &Arc<ServiceShared>, session_id: SessionId) {
+    {
+        let mut registry = lock_registry(shared);
+        registry.tickets.retain(|_, ticket| ticket.session_id != session_id);
+    }
+    let outputs = {
+        let mut outputs =
+            shared.audio_outputs.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let keys = outputs.keys().copied().filter(|key| key.0 == session_id).collect::<Vec<_>>();
+        keys.into_iter().filter_map(|key| outputs.remove(&key)).collect::<Vec<_>>()
+    };
+    for output in outputs {
+        output.stop();
+    }
+    if let Err(error) = shared.scene.detach_session(session_id) {
+        log::error!("Could not revoke Vivid session scene resources: {error}");
+    }
 }
 
 fn audio_group(shared: &Arc<ServiceShared>, source: SourceKey) -> Vec<Arc<AudioOutput>> {
@@ -1772,6 +2053,49 @@ fn dispatch_control(
     observations: &mut ObservationTracker,
 ) -> Result<ControlAction, ProtocolError> {
     let bad = |message| ProtocolError { code: messages::ERROR_BAD_MESSAGE, message, fatal: false };
+    if let Some(required_class) = required_context_class(record.record_type) {
+        let session_policy = lock_registry(shared).sessions.get(&session_id).map(|session| {
+            (session.context_class_mask & required_class != 0, session.context_quotas)
+        });
+        let permitted = session_policy.is_some_and(|(permitted, _)| permitted);
+        if !permitted {
+            return Err(ProtocolError {
+                code: messages::ERROR_NOT_FOUND,
+                message: "object is outside the authenticated context",
+                fatal: false,
+            });
+        }
+        let quotas = session_policy.expect("permitted session has a policy").1;
+        let counts = shared.scene.counts(session_id);
+        if matches!(
+            record.record_type,
+            messages::CREATE_RASTER
+                | messages::CREATE_VIDEO
+                | messages::CREATE_AUDIO
+                | messages::CREATE_IMAGE
+        ) && counts.sources >= quotas.maximum_sources
+        {
+            return Err(ProtocolError {
+                code: messages::ERROR_LIMIT_EXCEEDED,
+                message: "delegated context source quota exceeded",
+                fatal: false,
+            });
+        }
+        if record.record_type == messages::CREATE_NODE {
+            let queued_creates = transactions
+                .values()
+                .flatten()
+                .filter(|mutation| matches!(mutation, SceneMutation::Create(_)))
+                .count() as u64;
+            if counts.nodes.saturating_add(queued_creates) >= quotas.maximum_nodes {
+                return Err(ProtocolError {
+                    code: messages::ERROR_LIMIT_EXCEEDED,
+                    message: "delegated context node quota exceeded",
+                    fatal: false,
+                });
+            }
+        }
+    }
     if record.record_type != messages::CANCEL_WAIT
         && let Ok(envelope) = messages::decode_control(&record.body)
         && waits.contains_key(&envelope.request_id)
@@ -1779,6 +2103,307 @@ fn dispatch_control(
         return Err(bad("request ID already has a registered wait"));
     }
     match record.record_type {
+        messages::CREATE_CONTEXT => {
+            if !negotiated(shared, session_id, messages::FEATURE_DELEGATED_CONTEXT_V1) {
+                return Err(ProtocolError {
+                    code: messages::ERROR_UNSUPPORTED_FEATURE,
+                    message: "delegated contexts were not negotiated",
+                    fatal: false,
+                });
+            }
+            let (envelope, request) = messages::parse_create_context(&record.body)
+                .map_err(|_| bad("invalid CREATE_CONTEXT"))?;
+            if record.object_id != request.context_id {
+                return Err(bad("CREATE_CONTEXT object ID mismatch"));
+            }
+            let now = Instant::now();
+            let ready = {
+                let mut registry = lock_registry(shared);
+                let session = registry.sessions.get(&session_id).ok_or(ProtocolError {
+                    code: messages::ERROR_CONTEXT_REVOKED,
+                    message: "session context was revoked",
+                    fatal: true,
+                })?;
+                let bound = ContextKey {
+                    authority_root_session: session.authority_root_session,
+                    context_id: session.bound_context_id,
+                };
+                let key = ContextKey {
+                    authority_root_session: session.authority_root_session,
+                    context_id: request.context_id,
+                };
+                let parent = ContextKey {
+                    authority_root_session: session.authority_root_session,
+                    context_id: request.parent_context_id,
+                };
+                if registry.contexts.contains_key(&key) {
+                    return Err(ProtocolError {
+                        code: messages::ERROR_DUPLICATE_ID,
+                        message: "context ID already exists",
+                        fatal: false,
+                    });
+                }
+                if registry
+                    .contexts
+                    .keys()
+                    .filter(|key| key.authority_root_session == session.authority_root_session)
+                    .count()
+                    >= messages::MAX_CONTEXTS_PER_SESSION
+                {
+                    return Err(ProtocolError {
+                        code: messages::ERROR_LIMIT_EXCEEDED,
+                        message: "context quota exceeded",
+                        fatal: false,
+                    });
+                }
+                let parent_entry = registry.contexts.get(&parent).ok_or(ProtocolError {
+                    code: messages::ERROR_NOT_FOUND,
+                    message: "parent context does not exist",
+                    fatal: false,
+                })?;
+                if !context_is_descendant(&registry, parent, bound)
+                    || parent_entry.revoked
+                    || parent_entry.expires_at.is_some_and(|expires_at| expires_at <= now)
+                {
+                    return Err(ProtocolError {
+                        code: messages::ERROR_NOT_FOUND,
+                        message: "parent context does not exist",
+                        fatal: false,
+                    });
+                }
+                let class_mask = request.class_mask & parent_entry.class_mask;
+                let quotas = request.quotas.intersect(parent_entry.quotas);
+                let requested_expiry = (request.expiry_us != 0)
+                    .then(|| now + Duration::from_micros(request.expiry_us));
+                let expires_at = match (requested_expiry, parent_entry.expires_at) {
+                    (Some(requested), Some(parent)) => Some(requested.min(parent)),
+                    (Some(requested), None) => Some(requested),
+                    (None, parent) => parent,
+                };
+                registry.contexts.insert(
+                    key,
+                    ContextEntry {
+                        parent: Some(parent),
+                        class_mask,
+                        quotas,
+                        _label: request.label,
+                        expires_at,
+                        revoked: false,
+                    },
+                );
+                messages::ContextReady {
+                    context_id: request.context_id,
+                    class_mask,
+                    quotas,
+                    expiry_us: context_expiry_us(expires_at, now),
+                }
+            };
+            let body = messages::context_ready(envelope.request_id, ready)
+                .map_err(|_| bad("could not encode CONTEXT_READY"))?;
+            writer
+                .write_record(messages::CONTEXT_READY, ready.context_id, &body)
+                .map_err(|_| bad("could not send CONTEXT_READY"))?;
+        },
+        messages::DELEGATE_CONTEXT => {
+            if !negotiated(shared, session_id, messages::FEATURE_DELEGATED_CONTEXT_V1) {
+                return Err(ProtocolError {
+                    code: messages::ERROR_UNSUPPORTED_FEATURE,
+                    message: "delegated contexts were not negotiated",
+                    fatal: false,
+                });
+            }
+            let (envelope, context_id) = messages::parse_object_id(&record.body, "context ID")
+                .map_err(|_| bad("invalid DELEGATE_CONTEXT"))?;
+            if record.object_id != context_id {
+                return Err(bad("DELEGATE_CONTEXT object ID mismatch"));
+            }
+            let now = Instant::now();
+            let mut capability = [0_u8; messages::CONTEXT_CAPABILITY_BYTES];
+            getrandom::fill(&mut capability)
+                .map_err(|_| bad("could not generate delegated capability"))?;
+            let verifier: [u8; 32] = Sha256::digest(capability).into();
+            {
+                let mut registry = lock_registry(shared);
+                let session = registry.sessions.get(&session_id).ok_or(ProtocolError {
+                    code: messages::ERROR_CONTEXT_REVOKED,
+                    message: "session context was revoked",
+                    fatal: true,
+                })?;
+                let bound = ContextKey {
+                    authority_root_session: session.authority_root_session,
+                    context_id: session.bound_context_id,
+                };
+                if registry.capabilities.len() >= MAX_CONTEXT_CAPABILITIES {
+                    capability.fill(0);
+                    return Err(ProtocolError {
+                        code: messages::ERROR_LIMIT_EXCEEDED,
+                        message: "delegated capability quota exceeded",
+                        fatal: false,
+                    });
+                }
+                let target = ContextKey {
+                    authority_root_session: session.authority_root_session,
+                    context_id,
+                };
+                let (class_mask, quotas, expires_at, invalid) = match registry.contexts.get(&target)
+                {
+                    Some(context) => (
+                        context.class_mask,
+                        context.quotas,
+                        context.expires_at,
+                        context.revoked
+                            || context.expires_at.is_some_and(|expires_at| expires_at <= now),
+                    ),
+                    None => {
+                        capability.fill(0);
+                        return Err(ProtocolError {
+                            code: messages::ERROR_NOT_FOUND,
+                            message: "context does not exist",
+                            fatal: false,
+                        });
+                    },
+                };
+                if target == bound || !context_is_descendant(&registry, target, bound) || invalid {
+                    capability.fill(0);
+                    return Err(ProtocolError {
+                        code: messages::ERROR_NOT_FOUND,
+                        message: "context does not exist",
+                        fatal: false,
+                    });
+                }
+                registry.capabilities.push(CapabilityBinding {
+                    verifier,
+                    context: target,
+                    class_mask,
+                    quotas,
+                    expires_at,
+                });
+            }
+            let body = messages::context_capability(envelope.request_id, context_id, &capability);
+            let sent = writer.write_record(messages::CONTEXT_CAPABILITY, context_id, &body);
+            capability.fill(0);
+            if sent.is_err() {
+                lock_registry(shared).capabilities.retain(|binding| binding.verifier != verifier);
+                return Err(bad("could not send CONTEXT_CAPABILITY"));
+            }
+        },
+        messages::REVOKE_CONTEXT => {
+            if !negotiated(shared, session_id, messages::FEATURE_DELEGATED_CONTEXT_V1) {
+                return Err(ProtocolError {
+                    code: messages::ERROR_UNSUPPORTED_FEATURE,
+                    message: "delegated contexts were not negotiated",
+                    fatal: false,
+                });
+            }
+            let (envelope, context_id) = messages::parse_object_id(&record.body, "context ID")
+                .map_err(|_| bad("invalid REVOKE_CONTEXT"))?;
+            if record.object_id != context_id {
+                return Err(bad("REVOKE_CONTEXT object ID mismatch"));
+            }
+            let (revoked_sessions, changed_writers) = {
+                let mut registry = lock_registry(shared);
+                let session = registry.sessions.get(&session_id).ok_or(ProtocolError {
+                    code: messages::ERROR_CONTEXT_REVOKED,
+                    message: "session context was revoked",
+                    fatal: true,
+                })?;
+                let bound = ContextKey {
+                    authority_root_session: session.authority_root_session,
+                    context_id: session.bound_context_id,
+                };
+                let target = ContextKey {
+                    authority_root_session: session.authority_root_session,
+                    context_id,
+                };
+                if target == bound
+                    || !registry.contexts.contains_key(&target)
+                    || !context_is_descendant(&registry, target, bound)
+                {
+                    return Err(ProtocolError {
+                        code: messages::ERROR_NOT_FOUND,
+                        message: "context does not exist",
+                        fatal: false,
+                    });
+                }
+                let revoked = registry
+                    .contexts
+                    .keys()
+                    .copied()
+                    .filter(|key| context_is_descendant(&registry, *key, target))
+                    .collect::<HashSet<_>>();
+                for key in &revoked {
+                    if let Some(context) = registry.contexts.get_mut(key) {
+                        context.revoked = true;
+                    }
+                }
+                registry.capabilities.retain(|binding| !revoked.contains(&binding.context));
+                let mut revoked_sessions = Vec::new();
+                let mut changed_writers = Vec::new();
+                for (&candidate_id, candidate) in &mut registry.sessions {
+                    if candidate.authority_root_session != target.authority_root_session {
+                        continue;
+                    }
+                    let key = ContextKey {
+                        authority_root_session: candidate.authority_root_session,
+                        context_id: candidate.bound_context_id,
+                    };
+                    if revoked.contains(&key) {
+                        candidate.revoked = true;
+                        revoked_sessions.push((
+                            candidate_id,
+                            candidate.writer.upgrade(),
+                            candidate.bound_context_id,
+                        ));
+                    } else if let Some(target_writer) = candidate.writer.upgrade() {
+                        changed_writers.push(target_writer);
+                    }
+                }
+                (revoked_sessions, changed_writers)
+            };
+            for (revoked_session, target_writer, revoked_context) in &revoked_sessions {
+                if let Some(target_writer) = target_writer {
+                    let _ = target_writer.write_record(
+                        messages::INPUT_RESET,
+                        0,
+                        &messages::input_reset(),
+                    );
+                    let detail = messages::ErrorDetail::new();
+                    let body = messages::error_with_detail(
+                        0,
+                        messages::ERROR_CONTEXT_REVOKED,
+                        true,
+                        &detail,
+                        "delegated context revoked",
+                    )
+                    .map_err(|_| bad("could not encode CONTEXT_REVOKED"))?;
+                    let _ = target_writer.write_record(messages::ERROR, *revoked_context, &body);
+                }
+                cleanup_revoked_session(shared, *revoked_session);
+            }
+            let authority_root_session = {
+                lock_registry(shared)
+                    .sessions
+                    .get(&session_id)
+                    .map(|session| session.authority_root_session)
+                    .unwrap_or(session_id)
+            };
+            shared
+                .scene
+                .note_context_revocation(authority_root_session)
+                .map_err(|_| bad("could not advance context-revocation revision"))?;
+            let changed = messages::context_changed(messages::ContextChanged {
+                context_id,
+                state: messages::CONTEXT_STATE_REVOKED,
+                reason_mask: messages::CONTEXT_CHANGED_EXPLICIT_REVOCATION,
+            })
+            .map_err(|_| bad("could not encode CONTEXT_CHANGED"))?;
+            for target_writer in changed_writers {
+                let _ = target_writer.write_record(messages::CONTEXT_CHANGED, context_id, &changed);
+            }
+            writer
+                .write_ok(messages::OK, context_id, envelope.request_id)
+                .map_err(|_| bad("could not acknowledge REVOKE_CONTEXT"))?;
+        },
         messages::PING => {
             let envelope =
                 messages::decode_control(&record.body).map_err(|_| bad("invalid PING"))?;
@@ -2149,6 +2774,12 @@ fn dispatch_control(
                         fatal: false,
                     }
                 })?;
+            enforce_context_source_capacity(
+                shared,
+                session_id,
+                u64::from(config.width) * u64::from(config.height),
+                max_body,
+            )?;
             shared
                 .scene
                 .add_source(session_id, config.source_id, SourceConfig::Raster(config.clone()))
@@ -2198,6 +2829,12 @@ fn dispatch_control(
                     message: "maximum video access unit exceeds the media-body limit",
                     fatal: false,
                 })?;
+            enforce_context_source_capacity(
+                shared,
+                session_id,
+                u64::from(config.width) * u64::from(config.height),
+                max_body,
+            )?;
             shared
                 .scene
                 .add_source(session_id, config.source_id, SourceConfig::Video(config.clone()))
@@ -2254,6 +2891,7 @@ fn dispatch_control(
                     message: "maximum audio access unit exceeds the media-body limit",
                     fatal: false,
                 })?;
+            enforce_context_source_capacity(shared, session_id, 0, max_body)?;
             // Reserve the source in receive order before device opening yields to a worker. The
             // worker may finish out of order, but it only completes the admitted operation and
             // issues its ticket; it does not reorder the source-creation mutation.
@@ -2303,6 +2941,12 @@ fn dispatch_control(
                 message: "decoded image size is not representable",
                 fatal: false,
             })?;
+            enforce_context_source_capacity(
+                shared,
+                session_id,
+                u64::from(config.width) * u64::from(config.height),
+                config.encoded_length,
+            )?;
             shared
                 .scene
                 .add_source(session_id, config.source_id, SourceConfig::Image(config.clone()))
@@ -2751,15 +3395,24 @@ fn prepare_source_ready(
     let mut ticket_bytes = vec![0_u8; 32];
     getrandom::fill(&mut ticket_bytes)
         .map_err(|error| io::Error::other(format!("could not generate media ticket: {error}")))?;
-    lock_registry(shared)
-        .tickets
-        .insert(ticket_bytes.clone(), Ticket { session_id: source_key.0, source_key, kind });
-    let byte_credits = INITIAL_BYTE_CREDITS.max(u64::from(max_media_body));
+    let media_byte_quota = session_quotas(shared, source_key.0)
+        .ok_or_else(|| io::Error::new(ErrorKind::NotConnected, "control session is gone"))?
+        .maximum_media_bytes;
+    if u64::from(max_media_body) > media_byte_quota {
+        return Err(io::Error::new(
+            ErrorKind::OutOfMemory,
+            "context media-byte quota is smaller than one packet",
+        ));
+    }
+    let byte_credits = INITIAL_BYTE_CREDITS.min(media_byte_quota).max(u64::from(max_media_body));
     let initial_source_revision = shared
         .scene
         .source_observation(source_key)
         .ok_or_else(|| invalid("source disappeared before SOURCE_READY"))?
         .revision;
+    lock_registry(shared)
+        .tickets
+        .insert(ticket_bytes.clone(), Ticket { session_id: source_key.0, source_key, kind });
     messages::source_ready_with_observability(
         request_id,
         &messages::SourceReady {
@@ -2799,13 +3452,25 @@ fn handle_media(
                 "media ticket channel mismatch",
             ));
         }
-        let writer = registry
+        let session = registry
             .sessions
-            .get(&ticket.session_id)
-            .and_then(|session| session.writer.upgrade())
+            .get_mut(&ticket.session_id)
             .ok_or_else(|| io::Error::new(ErrorKind::NotConnected, "control session is gone"))?;
+        if session.active_media_connections >= session.context_quotas.maximum_media_connections {
+            return Err(io::Error::new(
+                ErrorKind::PermissionDenied,
+                "delegated context media connection quota exceeded",
+            ));
+        }
+        let writer = session
+            .writer
+            .upgrade()
+            .ok_or_else(|| io::Error::new(ErrorKind::NotConnected, "control session is gone"))?;
+        session.active_media_connections = session.active_media_connections.saturating_add(1);
         (ticket, writer)
     };
+    let _active_media =
+        ActiveMediaConnection { shared: shared.clone(), session_id: ticket.session_id };
     shared.scene.mark_attached(ticket.source_key).map_err(invalid)?;
     wake(&shared);
     let max_media_body = match shared.scene.source_config(ticket.source_key) {
@@ -3422,11 +4087,61 @@ impl Drop for ActiveConnection<'_> {
     }
 }
 
+struct ActiveMediaConnection {
+    shared: Arc<ServiceShared>,
+    session_id: SessionId,
+}
+
+impl Drop for ActiveMediaConnection {
+    fn drop(&mut self) {
+        if let Some(session) = lock_registry(&self.shared).sessions.get_mut(&self.session_id) {
+            session.active_media_connections = session.active_media_connections.saturating_sub(1);
+        }
+    }
+}
+
 fn cleanup_session(shared: &Arc<ServiceShared>, session_id: SessionId) {
     let mut registry = lock_registry(shared);
+    let root_authority = registry
+        .sessions
+        .get(&session_id)
+        .filter(|session| session.authority_root_session == session_id)
+        .map(|session| session.authority_root_session);
+    let mut revoked_children = Vec::new();
+    if let Some(root_authority) = root_authority {
+        for (&candidate_id, candidate) in &mut registry.sessions {
+            if candidate_id != session_id && candidate.authority_root_session == root_authority {
+                candidate.revoked = true;
+                revoked_children.push((
+                    candidate_id,
+                    candidate.writer.upgrade(),
+                    candidate.bound_context_id,
+                ));
+            }
+        }
+        registry.contexts.retain(|key, _| key.authority_root_session != root_authority);
+        registry
+            .capabilities
+            .retain(|binding| binding.context.authority_root_session != root_authority);
+    }
     registry.sessions.remove(&session_id);
     registry.tickets.retain(|_, ticket| ticket.session_id != session_id);
     drop(registry);
+    for (child_id, child_writer, context_id) in revoked_children {
+        if let Some(child_writer) = child_writer {
+            let _ = child_writer.write_record(messages::INPUT_RESET, 0, &messages::input_reset());
+            if let Ok(body) = messages::error_with_detail(
+                0,
+                messages::ERROR_CONTEXT_REVOKED,
+                true,
+                &messages::ErrorDetail::new(),
+                "root authority session closed",
+            ) {
+                let _ = child_writer.write_record(messages::ERROR, context_id, &body);
+            }
+        }
+        cleanup_revoked_session(shared, child_id);
+    }
     let outputs = {
         let mut outputs =
             shared.audio_outputs.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -3498,6 +4213,7 @@ fn wake(shared: &ServiceShared) {
     (shared.wake)();
 }
 
+#[cfg(test)]
 fn constant_time_token_eq(expected: &[u8; 32], candidate_hex: &[u8]) -> bool {
     let mut decoded = [0_u8; 32];
     let valid_length = candidate_hex.len() == 64;
@@ -3527,6 +4243,7 @@ fn hex(bytes: &[u8]) -> String {
     output
 }
 
+#[cfg(test)]
 fn unhex(byte: u8) -> (u8, bool) {
     match byte {
         b'0'..=b'9' => (byte - b'0', true),
@@ -3654,6 +4371,32 @@ mod tests {
         }
     }
 
+    fn context_hello(request_id: u64, credential: &str, authentication_kind: u64) -> Vec<u8> {
+        messages::try_encode_hello(
+            request_id,
+            &messages::HelloConfig {
+                minimum_major: 1,
+                minimum_minor: 1,
+                maximum_major: 1,
+                maximum_minor: 1,
+                token: credential,
+                producer: "context-test",
+                producer_version: "1",
+                required_features: &[
+                    messages::FEATURE_RASTER_RGBA8,
+                    messages::FEATURE_RASTER_ZSTD_V1,
+                    messages::FEATURE_OBSERVABILITY_CORE_V1,
+                    messages::FEATURE_DELEGATED_CONTEXT_V1,
+                ],
+                optional_features: &[],
+                maximum_record_body: vivid_protocol::CONTROL_MAX_RECORD_BODY,
+                authentication_kind,
+                preserved_fields: &[],
+            },
+        )
+        .unwrap()
+    }
+
     #[test]
     fn pending_operations_are_bounded_and_timeout_once() {
         let pending = PendingOperations::default();
@@ -3697,6 +4440,12 @@ mod tests {
                     messages::FEATURE_AUDIO_ACCESS_UNIT_V1,
                     messages::FEATURE_VIDEO_CONTROL_V1,
                 ]),
+                authority_root_session: 1,
+                bound_context_id: 1,
+                context_class_mask: messages::CONTEXT_CLASS_MASK,
+                context_quotas: root_context_quotas(),
+                active_media_connections: 0,
+                revoked: false,
             },
         );
         let pending = Arc::new(PendingOperations::default());
@@ -3881,6 +4630,12 @@ mod tests {
                 seen_anchors: HashSet::new(),
                 last_visibility: HashMap::new(),
                 accepted_features: HashSet::from([messages::FEATURE_OBSERVABILITY_CORE_V1]),
+                authority_root_session: 1,
+                bound_context_id: 1,
+                context_class_mask: messages::CONTEXT_CLASS_MASK,
+                context_quotas: root_context_quotas(),
+                active_media_connections: 0,
+                revoked: false,
             },
         );
         let pending = Arc::new(PendingOperations::default());
@@ -4049,6 +4804,12 @@ mod tests {
                 seen_anchors: HashSet::new(),
                 last_visibility: HashMap::new(),
                 accepted_features: HashSet::from([messages::FEATURE_VIDEO_CONTROL_V1]),
+                authority_root_session: 1,
+                bound_context_id: 1,
+                context_class_mask: messages::CONTEXT_CLASS_MASK,
+                context_quotas: root_context_quotas(),
+                active_media_connections: 0,
+                revoked: false,
             },
         );
         let pending = Arc::new(PendingOperations::default());
@@ -4458,6 +5219,166 @@ mod tests {
         }
 
         control.write_record(messages::GOODBYE, 0, 0, &messages::goodbye(6)).unwrap();
+    }
+
+    #[test]
+    fn delegated_context_auth_is_confined_and_revocation_is_actionable() {
+        let service = VividService::start_with_wake(
+            DisplayMetrics {
+                viewport_width: 800,
+                viewport_height: 600,
+                columns: 80,
+                rows: 30,
+                cell_width: 10,
+                cell_height: 20,
+                generation: 1,
+            },
+            Arc::new(|| {}),
+        )
+        .unwrap();
+        let endpoint = Endpoint::parse(service.endpoint()).unwrap();
+        let mut root = Connection::open(&endpoint, ConnectionKind::Control).unwrap();
+        root.write_record(
+            messages::HELLO,
+            0,
+            0,
+            &context_hello(1, service.token(), messages::AUTHENTICATION_WINDOW_ROOT),
+        )
+        .unwrap();
+        let welcome = parse_welcome(&root.read_record().unwrap().body).unwrap();
+        let child_id = welcome.root_context_id + 1;
+        let create = messages::create_context(
+            2,
+            &messages::CreateContextRequest {
+                context_id: child_id,
+                parent_context_id: welcome.root_context_id,
+                class_mask: messages::CONTEXT_CLASS_CREATE_SOURCE | messages::CONTEXT_CLASS_OBSERVE,
+                label: "isolated raster worker".into(),
+                expiry_us: 5_000_000,
+                quotas: messages::ContextQuotas {
+                    maximum_sources: 1,
+                    maximum_nodes: 1,
+                    maximum_retained_pixels: 4,
+                    maximum_media_bytes: 4096,
+                    maximum_media_connections: 1,
+                },
+            },
+        )
+        .unwrap();
+        root.write_record(messages::CREATE_CONTEXT, 0, child_id, &create).unwrap();
+        let ready = read_correlated(&mut root, messages::CONTEXT_READY, 2);
+        assert_eq!(
+            messages::parse_context_ready(&ready.body).unwrap().1.class_mask,
+            messages::CONTEXT_CLASS_CREATE_SOURCE | messages::CONTEXT_CLASS_OBSERVE
+        );
+
+        root.write_record(
+            messages::DELEGATE_CONTEXT,
+            0,
+            child_id,
+            &messages::delegate_context(3, child_id),
+        )
+        .unwrap();
+        let capability_record = read_correlated(&mut root, messages::CONTEXT_CAPABILITY, 3);
+        let (_, _, capability) =
+            messages::parse_context_capability(&capability_record.body).unwrap();
+        let verifier: [u8; 32] = Sha256::digest(capability).into();
+        assert!(
+            lock_registry(&service.shared)
+                .capabilities
+                .iter()
+                .any(|binding| binding.verifier == verifier)
+        );
+        assert_ne!(capability, verifier);
+        root.write_record(
+            messages::QUERY_SCENE,
+            0,
+            0,
+            &messages::query_scene(
+                30,
+                &messages::SceneQuery {
+                    expected_revision: None,
+                    cursor: None,
+                    maximum_nodes: Some(16),
+                },
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let status = read_correlated(&mut root, messages::SCENE_STATUS, 30);
+        assert!(!status.body.windows(capability.len()).any(|window| window == capability));
+
+        let mut delegated = Connection::open(&endpoint, ConnectionKind::Control).unwrap();
+        delegated
+            .write_record(
+                messages::HELLO,
+                0,
+                0,
+                &context_hello(1, &hex(&capability), messages::AUTHENTICATION_DELEGATED_CONTEXT),
+            )
+            .unwrap();
+        let delegated_welcome = parse_welcome(&delegated.read_record().unwrap().body).unwrap();
+        assert_eq!(delegated_welcome.root_context_id, child_id);
+
+        root.write_record(messages::CREATE_RASTER, 0, 999, &messages::create_raster(31, 999, 1, 1))
+            .unwrap();
+        read_correlated(&mut root, messages::SOURCE_READY, 31);
+        delegated
+            .write_record(messages::QUERY_SOURCE, 0, 999, &messages::query_source(2, 999).unwrap())
+            .unwrap();
+        let denied = read_correlated(&mut delegated, messages::ERROR, 2);
+        assert_eq!(
+            messages::parse_error_reply(&denied.body).unwrap().code,
+            messages::ERROR_NOT_FOUND
+        );
+        delegated
+            .write_record(messages::CREATE_RASTER, 0, 7, &messages::create_raster(3, 7, 1, 1))
+            .unwrap();
+        let source_reply = delegated.read_record().unwrap();
+        assert_eq!(
+            source_reply.record_type,
+            messages::SOURCE_READY,
+            "{:?}",
+            (source_reply.record_type == messages::ERROR)
+                .then(|| messages::parse_error_reply(&source_reply.body).unwrap())
+        );
+
+        root.write_record(
+            messages::REVOKE_CONTEXT,
+            0,
+            child_id,
+            &messages::revoke_context(4, child_id),
+        )
+        .unwrap();
+        loop {
+            let record = root.read_record().unwrap();
+            assert!(
+                !record.body.windows(capability.len()).any(|window| window == capability),
+                "capability leaked into a non-capability reply or event"
+            );
+            if record.record_type == messages::OK
+                && messages::request_id(&record.body).unwrap() == 4
+            {
+                break;
+            }
+        }
+        let reset = delegated.read_record().unwrap();
+        assert_eq!(reset.record_type, messages::INPUT_RESET);
+        let revoked = delegated.read_record().unwrap();
+        assert_eq!(revoked.record_type, messages::ERROR);
+        let error = messages::parse_error_reply(&revoked.body).unwrap();
+        assert_eq!(error.code, messages::ERROR_CONTEXT_REVOKED);
+        assert!(error.fatal);
+        assert!(
+            lock_registry(&service.shared)
+                .capabilities
+                .iter()
+                .all(|binding| binding.verifier != verifier)
+        );
+        assert!(
+            service.shared.scene.source_observation((delegated_welcome.session_id, 7)).is_none()
+        );
+        assert!(service.shared.scene.scene_revision(welcome.session_id).get() > 0);
     }
 
     #[test]
