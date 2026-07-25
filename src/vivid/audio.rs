@@ -398,7 +398,7 @@ impl AudioOutput {
                     return Ok(());
                 }
                 if let Some(error) = self.shared.error() {
-                    return Err(io::Error::other(error));
+                    return Err(io::Error::new(io::ErrorKind::NotConnected, error));
                 }
                 match producer.try_push(sample) {
                     Ok(()) => {
@@ -433,7 +433,7 @@ impl AudioOutput {
                 return Err(io::Error::new(io::ErrorKind::BrokenPipe, "audio output stopped"));
             }
             if let Some(error) = self.shared.error() {
-                return Err(io::Error::other(error));
+                return Err(io::Error::new(io::ErrorKind::NotConnected, error));
             }
             thread::sleep(POLL_INTERVAL);
         }

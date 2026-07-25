@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::io::{self, IoSlice, Read, Write};
 #[cfg(windows)]
 use std::net::TcpStream as LocalStream;
@@ -5,13 +6,14 @@ use std::net::TcpStream as LocalStream;
 use std::os::fd::AsRawFd;
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 #[cfg(unix)]
 type LocalStream = UnixStream;
 
 use vivid_protocol::messages;
+use vivid_protocol::trace::{TraceDirection, TraceEmitter, TraceOutcome};
 use vivid_protocol::wire::{
     BorrowedRecord, HEADER_SIZE, PREFACE_SIZE, Preface, RECORD_KNOWN_FLAGS, Record, RecordHeader,
 };
@@ -22,6 +24,69 @@ pub struct Reader {
     negotiated_maximum: u32,
     maximum: u32,
     sequence: u64,
+    trace: Option<TraceChannel>,
+}
+
+#[derive(Clone)]
+pub struct TraceChannel {
+    emitter: TraceEmitter,
+    restricted_sources: Arc<Mutex<HashSet<u64>>>,
+}
+
+impl TraceChannel {
+    pub fn new(emitter: TraceEmitter) -> Self {
+        Self { emitter, restricted_sources: Arc::new(Mutex::new(HashSet::new())) }
+    }
+
+    pub fn mark_source_policy(&self, source_id: u64, capture_policy: u64) {
+        if capture_policy & messages::CAPTURE_POLICY_REDUCE_DIAGNOSTICS != 0 {
+            self.restricted_sources
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(source_id);
+        }
+    }
+
+    fn emit(&self, direction: TraceDirection, header: RecordHeader, body: &[u8]) {
+        let restricted = header.record_type == messages::ATTACH_CHANNEL
+            || (header.object_id != 0
+                && (self
+                    .restricted_sources
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .contains(&header.object_id)
+                    || body_restricts_trace(header.record_type, body)));
+        if restricted {
+            self.emitter.emit_restricted_source(
+                direction,
+                header.record_type,
+                u64::from(header.body_length),
+                header.sequence,
+            );
+        } else if header.record_type >= messages::ATTACH_CHANNEL {
+            self.emitter.emit(
+                direction,
+                header.record_type,
+                u64::from(header.body_length),
+                header.sequence,
+                vivid_protocol::trace::object_kind(header.record_type, header.object_id),
+                (header.object_id != 0).then_some(header.object_id),
+                None,
+                None,
+                TraceOutcome::Ok,
+            );
+        } else {
+            self.emitter.emit_control(
+                direction,
+                header.record_type,
+                body,
+                header.sequence,
+                vivid_protocol::trace::object_kind(header.record_type, header.object_id),
+                (header.object_id != 0).then_some(header.object_id),
+                TraceOutcome::Ok,
+            );
+        }
+    }
 }
 
 impl Reader {
@@ -44,6 +109,7 @@ impl Reader {
                     .min(HARD_MAX_RECORD_BODY)
                     .min(CONTROL_MAX_RECORD_BODY),
                 sequence: 0,
+                trace: None,
             },
             preface,
         ))
@@ -103,6 +169,9 @@ impl Reader {
         self.sequence = header.sequence;
         body.resize(header.body_length as usize, 0);
         self.stream.read_exact(body)?;
+        if let Some(trace) = &self.trace {
+            trace.emit(TraceDirection::Receive, header, body);
+        }
         Ok(header)
     }
 
@@ -114,11 +183,22 @@ impl Reader {
                 sequence: 0,
             }),
             control_body: Mutex::new(Vec::with_capacity(64)),
+            trace: self.trace.clone(),
         })
     }
 
     pub fn set_maximum(&mut self, maximum: u32) {
         self.maximum = self.negotiated_maximum.min(maximum);
+    }
+
+    pub fn set_trace(&mut self, trace: TraceChannel) {
+        self.trace = Some(trace);
+    }
+
+    pub fn mark_source_policy(&self, source_id: u64, capture_policy: u64) {
+        if let Some(trace) = &self.trace {
+            trace.mark_source_policy(source_id, capture_policy);
+        }
     }
 
     #[cfg(unix)]
@@ -163,6 +243,7 @@ const fn c_int_max() -> libc::c_int {
 pub struct Writer {
     inner: Mutex<WriterInner>,
     control_body: Mutex<Vec<u8>>,
+    trace: Option<TraceChannel>,
 }
 
 struct WriterInner {
@@ -219,7 +300,13 @@ impl Writer {
             sequence: inner.sequence,
         };
         write_parts(&mut inner.stream, &header.encode(), parts)?;
-        inner.stream.flush()
+        inner.stream.flush()?;
+        drop(inner);
+        if let Some(trace) = &self.trace {
+            let body = parts.first().copied().unwrap_or_default();
+            trace.emit(TraceDirection::Send, header, body);
+        }
+        Ok(())
     }
 
     pub fn write_ok(&self, record_type: u16, object_id: u64, request_id: u64) -> io::Result<()> {
@@ -245,6 +332,34 @@ impl Writer {
         messages::credit_into(&mut body, bytes, packets, fragments);
         self.write_record(messages::CREDIT, object_id, &body)
     }
+
+    pub fn mark_source_policy(&self, source_id: u64, capture_policy: u64) {
+        if let Some(trace) = &self.trace {
+            trace.mark_source_policy(source_id, capture_policy);
+        }
+    }
+}
+
+fn body_restricts_trace(record_type: u16, body: &[u8]) -> bool {
+    let policy = match record_type {
+        messages::CREATE_RASTER => {
+            messages::parse_create_raster_with_extensions(body).ok().map(|(_, _, policy, _)| policy)
+        },
+        messages::CREATE_IMAGE => {
+            messages::parse_create_image_with_extensions(body).ok().map(|(_, _, policy, _)| policy)
+        },
+        messages::CREATE_VIDEO => {
+            messages::parse_create_video_with_extensions(body).ok().map(|(_, _, policy, _)| policy)
+        },
+        messages::CREATE_AUDIO => {
+            messages::parse_create_audio_with_extensions(body).ok().map(|(_, _, policy, _)| policy)
+        },
+        messages::SET_SOURCE_POLICY => {
+            messages::parse_set_source_policy(body).ok().map(|(_, _, policy)| policy)
+        },
+        _ => None,
+    };
+    policy.is_some_and(|policy| policy & messages::CAPTURE_POLICY_REDUCE_DIAGNOSTICS != 0)
 }
 
 fn write_parts(stream: &mut LocalStream, header: &[u8], parts: &[&[u8]]) -> io::Result<()> {
@@ -296,6 +411,9 @@ fn write_parts(stream: &mut LocalStream, header: &[u8], parts: &[&[u8]]) -> io::
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    use vivid_protocol::trace::{TraceComponent, TraceGuard, TraceHop};
     use vivid_protocol::wire::{ConnectionKind, encode_preface};
 
     #[cfg(unix)]
@@ -409,6 +527,86 @@ mod tests {
             let record = reader.read_record().unwrap();
             assert_eq!(record.body, body);
             writer.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn diagnostic_trace_never_serializes_control_secrets_or_restricted_source_ids() {
+        let records = Arc::new(Mutex::new(Vec::new()));
+        let output = records.clone();
+        let guard = TraceGuard::callback(
+            TraceComponent::Vivido,
+            TraceHop::Presenter,
+            [0x55; 16],
+            move |record| output.lock().unwrap().push(record),
+        )
+        .unwrap();
+        let channel = TraceChannel::new(guard.emitter());
+        let token = "abababababababababababababababababababababababababababababababab";
+        let hello = messages::encode_hello(
+            7,
+            &messages::HelloConfig {
+                minimum_major: 1,
+                minimum_minor: 1,
+                maximum_major: 1,
+                maximum_minor: 1,
+                token,
+                producer: "private producer title",
+                producer_version: "1",
+                required_features: &[],
+                optional_features: &[],
+                maximum_record_body: 4096,
+                authentication_kind: messages::AUTHENTICATION_WINDOW_ROOT,
+                preserved_fields: &[],
+            },
+        );
+        channel.emit(
+            TraceDirection::Receive,
+            RecordHeader {
+                body_length: hello.len() as u32,
+                record_type: messages::HELLO,
+                flags: 0,
+                object_id: 0,
+                sequence: 1,
+            },
+            &hello,
+        );
+        channel.mark_source_policy(91, messages::CAPTURE_POLICY_REDUCE_DIAGNOSTICS);
+        channel.emit(
+            TraceDirection::Receive,
+            RecordHeader {
+                body_length: 32,
+                record_type: messages::VIDEO_PACKET,
+                flags: 0,
+                object_id: 91,
+                sequence: 2,
+            },
+            b"private-media-body-is-never-traced",
+        );
+        let cbor_shaped_media = messages::ok(999);
+        channel.emit(
+            TraceDirection::Receive,
+            RecordHeader {
+                body_length: cbor_shaped_media.len() as u32,
+                record_type: messages::VIDEO_PACKET,
+                flags: 0,
+                object_id: 93,
+                sequence: 3,
+            },
+            &cbor_shaped_media,
+        );
+        drop(channel);
+        drop(guard);
+
+        let records = records.lock().unwrap();
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[1].outcome, TraceOutcome::Restricted);
+        assert_eq!(records[1].object_id, None);
+        assert_eq!(records[2].request_id, None, "media bytes are never decoded as control CBOR");
+        let trace = records.iter().map(|record| record.ndjson_line()).collect::<String>();
+        for forbidden in [token, "private producer title", "private-media-body", "\"object_id\":91"]
+        {
+            assert!(!trace.contains(forbidden), "trace leaked {forbidden}");
         }
     }
 }
