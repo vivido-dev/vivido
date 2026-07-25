@@ -243,6 +243,15 @@ pub enum SourceWaitEvaluation {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaBarrierWait {
+    Accepted,
+    AttachmentChanged,
+    AttachmentClosed,
+    SourceLost,
+    TimedOut,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SceneCounts {
     pub sources: u64,
     pub nodes: u64,
@@ -998,6 +1007,7 @@ impl SharedScene {
                 | messages::SOURCE_CHANGED_ATTACHMENT
                 | messages::SOURCE_CHANGED_MILESTONES,
         )?;
+        self.0.playback_changed.notify_all();
         Ok(observation(source, None))
     }
 
@@ -1008,6 +1018,7 @@ impl SharedScene {
             source.attachment_state = messages::ATTACHMENT_CLOSED;
             advance_source_revision(source, messages::SOURCE_CHANGED_ATTACHMENT)?;
         }
+        self.0.playback_changed.notify_all();
         Ok(())
     }
 
@@ -1040,7 +1051,51 @@ impl SharedScene {
         if changed_fields != 0 {
             advance_source_revision(source, changed_fields)?;
         }
+        self.0.playback_changed.notify_all();
         Ok(())
+    }
+
+    /// Wait until a media record is accepted on exactly the named attachment generation.
+    ///
+    /// This waits on source-local authoritative state and performs no allocation while media is
+    /// arriving. Sequence framing is gap-checked, so observing a later accepted sequence also
+    /// proves that the named sequence was accepted.
+    pub fn wait_media_barrier(
+        &self,
+        key: SourceKey,
+        attachment_generation: u64,
+        final_record_sequence: u64,
+        timeout: Duration,
+    ) -> MediaBarrierWait {
+        let deadline = Instant::now() + timeout;
+        let mut state = self.lock();
+        loop {
+            let Some(source) = state.sources.get(&key) else {
+                return MediaBarrierWait::SourceLost;
+            };
+            if source.attachment_generation != attachment_generation {
+                return MediaBarrierWait::AttachmentChanged;
+            }
+            if source.last_media_sequence >= final_record_sequence {
+                return MediaBarrierWait::Accepted;
+            }
+            if source.attachment_state == messages::ATTACHMENT_CLOSED {
+                return MediaBarrierWait::AttachmentClosed;
+            }
+            let now = Instant::now();
+            let Some(remaining) = deadline.checked_duration_since(now) else {
+                return MediaBarrierWait::TimedOut;
+            };
+            let (next, result) = self
+                .0
+                .playback_changed
+                .wait_timeout(state, remaining)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state = next;
+            if result.timed_out() {
+                return MediaBarrierWait::TimedOut;
+            }
+        }
     }
 
     pub fn mark_decoder_initialized(&self, key: SourceKey) -> Result<(), &'static str> {
@@ -2050,6 +2105,56 @@ mod tests {
         assert_eq!(scene.presentation_due((1, 8), 50_000), Some(false));
         scene.signal_eos((1, 8), 0).unwrap();
         assert_eq!(scene.presentation_due((1, 8), 50_000), Some(true));
+    }
+
+    #[test]
+    fn media_order_barrier_covers_accept_mismatch_close_loss_and_timeout() {
+        let accepted = SharedScene::default();
+        add_video(&accepted, 20);
+        accepted.mark_attached((1, 20)).unwrap();
+        let waiter = {
+            let scene = accepted.clone();
+            std::thread::spawn(move || {
+                scene.wait_media_barrier((1, 20), 1, 2, Duration::from_secs(1))
+            })
+        };
+        accepted.mark_media_accepted((1, 20), 1, 1, 1, true).unwrap();
+        accepted.mark_media_accepted((1, 20), 1, 2, 2, false).unwrap();
+        assert_eq!(waiter.join().unwrap(), MediaBarrierWait::Accepted);
+
+        let changed = SharedScene::default();
+        add_video(&changed, 21);
+        changed.mark_attached((1, 21)).unwrap();
+        assert_eq!(
+            changed.wait_media_barrier((1, 21), 2, 1, Duration::ZERO),
+            MediaBarrierWait::AttachmentChanged
+        );
+
+        let closed = SharedScene::default();
+        add_video(&closed, 22);
+        closed.mark_attached((1, 22)).unwrap();
+        closed.mark_attachment_closed((1, 22)).unwrap();
+        assert_eq!(
+            closed.wait_media_barrier((1, 22), 1, 1, Duration::from_secs(1)),
+            MediaBarrierWait::AttachmentClosed
+        );
+
+        let lost = SharedScene::default();
+        add_video(&lost, 23);
+        lost.mark_attached((1, 23)).unwrap();
+        lost.lose_source((1, 23), messages::ERROR_DECODER).unwrap();
+        assert_eq!(
+            lost.wait_media_barrier((1, 23), 1, 1, Duration::from_secs(1)),
+            MediaBarrierWait::SourceLost
+        );
+
+        let timed_out = SharedScene::default();
+        add_video(&timed_out, 24);
+        timed_out.mark_attached((1, 24)).unwrap();
+        assert_eq!(
+            timed_out.wait_media_barrier((1, 24), 1, 1, Duration::ZERO),
+            MediaBarrierWait::TimedOut
+        );
     }
 
     #[test]
