@@ -4638,6 +4638,17 @@ mod tests {
         }
     }
 
+    fn assert_record_excludes(record: &Record, secrets: &[(&str, &[u8])]) {
+        for (name, secret) in secrets {
+            assert!(
+                !secret.is_empty()
+                    && !record.body.windows(secret.len()).any(|window| window == *secret),
+                "{name} leaked through record type {:#06x}",
+                record.record_type
+            );
+        }
+    }
+
     fn context_hello(request_id: u64, credential: &str, authentication_kind: u64) -> Vec<u8> {
         messages::try_encode_hello(
             request_id,
@@ -4652,6 +4663,7 @@ mod tests {
                 required_features: &[
                     messages::FEATURE_RASTER_RGBA8,
                     messages::FEATURE_RASTER_ZSTD_V1,
+                    messages::FEATURE_TEXT_ANCHORS_V2,
                     messages::FEATURE_OBSERVABILITY_CORE_V1,
                     messages::FEATURE_DELEGATED_CONTEXT_V1,
                 ],
@@ -5573,6 +5585,8 @@ mod tests {
             Arc::new(|| {}),
         )
         .unwrap();
+        let root_token = service.token().as_bytes().to_vec();
+        let root_token_binary = anchor::decode_token(service.token()).unwrap().to_vec();
         let endpoint = Endpoint::parse(service.endpoint()).unwrap();
         let mut root = Connection::open(&endpoint, ConnectionKind::Control).unwrap();
         root.write_record(
@@ -5589,7 +5603,9 @@ mod tests {
             &messages::CreateContextRequest {
                 context_id: child_id,
                 parent_context_id: welcome.root_context_id,
-                class_mask: messages::CONTEXT_CLASS_CREATE_SOURCE | messages::CONTEXT_CLASS_OBSERVE,
+                class_mask: messages::CONTEXT_CLASS_CREATE_SOURCE
+                    | messages::CONTEXT_CLASS_OBSERVE
+                    | messages::CONTEXT_CLASS_CREATE_ANCHOR,
                 label: "isolated raster worker".into(),
                 expiry_us: 5_000_000,
                 quotas: messages::ContextQuotas {
@@ -5606,7 +5622,9 @@ mod tests {
         let ready = read_correlated(&mut root, messages::CONTEXT_READY, 2);
         assert_eq!(
             messages::parse_context_ready(&ready.body).unwrap().1.class_mask,
-            messages::CONTEXT_CLASS_CREATE_SOURCE | messages::CONTEXT_CLASS_OBSERVE
+            messages::CONTEXT_CLASS_CREATE_SOURCE
+                | messages::CONTEXT_CLASS_OBSERVE
+                | messages::CONTEXT_CLASS_CREATE_ANCHOR
         );
 
         root.write_record(
@@ -5656,10 +5674,17 @@ mod tests {
             .unwrap();
         let delegated_welcome = parse_welcome(&delegated.read_record().unwrap().body).unwrap();
         assert_eq!(delegated_welcome.root_context_id, child_id);
+        assert!(
+            !delegated_welcome.accepted_features.contains(&messages::FEATURE_IMAGE_CACHE_V1),
+            "the Stage 3 presenter must not expose a cache-hit oracle before context-local caching"
+        );
 
         root.write_record(messages::CREATE_RASTER, 0, 999, &messages::create_raster(31, 999, 1, 1))
             .unwrap();
-        read_correlated(&mut root, messages::SOURCE_READY, 31);
+        let root_ready = messages::parse_source_ready(
+            &read_correlated(&mut root, messages::SOURCE_READY, 31).body,
+        )
+        .unwrap();
         delegated
             .write_record(messages::QUERY_SOURCE, 0, 999, &messages::query_source(2, 999).unwrap())
             .unwrap();
@@ -5667,6 +5692,15 @@ mod tests {
         assert_eq!(
             messages::parse_error_reply(&denied.body).unwrap().code,
             messages::ERROR_NOT_FOUND
+        );
+        assert_record_excludes(
+            &denied,
+            &[
+                ("root token", &root_token),
+                ("raw root token", &root_token_binary),
+                ("delegated capability", &capability),
+                ("foreign ticket", &root_ready.media_ticket),
+            ],
         );
         delegated
             .write_record(messages::CREATE_RASTER, 0, 7, &messages::create_raster(3, 7, 1, 1))
@@ -5679,6 +5713,56 @@ mod tests {
             (source_reply.record_type == messages::ERROR)
                 .then(|| messages::parse_error_reply(&source_reply.body).unwrap())
         );
+        let delegated_ready = messages::parse_source_ready(&source_reply.body).unwrap();
+        assert!(
+            lock_registry(&service.shared).tickets.contains_key(&delegated_ready.media_ticket),
+            "the revocation fixture needs an outstanding single-use ticket"
+        );
+
+        delegated.write_record(messages::QUERY_LIMITS, 0, 0, &messages::query_limits(5)).unwrap();
+        let limits_record = read_correlated(&mut delegated, messages::LIMITS_STATUS, 5);
+        let (_, limits) = messages::parse_limits_status(&limits_record.body).unwrap();
+        assert_eq!(
+            limits.current_sources, 1,
+            "a delegated session must not enumerate the root context's source"
+        );
+        assert_eq!(
+            limits.image_cache_budget, None,
+            "no cache-probe surface is advertised before IMAGE_CACHE_V1"
+        );
+        assert_record_excludes(
+            &limits_record,
+            &[
+                ("root token", &root_token),
+                ("raw root token", &root_token_binary),
+                ("delegated capability", &capability),
+                ("foreign ticket", &root_ready.media_ticket),
+                ("owned ticket", &delegated_ready.media_ticket),
+            ],
+        );
+
+        let delegated_tag: [u8; 16] = delegated_welcome.session_tag.as_slice().try_into().unwrap();
+        let delegated_key =
+            anchor::derive_key(capability.as_slice().try_into().unwrap(), &delegated_tag);
+        let marker = anchor::encode_marker(&delegated_key, &delegated_tag, 77).unwrap();
+        service.handle_terminal_marker(&marker[2..marker.len() - 2], 1, 2, false);
+        loop {
+            let event = delegated.read_record().unwrap();
+            assert_record_excludes(
+                &event,
+                &[
+                    ("root token", &root_token),
+                    ("raw root token", &root_token_binary),
+                    ("delegated capability", &capability),
+                    ("foreign ticket", &root_ready.media_ticket),
+                    ("owned ticket", &delegated_ready.media_ticket),
+                    ("anchor marker", marker.as_bytes()),
+                ],
+            );
+            if event.record_type == messages::ANCHOR_READY {
+                break;
+            }
+        }
 
         root.write_record(
             messages::REVOKE_CONTEXT,
@@ -5689,9 +5773,16 @@ mod tests {
         .unwrap();
         loop {
             let record = root.read_record().unwrap();
-            assert!(
-                !record.body.windows(capability.len()).any(|window| window == capability),
-                "capability leaked into a non-capability reply or event"
+            assert_record_excludes(
+                &record,
+                &[
+                    ("root token", &root_token),
+                    ("raw root token", &root_token_binary),
+                    ("delegated capability", &capability),
+                    ("foreign ticket", &root_ready.media_ticket),
+                    ("owned ticket", &delegated_ready.media_ticket),
+                    ("anchor marker", marker.as_bytes()),
+                ],
             );
             if record.record_type == messages::OK
                 && messages::request_id(&record.body).unwrap() == 4
@@ -5701,8 +5792,30 @@ mod tests {
         }
         let reset = delegated.read_record().unwrap();
         assert_eq!(reset.record_type, messages::INPUT_RESET);
+        assert_record_excludes(
+            &reset,
+            &[
+                ("root token", &root_token),
+                ("raw root token", &root_token_binary),
+                ("delegated capability", &capability),
+                ("foreign ticket", &root_ready.media_ticket),
+                ("owned ticket", &delegated_ready.media_ticket),
+                ("anchor marker", marker.as_bytes()),
+            ],
+        );
         let revoked = delegated.read_record().unwrap();
         assert_eq!(revoked.record_type, messages::ERROR);
+        assert_record_excludes(
+            &revoked,
+            &[
+                ("root token", &root_token),
+                ("raw root token", &root_token_binary),
+                ("delegated capability", &capability),
+                ("foreign ticket", &root_ready.media_ticket),
+                ("owned ticket", &delegated_ready.media_ticket),
+                ("anchor marker", marker.as_bytes()),
+            ],
+        );
         let error = messages::parse_error_reply(&revoked.body).unwrap();
         assert_eq!(error.code, messages::ERROR_CONTEXT_REVOKED);
         assert!(error.fatal);
@@ -5714,6 +5827,10 @@ mod tests {
         );
         assert!(
             service.shared.scene.source_observation((delegated_welcome.session_id, 7)).is_none()
+        );
+        assert!(
+            !lock_registry(&service.shared).tickets.contains_key(&delegated_ready.media_ticket),
+            "context revocation must synchronously destroy unused tickets"
         );
         assert!(service.shared.scene.scene_revision(welcome.session_id).get() > 0);
     }
@@ -5948,26 +6065,39 @@ mod tests {
             messages::with_request_metadata(&messages::create_raster(3, 7, 2, 1), &create_metadata)
                 .unwrap();
         control.write_record(messages::CREATE_RASTER, 0, 7, &create).unwrap();
-        let mut saw_ready = false;
+        let mut ready = None;
         let mut saw_causation = false;
-        while !saw_ready || !saw_causation {
+        while ready.is_none() || !saw_causation {
             let record = control.read_record().unwrap();
             if record.record_type == messages::SOURCE_READY {
-                saw_ready = true;
+                ready = Some(messages::parse_source_ready(&record.body).unwrap());
             } else if record.record_type == messages::SOURCE_CHANGED {
                 saw_causation = messages::decode_control(&record.body).unwrap().causation_id
                     == Some(causation_id);
             }
         }
+        let ready = ready.unwrap();
 
         let retry =
             messages::with_request_metadata(&messages::create_raster(4, 7, 2, 1), &create_metadata)
                 .unwrap();
         control.write_record(messages::CREATE_RASTER, 0, 7, &retry).unwrap();
-        let replay =
-            messages::parse_error_reply(&read_correlated(&mut control, messages::ERROR, 4).body)
-                .unwrap();
+        let replay_record = read_correlated(&mut control, messages::ERROR, 4);
+        assert!(
+            !replay_record
+                .body
+                .windows(ready.media_ticket.len())
+                .any(|window| window == ready.media_ticket),
+            "an idempotent source-creation retry replayed the media ticket"
+        );
+        let replay = messages::parse_error_reply(&replay_record.body).unwrap();
         assert_eq!(replay.code, messages::ERROR_ALREADY_APPLIED);
+        control.write_record(messages::QUERY_LIMITS, 0, 0, &messages::query_limits(40)).unwrap();
+        let (_, limits) = messages::parse_limits_status(
+            &read_correlated(&mut control, messages::LIMITS_STATUS, 40).body,
+        )
+        .unwrap();
+        assert_eq!(limits.current_sources, 1, "a retried create duplicated the source");
 
         let stale = messages::with_request_metadata(
             &messages::destroy_source(5, 7),
