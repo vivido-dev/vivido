@@ -614,6 +614,21 @@ impl SharedScene {
             .or_else(|| state.tombstones.get(&key).map(|tombstone| tombstone.observation))
     }
 
+    pub fn source_content_revision(&self, key: SourceKey) -> Option<u64> {
+        self.lock().sources.get(&key).map(|_| 0)
+    }
+
+    pub fn anchor_state(&self, session_id: SessionId, anchor_id: u64) -> u64 {
+        let state = self.lock();
+        if state.anchors.contains_key(&(session_id, anchor_id)) {
+            messages::ANCHOR_STATE_READY
+        } else if state.gone_anchors.contains(&(session_id, anchor_id)) {
+            messages::ANCHOR_STATE_GONE
+        } else {
+            messages::ANCHOR_STATE_UNKNOWN
+        }
+    }
+
     pub fn take_observation_snapshot(&self, session_id: SessionId) -> SessionObservationSnapshot {
         let mut state = self.lock();
         let now = Instant::now();
