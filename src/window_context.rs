@@ -1792,6 +1792,18 @@ fn vivid_source_status_json(
             "eos_state": playback.eos_state,
         })
     });
+    let descriptor = status.descriptor.as_ref().map(|descriptor| match descriptor {
+        vivid_protocol::messages::ReportedSourceDescriptor::Full(descriptor) => json_value!({
+            "role": descriptor.role,
+            "title": descriptor.title,
+            "content_revision": descriptor.content_revision,
+            "semantic_availability": descriptor.semantic_availability,
+            "locator": descriptor.locator,
+        }),
+        vivid_protocol::messages::ReportedSourceDescriptor::RoleOnly { role } => {
+            json_value!({"role": role})
+        },
+    });
     json_value!({
         "window_id": window_id,
         "session_id": session_id,
@@ -1811,6 +1823,7 @@ fn vivid_source_status_json(
         "last_presentation_id": status.last_presentation_id,
         "visible": status.visible,
         "capture_policy": status.capture_policy,
+        "descriptor": descriptor,
         "linked_source_id": status.linked_source_id,
         "milestones": status.milestones,
         "credits": {

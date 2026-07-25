@@ -412,12 +412,14 @@ impl ObservationTracker {
 
         let mut current = HashMap::with_capacity(snapshot.sources.len());
         for (source_id, source, playback) in snapshot.sources {
-            let previous = self.sources.get(&source_id).copied();
+            let previous = self.sources.get(&source_id).cloned();
             if self.mask & messages::OBSERVE_SOURCE_TRANSITIONS != 0 {
-                let changed_fields = previous.map_or(messages::SOURCE_CHANGED_LIFECYCLE, |old| {
-                    source_changed_fields_after(source, old.0.revision)
-                });
-                if source.revision != previous.map_or(SourceRevision::ZERO, |old| old.0.revision)
+                let changed_fields =
+                    previous.as_ref().map_or(messages::SOURCE_CHANGED_LIFECYCLE, |old| {
+                        source_changed_fields_after(&source, old.0.revision)
+                    });
+                if source.revision
+                    != previous.as_ref().map_or(SourceRevision::ZERO, |old| old.0.revision)
                     && changed_fields != 0
                 {
                     let sequence = self.next_sequence()?;
@@ -584,7 +586,7 @@ impl ObservationTracker {
     }
 }
 
-fn source_changed_fields_after(source: SourceObservation, revision: SourceRevision) -> u64 {
+fn source_changed_fields_after(source: &SourceObservation, revision: SourceRevision) -> u64 {
     source.field_revisions.iter().enumerate().fold(0, |fields, (bit, changed_at)| {
         fields | (u64::from(*changed_at > revision.get()) * (1 << bit))
     })
@@ -1427,6 +1429,7 @@ fn is_supported_feature(feature: u64) -> bool {
             | messages::FEATURE_ATOMIC_CONTROL_V1
             | messages::FEATURE_DELEGATED_CONTEXT_V1
             | messages::FEATURE_SOURCE_CAPTURE_POLICY_V1
+            | messages::FEATURE_SOURCE_DESCRIPTOR_V1
     )
 }
 
@@ -1873,6 +1876,7 @@ fn evaluate_preconditions(
                 shared.scene.scene_revision(session_id).get()
             },
             messages::PRECONDITION_SOURCE_REVISION if source_target => observation
+                .as_ref()
                 .ok_or(PreconditionError::Malformed(
                     "source precondition targets a missing source",
                 ))?
@@ -1880,6 +1884,7 @@ fn evaluate_preconditions(
                 .get(),
             messages::PRECONDITION_SOURCE_EPOCH if source_target => u64::from(
                 observation
+                    .as_ref()
                     .ok_or(PreconditionError::Malformed(
                         "source precondition targets a missing source",
                     ))?
@@ -1887,6 +1892,7 @@ fn evaluate_preconditions(
             ),
             messages::PRECONDITION_SOURCE_LIFECYCLE if source_target => {
                 observation
+                    .as_ref()
                     .ok_or(PreconditionError::Malformed(
                         "source precondition targets a missing source",
                     ))?
@@ -2746,8 +2752,8 @@ fn dispatch_control(
             )?;
         },
         messages::CREATE_RASTER => {
-            let (envelope, config, capture_policy) =
-                messages::parse_create_raster_with_policy(&record.body)
+            let (envelope, config, capture_policy, descriptor) =
+                messages::parse_create_raster_with_extensions(&record.body)
                     .map_err(|_| bad("invalid CREATE_RASTER"))?;
             if record.object_id != config.source_id {
                 return Err(bad("CREATE_RASTER object ID mismatch"));
@@ -2763,6 +2769,8 @@ fn dispatch_control(
                     ))
                 || (envelope.payload.map_value(9).is_some()
                     && !negotiated(shared, session_id, messages::FEATURE_SOURCE_CAPTURE_POLICY_V1))
+                || (envelope.payload.map_value(10).is_some()
+                    && !negotiated(shared, session_id, messages::FEATURE_SOURCE_DESCRIPTOR_V1))
             {
                 return Err(ProtocolError {
                     code: messages::ERROR_UNSUPPORTED_FEATURE,
@@ -2786,11 +2794,12 @@ fn dispatch_control(
             )?;
             shared
                 .scene
-                .add_source_with_policy(
+                .add_source_with_extensions(
                     session_id,
                     config.source_id,
                     SourceConfig::Raster(config.clone()),
                     capture_policy,
+                    descriptor,
                 )
                 .map_err(|message| ProtocolError {
                     code: messages::ERROR_LIMIT_EXCEEDED,
@@ -2808,8 +2817,8 @@ fn dispatch_control(
             .map_err(|_| bad("could not create raster media ticket"))?;
         },
         messages::CREATE_VIDEO => {
-            let (envelope, config, capture_policy) =
-                messages::parse_create_video_with_policy(&record.body)
+            let (envelope, config, capture_policy, descriptor) =
+                messages::parse_create_video_with_extensions(&record.body)
                     .map_err(|_| bad("invalid CREATE_VIDEO"))?;
             if !negotiated(shared, session_id, messages::FEATURE_VIDEO_ACCESS_UNIT_V1) {
                 return Err(ProtocolError {
@@ -2837,6 +2846,15 @@ fn dispatch_control(
                     fatal: false,
                 });
             }
+            if envelope.payload.map_value(24).is_some()
+                && !negotiated(shared, session_id, messages::FEATURE_SOURCE_DESCRIPTOR_V1)
+            {
+                return Err(ProtocolError {
+                    code: messages::ERROR_UNSUPPORTED_FEATURE,
+                    message: "source descriptors were not negotiated",
+                    fatal: false,
+                });
+            }
             Decoder::new(&config).map_err(|_| ProtocolError {
                 code: messages::ERROR_UNSUPPORTED_CONFIG,
                 message: "video decoder configuration is unavailable",
@@ -2856,11 +2874,12 @@ fn dispatch_control(
             )?;
             shared
                 .scene
-                .add_source_with_policy(
+                .add_source_with_extensions(
                     session_id,
                     config.source_id,
                     SourceConfig::Video(config.clone()),
                     capture_policy,
+                    descriptor,
                 )
                 .map_err(|message| ProtocolError {
                     code: messages::ERROR_LIMIT_EXCEEDED,
@@ -2885,8 +2904,8 @@ fn dispatch_control(
                     fatal: false,
                 });
             }
-            let (envelope, config, capture_policy) =
-                messages::parse_create_audio_with_policy(&record.body)
+            let (envelope, config, capture_policy, descriptor) =
+                messages::parse_create_audio_with_extensions(&record.body)
                     .map_err(|_| bad("invalid CREATE_AUDIO"))?;
             if config.source_id == 0 || record.object_id != config.source_id {
                 return Err(bad("CREATE_AUDIO object ID mismatch"));
@@ -2897,6 +2916,15 @@ fn dispatch_control(
                 return Err(ProtocolError {
                     code: messages::ERROR_UNSUPPORTED_FEATURE,
                     message: "source capture policy was not negotiated",
+                    fatal: false,
+                });
+            }
+            if envelope.payload.map_value(13).is_some()
+                && !negotiated(shared, session_id, messages::FEATURE_SOURCE_DESCRIPTOR_V1)
+            {
+                return Err(ProtocolError {
+                    code: messages::ERROR_UNSUPPORTED_FEATURE,
+                    message: "source descriptors were not negotiated",
                     fatal: false,
                 });
             }
@@ -2931,11 +2959,12 @@ fn dispatch_control(
             // issues its ticket; it does not reorder the source-creation mutation.
             shared
                 .scene
-                .add_source_with_policy(
+                .add_source_with_extensions(
                     session_id,
                     config.source_id,
                     SourceConfig::Audio(config.clone()),
                     capture_policy,
+                    descriptor,
                 )
                 .map_err(|message| ProtocolError {
                     code: messages::ERROR_LIMIT_EXCEEDED,
@@ -2956,8 +2985,8 @@ fn dispatch_control(
             }
         },
         messages::CREATE_IMAGE => {
-            let (envelope, config, capture_policy) =
-                messages::parse_create_image_with_policy(&record.body)
+            let (envelope, config, capture_policy, descriptor) =
+                messages::parse_create_image_with_extensions(&record.body)
                     .map_err(|_| bad("invalid CREATE_IMAGE"))?;
             if !negotiated(shared, session_id, messages::FEATURE_ENCODED_IMAGE_V1) {
                 return Err(ProtocolError {
@@ -2975,6 +3004,15 @@ fn dispatch_control(
                 return Err(ProtocolError {
                     code: messages::ERROR_UNSUPPORTED_FEATURE,
                     message: "source capture policy was not negotiated",
+                    fatal: false,
+                });
+            }
+            if envelope.payload.map_value(10).is_some()
+                && !negotiated(shared, session_id, messages::FEATURE_SOURCE_DESCRIPTOR_V1)
+            {
+                return Err(ProtocolError {
+                    code: messages::ERROR_UNSUPPORTED_FEATURE,
+                    message: "source descriptors were not negotiated",
                     fatal: false,
                 });
             }
@@ -2998,11 +3036,12 @@ fn dispatch_control(
             )?;
             shared
                 .scene
-                .add_source_with_policy(
+                .add_source_with_extensions(
                     session_id,
                     config.source_id,
                     SourceConfig::Image(config.clone()),
                     capture_policy,
+                    descriptor,
                 )
                 .map_err(|message| ProtocolError {
                     code: messages::ERROR_LIMIT_EXCEEDED,
@@ -3046,6 +3085,36 @@ fn dispatch_control(
             writer
                 .write_ok(messages::OK, source_id, envelope.request_id)
                 .map_err(|_| bad("could not acknowledge source policy"))?;
+            wake(shared);
+        },
+        messages::UPDATE_SOURCE_DESCRIPTOR => {
+            if !negotiated(shared, session_id, messages::FEATURE_SOURCE_DESCRIPTOR_V1) {
+                return Err(ProtocolError {
+                    code: messages::ERROR_UNSUPPORTED_FEATURE,
+                    message: "source descriptors were not negotiated",
+                    fatal: false,
+                });
+            }
+            let (envelope, source_id, descriptor) =
+                messages::parse_update_source_descriptor(&record.body)
+                    .map_err(|_| bad("invalid UPDATE_SOURCE_DESCRIPTOR"))?;
+            if record.object_id != source_id {
+                return Err(bad("UPDATE_SOURCE_DESCRIPTOR object ID mismatch"));
+            }
+            shared.scene.update_source_descriptor((session_id, source_id), descriptor).map_err(
+                |message| ProtocolError {
+                    code: if message == "source does not exist" {
+                        messages::ERROR_NOT_FOUND
+                    } else {
+                        messages::ERROR_BAD_STATE
+                    },
+                    message,
+                    fatal: false,
+                },
+            )?;
+            writer
+                .write_ok(messages::OK, source_id, envelope.request_id)
+                .map_err(|_| bad("could not acknowledge source descriptor"))?;
             wake(shared);
         },
         messages::DESTROY_SOURCE => {
