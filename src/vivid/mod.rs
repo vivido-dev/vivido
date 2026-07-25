@@ -17,7 +17,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -29,6 +29,7 @@ use vivid_protocol::anchor::{self, AnchorKey};
 use vivid_protocol::media::{self, VIDEO_PACKET_KEY};
 use vivid_protocol::messages::{self, DisplayChanged};
 use vivid_protocol::revision::{ObservationSequence, SceneRevision, SourceRevision};
+use vivid_protocol::trace::{TraceComponent, TraceGuard, TraceHop};
 use vivid_protocol::wire::{ConnectionKind, RECORD_OPTIONAL, Record};
 use vivid_protocol::{VIVID_MAJOR, VIVID_MINOR};
 
@@ -43,7 +44,7 @@ use crate::vivid::scene::{
     Frame, SceneMutation, SceneNode, SessionId, SessionObservationSnapshot, SharedScene,
     SourceConfig, SourceKey, SourceObservation, SourceWaitEvaluation,
 };
-use crate::vivid::transport::{Reader, Writer};
+use crate::vivid::transport::{Reader, TraceChannel, Writer};
 
 #[cfg(windows)]
 type LocalListener = TcpListener;
@@ -178,6 +179,8 @@ struct ServiceShared {
     registry: Mutex<Registry>,
     metrics: Mutex<DisplayMetrics>,
     pending_display_change: Mutex<Option<PendingDisplayChange>>,
+    capability_generation: AtomicU64,
+    audio_device_available: AtomicBool,
     active_connections: AtomicUsize,
     audio_outputs: Mutex<HashMap<SourceKey, Arc<AudioOutput>>>,
     /// Last `(renderable, display_offset)` reported by the UI thread. Cached so scene changes
@@ -185,6 +188,8 @@ struct ServiceShared {
     /// source visibility without the UI-thread inputs directly at hand.
     render_state: Mutex<(bool, usize)>,
     wake: Arc<dyn Fn() + Send + Sync>,
+    trace: Option<vivid_protocol::trace::TraceEmitter>,
+    _trace_guard: Option<TraceGuard>,
 }
 
 struct PendingOperation {
@@ -622,16 +627,22 @@ impl VividService {
         })?;
         let token_text = hex(&token);
         let scene = SharedScene::default();
+        let trace_guard = diagnostic_trace_guard(TraceComponent::Vivido)?;
+        let trace = trace_guard.as_ref().map(TraceGuard::emitter);
         let shared = Arc::new(ServiceShared {
             token,
             scene: scene.clone(),
             registry: Mutex::new(Registry::default()),
             metrics: Mutex::new(metrics),
             pending_display_change: Mutex::new(None),
+            capability_generation: AtomicU64::new(1),
+            audio_device_available: AtomicBool::new(true),
             active_connections: AtomicUsize::new(0),
             audio_outputs: Mutex::new(HashMap::new()),
             render_state: Mutex::new((true, 0)),
             wake,
+            trace,
+            _trace_guard: trace_guard,
         });
         let shutdown = Arc::new(AtomicBool::new(false));
         let listener_shutdown = shutdown.clone();
@@ -661,6 +672,20 @@ impl VividService {
 
     pub fn scene(&self) -> SharedScene {
         self.scene.clone()
+    }
+
+    #[allow(dead_code)] // Platform device watchers call this hook on supported desktop backends.
+    pub fn capability_generation(&self) -> u64 {
+        self.shared.capability_generation.load(Ordering::Acquire)
+    }
+
+    /// Notify producers that future source-creation capabilities changed.
+    ///
+    /// The accepted feature set remains immutable. Callers separately lose any affected live
+    /// source through its source-scoped path.
+    #[allow(dead_code)] // Platform device watchers call this hook on supported desktop backends.
+    pub fn notify_capabilities_changed(&self, reason_mask: u64) -> io::Result<u64> {
+        advance_capability_generation(&self.shared, reason_mask)
     }
 
     #[cfg(unix)]
@@ -955,6 +980,9 @@ fn listener_loop(listener: LocalListener, shared: Arc<ServiceShared>, shutdown: 
 
 fn handle_connection(stream: LocalStream, shared: Arc<ServiceShared>) -> io::Result<()> {
     let (mut reader, preface) = Reader::new(stream)?;
+    if let Some(trace) = &shared.trace {
+        reader.set_trace(TraceChannel::new(trace.clone()));
+    }
     match preface.kind {
         ConnectionKind::Control => handle_control(&mut reader, shared),
         ConnectionKind::Raster
@@ -1163,7 +1191,7 @@ fn handle_control(reader: &mut Reader, shared: Arc<ServiceShared>) -> io::Result
     writer.write_record(
         messages::WELCOME,
         0,
-        &messages::welcome_preserving_at_scene_revision(
+        &messages::welcome_preserving_at_generations(
             request_id,
             session_id,
             &session_tag,
@@ -1179,6 +1207,7 @@ fn handle_control(reader: &mut Reader, shared: Arc<ServiceShared>) -> io::Result
                 settled: true,
             },
             &accepted_features,
+            shared.capability_generation.load(Ordering::Acquire),
             shared.scene.scene_revision(session_id),
             &[],
         ),
@@ -1696,11 +1725,16 @@ fn spawn_audio_source_open(
         .name("vivid-audio-open".into())
         .spawn(move || {
             let opened = if audio::supports(&config) {
-                AudioOutput::open().map_err(|_| ProtocolError {
-                    code: messages::ERROR_DEVICE_LOST,
-                    message: "default audio output is unavailable",
-                    fatal: false,
-                })
+                AudioOutput::open()
+                    .inspect(|_| update_audio_device_availability(&worker_shared, true))
+                    .map_err(|_| {
+                        update_audio_device_availability(&worker_shared, false);
+                        ProtocolError {
+                            code: messages::ERROR_DEVICE_LOST,
+                            message: "default audio output is unavailable",
+                            fatal: false,
+                        }
+                    })
             } else {
                 Err(ProtocolError {
                     code: messages::ERROR_UNSUPPORTED_CONFIG,
@@ -2702,6 +2736,7 @@ fn dispatch_control(
                 return Err(bad("PROBE_VIDEO_CONFIG must be session-level"));
             }
             let request_id = envelope.request_id;
+            let capability_generation = shared.capability_generation.load(Ordering::Acquire);
             spawn_pending_operation(
                 pending,
                 writer,
@@ -2715,7 +2750,12 @@ fn dispatch_control(
                     Ok(PendingReply {
                         record_type: messages::VIDEO_SUPPORT,
                         object_id: 0,
-                        body: messages::video_support(request_id, supported, &config.codec),
+                        body: messages::capability_support(
+                            request_id,
+                            supported,
+                            &config.codec,
+                            capability_generation,
+                        ),
                     })
                 },
             )?;
@@ -2734,6 +2774,7 @@ fn dispatch_control(
                 return Err(bad("PROBE_AUDIO_CONFIG must be session-level"));
             }
             let request_id = envelope.request_id;
+            let capability_generation = shared.capability_generation.load(Ordering::Acquire);
             spawn_pending_operation(
                 pending,
                 writer,
@@ -2746,7 +2787,12 @@ fn dispatch_control(
                     Ok(PendingReply {
                         record_type: messages::AUDIO_SUPPORT,
                         object_id: 0,
-                        body: messages::audio_support(request_id, supported, &config.codec),
+                        body: messages::capability_support(
+                            request_id,
+                            supported,
+                            &config.codec,
+                            capability_generation,
+                        ),
                     })
                 },
             )?;
@@ -2755,6 +2801,7 @@ fn dispatch_control(
             let (envelope, config, capture_policy, descriptor) =
                 messages::parse_create_raster_with_extensions(&record.body)
                     .map_err(|_| bad("invalid CREATE_RASTER"))?;
+            writer.mark_source_policy(config.source_id, capture_policy);
             if record.object_id != config.source_id {
                 return Err(bad("CREATE_RASTER object ID mismatch"));
             }
@@ -2820,6 +2867,7 @@ fn dispatch_control(
             let (envelope, config, capture_policy, descriptor) =
                 messages::parse_create_video_with_extensions(&record.body)
                     .map_err(|_| bad("invalid CREATE_VIDEO"))?;
+            writer.mark_source_policy(config.source_id, capture_policy);
             if !negotiated(shared, session_id, messages::FEATURE_VIDEO_ACCESS_UNIT_V1) {
                 return Err(ProtocolError {
                     code: messages::ERROR_UNSUPPORTED_FEATURE,
@@ -2907,6 +2955,7 @@ fn dispatch_control(
             let (envelope, config, capture_policy, descriptor) =
                 messages::parse_create_audio_with_extensions(&record.body)
                     .map_err(|_| bad("invalid CREATE_AUDIO"))?;
+            writer.mark_source_policy(config.source_id, capture_policy);
             if config.source_id == 0 || record.object_id != config.source_id {
                 return Err(bad("CREATE_AUDIO object ID mismatch"));
             }
@@ -2988,6 +3037,7 @@ fn dispatch_control(
             let (envelope, config, capture_policy, descriptor) =
                 messages::parse_create_image_with_extensions(&record.body)
                     .map_err(|_| bad("invalid CREATE_IMAGE"))?;
+            writer.mark_source_policy(config.source_id, capture_policy);
             if !negotiated(shared, session_id, messages::FEATURE_ENCODED_IMAGE_V1) {
                 return Err(ProtocolError {
                     code: messages::ERROR_UNSUPPORTED_FEATURE,
@@ -3068,6 +3118,7 @@ fn dispatch_control(
             }
             let (envelope, source_id, requested) = messages::parse_set_source_policy(&record.body)
                 .map_err(|_| bad("invalid SET_SOURCE_POLICY"))?;
+            writer.mark_source_policy(source_id, requested);
             if record.object_id != source_id {
                 return Err(bad("SET_SOURCE_POLICY object ID mismatch"));
             }
@@ -3623,6 +3674,9 @@ fn handle_media(
     };
     let _active_media =
         ActiveMediaConnection { shared: shared.clone(), session_id: ticket.session_id };
+    if let Some(policy) = shared.scene.source_capture_policy(ticket.source_key) {
+        reader.mark_source_policy(ticket.source_key.1, policy);
+    }
     shared.scene.mark_attached(ticket.source_key).map_err(invalid)?;
     wake(&shared);
     let max_media_body = match shared.scene.source_config(ticket.source_key) {
@@ -3657,11 +3711,18 @@ fn handle_media(
             output.stop();
         }
         let detailed_diagnostic = error.to_string();
-        let code = if detailed_diagnostic.contains("hash mismatch") {
+        let device_lost =
+            kind == ConnectionKind::Audio && error.kind() == io::ErrorKind::NotConnected;
+        let code = if device_lost {
+            messages::ERROR_DEVICE_LOST
+        } else if detailed_diagnostic.contains("hash mismatch") {
             messages::ERROR_HASH_MISMATCH
         } else {
             messages::ERROR_DECODER
         };
+        if device_lost {
+            update_audio_device_availability(&shared, false);
+        }
         let reduce_diagnostics = shared
             .scene
             .source_capture_policy(source_key)
@@ -4374,6 +4435,51 @@ fn wake(shared: &ServiceShared) {
     (shared.wake)();
 }
 
+fn advance_capability_generation(shared: &Arc<ServiceShared>, reason_mask: u64) -> io::Result<u64> {
+    if reason_mask == 0 || reason_mask & !messages::CAPS_CHANGE_REASON_MASK != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid Vivid capability change reason",
+        ));
+    }
+    let previous = shared
+        .capability_generation
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |generation| generation.checked_add(1))
+        .map_err(|_| io::Error::other("Vivid capability generation exhausted"))?;
+    let generation = previous + 1;
+    let body = messages::caps_changed(generation, reason_mask)?;
+    let writers = {
+        let registry = lock_registry(shared);
+        registry
+            .sessions
+            .values()
+            .filter_map(|session| session.writer.upgrade())
+            .collect::<Vec<_>>()
+    };
+    for writer in writers {
+        let _ = writer.write_record(messages::CAPS_CHANGED, 0, &body);
+    }
+    Ok(generation)
+}
+
+fn update_audio_device_availability(shared: &Arc<ServiceShared>, available: bool) {
+    if shared.audio_device_available.swap(available, Ordering::AcqRel) != available {
+        let _ = advance_capability_generation(shared, messages::CAPS_CHANGE_DEVICE_AVAILABILITY);
+    }
+}
+
+fn diagnostic_trace_guard(component: TraceComponent) -> io::Result<Option<TraceGuard>> {
+    let Some(directory) = std::env::var_os("VIVID_DIAGNOSTIC_TRACE_DIR") else {
+        return Ok(None);
+    };
+    let mut hint = [0_u8; 16];
+    getrandom::fill(&mut hint)
+        .map_err(|error| io::Error::other(format!("trace hint generation failed: {error}")))?;
+    let path =
+        std::path::PathBuf::from(directory).join(format!("vivido-{}.ndjson", std::process::id()));
+    TraceGuard::file(&path, component, TraceHop::Presenter, hint).map(Some)
+}
+
 #[cfg(test)]
 fn constant_time_token_eq(expected: &[u8; 32], candidate_hex: &[u8]) -> bool {
     let mut decoded = [0_u8; 32];
@@ -4578,6 +4684,72 @@ mod tests {
         assert_eq!(pending.expire(Instant::now()), vec![(1000, 77)]);
         assert!(pending.expire(Instant::now()).is_empty());
         assert!(!pending.complete(1000));
+    }
+
+    #[test]
+    fn capability_generation_advances_without_mutating_accepted_features() {
+        let (shared, output) = linked_av_shared();
+        let (mut client, server) = stream_pair();
+        client
+            .write_all(&vivid_protocol::wire::encode_preface(ConnectionKind::Control, 4096))
+            .unwrap();
+        let (reader, _) = Reader::new(server).unwrap();
+        let writer = Arc::new(reader.writer().unwrap());
+        let accepted_features =
+            HashSet::from([messages::FEATURE_RASTER_RGBA8, messages::FEATURE_VIDEO_ACCESS_UNIT_V1]);
+        lock_registry(&shared).sessions.insert(
+            1,
+            SessionRuntime {
+                writer: Arc::downgrade(&writer),
+                tag: [0; 16],
+                anchor_key: anchor::derive_key(&[0; 32], &[0; 16]),
+                seen_anchors: HashSet::new(),
+                last_visibility: HashMap::new(),
+                accepted_features: accepted_features.clone(),
+                authority_root_session: 1,
+                bound_context_id: 1,
+                context_class_mask: messages::CONTEXT_CLASS_MASK,
+                context_quotas: root_context_quotas(),
+                active_media_connections: 0,
+                revoked: false,
+            },
+        );
+
+        assert!(
+            advance_capability_generation(&shared, messages::CAPS_CHANGE_REASON_MASK << 1).is_err()
+        );
+        assert_eq!(shared.capability_generation.load(Ordering::Acquire), 1);
+        let generation =
+            advance_capability_generation(&shared, messages::CAPS_CHANGE_DECODER_AVAILABILITY)
+                .unwrap();
+        assert_eq!(generation, 2);
+
+        let mut header = [0; vivid_protocol::wire::HEADER_SIZE];
+        client.read_exact(&mut header).unwrap();
+        let header = vivid_protocol::wire::RecordHeader::decode(header);
+        assert_eq!(header.record_type, messages::CAPS_CHANGED);
+        assert_eq!(header.object_id, 0);
+        let mut body = vec![0; header.body_length as usize];
+        client.read_exact(&mut body).unwrap();
+        assert_eq!(
+            messages::parse_caps_changed(&body).unwrap(),
+            messages::CapsChanged {
+                capability_generation: 2,
+                reason_mask: messages::CAPS_CHANGE_DECODER_AVAILABILITY,
+            }
+        );
+        update_audio_device_availability(&shared, false);
+        assert_eq!(shared.capability_generation.load(Ordering::Acquire), 3);
+        update_audio_device_availability(&shared, false);
+        assert_eq!(
+            shared.capability_generation.load(Ordering::Acquire),
+            3,
+            "repeated device failures are not capability changes"
+        );
+        update_audio_device_availability(&shared, true);
+        assert_eq!(shared.capability_generation.load(Ordering::Acquire), 4);
+        assert_eq!(lock_registry(&shared).sessions[&1].accepted_features, accepted_features);
+        output.stop();
     }
 
     #[test]
@@ -5074,10 +5246,14 @@ mod tests {
                 generation: 1,
             }),
             pending_display_change: Mutex::new(None),
+            capability_generation: AtomicU64::new(1),
+            audio_device_available: AtomicBool::new(true),
             active_connections: AtomicUsize::new(0),
             audio_outputs: Mutex::new(HashMap::from([((1, 11), output.clone())])),
             render_state: Mutex::new((true, 0)),
             wake: Arc::new(|| {}),
+            trace: None,
+            _trace_guard: None,
         });
         (shared, output)
     }
