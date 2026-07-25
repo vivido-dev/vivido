@@ -156,6 +156,7 @@ pub struct RenderItem {
 struct Source {
     config: SourceConfig,
     capture_policy: u64,
+    descriptor: Option<messages::SourceDescriptor>,
     revision: SourceRevision,
     field_revisions: [u64; 9],
     lifecycle: u64,
@@ -179,7 +180,7 @@ struct Source {
     eos_epoch: Option<u32>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceObservation {
     pub revision: SourceRevision,
     pub field_revisions: [u64; 9],
@@ -198,6 +199,7 @@ pub struct SourceObservation {
     pub linked_source_id: u64,
     pub visible: bool,
     pub capture_policy: u64,
+    pub descriptor: Option<messages::SourceDescriptor>,
     pub terminal_loss_code: Option<u64>,
 }
 
@@ -329,6 +331,7 @@ fn observation(source: &Source, terminal_loss_code: Option<u64>) -> SourceObserv
         linked_source_id: source.config.linked_source_id(),
         visible: source.visible,
         capture_policy: source.capture_policy,
+        descriptor: source.descriptor.clone(),
         terminal_loss_code,
     }
 }
@@ -540,8 +543,25 @@ impl SharedScene {
         config: SourceConfig,
         capture_policy: u64,
     ) -> Result<(), &'static str> {
+        self.add_source_with_extensions(session_id, source_id, config, capture_policy, None)
+    }
+
+    pub fn add_source_with_extensions(
+        &self,
+        session_id: SessionId,
+        source_id: u64,
+        config: SourceConfig,
+        capture_policy: u64,
+        descriptor: Option<messages::SourceDescriptor>,
+    ) -> Result<(), &'static str> {
         if messages::validate_capture_policy(capture_policy).is_err() {
             return Err("capture policy contains reserved bits");
+        }
+        if descriptor
+            .as_ref()
+            .is_some_and(|descriptor| messages::validate_source_descriptor(descriptor).is_err())
+        {
+            return Err("source descriptor is invalid");
         }
         let mut state = self.lock();
         let key = (session_id, source_id);
@@ -589,6 +609,7 @@ impl SharedScene {
             Source {
                 config,
                 capture_policy,
+                descriptor,
                 revision: SourceRevision::new(1),
                 field_revisions: [1, 0, 0, 0, 0, 0, 0, 0, 0],
                 lifecycle: messages::SOURCE_LIFECYCLE_CREATED,
@@ -642,11 +663,14 @@ impl SharedScene {
             .sources
             .get(&key)
             .map(|source| observation(source, None))
-            .or_else(|| state.tombstones.get(&key).map(|tombstone| tombstone.observation))
+            .or_else(|| state.tombstones.get(&key).map(|tombstone| tombstone.observation.clone()))
     }
 
     pub fn source_content_revision(&self, key: SourceKey) -> Option<u64> {
-        self.lock().sources.get(&key).map(|_| 0)
+        self.lock()
+            .sources
+            .get(&key)
+            .map(|source| source.descriptor.as_ref().map_or(0, |value| value.content_revision))
     }
 
     pub fn source_capture_policy(&self, key: SourceKey) -> Option<u64> {
@@ -672,6 +696,26 @@ impl SharedScene {
         source.capture_policy = requested;
         advance_source_revision(source, messages::SOURCE_CHANGED_CAPTURE_POLICY)?;
         Ok(true)
+    }
+
+    pub fn update_source_descriptor(
+        &self,
+        key: SourceKey,
+        descriptor: messages::SourceDescriptor,
+    ) -> Result<(), &'static str> {
+        if messages::validate_source_descriptor(&descriptor).is_err() {
+            return Err("source descriptor is invalid");
+        }
+        let mut state = self.lock();
+        let source = state.sources.get_mut(&key).ok_or("source does not exist")?;
+        let current_revision =
+            source.descriptor.as_ref().map_or(0, |current| current.content_revision);
+        if descriptor.content_revision <= current_revision {
+            return Err("descriptor content revision must advance");
+        }
+        source.descriptor = Some(descriptor);
+        advance_source_revision(source, messages::SOURCE_CHANGED_DESCRIPTOR)?;
+        Ok(())
     }
 
     pub fn anchor_state(&self, session_id: SessionId, anchor_id: u64) -> u64 {
@@ -701,8 +745,8 @@ impl SharedScene {
             .chain(state.tombstones.iter().filter_map(|(&(owner, source_id), tombstone)| {
                 (owner == session_id).then_some((
                     source_id,
-                    tombstone.observation,
-                    tombstone_playback_snapshot(tombstone.observation),
+                    tombstone.observation.clone(),
+                    tombstone_playback_snapshot(tombstone.observation.clone()),
                 ))
             }))
             .collect::<Vec<_>>();
@@ -732,10 +776,10 @@ impl SharedScene {
         state.tombstones.get(&key).map(|tombstone| {
             source_status_from_observation(
                 key.1,
-                tombstone.observation,
+                tombstone.observation.clone(),
                 0,
                 0,
-                tombstone_playback_snapshot(tombstone.observation),
+                tombstone_playback_snapshot(tombstone.observation.clone()),
             )
         })
     }
@@ -870,11 +914,10 @@ impl SharedScene {
     ) -> SourceWaitEvaluation {
         let mut state = self.lock();
         purge_expired_tombstones(&mut state, Instant::now());
-        let observed = state
-            .sources
-            .get(&key)
-            .map(|source| observation(source, None))
-            .or_else(|| state.tombstones.get(&key).map(|tombstone| tombstone.observation));
+        let observed =
+            state.sources.get(&key).map(|source| observation(source, None)).or_else(|| {
+                state.tombstones.get(&key).map(|tombstone| tombstone.observation.clone())
+            });
         let Some(observed) = observed else {
             return SourceWaitEvaluation::NotFound;
         };
@@ -1049,14 +1092,6 @@ impl SharedScene {
             )?;
         }
         self.0.playback_changed.notify_all();
-        Ok(())
-    }
-
-    #[allow(dead_code)] // Called by the Stage 3 descriptor command path.
-    pub fn mark_descriptor_changed(&self, key: SourceKey) -> Result<(), &'static str> {
-        let mut state = self.lock();
-        let source = state.sources.get_mut(&key).ok_or("source does not exist")?;
-        advance_source_revision(source, messages::SOURCE_CHANGED_DESCRIPTOR)?;
         Ok(())
     }
 
@@ -1443,7 +1478,10 @@ impl SharedScene {
         state.tombstone_order.push_back(key);
         state.tombstones.insert(
             key,
-            SourceTombstone { observation, expires_at: Instant::now() + SOURCE_TOMBSTONE_TTL },
+            SourceTombstone {
+                observation: observation.clone(),
+                expires_at: Instant::now() + SOURCE_TOMBSTONE_TTL,
+            },
         );
         state.revision = state.revision.wrapping_add(1);
         self.0.playback_changed.notify_all();
@@ -1822,7 +1860,13 @@ fn source_status_from_observation(
         outstanding_byte_credit,
         outstanding_packet_credit,
         ingress_queue_depth: messages::QUEUE_DEPTH_EMPTY,
-        descriptor: None,
+        descriptor: observed.descriptor.map(|descriptor| {
+            if observed.capture_policy & messages::CAPTURE_POLICY_DENY_SEMANTIC_EXPORT != 0 {
+                messages::ReportedSourceDescriptor::RoleOnly { role: descriptor.role }
+            } else {
+                messages::ReportedSourceDescriptor::Full(descriptor)
+            }
+        }),
         playback,
         terminal_loss_code: observed.terminal_loss_code,
     }
@@ -2062,7 +2106,18 @@ mod tests {
         assert_eq!(revision(&scene), 13);
         scene.tighten_source_policy(key, messages::CAPTURE_POLICY_DENY_CAPTURE).unwrap();
         assert_eq!(revision(&scene), 14);
-        scene.mark_descriptor_changed(key).unwrap();
+        scene
+            .update_source_descriptor(
+                key,
+                messages::SourceDescriptor {
+                    role: messages::SOURCE_ROLE_TIMED_MEDIA,
+                    title: "revision test".into(),
+                    content_revision: 1,
+                    semantic_availability: 0,
+                    locator: String::new(),
+                },
+            )
+            .unwrap();
         assert_eq!(revision(&scene), 15);
         scene.signal_eos(key, 2).unwrap();
         assert_eq!(revision(&scene), 16);
@@ -2605,6 +2660,85 @@ mod tests {
 
         scene.detach_session(9).unwrap();
         assert!(scene.source_config((9, 1)).is_none());
+    }
+
+    #[test]
+    fn source_descriptor_updates_are_monotonic_and_policy_filters_status() {
+        let scene = SharedScene::default();
+        let descriptor = messages::SourceDescriptor {
+            role: messages::SOURCE_ROLE_DOCUMENT,
+            title: "private document title".into(),
+            content_revision: 4,
+            semantic_availability: messages::SEMANTIC_AVAILABLE_TEXT
+                | messages::SEMANTIC_AVAILABLE_LINKS,
+            locator: "vvrd+unix:///owner-only/control.sock".into(),
+        };
+        scene
+            .add_source_with_extensions(
+                9,
+                1,
+                SourceConfig::Raster(RasterSourceConfig {
+                    source_id: 1,
+                    width: 1,
+                    height: 1,
+                    alpha_mode: messages::ALPHA_STRAIGHT,
+                    compression_mode: messages::COMPRESSION_NONE,
+                }),
+                0,
+                Some(descriptor.clone()),
+            )
+            .unwrap();
+        assert_eq!(
+            scene.source_status((9, 1), 0, 0).unwrap().descriptor,
+            Some(messages::ReportedSourceDescriptor::Full(descriptor.clone()))
+        );
+
+        assert!(
+            scene
+                .update_source_descriptor(
+                    (9, 1),
+                    messages::SourceDescriptor {
+                        content_revision: descriptor.content_revision,
+                        ..descriptor.clone()
+                    },
+                )
+                .is_err()
+        );
+        let advanced = messages::SourceDescriptor {
+            content_revision: descriptor.content_revision + 1,
+            ..descriptor
+        };
+        scene.update_source_descriptor((9, 1), advanced.clone()).unwrap();
+        assert_eq!(scene.source_content_revision((9, 1)), Some(5));
+
+        scene.tighten_source_policy((9, 1), messages::CAPTURE_POLICY_DENY_SEMANTIC_EXPORT).unwrap();
+        assert_eq!(
+            scene.source_status((9, 1), 0, 0).unwrap().descriptor,
+            Some(messages::ReportedSourceDescriptor::RoleOnly { role: advanced.role })
+        );
+    }
+
+    #[test]
+    fn descriptor_reporting_path_contains_no_locator_io_or_terminal_rendering() {
+        let source = include_str!("scene.rs");
+        let start = source.find("fn source_status_from_observation(").unwrap();
+        let end = source[start..].find("fn maybe_start_buffered(").unwrap() + start;
+        let reporting_path = &source[start..end];
+        for forbidden in [
+            "std::fs",
+            "File::",
+            ".open(",
+            "connect(",
+            "Url::parse",
+            "reqwest",
+            "terminal::",
+            "pty::",
+        ] {
+            assert!(
+                !reporting_path.contains(forbidden),
+                "descriptor reporting path unexpectedly contains {forbidden}"
+            );
+        }
     }
 
     #[cfg(windows)]
