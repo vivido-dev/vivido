@@ -72,15 +72,17 @@ $env:VCPKG_ROOT = $vcpkgRoot
 $env:VCPKG_DEFAULT_TRIPLET = 'x64-windows'
 & "$vcpkgRoot\vcpkg.exe" install `
     --triplet x64-windows `
-    --x-manifest-root="$repositoryRoot\vivido\windows"
+    --x-manifest-root="$repositoryRoot\vivido\windows" `
+    --x-install-root="$vcpkgRoot\installed"
 
 $vcpkgBin = "$vcpkgRoot\installed\x64-windows\bin"
 $env:PATH = "$vcpkgBin;$env:PATH"
 ```
 
-The manifest disables FFmpeg default features and enables only `avcodec`, `avformat`,
-`swresample`, and `swscale`. Do not add GPL, nonfree, FDK-AAC, or unrelated features when testing
-a prospective public package.
+The manifest disables FFmpeg default features and enables only `avcodec`, `avformat`, `dav1d`,
+`swresample`, and `swscale`. The BSD-licensed dav1d dependency is the software AV1 fallback for
+systems without AV1 hardware decoding. Do not add GPL, nonfree, FDK-AAC, or unrelated features
+when testing a prospective public package.
 
 Verify the checkout and resolved package set:
 

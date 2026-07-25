@@ -102,10 +102,9 @@ pub struct Decoder {
 
 impl Decoder {
     pub fn new(config: &ParsedVideoSourceConfig) -> io::Result<Self> {
-        // Homebrew FFmpeg's native `av1` decoder advertises VideoToolbox and can open even on
-        // Macs which cannot actually decode AV1 in hardware, only to fail on the first packet.
-        // Prefer the bounded software implementation in that case. Other codecs retain FFmpeg's
-        // primary decoder selection and can use their supported hardware paths.
+        // FFmpeg's native `av1` decoder can open when only a hardware path is available, then fail
+        // on the first packet on systems without supported AV1 hardware. Require the bounded
+        // software implementation for predictable decoding on every supported platform.
         let decoder_name = if config.codec == "av1" { "libdav1d" } else { config.codec.as_str() };
         let codec_name =
             CString::new(decoder_name).map_err(|_| invalid("video codec contains NUL"))?;
@@ -485,17 +484,16 @@ unsafe extern "C" {
 mod tests {
     use super::*;
 
-    #[test]
-    fn decoder_context_uses_protocol_packet_time_base() {
-        let decoder = Decoder::new(&ParsedVideoSourceConfig {
+    fn video_config(codec: &str, extradata: Vec<u8>) -> ParsedVideoSourceConfig {
+        ParsedVideoSourceConfig {
             source_id: 1,
-            codec: "h264".into(),
-            packetization: "h264-annexb-au-v1".into(),
-            extradata: Vec::new(),
-            width: 16,
-            height: 16,
+            codec: codec.into(),
+            packetization: format!("{codec}-test"),
+            extradata,
+            width: 640,
+            height: 480,
             profile: 0,
-            level: 0,
+            level: 4,
             bitrate: 0,
             color_primaries: 1,
             transfer: 1,
@@ -503,12 +501,48 @@ mod tests {
             range: 1,
             sar_num: 1,
             sar_den: 1,
-            max_access_unit_bytes: 1024,
+            max_access_unit_bytes: 1024 * 1024,
             codec_string: None,
             decoder_config: None,
-        })
-        .unwrap();
+        }
+    }
+
+    #[test]
+    fn decoder_context_uses_protocol_packet_time_base() {
+        let decoder = Decoder::new(&video_config("h264", Vec::new())).unwrap();
 
         assert_eq!(decoder.packet_time_base().unwrap(), PACKET_TIME_BASE);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn windows_decodes_av1_with_software_decoder() {
+        // Canonical sequence-header OBU and first temporal unit from medias/under_attack.webm.
+        let extradata = [
+            0x0a, 0x0e, 0x00, 0x00, 0x00, 0x24, 0xc4, 0xff, 0xdf, 0x30, 0xbf, 0x44, 0x04, 0x04,
+            0x04, 0x10,
+        ];
+        let access_unit = [
+            0x0a, 0x0e, 0x00, 0x00, 0x00, 0x24, 0xc4, 0xff, 0xdf, 0x30, 0xbf, 0x44, 0x04, 0x04,
+            0x04, 0x10, 0x32, 0x2e, 0x10, 0x00, 0x46, 0x71, 0x8a, 0x60, 0xc3, 0x0c, 0x30, 0x90,
+            0x41, 0x20, 0x07, 0xee, 0x43, 0xbd, 0x31, 0x18, 0x9b, 0xb8, 0x10, 0xf4, 0x72, 0x82,
+            0xe5, 0x32, 0xe7, 0xc7, 0x11, 0xa7, 0x0f, 0x82, 0x7f, 0x25, 0x17, 0x49, 0x75, 0x9e,
+            0x87, 0x13, 0x6f, 0xca, 0xa7, 0x25, 0x3f, 0x80,
+        ];
+        let mut decoder = Decoder::new(&video_config("av1", extradata.to_vec())).unwrap();
+        let frames = decoder
+            .push(ParsedVideoPacket {
+                epoch: 1,
+                flags: vivid_protocol::media::VIDEO_PACKET_KEY,
+                packet_id: 1,
+                pts_us: 0,
+                dts_us: 0,
+                duration_us: 40_000,
+                side_data: &[],
+                data: &access_unit,
+            })
+            .unwrap();
+        assert_eq!(frames.len(), 1);
+        assert_eq!((frames[0].width, frames[0].height), (640, 480));
     }
 }

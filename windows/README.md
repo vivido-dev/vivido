@@ -19,8 +19,10 @@ repair, uninstall, bundle prerequisite testing, and signed-artifact verification
 ## Reproducible inputs
 
 `release.json` pins Rust, vcpkg, WiX, and the unmodified Microsoft PowerShell MSI. `vcpkg.json`
-selects only FFmpeg `avcodec`, `avformat`, `swresample`, and `swscale` with default features
-disabled. Do not add `gpl`, `all-gpl`, `nonfree`, or `fdk-aac` features to the public build.
+selects only FFmpeg `avcodec`, `avformat`, `dav1d`, `swresample`, and `swscale` with default
+features disabled. The BSD-licensed dav1d dependency provides the software AV1 fallback required
+on systems without AV1 hardware decoding. Do not add `gpl`, `all-gpl`, `nonfree`, or `fdk-aac`
+features to the public build.
 
 The release workflow runs Cargo independently in `vivid_protocol`, `vivi`, `vivido`, and `vvmux`;
 the repository root is not a Cargo workspace. `scripts/prepare-release.ps1` rejects mismatched
@@ -38,7 +40,9 @@ To reproduce an unsigned build in a Visual Studio Developer PowerShell:
 ```powershell
 $env:VCPKG_ROOT = 'C:\src\vcpkg'
 $env:VCPKG_DEFAULT_TRIPLET = 'x64-windows'
-& $env:VCPKG_ROOT\vcpkg.exe install --triplet x64-windows --x-manifest-root="$PWD\vivido\windows"
+& $env:VCPKG_ROOT\vcpkg.exe install --triplet x64-windows `
+    --x-manifest-root="$PWD\vivido\windows" `
+    --x-install-root="$env:VCPKG_ROOT\installed"
 
 foreach ($project in @('vivido', 'vivi', 'vvmux')) {
     Push-Location $project

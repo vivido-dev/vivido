@@ -29,10 +29,10 @@ $ffmpegDependency = @($vcpkgManifest.dependencies | Where-Object name -eq 'ffmpe
 if ($ffmpegDependency.Count -ne 1 -or $ffmpegDependency[0].'default-features' -ne $false) {
     throw 'vcpkg.json must contain exactly one FFmpeg dependency with default features disabled'
 }
-$expectedFfmpegFeatures = @('avcodec', 'avformat', 'swresample', 'swscale')
+$expectedFfmpegFeatures = @('avcodec', 'avformat', 'dav1d', 'swresample', 'swscale')
 $actualFfmpegFeatures = @($ffmpegDependency[0].features | Sort-Object)
 if (Compare-Object $expectedFfmpegFeatures $actualFfmpegFeatures) {
-    throw 'FFmpeg features must be exactly avcodec, avformat, swresample, and swscale'
+    throw 'FFmpeg features must be exactly avcodec, avformat, dav1d, swresample, and swscale'
 }
 $forbiddenFfmpegFeatures = @('gpl', 'all-gpl', 'nonfree', 'fdk-aac')
 if ($actualFfmpegFeatures | Where-Object { $_ -in $forbiddenFfmpegFeatures }) {
