@@ -43,8 +43,9 @@ use crate::terminal::term::{ResizePoint, Term};
 use crate::vivid::audio::AudioOutput;
 use crate::vivid::decoder::{DecodedFrame, Decoder};
 use crate::vivid::scene::{
-    Frame, MediaBarrierWait, SceneMutation, SceneNode, SessionId, SessionObservationSnapshot,
-    SharedScene, SourceConfig, SourceKey, SourceObservation, SourceWaitEvaluation,
+    Frame, MediaBarrierWait, RasterDeltaRejection, SceneMutation, SceneNode, SessionId,
+    SessionObservationSnapshot, SharedScene, SourceConfig, SourceKey, SourceObservation,
+    SourceWaitEvaluation,
 };
 use crate::vivid::transport::{Reader, TraceChannel, Writer};
 
@@ -1531,6 +1532,7 @@ fn is_supported_feature(feature: u64) -> bool {
             | messages::FEATURE_DELEGATED_CONTEXT_V1
             | messages::FEATURE_SOURCE_CAPTURE_POLICY_V1
             | messages::FEATURE_SOURCE_DESCRIPTOR_V1
+            | messages::FEATURE_RASTER_DELTA_V1
             | messages::FEATURE_MEDIA_ORDER_BARRIER_V1
     )
 }
@@ -2914,8 +2916,8 @@ fn dispatch_control(
             )?;
         },
         messages::CREATE_RASTER => {
-            let (envelope, config, capture_policy, descriptor) =
-                messages::parse_create_raster_with_extensions(&record.body)
+            let (envelope, config, update, capture_policy, descriptor) =
+                messages::parse_create_raster_with_update_extensions(&record.body)
                     .map_err(|_| bad("invalid CREATE_RASTER"))?;
             writer.mark_source_policy(config.source_id, capture_policy);
             if record.object_id != config.source_id {
@@ -2930,6 +2932,8 @@ fn dispatch_control(
                         session_id,
                         messages::FEATURE_RASTER_PREMULTIPLIED_ALPHA,
                     ))
+                || (update.mode == messages::RASTER_FULL_FRAME_AND_DELTA
+                    && !negotiated(shared, session_id, messages::FEATURE_RASTER_DELTA_V1))
                 || (envelope.payload.map_value(9).is_some()
                     && !negotiated(shared, session_id, messages::FEATURE_SOURCE_CAPTURE_POLICY_V1))
                 || (envelope.payload.map_value(10).is_some()
@@ -2957,10 +2961,11 @@ fn dispatch_control(
             )?;
             shared
                 .scene
-                .add_source_with_extensions(
+                .add_source_with_raster_update_extensions(
                     session_id,
                     config.source_id,
                     SourceConfig::Raster(config.clone()),
+                    update,
                     capture_policy,
                     descriptor,
                 )
@@ -3779,7 +3784,11 @@ fn prepare_source_ready(
             rolling_packet_window: ROLLING_PACKET_CREDITS,
             initial_source_revision,
             media_connection_required: true,
-            delta_operation_limit: None,
+            delta_operation_limit: shared
+                .scene
+                .raster_update(source_key)
+                .filter(|update| update.mode == messages::RASTER_FULL_FRAME_AND_DELTA)
+                .map(|update| u64::from(update.operation_limit)),
         },
     )
 }
@@ -3873,6 +3882,8 @@ fn handle_media(
             messages::ERROR_DEVICE_LOST
         } else if detailed_diagnostic.contains("hash mismatch") {
             messages::ERROR_HASH_MISMATCH
+        } else if error.kind() == io::ErrorKind::InvalidData {
+            messages::ERROR_BAD_MESSAGE
         } else {
             messages::ERROR_DECODER
         };
@@ -3922,6 +3933,10 @@ fn handle_raster(
         Some(SourceConfig::Raster(config)) => config,
         _ => return Err(invalid("raster ticket references a non-raster source")),
     };
+    let update = shared
+        .scene
+        .raster_update(key)
+        .ok_or_else(|| invalid("raster source has no update configuration"))?;
     let mut sequence = media::MediaSequence::default();
     let mut body = Vec::new();
     loop {
@@ -3934,43 +3949,105 @@ fn handle_raster(
         if record.record_type != messages::RASTER_FRAME || record.object_id != key.1 {
             return Err(invalid("unexpected record on raster media channel"));
         }
-        let raster = media::parse_full_raster_frame(record.body)?;
-        sequence.accept(raster.frame_id, raster.epoch)?;
-        if (raster.width, raster.height) != (config.width, config.height) {
-            return Err(invalid("raster frame dimensions differ from source"));
-        }
-        if raster.compressed && config.compression_mode != messages::COMPRESSION_RAW_OR_ZSTD {
-            return Err(invalid("zstd raster was not enabled for the source"));
-        }
-        let pixels = media::decode_raster_pixels(raster)?;
-        if config.alpha_mode == messages::ALPHA_PREMULTIPLIED
-            && pixels
-                .chunks_exact(4)
-                .any(|pixel| pixel[0] > pixel[3] || pixel[1] > pixel[3] || pixel[2] > pixel[3])
-        {
-            return Err(invalid("premultiplied raster color exceeds alpha"));
-        }
-        shared
-            .scene
-            .publish_frame(
+        let flags = record
+            .body
+            .get(4..8)
+            .map(|bytes| u32::from_be_bytes(bytes.try_into().unwrap()))
+            .ok_or_else(|| invalid("raster frame is shorter than its flags"))?;
+        let mut accepted_sequence = sequence;
+        if flags & media::RASTER_FRAME_DELTA != 0 {
+            if update.mode != messages::RASTER_FULL_FRAME_AND_DELTA {
+                return Err(invalid("raster delta was not enabled for the source"));
+            }
+            let delta = media::parse_delta_raster_frame(
+                record.body,
+                config.width,
+                config.height,
+                update.operation_limit,
+            )?;
+            accepted_sequence.accept(delta.frame_id, delta.epoch)?;
+            if delta.compressed && config.compression_mode != messages::COMPRESSION_RAW_OR_ZSTD {
+                return Err(invalid("zstd raster was not enabled for the source"));
+            }
+            if config.alpha_mode == messages::ALPHA_PREMULTIPLIED
+                && delta.operations.iter().any(|operation| match operation {
+                    media::ParsedRasterDeltaOperation::Overwrite { rgba, .. } => {
+                        rgba.chunks_exact(4).any(|pixel| {
+                            pixel[0] > pixel[3] || pixel[1] > pixel[3] || pixel[2] > pixel[3]
+                        })
+                    },
+                    media::ParsedRasterDeltaOperation::Copy { .. } => false,
+                })
+            {
+                return Err(invalid("premultiplied raster color exceeds alpha"));
+            }
+            match shared.scene.publish_raster_delta_and_accept(
                 key,
-                raster.epoch,
-                Frame {
-                    frame_id: raster.frame_id,
-                    pts_us: raster.pts_us,
-                    width: raster.width,
-                    height: raster.height,
-                    rgba: Arc::from(pixels),
-                    alpha_mode: config.alpha_mode,
-                    sar_num: 1,
-                    sar_den: 1,
+                delta,
+                record.sequence,
+                config.alpha_mode,
+            ) {
+                Ok(_) => {},
+                Err(RasterDeltaRejection::NeedFullFrame { reason, notify }) => {
+                    writer.write_record(
+                        messages::ERROR,
+                        key.1,
+                        &messages::error(
+                            0,
+                            messages::ERROR_BAD_STATE,
+                            "raster delta requires a new full frame",
+                        ),
+                    )?;
+                    if notify {
+                        writer.write_record(
+                            messages::NEED_FULL_FRAME,
+                            key.1,
+                            &messages::need_full_frame(key.1, reason)?,
+                        )?;
+                    }
+                    wake(shared);
+                    continue;
                 },
-            )
-            .map_err(invalid)?;
-        shared
-            .scene
-            .mark_media_accepted(key, raster.epoch, raster.frame_id, record.sequence, false)
-            .map_err(invalid)?;
+                Err(RasterDeltaRejection::Fatal(message)) => return Err(invalid(message)),
+            }
+        } else {
+            let raster = media::parse_full_raster_frame(record.body)?;
+            accepted_sequence.accept(raster.frame_id, raster.epoch)?;
+            if (raster.width, raster.height) != (config.width, config.height) {
+                return Err(invalid("raster frame dimensions differ from source"));
+            }
+            if raster.compressed && config.compression_mode != messages::COMPRESSION_RAW_OR_ZSTD {
+                return Err(invalid("zstd raster was not enabled for the source"));
+            }
+            let pixels = media::decode_raster_pixels(raster)?;
+            if config.alpha_mode == messages::ALPHA_PREMULTIPLIED
+                && pixels
+                    .chunks_exact(4)
+                    .any(|pixel| pixel[0] > pixel[3] || pixel[1] > pixel[3] || pixel[2] > pixel[3])
+            {
+                return Err(invalid("premultiplied raster color exceeds alpha"));
+            }
+            shared
+                .scene
+                .publish_raster_full_and_accept(
+                    key,
+                    raster.epoch,
+                    Frame {
+                        frame_id: raster.frame_id,
+                        pts_us: raster.pts_us,
+                        width: raster.width,
+                        height: raster.height,
+                        rgba: Arc::from(pixels),
+                        alpha_mode: config.alpha_mode,
+                        sar_num: 1,
+                        sar_den: 1,
+                        damage: None,
+                    },
+                    record.sequence,
+                )
+                .map_err(invalid)?;
+        }
+        sequence = accepted_sequence;
         charge.accepted(record.record_type, record.sequence);
         wake(shared);
     }
@@ -4025,6 +4102,7 @@ fn queue_decoded_video_frame(
             alpha_mode: messages::ALPHA_STRAIGHT,
             sar_num: config.sar_num,
             sar_den: config.sar_den,
+            damage: None,
         }),
         pixels,
         scene: shared.scene.clone(),
@@ -4365,6 +4443,7 @@ fn handle_image(
                 alpha_mode: messages::ALPHA_STRAIGHT,
                 sar_num: 1,
                 sar_den: 1,
+                damage: None,
             },
         )
         .map_err(invalid)?;
@@ -5495,6 +5574,7 @@ mod tests {
                 alpha_mode: messages::ALPHA_STRAIGHT,
                 sar_num: 1,
                 sar_den: 1,
+                damage: None,
             }),
             pixels: 1,
             scene: scene.clone(),
@@ -5794,6 +5874,141 @@ mod tests {
         }
 
         control.write_record(messages::GOODBYE, 0, 0, &messages::goodbye(6)).unwrap();
+    }
+
+    #[test]
+    fn live_raster_delta_reports_base_recovery_and_resumes_after_full_frame() {
+        let service = VividService::start_with_wake(
+            DisplayMetrics {
+                viewport_width: 800,
+                viewport_height: 600,
+                columns: 80,
+                rows: 30,
+                cell_width: 10,
+                cell_height: 20,
+                generation: 1,
+            },
+            Arc::new(|| {}),
+        )
+        .unwrap();
+        let endpoint = Endpoint::parse(service.endpoint()).unwrap();
+        let mut control = Connection::open(&endpoint, ConnectionKind::Control).unwrap();
+        control.write_record(messages::HELLO, 0, 0, &messages::hello(1, service.token())).unwrap();
+        let welcome = parse_welcome(&control.read_record().unwrap().body).unwrap();
+        assert!(welcome.accepted_features.contains(&messages::FEATURE_RASTER_DELTA_V1));
+
+        let config = messages::RasterSourceConfig {
+            source_id: 1,
+            width: 2,
+            height: 2,
+            alpha_mode: messages::ALPHA_STRAIGHT,
+            compression_mode: messages::COMPRESSION_NONE,
+        };
+        control
+            .write_record(
+                messages::CREATE_RASTER,
+                0,
+                1,
+                &messages::create_raster_delta_config(2, &config, 16).unwrap(),
+            )
+            .unwrap();
+        let ready = parse_source_ready(&control.read_record().unwrap().body).unwrap();
+        assert_eq!(ready.delta_operation_limit, Some(16));
+
+        let mut media_channel = Connection::open(&endpoint, ConnectionKind::Raster).unwrap();
+        media_channel
+            .write_record(
+                messages::ATTACH_CHANNEL,
+                0,
+                1,
+                &messages::attach_channel(&ready.media_ticket),
+            )
+            .unwrap();
+        media_channel
+            .write_record(
+                messages::RASTER_FRAME,
+                0,
+                1,
+                &media::raster_frame_body(1, 1, 2, 2, &[0; 16]).unwrap(),
+            )
+            .unwrap();
+        let wait_for_media_id = |expected| {
+            let deadline = Instant::now() + Duration::from_secs(1);
+            loop {
+                if service
+                    .scene()
+                    .source_observation((welcome.session_id, 1))
+                    .is_some_and(|source| source.last_media_id == expected)
+                {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "raster frame {expected} was not accepted");
+                thread::sleep(Duration::from_millis(5));
+            }
+        };
+        wait_for_media_id(1);
+
+        let pixel = [1, 2, 3, 255];
+        let operation = [media::RasterDeltaOperation::Overwrite {
+            x: 0,
+            y: 0,
+            width: 1,
+            height: 1,
+            rgba: &pixel,
+        }];
+        media_channel
+            .write_record(
+                messages::RASTER_FRAME,
+                0,
+                1,
+                &media::raster_delta_frame_body(1, 2, 99, 0, 0, 2, 2, 16, &operation, false)
+                    .unwrap(),
+            )
+            .unwrap();
+        let mut saw_bad_state = false;
+        let mut saw_need_full = false;
+        while !saw_bad_state || !saw_need_full {
+            let record = control.read_record().unwrap();
+            match record.record_type {
+                messages::ERROR => {
+                    saw_bad_state = messages::parse_error_reply(&record.body).unwrap().code
+                        == messages::ERROR_BAD_STATE;
+                },
+                messages::NEED_FULL_FRAME => {
+                    let need = messages::parse_need_full_frame(&record.body).unwrap();
+                    assert_eq!(need.source_id, 1);
+                    assert_eq!(need.reason, messages::NEED_FULL_FRAME_BASE_UNAVAILABLE);
+                    saw_need_full = true;
+                },
+                messages::CREDIT => {},
+                other => panic!("unexpected control record {other:#06x}"),
+            }
+        }
+        assert_eq!(
+            service.scene().source_observation((welcome.session_id, 1)).unwrap().last_media_id,
+            1
+        );
+
+        media_channel
+            .write_record(
+                messages::RASTER_FRAME,
+                0,
+                1,
+                &media::raster_frame_body(1, 3, 2, 2, &[0; 16]).unwrap(),
+            )
+            .unwrap();
+        wait_for_media_id(3);
+        media_channel
+            .write_record(
+                messages::RASTER_FRAME,
+                0,
+                1,
+                &media::raster_delta_frame_body(1, 4, 3, 0, 0, 2, 2, 16, &operation, false)
+                    .unwrap(),
+            )
+            .unwrap();
+        wait_for_media_id(4);
+        control.write_record(messages::GOODBYE, 0, 0, &messages::goodbye(3)).unwrap();
     }
 
     #[test]

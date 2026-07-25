@@ -73,7 +73,7 @@ struct SourceOptions {
 }
 
 struct SourceTexture {
-    _texture: wgpu::Texture,
+    texture: wgpu::Texture,
     _options: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
     frame_id: u64,
@@ -82,6 +82,14 @@ struct SourceTexture {
     height: u32,
     rgba_ptr: usize,
     rgba_len: usize,
+    alpha_mode: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SourceUploadMetrics {
+    pub frames: u64,
+    pub uploaded_pixels: u64,
+    pub full_frame_pixels: u64,
 }
 
 struct MediaTarget {
@@ -103,6 +111,7 @@ pub struct VividMediaRenderer {
     target: Option<MediaTarget>,
     scene: Option<SharedScene>,
     capture_redactions: Vec<CaptureRedaction>,
+    source_upload_metrics: SourceUploadMetrics,
 }
 
 impl VividMediaRenderer {
@@ -209,6 +218,7 @@ impl VividMediaRenderer {
             target: None,
             scene: None,
             capture_redactions: Vec::new(),
+            source_upload_metrics: SourceUploadMetrics::default(),
         }
     }
 
@@ -233,6 +243,12 @@ impl VividMediaRenderer {
     pub fn clear_sources(&mut self) {
         self.reported_protocols.clear();
         self.sources.clear();
+    }
+
+    /// Cumulative source-texture traffic for targeted-performance diagnostics.
+    #[allow(dead_code)]
+    pub fn source_upload_metrics(&self) -> SourceUploadMetrics {
+        self.source_upload_metrics
     }
 
     pub fn clear_target(&mut self, renderer: &mut Renderer) {
@@ -355,6 +371,71 @@ impl VividMediaRenderer {
         if unchanged {
             return;
         }
+        let full_frame_pixels = u64::from(frame.width) * u64::from(frame.height);
+        if let Some(source) = self.sources.get_mut(&key)
+            && source.width == frame.width
+            && source.height == frame.height
+            && source.alpha_mode == frame.alpha_mode
+        {
+            let uploaded_pixels = if let Some(damage) = &frame.damage {
+                for rect in damage.iter() {
+                    let offset = (rect.y as usize * frame.width as usize + rect.x as usize) * 4;
+                    queue.write_texture(
+                        wgpu::TexelCopyTextureInfo {
+                            texture: &source.texture,
+                            mip_level: 0,
+                            origin: wgpu::Origin3d { x: rect.x, y: rect.y, z: 0 },
+                            aspect: wgpu::TextureAspect::All,
+                        },
+                        &frame.rgba[offset..],
+                        wgpu::TexelCopyBufferLayout {
+                            offset: 0,
+                            bytes_per_row: Some(frame.width * 4),
+                            rows_per_image: None,
+                        },
+                        wgpu::Extent3d {
+                            width: rect.width,
+                            height: rect.height,
+                            depth_or_array_layers: 1,
+                        },
+                    );
+                }
+                damage.iter().fold(0_u64, |total, rect| {
+                    total.saturating_add(u64::from(rect.width) * u64::from(rect.height))
+                })
+            } else {
+                queue.write_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &source.texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    frame.rgba.as_ref(),
+                    wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(frame.width * 4),
+                        rows_per_image: Some(frame.height),
+                    },
+                    wgpu::Extent3d {
+                        width: frame.width,
+                        height: frame.height,
+                        depth_or_array_layers: 1,
+                    },
+                );
+                full_frame_pixels
+            };
+            source.frame_id = frame.frame_id;
+            source.pts_us = frame.pts_us;
+            source.rgba_ptr = frame.rgba.as_ptr() as usize;
+            source.rgba_len = frame.rgba.len();
+            self.source_upload_metrics.frames = self.source_upload_metrics.frames.saturating_add(1);
+            self.source_upload_metrics.uploaded_pixels =
+                self.source_upload_metrics.uploaded_pixels.saturating_add(uploaded_pixels);
+            self.source_upload_metrics.full_frame_pixels =
+                self.source_upload_metrics.full_frame_pixels.saturating_add(full_frame_pixels);
+            return;
+        }
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("vivido.vivid.source"),
             size: wgpu::Extent3d {
@@ -413,7 +494,7 @@ impl VividMediaRenderer {
         self.sources.insert(
             key,
             SourceTexture {
-                _texture: texture,
+                texture,
                 _options: options,
                 bind_group,
                 frame_id: frame.frame_id,
@@ -422,8 +503,14 @@ impl VividMediaRenderer {
                 height: frame.height,
                 rgba_ptr: frame.rgba.as_ptr() as usize,
                 rgba_len: frame.rgba.len(),
+                alpha_mode: frame.alpha_mode,
             },
         );
+        self.source_upload_metrics.frames = self.source_upload_metrics.frames.saturating_add(1);
+        self.source_upload_metrics.uploaded_pixels =
+            self.source_upload_metrics.uploaded_pixels.saturating_add(full_frame_pixels);
+        self.source_upload_metrics.full_frame_pixels =
+            self.source_upload_metrics.full_frame_pixels.saturating_add(full_frame_pixels);
     }
 
     fn ensure_target(
@@ -554,7 +641,7 @@ mod tests {
     use crate::display::SizeInfo;
     #[cfg(unix)]
     use crate::vivid::scene::{
-        Frame, RenderItem, SceneMutation, SceneNode, SharedScene, SourceConfig,
+        Frame, RasterDamageRect, RenderItem, SceneMutation, SceneNode, SharedScene, SourceConfig,
     };
 
     #[cfg(unix)]
@@ -582,6 +669,7 @@ mod tests {
                 alpha_mode: vivid_protocol::messages::ALPHA_STRAIGHT,
                 sar_num: 1,
                 sar_den: 1,
+                damage: None,
             },
             x: 0,
             y: 0,
@@ -659,6 +747,7 @@ mod tests {
                         alpha_mode: vivid_protocol::messages::ALPHA_STRAIGHT,
                         sar_num: 1,
                         sar_den: 1,
+                        damage: None,
                     },
                 )
                 .unwrap();
@@ -805,6 +894,65 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[test]
+    fn sparse_raster_damage_reuses_texture_and_reduces_upload_area() {
+        let instance = wgpu::Instance::default();
+        let Ok(adapter) =
+            pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
+        else {
+            eprintln!("Skipping sparse upload test: no native wgpu adapter");
+            return;
+        };
+        let (device, queue) =
+            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
+                .expect("headless wgpu device");
+        let mut media = VividMediaRenderer::new(&device);
+        let base = RenderItem {
+            source_key: (1, 9),
+            node_id: 1,
+            frame: Frame {
+                frame_id: 1,
+                pts_us: 0,
+                width: 4,
+                height: 4,
+                rgba: Arc::from(vec![0; 4 * 4 * 4]),
+                alpha_mode: vivid_protocol::messages::ALPHA_STRAIGHT,
+                sar_num: 1,
+                sar_den: 1,
+                damage: None,
+            },
+            x: 0,
+            y: 0,
+            width: 4_i64 << 32,
+            height: 4_i64 << 32,
+            text_layer: 1,
+            z_index: 0,
+            text_anchored: false,
+            clip: None,
+            capture_policy: 0,
+        };
+        media.upload_source(&device, &queue, base.source_key, &base);
+        let mut changed = vec![0; 4 * 4 * 4];
+        changed[(2 * 4 + 1) * 4..(2 * 4 + 2) * 4].copy_from_slice(&[1, 2, 3, 255]);
+        let delta = RenderItem {
+            frame: Frame {
+                frame_id: 2,
+                pts_us: 1,
+                rgba: Arc::from(changed),
+                damage: Some(Arc::from([RasterDamageRect { x: 1, y: 2, width: 1, height: 1 }])),
+                ..base.frame.clone()
+            },
+            ..base
+        };
+        media.upload_source(&device, &queue, delta.source_key, &delta);
+        device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+        assert_eq!(
+            media.source_upload_metrics(),
+            super::SourceUploadMetrics { frames: 2, uploaded_pixels: 17, full_frame_pixels: 32 }
+        );
+    }
+
+    #[cfg(unix)]
     fn publish_test_frame(scene: &SharedScene, frame_id: u64, rgba: [u8; 4]) {
         scene
             .publish_frame(
@@ -819,6 +967,7 @@ mod tests {
                     alpha_mode: vivid_protocol::messages::ALPHA_STRAIGHT,
                     sar_num: 1,
                     sar_den: 1,
+                    damage: None,
                 },
             )
             .unwrap();

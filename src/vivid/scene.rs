@@ -6,8 +6,9 @@ use vivid_protocol::media;
 use vivid_protocol::messages::{
     self, ClipRect, ImageSourceConfig, MAX_SCENE_NODES, ParsedAudioSourceConfig, ParsedNodeConfig,
     ParsedSceneNode, ParsedVideoSourceConfig, PlayRequest, PlaybackSnapshot, RasterSourceConfig,
-    SceneCursor, SceneQuery, SceneStatus, SceneValidationKey, SceneValidationNode,
-    SceneValidationSource, SourceStatus, WaitSatisfied, validate_scene_snapshot,
+    RasterUpdateConfig, SceneCursor, SceneQuery, SceneStatus, SceneValidationKey,
+    SceneValidationNode, SceneValidationSource, SourceStatus, WaitSatisfied,
+    validate_scene_snapshot,
 };
 use vivid_protocol::revision::{SceneRevision, SourceRevision};
 
@@ -21,6 +22,8 @@ const MAX_RESERVED_INGRESS_BYTES: u64 = 256 * 1024 * 1024;
 const RESERVED_INGRESS_WINDOW: u64 = 4 * 1024 * 1024;
 const MAX_SOURCE_TOMBSTONES: usize = 32;
 const SOURCE_TOMBSTONE_TTL: Duration = Duration::from_secs(60);
+pub const RASTER_DAMAGE_INTERVAL: Duration = Duration::from_millis(100);
+pub const RASTER_DAMAGE_FRAME_EQUIVALENTS: u64 = 8;
 
 #[derive(Debug, Clone)]
 pub enum SourceConfig {
@@ -82,6 +85,23 @@ pub struct Frame {
     pub alpha_mode: u64,
     pub sar_num: u32,
     pub sar_den: u32,
+    /// `None` means the complete source changed. Delta frames carry an exact, non-overlapping
+    /// union of pixel rectangles so the renderer can keep and update its existing texture.
+    pub damage: Option<Arc<[RasterDamageRect]>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RasterDamageRect {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RasterDeltaRejection {
+    NeedFullFrame { reason: u64, notify: bool },
+    Fatal(&'static str),
 }
 
 #[derive(Debug, Clone)]
@@ -184,6 +204,11 @@ struct Source {
     buffered_until_pts_us: Option<i64>,
     last_epoch: u32,
     eos_epoch: Option<u32>,
+    raster_update: RasterUpdateConfig,
+    raster_requires_full: bool,
+    raster_recovery_reason: u64,
+    raster_damage_window_started: Instant,
+    raster_damage_pixels: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -325,6 +350,142 @@ fn set_milestone(source: &mut Source, milestone: u64) -> bool {
 
 const fn changed_field(changed: bool, field: u64) -> u64 {
     if changed { field } else { 0 }
+}
+
+fn mark_media_accepted_locked(
+    source: &mut Source,
+    epoch: u32,
+    media_id: u64,
+    record_sequence: u64,
+    random_access: bool,
+) -> Result<(), &'static str> {
+    if epoch < source.last_epoch {
+        return Err("stale source epoch");
+    }
+    let epoch_changed = source.last_epoch != epoch;
+    source.last_epoch = epoch;
+    source.last_media_id = media_id;
+    source.last_media_sequence = record_sequence;
+    let lifecycle_changed = source.lifecycle != messages::SOURCE_LIFECYCLE_ACTIVE;
+    source.lifecycle = messages::SOURCE_LIFECYCLE_ACTIVE;
+    let mut milestone_changed = set_milestone(source, messages::MILESTONE_FIRST_MEDIA_RECORD);
+    if random_access {
+        milestone_changed |= set_milestone(source, messages::MILESTONE_RANDOM_ACCESS_ACCEPTED);
+    }
+    let changed_fields = changed_field(epoch_changed, messages::SOURCE_CHANGED_EPOCH)
+        | changed_field(lifecycle_changed, messages::SOURCE_CHANGED_LIFECYCLE)
+        | changed_field(milestone_changed, messages::SOURCE_CHANGED_MILESTONES);
+    if changed_fields != 0 {
+        advance_source_revision(source, changed_fields)?;
+    }
+    Ok(())
+}
+
+fn normalized_raster_damage(
+    operations: &[media::ParsedRasterDeltaOperation<'_>],
+) -> Vec<RasterDamageRect> {
+    let rectangles = operations
+        .iter()
+        .map(|operation| match operation {
+            media::ParsedRasterDeltaOperation::Overwrite { x, y, width, height, .. } => {
+                RasterDamageRect { x: *x, y: *y, width: *width, height: *height }
+            },
+            media::ParsedRasterDeltaOperation::Copy {
+                destination_x,
+                destination_y,
+                width,
+                height,
+                ..
+            } => RasterDamageRect {
+                x: *destination_x,
+                y: *destination_y,
+                width: *width,
+                height: *height,
+            },
+        })
+        .collect::<Vec<_>>();
+    let mut y_edges =
+        rectangles.iter().flat_map(|rect| [rect.y, rect.y + rect.height]).collect::<Vec<_>>();
+    y_edges.sort_unstable();
+    y_edges.dedup();
+
+    let mut union = Vec::<RasterDamageRect>::new();
+    for band in y_edges.windows(2) {
+        let (top, bottom) = (band[0], band[1]);
+        let mut intervals = rectangles
+            .iter()
+            .filter(|rect| rect.y <= top && rect.y + rect.height >= bottom)
+            .map(|rect| (rect.x, rect.x + rect.width))
+            .collect::<Vec<_>>();
+        intervals.sort_unstable();
+        let mut merged = Vec::<(u32, u32)>::new();
+        for (left, right) in intervals {
+            if let Some(last) = merged.last_mut()
+                && left <= last.1
+            {
+                last.1 = last.1.max(right);
+            } else {
+                merged.push((left, right));
+            }
+        }
+        for (left, right) in merged {
+            let width = right - left;
+            if let Some(previous) = union
+                .iter_mut()
+                .rev()
+                .find(|rect| rect.x == left && rect.width == width && rect.y + rect.height == top)
+            {
+                previous.height += bottom - top;
+            } else {
+                union.push(RasterDamageRect { x: left, y: top, width, height: bottom - top });
+            }
+        }
+    }
+    union
+}
+
+fn apply_raster_delta_operation(
+    pixels: &mut [u8],
+    source_width: u32,
+    operation: &media::ParsedRasterDeltaOperation<'_>,
+) {
+    let stride = source_width as usize * 4;
+    match operation {
+        media::ParsedRasterDeltaOperation::Overwrite { x, y, width, height, rgba } => {
+            let row_bytes = *width as usize * 4;
+            for row in 0..*height as usize {
+                let destination = (*y as usize + row) * stride + *x as usize * 4;
+                let source = row * row_bytes;
+                pixels[destination..destination + row_bytes]
+                    .copy_from_slice(&rgba[source..source + row_bytes]);
+            }
+        },
+        media::ParsedRasterDeltaOperation::Copy {
+            destination_x,
+            destination_y,
+            width,
+            height,
+            source_x,
+            source_y,
+        } => {
+            let row_bytes = *width as usize * 4;
+            if destination_y > source_y {
+                for row in (0..*height as usize).rev() {
+                    let source = (*source_y as usize + row) * stride + *source_x as usize * 4;
+                    let destination =
+                        (*destination_y as usize + row) * stride + *destination_x as usize * 4;
+                    pixels.copy_within(source..source + row_bytes, destination);
+                }
+            } else {
+                for row in 0..*height as usize {
+                    let source = (*source_y as usize + row) * stride + *source_x as usize * 4;
+                    let destination =
+                        (*destination_y as usize + row) * stride + *destination_x as usize * 4;
+                    pixels.copy_within(source..source + row_bytes, destination);
+                }
+            }
+        },
+    }
 }
 
 fn observation(source: &Source, terminal_loss_code: Option<u64>) -> SourceObservation {
@@ -569,6 +730,25 @@ impl SharedScene {
         capture_policy: u64,
         descriptor: Option<messages::SourceDescriptor>,
     ) -> Result<(), &'static str> {
+        self.add_source_with_raster_update_extensions(
+            session_id,
+            source_id,
+            config,
+            RasterUpdateConfig { mode: messages::RASTER_FULL_FRAME, operation_limit: 1 },
+            capture_policy,
+            descriptor,
+        )
+    }
+
+    pub fn add_source_with_raster_update_extensions(
+        &self,
+        session_id: SessionId,
+        source_id: u64,
+        config: SourceConfig,
+        raster_update: RasterUpdateConfig,
+        capture_policy: u64,
+        descriptor: Option<messages::SourceDescriptor>,
+    ) -> Result<(), &'static str> {
         if messages::validate_capture_policy(capture_policy).is_err() {
             return Err("capture policy contains reserved bits");
         }
@@ -592,6 +772,27 @@ impl SharedScene {
             && (width == 0 || height == 0 || width > 8192 || height > 8192)
         {
             return Err("source dimensions are outside limits");
+        }
+        match &config {
+            SourceConfig::Raster(config) => {
+                messages::validate_raster_source_features(
+                    config,
+                    raster_update,
+                    &[
+                        messages::FEATURE_RASTER_RGBA8,
+                        messages::FEATURE_RASTER_ZSTD_V1,
+                        messages::FEATURE_RASTER_PREMULTIPLIED_ALPHA,
+                        messages::FEATURE_RASTER_DELTA_V1,
+                    ],
+                )
+                .map_err(|_| "raster update configuration is invalid")?;
+            },
+            _ if raster_update.mode != messages::RASTER_FULL_FRAME
+                || raster_update.operation_limit != 1 =>
+            {
+                return Err("raster update configuration was applied to a non-raster source");
+            },
+            _ => {},
         }
         let requested_pixels = u64::from(width) * u64::from(height);
         let reserved_pixels = state
@@ -652,6 +853,11 @@ impl SharedScene {
                 buffered_until_pts_us: None,
                 last_epoch: 0,
                 eos_epoch: None,
+                raster_update,
+                raster_requires_full: false,
+                raster_recovery_reason: 0,
+                raster_damage_window_started: Instant::now(),
+                raster_damage_pixels: 0,
             },
         );
         Ok(())
@@ -659,6 +865,12 @@ impl SharedScene {
 
     pub fn source_config(&self, key: SourceKey) -> Option<SourceConfig> {
         self.lock().sources.get(&key).map(|source| source.config.clone())
+    }
+
+    pub fn raster_update(&self, key: SourceKey) -> Option<RasterUpdateConfig> {
+        self.lock().sources.get(&key).and_then(|source| {
+            matches!(source.config, SourceConfig::Raster(_)).then_some(source.raster_update)
+        })
     }
 
     pub fn scene_revision(&self, session_id: SessionId) -> SceneRevision {
@@ -1139,25 +1351,7 @@ impl SharedScene {
     ) -> Result<(), &'static str> {
         let mut state = self.lock();
         let source = state.sources.get_mut(&key).ok_or("source does not exist")?;
-        if epoch < source.last_epoch {
-            return Err("stale source epoch");
-        }
-        let epoch_changed = source.last_epoch != epoch;
-        source.last_epoch = epoch;
-        source.last_media_id = media_id;
-        source.last_media_sequence = record_sequence;
-        let lifecycle_changed = source.lifecycle != messages::SOURCE_LIFECYCLE_ACTIVE;
-        source.lifecycle = messages::SOURCE_LIFECYCLE_ACTIVE;
-        let mut milestone_changed = set_milestone(source, messages::MILESTONE_FIRST_MEDIA_RECORD);
-        if random_access {
-            milestone_changed |= set_milestone(source, messages::MILESTONE_RANDOM_ACCESS_ACCEPTED);
-        }
-        let changed_fields = changed_field(epoch_changed, messages::SOURCE_CHANGED_EPOCH)
-            | changed_field(lifecycle_changed, messages::SOURCE_CHANGED_LIFECYCLE)
-            | changed_field(milestone_changed, messages::SOURCE_CHANGED_MILESTONES);
-        if changed_fields != 0 {
-            advance_source_revision(source, changed_fields)?;
-        }
+        mark_media_accepted_locked(source, epoch, media_id, record_sequence, random_access)?;
         self.0.playback_changed.notify_all();
         Ok(())
     }
@@ -1473,6 +1667,152 @@ impl SharedScene {
         state.decoded_pixels = decoded_pixels;
         state.revision = state.revision.wrapping_add(1);
         Ok(())
+    }
+
+    pub fn publish_raster_full_and_accept(
+        &self,
+        key: SourceKey,
+        epoch: u32,
+        mut frame: Frame,
+        record_sequence: u64,
+    ) -> Result<(), &'static str> {
+        frame.damage = None;
+        let mut state = self.lock();
+        let old_pixels = state
+            .sources
+            .get(&key)
+            .and_then(|source| source.latest_frame.as_ref())
+            .map_or(0, |frame| u64::from(frame.width) * u64::from(frame.height));
+        let new_pixels = u64::from(frame.width) * u64::from(frame.height);
+        let decoded_pixels =
+            state.decoded_pixels.saturating_sub(old_pixels).saturating_add(new_pixels);
+        if decoded_pixels.saturating_add(state.queued_pixels) > MAX_DECODED_PIXELS {
+            return Err("decoded pixel quota exceeded");
+        }
+        {
+            let source = state.sources.get_mut(&key).ok_or("source does not exist")?;
+            if !matches!(source.config, SourceConfig::Raster(_)) {
+                return Err("source is not raster");
+            }
+            source.last_decoded_pts_us = frame.pts_us;
+            let milestone_changed = set_milestone(source, messages::MILESTONE_FIRST_DECODED_OUTPUT);
+            source.latest_frame = Some(frame.clone());
+            source.raster_requires_full = false;
+            source.raster_recovery_reason = 0;
+            source.raster_damage_window_started = Instant::now();
+            source.raster_damage_pixels = 0;
+            mark_media_accepted_locked(source, epoch, frame.frame_id, record_sequence, false)?;
+            if milestone_changed {
+                advance_source_revision(source, messages::SOURCE_CHANGED_MILESTONES)?;
+            }
+        }
+        state.decoded_pixels = decoded_pixels;
+        state.revision = state.revision.wrapping_add(1);
+        self.0.playback_changed.notify_all();
+        Ok(())
+    }
+
+    pub fn publish_raster_delta_and_accept(
+        &self,
+        key: SourceKey,
+        frame: media::ParsedRasterDeltaFrame<'_>,
+        record_sequence: u64,
+        alpha_mode: u64,
+    ) -> Result<u64, RasterDeltaRejection> {
+        let mut state = self.lock();
+        let source = state
+            .sources
+            .get_mut(&key)
+            .ok_or(RasterDeltaRejection::Fatal("source does not exist"))?;
+        let SourceConfig::Raster(config) = &source.config else {
+            return Err(RasterDeltaRejection::Fatal("source is not raster"));
+        };
+        if source.raster_update.mode != messages::RASTER_FULL_FRAME_AND_DELTA {
+            return Err(RasterDeltaRejection::Fatal("raster source was not created for deltas"));
+        }
+        if source.raster_requires_full {
+            return Err(RasterDeltaRejection::NeedFullFrame {
+                reason: source.raster_recovery_reason,
+                notify: false,
+            });
+        }
+        if frame.epoch != source.last_epoch {
+            source.raster_requires_full = true;
+            source.raster_recovery_reason = messages::NEED_FULL_FRAME_BASE_UNAVAILABLE;
+            return Err(RasterDeltaRejection::NeedFullFrame {
+                reason: messages::NEED_FULL_FRAME_BASE_UNAVAILABLE,
+                notify: true,
+            });
+        }
+        let Some(current) = source.latest_frame.as_ref() else {
+            source.raster_requires_full = true;
+            source.raster_recovery_reason = messages::NEED_FULL_FRAME_BASE_UNAVAILABLE;
+            return Err(RasterDeltaRejection::NeedFullFrame {
+                reason: messages::NEED_FULL_FRAME_BASE_UNAVAILABLE,
+                notify: true,
+            });
+        };
+        if current.frame_id != frame.base_frame_id {
+            source.raster_requires_full = true;
+            source.raster_recovery_reason = messages::NEED_FULL_FRAME_BASE_UNAVAILABLE;
+            return Err(RasterDeltaRejection::NeedFullFrame {
+                reason: messages::NEED_FULL_FRAME_BASE_UNAVAILABLE,
+                notify: true,
+            });
+        }
+        if current.width != config.width
+            || current.height != config.height
+            || current.alpha_mode != alpha_mode
+        {
+            return Err(RasterDeltaRejection::Fatal(
+                "retained raster framebuffer configuration changed",
+            ));
+        }
+        let damage = normalized_raster_damage(&frame.operations);
+        let damaged_pixels = damage.iter().try_fold(0_u64, |total, rect| {
+            total.checked_add(u64::from(rect.width) * u64::from(rect.height))
+        });
+        let Some(damaged_pixels) = damaged_pixels else {
+            return Err(RasterDeltaRejection::Fatal("raster delta damage accounting overflowed"));
+        };
+        let now = Instant::now();
+        if now.duration_since(source.raster_damage_window_started) >= RASTER_DAMAGE_INTERVAL {
+            source.raster_damage_window_started = now;
+            source.raster_damage_pixels = 0;
+        }
+        let budget = u64::from(config.width)
+            .saturating_mul(u64::from(config.height))
+            .saturating_mul(RASTER_DAMAGE_FRAME_EQUIVALENTS);
+        if source.raster_damage_pixels.saturating_add(damaged_pixels) > budget {
+            source.raster_requires_full = true;
+            source.raster_recovery_reason = messages::NEED_FULL_FRAME_DAMAGE_BUDGET;
+            return Err(RasterDeltaRejection::NeedFullFrame {
+                reason: messages::NEED_FULL_FRAME_DAMAGE_BUDGET,
+                notify: true,
+            });
+        }
+
+        let mut composed = current.clone();
+        let pixels = Arc::make_mut(&mut composed.rgba);
+        for operation in &frame.operations {
+            apply_raster_delta_operation(pixels, config.width, operation);
+        }
+        composed.frame_id = frame.frame_id;
+        composed.pts_us = frame.pts_us;
+        composed.damage = Some(Arc::from(damage));
+        source.raster_damage_pixels += damaged_pixels;
+        source.last_decoded_pts_us = frame.pts_us;
+        source.latest_frame = Some(composed);
+        let milestone_changed = set_milestone(source, messages::MILESTONE_FIRST_DECODED_OUTPUT);
+        mark_media_accepted_locked(source, frame.epoch, frame.frame_id, record_sequence, false)
+            .map_err(RasterDeltaRejection::Fatal)?;
+        if milestone_changed {
+            advance_source_revision(source, messages::SOURCE_CHANGED_MILESTONES)
+                .map_err(RasterDeltaRejection::Fatal)?;
+        }
+        state.revision = state.revision.wrapping_add(1);
+        self.0.playback_changed.notify_all();
+        Ok(damaged_pixels)
     }
 
     /// Reserve aggregate decoded-frame memory before retaining a queued presentation frame.
@@ -2132,6 +2472,57 @@ fn gc_detached_sources(state: &mut State) {
 mod tests {
     use super::*;
 
+    fn add_delta_raster(scene: &SharedScene, source_id: u64, width: u32, height: u32) {
+        scene
+            .add_source_with_raster_update_extensions(
+                1,
+                source_id,
+                SourceConfig::Raster(RasterSourceConfig {
+                    source_id,
+                    width,
+                    height,
+                    alpha_mode: messages::ALPHA_STRAIGHT,
+                    compression_mode: messages::COMPRESSION_NONE,
+                }),
+                RasterUpdateConfig {
+                    mode: messages::RASTER_FULL_FRAME_AND_DELTA,
+                    operation_limit: 16,
+                },
+                0,
+                None,
+            )
+            .unwrap();
+    }
+
+    fn accept_raster_full(
+        scene: &SharedScene,
+        key: SourceKey,
+        epoch: u32,
+        frame_id: u64,
+        width: u32,
+        height: u32,
+        pixels: Vec<u8>,
+    ) {
+        scene
+            .publish_raster_full_and_accept(
+                key,
+                epoch,
+                Frame {
+                    frame_id,
+                    pts_us: 0,
+                    width,
+                    height,
+                    rgba: Arc::from(pixels),
+                    alpha_mode: messages::ALPHA_STRAIGHT,
+                    sar_num: 1,
+                    sar_den: 1,
+                    damage: None,
+                },
+                frame_id,
+            )
+            .unwrap();
+    }
+
     fn add_video(scene: &SharedScene, source_id: u64) {
         scene
             .add_source(
@@ -2176,6 +2567,166 @@ mod tests {
             anchor_id: None,
             clip: None,
         }
+    }
+
+    #[test]
+    fn raster_delta_overlapping_copy_matches_a_temporary_reference() {
+        let scene = SharedScene::default();
+        let key = (1, 40);
+        add_delta_raster(&scene, key.1, 4, 4);
+        let initial = (0_u8..16).flat_map(|value| [value, value, value, 255]).collect::<Vec<_>>();
+        accept_raster_full(&scene, key, 1, 1, 4, 4, initial.clone());
+
+        let replacement = [100_u8, 100, 100, 255].repeat(4);
+        let operations = [
+            media::RasterDeltaOperation::Copy {
+                destination_x: 0,
+                destination_y: 1,
+                width: 4,
+                height: 3,
+                source_x: 0,
+                source_y: 0,
+            },
+            media::RasterDeltaOperation::Overwrite {
+                x: 0,
+                y: 0,
+                width: 4,
+                height: 1,
+                rgba: &replacement,
+            },
+        ];
+        let body =
+            media::raster_delta_frame_body(1, 2, 1, 0, 0, 4, 4, 16, &operations, false).unwrap();
+        let delta = media::parse_delta_raster_frame(&body, 4, 4, 16).unwrap();
+        assert_eq!(
+            scene.publish_raster_delta_and_accept(key, delta, 2, messages::ALPHA_STRAIGHT),
+            Ok(16)
+        );
+
+        let mut expected = initial;
+        let previous = expected.clone();
+        expected[16..64].copy_from_slice(&previous[0..48]);
+        expected[0..16].copy_from_slice(&replacement);
+        let state = scene.lock();
+        let frame = state.sources[&key].latest_frame.as_ref().unwrap();
+        assert_eq!(frame.rgba.as_ref(), expected);
+        assert_eq!(
+            frame.damage.as_deref(),
+            Some([RasterDamageRect { x: 0, y: 0, width: 4, height: 4 }].as_slice())
+        );
+    }
+
+    #[test]
+    fn raster_delta_base_mismatch_requires_one_full_frame_notification() {
+        let scene = SharedScene::default();
+        let key = (1, 41);
+        add_delta_raster(&scene, key.1, 2, 2);
+        accept_raster_full(&scene, key, 1, 1, 2, 2, vec![0; 16]);
+        let pixel = [1, 2, 3, 255];
+        let operation = [media::RasterDeltaOperation::Overwrite {
+            x: 0,
+            y: 0,
+            width: 1,
+            height: 1,
+            rgba: &pixel,
+        }];
+        let body =
+            media::raster_delta_frame_body(1, 2, 99, 0, 0, 2, 2, 16, &operation, false).unwrap();
+        let first = media::parse_delta_raster_frame(&body, 2, 2, 16).unwrap();
+        assert_eq!(
+            scene.publish_raster_delta_and_accept(key, first, 2, messages::ALPHA_STRAIGHT),
+            Err(RasterDeltaRejection::NeedFullFrame {
+                reason: messages::NEED_FULL_FRAME_BASE_UNAVAILABLE,
+                notify: true,
+            })
+        );
+        let second = media::parse_delta_raster_frame(&body, 2, 2, 16).unwrap();
+        assert_eq!(
+            scene.publish_raster_delta_and_accept(key, second, 2, messages::ALPHA_STRAIGHT),
+            Err(RasterDeltaRejection::NeedFullFrame {
+                reason: messages::NEED_FULL_FRAME_BASE_UNAVAILABLE,
+                notify: false,
+            })
+        );
+        assert_eq!(scene.source_observation(key).unwrap().last_media_id, 1);
+        assert_eq!(scene.lock().sources[&key].latest_frame.as_ref().unwrap().frame_id, 1);
+
+        accept_raster_full(&scene, key, 1, 3, 2, 2, vec![0; 16]);
+        let recovered =
+            media::raster_delta_frame_body(1, 4, 3, 0, 0, 2, 2, 16, &operation, false).unwrap();
+        let recovered = media::parse_delta_raster_frame(&recovered, 2, 2, 16).unwrap();
+        assert!(
+            scene
+                .publish_raster_delta_and_accept(key, recovered, 4, messages::ALPHA_STRAIGHT)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn raster_delta_damage_budget_falls_back_until_a_full_frame() {
+        let scene = SharedScene::default();
+        let key = (1, 42);
+        add_delta_raster(&scene, key.1, 2, 2);
+        accept_raster_full(&scene, key, 1, 1, 2, 2, vec![0; 16]);
+        let pixels = [9_u8; 16];
+        let operation = [media::RasterDeltaOperation::Overwrite {
+            x: 0,
+            y: 0,
+            width: 2,
+            height: 2,
+            rgba: &pixels,
+        }];
+        for frame_id in 2..=1 + RASTER_DAMAGE_FRAME_EQUIVALENTS {
+            let body = media::raster_delta_frame_body(
+                1,
+                frame_id,
+                frame_id - 1,
+                0,
+                0,
+                2,
+                2,
+                16,
+                &operation,
+                false,
+            )
+            .unwrap();
+            let delta = media::parse_delta_raster_frame(&body, 2, 2, 16).unwrap();
+            assert!(
+                scene
+                    .publish_raster_delta_and_accept(key, delta, frame_id, messages::ALPHA_STRAIGHT)
+                    .is_ok()
+            );
+        }
+        let rejected_id = RASTER_DAMAGE_FRAME_EQUIVALENTS + 2;
+        let body = media::raster_delta_frame_body(
+            1,
+            rejected_id,
+            rejected_id - 1,
+            0,
+            0,
+            2,
+            2,
+            16,
+            &operation,
+            false,
+        )
+        .unwrap();
+        let delta = media::parse_delta_raster_frame(&body, 2, 2, 16).unwrap();
+        assert_eq!(
+            scene.publish_raster_delta_and_accept(
+                key,
+                delta,
+                rejected_id,
+                messages::ALPHA_STRAIGHT
+            ),
+            Err(RasterDeltaRejection::NeedFullFrame {
+                reason: messages::NEED_FULL_FRAME_DAMAGE_BUDGET,
+                notify: true,
+            })
+        );
+        assert_eq!(scene.source_observation(key).unwrap().last_media_id, rejected_id - 1);
+        accept_raster_full(&scene, key, 1, rejected_id + 1, 2, 2, vec![0; 16]);
+        assert!(!scene.lock().sources[&key].raster_requires_full);
     }
 
     #[test]
@@ -2439,6 +2990,7 @@ mod tests {
                             alpha_mode: messages::ALPHA_STRAIGHT,
                             sar_num: 1,
                             sar_den: 1,
+                            damage: None,
                         },
                     )
                     .unwrap();
@@ -2825,6 +3377,7 @@ mod tests {
                     alpha_mode: vivid_protocol::messages::ALPHA_STRAIGHT,
                     sar_num: 1,
                     sar_den: 1,
+                    damage: None,
                 },
             )
             .unwrap();
@@ -3039,6 +3592,7 @@ mod tests {
                     alpha_mode: vivid_protocol::messages::ALPHA_STRAIGHT,
                     sar_num: 1,
                     sar_den: 1,
+                    damage: None,
                 },
             )
             .unwrap();
@@ -3112,6 +3666,7 @@ mod tests {
                     alpha_mode: vivid_protocol::messages::ALPHA_STRAIGHT,
                     sar_num: 1,
                     sar_den: 1,
+                    damage: None,
                 },
             )
             .unwrap();
