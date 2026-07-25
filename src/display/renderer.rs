@@ -14,7 +14,9 @@ use winit::window::Window as WinitWindow;
 use crate::terminal::graphics::GraphicsCommand;
 
 use crate::display::SizeInfo;
-use crate::display::media::{CaptureRedaction, VividMediaRenderer};
+#[cfg(unix)]
+use crate::display::media::CaptureRedaction;
+use crate::display::media::VividMediaRenderer;
 
 #[derive(Debug)]
 pub enum Error {
