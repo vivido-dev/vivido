@@ -41,8 +41,8 @@ use crate::terminal::term::{ResizePoint, Term};
 use crate::vivid::audio::AudioOutput;
 use crate::vivid::decoder::{DecodedFrame, Decoder};
 use crate::vivid::scene::{
-    Frame, SceneMutation, SceneNode, SessionId, SessionObservationSnapshot, SharedScene,
-    SourceConfig, SourceKey, SourceObservation, SourceWaitEvaluation,
+    Frame, MediaBarrierWait, SceneMutation, SceneNode, SessionId, SessionObservationSnapshot,
+    SharedScene, SourceConfig, SourceKey, SourceObservation, SourceWaitEvaluation,
 };
 use crate::vivid::transport::{Reader, TraceChannel, Writer};
 
@@ -68,6 +68,7 @@ const MAX_PENDING_REQUESTS: usize = MAX_PENDING_OPERATIONS + MAX_REGISTERED_WAIT
 const MAX_OBSERVATION_QUEUE: usize = 64;
 const MAX_OBSERVATIONS_PER_TICK: usize = 8;
 const PENDING_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
+const MEDIA_ORDER_BARRIER_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 const CONTROL_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
@@ -1459,6 +1460,7 @@ fn is_supported_feature(feature: u64) -> bool {
             | messages::FEATURE_DELEGATED_CONTEXT_V1
             | messages::FEATURE_SOURCE_CAPTURE_POLICY_V1
             | messages::FEATURE_SOURCE_DESCRIPTOR_V1
+            | messages::FEATURE_MEDIA_ORDER_BARRIER_V1
     )
 }
 
@@ -1611,6 +1613,55 @@ fn media_time_reached(shared: &Arc<ServiceShared>, source: SourceKey, pts_us: i6
         return Some(output.pts_reached(pts_us));
     }
     shared.scene.presentation_due(source, pts_us)
+}
+
+fn apply_eos(shared: &Arc<ServiceShared>, key: SourceKey, epoch: u32) -> Result<(), ProtocolError> {
+    let linked_audio = shared.scene.linked_audio_sources(key);
+    shared.scene.signal_eos(key, epoch).map_err(|message| ProtocolError {
+        code: messages::ERROR_STALE_EPOCH,
+        message,
+        fatal: false,
+    })?;
+    for audio_key in linked_audio {
+        shared.scene.signal_eos(audio_key, epoch).map_err(|message| ProtocolError {
+            code: messages::ERROR_STALE_EPOCH,
+            message,
+            fatal: false,
+        })?;
+    }
+    let audio_keys = if matches!(shared.scene.source_config(key), Some(SourceConfig::Audio(_))) {
+        vec![key]
+    } else {
+        shared.scene.linked_audio_sources(key)
+    };
+    for audio_key in audio_keys {
+        let output = shared
+            .audio_outputs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&audio_key)
+            .cloned();
+        let Some(output) = output else {
+            continue;
+        };
+        output.signal_eos();
+        let scene = shared.scene.clone();
+        thread::Builder::new()
+            .name("vivid-audio-playback-end".into())
+            .spawn(move || {
+                if output.wait_drained().is_ok()
+                    && let Err(error) = scene.mark_playback_ended(audio_key)
+                {
+                    log::debug!("Could not record drained audio source {audio_key:?}: {error}");
+                }
+            })
+            .map_err(|_| ProtocolError {
+                code: messages::ERROR_LIMIT_EXCEEDED,
+                message: "could not start audio completion observer",
+                fatal: false,
+            })?;
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -3461,59 +3512,77 @@ fn dispatch_control(
                 .map_err(|_| bad("could not acknowledge FLUSH"))?;
         },
         messages::EOS => {
-            let (envelope, source_id, epoch) =
+            let (envelope, request) =
                 messages::parse_eos(&record.body).map_err(|_| bad("invalid EOS"))?;
-            if record.object_id != source_id {
+            if record.object_id != request.source_id {
                 return Err(bad("EOS object ID mismatch"));
             }
-            let key = (session_id, source_id);
-            let linked_audio = shared.scene.linked_audio_sources(key);
-            shared.scene.signal_eos(key, epoch).map_err(|message| ProtocolError {
-                code: messages::ERROR_STALE_EPOCH,
-                message,
-                fatal: false,
-            })?;
-            for audio_key in linked_audio {
-                shared.scene.signal_eos(audio_key, epoch).map_err(|message| ProtocolError {
-                    code: messages::ERROR_STALE_EPOCH,
-                    message,
+            let key = (session_id, request.source_id);
+            if let Some(barrier) = request.barrier {
+                if !negotiated(shared, session_id, messages::FEATURE_MEDIA_ORDER_BARRIER_V1) {
+                    return Err(ProtocolError {
+                        code: messages::ERROR_UNSUPPORTED_FEATURE,
+                        message: "media-order barrier was not negotiated",
+                        fatal: false,
+                    });
+                }
+                let observation = shared.scene.source_observation(key).ok_or(ProtocolError {
+                    code: messages::ERROR_NOT_FOUND,
+                    message: "source does not exist",
                     fatal: false,
                 })?;
-            }
-            let audio_keys =
-                if matches!(shared.scene.source_config(key), Some(SourceConfig::Audio(_))) {
-                    vec![key]
-                } else {
-                    shared.scene.linked_audio_sources(key)
-                };
-            for audio_key in audio_keys {
-                let output = shared
-                    .audio_outputs
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .get(&audio_key)
-                    .cloned();
-                let Some(output) = output else {
-                    continue;
-                };
-                output.signal_eos();
+                if observation.attachment_generation != barrier.attachment_generation {
+                    return Err(ProtocolError {
+                        code: messages::ERROR_BAD_STATE,
+                        message: "EOS attachment generation is not current",
+                        fatal: false,
+                    });
+                }
                 let scene = shared.scene.clone();
-                thread::Builder::new()
-                    .name("vivid-audio-playback-end".into())
-                    .spawn(move || {
-                        if output.wait_drained().is_ok()
-                            && let Err(error) = scene.mark_playback_ended(audio_key)
-                        {
-                            log::debug!(
-                                "Could not record drained audio source {audio_key:?}: {error}"
-                            );
+                let worker_shared = shared.clone();
+                let source_id = request.source_id;
+                let epoch = request.epoch;
+                let request_id = envelope.request_id;
+                spawn_pending_operation(
+                    pending,
+                    writer,
+                    request_id,
+                    source_id,
+                    "vivid-media-order-barrier",
+                    move || {
+                        match scene.wait_media_barrier(
+                            key,
+                            barrier.attachment_generation,
+                            barrier.final_record_sequence,
+                            MEDIA_ORDER_BARRIER_TIMEOUT,
+                        ) {
+                            MediaBarrierWait::Accepted => apply_eos(&worker_shared, key, epoch)?,
+                            MediaBarrierWait::TimedOut => {
+                                return Err(ProtocolError {
+                                    code: messages::ERROR_TIMEOUT,
+                                    message: "EOS media-order barrier timed out",
+                                    fatal: false,
+                                });
+                            },
+                            MediaBarrierWait::AttachmentChanged
+                            | MediaBarrierWait::AttachmentClosed
+                            | MediaBarrierWait::SourceLost => {
+                                return Err(ProtocolError {
+                                    code: messages::ERROR_BAD_STATE,
+                                    message: "EOS media attachment ended before the barrier",
+                                    fatal: false,
+                                });
+                            },
                         }
-                    })
-                    .map_err(|_| bad("could not start audio completion observer"))?;
+                        Ok(PendingReply::ok(source_id, request_id))
+                    },
+                )?;
+            } else {
+                apply_eos(shared, key, request.epoch)?;
+                writer
+                    .write_ok(messages::OK, request.source_id, envelope.request_id)
+                    .map_err(|_| bad("could not acknowledge EOS"))?;
             }
-            writer
-                .write_ok(messages::OK, source_id, envelope.request_id)
-                .map_err(|_| bad("could not acknowledge EOS"))?;
         },
         messages::DRAIN => {
             if !negotiated(shared, session_id, messages::FEATURE_AUDIO_ACCESS_UNIT_V1) {
