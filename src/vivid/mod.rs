@@ -27,7 +27,7 @@ use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use vivid_protocol::anchor::{self, AnchorKey};
 use vivid_protocol::media::{self, VIDEO_PACKET_KEY};
-use vivid_protocol::messages::{self, Credits, DisplayChanged};
+use vivid_protocol::messages::{self, DisplayChanged};
 use vivid_protocol::wire::{ConnectionKind, RECORD_OPTIONAL, Record};
 use vivid_protocol::{VIVID_MAJOR, VIVID_MINOR};
 
@@ -310,8 +310,10 @@ impl VividService {
                 }),
             )
         });
-        let removed = self.scene.apply_anchor_resize(updates);
-        self.notify_anchor_events(messages::ANCHOR_GONE, removed);
+        match self.scene.apply_anchor_resize(updates) {
+            Ok(removed) => self.notify_anchor_events(messages::ANCHOR_GONE, removed),
+            Err(error) => log::error!("Could not advance scene revision during resize: {error}"),
+        }
     }
 
     pub fn handle_terminal_marker(&self, marker: &str, line: i32, column: usize, alternate: bool) {
@@ -361,22 +363,30 @@ impl VividService {
     }
 
     pub fn handle_grid_scroll(&self, origin: i32, end: i32, lines: i32, history_size: usize) {
-        let removed = self.scene.scroll_anchors(origin, end, lines, history_size);
-        self.notify_anchor_events(messages::ANCHOR_GONE, removed);
+        match self.scene.scroll_anchors(origin, end, lines, history_size) {
+            Ok(removed) => self.notify_anchor_events(messages::ANCHOR_GONE, removed),
+            Err(error) => log::error!("Could not advance scene revision during scroll: {error}"),
+        }
         wake(&self.shared);
     }
 
     pub fn handle_terminal_clear(&self) {
-        let removed = self.scene.clear_terminal();
-        self.notify_anchor_events(messages::ANCHOR_GONE, removed);
+        match self.scene.clear_terminal() {
+            Ok(removed) => self.notify_anchor_events(messages::ANCHOR_GONE, removed),
+            Err(error) => log::error!("Could not advance scene revision during clear: {error}"),
+        }
         wake(&self.shared);
     }
 
     /// The terminal switched between the primary and alternate screens. Anchored media on the
     /// inactive screen is hidden; anchors created on the alternate screen are gone once it exits.
     pub fn handle_screen_swap(&self, alternate: bool) {
-        let removed = self.scene.set_alternate_screen(alternate);
-        self.notify_anchor_events(messages::ANCHOR_GONE, removed);
+        match self.scene.set_alternate_screen(alternate) {
+            Ok(removed) => self.notify_anchor_events(messages::ANCHOR_GONE, removed),
+            Err(error) => {
+                log::error!("Could not advance scene revision during screen switch: {error}");
+            },
+        }
         wake(&self.shared);
     }
 
@@ -582,7 +592,7 @@ fn handle_control(reader: &mut Reader, shared: Arc<ServiceShared>) -> io::Result
     writer.write_record(
         messages::WELCOME,
         0,
-        &messages::welcome(
+        &messages::welcome_preserving_at_scene_revision(
             request_id,
             session_id,
             &session_tag,
@@ -597,6 +607,8 @@ fn handle_control(reader: &mut Reader, shared: Arc<ServiceShared>) -> io::Result
                 cell_height: metrics.cell_height,
             },
             &accepted_features,
+            shared.scene.scene_revision(session_id),
+            &[],
         ),
     )?;
     log::info!("Authenticated Vivid producer {:?} as session {session_id}", hello.producer);
@@ -1352,13 +1364,16 @@ fn dispatch_control(
                 message: "transaction has not begun",
                 fatal: false,
             })?;
-            shared.scene.commit_mutations(session_id, nodes).map_err(|message| ProtocolError {
-                code: messages::ERROR_BAD_STATE,
-                message,
-                fatal: false,
-            })?;
+            let scene_revision =
+                shared.scene.commit_mutations(session_id, nodes).map_err(|message| {
+                    ProtocolError { code: messages::ERROR_BAD_STATE, message, fatal: false }
+                })?;
             writer
-                .write_ok(messages::PRESENTED, 0, envelope.request_id)
+                .write_record(
+                    messages::PRESENTED,
+                    0,
+                    &messages::presented(envelope.request_id, scene_revision),
+                )
                 .map_err(|_| bad("could not acknowledge scene commit"))?;
             // A newly committed node may make a previously off-screen source visible (or vice
             // versa). Visibility is otherwise only recomputed on screen-swap/occlusion/scroll, so
@@ -1496,8 +1511,36 @@ fn dispatch_control(
                     fatal: false,
                 })?;
             }
-            for output in audio_group(shared, key) {
+            let audio_keys =
+                if matches!(shared.scene.source_config(key), Some(SourceConfig::Audio(_))) {
+                    vec![key]
+                } else {
+                    shared.scene.linked_audio_sources(key)
+                };
+            for audio_key in audio_keys {
+                let output = shared
+                    .audio_outputs
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .get(&audio_key)
+                    .cloned();
+                let Some(output) = output else {
+                    continue;
+                };
                 output.signal_eos();
+                let scene = shared.scene.clone();
+                thread::Builder::new()
+                    .name("vivid-audio-playback-end".into())
+                    .spawn(move || {
+                        if output.wait_drained().is_ok()
+                            && let Err(error) = scene.mark_playback_ended(audio_key)
+                        {
+                            log::debug!(
+                                "Could not record drained audio source {audio_key:?}: {error}"
+                            );
+                        }
+                    })
+                    .map_err(|_| bad("could not start audio completion observer"))?;
             }
             writer
                 .write_ok(messages::OK, source_id, envelope.request_id)
@@ -1589,17 +1632,28 @@ fn prepare_source_ready(
     lock_registry(shared)
         .tickets
         .insert(ticket_bytes.clone(), Ticket { session_id: source_key.0, source_key, kind });
-    Ok(messages::source_ready(
+    let byte_credits = INITIAL_BYTE_CREDITS.max(u64::from(max_media_body));
+    let initial_source_revision = shared
+        .scene
+        .source_observation(source_key)
+        .ok_or_else(|| invalid("source disappeared before SOURCE_READY"))?
+        .revision;
+    messages::source_ready_with_observability(
         request_id,
-        source_key.1,
-        &ticket_bytes,
-        Credits {
-            bytes: INITIAL_BYTE_CREDITS.max(u64::from(max_media_body)),
-            packets: INITIAL_PACKET_CREDITS,
-            fragments: 0,
+        &messages::SourceReady {
+            source_id: source_key.1,
+            media_ticket: ticket_bytes,
+            byte_credits,
+            packet_credits: INITIAL_PACKET_CREDITS,
+            fragment_credits: 0,
+            max_media_body,
+            rolling_byte_window: byte_credits,
+            rolling_packet_window: INITIAL_PACKET_CREDITS,
+            initial_source_revision,
+            media_connection_required: true,
+            delta_operation_limit: None,
         },
-        max_media_body,
-    ))
+    )
 }
 
 fn handle_media(
@@ -1630,6 +1684,7 @@ fn handle_media(
             .ok_or_else(|| io::Error::new(ErrorKind::NotConnected, "control session is gone"))?;
         (ticket, writer)
     };
+    shared.scene.mark_attached(ticket.source_key).map_err(invalid)?;
     let max_media_body = match shared.scene.source_config(ticket.source_key) {
         Some(SourceConfig::Raster(config)) => {
             media::rgba8_raw_frame_body_len(config.width, config.height)
@@ -1653,7 +1708,6 @@ fn handle_media(
         _ => unreachable!(),
     };
     if let Err(error) = result {
-        let _ = shared.scene.remove_source(source_key);
         if let Some(output) = shared
             .audio_outputs
             .lock()
@@ -1668,14 +1722,27 @@ fn handle_media(
         } else {
             messages::ERROR_DECODER
         };
+        let final_revision = shared
+            .scene
+            .lose_source(source_key, code)
+            .map(|observation| observation.revision)
+            .unwrap_or(vivid_protocol::revision::SourceRevision::ZERO);
         let _ = writer.write_record(
             messages::SOURCE_LOST,
             source_key.1,
-            &messages::source_lost(source_key.1, code, &diagnostic),
+            &messages::source_lost_with_observability(
+                source_key.1,
+                code,
+                &diagnostic,
+                final_revision,
+                &messages::ErrorDetail::new(),
+            )
+            .unwrap_or_else(|_| messages::source_lost(source_key.1, code, &diagnostic)),
         );
         wake(&shared);
         return Ok(());
     }
+    let _ = shared.scene.mark_attachment_closed(source_key);
     Ok(())
 }
 
@@ -1734,6 +1801,10 @@ fn handle_raster(
                 },
             )
             .map_err(invalid)?;
+        shared
+            .scene
+            .mark_media_accepted(key, raster.epoch, raster.frame_id, record.sequence, false)
+            .map_err(invalid)?;
         wake(shared);
     }
 }
@@ -1765,6 +1836,7 @@ fn queue_decoded_video_frame(
     pending: &mut VecDeque<QueuedVideoFrame>,
 ) -> io::Result<()> {
     shared.scene.observe_buffered_pts(key, decoded.pts_us).map_err(invalid)?;
+    shared.scene.mark_decoded_output(key, decoded.pts_us).map_err(invalid)?;
     *frame_id = frame_id.saturating_add(1);
     let pixels = u64::from(decoded.width)
         .checked_mul(u64::from(decoded.height))
@@ -1830,6 +1902,7 @@ fn handle_video(
         _ => return Err(invalid("video ticket references a non-video source")),
     };
     let mut decoder = Decoder::new(&config)?;
+    shared.scene.mark_decoder_initialized(key).map_err(invalid)?;
     let mut current_epoch = None;
     let mut sequence = media::MediaSequence::default();
     let mut frame_id = 0_u64;
@@ -1908,6 +1981,8 @@ fn handle_video(
         }
         current_epoch = Some(packet.epoch);
         let epoch = packet.epoch;
+        let packet_id = packet.packet_id;
+        let random_access = packet.flags & VIDEO_PACKET_KEY != 0;
         let decoded_frames = match decoder.push(packet) {
             Ok(frames) => frames,
             Err(_) => {
@@ -1927,6 +2002,10 @@ fn handle_video(
                 continue;
             },
         };
+        shared
+            .scene
+            .mark_media_accepted(key, epoch, packet_id, record.sequence, random_access)
+            .map_err(invalid)?;
         for decoded in decoded_frames {
             while pending.len() >= MAX_QUEUED_VIDEO_FRAMES {
                 if !present_ready_video_frames(shared, key, &mut pending)? {
@@ -1974,6 +2053,9 @@ fn handle_video(
             thread::sleep(Duration::from_millis(2));
         }
     }
+    if pending.is_empty() && shared.scene.eos_epoch(key).is_some() {
+        shared.scene.mark_playback_ended(key).map_err(invalid)?;
+    }
     Ok(())
 }
 
@@ -1996,6 +2078,7 @@ fn handle_audio(
         .ok_or_else(|| invalid("audio output is missing"))?;
     let result = (|| {
         let mut decoder = output.decoder(&config)?;
+        shared.scene.mark_decoder_initialized(key).map_err(invalid)?;
         let mut sequence = media::MediaSequence::default();
         let mut decoder_epoch = None;
         let mut body = Vec::new();
@@ -2027,10 +2110,19 @@ fn handle_audio(
             if packet.data.len() > config.max_access_unit_bytes as usize {
                 return Err(invalid("audio packet exceeds its declared bound"));
             }
+            let packet_id = packet.packet_id;
+            let epoch = packet.epoch;
+            let pts_us = packet.pts_us;
+            let duration_us = packet.duration_us;
             let mut samples = decoder.push(packet)?;
-            output.trim_before_start(packet.pts_us, packet.duration_us, &mut samples);
+            shared
+                .scene
+                .mark_media_accepted(key, epoch, packet_id, record.sequence, false)
+                .map_err(invalid)?;
+            output.trim_before_start(pts_us, duration_us, &mut samples);
             if !samples.is_empty() {
-                output.observe_audio_pts(packet.pts_us);
+                shared.scene.mark_decoded_output(key, pts_us).map_err(invalid)?;
+                output.observe_audio_pts(pts_us);
                 output.push(&samples)?;
             }
         }
@@ -2085,6 +2177,7 @@ fn handle_image(
     limits.max_alloc = Some(decoded_bytes.saturating_add(16 * 1024 * 1024));
     image_reader.limits(limits);
     let decoded = image_reader.decode().map_err(|_| invalid("encoded image decoder failed"))?;
+    shared.scene.mark_decoder_initialized(key).map_err(invalid)?;
     if decoded.dimensions() != (config.width, config.height) {
         return Err(invalid("decoded image dimensions differ from declaration"));
     }
@@ -2106,6 +2199,7 @@ fn handle_image(
             },
         )
         .map_err(invalid)?;
+    shared.scene.mark_media_accepted(key, 1, 1, record.sequence, false).map_err(invalid)?;
     wake(shared);
     Ok(())
 }
@@ -2219,7 +2313,9 @@ fn cleanup_session(shared: &Arc<ServiceShared>, session_id: SessionId) {
     for output in outputs {
         output.stop();
     }
-    shared.scene.detach_session(session_id);
+    if let Err(error) = shared.scene.detach_session(session_id) {
+        log::error!("Could not advance scene revision during session cleanup: {error}");
+    }
 }
 
 fn lock_registry(shared: &Arc<ServiceShared>) -> std::sync::MutexGuard<'_, Registry> {
@@ -2242,12 +2338,15 @@ fn lock_render_state(shared: &Arc<ServiceShared>) -> std::sync::MutexGuard<'_, (
 fn emit_visibility(shared: &Arc<ServiceShared>) {
     let (renderable, display_offset) = *lock_render_state(shared);
     let metrics = *lock_metrics(shared);
-    let states = shared.scene.aggregate_visibility(
+    let Ok(states) = shared.scene.aggregate_visibility(
         metrics.columns,
         metrics.rows,
         display_offset,
         renderable,
-    );
+    ) else {
+        log::error!("Could not advance source revision while updating visibility");
+        return;
+    };
     let mut registry = lock_registry(shared);
     for ((session_id, source_id), visible, reasons) in states {
         let Some(session) = registry.sessions.get_mut(&session_id) else { continue };
@@ -2797,6 +2896,7 @@ mod tests {
         let mut control = Connection::open(&endpoint, ConnectionKind::Control).unwrap();
         control.write_record(messages::HELLO, 0, 0, &messages::hello(1, service.token())).unwrap();
         let welcome = parse_welcome(&control.read_record().unwrap().body).unwrap();
+        assert_eq!(welcome.initial_scene_revision, vivid_protocol::revision::SceneRevision::ZERO);
         let token: [u8; 32] = *anchor::decode_token(service.token()).unwrap();
         let tag: [u8; 16] = welcome.session_tag.as_slice().try_into().unwrap();
         let key = anchor::derive_key(&token, &tag);
@@ -2863,7 +2963,17 @@ mod tests {
         control
             .write_record(messages::COMMIT_TXN, 0, 0, &messages::commit_transaction(5, 3, 2))
             .unwrap();
-        while messages::request_id(&control.read_record().unwrap().body).unwrap() != 5 {}
+        let presented = loop {
+            let record = control.read_record().unwrap();
+            if messages::request_id(&record.body).unwrap() == 5 {
+                break record;
+            }
+        };
+        assert_eq!(presented.record_type, messages::PRESENTED);
+        assert_eq!(
+            messages::parse_presented(&presented.body).unwrap(),
+            (5, vivid_protocol::revision::SceneRevision::new(1))
+        );
 
         let mut media_channel = Connection::open(&endpoint, ConnectionKind::Raster).unwrap();
         media_channel

@@ -296,6 +296,14 @@ impl VividMediaRenderer {
             }
         }
         queue.submit([encoder.finish()]);
+        for (item, _) in &rendered {
+            if let Err(error) = scene.mark_presented(item.source_key, item.frame.pts_us, true) {
+                log::warn!(
+                    "Could not record Vivid presentation for source {:?}: {error}",
+                    item.source_key
+                );
+            }
+        }
         renderer.mark_override_image_dirty(&target.image);
         Some(target.image.clone())
     }

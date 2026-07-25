@@ -1,13 +1,14 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use vivid_protocol::media;
 use vivid_protocol::messages::{
-    ClipRect, ImageSourceConfig, MAX_SCENE_NODES, ParsedAudioSourceConfig, ParsedSceneNode,
+    self, ClipRect, ImageSourceConfig, MAX_SCENE_NODES, ParsedAudioSourceConfig, ParsedSceneNode,
     ParsedVideoSourceConfig, PlayRequest, RasterSourceConfig, SceneValidationKey,
     SceneValidationNode, SceneValidationSource, validate_scene_snapshot,
 };
+use vivid_protocol::revision::{SceneRevision, SourceRevision};
 
 pub type SessionId = u64;
 pub type SourceKey = (SessionId, u64);
@@ -17,6 +18,8 @@ const MAX_SOURCES: usize = 64;
 const MAX_DECODED_PIXELS: u64 = 8192 * 8192 * 2;
 const MAX_RESERVED_INGRESS_BYTES: u64 = 256 * 1024 * 1024;
 const RESERVED_INGRESS_WINDOW: u64 = 4 * 1024 * 1024;
+const MAX_SOURCE_TOMBSTONES: usize = 32;
+const SOURCE_TOMBSTONE_TTL: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone)]
 pub enum SourceConfig {
@@ -134,6 +137,17 @@ pub struct RenderItem {
 #[derive(Debug)]
 struct Source {
     config: SourceConfig,
+    revision: SourceRevision,
+    lifecycle: u64,
+    milestones: u64,
+    attachment_state: u64,
+    attachment_generation: u64,
+    last_media_id: u64,
+    last_media_sequence: u64,
+    last_decoded_pts_us: i64,
+    last_presented_pts_us: i64,
+    last_presentation_id: u64,
+    visible: bool,
     latest_frame: Option<Frame>,
     play_started: Option<Instant>,
     played_before_pause: Duration,
@@ -144,15 +158,41 @@ struct Source {
     eos_epoch: Option<u32>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourceObservation {
+    pub revision: SourceRevision,
+    pub lifecycle: u64,
+    pub milestones: u64,
+    pub epoch: u32,
+    pub attachment_state: u64,
+    pub attachment_generation: u64,
+    pub last_media_id: u64,
+    pub last_media_sequence: u64,
+    pub last_decoded_pts_us: i64,
+    pub last_presented_pts_us: i64,
+    pub last_presentation_id: u64,
+    pub visible: bool,
+    pub terminal_loss_code: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+struct SourceTombstone {
+    observation: SourceObservation,
+    expires_at: Instant,
+}
+
 #[derive(Debug, Default)]
 struct State {
     sources: HashMap<SourceKey, Source>,
+    tombstones: HashMap<SourceKey, SourceTombstone>,
+    tombstone_order: VecDeque<SourceKey>,
     nodes: HashMap<(SessionId, u64), SceneNode>,
     anchors: HashMap<AnchorKey, TextAnchor>,
     detached_sessions: HashSet<SessionId>,
     decoded_pixels: u64,
     queued_pixels: u64,
     revision: u64,
+    scene_revisions: HashMap<SessionId, SceneRevision>,
     alternate_screen: bool,
 }
 
@@ -164,6 +204,66 @@ struct Inner {
 
 #[derive(Clone, Debug, Default)]
 pub struct SharedScene(Arc<Inner>);
+
+fn advance_scene_revision(
+    state: &mut State,
+    session_id: SessionId,
+) -> Result<SceneRevision, &'static str> {
+    let revision = state.scene_revisions.entry(session_id).or_default();
+    *revision = revision.advance().map_err(|_| "scene revision exhausted")?;
+    Ok(*revision)
+}
+
+fn advance_changed_scenes(
+    state: &mut State,
+    sessions: impl IntoIterator<Item = SessionId>,
+) -> Result<(), &'static str> {
+    for session_id in sessions.into_iter().collect::<HashSet<_>>() {
+        advance_scene_revision(state, session_id)?;
+    }
+    Ok(())
+}
+
+fn advance_source_revision(source: &mut Source) -> Result<SourceRevision, &'static str> {
+    source.revision = source.revision.advance().map_err(|_| "source revision exhausted")?;
+    Ok(source.revision)
+}
+
+fn set_milestone(source: &mut Source, milestone: u64) -> bool {
+    let previous = source.milestones;
+    source.milestones |= milestone;
+    source.milestones != previous
+}
+
+fn observation(source: &Source, terminal_loss_code: Option<u64>) -> SourceObservation {
+    SourceObservation {
+        revision: source.revision,
+        lifecycle: source.lifecycle,
+        milestones: source.milestones,
+        epoch: source.last_epoch,
+        attachment_state: source.attachment_state,
+        attachment_generation: source.attachment_generation,
+        last_media_id: source.last_media_id,
+        last_media_sequence: source.last_media_sequence,
+        last_decoded_pts_us: source.last_decoded_pts_us,
+        last_presented_pts_us: source.last_presented_pts_us,
+        last_presentation_id: source.last_presentation_id,
+        visible: source.visible,
+        terminal_loss_code,
+    }
+}
+
+fn purge_expired_tombstones(state: &mut State, now: Instant) {
+    while let Some(key) = state.tombstone_order.front().copied() {
+        let expired =
+            state.tombstones.get(&key).is_none_or(|tombstone| tombstone.expires_at <= now);
+        if !expired {
+            break;
+        }
+        state.tombstone_order.pop_front();
+        state.tombstones.remove(&key);
+    }
+}
 
 fn insert_anchor(
     state: &mut State,
@@ -204,7 +304,7 @@ impl SharedScene {
     pub fn apply_anchor_resize(
         &self,
         positions: impl IntoIterator<Item = (AnchorKey, Option<(usize, i32, bool)>)>,
-    ) -> Vec<AnchorKey> {
+    ) -> Result<Vec<AnchorKey>, &'static str> {
         let mut state = self.lock();
         let mut removed = Vec::new();
         let mut changed = false;
@@ -225,6 +325,16 @@ impl SharedScene {
 
         if !removed.is_empty() {
             let removed_set = removed.iter().copied().collect::<HashSet<_>>();
+            let changed_sessions = state
+                .nodes
+                .iter()
+                .filter_map(|(&(session_id, _), node)| {
+                    node.anchor_id
+                        .is_some_and(|anchor_id| removed_set.contains(&(session_id, anchor_id)))
+                        .then_some(session_id)
+                })
+                .collect::<Vec<_>>();
+            advance_changed_scenes(&mut state, changed_sessions)?;
             state.anchors.retain(|key, _| !removed_set.contains(key));
             state.nodes.retain(|(session_id, _), node| {
                 node.anchor_id
@@ -236,7 +346,7 @@ impl SharedScene {
         if changed {
             state.revision = state.revision.wrapping_add(1);
         }
-        removed
+        Ok(removed)
     }
 
     #[cfg(test)]
@@ -269,10 +379,10 @@ impl SharedScene {
     /// Record which screen the terminal presents. Anchors belonging to the inactive screen stay
     /// registered but hidden; anchors created on the alternate screen are discarded when that
     /// screen is left, because its content does not survive the switch.
-    pub fn set_alternate_screen(&self, alternate: bool) -> Vec<AnchorKey> {
+    pub fn set_alternate_screen(&self, alternate: bool) -> Result<Vec<AnchorKey>, &'static str> {
         let mut state = self.lock();
         if state.alternate_screen == alternate {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         state.alternate_screen = alternate;
         let mut removed = Vec::new();
@@ -285,6 +395,16 @@ impl SharedScene {
                 .collect();
             if !removed.is_empty() {
                 let removed_set = removed.iter().copied().collect::<HashSet<_>>();
+                let changed_sessions = state
+                    .nodes
+                    .iter()
+                    .filter_map(|(&(session_id, _), node)| {
+                        node.anchor_id
+                            .is_some_and(|anchor_id| removed_set.contains(&(session_id, anchor_id)))
+                            .then_some(session_id)
+                    })
+                    .collect::<Vec<_>>();
+                advance_changed_scenes(&mut state, changed_sessions)?;
                 state.anchors.retain(|key, _| !removed_set.contains(key));
                 state.nodes.retain(|(session_id, _), node| {
                     node.anchor_id
@@ -295,7 +415,7 @@ impl SharedScene {
         }
         state.revision = state.revision.wrapping_add(1);
         self.0.playback_changed.notify_all();
-        removed
+        Ok(removed)
     }
 
     pub fn add_source(
@@ -306,7 +426,8 @@ impl SharedScene {
     ) -> Result<(), &'static str> {
         let mut state = self.lock();
         let key = (session_id, source_id);
-        if state.sources.contains_key(&key) {
+        purge_expired_tombstones(&mut state, Instant::now());
+        if state.sources.contains_key(&key) || state.tombstones.contains_key(&key) {
             return Err("source ID already exists");
         }
         if state.sources.len() >= MAX_SOURCES {
@@ -348,6 +469,17 @@ impl SharedScene {
             key,
             Source {
                 config,
+                revision: SourceRevision::new(1),
+                lifecycle: messages::SOURCE_LIFECYCLE_CREATED,
+                milestones: 0,
+                attachment_state: messages::ATTACHMENT_NEVER,
+                attachment_generation: 0,
+                last_media_id: 0,
+                last_media_sequence: 0,
+                last_decoded_pts_us: 0,
+                last_presented_pts_us: 0,
+                last_presentation_id: 0,
+                visible: false,
                 latest_frame: None,
                 play_started: None,
                 played_before_pause: Duration::ZERO,
@@ -363,6 +495,142 @@ impl SharedScene {
 
     pub fn source_config(&self, key: SourceKey) -> Option<SourceConfig> {
         self.lock().sources.get(&key).map(|source| source.config.clone())
+    }
+
+    pub fn scene_revision(&self, session_id: SessionId) -> SceneRevision {
+        self.lock().scene_revisions.get(&session_id).copied().unwrap_or_default()
+    }
+
+    pub fn source_observation(&self, key: SourceKey) -> Option<SourceObservation> {
+        let mut state = self.lock();
+        purge_expired_tombstones(&mut state, Instant::now());
+        state
+            .sources
+            .get(&key)
+            .map(|source| observation(source, None))
+            .or_else(|| state.tombstones.get(&key).map(|tombstone| tombstone.observation))
+    }
+
+    pub fn mark_attached(&self, key: SourceKey) -> Result<SourceObservation, &'static str> {
+        let mut state = self.lock();
+        let source = state.sources.get_mut(&key).ok_or("source does not exist")?;
+        source.attachment_generation =
+            source.attachment_generation.checked_add(1).ok_or("attachment generation exhausted")?;
+        source.attachment_state = messages::ATTACHMENT_ATTACHED;
+        source.lifecycle = messages::SOURCE_LIFECYCLE_ATTACHED;
+        set_milestone(source, messages::MILESTONE_MEDIA_ATTACHED);
+        advance_source_revision(source)?;
+        Ok(observation(source, None))
+    }
+
+    pub fn mark_attachment_closed(&self, key: SourceKey) -> Result<(), &'static str> {
+        let mut state = self.lock();
+        let source = state.sources.get_mut(&key).ok_or("source does not exist")?;
+        if source.attachment_state != messages::ATTACHMENT_CLOSED {
+            source.attachment_state = messages::ATTACHMENT_CLOSED;
+            advance_source_revision(source)?;
+        }
+        Ok(())
+    }
+
+    pub fn mark_media_accepted(
+        &self,
+        key: SourceKey,
+        epoch: u32,
+        media_id: u64,
+        record_sequence: u64,
+        random_access: bool,
+    ) -> Result<(), &'static str> {
+        let mut state = self.lock();
+        let source = state.sources.get_mut(&key).ok_or("source does not exist")?;
+        if epoch < source.last_epoch {
+            return Err("stale source epoch");
+        }
+        let mut changed = source.last_epoch != epoch;
+        source.last_epoch = epoch;
+        source.last_media_id = media_id;
+        source.last_media_sequence = record_sequence;
+        changed |= source.lifecycle != messages::SOURCE_LIFECYCLE_ACTIVE;
+        source.lifecycle = messages::SOURCE_LIFECYCLE_ACTIVE;
+        changed |= set_milestone(source, messages::MILESTONE_FIRST_MEDIA_RECORD);
+        if random_access {
+            changed |= set_milestone(source, messages::MILESTONE_RANDOM_ACCESS_ACCEPTED);
+        }
+        if changed {
+            advance_source_revision(source)?;
+        }
+        Ok(())
+    }
+
+    pub fn mark_decoder_initialized(&self, key: SourceKey) -> Result<(), &'static str> {
+        self.mark_source_milestone(key, messages::MILESTONE_DECODER_INITIALIZED)
+    }
+
+    pub fn mark_decoded_output(&self, key: SourceKey, pts_us: i64) -> Result<(), &'static str> {
+        let mut state = self.lock();
+        let source = state.sources.get_mut(&key).ok_or("source does not exist")?;
+        source.last_decoded_pts_us = pts_us;
+        if set_milestone(source, messages::MILESTONE_FIRST_DECODED_OUTPUT) {
+            advance_source_revision(source)?;
+        }
+        self.0.playback_changed.notify_all();
+        Ok(())
+    }
+
+    pub fn mark_presented(
+        &self,
+        key: SourceKey,
+        pts_us: i64,
+        visible: bool,
+    ) -> Result<(), &'static str> {
+        let mut state = self.lock();
+        let source = state.sources.get_mut(&key).ok_or("source does not exist")?;
+        source.last_presentation_id =
+            source.last_presentation_id.checked_add(1).ok_or("presentation ID exhausted")?;
+        source.last_presented_pts_us = pts_us;
+        if visible && set_milestone(source, messages::MILESTONE_FIRST_VISIBLE_PRESENTATION) {
+            advance_source_revision(source)?;
+        }
+        self.0.playback_changed.notify_all();
+        Ok(())
+    }
+
+    pub fn mark_playback_ended(&self, key: SourceKey) -> Result<(), &'static str> {
+        let mut state = self.lock();
+        let source = state.sources.get_mut(&key).ok_or("source does not exist")?;
+        let lifecycle_changed = source.lifecycle != messages::SOURCE_LIFECYCLE_ENDED;
+        let milestone_changed = set_milestone(source, messages::MILESTONE_PLAYBACK_ENDED);
+        source.lifecycle = messages::SOURCE_LIFECYCLE_ENDED;
+        if lifecycle_changed || milestone_changed {
+            advance_source_revision(source)?;
+        }
+        self.0.playback_changed.notify_all();
+        Ok(())
+    }
+
+    #[allow(dead_code)] // Called by the Stage 3 policy command path.
+    pub fn mark_policy_changed(&self, key: SourceKey) -> Result<(), &'static str> {
+        let mut state = self.lock();
+        let source = state.sources.get_mut(&key).ok_or("source does not exist")?;
+        advance_source_revision(source)?;
+        Ok(())
+    }
+
+    #[allow(dead_code)] // Called by the Stage 3 descriptor command path.
+    pub fn mark_descriptor_changed(&self, key: SourceKey) -> Result<(), &'static str> {
+        let mut state = self.lock();
+        let source = state.sources.get_mut(&key).ok_or("source does not exist")?;
+        advance_source_revision(source)?;
+        Ok(())
+    }
+
+    fn mark_source_milestone(&self, key: SourceKey, milestone: u64) -> Result<(), &'static str> {
+        let mut state = self.lock();
+        let source = state.sources.get_mut(&key).ok_or("source does not exist")?;
+        if set_milestone(source, milestone) {
+            advance_source_revision(source)?;
+        }
+        Ok(())
     }
 
     pub fn start_playback(&self, key: SourceKey, request: PlayRequest) -> Result<(), &'static str> {
@@ -382,7 +650,12 @@ impl SharedScene {
             source.played_before_pause = Duration::ZERO;
             source.play_started = None;
         }
-        maybe_start_buffered(source);
+        source.lifecycle = messages::SOURCE_LIFECYCLE_ACTIVE;
+        let started = maybe_start_buffered(source);
+        if started {
+            set_milestone(source, messages::MILESTONE_PLAYBACK_STARTED);
+        }
+        advance_source_revision(source)?;
         self.0.playback_changed.notify_all();
         Ok(())
     }
@@ -393,7 +666,10 @@ impl SharedScene {
         let source = state.sources.get_mut(&key).ok_or("source does not exist")?;
         source.buffered_until_pts_us =
             Some(source.buffered_until_pts_us.map_or(pts_us, |current| current.max(pts_us)));
-        maybe_start_buffered(source);
+        if maybe_start_buffered(source) {
+            set_milestone(source, messages::MILESTONE_PLAYBACK_STARTED);
+            advance_source_revision(source)?;
+        }
         self.0.playback_changed.notify_all();
         Ok(())
     }
@@ -416,6 +692,8 @@ impl SharedScene {
             source.played_before_pause =
                 source.played_before_pause.saturating_add(started.elapsed());
         }
+        source.lifecycle = messages::SOURCE_LIFECYCLE_PAUSED;
+        advance_source_revision(source)?;
         self.0.playback_changed.notify_all();
         Ok(())
     }
@@ -435,6 +713,8 @@ impl SharedScene {
         source.play_request = None;
         source.buffered_until_pts_us = None;
         source.eos_epoch = None;
+        source.lifecycle = messages::SOURCE_LIFECYCLE_PAUSED;
+        advance_source_revision(source)?;
         self.0.playback_changed.notify_all();
         Ok(())
     }
@@ -445,8 +725,18 @@ impl SharedScene {
         if epoch < source.last_epoch {
             return Err("stale source epoch");
         }
+        let epoch_changed = source.last_epoch != epoch;
+        source.last_epoch = epoch;
+        let eos_changed = source.eos_epoch != Some(epoch);
         source.eos_epoch = Some(epoch);
-        maybe_start_buffered(source);
+        let eos_milestone_changed = set_milestone(source, messages::MILESTONE_EOS_ACCEPTED);
+        let playback_started = maybe_start_buffered(source);
+        if playback_started {
+            set_milestone(source, messages::MILESTONE_PLAYBACK_STARTED);
+        }
+        if epoch_changed || eos_changed || eos_milestone_changed || playback_started {
+            advance_source_revision(source)?;
+        }
         self.0.playback_changed.notify_all();
         Ok(())
     }
@@ -513,8 +803,14 @@ impl SharedScene {
         if epoch < source.last_epoch {
             return Err("stale source epoch");
         }
+        let epoch_changed = source.last_epoch != epoch;
         source.last_epoch = epoch;
+        source.last_decoded_pts_us = frame.pts_us;
+        let milestone_changed = set_milestone(source, messages::MILESTONE_FIRST_DECODED_OUTPUT);
         source.latest_frame = Some(frame);
+        if epoch_changed || milestone_changed {
+            advance_source_revision(source)?;
+        }
         state.decoded_pixels = decoded_pixels;
         state.revision = state.revision.wrapping_add(1);
         Ok(())
@@ -573,8 +869,14 @@ impl SharedScene {
         if epoch < source.last_epoch {
             return Err("stale source epoch");
         }
+        let epoch_changed = source.last_epoch != epoch;
         source.last_epoch = epoch;
+        source.last_decoded_pts_us = frame.pts_us;
+        let milestone_changed = set_milestone(source, messages::MILESTONE_FIRST_DECODED_OUTPUT);
         source.latest_frame = Some(frame);
+        if epoch_changed || milestone_changed {
+            advance_source_revision(source)?;
+        }
         state.decoded_pixels = decoded_pixels;
         state.revision = state.revision.wrapping_add(1);
         Ok(())
@@ -584,7 +886,7 @@ impl SharedScene {
         &self,
         session_id: SessionId,
         mutations: Vec<SceneMutation>,
-    ) -> Result<(), &'static str> {
+    ) -> Result<SceneRevision, &'static str> {
         let mut state = self.lock();
         let mut nodes = state.nodes.clone();
         for mutation in mutations {
@@ -613,13 +915,19 @@ impl SharedScene {
             }
         }
         validate_scene_structure(&state, &nodes)?;
+        let scene_revision = advance_scene_revision(&mut state, session_id)?;
         state.nodes = nodes;
         state.revision = state.revision.wrapping_add(1);
-        Ok(())
+        Ok(scene_revision)
     }
 
     pub fn remove_source(&self, key: SourceKey) -> Result<(), &'static str> {
         let mut state = self.lock();
+        let removes_nodes =
+            state.nodes.values().any(|node| (node.session_id, node.source_id) == key);
+        if removes_nodes {
+            advance_scene_revision(&mut state, key.0)?;
+        }
         let source = state.sources.remove(&key).ok_or("source does not exist")?;
         if let Some(frame) = source.latest_frame {
             let pixels = u64::from(frame.width) * u64::from(frame.height);
@@ -629,6 +937,45 @@ impl SharedScene {
         state.revision = state.revision.wrapping_add(1);
         self.0.playback_changed.notify_all();
         Ok(())
+    }
+
+    pub fn lose_source(
+        &self,
+        key: SourceKey,
+        terminal_loss_code: u64,
+    ) -> Result<SourceObservation, &'static str> {
+        let mut state = self.lock();
+        purge_expired_tombstones(&mut state, Instant::now());
+        let removes_nodes =
+            state.nodes.values().any(|node| (node.session_id, node.source_id) == key);
+        if removes_nodes {
+            advance_scene_revision(&mut state, key.0)?;
+        }
+        let mut source = state.sources.remove(&key).ok_or("source does not exist")?;
+        source.lifecycle = messages::SOURCE_LIFECYCLE_TOMBSTONE;
+        source.attachment_state = messages::ATTACHMENT_CLOSED;
+        set_milestone(&mut source, messages::MILESTONE_SOURCE_LOST);
+        advance_source_revision(&mut source)?;
+        if let Some(frame) = source.latest_frame.take() {
+            let pixels = u64::from(frame.width) * u64::from(frame.height);
+            state.decoded_pixels = state.decoded_pixels.saturating_sub(pixels);
+        }
+        state.nodes.retain(|(owner, _), node| *owner != key.0 || node.source_id != key.1);
+        let observation = observation(&source, Some(terminal_loss_code));
+        while state.tombstones.len() >= MAX_SOURCE_TOMBSTONES {
+            let Some(oldest) = state.tombstone_order.pop_front() else {
+                break;
+            };
+            state.tombstones.remove(&oldest);
+        }
+        state.tombstone_order.push_back(key);
+        state.tombstones.insert(
+            key,
+            SourceTombstone { observation, expires_at: Instant::now() + SOURCE_TOMBSTONE_TTL },
+        );
+        state.revision = state.revision.wrapping_add(1);
+        self.0.playback_changed.notify_all();
+        Ok(observation)
     }
 
     pub fn snapshot(&self) -> (u64, Vec<RenderItem>) {
@@ -683,11 +1030,11 @@ impl SharedScene {
         rows: u32,
         display_offset: usize,
         renderable: bool,
-    ) -> Vec<(SourceKey, bool, u64)> {
-        let state = self.lock();
+    ) -> Result<Vec<(SourceKey, bool, u64)>, &'static str> {
+        let mut state = self.lock();
         let right = i64::from(columns) << 32;
         let bottom = i64::from(rows) << 32;
-        state
+        let states = state
             .sources
             .keys()
             .copied()
@@ -743,7 +1090,15 @@ impl SharedScene {
                 let reasons = u64::from(!intersects) | (u64::from(!renderable) << 1);
                 (key, visible, reasons)
             })
-            .collect()
+            .collect::<Vec<_>>();
+        for (key, visible, _) in &states {
+            let source = state.sources.get_mut(key).expect("source key was just enumerated");
+            if source.visible != *visible {
+                source.visible = *visible;
+                advance_source_revision(source)?;
+            }
+        }
+        Ok(states)
     }
 
     /// Move text anchors with terminal scrolling and discard anchors whose text position is erased
@@ -754,9 +1109,9 @@ impl SharedScene {
         end: i32,
         lines: i32,
         history_size: usize,
-    ) -> Vec<AnchorKey> {
+    ) -> Result<Vec<AnchorKey>, &'static str> {
         if lines == 0 || origin >= end {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         let minimum_line = -(history_size.min(i32::MAX as usize) as i32);
         let mut state = self.lock();
@@ -788,6 +1143,22 @@ impl SharedScene {
 
         if !removed.is_empty() {
             let removed_set = removed.iter().copied().collect::<HashSet<_>>();
+            let removes_nodes = state.nodes.iter().any(|((session_id, _), node)| {
+                node.anchor_id
+                    .is_some_and(|anchor_id| removed_set.contains(&(*session_id, anchor_id)))
+            });
+            if removes_nodes {
+                let changed_sessions = state
+                    .nodes
+                    .iter()
+                    .filter_map(|(&(session_id, _), node)| {
+                        node.anchor_id
+                            .is_some_and(|anchor_id| removed_set.contains(&(session_id, anchor_id)))
+                            .then_some(session_id)
+                    })
+                    .collect::<Vec<_>>();
+                advance_changed_scenes(&mut state, changed_sessions)?;
+            }
             state.anchors.retain(|key, _| !removed_set.contains(key));
             state.nodes.retain(|(session_id, _), node| {
                 node.anchor_id
@@ -796,13 +1167,18 @@ impl SharedScene {
             gc_detached_sources(&mut state);
         }
         state.revision = state.revision.wrapping_add(1);
-        removed
+        Ok(removed)
     }
 
     /// Clear all placements associated with the terminal text plane.
-    pub fn clear_terminal(&self) -> Vec<AnchorKey> {
+    pub fn clear_terminal(&self) -> Result<Vec<AnchorKey>, &'static str> {
         let mut state = self.lock();
         let removed = state.anchors.keys().copied().collect::<Vec<_>>();
+        if !state.nodes.is_empty() {
+            let changed_sessions =
+                state.nodes.keys().map(|(session_id, _)| *session_id).collect::<Vec<_>>();
+            advance_changed_scenes(&mut state, changed_sessions)?;
+        }
         state.anchors.clear();
 
         // A ConPTY producer cannot wait for its terminal marker acknowledgement: doing so can
@@ -822,18 +1198,26 @@ impl SharedScene {
         state.nodes.clear();
         gc_detached_sources(&mut state);
         state.revision = state.revision.wrapping_add(1);
-        removed
+        Ok(removed)
     }
 
     /// Keep anchored posters after a producer exits; they are reclaimed when their anchor is
     /// cleared or evicted. Viewport-fixed nodes retain their original connection lifetime.
-    pub fn detach_session(&self, session_id: SessionId) {
+    pub fn detach_session(&self, session_id: SessionId) -> Result<(), &'static str> {
         let mut state = self.lock();
         state.detached_sessions.insert(session_id);
+        if state
+            .nodes
+            .iter()
+            .any(|((owner, _), node)| *owner == session_id && node.anchor_id.is_none())
+        {
+            advance_scene_revision(&mut state, session_id)?;
+        }
         state.nodes.retain(|(owner, _), node| *owner != session_id || node.anchor_id.is_some());
         gc_detached_sources(&mut state);
         state.revision = state.revision.wrapping_add(1);
         self.0.playback_changed.notify_all();
+        Ok(())
     }
 
     fn lock(&self) -> MutexGuard<'_, State> {
@@ -841,12 +1225,12 @@ impl SharedScene {
     }
 }
 
-fn maybe_start_buffered(source: &mut Source) {
+fn maybe_start_buffered(source: &mut Source) -> bool {
     let Some(request) = source.play_request else {
-        return;
+        return false;
     };
     if source.play_started.is_some() {
-        return;
+        return false;
     }
     let buffered = source
         .buffered_until_pts_us
@@ -854,7 +1238,9 @@ fn maybe_start_buffered(source: &mut Source) {
         .unwrap_or(0);
     if buffered >= request.minimum_buffer_us || source.eos_epoch.is_some() {
         source.play_started = Some(Instant::now());
+        return true;
     }
+    false
 }
 
 fn validate_node(
@@ -965,6 +1351,23 @@ mod tests {
             .unwrap();
     }
 
+    fn video_node(session_id: SessionId, source_id: u64, node_id: u64) -> SceneNode {
+        SceneNode {
+            session_id,
+            node_id,
+            source_id,
+            x: 0,
+            y: 0,
+            width: 16_i64 << 32,
+            height: 16_i64 << 32,
+            text_layer: 1,
+            z_index: 0,
+            visible: true,
+            anchor_id: None,
+            clip: None,
+        }
+    }
+
     #[test]
     fn play_waits_for_exact_requested_buffer_horizon() {
         let scene = SharedScene::default();
@@ -999,6 +1402,228 @@ mod tests {
         assert_eq!(scene.presentation_due((1, 8), 50_000), Some(false));
         scene.signal_eos((1, 8), 0).unwrap();
         assert_eq!(scene.presentation_due((1, 8), 50_000), Some(true));
+    }
+
+    #[test]
+    fn source_revision_advances_only_for_enumerated_transitions() {
+        let scene = SharedScene::default();
+        add_video(&scene, 9);
+        let key = (1, 9);
+        let revision = |scene: &SharedScene| scene.source_observation(key).unwrap().revision.get();
+
+        assert_eq!(revision(&scene), 1);
+        assert_eq!(scene.mark_attached(key).unwrap().attachment_generation, 1);
+        assert_eq!(revision(&scene), 2);
+        scene.mark_attachment_closed(key).unwrap();
+        assert_eq!(revision(&scene), 3);
+
+        scene.mark_media_accepted(key, 1, 10, 1, false).unwrap();
+        assert_eq!(revision(&scene), 4);
+        scene.mark_media_accepted(key, 1, 11, 2, false).unwrap();
+        assert_eq!(revision(&scene), 4, "packet counters are not source transitions");
+        scene.mark_media_accepted(key, 1, 12, 3, true).unwrap();
+        assert_eq!(revision(&scene), 5);
+
+        scene.mark_decoder_initialized(key).unwrap();
+        assert_eq!(revision(&scene), 6);
+        scene.mark_decoder_initialized(key).unwrap();
+        assert_eq!(revision(&scene), 6, "milestones are sticky");
+        scene.mark_decoded_output(key, 1_000).unwrap();
+        assert_eq!(revision(&scene), 7);
+        scene.mark_decoded_output(key, 2_000).unwrap();
+        assert_eq!(revision(&scene), 7, "decoded PTS is not a transition counter");
+
+        scene.commit_mutations(1, vec![SceneMutation::Create(video_node(1, 9, 1))]).unwrap();
+        scene.aggregate_visibility(80, 24, 0, true).unwrap();
+        assert_eq!(revision(&scene), 8);
+        scene.aggregate_visibility(80, 24, 0, true).unwrap();
+        assert_eq!(revision(&scene), 8);
+        scene.mark_presented(key, 2_000, true).unwrap();
+        assert_eq!(revision(&scene), 9);
+        scene.mark_presented(key, 2_000, true).unwrap();
+        assert_eq!(revision(&scene), 9, "presentation IDs are independent counters");
+
+        let request = PlayRequest {
+            source_id: 9,
+            start_pts_us: 2_000,
+            minimum_buffer_us: 100,
+            ..PlayRequest::baseline(9, 100)
+        };
+        scene.start_playback(key, request).unwrap();
+        assert_eq!(revision(&scene), 10);
+        scene.observe_buffered_pts(key, 2_100).unwrap();
+        assert_eq!(revision(&scene), 11);
+        scene.pause_playback(key).unwrap();
+        assert_eq!(revision(&scene), 12);
+        scene.flush_playback(key, 2).unwrap();
+        assert_eq!(revision(&scene), 13);
+        scene.mark_policy_changed(key).unwrap();
+        assert_eq!(revision(&scene), 14);
+        scene.mark_descriptor_changed(key).unwrap();
+        assert_eq!(revision(&scene), 15);
+        scene.signal_eos(key, 2).unwrap();
+        assert_eq!(revision(&scene), 16);
+        scene.mark_playback_ended(key).unwrap();
+        assert_eq!(revision(&scene), 17);
+
+        let lost = scene.lose_source(key, messages::ERROR_DEVICE_LOST).unwrap();
+        assert_eq!(lost.revision.get(), 18);
+        assert_eq!(lost.lifecycle, messages::SOURCE_LIFECYCLE_TOMBSTONE);
+        assert_eq!(lost.milestones, messages::MILESTONE_MASK);
+    }
+
+    #[test]
+    fn attachment_generation_is_independent_and_monotonic() {
+        let scene = SharedScene::default();
+        add_video(&scene, 10);
+        let key = (1, 10);
+
+        let first = scene.mark_attached(key).unwrap();
+        scene.mark_attachment_closed(key).unwrap();
+        let second = scene.mark_attached(key).unwrap();
+        assert_eq!(first.attachment_generation, 1);
+        assert_eq!(second.attachment_generation, 2);
+        assert_eq!(second.attachment_state, messages::ATTACHMENT_ATTACHED);
+        assert_eq!(second.last_media_id, 0);
+        assert_eq!(second.last_media_sequence, 0);
+    }
+
+    #[test]
+    fn scene_revisions_are_session_scoped_and_cover_automatic_node_loss() {
+        let scene = SharedScene::default();
+        add_video(&scene, 1);
+        scene
+            .add_source(
+                2,
+                1,
+                SourceConfig::Video(ParsedVideoSourceConfig {
+                    source_id: 1,
+                    codec: "h264".into(),
+                    packetization: "h264-annexb-au-v1".into(),
+                    extradata: Vec::new(),
+                    width: 16,
+                    height: 16,
+                    profile: 0,
+                    level: 0,
+                    bitrate: 0,
+                    color_primaries: 1,
+                    transfer: 1,
+                    matrix: 1,
+                    range: 1,
+                    sar_num: 1,
+                    sar_den: 1,
+                    max_access_unit_bytes: 1024,
+                    codec_string: None,
+                    decoder_config: None,
+                }),
+            )
+            .unwrap();
+
+        assert_eq!(
+            scene.commit_mutations(1, vec![SceneMutation::Create(video_node(1, 1, 1))]).unwrap(),
+            SceneRevision::new(1)
+        );
+        assert_eq!(
+            scene.commit_mutations(2, vec![SceneMutation::Create(video_node(2, 1, 1))]).unwrap(),
+            SceneRevision::new(1)
+        );
+        assert_eq!(scene.scene_revision(1), SceneRevision::new(1));
+        assert_eq!(scene.scene_revision(2), SceneRevision::new(1));
+
+        scene.lose_source((1, 1), messages::ERROR_DEVICE_LOST).unwrap();
+        assert_eq!(scene.scene_revision(1), SceneRevision::new(2));
+        assert_eq!(scene.scene_revision(2), SceneRevision::new(1));
+
+        assert!(
+            scene
+                .commit_mutations(2, vec![SceneMutation::Delete { session_id: 2, node_id: 99 }],)
+                .is_err()
+        );
+        assert_eq!(scene.scene_revision(2), SceneRevision::new(1));
+        assert_eq!(scene.commit_mutations(2, Vec::new()).unwrap(), SceneRevision::new(2));
+    }
+
+    #[test]
+    fn tombstones_are_metadata_only_bounded_and_expiring() {
+        let scene = SharedScene::default();
+        for source_id in 1..=(MAX_SOURCE_TOMBSTONES as u64 + 1) {
+            add_video(&scene, source_id);
+            if source_id == 1 {
+                scene
+                    .commit_mutations(
+                        1,
+                        vec![SceneMutation::Create(video_node(1, source_id, source_id))],
+                    )
+                    .unwrap();
+                scene
+                    .publish_frame(
+                        (1, source_id),
+                        1,
+                        Frame {
+                            frame_id: 1,
+                            pts_us: 0,
+                            width: 16,
+                            height: 16,
+                            rgba: Arc::from(vec![0; 16 * 16 * 4]),
+                            alpha_mode: messages::ALPHA_STRAIGHT,
+                            sar_num: 1,
+                            sar_den: 1,
+                        },
+                    )
+                    .unwrap();
+            }
+            scene.lose_source((1, source_id), messages::ERROR_DEVICE_LOST).unwrap();
+        }
+
+        {
+            let state = scene.lock();
+            assert!(state.sources.is_empty());
+            assert!(state.nodes.is_empty());
+            assert_eq!(state.decoded_pixels, 0);
+            assert_eq!(state.queued_pixels, 0);
+            assert_eq!(state.tombstones.len(), MAX_SOURCE_TOMBSTONES);
+            assert_eq!(state.tombstone_order.len(), MAX_SOURCE_TOMBSTONES);
+            assert!(!state.tombstones.contains_key(&(1, 1)), "oldest tombstone was evicted");
+        }
+        assert!(scene.source_observation((1, 2)).is_some());
+        assert!(
+            scene
+                .add_source(
+                    1,
+                    2,
+                    SourceConfig::Raster(RasterSourceConfig {
+                        source_id: 2,
+                        width: 1,
+                        height: 1,
+                        alpha_mode: messages::ALPHA_STRAIGHT,
+                        compression_mode: messages::COMPRESSION_NONE,
+                    }),
+                )
+                .is_err()
+        );
+
+        {
+            let mut state = scene.lock();
+            let expired = Instant::now() - Duration::from_secs(1);
+            for tombstone in state.tombstones.values_mut() {
+                tombstone.expires_at = expired;
+            }
+        }
+        assert!(scene.source_observation((1, 2)).is_none());
+        assert!(scene.lock().tombstones.is_empty());
+        scene
+            .add_source(
+                1,
+                2,
+                SourceConfig::Raster(RasterSourceConfig {
+                    source_id: 2,
+                    width: 1,
+                    height: 1,
+                    alpha_mode: messages::ALPHA_STRAIGHT,
+                    compression_mode: messages::COMPRESSION_NONE,
+                }),
+            )
+            .unwrap();
     }
 
     #[test]
@@ -1126,12 +1751,12 @@ mod tests {
         assert_eq!((item.x, item.y), (2_i64 << 32, 5_i64 << 32));
         assert!(item.text_anchored);
 
-        assert!(scene.scroll_anchors(0, 24, 3, 3).is_empty());
+        assert!(scene.scroll_anchors(0, 24, 3, 3).unwrap().is_empty());
         assert_eq!(scene.snapshot().1[0].y, 2_i64 << 32);
 
-        scene.detach_session(4);
+        scene.detach_session(4).unwrap();
         assert!(scene.source_config((4, 1)).is_some());
-        assert_eq!(scene.clear_terminal(), vec![(4, 7)]);
+        assert_eq!(scene.clear_terminal().unwrap(), vec![(4, 7)]);
         assert!(scene.snapshot().1.is_empty());
         assert!(scene.source_config((4, 1)).is_none());
     }
@@ -1142,7 +1767,8 @@ mod tests {
         scene.add_anchor(4, 7, 2, 5).unwrap();
         scene.add_anchor(4, 8, 3, 6).unwrap();
 
-        let removed = scene.apply_anchor_resize([((4, 7), Some((9, -2, false))), ((4, 8), None)]);
+        let removed =
+            scene.apply_anchor_resize([((4, 7), Some((9, -2, false))), ((4, 8), None)]).unwrap();
         assert_eq!(removed, vec![(4, 8)]);
         assert_eq!(scene.anchor_positions(), vec![((4, 7), 9, -2, false)]);
     }
@@ -1204,18 +1830,18 @@ mod tests {
         // viewport coordinate. The control commit can also overtake the full-screen clear which
         // preceded the marker; that clear must not discard this logically newer pending node.
         assert!(scene.snapshot().1.is_empty());
-        assert!(scene.clear_terminal().is_empty());
+        assert!(scene.clear_terminal().unwrap().is_empty());
         scene.add_anchor(5, 9, 3, 6).unwrap();
         let item = scene.snapshot().1.pop().unwrap();
         assert_eq!((item.x, item.y), (3_i64 << 32, 6_i64 << 32));
         assert!(item.text_anchored);
 
-        assert!(scene.scroll_anchors(0, 24, 2, 0).is_empty());
+        assert!(scene.scroll_anchors(0, 24, 2, 0).unwrap().is_empty());
         assert_eq!(scene.snapshot().1[0].y, 4_i64 << 32);
 
-        scene.detach_session(5);
+        scene.detach_session(5).unwrap();
         assert_eq!(scene.snapshot().1.len(), 1);
-        assert_eq!(scene.clear_terminal(), vec![(5, 9)]);
+        assert_eq!(scene.clear_terminal().unwrap(), vec![(5, 9)]);
         assert!(scene.snapshot().1.is_empty());
         assert!(scene.source_config((5, 1)).is_none());
     }
@@ -1298,21 +1924,21 @@ mod tests {
 
         // A full-screen application takes the alternate screen: the primary-screen node must stop
         // rendering, while the marker which arrived early becomes visible on its actual screen.
-        assert!(scene.set_alternate_screen(true).is_empty());
+        assert!(scene.set_alternate_screen(true).unwrap().is_empty());
         let items = scene.snapshot().1;
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].node_id, 3);
-        let states = scene.aggregate_visibility(80, 24, 0, true);
+        let states = scene.aggregate_visibility(80, 24, 0, true).unwrap();
         assert_eq!(states.len(), 1);
         assert!(states[0].1);
 
         // Leaving the alternate screen discards its content, so its anchors go with it; the
         // primary-screen image returns unchanged.
-        assert_eq!(scene.set_alternate_screen(false), vec![(6, 8)]);
+        assert_eq!(scene.set_alternate_screen(false).unwrap(), vec![(6, 8)]);
         let items = scene.snapshot().1;
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].node_id, 2);
         assert_eq!((items[0].x, items[0].y), (2_i64 << 32, 5_i64 << 32));
-        assert!(scene.set_alternate_screen(false).is_empty());
+        assert!(scene.set_alternate_screen(false).unwrap().is_empty());
     }
 }
