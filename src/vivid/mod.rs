@@ -512,13 +512,22 @@ fn handle_control(reader: &mut Reader, shared: Arc<ServiceShared>) -> io::Result
     );
     if !supports_current_version || hello.maximum_record_body == 0 || unsupported_feature {
         let (code, diagnostic) = if !supports_current_version {
-            (messages::ERROR_UNSUPPORTED_VERSION, "Vivid 1.0 is required")
+            (messages::ERROR_UNSUPPORTED_VERSION, "Vivid 1.1 is required")
         } else if hello.maximum_record_body == 0 {
             (messages::ERROR_BAD_MESSAGE, "maximum record body is zero")
         } else {
             (messages::ERROR_UNSUPPORTED_FEATURE, "required Vivid feature is unsupported")
         };
-        writer.write_record(messages::ERROR, 0, &messages::error(request_id, code, diagnostic))?;
+        let detail = if code == messages::ERROR_UNSUPPORTED_VERSION {
+            messages::ErrorDetail::supported_version(u64::from(VIVID_MAJOR), u64::from(VIVID_MINOR))
+        } else {
+            messages::ErrorDetail::new()
+        };
+        writer.write_record(
+            messages::ERROR,
+            0,
+            &messages::error_with_detail(request_id, code, false, &detail, diagnostic)?,
+        )?;
         return Ok(());
     }
 
@@ -527,14 +536,21 @@ fn handle_control(reader: &mut Reader, shared: Arc<ServiceShared>) -> io::Result
     let (session_id, session_tag, root_context_id) = {
         let mut registry = lock_registry(&shared);
         if registry.sessions.len() >= MAX_SESSIONS {
+            let detail = messages::ErrorDetail::limit(
+                messages::LIMIT_CONCURRENT_SESSIONS,
+                registry.sessions.len() as u64,
+                MAX_SESSIONS as u64,
+            );
             writer.write_record(
                 messages::ERROR,
                 0,
-                &messages::error(
+                &messages::error_with_detail(
                     request_id,
                     messages::ERROR_LIMIT_EXCEEDED,
+                    false,
+                    &detail,
                     "session quota exceeded",
-                ),
+                )?,
             )?;
             return Ok(());
         }
@@ -2617,11 +2633,13 @@ mod tests {
     }
 
     #[test]
-    fn vivid_version_selection_accepts_only_ranges_containing_1_0() {
+    fn vivid_version_selection_accepts_only_ranges_containing_1_1() {
         assert!(!offers_vivid_version(0, 9, 0, 9));
-        assert!(offers_vivid_version(1, 0, 1, 0));
-        assert!(offers_vivid_version(0, 9, 1, 0));
-        assert!(!offers_vivid_version(1, 1, 2, 0));
+        assert!(!offers_vivid_version(1, 0, 1, 0));
+        assert!(offers_vivid_version(1, 1, 1, 1));
+        assert!(offers_vivid_version(1, 0, 1, 1));
+        assert!(offers_vivid_version(0, 9, 2, 0));
+        assert!(!offers_vivid_version(1, 2, 2, 0));
     }
 
     #[test]
@@ -2706,11 +2724,11 @@ mod tests {
         hello.u64(0);
         hello.u64(1);
         hello.u64(1);
-        hello.u64(1);
+        hello.u64(0);
         hello.u64(2);
         hello.u64(1);
         hello.u64(3);
-        hello.u64(1);
+        hello.u64(0);
         hello.u64(4);
         hello.text(service.token());
         hello.u64(5);
@@ -2727,6 +2745,7 @@ mod tests {
         let rejection =
             messages::parse_error_reply(&unsupported.read_record().unwrap().body).unwrap();
         assert_eq!(rejection.code, messages::ERROR_UNSUPPORTED_VERSION);
+        assert_eq!(rejection.supported_version, Some((1, 1)));
 
         let mut control = Connection::open(&endpoint, ConnectionKind::Control).unwrap();
         control.write_record(messages::HELLO, 0, 0, &messages::hello(1, service.token())).unwrap();
