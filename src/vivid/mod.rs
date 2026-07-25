@@ -29,7 +29,9 @@ use vivid_protocol::anchor::{self, AnchorKey};
 use vivid_protocol::media::{self, VIDEO_PACKET_KEY};
 use vivid_protocol::messages::{self, DisplayChanged};
 use vivid_protocol::revision::{ObservationSequence, SceneRevision, SourceRevision};
-use vivid_protocol::trace::{TraceComponent, TraceGuard, TraceHop};
+use vivid_protocol::trace::{
+    TraceComponent, TraceDirection, TraceGuard, TraceHop, TraceObjectKind, TraceOutcome,
+};
 use vivid_protocol::wire::{ConnectionKind, RECORD_OPTIONAL, Record};
 use vivid_protocol::{VIVID_MAJOR, VIVID_MINOR};
 
@@ -57,6 +59,8 @@ type LocalStream = UnixStream;
 
 const INITIAL_BYTE_CREDITS: u64 = 4 * 1024 * 1024;
 const INITIAL_PACKET_CREDITS: u64 = 32;
+const ROLLING_PACKET_CREDITS: u64 = 64;
+const MAX_CREDIT_LATENCY_SAMPLES: usize = 4096;
 const MAX_SESSIONS: usize = 16;
 const MAX_CONNECTIONS: usize = 64;
 const MAX_PENDING_OPERATIONS: usize = 64;
@@ -190,7 +194,61 @@ struct ServiceShared {
     render_state: Mutex<(bool, usize)>,
     wake: Arc<dyn Fn() + Send + Sync>,
     trace: Option<vivid_protocol::trace::TraceEmitter>,
+    credit_latency: CreditLatencyMetrics,
     _trace_guard: Option<TraceGuard>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CreditLatencySnapshot {
+    pub samples: u64,
+    pub dropped_samples: u64,
+    pub p50_us: u64,
+    pub p95_us: u64,
+    pub p99_us: u64,
+}
+
+#[derive(Default)]
+struct CreditLatencyMetrics {
+    samples: Mutex<VecDeque<u64>>,
+    dropped: AtomicU64,
+}
+
+impl CreditLatencyMetrics {
+    fn record(&self, elapsed: Duration) {
+        let Ok(mut samples) = self.samples.try_lock() else {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+            return;
+        };
+        if samples.len() == MAX_CREDIT_LATENCY_SAMPLES {
+            samples.pop_front();
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+        }
+        samples.push_back(u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX));
+    }
+
+    fn snapshot(&self) -> CreditLatencySnapshot {
+        let samples = self.samples.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let values = samples.iter().copied().collect::<Vec<_>>();
+        CreditLatencySnapshot {
+            samples: values.len() as u64,
+            dropped_samples: self.dropped.load(Ordering::Relaxed),
+            p50_us: percentile(&values, 50),
+            p95_us: percentile(&values, 95),
+            p99_us: percentile(&values, 99),
+        }
+    }
+}
+
+fn percentile(values: &[u64], percentile: usize) -> u64 {
+    let mut sorted = values.to_vec();
+    sorted.sort_unstable();
+    let index = sorted
+        .len()
+        .saturating_mul(percentile)
+        .div_ceil(100)
+        .saturating_sub(1)
+        .min(sorted.len().saturating_sub(1));
+    sorted.get(index).copied().unwrap_or(0)
 }
 
 struct PendingOperation {
@@ -643,6 +701,7 @@ impl VividService {
             render_state: Mutex::new((true, 0)),
             wake,
             trace,
+            credit_latency: CreditLatencyMetrics::default(),
             _trace_guard: trace_guard,
         });
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -675,6 +734,11 @@ impl VividService {
         self.scene.clone()
     }
 
+    /// Snapshot bounded accept-to-credit-return latency observations for diagnostics.
+    pub fn credit_latency_snapshot(&self) -> CreditLatencySnapshot {
+        self.shared.credit_latency.snapshot()
+    }
+
     #[allow(dead_code)] // Platform device watchers call this hook on supported desktop backends.
     pub fn capability_generation(&self) -> u64 {
         self.shared.capability_generation.load(Ordering::Acquire)
@@ -695,11 +759,7 @@ impl VividService {
         session_id: SessionId,
         source_id: u64,
     ) -> Option<messages::SourceStatus> {
-        self.scene.source_status(
-            (session_id, source_id),
-            INITIAL_BYTE_CREDITS,
-            INITIAL_PACKET_CREDITS,
-        )
+        self.scene.source_status((session_id, source_id))
     }
 
     #[cfg(unix)]
@@ -926,6 +986,17 @@ impl Drop for VividService {
         self.shutdown.store(true, Ordering::Release);
         if let Some(thread) = self.listener_thread.take() {
             let _ = thread.join();
+        }
+        let latency = self.credit_latency_snapshot();
+        if latency.samples != 0 || latency.dropped_samples != 0 {
+            log::debug!(
+                "Vivid accept-to-credit latency: samples={} dropped={} p50={}us p95={}us p99={}us",
+                latency.samples,
+                latency.dropped_samples,
+                latency.p50_us,
+                latency.p95_us,
+                latency.p99_us,
+            );
         }
     }
 }
@@ -2535,14 +2606,8 @@ fn dispatch_control(
             if record.object_id != source_id {
                 return Err(bad("QUERY_SOURCE object ID mismatch"));
             }
-            let status = shared
-                .scene
-                .source_status(
-                    (session_id, source_id),
-                    INITIAL_BYTE_CREDITS,
-                    INITIAL_PACKET_CREDITS,
-                )
-                .ok_or(ProtocolError {
+            let status =
+                shared.scene.source_status((session_id, source_id)).ok_or(ProtocolError {
                     code: messages::ERROR_NOT_FOUND,
                     message: "source does not exist",
                     fatal: false,
@@ -2667,7 +2732,7 @@ fn dispatch_control(
                     maximum_waits: MAX_REGISTERED_WAITS as u64,
                     maximum_pending_requests: MAX_PENDING_REQUESTS as u64,
                     rolling_byte_window: INITIAL_BYTE_CREDITS,
-                    rolling_packet_window: INITIAL_PACKET_CREDITS,
+                    rolling_packet_window: ROLLING_PACKET_CREDITS,
                     retained_pixel_budget: 8192 * 8192 * 2,
                     current_sources: counts.sources,
                     current_nodes: counts.nodes,
@@ -3677,6 +3742,22 @@ fn prepare_source_ready(
         ));
     }
     let byte_credits = INITIAL_BYTE_CREDITS.min(media_byte_quota).max(u64::from(max_media_body));
+    shared
+        .scene
+        .configure_credit_window(
+            source_key,
+            messages::Credits {
+                bytes: byte_credits,
+                packets: INITIAL_PACKET_CREDITS,
+                fragments: 0,
+            },
+            messages::Credits {
+                bytes: byte_credits,
+                packets: ROLLING_PACKET_CREDITS,
+                fragments: 0,
+            },
+        )
+        .map_err(invalid)?;
     let initial_source_revision = shared
         .scene
         .source_observation(source_key)
@@ -3695,7 +3776,7 @@ fn prepare_source_ready(
             fragment_credits: 0,
             max_media_body,
             rolling_byte_window: byte_credits,
-            rolling_packet_window: INITIAL_PACKET_CREDITS,
+            rolling_packet_window: ROLLING_PACKET_CREDITS,
             initial_source_revision,
             media_connection_required: true,
             delta_operation_limit: None,
@@ -3747,6 +3828,10 @@ fn handle_media(
         reader.mark_source_policy(ticket.source_key.1, policy);
     }
     shared.scene.mark_attached(ticket.source_key).map_err(invalid)?;
+    let top_up = shared.scene.top_up_credit(ticket.source_key).map_err(invalid)?;
+    if top_up.bytes != 0 || top_up.packets != 0 {
+        writer.write_credit(ticket.source_key.1, top_up.bytes, top_up.packets, top_up.fragments)?;
+    }
     wake(&shared);
     let max_media_body = match shared.scene.source_config(ticket.source_key) {
         Some(SourceConfig::Raster(config)) => {
@@ -3782,7 +3867,9 @@ fn handle_media(
         let detailed_diagnostic = error.to_string();
         let device_lost =
             kind == ConnectionKind::Audio && error.kind() == io::ErrorKind::NotConnected;
-        let code = if device_lost {
+        let code = if error.kind() == io::ErrorKind::PermissionDenied {
+            messages::ERROR_FLOW_CONTROL
+        } else if device_lost {
             messages::ERROR_DEVICE_LOST
         } else if detailed_diagnostic.contains("hash mismatch") {
             messages::ERROR_HASH_MISMATCH
@@ -3843,7 +3930,7 @@ fn handle_raster(
             Err(error) if error.kind() == ErrorKind::UnexpectedEof => return Ok(()),
             Err(error) => return Err(error),
         };
-        let _charge = ChargedBody::new(writer, key.1, record.body.len() as u64);
+        let mut charge = ChargedBody::new(shared, writer, key, record.body.len() as u64)?;
         if record.record_type != messages::RASTER_FRAME || record.object_id != key.1 {
             return Err(invalid("unexpected record on raster media channel"));
         }
@@ -3884,6 +3971,7 @@ fn handle_raster(
             .scene
             .mark_media_accepted(key, raster.epoch, raster.frame_id, record.sequence, false)
             .map_err(invalid)?;
+        charge.accepted(record.record_type, record.sequence);
         wake(shared);
     }
 }
@@ -4006,7 +4094,7 @@ fn handle_video(
             Err(error) if error.kind() == ErrorKind::UnexpectedEof => break,
             Err(error) => return Err(error),
         };
-        let _charge = ChargedBody::new(writer, key.1, record.body.len() as u64);
+        let mut charge = ChargedBody::new(shared, writer, key, record.body.len() as u64)?;
         if record.record_type != messages::VIDEO_PACKET || record.object_id != key.1 {
             return Err(invalid("unexpected record on video media channel"));
         }
@@ -4085,6 +4173,7 @@ fn handle_video(
             .scene
             .mark_media_accepted(key, epoch, packet_id, record.sequence, random_access)
             .map_err(invalid)?;
+        charge.accepted(record.record_type, record.sequence);
         for decoded in decoded_frames {
             while pending.len() >= MAX_QUEUED_VIDEO_FRAMES {
                 if !present_ready_video_frames(shared, key, &mut pending)? {
@@ -4173,7 +4262,7 @@ fn handle_audio(
                 Err(error) if error.kind() == ErrorKind::UnexpectedEof => break,
                 Err(error) => return Err(error),
             };
-            let _charge = ChargedBody::new(writer, key.1, record.body.len() as u64);
+            let mut charge = ChargedBody::new(shared, writer, key, record.body.len() as u64)?;
             if record.record_type != messages::AUDIO_PACKET || record.object_id != key.1 {
                 return Err(invalid("unexpected record on audio media channel"));
             }
@@ -4198,6 +4287,7 @@ fn handle_audio(
                 .scene
                 .mark_media_accepted(key, epoch, packet_id, record.sequence, false)
                 .map_err(invalid)?;
+            charge.accepted(record.record_type, record.sequence);
             output.trim_before_start(pts_us, duration_us, &mut samples);
             if !samples.is_empty() {
                 shared.scene.mark_decoded_output(key, pts_us).map_err(invalid)?;
@@ -4224,7 +4314,7 @@ fn handle_image(
     };
     let mut body = Vec::new();
     let record = reader.read_record_into(&mut body)?;
-    let _charge = ChargedBody::new(writer, key.1, record.body.len() as u64);
+    let mut charge = ChargedBody::new(shared, writer, key, record.body.len() as u64)?;
     if record.record_type != messages::IMAGE_DATA
         || record.object_id != key.1
         || record.body.len() != config.encoded_length as usize
@@ -4279,6 +4369,7 @@ fn handle_image(
         )
         .map_err(invalid)?;
     shared.scene.mark_media_accepted(key, 1, 1, record.sequence, false).map_err(invalid)?;
+    charge.accepted(record.record_type, record.sequence);
     wake(shared);
     Ok(())
 }
@@ -4346,27 +4437,78 @@ fn encoded_image_has_multiple_pictures(encoding: u64, data: &[u8]) -> io::Result
     Err(invalid("JPEG has no scan or end marker"))
 }
 
-fn return_credit(writer: &Writer, source_id: u64, bytes: u64) -> io::Result<()> {
-    writer.write_credit(source_id, bytes, 1, 0)
-}
-
 /// Owns ingress storage and its one bounded queue slot. Dropping it makes both reusable and emits
 /// the corresponding credit exactly once, including every error and early-return path.
 struct ChargedBody<'a> {
+    shared: &'a ServiceShared,
     writer: &'a Writer,
-    source_id: u64,
+    key: SourceKey,
     bytes: u64,
+    accepted_at: Option<Instant>,
 }
 
 impl<'a> ChargedBody<'a> {
-    fn new(writer: &'a Writer, source_id: u64, bytes: u64) -> Self {
-        Self { writer, source_id, bytes }
+    fn new(
+        shared: &'a ServiceShared,
+        writer: &'a Writer,
+        key: SourceKey,
+        bytes: u64,
+    ) -> io::Result<Self> {
+        shared
+            .scene
+            .consume_credit(key, bytes)
+            .map_err(|message| io::Error::new(ErrorKind::PermissionDenied, message))?;
+        Ok(Self { shared, writer, key, bytes, accepted_at: None })
+    }
+
+    fn accepted(&mut self, record_type: u16, connection_sequence: u64) {
+        self.accepted_at = Some(Instant::now());
+        let Some(trace) = &self.shared.trace else {
+            return;
+        };
+        let restricted = self
+            .shared
+            .scene
+            .source_capture_policy(self.key)
+            .is_some_and(|policy| policy & messages::CAPTURE_POLICY_REDUCE_DIAGNOSTICS != 0);
+        if restricted {
+            trace.emit_restricted_source(
+                TraceDirection::Local,
+                record_type,
+                self.bytes,
+                connection_sequence,
+            );
+        } else {
+            trace.emit(
+                TraceDirection::Local,
+                record_type,
+                self.bytes,
+                connection_sequence,
+                TraceObjectKind::Source,
+                Some(self.key.1),
+                None,
+                None,
+                TraceOutcome::State,
+            );
+        }
     }
 }
 
 impl Drop for ChargedBody<'_> {
     fn drop(&mut self) {
-        let _ = return_credit(self.writer, self.source_id, self.bytes);
+        if self.writer.write_credit(self.key.1, self.bytes, 1, 0).is_err() {
+            return;
+        }
+        if let Err(error) = self.shared.scene.return_credit(
+            self.key,
+            messages::Credits { bytes: self.bytes, packets: 1, fragments: 0 },
+        ) {
+            log::debug!("Could not account for returned Vivid credit: {error}");
+            return;
+        }
+        if let Some(accepted_at) = self.accepted_at {
+            self.shared.credit_latency.record(accepted_at.elapsed());
+        }
     }
 }
 
@@ -5334,6 +5476,7 @@ mod tests {
             render_state: Mutex::new((true, 0)),
             wake: Arc::new(|| {}),
             trace: None,
+            credit_latency: CreditLatencyMetrics::default(),
             _trace_guard: None,
         });
         (shared, output)
@@ -5417,18 +5560,29 @@ mod tests {
         use std::io::{Read, Write};
         use vivid_protocol::wire::{HEADER_SIZE, RecordHeader, encode_preface};
 
+        let (shared, output) = linked_av_shared();
+        shared
+            .scene
+            .configure_credit_window(
+                (1, 11),
+                messages::Credits { bytes: 4096, packets: 4, fragments: 0 },
+                messages::Credits { bytes: 4096, packets: 4, fragments: 0 },
+            )
+            .unwrap();
         let (mut client, server) = stream_pair();
         client.write_all(&encode_preface(ConnectionKind::Raster, 1024)).unwrap();
         let (reader, _) = Reader::new(server).unwrap();
         let writer = reader.writer().unwrap();
-        drop(ChargedBody::new(&writer, 7, 99));
+        let mut charge = ChargedBody::new(&shared, &writer, (1, 11), 99).unwrap();
+        charge.accepted(messages::AUDIO_PACKET, 1);
+        drop(charge);
 
         let mut header = [0; HEADER_SIZE];
         client.read_exact(&mut header).unwrap();
         let header = RecordHeader::decode(header);
         assert_eq!(
             (header.record_type, header.object_id, header.sequence),
-            (messages::CREDIT, 7, 1)
+            (messages::CREDIT, 11, 1)
         );
         let mut body = vec![0; header.body_length as usize];
         client.read_exact(&mut body).unwrap();
@@ -5438,6 +5592,9 @@ mod tests {
         client.set_nonblocking(true).unwrap();
         let mut extra = [0];
         assert_eq!(client.read(&mut extra).unwrap_err().kind(), ErrorKind::WouldBlock);
+        assert_eq!(shared.scene.source_status((1, 11)).unwrap().outstanding_byte_credit, 4096);
+        assert_eq!(shared.credit_latency.snapshot().samples, 1);
+        output.stop();
     }
 
     #[test]
@@ -5984,6 +6141,8 @@ mod tests {
         let (_, source_status) = messages::parse_source_status(&source_status_record.body).unwrap();
         assert_eq!(source_status.source_revision, SourceRevision::new(1));
         assert_eq!(source_status.attachment_state, messages::ATTACHMENT_NEVER);
+        assert_eq!(source_status.outstanding_byte_credit, ready.byte_credits);
+        assert_eq!(source_status.outstanding_packet_credit, INITIAL_PACKET_CREDITS);
 
         control
             .write_record(
@@ -6045,6 +6204,8 @@ mod tests {
         let (_, limits) = messages::parse_limits_status(&limits.body).unwrap();
         assert!(limits.maximum_waits >= 32);
         assert_eq!(limits.current_sources, 1);
+        assert_eq!(limits.rolling_byte_window, INITIAL_BYTE_CREDITS);
+        assert_eq!(limits.rolling_packet_window, ROLLING_PACKET_CREDITS);
 
         control
             .write_record(messages::BEGIN_TXN, 0, 0, &messages::begin_transaction(7, 1))

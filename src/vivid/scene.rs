@@ -163,6 +163,12 @@ struct Source {
     milestones: u64,
     attachment_state: u64,
     attachment_generation: u64,
+    credit_window_bytes: u64,
+    credit_window_packets: u64,
+    outstanding_byte_credit: u64,
+    outstanding_packet_credit: u64,
+    charged_bytes: u64,
+    charged_packets: u64,
     last_media_id: u64,
     last_media_sequence: u64,
     last_decoded_pts_us: i64,
@@ -625,6 +631,12 @@ impl SharedScene {
                 milestones: 0,
                 attachment_state: messages::ATTACHMENT_NEVER,
                 attachment_generation: 0,
+                credit_window_bytes: 0,
+                credit_window_packets: 0,
+                outstanding_byte_credit: 0,
+                outstanding_packet_credit: 0,
+                charged_bytes: 0,
+                charged_packets: 0,
                 last_media_id: 0,
                 last_media_sequence: 0,
                 last_decoded_pts_us: 0,
@@ -763,12 +775,7 @@ impl SharedScene {
         SessionObservationSnapshot { scene_revision, scene_change_reasons, sources }
     }
 
-    pub fn source_status(
-        &self,
-        key: SourceKey,
-        outstanding_byte_credit: u64,
-        outstanding_packet_credit: u64,
-    ) -> Option<SourceStatus> {
+    pub fn source_status(&self, key: SourceKey) -> Option<SourceStatus> {
         let mut state = self.lock();
         let now = Instant::now();
         purge_expired_tombstones(&mut state, now);
@@ -777,8 +784,8 @@ impl SharedScene {
             return Some(source_status_from_observation(
                 key.1,
                 observed,
-                outstanding_byte_credit.max(source.config.maximum_body().unwrap_or(0)),
-                outstanding_packet_credit,
+                source.outstanding_byte_credit,
+                source.outstanding_packet_credit,
                 timed_playback_snapshot(source, now),
             ));
         }
@@ -791,6 +798,106 @@ impl SharedScene {
                 tombstone_playback_snapshot(tombstone.observation.clone()),
             )
         })
+    }
+
+    pub fn configure_credit_window(
+        &self,
+        key: SourceKey,
+        initial: messages::Credits,
+        rolling: messages::Credits,
+    ) -> Result<(), &'static str> {
+        if initial.fragments != 0
+            || rolling.fragments != 0
+            || initial.bytes == 0
+            || initial.packets == 0
+            || rolling.bytes < initial.bytes
+            || rolling.packets < initial.packets
+        {
+            return Err("invalid source credit window");
+        }
+        let mut state = self.lock();
+        let source = state.sources.get_mut(&key).ok_or("source does not exist")?;
+        if source.credit_window_bytes != 0 || source.credit_window_packets != 0 {
+            return Err("source credit window is already configured");
+        }
+        source.credit_window_bytes = rolling.bytes;
+        source.credit_window_packets = rolling.packets;
+        source.outstanding_byte_credit = initial.bytes;
+        source.outstanding_packet_credit = initial.packets;
+        Ok(())
+    }
+
+    pub fn consume_credit(&self, key: SourceKey, bytes: u64) -> Result<(), &'static str> {
+        let mut state = self.lock();
+        let source = state.sources.get_mut(&key).ok_or("source does not exist")?;
+        if bytes == 0
+            || source.outstanding_byte_credit < bytes
+            || source.outstanding_packet_credit == 0
+        {
+            return Err("media record exceeds outstanding source credit");
+        }
+        source.outstanding_byte_credit -= bytes;
+        source.outstanding_packet_credit -= 1;
+        source.charged_bytes =
+            source.charged_bytes.checked_add(bytes).ok_or("charged byte credit overflow")?;
+        source.charged_packets =
+            source.charged_packets.checked_add(1).ok_or("charged packet credit overflow")?;
+        Ok(())
+    }
+
+    pub fn return_credit(
+        &self,
+        key: SourceKey,
+        credits: messages::Credits,
+    ) -> Result<(), &'static str> {
+        let mut state = self.lock();
+        let source = state.sources.get_mut(&key).ok_or("source does not exist")?;
+        if credits.fragments != 0
+            || source.charged_bytes < credits.bytes
+            || source.charged_packets < credits.packets
+        {
+            return Err("returned credit was not charged");
+        }
+        let outstanding_bytes = source
+            .outstanding_byte_credit
+            .checked_add(credits.bytes)
+            .ok_or("outstanding byte credit overflow")?;
+        let outstanding_packets = source
+            .outstanding_packet_credit
+            .checked_add(credits.packets)
+            .ok_or("outstanding packet credit overflow")?;
+        if outstanding_bytes
+            .checked_add(source.charged_bytes - credits.bytes)
+            .is_none_or(|total| total > source.credit_window_bytes)
+            || outstanding_packets
+                .checked_add(source.charged_packets - credits.packets)
+                .is_none_or(|total| total > source.credit_window_packets)
+        {
+            return Err("returned credit exceeds the rolling window");
+        }
+        source.charged_bytes -= credits.bytes;
+        source.charged_packets -= credits.packets;
+        source.outstanding_byte_credit = outstanding_bytes;
+        source.outstanding_packet_credit = outstanding_packets;
+        Ok(())
+    }
+
+    pub fn top_up_credit(&self, key: SourceKey) -> Result<messages::Credits, &'static str> {
+        let mut state = self.lock();
+        let source = state.sources.get_mut(&key).ok_or("source does not exist")?;
+        let bytes = source
+            .credit_window_bytes
+            .saturating_sub(source.outstanding_byte_credit.saturating_add(source.charged_bytes));
+        let packets = source.credit_window_packets.saturating_sub(
+            source.outstanding_packet_credit.saturating_add(source.charged_packets),
+        );
+        source.outstanding_byte_credit =
+            source.outstanding_byte_credit.checked_add(bytes).ok_or("credit top-up overflow")?;
+        source.outstanding_packet_credit = source
+            .outstanding_packet_credit
+            .checked_add(packets)
+            .ok_or("credit top-up overflow")?;
+        Ok(messages::Credits { bytes, packets, fragments: 0 })
     }
 
     #[cfg(unix)]
@@ -2443,7 +2550,7 @@ mod tests {
             .unwrap_err();
         assert_eq!(stale.current_revision, SceneRevision::new(2));
 
-        let status = scene.source_status((1, 40), 4096, 4).unwrap();
+        let status = scene.source_status((1, 40)).unwrap();
         let encoded = messages::source_status(7, &status).unwrap();
         assert!(encoded.len() <= messages::MAX_STATUS_REPLY_BODY);
         for forbidden in [b"VIVID_TOKEN".as_slice(), b"media_ticket", b"/tmp/"] {
@@ -2478,6 +2585,42 @@ mod tests {
         assert!(status.cursor.is_none());
         let encoded = messages::scene_status(7, &status).unwrap();
         assert!(encoded.len() <= messages::MAX_STATUS_REPLY_BODY);
+    }
+
+    #[test]
+    fn source_credit_status_tracks_consumption_top_up_and_return_exactly() {
+        let scene = SharedScene::default();
+        add_video(&scene, 40);
+        scene
+            .configure_credit_window(
+                (1, 40),
+                messages::Credits { bytes: 4096, packets: 4, fragments: 0 },
+                messages::Credits { bytes: 8192, packets: 8, fragments: 0 },
+            )
+            .unwrap();
+        let status = scene.source_status((1, 40)).unwrap();
+        assert_eq!((status.outstanding_byte_credit, status.outstanding_packet_credit), (4096, 4));
+
+        scene.consume_credit((1, 40), 100).unwrap();
+        let status = scene.source_status((1, 40)).unwrap();
+        assert_eq!((status.outstanding_byte_credit, status.outstanding_packet_credit), (3996, 3));
+
+        let top_up = scene.top_up_credit((1, 40)).unwrap();
+        assert_eq!((top_up.bytes, top_up.packets), (4096, 4));
+        let status = scene.source_status((1, 40)).unwrap();
+        assert_eq!((status.outstanding_byte_credit, status.outstanding_packet_credit), (8092, 7));
+
+        scene
+            .return_credit((1, 40), messages::Credits { bytes: 100, packets: 1, fragments: 0 })
+            .unwrap();
+        let status = scene.source_status((1, 40)).unwrap();
+        assert_eq!((status.outstanding_byte_credit, status.outstanding_packet_credit), (8192, 8));
+        assert!(
+            scene
+                .return_credit((1, 40), messages::Credits { bytes: 100, packets: 1, fragments: 0 },)
+                .is_err()
+        );
+        assert!(scene.consume_credit((1, 40), 8193).is_err());
     }
 
     #[test]
@@ -2762,7 +2905,7 @@ mod tests {
                 )
                 .is_err()
         );
-        assert_eq!(scene.source_status((9, 1), 0, 0).unwrap().capture_policy, tightened);
+        assert_eq!(scene.source_status((9, 1)).unwrap().capture_policy, tightened);
 
         scene.detach_session(9).unwrap();
         assert!(scene.source_config((9, 1)).is_none());
@@ -2795,7 +2938,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            scene.source_status((9, 1), 0, 0).unwrap().descriptor,
+            scene.source_status((9, 1)).unwrap().descriptor,
             Some(messages::ReportedSourceDescriptor::Full(descriptor.clone()))
         );
 
@@ -2819,7 +2962,7 @@ mod tests {
 
         scene.tighten_source_policy((9, 1), messages::CAPTURE_POLICY_DENY_SEMANTIC_EXPORT).unwrap();
         assert_eq!(
-            scene.source_status((9, 1), 0, 0).unwrap().descriptor,
+            scene.source_status((9, 1)).unwrap().descriptor,
             Some(messages::ReportedSourceDescriptor::RoleOnly { role: advanced.role })
         );
     }
