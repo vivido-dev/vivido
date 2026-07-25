@@ -784,6 +784,7 @@ impl SharedScene {
         })
     }
 
+    #[cfg(unix)]
     pub fn source_keys(&self) -> Vec<SourceKey> {
         let mut state = self.lock();
         purge_expired_tombstones(&mut state, Instant::now());

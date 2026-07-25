@@ -65,6 +65,7 @@ mod text;
 #[cfg(unix)]
 #[cfg(test)]
 pub(crate) use media::CaptureRedaction;
+#[cfg(unix)]
 pub(crate) use renderer::{ScreenshotError, ScreenshotPixels, ScreenshotReadback};
 
 /// Label for the forward terminal search bar.

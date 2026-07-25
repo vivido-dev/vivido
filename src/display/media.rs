@@ -331,6 +331,7 @@ impl VividMediaRenderer {
         Some(target.image.clone())
     }
 
+    #[cfg(unix)]
     pub fn capture_redactions(&self) -> &[CaptureRedaction] {
         &self.capture_redactions
     }
