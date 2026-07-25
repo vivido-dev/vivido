@@ -1,5 +1,7 @@
 use std::sync::Arc;
+#[cfg(unix)]
 use std::sync::mpsc::{self, Receiver, TryRecvError};
+#[cfg(unix)]
 use std::time::Instant;
 
 use pollster::block_on;
@@ -23,33 +25,45 @@ pub enum Error {
 }
 
 /// Maximum raw screenshot readback allocation.
+#[cfg(any(unix, test))]
 const MAX_SCREENSHOT_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Number of bytes in one captured RGBA pixel.
+#[cfg(any(unix, test))]
 const SCREENSHOT_PIXEL_BYTES: u32 = 4;
 
+#[cfg(any(unix, test))]
 #[derive(Debug)]
 pub enum ScreenshotError {
+    #[cfg(unix)]
     NoPresentedFrame,
     TooLarge,
+    #[cfg(unix)]
     Device(String),
+    #[cfg(unix)]
     Readback(String),
 }
 
+#[cfg(any(unix, test))]
 impl std::fmt::Display for ScreenshotError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            #[cfg(unix)]
             Self::NoPresentedFrame => formatter.write_str("no displayed frame is available"),
             Self::TooLarge => formatter.write_str("screenshot exceeds the 256 MiB readback limit"),
+            #[cfg(unix)]
             Self::Device(err) => write!(formatter, "screenshot device polling failed: {err}"),
+            #[cfg(unix)]
             Self::Readback(err) => write!(formatter, "screenshot readback failed: {err}"),
         }
     }
 }
 
+#[cfg(any(unix, test))]
 impl std::error::Error for ScreenshotError {}
 
 /// Asynchronous GPU screenshot readback.
+#[cfg(unix)]
 pub struct ScreenshotReadback {
     receiver: Receiver<Result<Vec<u8>, String>>,
     pub width: u32,
@@ -59,6 +73,7 @@ pub struct ScreenshotReadback {
 }
 
 /// Completed screenshot pixels with WebGPU row padding still present.
+#[cfg(unix)]
 pub struct ScreenshotPixels {
     pub bytes: Vec<u8>,
     pub width: u32,
@@ -249,6 +264,7 @@ impl SceneRenderer {
     }
 
     /// Start asynchronously reading the last successfully presented frame.
+    #[cfg(unix)]
     pub fn begin_screenshot(&self) -> Result<ScreenshotReadback, ScreenshotError> {
         if !self.has_presented_frame {
             return Err(ScreenshotError::NoPresentedFrame);
@@ -303,6 +319,7 @@ impl SceneRenderer {
     }
 
     /// Poll an asynchronous screenshot without blocking the renderer thread.
+    #[cfg(unix)]
     pub fn poll_screenshot(
         &self,
         readback: &ScreenshotReadback,
@@ -361,6 +378,7 @@ fn create_render_target(
     (texture, view)
 }
 
+#[cfg(any(unix, test))]
 fn screenshot_layout(width: u32, height: u32) -> Result<(u32, u64), ScreenshotError> {
     let unpadded_bytes_per_row =
         width.checked_mul(SCREENSHOT_PIXEL_BYTES).ok_or(ScreenshotError::TooLarge)?;

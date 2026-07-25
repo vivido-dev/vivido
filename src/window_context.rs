@@ -28,10 +28,9 @@ use serde_json as json;
 use serde_json::{Value, json as json_value};
 #[cfg(unix)]
 use winit::dpi::PhysicalPosition;
-use winit::event::{
-    ElementState, Event as WinitEvent, Modifiers, MouseButton, MouseScrollDelta, TouchPhase,
-    WindowEvent,
-};
+#[cfg(unix)]
+use winit::event::{ElementState, MouseButton, MouseScrollDelta, TouchPhase};
+use winit::event::{Event as WinitEvent, Modifiers, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoopProxy};
 use winit::window::WindowId;
 

@@ -153,12 +153,14 @@ impl Processor {
         event_loop: &ActiveEventLoop,
         window_options: WindowOptions,
     ) -> Result<u64, Box<dyn Error>> {
-        let mut window_context = WindowContext::initial(
+        let window_context = WindowContext::initial(
             event_loop,
             self.proxy.clone(),
             self.config.clone(),
             window_options,
         )?;
+        #[cfg(unix)]
+        let mut window_context = window_context;
 
         #[cfg(unix)]
         {
@@ -207,13 +209,15 @@ impl Processor {
         let mut config = self.config.clone();
         config = config_overrides.override_config_rc(config);
 
-        let mut window_context = WindowContext::additional(
+        let window_context = WindowContext::additional(
             event_loop,
             self.proxy.clone(),
             config,
             options,
             config_overrides,
         )?;
+        #[cfg(unix)]
+        let mut window_context = window_context;
 
         #[cfg(unix)]
         if self
@@ -1575,9 +1579,9 @@ impl ApplicationHandler<Event> for Processor {
         }
 
         if is_redraw {
-            let presented = window_context.draw(&mut self.scheduler);
+            let _presented = window_context.draw(&mut self.scheduler);
             #[cfg(unix)]
-            if presented {
+            if _presented {
                 let ipc_window_id = window_context.ipc_window_id();
                 let frame_sequence = window_context.automation.record_frame();
                 self.automation.emit(
@@ -1830,7 +1834,7 @@ impl ApplicationHandler<Event> for Processor {
             },
             (EventType::Terminal(TerminalEvent::Exit), Some(window_id)) => {
                 // Remove the closed terminal.
-                let mut window_context = match self.windows.entry(*window_id) {
+                let window_context = match self.windows.entry(*window_id) {
                     // Don't exit when terminal exits if user asked to hold the window.
                     Entry::Occupied(window_context)
                         if !window_context.get().display.window.hold =>
@@ -1839,6 +1843,8 @@ impl ApplicationHandler<Event> for Processor {
                     },
                     _ => return,
                 };
+                #[cfg(unix)]
+                let mut window_context = window_context;
 
                 #[cfg(unix)]
                 {

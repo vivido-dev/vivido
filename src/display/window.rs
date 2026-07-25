@@ -205,6 +205,7 @@ impl Window {
     }
 
     #[inline]
+    #[cfg(unix)]
     pub fn focus_window(&self) {
         // Direct focus is intentionally a no-op on Wayland. Winit's attention request uses
         // xdg_activation_v1 to obtain and apply a compositor-approved activation token.
