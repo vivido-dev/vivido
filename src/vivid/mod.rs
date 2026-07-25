@@ -1426,6 +1426,7 @@ fn is_supported_feature(feature: u64) -> bool {
             | messages::FEATURE_OBSERVABILITY_CORE_V1
             | messages::FEATURE_ATOMIC_CONTROL_V1
             | messages::FEATURE_DELEGATED_CONTEXT_V1
+            | messages::FEATURE_SOURCE_CAPTURE_POLICY_V1
     )
 }
 
@@ -2689,7 +2690,7 @@ fn dispatch_control(
             }
         },
         messages::PROBE_VIDEO_CONFIG => {
-            let (envelope, config) = messages::parse_create_video(&record.body)
+            let (envelope, config) = messages::parse_probe_video_config(&record.body)
                 .map_err(|_| bad("invalid PROBE_VIDEO_CONFIG"))?;
             if record.object_id != 0 || config.source_id != 0 {
                 return Err(bad("PROBE_VIDEO_CONFIG must be session-level"));
@@ -2721,7 +2722,7 @@ fn dispatch_control(
                     fatal: false,
                 });
             }
-            let (envelope, config) = messages::parse_create_audio(&record.body)
+            let (envelope, config) = messages::parse_probe_audio_config(&record.body)
                 .map_err(|_| bad("invalid PROBE_AUDIO_CONFIG"))?;
             if record.object_id != 0 || config.source_id != 0 {
                 return Err(bad("PROBE_AUDIO_CONFIG must be session-level"));
@@ -2745,8 +2746,9 @@ fn dispatch_control(
             )?;
         },
         messages::CREATE_RASTER => {
-            let (envelope, config) = messages::parse_create_raster(&record.body)
-                .map_err(|_| bad("invalid CREATE_RASTER"))?;
+            let (envelope, config, capture_policy) =
+                messages::parse_create_raster_with_policy(&record.body)
+                    .map_err(|_| bad("invalid CREATE_RASTER"))?;
             if record.object_id != config.source_id {
                 return Err(bad("CREATE_RASTER object ID mismatch"));
             }
@@ -2759,6 +2761,8 @@ fn dispatch_control(
                         session_id,
                         messages::FEATURE_RASTER_PREMULTIPLIED_ALPHA,
                     ))
+                || (envelope.payload.map_value(9).is_some()
+                    && !negotiated(shared, session_id, messages::FEATURE_SOURCE_CAPTURE_POLICY_V1))
             {
                 return Err(ProtocolError {
                     code: messages::ERROR_UNSUPPORTED_FEATURE,
@@ -2782,7 +2786,12 @@ fn dispatch_control(
             )?;
             shared
                 .scene
-                .add_source(session_id, config.source_id, SourceConfig::Raster(config.clone()))
+                .add_source_with_policy(
+                    session_id,
+                    config.source_id,
+                    SourceConfig::Raster(config.clone()),
+                    capture_policy,
+                )
                 .map_err(|message| ProtocolError {
                     code: messages::ERROR_LIMIT_EXCEEDED,
                     message,
@@ -2799,8 +2808,9 @@ fn dispatch_control(
             .map_err(|_| bad("could not create raster media ticket"))?;
         },
         messages::CREATE_VIDEO => {
-            let (envelope, config) = messages::parse_create_video(&record.body)
-                .map_err(|_| bad("invalid CREATE_VIDEO"))?;
+            let (envelope, config, capture_policy) =
+                messages::parse_create_video_with_policy(&record.body)
+                    .map_err(|_| bad("invalid CREATE_VIDEO"))?;
             if !negotiated(shared, session_id, messages::FEATURE_VIDEO_ACCESS_UNIT_V1) {
                 return Err(ProtocolError {
                     code: messages::ERROR_UNSUPPORTED_FEATURE,
@@ -2815,6 +2825,15 @@ fn dispatch_control(
                 return Err(ProtocolError {
                     code: messages::ERROR_UNSUPPORTED_CONFIG,
                     message: "unsupported video packetization",
+                    fatal: false,
+                });
+            }
+            if envelope.payload.map_value(23).is_some()
+                && !negotiated(shared, session_id, messages::FEATURE_SOURCE_CAPTURE_POLICY_V1)
+            {
+                return Err(ProtocolError {
+                    code: messages::ERROR_UNSUPPORTED_FEATURE,
+                    message: "source capture policy was not negotiated",
                     fatal: false,
                 });
             }
@@ -2837,7 +2856,12 @@ fn dispatch_control(
             )?;
             shared
                 .scene
-                .add_source(session_id, config.source_id, SourceConfig::Video(config.clone()))
+                .add_source_with_policy(
+                    session_id,
+                    config.source_id,
+                    SourceConfig::Video(config.clone()),
+                    capture_policy,
+                )
                 .map_err(|message| ProtocolError {
                     code: messages::ERROR_LIMIT_EXCEEDED,
                     message,
@@ -2861,10 +2885,20 @@ fn dispatch_control(
                     fatal: false,
                 });
             }
-            let (envelope, config) = messages::parse_create_audio(&record.body)
-                .map_err(|_| bad("invalid CREATE_AUDIO"))?;
+            let (envelope, config, capture_policy) =
+                messages::parse_create_audio_with_policy(&record.body)
+                    .map_err(|_| bad("invalid CREATE_AUDIO"))?;
             if config.source_id == 0 || record.object_id != config.source_id {
                 return Err(bad("CREATE_AUDIO object ID mismatch"));
+            }
+            if envelope.payload.map_value(12).is_some()
+                && !negotiated(shared, session_id, messages::FEATURE_SOURCE_CAPTURE_POLICY_V1)
+            {
+                return Err(ProtocolError {
+                    code: messages::ERROR_UNSUPPORTED_FEATURE,
+                    message: "source capture policy was not negotiated",
+                    fatal: false,
+                });
             }
             if !messages::audio_config_supported(&config) {
                 return Err(ProtocolError {
@@ -2897,7 +2931,12 @@ fn dispatch_control(
             // issues its ticket; it does not reorder the source-creation mutation.
             shared
                 .scene
-                .add_source(session_id, config.source_id, SourceConfig::Audio(config.clone()))
+                .add_source_with_policy(
+                    session_id,
+                    config.source_id,
+                    SourceConfig::Audio(config.clone()),
+                    capture_policy,
+                )
                 .map_err(|message| ProtocolError {
                     code: messages::ERROR_LIMIT_EXCEEDED,
                     message,
@@ -2917,8 +2956,9 @@ fn dispatch_control(
             }
         },
         messages::CREATE_IMAGE => {
-            let (envelope, config) = messages::parse_create_image(&record.body)
-                .map_err(|_| bad("invalid CREATE_IMAGE"))?;
+            let (envelope, config, capture_policy) =
+                messages::parse_create_image_with_policy(&record.body)
+                    .map_err(|_| bad("invalid CREATE_IMAGE"))?;
             if !negotiated(shared, session_id, messages::FEATURE_ENCODED_IMAGE_V1) {
                 return Err(ProtocolError {
                     code: messages::ERROR_UNSUPPORTED_FEATURE,
@@ -2928,6 +2968,15 @@ fn dispatch_control(
             }
             if record.object_id != config.source_id {
                 return Err(bad("CREATE_IMAGE object ID mismatch"));
+            }
+            if envelope.payload.map_value(9).is_some()
+                && !negotiated(shared, session_id, messages::FEATURE_SOURCE_CAPTURE_POLICY_V1)
+            {
+                return Err(ProtocolError {
+                    code: messages::ERROR_UNSUPPORTED_FEATURE,
+                    message: "source capture policy was not negotiated",
+                    fatal: false,
+                });
             }
             if config.encoded_length > vivid_protocol::HARD_MAX_RECORD_BODY {
                 return Err(ProtocolError {
@@ -2949,7 +2998,12 @@ fn dispatch_control(
             )?;
             shared
                 .scene
-                .add_source(session_id, config.source_id, SourceConfig::Image(config.clone()))
+                .add_source_with_policy(
+                    session_id,
+                    config.source_id,
+                    SourceConfig::Image(config.clone()),
+                    capture_policy,
+                )
                 .map_err(|message| ProtocolError {
                     code: messages::ERROR_LIMIT_EXCEEDED,
                     message,
@@ -2964,6 +3018,35 @@ fn dispatch_control(
                 config.encoded_length,
             )
             .map_err(|_| bad("could not create image media ticket"))?;
+        },
+        messages::SET_SOURCE_POLICY => {
+            if !negotiated(shared, session_id, messages::FEATURE_SOURCE_CAPTURE_POLICY_V1) {
+                return Err(ProtocolError {
+                    code: messages::ERROR_UNSUPPORTED_FEATURE,
+                    message: "source capture policy was not negotiated",
+                    fatal: false,
+                });
+            }
+            let (envelope, source_id, requested) = messages::parse_set_source_policy(&record.body)
+                .map_err(|_| bad("invalid SET_SOURCE_POLICY"))?;
+            if record.object_id != source_id {
+                return Err(bad("SET_SOURCE_POLICY object ID mismatch"));
+            }
+            shared.scene.tighten_source_policy((session_id, source_id), requested).map_err(
+                |message| ProtocolError {
+                    code: if message == "source does not exist" {
+                        messages::ERROR_NOT_FOUND
+                    } else {
+                        messages::ERROR_BAD_STATE
+                    },
+                    message,
+                    fatal: false,
+                },
+            )?;
+            writer
+                .write_ok(messages::OK, source_id, envelope.request_id)
+                .map_err(|_| bad("could not acknowledge source policy"))?;
+            wake(shared);
         },
         messages::DESTROY_SOURCE => {
             let (envelope, source_id) = messages::parse_object_id(&record.body, "source ID")
@@ -3504,11 +3587,20 @@ fn handle_media(
         {
             output.stop();
         }
-        let diagnostic = error.to_string();
-        let code = if diagnostic.contains("hash mismatch") {
+        let detailed_diagnostic = error.to_string();
+        let code = if detailed_diagnostic.contains("hash mismatch") {
             messages::ERROR_HASH_MISMATCH
         } else {
             messages::ERROR_DECODER
+        };
+        let reduce_diagnostics = shared
+            .scene
+            .source_capture_policy(source_key)
+            .is_some_and(|policy| policy & messages::CAPTURE_POLICY_REDUCE_DIAGNOSTICS != 0);
+        let diagnostic = if reduce_diagnostics {
+            String::from("source processing failed")
+        } else {
+            detailed_diagnostic
         };
         let final_revision = shared
             .scene

@@ -14,7 +14,7 @@ use winit::window::Window as WinitWindow;
 use crate::terminal::graphics::GraphicsCommand;
 
 use crate::display::SizeInfo;
-use crate::display::media::VividMediaRenderer;
+use crate::display::media::{CaptureRedaction, VividMediaRenderer};
 
 #[derive(Debug)]
 pub enum Error {
@@ -70,6 +70,7 @@ pub struct ScreenshotReadback {
     pub height: u32,
     pub padded_bytes_per_row: u32,
     pub started: Instant,
+    pub redactions: Vec<CaptureRedaction>,
 }
 
 /// Completed screenshot pixels with WebGPU row padding still present.
@@ -79,6 +80,7 @@ pub struct ScreenshotPixels {
     pub width: u32,
     pub height: u32,
     pub padded_bytes_per_row: u32,
+    pub redactions: Vec<CaptureRedaction>,
 }
 
 impl std::fmt::Display for Error {
@@ -315,6 +317,7 @@ impl SceneRenderer {
             height,
             padded_bytes_per_row,
             started: Instant::now(),
+            redactions: self.media.capture_redactions().to_vec(),
         })
     }
 
@@ -335,6 +338,7 @@ impl SceneRenderer {
                 width: readback.width,
                 height: readback.height,
                 padded_bytes_per_row: readback.padded_bytes_per_row,
+                redactions: readback.redactions.clone(),
             })),
             Ok(Err(err)) => Err(ScreenshotError::Readback(err)),
             Err(TryRecvError::Empty) => Ok(None),

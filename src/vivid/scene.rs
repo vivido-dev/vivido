@@ -149,11 +149,13 @@ pub struct RenderItem {
     pub z_index: i64,
     pub text_anchored: bool,
     pub clip: Option<ClipRect>,
+    pub capture_policy: u64,
 }
 
 #[derive(Debug)]
 struct Source {
     config: SourceConfig,
+    capture_policy: u64,
     revision: SourceRevision,
     field_revisions: [u64; 9],
     lifecycle: u64,
@@ -195,6 +197,7 @@ pub struct SourceObservation {
     pub last_presentation_id: u64,
     pub linked_source_id: u64,
     pub visible: bool,
+    pub capture_policy: u64,
     pub terminal_loss_code: Option<u64>,
 }
 
@@ -325,6 +328,7 @@ fn observation(source: &Source, terminal_loss_code: Option<u64>) -> SourceObserv
         last_presentation_id: source.last_presentation_id,
         linked_source_id: source.config.linked_source_id(),
         visible: source.visible,
+        capture_policy: source.capture_policy,
         terminal_loss_code,
     }
 }
@@ -519,12 +523,26 @@ impl SharedScene {
         Ok(removed)
     }
 
+    #[allow(dead_code)] // Convenience API retained for tests and policy-free internal callers.
     pub fn add_source(
         &self,
         session_id: SessionId,
         source_id: u64,
         config: SourceConfig,
     ) -> Result<(), &'static str> {
+        self.add_source_with_policy(session_id, source_id, config, 0)
+    }
+
+    pub fn add_source_with_policy(
+        &self,
+        session_id: SessionId,
+        source_id: u64,
+        config: SourceConfig,
+        capture_policy: u64,
+    ) -> Result<(), &'static str> {
+        if messages::validate_capture_policy(capture_policy).is_err() {
+            return Err("capture policy contains reserved bits");
+        }
         let mut state = self.lock();
         let key = (session_id, source_id);
         purge_expired_tombstones(&mut state, Instant::now());
@@ -570,6 +588,7 @@ impl SharedScene {
             key,
             Source {
                 config,
+                capture_policy,
                 revision: SourceRevision::new(1),
                 field_revisions: [1, 0, 0, 0, 0, 0, 0, 0, 0],
                 lifecycle: messages::SOURCE_LIFECYCLE_CREATED,
@@ -628,6 +647,31 @@ impl SharedScene {
 
     pub fn source_content_revision(&self, key: SourceKey) -> Option<u64> {
         self.lock().sources.get(&key).map(|_| 0)
+    }
+
+    pub fn source_capture_policy(&self, key: SourceKey) -> Option<u64> {
+        self.lock().sources.get(&key).map(|source| source.capture_policy)
+    }
+
+    pub fn tighten_source_policy(
+        &self,
+        key: SourceKey,
+        requested: u64,
+    ) -> Result<bool, &'static str> {
+        if messages::validate_capture_policy(requested).is_err() {
+            return Err("capture policy contains reserved bits");
+        }
+        let mut state = self.lock();
+        let source = state.sources.get_mut(&key).ok_or("source does not exist")?;
+        if requested & source.capture_policy != source.capture_policy {
+            return Err("capture policy cannot be relaxed");
+        }
+        if requested == source.capture_policy {
+            return Ok(false);
+        }
+        source.capture_policy = requested;
+        advance_source_revision(source, messages::SOURCE_CHANGED_CAPTURE_POLICY)?;
+        Ok(true)
     }
 
     pub fn anchor_state(&self, session_id: SessionId, anchor_id: u64) -> u64 {
@@ -1005,14 +1049,6 @@ impl SharedScene {
             )?;
         }
         self.0.playback_changed.notify_all();
-        Ok(())
-    }
-
-    #[allow(dead_code)] // Called by the Stage 3 policy command path.
-    pub fn mark_policy_changed(&self, key: SourceKey) -> Result<(), &'static str> {
-        let mut state = self.lock();
-        let source = state.sources.get_mut(&key).ok_or("source does not exist")?;
-        advance_source_revision(source, messages::SOURCE_CHANGED_CAPTURE_POLICY)?;
         Ok(())
     }
 
@@ -1422,7 +1458,8 @@ impl SharedScene {
             .filter(|node| node.visible)
             .filter_map(|node| {
                 let key = (node.session_id, node.source_id);
-                let frame = state.sources.get(&key)?.latest_frame.clone()?;
+                let source = state.sources.get(&key)?;
+                let frame = source.latest_frame.clone()?;
                 let (x, y, text_anchored, anchor_offset) = if let Some(anchor_id) = node.anchor_id {
                     let anchor = state.anchors.get(&(node.session_id, anchor_id))?;
                     if anchor.alternate != state.alternate_screen {
@@ -1453,6 +1490,7 @@ impl SharedScene {
                     z_index: node.z_index,
                     text_anchored,
                     clip,
+                    capture_policy: source.capture_policy,
                 })
             })
             .collect::<Vec<_>>();
@@ -1652,18 +1690,33 @@ impl SharedScene {
     pub fn detach_session(&self, session_id: SessionId) -> Result<(), &'static str> {
         let mut state = self.lock();
         state.detached_sessions.insert(session_id);
-        if state
-            .nodes
+        let poster_denied = state
+            .sources
             .iter()
-            .any(|((owner, _), node)| *owner == session_id && node.anchor_id.is_none())
-        {
-            advance_scene_revision(
-                &mut state,
-                session_id,
-                messages::SCENE_CHANGED_CONTEXT_REVOKED,
-            )?;
+            .filter_map(|(key, source)| {
+                (key.0 == session_id
+                    && source.capture_policy & messages::CAPTURE_POLICY_DENY_POSTER_RETENTION != 0)
+                    .then_some(*key)
+            })
+            .collect::<HashSet<_>>();
+        let mut teardown_reasons = 0;
+        for ((owner, _), node) in &state.nodes {
+            if *owner != session_id {
+                continue;
+            }
+            if node.anchor_id.is_none() {
+                teardown_reasons |= messages::SCENE_CHANGED_CONTEXT_REVOKED;
+            } else if poster_denied.contains(&(*owner, node.source_id)) {
+                teardown_reasons |= messages::SCENE_CHANGED_POLICY_TEARDOWN;
+            }
         }
-        state.nodes.retain(|(owner, _), node| *owner != session_id || node.anchor_id.is_some());
+        if teardown_reasons != 0 {
+            advance_scene_revision(&mut state, session_id, teardown_reasons)?;
+        }
+        state.nodes.retain(|(owner, _), node| {
+            *owner != session_id
+                || (node.anchor_id.is_some() && !poster_denied.contains(&(*owner, node.source_id)))
+        });
         gc_detached_sources(&mut state);
         state.revision = state.revision.wrapping_add(1);
         self.0.playback_changed.notify_all();
@@ -1763,7 +1816,7 @@ fn source_status_from_observation(
         last_presented_pts_us: observed.last_presented_pts_us,
         last_presentation_id: observed.last_presentation_id,
         visible: observed.visible,
-        capture_policy: 0,
+        capture_policy: observed.capture_policy,
         linked_source_id: observed.linked_source_id,
         milestones: observed.milestones,
         outstanding_byte_credit,
@@ -2007,7 +2060,7 @@ mod tests {
         assert_eq!(revision(&scene), 12);
         scene.flush_playback(key, 2).unwrap();
         assert_eq!(revision(&scene), 13);
-        scene.mark_policy_changed(key).unwrap();
+        scene.tighten_source_policy(key, messages::CAPTURE_POLICY_DENY_CAPTURE).unwrap();
         assert_eq!(revision(&scene), 14);
         scene.mark_descriptor_changed(key).unwrap();
         assert_eq!(revision(&scene), 15);
@@ -2496,6 +2549,62 @@ mod tests {
             scene.apply_anchor_resize([((4, 7), Some((9, -2, false))), ((4, 8), None)]).unwrap();
         assert_eq!(removed, vec![(4, 8)]);
         assert_eq!(scene.anchor_positions(), vec![((4, 7), 9, -2, false)]);
+    }
+
+    #[test]
+    fn capture_policy_only_tightens_and_denies_detached_posters() {
+        let scene = SharedScene::default();
+        scene
+            .add_source_with_policy(
+                9,
+                1,
+                SourceConfig::Raster(RasterSourceConfig {
+                    source_id: 1,
+                    width: 1,
+                    height: 1,
+                    alpha_mode: vivid_protocol::messages::ALPHA_STRAIGHT,
+                    compression_mode: vivid_protocol::messages::COMPRESSION_NONE,
+                }),
+                vivid_protocol::messages::CAPTURE_POLICY_DENY_CAPTURE,
+            )
+            .unwrap();
+        scene.add_anchor(9, 2, 0, 0).unwrap();
+        scene
+            .commit_mutations(
+                9,
+                vec![SceneMutation::Create(SceneNode {
+                    session_id: 9,
+                    node_id: 3,
+                    source_id: 1,
+                    x: 0,
+                    y: 0,
+                    width: 1_i64 << 32,
+                    height: 1_i64 << 32,
+                    text_layer: 1,
+                    z_index: 0,
+                    visible: true,
+                    anchor_id: Some(2),
+                    clip: None,
+                })],
+            )
+            .unwrap();
+
+        let tightened = vivid_protocol::messages::CAPTURE_POLICY_DENY_CAPTURE
+            | vivid_protocol::messages::CAPTURE_POLICY_DENY_POSTER_RETENTION;
+        assert!(scene.tighten_source_policy((9, 1), tightened).unwrap());
+        assert!(!scene.tighten_source_policy((9, 1), tightened).unwrap());
+        assert!(
+            scene
+                .tighten_source_policy(
+                    (9, 1),
+                    vivid_protocol::messages::CAPTURE_POLICY_DENY_CAPTURE,
+                )
+                .is_err()
+        );
+        assert_eq!(scene.source_status((9, 1), 0, 0).unwrap().capture_policy, tightened);
+
+        scene.detach_session(9).unwrap();
+        assert!(scene.source_config((9, 1)).is_none());
     }
 
     #[cfg(windows)]

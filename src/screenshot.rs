@@ -12,6 +12,7 @@ use crate::display::ScreenshotPixels;
 /// Convert a padded premultiplied GPU readback and persist it as a private PNG.
 pub fn save(mut pixels: ScreenshotPixels) -> IoResult<PathBuf> {
     compact_and_unpremultiply(&mut pixels)?;
+    apply_capture_redactions(&mut pixels)?;
 
     let temp_dir = std::env::temp_dir();
     let temp_dir =
@@ -29,6 +30,32 @@ pub fn save(mut pixels: ScreenshotPixels) -> IoResult<PathBuf> {
     let (persisted, path) = file.keep().map_err(|err| err.error)?;
     drop(persisted);
     Ok(path)
+}
+
+fn apply_capture_redactions(pixels: &mut ScreenshotPixels) -> IoResult<()> {
+    let width = usize::try_from(pixels.width)
+        .map_err(|_| IoError::new(ErrorKind::InvalidData, "invalid screenshot width"))?;
+    let height = usize::try_from(pixels.height)
+        .map_err(|_| IoError::new(ErrorKind::InvalidData, "invalid screenshot height"))?;
+    for redaction in &pixels.redactions {
+        let left = usize::try_from(redaction.left).unwrap_or(usize::MAX).min(width);
+        let top = usize::try_from(redaction.top).unwrap_or(usize::MAX).min(height);
+        let right = usize::try_from(redaction.right).unwrap_or(usize::MAX).min(width);
+        let bottom = usize::try_from(redaction.bottom).unwrap_or(usize::MAX).min(height);
+        for row in top..bottom {
+            for column in left..right {
+                let offset = row
+                    .checked_mul(width)
+                    .and_then(|value| value.checked_add(column))
+                    .and_then(|value| value.checked_mul(4))
+                    .ok_or_else(|| {
+                        IoError::new(ErrorKind::InvalidData, "invalid screenshot redaction")
+                    })?;
+                pixels.bytes[offset..offset + 4].copy_from_slice(&[36, 40, 48, 255]);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Remove WebGPU row padding and convert premultiplied RGBA to straight alpha in place.
@@ -91,7 +118,8 @@ mod tests {
 
     use image::GenericImageView;
 
-    use super::{compact_and_unpremultiply, save};
+    use super::{apply_capture_redactions, compact_and_unpremultiply, save};
+    use crate::display::CaptureRedaction;
     use crate::display::ScreenshotPixels;
 
     #[test]
@@ -99,11 +127,31 @@ mod tests {
         let mut bytes = vec![0; 512];
         bytes[..4].copy_from_slice(&[64, 0, 128, 192]);
         bytes[256..260].copy_from_slice(&[10, 20, 30, 0]);
-        let mut pixels = ScreenshotPixels { bytes, width: 1, height: 2, padded_bytes_per_row: 256 };
+        let mut pixels = ScreenshotPixels {
+            bytes,
+            width: 1,
+            height: 2,
+            padded_bytes_per_row: 256,
+            redactions: Vec::new(),
+        };
 
         compact_and_unpremultiply(&mut pixels).unwrap();
 
         assert_eq!(pixels.bytes, [85, 0, 170, 192, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn capture_policy_replaces_pixels_with_an_opaque_neutral_color() {
+        let mut pixels = ScreenshotPixels {
+            bytes: vec![255; 3 * 2 * 4],
+            width: 3,
+            height: 2,
+            padded_bytes_per_row: 12,
+            redactions: vec![CaptureRedaction { left: 1, top: 0, right: 3, bottom: 1 }],
+        };
+        apply_capture_redactions(&mut pixels).unwrap();
+        assert_eq!(&pixels.bytes[4..12], &[36, 40, 48, 255, 36, 40, 48, 255]);
+        assert_eq!(&pixels.bytes[12..], &[255; 12]);
     }
 
     #[test]
@@ -113,6 +161,7 @@ mod tests {
             width: 1,
             height: 1,
             padded_bytes_per_row: 4,
+            redactions: Vec::new(),
         };
 
         let path = save(pixels).unwrap();
