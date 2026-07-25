@@ -20,7 +20,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use image::GenericImageView;
 use sha2::{Digest, Sha256};
@@ -56,6 +56,9 @@ const INITIAL_BYTE_CREDITS: u64 = 4 * 1024 * 1024;
 const INITIAL_PACKET_CREDITS: u64 = 32;
 const MAX_SESSIONS: usize = 16;
 const MAX_CONNECTIONS: usize = 64;
+const MAX_PENDING_OPERATIONS: usize = 64;
+const PENDING_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
+const CONTROL_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 #[derive(Debug, Clone, Copy)]
 pub struct DisplayMetrics {
@@ -103,6 +106,68 @@ struct ServiceShared {
     /// source visibility without the UI-thread inputs directly at hand.
     render_state: Mutex<(bool, usize)>,
     wake: Arc<dyn Fn() + Send + Sync>,
+}
+
+struct PendingOperation {
+    object_id: u64,
+    deadline: Instant,
+}
+
+#[derive(Default)]
+struct PendingOperations {
+    entries: Mutex<HashMap<u64, PendingOperation>>,
+}
+
+#[derive(Debug)]
+enum PendingRegisterError {
+    Full,
+    Duplicate,
+}
+
+impl PendingOperations {
+    fn register(
+        &self,
+        request_id: u64,
+        object_id: u64,
+        timeout: Duration,
+    ) -> Result<(), PendingRegisterError> {
+        let mut entries = self.entries.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if entries.contains_key(&request_id) {
+            return Err(PendingRegisterError::Duplicate);
+        }
+        if entries.len() >= MAX_PENDING_OPERATIONS {
+            return Err(PendingRegisterError::Full);
+        }
+        entries
+            .insert(request_id, PendingOperation { object_id, deadline: Instant::now() + timeout });
+        Ok(())
+    }
+
+    fn complete(&self, request_id: u64) -> bool {
+        self.entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&request_id)
+            .is_some()
+    }
+
+    fn expire(&self, now: Instant) -> Vec<(u64, u64)> {
+        let mut entries = self.entries.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let expired = entries
+            .iter()
+            .filter_map(|(&request_id, operation)| {
+                (operation.deadline <= now).then_some((request_id, operation.object_id))
+            })
+            .collect::<Vec<_>>();
+        for (request_id, _) in &expired {
+            entries.remove(request_id);
+        }
+        expired
+    }
+
+    fn cancel_all(&self) {
+        self.entries.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clear();
+    }
 }
 
 pub struct VividService {
@@ -521,7 +586,26 @@ fn handle_control(reader: &mut Reader, shared: Arc<ServiceShared>) -> io::Result
     log::info!("Authenticated Vivid producer {:?} as session {session_id}", hello.producer);
 
     let mut transactions: HashMap<u64, Vec<SceneMutation>> = HashMap::new();
-    let result = loop {
+    let pending = Arc::new(PendingOperations::default());
+    let result = 'control: loop {
+        for (request_id, object_id) in pending.expire(Instant::now()) {
+            if let Err(error) = writer.write_record(
+                messages::ERROR,
+                object_id,
+                &messages::error(
+                    request_id,
+                    messages::ERROR_TIMEOUT,
+                    "pending operation timed out",
+                ),
+            ) {
+                break 'control Err(error);
+            }
+        }
+        match reader.wait_readable(CONTROL_POLL_INTERVAL) {
+            Ok(true) => {},
+            Ok(false) => continue,
+            Err(error) => break Err(error),
+        }
         let record = match reader.read_record() {
             Ok(record) => record,
             Err(error) if error.kind() == ErrorKind::UnexpectedEof => break Ok(()),
@@ -533,6 +617,7 @@ fn handle_control(reader: &mut Reader, shared: Arc<ServiceShared>) -> io::Result
             root_context_id,
             &shared,
             &writer,
+            &pending,
             &mut transactions,
         );
         match result {
@@ -554,6 +639,7 @@ fn handle_control(reader: &mut Reader, shared: Arc<ServiceShared>) -> io::Result
         }
     };
 
+    pending.cancel_all();
     cleanup_session(&shared, session_id);
     wake(&shared);
     result
@@ -624,10 +710,196 @@ enum ControlAction {
     Goodbye,
 }
 
+#[derive(Debug)]
 struct ProtocolError {
     code: u64,
     message: &'static str,
     fatal: bool,
+}
+
+struct PendingReply {
+    record_type: u16,
+    object_id: u64,
+    body: Vec<u8>,
+}
+
+impl PendingReply {
+    fn ok(object_id: u64, request_id: u64) -> Self {
+        Self { record_type: messages::OK, object_id, body: messages::ok(request_id) }
+    }
+}
+
+fn spawn_pending_operation(
+    pending: &Arc<PendingOperations>,
+    writer: &Arc<Writer>,
+    request_id: u64,
+    object_id: u64,
+    name: &'static str,
+    operation: impl FnOnce() -> Result<PendingReply, ProtocolError> + Send + 'static,
+) -> Result<(), ProtocolError> {
+    register_pending_operation(pending, request_id, object_id)?;
+    let worker_pending = pending.clone();
+    let worker_writer = writer.clone();
+    if thread::Builder::new()
+        .name(name.into())
+        .spawn(move || {
+            let result = operation();
+            if !worker_pending.complete(request_id) {
+                return;
+            }
+            let write_result = match result {
+                Ok(reply) => {
+                    worker_writer.write_record(reply.record_type, reply.object_id, &reply.body)
+                },
+                Err(error) => worker_writer.write_record(
+                    messages::ERROR,
+                    object_id,
+                    &messages::error(request_id, error.code, error.message),
+                ),
+            };
+            if let Err(error) = write_result {
+                log::debug!("Could not complete pending Vivid operation: {error}");
+            }
+        })
+        .is_err()
+    {
+        pending.complete(request_id);
+        return Err(ProtocolError {
+            code: messages::ERROR_LIMIT_EXCEEDED,
+            message: "could not start pending operation worker",
+            fatal: false,
+        });
+    }
+    Ok(())
+}
+
+fn register_pending_operation(
+    pending: &PendingOperations,
+    request_id: u64,
+    object_id: u64,
+) -> Result<(), ProtocolError> {
+    match pending.register(request_id, object_id, PENDING_OPERATION_TIMEOUT) {
+        Ok(()) => {},
+        Err(PendingRegisterError::Full) => {
+            return Err(ProtocolError {
+                code: messages::ERROR_LIMIT_EXCEEDED,
+                message: "pending operation quota exceeded",
+                fatal: false,
+            });
+        },
+        Err(PendingRegisterError::Duplicate) => {
+            return Err(ProtocolError {
+                code: messages::ERROR_BAD_MESSAGE,
+                message: "request ID already has a pending operation",
+                fatal: false,
+            });
+        },
+    }
+    Ok(())
+}
+
+fn spawn_audio_source_open(
+    pending: &Arc<PendingOperations>,
+    writer: &Arc<Writer>,
+    shared: &Arc<ServiceShared>,
+    session_id: SessionId,
+    request_id: u64,
+    config: messages::ParsedAudioSourceConfig,
+    max_media_body: u32,
+) -> Result<(), ProtocolError> {
+    let source_id = config.source_id;
+    register_pending_operation(pending, request_id, source_id)?;
+    let worker_pending = pending.clone();
+    let worker_writer = writer.clone();
+    let worker_shared = shared.clone();
+    if thread::Builder::new()
+        .name("vivid-audio-open".into())
+        .spawn(move || {
+            let opened = if audio::supports(&config) {
+                AudioOutput::open().map_err(|_| ProtocolError {
+                    code: messages::ERROR_DEVICE_LOST,
+                    message: "default audio output is unavailable",
+                    fatal: false,
+                })
+            } else {
+                Err(ProtocolError {
+                    code: messages::ERROR_UNSUPPORTED_CONFIG,
+                    message: "audio decoder configuration is unavailable",
+                    fatal: false,
+                })
+            };
+            if !worker_pending.complete(request_id) {
+                if let Ok(output) = opened {
+                    output.stop();
+                }
+                return;
+            }
+            let result = opened.and_then(|output| {
+                worker_shared
+                    .scene
+                    .add_source(session_id, source_id, SourceConfig::Audio(config.clone()))
+                    .map_err(|message| ProtocolError {
+                        code: messages::ERROR_LIMIT_EXCEEDED,
+                        message,
+                        fatal: false,
+                    })?;
+                worker_shared
+                    .audio_outputs
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .insert((session_id, source_id), output.clone());
+                match prepare_source_ready(
+                    &worker_shared,
+                    request_id,
+                    (session_id, source_id),
+                    ConnectionKind::Audio,
+                    max_media_body,
+                ) {
+                    Ok(body) => Ok(PendingReply {
+                        record_type: messages::SOURCE_READY,
+                        object_id: source_id,
+                        body,
+                    }),
+                    Err(_) => {
+                        worker_shared
+                            .audio_outputs
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .remove(&(session_id, source_id));
+                        let _ = worker_shared.scene.remove_source((session_id, source_id));
+                        output.stop();
+                        Err(ProtocolError {
+                            code: messages::ERROR_LIMIT_EXCEEDED,
+                            message: "could not create audio media ticket",
+                            fatal: false,
+                        })
+                    },
+                }
+            });
+            let write_result = match result {
+                Ok(reply) => {
+                    worker_writer.write_record(reply.record_type, reply.object_id, &reply.body)
+                },
+                Err(error) => worker_writer.write_record(
+                    messages::ERROR,
+                    source_id,
+                    &messages::error(request_id, error.code, error.message),
+                ),
+            };
+            if let Err(error) = write_result {
+                log::debug!("Could not complete pending audio source creation: {error}");
+            }
+        })
+        .is_err()
+    {
+        pending.complete(request_id);
+        return Err(ProtocolError {
+            code: messages::ERROR_LIMIT_EXCEEDED,
+            message: "could not start audio device worker",
+            fatal: false,
+        });
+    }
+    Ok(())
 }
 
 fn dispatch_control(
@@ -636,6 +908,7 @@ fn dispatch_control(
     root_context_id: u64,
     shared: &Arc<ServiceShared>,
     writer: &Arc<Writer>,
+    pending: &Arc<PendingOperations>,
     transactions: &mut HashMap<u64, Vec<SceneMutation>>,
 ) -> Result<ControlAction, ProtocolError> {
     let bad = |message| ProtocolError { code: messages::ERROR_BAD_MESSAGE, message, fatal: false };
@@ -646,9 +919,7 @@ fn dispatch_control(
             if record.object_id != 0 || envelope.request_id == 0 {
                 return Err(bad("PING is not a correlated session-level request"));
             }
-            writer
-                .write_record(messages::PONG, 0, &messages::ok(envelope.request_id))
-                .map_err(|_| bad("could not send PONG"))?;
+            writer.write_pong(envelope.request_id).map_err(|_| bad("could not send PONG"))?;
         },
         messages::PROBE_VIDEO_CONFIG => {
             let (envelope, config) = messages::parse_create_video(&record.body)
@@ -656,15 +927,24 @@ fn dispatch_control(
             if record.object_id != 0 || config.source_id != 0 {
                 return Err(bad("PROBE_VIDEO_CONFIG must be session-level"));
             }
-            let supported = media::is_portable_packetization(&config.codec, &config.packetization)
-                && Decoder::new(&config).is_ok();
-            writer
-                .write_record(
-                    messages::VIDEO_SUPPORT,
-                    0,
-                    &messages::video_support(envelope.request_id, supported, &config.codec),
-                )
-                .map_err(|_| bad("could not send VIDEO_SUPPORT"))?;
+            let request_id = envelope.request_id;
+            spawn_pending_operation(
+                pending,
+                writer,
+                request_id,
+                0,
+                "vivid-video-probe",
+                move || {
+                    let supported =
+                        media::is_portable_packetization(&config.codec, &config.packetization)
+                            && Decoder::new(&config).is_ok();
+                    Ok(PendingReply {
+                        record_type: messages::VIDEO_SUPPORT,
+                        object_id: 0,
+                        body: messages::video_support(request_id, supported, &config.codec),
+                    })
+                },
+            )?;
         },
         messages::PROBE_AUDIO_CONFIG => {
             if !negotiated(shared, session_id, messages::FEATURE_AUDIO_ACCESS_UNIT_V1) {
@@ -679,14 +959,23 @@ fn dispatch_control(
             if record.object_id != 0 || config.source_id != 0 {
                 return Err(bad("PROBE_AUDIO_CONFIG must be session-level"));
             }
-            let supported = messages::audio_config_supported(&config) && audio::supports(&config);
-            writer
-                .write_record(
-                    messages::AUDIO_SUPPORT,
-                    0,
-                    &messages::audio_support(envelope.request_id, supported, &config.codec),
-                )
-                .map_err(|_| bad("could not send AUDIO_SUPPORT"))?;
+            let request_id = envelope.request_id;
+            spawn_pending_operation(
+                pending,
+                writer,
+                request_id,
+                0,
+                "vivid-audio-probe",
+                move || {
+                    let supported =
+                        messages::audio_config_supported(&config) && audio::supports(&config);
+                    Ok(PendingReply {
+                        record_type: messages::AUDIO_SUPPORT,
+                        object_id: 0,
+                        body: messages::audio_support(request_id, supported, &config.codec),
+                    })
+                },
+            )?;
         },
         messages::CREATE_RASTER => {
             let (envelope, config) = messages::parse_create_raster(&record.body)
@@ -817,46 +1106,21 @@ fn dispatch_control(
                     fatal: false,
                 });
             }
-            if !audio::supports(&config) {
-                return Err(ProtocolError {
-                    code: messages::ERROR_UNSUPPORTED_CONFIG,
-                    message: "audio decoder configuration is unavailable",
-                    fatal: false,
-                });
-            }
             let max_body =
                 media::audio_body_len(config.max_access_unit_bytes).map_err(|_| ProtocolError {
                     code: messages::ERROR_LIMIT_EXCEEDED,
                     message: "maximum audio access unit exceeds the media-body limit",
                     fatal: false,
                 })?;
-            let output = AudioOutput::open().map_err(|_| ProtocolError {
-                code: messages::ERROR_DEVICE_LOST,
-                message: "default audio output is unavailable",
-                fatal: false,
-            })?;
-            shared
-                .scene
-                .add_source(session_id, config.source_id, SourceConfig::Audio(config.clone()))
-                .map_err(|message| ProtocolError {
-                    code: messages::ERROR_LIMIT_EXCEEDED,
-                    message,
-                    fatal: false,
-                })?;
-            shared
-                .audio_outputs
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .insert((session_id, config.source_id), output);
-            issue_source_ready(
-                shared,
+            spawn_audio_source_open(
+                pending,
                 writer,
+                shared,
+                session_id,
                 envelope.request_id,
-                (session_id, config.source_id),
-                ConnectionKind::Audio,
+                config,
                 max_body,
-            )
-            .map_err(|_| bad("could not create audio media ticket"))?;
+            )?;
         },
         messages::CREATE_IMAGE => {
             let (envelope, config) = messages::parse_create_image(&record.body)
@@ -922,7 +1186,7 @@ fn dispatch_control(
                 .tickets
                 .retain(|_, ticket| ticket.source_key != (session_id, source_id));
             writer
-                .write_record(messages::OK, source_id, &messages::ok(envelope.request_id))
+                .write_ok(messages::OK, source_id, envelope.request_id)
                 .map_err(|_| bad("could not acknowledge source destruction"))?;
             wake(shared);
         },
@@ -944,7 +1208,7 @@ fn dispatch_control(
                 });
             }
             writer
-                .write_record(messages::OK, 0, &messages::ok(envelope.request_id))
+                .write_ok(messages::OK, 0, envelope.request_id)
                 .map_err(|_| bad("could not acknowledge transaction"))?;
         },
         messages::CREATE_NODE => {
@@ -972,7 +1236,7 @@ fn dispatch_control(
             })?;
             nodes.push(SceneMutation::Create(SceneNode::from_protocol(session_id, config)));
             writer
-                .write_record(messages::OK, record.object_id, &messages::ok(envelope.request_id))
+                .write_ok(messages::OK, record.object_id, envelope.request_id)
                 .map_err(|_| bad("could not acknowledge node"))?;
         },
         messages::UPDATE_NODE => {
@@ -1000,7 +1264,7 @@ fn dispatch_control(
             })?;
             mutations.push(SceneMutation::Update(SceneNode::from_protocol(session_id, config)));
             writer
-                .write_record(messages::OK, record.object_id, &messages::ok(envelope.request_id))
+                .write_ok(messages::OK, record.object_id, envelope.request_id)
                 .map_err(|_| bad("could not acknowledge node update"))?;
         },
         messages::DELETE_NODE => {
@@ -1018,7 +1282,7 @@ fn dispatch_control(
             })?;
             mutations.push(SceneMutation::Delete { session_id, node_id });
             writer
-                .write_record(messages::OK, record.object_id, &messages::ok(envelope.request_id))
+                .write_ok(messages::OK, record.object_id, envelope.request_id)
                 .map_err(|_| bad("could not acknowledge node deletion"))?;
         },
         messages::COMMIT_TXN => {
@@ -1063,7 +1327,7 @@ fn dispatch_control(
                 fatal: false,
             })?;
             writer
-                .write_record(messages::PRESENTED, 0, &messages::ok(envelope.request_id))
+                .write_ok(messages::PRESENTED, 0, envelope.request_id)
                 .map_err(|_| bad("could not acknowledge scene commit"))?;
             // A newly committed node may make a previously off-screen source visible (or vice
             // versa). Visibility is otherwise only recomputed on screen-swap/occlusion/scroll, so
@@ -1086,7 +1350,7 @@ fn dispatch_control(
                 });
             }
             writer
-                .write_record(messages::OK, 0, &messages::ok(envelope.request_id))
+                .write_ok(messages::OK, 0, envelope.request_id)
                 .map_err(|_| bad("could not acknowledge transaction abort"))?;
         },
         messages::PLAY => {
@@ -1121,7 +1385,7 @@ fn dispatch_control(
                 output.start();
             }
             writer
-                .write_record(messages::OK, source_id, &messages::ok(envelope.request_id))
+                .write_ok(messages::OK, source_id, envelope.request_id)
                 .map_err(|_| bad("could not acknowledge PLAY"))?;
         },
         messages::PAUSE => {
@@ -1144,7 +1408,7 @@ fn dispatch_control(
                 output.pause();
             }
             writer
-                .write_record(messages::OK, source_id, &messages::ok(envelope.request_id))
+                .write_ok(messages::OK, source_id, envelope.request_id)
                 .map_err(|_| bad("could not acknowledge PAUSE"))?;
         },
         messages::FLUSH => {
@@ -1178,7 +1442,7 @@ fn dispatch_control(
                 output.flush();
             }
             writer
-                .write_record(messages::OK, source_id, &messages::ok(envelope.request_id))
+                .write_ok(messages::OK, source_id, envelope.request_id)
                 .map_err(|_| bad("could not acknowledge FLUSH"))?;
         },
         messages::EOS => {
@@ -1205,7 +1469,7 @@ fn dispatch_control(
                 output.signal_eos();
             }
             writer
-                .write_record(messages::OK, source_id, &messages::ok(envelope.request_id))
+                .write_ok(messages::OK, source_id, envelope.request_id)
                 .map_err(|_| bad("could not acknowledge EOS"))?;
         },
         messages::DRAIN => {
@@ -1232,20 +1496,28 @@ fn dispatch_control(
                     message: "audio source does not exist",
                     fatal: false,
                 })?;
-            output.wait_drained().map_err(|_| ProtocolError {
-                code: messages::ERROR_DEVICE_LOST,
-                message: "audio output failed while draining",
-                fatal: false,
-            })?;
-            writer
-                .write_record(messages::OK, source_id, &messages::ok(envelope.request_id))
-                .map_err(|_| bad("could not acknowledge DRAIN"))?;
+            let request_id = envelope.request_id;
+            spawn_pending_operation(
+                pending,
+                writer,
+                request_id,
+                source_id,
+                "vivid-audio-drain",
+                move || {
+                    output.wait_drained().map_err(|_| ProtocolError {
+                        code: messages::ERROR_DEVICE_LOST,
+                        message: "audio output failed while draining",
+                        fatal: false,
+                    })?;
+                    Ok(PendingReply::ok(source_id, request_id))
+                },
+            )?;
         },
         messages::GOODBYE => {
             let envelope =
                 messages::decode_control(&record.body).map_err(|_| bad("invalid GOODBYE"))?;
             writer
-                .write_record(messages::OK, 0, &messages::ok(envelope.request_id))
+                .write_ok(messages::OK, 0, envelope.request_id)
                 .map_err(|_| bad("could not acknowledge GOODBYE"))?;
             return Ok(ControlAction::Goodbye);
         },
@@ -1269,27 +1541,34 @@ fn issue_source_ready(
     kind: ConnectionKind,
     max_media_body: u32,
 ) -> io::Result<()> {
+    let body = prepare_source_ready(shared, request_id, source_key, kind, max_media_body)?;
+    writer.write_record(messages::SOURCE_READY, source_key.1, &body)
+}
+
+fn prepare_source_ready(
+    shared: &Arc<ServiceShared>,
+    request_id: u64,
+    source_key: SourceKey,
+    kind: ConnectionKind,
+    max_media_body: u32,
+) -> io::Result<Vec<u8>> {
     let mut ticket_bytes = vec![0_u8; 32];
     getrandom::fill(&mut ticket_bytes)
         .map_err(|error| io::Error::other(format!("could not generate media ticket: {error}")))?;
     lock_registry(shared)
         .tickets
         .insert(ticket_bytes.clone(), Ticket { session_id: source_key.0, source_key, kind });
-    writer.write_record(
-        messages::SOURCE_READY,
+    Ok(messages::source_ready(
+        request_id,
         source_key.1,
-        &messages::source_ready(
-            request_id,
-            source_key.1,
-            &ticket_bytes,
-            Credits {
-                bytes: INITIAL_BYTE_CREDITS.max(u64::from(max_media_body)),
-                packets: INITIAL_PACKET_CREDITS,
-                fragments: 0,
-            },
-            max_media_body,
-        ),
-    )
+        &ticket_bytes,
+        Credits {
+            bytes: INITIAL_BYTE_CREDITS.max(u64::from(max_media_body)),
+            packets: INITIAL_PACKET_CREDITS,
+            fragments: 0,
+        },
+        max_media_body,
+    ))
 }
 
 fn handle_media(
@@ -1380,8 +1659,9 @@ fn handle_raster(
         _ => return Err(invalid("raster ticket references a non-raster source")),
     };
     let mut sequence = media::MediaSequence::default();
+    let mut body = Vec::new();
     loop {
-        let record = match reader.read_record() {
+        let record = match reader.read_record_into(&mut body) {
             Ok(record) => record,
             Err(error) if error.kind() == ErrorKind::UnexpectedEof => return Ok(()),
             Err(error) => return Err(error),
@@ -1390,7 +1670,7 @@ fn handle_raster(
         if record.record_type != messages::RASTER_FRAME || record.object_id != key.1 {
             return Err(invalid("unexpected record on raster media channel"));
         }
-        let raster = media::parse_full_raster_frame(&record.body)?;
+        let raster = media::parse_full_raster_frame(record.body)?;
         sequence.accept(raster.frame_id, raster.epoch)?;
         if (raster.width, raster.height) != (config.width, config.height) {
             return Err(invalid("raster frame dimensions differ from source"));
@@ -1523,6 +1803,7 @@ fn handle_video(
     let mut sequence = media::MediaSequence::default();
     let mut frame_id = 0_u64;
     let mut pending = VecDeque::with_capacity(MAX_QUEUED_VIDEO_FRAMES);
+    let mut body = Vec::new();
     loop {
         if !present_ready_video_frames(shared, key, &mut pending)? {
             return Ok(());
@@ -1537,7 +1818,7 @@ fn handle_video(
             }
             continue;
         }
-        let record = match reader.read_record() {
+        let record = match reader.read_record_into(&mut body) {
             Ok(record) => record,
             Err(error) if error.kind() == ErrorKind::UnexpectedEof => break,
             Err(error) => return Err(error),
@@ -1546,7 +1827,7 @@ fn handle_video(
         if record.record_type != messages::VIDEO_PACKET || record.object_id != key.1 {
             return Err(invalid("unexpected record on video media channel"));
         }
-        let packet = media::parse_video_packet(&record.body)?;
+        let packet = media::parse_video_packet(record.body)?;
         sequence.accept(packet.packet_id, packet.epoch)?;
         if packet.epoch < shared.scene.source_epoch(key).unwrap_or(packet.epoch) {
             continue;
@@ -1686,6 +1967,7 @@ fn handle_audio(
         let mut decoder = output.decoder(&config)?;
         let mut sequence = media::MediaSequence::default();
         let mut decoder_epoch = None;
+        let mut body = Vec::new();
         loop {
             if !reader.wait_readable(Duration::from_millis(50))? {
                 if shared.scene.eos_epoch(key).is_some() {
@@ -1693,7 +1975,7 @@ fn handle_audio(
                 }
                 continue;
             }
-            let record = match reader.read_record() {
+            let record = match reader.read_record_into(&mut body) {
                 Ok(record) => record,
                 Err(error) if error.kind() == ErrorKind::UnexpectedEof => break,
                 Err(error) => return Err(error),
@@ -1702,7 +1984,7 @@ fn handle_audio(
             if record.record_type != messages::AUDIO_PACKET || record.object_id != key.1 {
                 return Err(invalid("unexpected record on audio media channel"));
             }
-            let packet = media::parse_audio_packet(&record.body)?;
+            let packet = media::parse_audio_packet(record.body)?;
             sequence.accept(packet.packet_id, packet.epoch)?;
             if packet.epoch < shared.scene.source_epoch(key).unwrap_or(packet.epoch) {
                 continue;
@@ -1738,7 +2020,8 @@ fn handle_image(
         Some(SourceConfig::Image(config)) => config,
         _ => return Err(invalid("image ticket references a non-image source")),
     };
-    let record = reader.read_record()?;
+    let mut body = Vec::new();
+    let record = reader.read_record_into(&mut body)?;
     let _charge = ChargedBody::new(writer, key.1, record.body.len() as u64);
     if record.record_type != messages::IMAGE_DATA
         || record.object_id != key.1
@@ -1747,12 +2030,12 @@ fn handle_image(
         return Err(invalid("invalid IMAGE_DATA record"));
     }
     if let Some(expected) = config.sha256 {
-        let actual: [u8; 32] = Sha256::digest(&record.body).into();
+        let actual: [u8; 32] = Sha256::digest(record.body).into();
         if actual != expected {
             return Err(invalid("encoded image hash mismatch"));
         }
     }
-    if encoded_image_has_multiple_pictures(config.encoding, &record.body)? {
+    if encoded_image_has_multiple_pictures(config.encoding, record.body)? {
         return Err(invalid("animated or multi-picture image is not supported"));
     }
     let format = if config.encoding == messages::IMAGE_PNG {
@@ -1764,7 +2047,7 @@ fn handle_image(
         .checked_mul(u64::from(config.height))
         .and_then(|pixels| pixels.checked_mul(4))
         .ok_or_else(|| invalid("decoded image size overflow"))?;
-    let mut image_reader = image::ImageReader::with_format(Cursor::new(&record.body), format);
+    let mut image_reader = image::ImageReader::with_format(Cursor::new(record.body), format);
     let mut limits = image::Limits::default();
     limits.max_image_width = Some(config.width);
     limits.max_image_height = Some(config.height);
@@ -1860,7 +2143,7 @@ fn encoded_image_has_multiple_pictures(encoding: u64, data: &[u8]) -> io::Result
 }
 
 fn return_credit(writer: &Writer, source_id: u64, bytes: u64) -> io::Result<()> {
-    writer.write_record(messages::CREDIT, source_id, &messages::credit(bytes, 1, 0))
+    writer.write_credit(source_id, bytes, 1, 0)
 }
 
 /// Owns ingress storage and its one bounded queue slot. Dropping it makes both reusable and emits
@@ -2080,6 +2363,7 @@ fn verify_peer(stream: &TcpStream) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
     use vivid_protocol::media;
     use vivid_protocol::messages::{
         NodeConfig, parse_display_changed, parse_source_ready, parse_welcome,
@@ -2098,6 +2382,103 @@ mod tests {
         let client = TcpStream::connect(address).unwrap();
         let (server, _) = listener.accept().unwrap();
         (client, server)
+    }
+
+    #[test]
+    fn pending_operations_are_bounded_and_timeout_once() {
+        let pending = PendingOperations::default();
+        for request_id in 1..=MAX_PENDING_OPERATIONS as u64 {
+            pending.register(request_id, request_id + 100, Duration::from_secs(1)).unwrap();
+        }
+        assert!(matches!(
+            pending.register(1000, 1, Duration::from_secs(1)),
+            Err(PendingRegisterError::Full)
+        ));
+        assert!(pending.complete(1));
+        assert!(matches!(
+            pending.register(2, 1, Duration::from_secs(1)),
+            Err(PendingRegisterError::Duplicate)
+        ));
+
+        pending.register(1000, 77, Duration::ZERO).unwrap();
+        assert_eq!(pending.expire(Instant::now()), vec![(1000, 77)]);
+        assert!(pending.expire(Instant::now()).is_empty());
+        assert!(!pending.complete(1000));
+    }
+
+    #[test]
+    fn pending_drain_does_not_block_ping_dispatch() {
+        let (shared, output) = linked_av_shared();
+        let (mut client, server) = stream_pair();
+        client
+            .write_all(&vivid_protocol::wire::encode_preface(ConnectionKind::Control, 1024))
+            .unwrap();
+        let (reader, _) = Reader::new(server).unwrap();
+        let writer = Arc::new(reader.writer().unwrap());
+        lock_registry(&shared).sessions.insert(
+            1,
+            SessionRuntime {
+                writer: Arc::downgrade(&writer),
+                tag: [0; 16],
+                anchor_key: anchor::derive_key(&[0; 32], &[0; 16]),
+                seen_anchors: HashSet::new(),
+                last_visibility: HashMap::new(),
+                accepted_features: HashSet::from([
+                    messages::FEATURE_AUDIO_ACCESS_UNIT_V1,
+                    messages::FEATURE_VIDEO_CONTROL_V1,
+                ]),
+            },
+        );
+        let pending = Arc::new(PendingOperations::default());
+        let mut transactions = HashMap::new();
+        let drain_body = messages::drain(41, 11);
+        dispatch_control(
+            &Record {
+                record_type: messages::DRAIN,
+                flags: 0,
+                object_id: 11,
+                sequence: 1,
+                body: drain_body,
+            },
+            1,
+            1,
+            &shared,
+            &writer,
+            &pending,
+            &mut transactions,
+        )
+        .unwrap();
+        assert_eq!(
+            pending.entries.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).len(),
+            1
+        );
+
+        dispatch_control(
+            &Record {
+                record_type: messages::PING,
+                flags: 0,
+                object_id: 0,
+                sequence: 2,
+                body: messages::ping(42),
+            },
+            1,
+            1,
+            &shared,
+            &writer,
+            &pending,
+            &mut transactions,
+        )
+        .unwrap();
+        let mut header = [0; vivid_protocol::wire::HEADER_SIZE];
+        client.read_exact(&mut header).unwrap();
+        let header = vivid_protocol::wire::RecordHeader::decode(header);
+        assert_eq!((header.record_type, header.object_id), (messages::PONG, 0));
+        let mut body = vec![0; header.body_length as usize];
+        client.read_exact(&mut body).unwrap();
+        assert_eq!(messages::request_id(&body).unwrap(), 42);
+
+        pending.cancel_all();
+        output.stop();
     }
 
     fn linked_av_shared() -> (Arc<ServiceShared>, Arc<AudioOutput>) {
