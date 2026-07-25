@@ -61,6 +61,7 @@ const MAX_CONNECTIONS: usize = 64;
 const MAX_PENDING_OPERATIONS: usize = 64;
 const MAX_TRANSACTIONS: usize = 64;
 const MAX_REGISTERED_WAITS: usize = 64;
+const MAX_IDEMPOTENCY_ENTRIES: usize = 256;
 const MAX_PENDING_REQUESTS: usize = MAX_PENDING_OPERATIONS + MAX_REGISTERED_WAITS;
 const MAX_OBSERVATION_QUEUE: usize = 64;
 const MAX_OBSERVATIONS_PER_TICK: usize = 8;
@@ -158,23 +159,45 @@ struct RegisteredWait {
 }
 
 #[derive(Debug, Clone, Copy)]
+enum IdempotencyOutcome {
+    Ok { object_id: u64 },
+    Presented { scene_revision: SceneRevision },
+    SourceCreated { source_id: u64 },
+}
+
+#[derive(Debug, Clone, Copy)]
+struct IdempotencyEntry {
+    request_hash: [u8; 32],
+    outcome: IdempotencyOutcome,
+}
+
+#[derive(Debug)]
+enum PreconditionError {
+    Malformed(&'static str),
+    Failed { kind: u64, detail: messages::ErrorDetail },
+}
+
+#[derive(Debug, Clone, Copy)]
 enum QueuedObservation {
     Source {
         source_id: u64,
         source_revision: SourceRevision,
         changed_fields: u64,
         sequence: ObservationSequence,
+        causation_id: Option<[u8; messages::CAUSATION_ID_BYTES]>,
     },
     Scene {
         scene_revision: SceneRevision,
         reason_mask: u64,
         sequence: ObservationSequence,
+        causation_id: Option<[u8; messages::CAUSATION_ID_BYTES]>,
     },
     Playback {
         source_id: u64,
         snapshot: messages::PlaybackSnapshot,
         source_revision: SourceRevision,
         sequence: ObservationSequence,
+        causation_id: Option<[u8; messages::CAUSATION_ID_BYTES]>,
     },
 }
 
@@ -216,6 +239,8 @@ struct ObservationTracker {
     queue: VecDeque<QueuedObservation>,
     source_gap: Option<ObservationSequence>,
     scene_gap: Option<ObservationSequence>,
+    source_causation: HashMap<u64, [u8; messages::CAUSATION_ID_BYTES]>,
+    scene_causation: Option<[u8; messages::CAUSATION_ID_BYTES]>,
 }
 
 #[derive(Default)]
@@ -294,6 +319,37 @@ impl ObservationTracker {
         self.queue.clear();
         self.source_gap = None;
         self.scene_gap = None;
+        self.source_causation.clear();
+        self.scene_causation = None;
+    }
+
+    fn note_causation(
+        &mut self,
+        record_type: u16,
+        object_id: u64,
+        causation_id: Option<[u8; messages::CAUSATION_ID_BYTES]>,
+    ) {
+        let Some(causation_id) = causation_id else { return };
+        if record_type == messages::COMMIT_TXN {
+            self.scene_causation = Some(causation_id);
+        }
+        if matches!(
+            record_type,
+            messages::CREATE_IMAGE
+                | messages::CREATE_VIDEO
+                | messages::CREATE_RASTER
+                | messages::DESTROY_SOURCE
+                | messages::CREATE_AUDIO
+                | messages::SET_SOURCE_POLICY
+                | messages::UPDATE_SOURCE_DESCRIPTOR
+                | messages::PLAY
+                | messages::PAUSE
+                | messages::FLUSH
+                | messages::EOS
+        ) && object_id != 0
+        {
+            self.source_causation.insert(object_id, causation_id);
+        }
     }
 
     fn collect(&mut self, snapshot: SessionObservationSnapshot) -> io::Result<()> {
@@ -302,10 +358,12 @@ impl ObservationTracker {
             && snapshot.scene_change_reasons != 0
         {
             let sequence = self.next_sequence()?;
+            let causation_id = self.scene_causation.take();
             self.push(QueuedObservation::Scene {
                 scene_revision: snapshot.scene_revision,
                 reason_mask: snapshot.scene_change_reasons,
                 sequence,
+                causation_id,
             });
         }
         self.scene_revision = snapshot.scene_revision;
@@ -321,11 +379,13 @@ impl ObservationTracker {
                     && changed_fields != 0
                 {
                     let sequence = self.next_sequence()?;
+                    let causation_id = self.source_causation.remove(&source_id);
                     self.push(QueuedObservation::Source {
                         source_id,
                         source_revision: source.revision,
                         changed_fields,
                         sequence,
+                        causation_id,
                     });
                 }
             }
@@ -335,11 +395,13 @@ impl ObservationTracker {
                     || previous.eos_state != current_playback.eos_state)
             {
                 let sequence = self.next_sequence()?;
+                let causation_id = self.source_causation.remove(&source_id);
                 self.push(QueuedObservation::Playback {
                     source_id,
                     snapshot: current_playback,
                     source_revision: source.revision,
                     sequence,
+                    causation_id,
                 });
             }
             current.insert(source_id, (source, playback));
@@ -366,20 +428,28 @@ impl ObservationTracker {
                         source_revision,
                         changed_fields,
                         sequence,
+                        causation_id,
                     },
                 ) => QueuedObservation::Source {
                     source_id,
                     source_revision,
                     changed_fields: old | changed_fields,
                     sequence,
+                    causation_id,
                 },
                 (
                     QueuedObservation::Scene { reason_mask: old, .. },
-                    QueuedObservation::Scene { scene_revision, reason_mask, sequence },
+                    QueuedObservation::Scene {
+                        scene_revision,
+                        reason_mask,
+                        sequence,
+                        causation_id,
+                    },
                 ) => QueuedObservation::Scene {
                     scene_revision,
                     reason_mask: old | reason_mask,
                     sequence,
+                    causation_id,
                 },
                 (_, event) => event,
             };
@@ -414,38 +484,56 @@ impl ObservationTracker {
                     source_revision,
                     changed_fields,
                     sequence,
-                } => writer.write_record(
-                    messages::SOURCE_CHANGED,
-                    source_id,
-                    &messages::source_changed(messages::SourceChanged {
+                    causation_id,
+                } => {
+                    let body = messages::source_changed(messages::SourceChanged {
                         source_id,
                         source_revision,
                         changed_fields,
                         observation_sequence: sequence,
                         first_lost_sequence: self.source_gap.take(),
-                    })?,
-                )?,
-                QueuedObservation::Scene { scene_revision, reason_mask, sequence } => writer
-                    .write_record(
+                    })?;
+                    writer.write_record(
+                        messages::SOURCE_CHANGED,
+                        source_id,
+                        &event_with_causation(&body, causation_id)?,
+                    )?
+                },
+                QueuedObservation::Scene {
+                    scene_revision,
+                    reason_mask,
+                    sequence,
+                    causation_id,
+                } => {
+                    let body = messages::scene_changed(messages::SceneChanged {
+                        scene_revision,
+                        reason_mask,
+                        observation_sequence: sequence,
+                        first_lost_sequence: self.scene_gap.take(),
+                    })?;
+                    writer.write_record(
                         messages::SCENE_CHANGED,
                         0,
-                        &messages::scene_changed(messages::SceneChanged {
-                            scene_revision,
-                            reason_mask,
-                            observation_sequence: sequence,
-                            first_lost_sequence: self.scene_gap.take(),
-                        })?,
-                    )?,
-                QueuedObservation::Playback { source_id, snapshot, source_revision, sequence } => {
+                        &event_with_causation(&body, causation_id)?,
+                    )?
+                },
+                QueuedObservation::Playback {
+                    source_id,
+                    snapshot,
+                    source_revision,
+                    sequence,
+                    causation_id,
+                } => {
+                    let body = messages::playback_state(messages::PlaybackState {
+                        source_id,
+                        snapshot,
+                        source_revision,
+                        observation_sequence: sequence,
+                    })?;
                     writer.write_record(
                         messages::PLAYBACK_STATE,
                         source_id,
-                        &messages::playback_state(messages::PlaybackState {
-                            source_id,
-                            snapshot,
-                            source_revision,
-                            observation_sequence: sequence,
-                        })?,
+                        &event_with_causation(&body, causation_id)?,
                     )?
                 },
             }
@@ -965,6 +1053,7 @@ fn handle_control(reader: &mut Reader, shared: Arc<ServiceShared>) -> io::Result
     let mut transactions: HashMap<u64, Vec<SceneMutation>> = HashMap::new();
     let pending = Arc::new(PendingOperations::default());
     let mut waits = HashMap::new();
+    let mut idempotency = HashMap::<[u8; messages::IDEMPOTENCY_KEY_BYTES], IdempotencyEntry>::new();
     let mut observations = ObservationTracker::default();
     observations.configure(0, shared.scene.take_observation_snapshot(session_id));
     let result = 'control: loop {
@@ -1003,6 +1092,102 @@ fn handle_control(reader: &mut Reader, shared: Arc<ServiceShared>) -> io::Result
             Err(error) if error.kind() == ErrorKind::UnexpectedEof => break Ok(()),
             Err(error) => break Err(error),
         };
+        let envelope = match messages::decode_control(&record.body) {
+            Ok(envelope) => envelope,
+            Err(_) => {
+                writer.write_record(
+                    messages::ERROR,
+                    record.object_id,
+                    &messages::error(0, messages::ERROR_BAD_MESSAGE, "invalid control envelope"),
+                )?;
+                continue;
+            },
+        };
+        if messages::validate_request_metadata(
+            record.record_type,
+            &envelope,
+            accepted_features.contains(&messages::FEATURE_ATOMIC_CONTROL_V1),
+        )
+        .is_err()
+        {
+            writer.write_record(
+                messages::ERROR,
+                record.object_id,
+                &messages::error(
+                    envelope.request_id,
+                    messages::ERROR_BAD_MESSAGE,
+                    "invalid atomic request metadata",
+                ),
+            )?;
+            continue;
+        }
+        match evaluate_preconditions(&record, &envelope, session_id, &shared, &transactions) {
+            Ok(()) => {},
+            Err(PreconditionError::Malformed(message)) => {
+                writer.write_record(
+                    messages::ERROR,
+                    record.object_id,
+                    &messages::error(envelope.request_id, messages::ERROR_BAD_MESSAGE, message),
+                )?;
+                continue;
+            },
+            Err(PreconditionError::Failed { kind, mut detail }) => {
+                detail.insert_u64(messages::ERROR_DETAIL_PRECONDITION_KIND, kind);
+                writer.write_record(
+                    messages::ERROR,
+                    record.object_id,
+                    &messages::error_with_detail(
+                        envelope.request_id,
+                        messages::ERROR_PRECONDITION_FAILED,
+                        false,
+                        &detail,
+                        "request precondition failed",
+                    )?,
+                )?;
+                continue;
+            },
+        }
+        let request_hash =
+            envelope.idempotency_key.map(|_| idempotency_request_hash(&record)).transpose()?;
+        if let (Some(key), Some(request_hash)) = (envelope.idempotency_key, request_hash)
+            && let Some(entry) = idempotency.get(&key)
+        {
+            if constant_time_eq(&entry.request_hash, &request_hash) {
+                replay_idempotent_outcome(&writer, envelope.request_id, entry.outcome)?;
+            } else {
+                writer.write_record(
+                    messages::ERROR,
+                    record.object_id,
+                    &messages::error(
+                        envelope.request_id,
+                        messages::ERROR_BAD_MESSAGE,
+                        "idempotency key was reused for a different request",
+                    ),
+                )?;
+            }
+            continue;
+        }
+        if envelope.idempotency_key.is_some() && idempotency.len() >= MAX_IDEMPOTENCY_ENTRIES {
+            let mut detail = messages::ErrorDetail::new();
+            detail.insert_u64(
+                messages::ERROR_DETAIL_LIMIT_ID,
+                messages::LIMIT_IDEMPOTENCY_MAP_ENTRIES,
+            );
+            detail.insert_u64(messages::ERROR_DETAIL_CURRENT, MAX_IDEMPOTENCY_ENTRIES as u64);
+            detail.insert_u64(messages::ERROR_DETAIL_MAXIMUM, MAX_IDEMPOTENCY_ENTRIES as u64);
+            writer.write_record(
+                messages::ERROR,
+                record.object_id,
+                &messages::error_with_detail(
+                    envelope.request_id,
+                    messages::ERROR_LIMIT_EXCEEDED,
+                    false,
+                    &detail,
+                    "idempotency map is full",
+                )?,
+            )?;
+            continue;
+        }
         let result = dispatch_control(
             &record,
             session_id,
@@ -1015,7 +1200,20 @@ fn handle_control(reader: &mut Reader, shared: Arc<ServiceShared>) -> io::Result
             &mut observations,
         );
         match result {
-            Ok(ControlAction::Continue) => {},
+            Ok(ControlAction::Continue) => {
+                observations.note_causation(
+                    record.record_type,
+                    record.object_id,
+                    envelope.causation_id,
+                );
+                if let (Some(key), Some(request_hash), Some(outcome)) = (
+                    envelope.idempotency_key,
+                    request_hash,
+                    idempotency_outcome(&record, session_id, &shared),
+                ) {
+                    idempotency.insert(key, IdempotencyEntry { request_hash, outcome });
+                }
+            },
             Ok(ControlAction::Goodbye) => break Ok(()),
             Err(error) => {
                 let request_id = messages::decode_control(&record.body)
@@ -1057,6 +1255,7 @@ fn is_supported_feature(feature: u64) -> bool {
             | messages::FEATURE_NODE_CLIP_RECT_V1
             | messages::FEATURE_DECODER_DESCRIPTION_V1
             | messages::FEATURE_OBSERVABILITY_CORE_V1
+            | messages::FEATURE_ATOMIC_CONTROL_V1
     )
 }
 
@@ -1345,6 +1544,219 @@ fn service_source_waits(
         }
     }
     Ok(())
+}
+
+fn event_with_causation(
+    body: &[u8],
+    causation_id: Option<[u8; messages::CAUSATION_ID_BYTES]>,
+) -> io::Result<Vec<u8>> {
+    let Some(causation_id) = causation_id else { return Ok(body.to_vec()) };
+    messages::with_request_metadata(
+        body,
+        &messages::RequestMetadata {
+            preconditions: Default::default(),
+            idempotency_key: None,
+            causation_id: Some(causation_id),
+        },
+    )
+}
+
+fn evaluate_preconditions(
+    record: &Record,
+    envelope: &messages::ControlEnvelope,
+    session_id: SessionId,
+    shared: &Arc<ServiceShared>,
+    _transactions: &HashMap<u64, Vec<SceneMutation>>,
+) -> Result<(), PreconditionError> {
+    if envelope.preconditions.is_empty() {
+        return Ok(());
+    }
+    let source_target = matches!(
+        record.record_type,
+        messages::DESTROY_SOURCE
+            | messages::SET_SOURCE_POLICY
+            | messages::UPDATE_SOURCE_DESCRIPTOR
+            | messages::PLAY
+            | messages::PAUSE
+            | messages::FLUSH
+            | messages::DRAIN
+            | messages::EOS
+    );
+    let observation = source_target
+        .then(|| shared.scene.source_observation((session_id, record.object_id)))
+        .flatten();
+    for (&kind, &expected) in &envelope.preconditions {
+        let current = match kind {
+            messages::PRECONDITION_SCENE_REVISION if record.record_type == messages::COMMIT_TXN => {
+                shared.scene.scene_revision(session_id).get()
+            },
+            messages::PRECONDITION_SOURCE_REVISION if source_target => observation
+                .ok_or(PreconditionError::Malformed(
+                    "source precondition targets a missing source",
+                ))?
+                .revision
+                .get(),
+            messages::PRECONDITION_SOURCE_EPOCH if source_target => u64::from(
+                observation
+                    .ok_or(PreconditionError::Malformed(
+                        "source precondition targets a missing source",
+                    ))?
+                    .epoch,
+            ),
+            messages::PRECONDITION_SOURCE_LIFECYCLE if source_target => {
+                observation
+                    .ok_or(PreconditionError::Malformed(
+                        "source precondition targets a missing source",
+                    ))?
+                    .lifecycle
+            },
+            messages::PRECONDITION_ANCHOR_STATE
+                if matches!(record.record_type, messages::CREATE_NODE | messages::UPDATE_NODE) =>
+            {
+                if !matches!(expected, messages::ANCHOR_STATE_READY | messages::ANCHOR_STATE_GONE) {
+                    return Err(PreconditionError::Malformed(
+                        "anchor-state precondition has an invalid expected value",
+                    ));
+                }
+                let (_, node) = messages::parse_scene_node(&record.body).map_err(|_| {
+                    PreconditionError::Malformed(
+                        "anchor-state precondition targets an invalid scene node",
+                    )
+                })?;
+                let anchor_id = node.node.anchor_id.ok_or(PreconditionError::Malformed(
+                    "anchor-state precondition requires an anchored node",
+                ))?;
+                shared.scene.anchor_state(session_id, anchor_id)
+            },
+            messages::PRECONDITION_CONTENT_REVISION
+                if record.record_type == messages::UPDATE_SOURCE_DESCRIPTOR =>
+            {
+                shared.scene.source_content_revision((session_id, record.object_id)).ok_or(
+                    PreconditionError::Malformed(
+                        "content-revision precondition targets a missing source",
+                    ),
+                )?
+            },
+            _ => {
+                return Err(PreconditionError::Malformed(
+                    "precondition kind is meaningless for this operation",
+                ));
+            },
+        };
+        if current != expected {
+            let mut detail = messages::ErrorDetail::new();
+            match kind {
+                messages::PRECONDITION_SCENE_REVISION => {
+                    detail.insert_u64(messages::ERROR_DETAIL_SCENE_REVISION, current);
+                },
+                messages::PRECONDITION_SOURCE_REVISION => {
+                    detail.insert_u64(messages::ERROR_DETAIL_SOURCE_REVISION, current);
+                },
+                messages::PRECONDITION_SOURCE_EPOCH => {
+                    detail.insert_u64(messages::ERROR_DETAIL_SOURCE_EPOCH, current);
+                },
+                _ => {},
+            }
+            return Err(PreconditionError::Failed { kind, detail });
+        }
+    }
+    Ok(())
+}
+
+fn idempotency_request_hash(record: &Record) -> io::Result<[u8; 32]> {
+    let mut envelope = vivid_protocol::cbor::decode(&record.body)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+    let vivid_protocol::cbor::Value::Map(entries) = &mut envelope else {
+        return Err(invalid("control envelope is not a map"));
+    };
+    for (key, value) in entries.iter_mut() {
+        if *key == 0 {
+            *value = vivid_protocol::cbor::Value::Unsigned(0);
+        }
+    }
+    entries.retain(|(key, _)| *key != 5);
+    let canonical = vivid_protocol::cbor::encode(&envelope)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+    let mut digest = Sha256::new();
+    digest.update(record.record_type.to_be_bytes());
+    digest.update(record.flags.to_be_bytes());
+    digest.update(record.object_id.to_be_bytes());
+    digest.update(canonical);
+    Ok(digest.finalize().into())
+}
+
+fn idempotency_outcome(
+    record: &Record,
+    session_id: SessionId,
+    shared: &Arc<ServiceShared>,
+) -> Option<IdempotencyOutcome> {
+    if matches!(
+        record.record_type,
+        messages::CREATE_RASTER
+            | messages::CREATE_VIDEO
+            | messages::CREATE_AUDIO
+            | messages::CREATE_IMAGE
+    ) {
+        return Some(IdempotencyOutcome::SourceCreated { source_id: record.object_id });
+    }
+    if record.record_type == messages::COMMIT_TXN {
+        return Some(IdempotencyOutcome::Presented {
+            scene_revision: shared.scene.scene_revision(session_id),
+        });
+    }
+    matches!(
+        record.record_type,
+        messages::SET_OBSERVATION
+            | messages::DESTROY_SOURCE
+            | messages::SET_SOURCE_POLICY
+            | messages::UPDATE_SOURCE_DESCRIPTOR
+            | messages::BEGIN_TXN
+            | messages::CREATE_NODE
+            | messages::UPDATE_NODE
+            | messages::DELETE_NODE
+            | messages::ABORT_TXN
+            | messages::PLAY
+            | messages::PAUSE
+            | messages::FLUSH
+            | messages::EOS
+    )
+    .then_some(IdempotencyOutcome::Ok { object_id: record.object_id })
+}
+
+fn replay_idempotent_outcome(
+    writer: &Writer,
+    request_id: u64,
+    outcome: IdempotencyOutcome,
+) -> io::Result<()> {
+    match outcome {
+        IdempotencyOutcome::Ok { object_id } => {
+            writer.write_record(messages::OK, object_id, &messages::ok(request_id))
+        },
+        IdempotencyOutcome::Presented { scene_revision } => writer.write_record(
+            messages::PRESENTED,
+            0,
+            &messages::presented(request_id, scene_revision),
+        ),
+        IdempotencyOutcome::SourceCreated { source_id } => {
+            let mut detail = messages::ErrorDetail::new();
+            detail.insert_u64(messages::ERROR_DETAIL_IDEMPOTENT_OUTCOME, 2);
+            writer.write_record(
+                messages::ERROR,
+                source_id,
+                &messages::error_with_detail(
+                    request_id,
+                    messages::ERROR_ALREADY_APPLIED,
+                    false,
+                    &detail,
+                    "source creation was already applied; query source state",
+                )?,
+            )
+        },
+    }
+}
+
+fn constant_time_eq<const N: usize>(left: &[u8; N], right: &[u8; N]) -> bool {
+    left.iter().zip(right).fold(0_u8, |difference, (left, right)| difference | (left ^ right)) == 0
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3392,6 +3804,7 @@ mod tests {
                 source_revision: SourceRevision::new(source_id),
                 changed_fields: messages::SOURCE_CHANGED_LIFECYCLE,
                 sequence,
+                causation_id: None,
             });
         }
         assert_eq!(tracker.queue.len(), MAX_OBSERVATION_QUEUE);
@@ -3403,6 +3816,7 @@ mod tests {
             source_revision: SourceRevision::new(99),
             changed_fields: messages::SOURCE_CHANGED_MILESTONES,
             sequence,
+            causation_id: None,
         });
         let latest = tracker.queue.back().copied().unwrap();
         assert!(matches!(
@@ -4233,6 +4647,97 @@ mod tests {
         assert_ne!(scene_changed.unwrap().reason_mask & messages::SCENE_CHANGED_PRODUCER_COMMIT, 0);
 
         control.write_record(messages::GOODBYE, 0, 0, &messages::goodbye(10)).unwrap();
+    }
+
+    #[test]
+    fn atomic_preconditions_idempotency_and_causation_use_authoritative_revisions() {
+        let service = VividService::start_with_wake(
+            DisplayMetrics {
+                viewport_width: 800,
+                viewport_height: 600,
+                columns: 80,
+                rows: 30,
+                cell_width: 10,
+                cell_height: 20,
+                generation: 1,
+            },
+            Arc::new(|| {}),
+        )
+        .unwrap();
+        let endpoint = Endpoint::parse(service.endpoint()).unwrap();
+        let mut control = Connection::open(&endpoint, ConnectionKind::Control).unwrap();
+        control.write_record(messages::HELLO, 0, 0, &messages::hello(1, service.token())).unwrap();
+        let welcome = parse_welcome(&control.read_record().unwrap().body).unwrap();
+        assert!(welcome.accepted_features.contains(&messages::FEATURE_ATOMIC_CONTROL_V1));
+        control
+            .write_record(
+                messages::SET_OBSERVATION,
+                0,
+                0,
+                &messages::set_observation(2, messages::OBSERVE_SOURCE_TRANSITIONS).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(control.read_record().unwrap().record_type, messages::OK);
+
+        let idempotency_key = [0x17; messages::IDEMPOTENCY_KEY_BYTES];
+        let causation_id = [0x29; messages::CAUSATION_ID_BYTES];
+        let create_metadata = messages::RequestMetadata {
+            preconditions: Default::default(),
+            idempotency_key: Some(idempotency_key),
+            causation_id: Some(causation_id),
+        };
+        let create =
+            messages::with_request_metadata(&messages::create_raster(3, 7, 2, 1), &create_metadata)
+                .unwrap();
+        control.write_record(messages::CREATE_RASTER, 0, 7, &create).unwrap();
+        let mut saw_ready = false;
+        let mut saw_causation = false;
+        while !saw_ready || !saw_causation {
+            let record = control.read_record().unwrap();
+            if record.record_type == messages::SOURCE_READY {
+                saw_ready = true;
+            } else if record.record_type == messages::SOURCE_CHANGED {
+                saw_causation = messages::decode_control(&record.body).unwrap().causation_id
+                    == Some(causation_id);
+            }
+        }
+
+        let retry =
+            messages::with_request_metadata(&messages::create_raster(4, 7, 2, 1), &create_metadata)
+                .unwrap();
+        control.write_record(messages::CREATE_RASTER, 0, 7, &retry).unwrap();
+        let replay =
+            messages::parse_error_reply(&read_correlated(&mut control, messages::ERROR, 4).body)
+                .unwrap();
+        assert_eq!(replay.code, messages::ERROR_ALREADY_APPLIED);
+
+        let stale = messages::with_request_metadata(
+            &messages::destroy_source(5, 7),
+            &messages::RequestMetadata {
+                preconditions: std::collections::BTreeMap::from([(
+                    messages::PRECONDITION_SOURCE_REVISION,
+                    999,
+                )]),
+                idempotency_key: None,
+                causation_id: None,
+            },
+        )
+        .unwrap();
+        control.write_record(messages::DESTROY_SOURCE, 0, 7, &stale).unwrap();
+        let failure =
+            messages::parse_error_reply(&read_correlated(&mut control, messages::ERROR, 5).body)
+                .unwrap();
+        assert_eq!(failure.code, messages::ERROR_PRECONDITION_FAILED);
+
+        control
+            .write_record(messages::QUERY_SOURCE, 0, 7, &messages::query_source(6, 7).unwrap())
+            .unwrap();
+        let (_, status) = messages::parse_source_status(
+            &read_correlated(&mut control, messages::SOURCE_STATUS, 6).body,
+        )
+        .unwrap();
+        assert_eq!(status.source_id, 7, "stale destroy mutated the source");
+        control.write_record(messages::GOODBYE, 0, 0, &messages::goodbye(7)).unwrap();
     }
 
     #[cfg(windows)]
