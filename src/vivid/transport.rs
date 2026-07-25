@@ -14,8 +14,9 @@ type LocalStream = UnixStream;
 use vivid_protocol::messages;
 use vivid_protocol::wire::{
     BorrowedRecord, HEADER_SIZE, PREFACE_SIZE, Preface, RECORD_KNOWN_FLAGS, Record, RecordHeader,
+    accept_preface,
 };
-use vivid_protocol::{CONTROL_MAX_RECORD_BODY, HARD_MAX_RECORD_BODY, VIVID_MAJOR, VIVID_MINOR};
+use vivid_protocol::{CONTROL_MAX_RECORD_BODY, HARD_MAX_RECORD_BODY};
 
 pub struct Reader {
     stream: LocalStream,
@@ -28,13 +29,7 @@ impl Reader {
     pub fn new(mut stream: LocalStream) -> io::Result<(Self, Preface)> {
         let mut bytes = [0_u8; PREFACE_SIZE];
         stream.read_exact(&mut bytes)?;
-        let preface = Preface::decode(bytes)?;
-        if preface.major != VIVID_MAJOR || preface.minor != VIVID_MINOR {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("unsupported Vivid major version {}", preface.major),
-            ));
-        }
+        let preface = accept_preface(bytes, &mut stream)?;
         Ok((
             Self {
                 stream,
@@ -332,6 +327,31 @@ mod tests {
             .unwrap();
         let (mut reader, _) = Reader::new(server).unwrap();
         assert!(reader.read_record().is_err());
+    }
+
+    #[test]
+    fn rejects_mismatched_preface_with_one_typed_error() {
+        let (mut client, server) = stream_pair();
+        let mut preface = encode_preface(ConnectionKind::Control, 1024);
+        preface[5] = 0;
+        client.write_all(&preface).unwrap();
+        let error = match Reader::new(server) {
+            Ok(_) => panic!("mismatched preface was accepted"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+
+        let mut header = [0; HEADER_SIZE];
+        client.read_exact(&mut header).unwrap();
+        let header = RecordHeader::decode(header);
+        assert_eq!(header.record_type, messages::ERROR);
+        assert_eq!(header.sequence, 1);
+        let mut body = vec![0; header.body_length as usize];
+        client.read_exact(&mut body).unwrap();
+        let rejection = messages::parse_error_reply(&body).unwrap();
+        assert_eq!(rejection.code, messages::ERROR_UNSUPPORTED_VERSION);
+        assert!(rejection.fatal);
+        assert_eq!(rejection.supported_version, Some((1, 1)));
     }
 
     #[test]
