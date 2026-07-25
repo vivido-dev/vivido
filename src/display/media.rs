@@ -14,6 +14,14 @@ use crate::vivid::scene::{RenderItem, SharedScene, SourceKey};
 
 const MAX_NODES: usize = 256;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CaptureRedaction {
+    pub left: u32,
+    pub top: u32,
+    pub right: u32,
+    pub bottom: u32,
+}
+
 const SHADER: &str = r#"
 struct VertexInput {
     @location(0) position: vec2<f32>,
@@ -94,6 +102,7 @@ pub struct VividMediaRenderer {
     sources: HashMap<(u64, u64), SourceTexture>,
     target: Option<MediaTarget>,
     scene: Option<SharedScene>,
+    capture_redactions: Vec<CaptureRedaction>,
 }
 
 impl VividMediaRenderer {
@@ -199,6 +208,7 @@ impl VividMediaRenderer {
             sources: HashMap::new(),
             target: None,
             scene: None,
+            capture_redactions: Vec::new(),
         }
     }
 
@@ -239,10 +249,14 @@ impl VividMediaRenderer {
         size: &SizeInfo,
         display_offset: usize,
     ) -> Option<ImageData> {
-        let scene = self.scene.as_ref()?.clone();
+        let Some(scene) = self.scene.as_ref().cloned() else {
+            self.capture_redactions.clear();
+            return None;
+        };
         let (_, items) = scene.snapshot();
         if items.is_empty() {
             self.sources.clear();
+            self.capture_redactions.clear();
             return None;
         }
         self.ensure_target(device, renderer, size.width() as u32, size.height() as u32);
@@ -253,6 +267,13 @@ impl VividMediaRenderer {
                 vertices(item, size, display_offset).map(|vertices| (item, vertices))
             })
             .collect::<Vec<_>>();
+        self.capture_redactions = rendered
+            .iter()
+            .filter(|(item, _)| {
+                item.capture_policy & vivid_protocol::messages::CAPTURE_POLICY_DENY_CAPTURE != 0
+            })
+            .map(|(_, vertices)| redaction_from_vertices(vertices, size))
+            .collect();
         let active = rendered.iter().map(|(item, _)| item.source_key).collect::<HashSet<_>>();
         self.sources.retain(|key, _| active.contains(key));
         for (item, _) in &rendered {
@@ -308,6 +329,10 @@ impl VividMediaRenderer {
         }
         renderer.mark_override_image_dirty(&target.image);
         Some(target.image.clone())
+    }
+
+    pub fn capture_redactions(&self) -> &[CaptureRedaction] {
+        &self.capture_redactions
     }
 
     fn upload_source(
@@ -491,6 +516,21 @@ fn vertices(item: &RenderItem, size: &SizeInfo, display_offset: usize) -> Option
     ])
 }
 
+fn redaction_from_vertices(vertices: &[Vertex; 6], size: &SizeInfo) -> CaptureRedaction {
+    let width = size.width().max(0.0);
+    let height = size.height().max(0.0);
+    let left = ((vertices[0].position[0] + 1.0) * 0.5 * width).floor().max(0.0);
+    let top = ((1.0 - vertices[0].position[1]) * 0.5 * height).floor().max(0.0);
+    let right = ((vertices[5].position[0] + 1.0) * 0.5 * width).ceil().min(width);
+    let bottom = ((1.0 - vertices[5].position[1]) * 0.5 * height).ceil().min(height);
+    CaptureRedaction {
+        left: left as u32,
+        top: top as u32,
+        right: right as u32,
+        bottom: bottom as u32,
+    }
+}
+
 fn fixed_to_f32(value: i64) -> f32 {
     (value as f64 / 4_294_967_296.0) as f32
 }
@@ -550,6 +590,7 @@ mod tests {
             z_index: 0,
             text_anchored: false,
             clip: Some(ClipRect { x: 1_i64 << 32, y: 0, width: 2_i64 << 32, height: 2_i64 << 32 }),
+            capture_policy: 0,
         };
         let size = SizeInfo::new(4.0, 2.0, 1.0, 1.0, 0.0, 0.0, false);
         let clipped = super::vertices(&item, &size, 0).unwrap();
