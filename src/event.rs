@@ -2020,6 +2020,11 @@ impl ApplicationHandler<Event> for Processor {
                     }
                 }
             },
+            (EventType::VividResizeSettled(generation), Some(window_id)) => {
+                if let Some(window_context) = self.windows.get_mut(window_id) {
+                    window_context.settle_vivid_resize(generation);
+                }
+            },
             (payload, Some(window_id)) => {
                 if let Some(window_context) = self.windows.get_mut(window_id) {
                     window_context.handle_event(
@@ -2165,6 +2170,7 @@ pub enum EventType {
     #[cfg(unix)]
     Shutdown,
     Frame,
+    VividResizeSettled(u64),
 }
 
 impl From<TerminalEvent> for EventType {
@@ -3222,7 +3228,8 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                 EventType::Message(_)
                 | EventType::ConfigReload(_)
                 | EventType::CreateWindow(_)
-                | EventType::Frame => (),
+                | EventType::Frame
+                | EventType::VividResizeSettled(_) => (),
                 EventType::VividFrame => (),
             },
             WinitEvent::WindowEvent { event, .. } => {

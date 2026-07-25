@@ -79,6 +79,33 @@ pub struct DisplayMetrics {
     pub generation: u64,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct PendingDisplayChange {
+    metrics: DisplayMetrics,
+    last_unsettled_generation: Option<u64>,
+}
+
+impl PendingDisplayChange {
+    fn event(&mut self, settled: bool) -> Option<DisplayChanged> {
+        if !settled && self.last_unsettled_generation == Some(self.metrics.generation) {
+            return None;
+        }
+        if !settled {
+            self.last_unsettled_generation = Some(self.metrics.generation);
+        }
+        Some(DisplayChanged {
+            display_generation: self.metrics.generation,
+            viewport_width: self.metrics.viewport_width,
+            viewport_height: self.metrics.viewport_height,
+            grid_columns: self.metrics.columns,
+            grid_rows: self.metrics.rows,
+            cell_width: self.metrics.cell_width,
+            cell_height: self.metrics.cell_height,
+            settled,
+        })
+    }
+}
+
 #[derive(Clone)]
 struct Ticket {
     session_id: SessionId,
@@ -107,6 +134,7 @@ struct ServiceShared {
     scene: SharedScene,
     registry: Mutex<Registry>,
     metrics: Mutex<DisplayMetrics>,
+    pending_display_change: Mutex<Option<PendingDisplayChange>>,
     active_connections: AtomicUsize,
     audio_outputs: Mutex<HashMap<SourceKey, Arc<AudioOutput>>>,
     /// Last `(renderable, display_offset)` reported by the UI thread. Cached so scene changes
@@ -467,6 +495,7 @@ impl VividService {
             scene: scene.clone(),
             registry: Mutex::new(Registry::default()),
             metrics: Mutex::new(metrics),
+            pending_display_change: Mutex::new(None),
             active_connections: AtomicUsize::new(0),
             audio_outputs: Mutex::new(HashMap::new()),
             render_state: Mutex::new((true, 0)),
@@ -549,7 +578,7 @@ impl VividService {
         self.scene.evaluate_wait((session_id, source_id), condition, value)
     }
 
-    pub fn update_metrics(&self, mut metrics: DisplayMetrics) {
+    pub fn update_metrics(&self, mut metrics: DisplayMetrics) -> Option<u64> {
         {
             let mut current = lock_metrics(&self.shared);
             if current.viewport_width == metrics.viewport_width
@@ -559,12 +588,35 @@ impl VividService {
                 && current.cell_width == metrics.cell_width
                 && current.cell_height == metrics.cell_height
             {
-                return;
+                return None;
             }
             metrics.generation = current.generation.saturating_add(1);
             *current = metrics;
         }
 
+        *lock_pending_display_change(&self.shared) =
+            Some(PendingDisplayChange { metrics, last_unsettled_generation: None });
+        emit_visibility(&self.shared);
+        wake(&self.shared);
+        Some(metrics.generation)
+    }
+
+    /// Publish at most one coalesced display update from a compositor frame.
+    pub fn flush_display_change(&self, settled_generation: Option<u64>) {
+        let display = {
+            let mut pending = lock_pending_display_change(&self.shared);
+            let settled = pending
+                .as_ref()
+                .is_some_and(|change| settled_generation == Some(change.metrics.generation));
+            let display = pending.as_mut().and_then(|change| change.event(settled));
+            if settled {
+                *pending = None;
+            }
+            display
+        };
+        let Some(display) = display else {
+            return;
+        };
         let writers = {
             let registry = lock_registry(&self.shared);
             registry
@@ -573,25 +625,12 @@ impl VividService {
                 .filter_map(|session| session.writer.upgrade())
                 .collect::<Vec<_>>()
         };
-        let body = messages::display_changed(
-            0,
-            DisplayChanged {
-                display_generation: metrics.generation,
-                viewport_width: metrics.viewport_width,
-                viewport_height: metrics.viewport_height,
-                grid_columns: metrics.columns,
-                grid_rows: metrics.rows,
-                cell_width: metrics.cell_width,
-                cell_height: metrics.cell_height,
-            },
-        );
+        let body = messages::display_changed(0, display);
         for writer in writers {
             if let Err(error) = writer.write_record(messages::DISPLAY_CHANGED, 0, &body) {
                 log::debug!("Could not notify Vivid session of display change: {error}");
             }
         }
-        emit_visibility(&self.shared);
-        wake(&self.shared);
     }
 
     /// Resize the terminal while preserving authenticated anchors through grid reflow.
@@ -914,6 +953,7 @@ fn handle_control(reader: &mut Reader, shared: Arc<ServiceShared>) -> io::Result
                 grid_rows: metrics.rows,
                 cell_width: metrics.cell_width,
                 cell_height: metrics.cell_height,
+                settled: true,
             },
             &accepted_features,
             shared.scene.scene_revision(session_id),
@@ -2016,6 +2056,7 @@ fn dispatch_control(
                                 grid_rows: metrics.rows,
                                 cell_width: metrics.cell_width,
                                 cell_height: metrics.cell_height,
+                                settled: lock_pending_display_change(shared).is_none(),
                             },
                         ),
                     )
@@ -2996,6 +3037,12 @@ fn lock_metrics(shared: &Arc<ServiceShared>) -> std::sync::MutexGuard<'_, Displa
     shared.metrics.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+fn lock_pending_display_change(
+    shared: &Arc<ServiceShared>,
+) -> std::sync::MutexGuard<'_, Option<PendingDisplayChange>> {
+    shared.pending_display_change.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 fn lock_render_state(shared: &Arc<ServiceShared>) -> std::sync::MutexGuard<'_, (bool, usize)> {
     shared.render_state.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
@@ -3690,6 +3737,7 @@ mod tests {
                 cell_height: 1,
                 generation: 1,
             }),
+            pending_display_change: Mutex::new(None),
             active_connections: AtomicUsize::new(0),
             audio_outputs: Mutex::new(HashMap::from([((1, 11), output.clone())])),
             render_state: Mutex::new((true, 0)),
@@ -3908,11 +3956,19 @@ mod tests {
             cell_height: 20,
             generation: 0,
         });
+        service.flush_display_change(None);
         let changed_record = control.read_record().unwrap();
         assert_eq!(changed_record.record_type, messages::DISPLAY_CHANGED);
         let changed = parse_display_changed(&changed_record.body).unwrap();
         assert_eq!(changed.display_generation, 2);
         assert_eq!((changed.grid_columns, changed.grid_rows), (100, 35));
+        assert!(!changed.settled);
+        service.flush_display_change(Some(changed.display_generation));
+        let settled_record = control.read_record().unwrap();
+        assert_eq!(settled_record.record_type, messages::DISPLAY_CHANGED);
+        let settled = parse_display_changed(&settled_record.body).unwrap();
+        assert_eq!(settled.display_generation, changed.display_generation);
+        assert!(settled.settled);
 
         control
             .write_record(messages::CREATE_RASTER, 0, 1, &messages::create_raster(2, 1, 2, 1))
@@ -3988,6 +4044,32 @@ mod tests {
         }
 
         control.write_record(messages::GOODBYE, 0, 0, &messages::goodbye(6)).unwrap();
+    }
+
+    #[test]
+    fn display_changes_coalesce_per_frame_and_end_settled() {
+        let initial = DisplayMetrics {
+            viewport_width: 800,
+            viewport_height: 600,
+            columns: 80,
+            rows: 24,
+            cell_width: 10,
+            cell_height: 25,
+            generation: 1,
+        };
+        let mut pending =
+            PendingDisplayChange { metrics: initial, last_unsettled_generation: None };
+        let first = pending.event(false).unwrap();
+        assert!(!first.settled);
+        assert!(pending.event(false).is_none(), "one compositor frame emits at most once");
+
+        pending.metrics.generation = 3;
+        let coalesced = pending.event(false).unwrap();
+        assert_eq!(coalesced.display_generation, 3);
+        assert!(!coalesced.settled);
+        let final_event = pending.event(true).unwrap();
+        assert_eq!(final_event.display_generation, 3);
+        assert!(final_event.settled);
     }
 
     #[test]

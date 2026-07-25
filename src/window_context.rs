@@ -18,9 +18,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 #[cfg(unix)]
 use std::sync::Mutex;
-#[cfg(unix)]
-use std::time::Duration;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use log::info;
 use serde_json as json;
@@ -70,18 +68,14 @@ use crate::display::ScreenshotReadback;
 #[cfg(unix)]
 use crate::display::color::{DIM_FACTOR, Rgb};
 use crate::display::window::Window;
-#[cfg(unix)]
-use crate::event::EventType;
-use crate::event::{ActionContext, Event, EventProxy, Mouse, SearchState, TouchPurpose};
+use crate::event::{ActionContext, Event, EventProxy, EventType, Mouse, SearchState, TouchPurpose};
 use crate::input;
 #[cfg(unix)]
 use crate::logging::LOG_TARGET_IPC_CONFIG;
 use crate::message_bar::MessageBuffer;
 #[cfg(unix)]
 use crate::polling::ipc::{IpcConnection, IpcError};
-use crate::scheduler::Scheduler;
-#[cfg(unix)]
-use crate::scheduler::{TimerId, Topic};
+use crate::scheduler::{Scheduler, TimerId, Topic};
 #[cfg(unix)]
 use crate::screenshot;
 #[cfg(unix)]
@@ -92,6 +86,8 @@ use crate::vivid::{DisplayMetrics, VividService};
 
 #[cfg(unix)]
 type AutomationResize = (u32, u32, Option<(u16, u16)>);
+
+const VIVID_RESIZE_SETTLE_DELAY: Duration = Duration::from_millis(120);
 
 #[cfg(unix)]
 #[derive(Default)]
@@ -134,6 +130,7 @@ pub struct WindowContext {
     window_config: ParsedOptions,
     config: Rc<UiConfig>,
     vivid_service: VividService,
+    vivid_resize_settled: Option<u64>,
     #[cfg(unix)]
     ipc_window_id: u64,
     #[cfg(unix)]
@@ -324,6 +321,7 @@ impl WindowContext {
             touch: Default::default(),
             dirty: Default::default(),
             vivid_service,
+            vivid_resize_settled: None,
             #[cfg(unix)]
             ipc_window_id,
             #[cfg(unix)]
@@ -443,6 +441,7 @@ impl WindowContext {
     /// Draw the window.
     pub fn draw(&mut self, scheduler: &mut Scheduler) -> bool {
         self.display.window.requested_redraw = false;
+        self.vivid_service.flush_display_change(self.vivid_resize_settled.take());
 
         if self.occluded {
             return false;
@@ -566,7 +565,7 @@ impl WindowContext {
 
             self.dirty = true;
             let size = self.display.size_info;
-            self.vivid_service.update_metrics(DisplayMetrics {
+            let changed = self.vivid_service.update_metrics(DisplayMetrics {
                 viewport_width: size.width() as u32,
                 viewport_height: size.height() as u32,
                 columns: size.columns() as u32,
@@ -575,6 +574,17 @@ impl WindowContext {
                 cell_height: size.cell_height().round() as u32,
                 generation: 0,
             });
+            if let Some(generation) = changed {
+                let window_id = self.id();
+                let timer_id = TimerId::new(Topic::VividResizeSettled, window_id);
+                scheduler.unschedule(timer_id);
+                scheduler.schedule(
+                    Event::new(EventType::VividResizeSettled(generation), window_id),
+                    VIVID_RESIZE_SETTLE_DELAY,
+                    false,
+                    timer_id,
+                );
+            }
         }
 
         if self.dirty || self.mouse.hint_highlight_dirty {
@@ -596,6 +606,12 @@ impl WindowContext {
         {
             self.display.window.request_redraw();
         }
+    }
+
+    pub fn settle_vivid_resize(&mut self, generation: u64) {
+        self.vivid_resize_settled = Some(generation);
+        self.dirty = true;
+        self.display.window.request_redraw();
     }
 
     /// ID of this terminal context.
