@@ -763,6 +763,71 @@ impl Processor {
                     self.windows[&target].automation_inspect(self.automation.event_sequence())
                 })
             },
+            "vivid_sources" => {
+                let params: IpcTarget = match decode_ipc_params(&request) {
+                    Ok(params) => params,
+                    Err(error) => {
+                        request.connection.error(request.id, error);
+                        return;
+                    },
+                };
+                self.resolve_ipc_target(params.window_id)
+                    .map(|target| self.windows[&target].automation_vivid_sources())
+            },
+            "vivid_source_status" | "vivid_milestones" => {
+                #[derive(serde::Deserialize)]
+                struct Params {
+                    window_id: Option<u64>,
+                    session_id: u64,
+                    source_id: u64,
+                }
+                let params: Params = match decode_ipc_params(&request) {
+                    Ok(params) => params,
+                    Err(error) => {
+                        request.connection.error(request.id, error);
+                        return;
+                    },
+                };
+                self.resolve_ipc_target(params.window_id).and_then(|target| {
+                    self.windows[&target]
+                        .automation_vivid_source(params.session_id, params.source_id)
+                        .map(|status| {
+                            if request.method == "vivid_milestones" {
+                                serde_json::json!({
+                                    "window_id": status["window_id"],
+                                    "session_id": params.session_id,
+                                    "source_id": params.source_id,
+                                    "source_revision": status["source_revision"],
+                                    "milestones": status["milestones"],
+                                    "lifecycle": status["lifecycle"],
+                                    "terminal_loss_code": status["terminal_loss_code"],
+                                })
+                            } else {
+                                status
+                            }
+                        })
+                })
+            },
+            "vivid_scene_status" => {
+                #[derive(serde::Deserialize)]
+                struct Params {
+                    window_id: Option<u64>,
+                    session_id: u64,
+                    #[serde(default = "default_vivid_scene_nodes")]
+                    maximum_nodes: u64,
+                }
+                let params: Params = match decode_ipc_params(&request) {
+                    Ok(params) => params,
+                    Err(error) => {
+                        request.connection.error(request.id, error);
+                        return;
+                    },
+                };
+                self.resolve_ipc_target(params.window_id).and_then(|target| {
+                    self.windows[&target]
+                        .automation_vivid_scene(params.session_id, params.maximum_nodes)
+                })
+            },
             "get_grid" => {
                 let params: IpcGetGrid = match decode_ipc_params(&request) {
                     Ok(params) => params,
@@ -1052,6 +1117,49 @@ impl Processor {
                     &request,
                 );
                 return;
+            },
+            "wait_vivid_source" => {
+                #[derive(serde::Deserialize)]
+                struct Params {
+                    window_id: Option<u64>,
+                    session_id: u64,
+                    source_id: u64,
+                    condition: u64,
+                    value: Option<u64>,
+                    timeout: u64,
+                }
+                let params: Params = match decode_ipc_params(&request) {
+                    Ok(params) => params,
+                    Err(error) => {
+                        request.connection.error(request.id, error);
+                        return;
+                    },
+                };
+                let wait = vivid_protocol::messages::WaitSource {
+                    source_id: params.source_id,
+                    condition: params.condition,
+                    value: params.value,
+                    timeout_us: params.timeout.saturating_mul(1_000),
+                };
+                if vivid_protocol::messages::wait_source(1, wait).is_err() {
+                    Err(IpcError::new(
+                        "invalid_params",
+                        "invalid Vivid source wait condition or value",
+                    ))
+                } else {
+                    self.register_wait(
+                        params.window_id,
+                        params.timeout,
+                        WaitKind::VividSource {
+                            session_id: params.session_id,
+                            source_id: params.source_id,
+                            condition: params.condition,
+                            value: params.value,
+                        },
+                        &request,
+                    );
+                    return;
+                }
             },
             "focus" => {
                 let params: IpcTarget = match decode_ipc_params(&request) {
@@ -1415,6 +1523,29 @@ impl Processor {
                 },
                 WaitKind::Frame { after } => (frame_sequence > *after)
                     .then(|| Ok(serde_json::json!({"frame_sequence": frame_sequence}))),
+                WaitKind::VividSource { session_id, source_id, condition, value } => match window
+                    .automation_vivid_wait(*session_id, *source_id, *condition, *value)
+                {
+                    crate::vivid::scene::SourceWaitEvaluation::Satisfied(satisfied) => {
+                        Some(Ok(serde_json::json!({
+                            "session_id": session_id,
+                            "source_id": source_id,
+                            "source_revision": satisfied.source_revision.get(),
+                            "condition": condition,
+                            "observed_value": satisfied.observed_value,
+                        })))
+                    },
+                    crate::vivid::scene::SourceWaitEvaluation::Pending => None,
+                    crate::vivid::scene::SourceWaitEvaluation::NotVisible => {
+                        Some(Err(IpcError::new(
+                            "not_visible",
+                            "Vivid source has no eligible visible placement",
+                        )))
+                    },
+                    crate::vivid::scene::SourceWaitEvaluation::NotFound => {
+                        Some(Err(IpcError::new("source_not_found", "Vivid source does not exist")))
+                    },
+                },
                 WaitKind::Exit => exit_status.map(|status| {
                     Ok(serde_json::json!({
                         "exited": true,
@@ -1472,6 +1603,11 @@ fn decode_ipc_params<T: DeserializeOwned>(request: &IpcRequest) -> Result<T, Ipc
     serde_json::from_value(request.params.clone()).map_err(|error| {
         IpcError::new("invalid_params", format!("invalid {} parameters: {error}", request.method))
     })
+}
+
+#[cfg(unix)]
+fn default_vivid_scene_nodes() -> u64 {
+    64
 }
 
 #[cfg(unix)]
@@ -1811,6 +1947,11 @@ impl ApplicationHandler<Event> for Processor {
                     if window_context.display.window.has_frame {
                         window_context.display.window.request_redraw();
                     }
+                }
+                #[cfg(unix)]
+                {
+                    self.evaluate_waiters(*window_id);
+                    self.schedule_automation_timer(*window_id);
                 }
             },
             #[cfg(unix)]

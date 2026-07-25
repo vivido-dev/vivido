@@ -79,6 +79,10 @@ pub const METHODS: &[&str] = &[
     "signal",
     "list_windows",
     "inspect",
+    "vivid_sources",
+    "vivid_source_status",
+    "vivid_scene_status",
+    "vivid_milestones",
     "get_grid",
     "wait_text",
     "wait_output",
@@ -86,6 +90,7 @@ pub const METHODS: &[&str] = &[
     "wait_screen_stable",
     "wait_frame",
     "wait_exit",
+    "wait_vivid_source",
     "transcript",
     "subscribe",
 ];
@@ -1142,5 +1147,14 @@ mod tests {
         assert_eq!(hello["protocol_version"], 1);
         assert_eq!(hello["limits"]["connections"], 32);
         assert!(hello["methods"].as_array().unwrap().iter().any(|value| value == "get_grid"));
+        for method in [
+            "vivid_sources",
+            "vivid_source_status",
+            "vivid_scene_status",
+            "vivid_milestones",
+            "wait_vivid_source",
+        ] {
+            assert!(hello["methods"].as_array().unwrap().iter().any(|value| value == method));
+        }
     }
 }

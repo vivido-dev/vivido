@@ -28,6 +28,7 @@ use tempfile::TempDir;
 use vivid_protocol::anchor::{self, AnchorKey};
 use vivid_protocol::media::{self, VIDEO_PACKET_KEY};
 use vivid_protocol::messages::{self, DisplayChanged};
+use vivid_protocol::revision::{ObservationSequence, SceneRevision, SourceRevision};
 use vivid_protocol::wire::{ConnectionKind, RECORD_OPTIONAL, Record};
 use vivid_protocol::{VIVID_MAJOR, VIVID_MINOR};
 
@@ -39,7 +40,8 @@ use crate::terminal::term::{ResizePoint, Term};
 use crate::vivid::audio::AudioOutput;
 use crate::vivid::decoder::{DecodedFrame, Decoder};
 use crate::vivid::scene::{
-    Frame, SceneMutation, SceneNode, SessionId, SharedScene, SourceConfig, SourceKey,
+    Frame, SceneMutation, SceneNode, SessionId, SessionObservationSnapshot, SharedScene,
+    SourceConfig, SourceKey, SourceObservation, SourceWaitEvaluation,
 };
 use crate::vivid::transport::{Reader, Writer};
 
@@ -57,7 +59,13 @@ const INITIAL_PACKET_CREDITS: u64 = 32;
 const MAX_SESSIONS: usize = 16;
 const MAX_CONNECTIONS: usize = 64;
 const MAX_PENDING_OPERATIONS: usize = 64;
+const MAX_TRANSACTIONS: usize = 64;
+const MAX_REGISTERED_WAITS: usize = 64;
+const MAX_PENDING_REQUESTS: usize = MAX_PENDING_OPERATIONS + MAX_REGISTERED_WAITS;
+const MAX_OBSERVATION_QUEUE: usize = 64;
+const MAX_OBSERVATIONS_PER_TICK: usize = 8;
 const PENDING_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 const CONTROL_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 #[derive(Debug, Clone, Copy)]
@@ -113,6 +121,75 @@ struct PendingOperation {
     deadline: Instant,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct RegisteredWait {
+    source_id: u64,
+    condition: u64,
+    value: Option<u64>,
+    deadline: Instant,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum QueuedObservation {
+    Source {
+        source_id: u64,
+        source_revision: SourceRevision,
+        changed_fields: u64,
+        sequence: ObservationSequence,
+    },
+    Scene {
+        scene_revision: SceneRevision,
+        reason_mask: u64,
+        sequence: ObservationSequence,
+    },
+    Playback {
+        source_id: u64,
+        snapshot: messages::PlaybackSnapshot,
+        source_revision: SourceRevision,
+        sequence: ObservationSequence,
+    },
+}
+
+impl QueuedObservation {
+    fn class(self) -> u64 {
+        match self {
+            Self::Source { .. } => messages::OBSERVE_SOURCE_TRANSITIONS,
+            Self::Scene { .. } => messages::OBSERVE_SCENE_CHANGES,
+            Self::Playback { .. } => messages::OBSERVE_PLAYBACK_TRANSITIONS,
+        }
+    }
+
+    fn sequence(self) -> ObservationSequence {
+        match self {
+            Self::Source { sequence, .. }
+            | Self::Scene { sequence, .. }
+            | Self::Playback { sequence, .. } => sequence,
+        }
+    }
+
+    fn coalesces(self, other: Self) -> bool {
+        match (self, other) {
+            (Self::Source { source_id: left, .. }, Self::Source { source_id: right, .. })
+            | (Self::Playback { source_id: left, .. }, Self::Playback { source_id: right, .. }) => {
+                left == right
+            },
+            (Self::Scene { .. }, Self::Scene { .. }) => true,
+            _ => false,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct ObservationTracker {
+    mask: u64,
+    sequence: ObservationSequence,
+    scene_revision: SceneRevision,
+    sources: HashMap<u64, (SourceObservation, Option<messages::PlaybackSnapshot>)>,
+    queue: VecDeque<QueuedObservation>,
+    source_gap: Option<ObservationSequence>,
+    scene_gap: Option<ObservationSequence>,
+}
+
 #[derive(Default)]
 struct PendingOperations {
     entries: Mutex<HashMap<u64, PendingOperation>>,
@@ -151,6 +228,13 @@ impl PendingOperations {
             .is_some()
     }
 
+    fn contains(&self, request_id: u64) -> bool {
+        self.entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains_key(&request_id)
+    }
+
     fn expire(&self, now: Instant) -> Vec<(u64, u64)> {
         let mut entries = self.entries.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let expired = entries
@@ -168,6 +252,184 @@ impl PendingOperations {
     fn cancel_all(&self) {
         self.entries.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clear();
     }
+}
+
+impl ObservationTracker {
+    fn configure(&mut self, mask: u64, snapshot: SessionObservationSnapshot) {
+        self.mask = mask;
+        self.scene_revision = snapshot.scene_revision;
+        self.sources = snapshot
+            .sources
+            .into_iter()
+            .map(|(source_id, source, playback)| (source_id, (source, playback)))
+            .collect();
+        self.queue.clear();
+        self.source_gap = None;
+        self.scene_gap = None;
+    }
+
+    fn collect(&mut self, snapshot: SessionObservationSnapshot) -> io::Result<()> {
+        if self.mask & messages::OBSERVE_SCENE_CHANGES != 0
+            && snapshot.scene_revision != self.scene_revision
+            && snapshot.scene_change_reasons != 0
+        {
+            let sequence = self.next_sequence()?;
+            self.push(QueuedObservation::Scene {
+                scene_revision: snapshot.scene_revision,
+                reason_mask: snapshot.scene_change_reasons,
+                sequence,
+            });
+        }
+        self.scene_revision = snapshot.scene_revision;
+
+        let mut current = HashMap::with_capacity(snapshot.sources.len());
+        for (source_id, source, playback) in snapshot.sources {
+            let previous = self.sources.get(&source_id).copied();
+            if self.mask & messages::OBSERVE_SOURCE_TRANSITIONS != 0 {
+                let changed_fields = previous.map_or(messages::SOURCE_CHANGED_LIFECYCLE, |old| {
+                    source_changed_fields_after(source, old.0.revision)
+                });
+                if source.revision != previous.map_or(SourceRevision::ZERO, |old| old.0.revision)
+                    && changed_fields != 0
+                {
+                    let sequence = self.next_sequence()?;
+                    self.push(QueuedObservation::Source {
+                        source_id,
+                        source_revision: source.revision,
+                        changed_fields,
+                        sequence,
+                    });
+                }
+            }
+            if self.mask & messages::OBSERVE_PLAYBACK_TRANSITIONS != 0
+                && let (Some((_, Some(previous))), Some(current_playback)) = (previous, playback)
+                && (previous.state != current_playback.state
+                    || previous.eos_state != current_playback.eos_state)
+            {
+                let sequence = self.next_sequence()?;
+                self.push(QueuedObservation::Playback {
+                    source_id,
+                    snapshot: current_playback,
+                    source_revision: source.revision,
+                    sequence,
+                });
+            }
+            current.insert(source_id, (source, playback));
+        }
+        self.sources = current;
+        Ok(())
+    }
+
+    fn next_sequence(&mut self) -> io::Result<ObservationSequence> {
+        self.sequence =
+            self.sequence.advance().map_err(|_| invalid("observation sequence exhausted"))?;
+        Ok(self.sequence)
+    }
+
+    fn push(&mut self, mut event: QueuedObservation) {
+        if let Some(index) = self.queue.iter().position(|queued| queued.coalesces(event)) {
+            let previous = self.queue.remove(index).unwrap();
+            self.note_lost(previous);
+            event = match (previous, event) {
+                (
+                    QueuedObservation::Source { changed_fields: old, .. },
+                    QueuedObservation::Source {
+                        source_id,
+                        source_revision,
+                        changed_fields,
+                        sequence,
+                    },
+                ) => QueuedObservation::Source {
+                    source_id,
+                    source_revision,
+                    changed_fields: old | changed_fields,
+                    sequence,
+                },
+                (
+                    QueuedObservation::Scene { reason_mask: old, .. },
+                    QueuedObservation::Scene { scene_revision, reason_mask, sequence },
+                ) => QueuedObservation::Scene {
+                    scene_revision,
+                    reason_mask: old | reason_mask,
+                    sequence,
+                },
+                (_, event) => event,
+            };
+        }
+        if self.queue.len() >= MAX_OBSERVATION_QUEUE
+            && let Some(discarded) = self.queue.pop_front()
+        {
+            self.note_lost(discarded);
+        }
+        self.queue.push_back(event);
+    }
+
+    fn note_lost(&mut self, event: QueuedObservation) {
+        let gap = match event.class() {
+            messages::OBSERVE_SOURCE_TRANSITIONS => &mut self.source_gap,
+            messages::OBSERVE_SCENE_CHANGES => &mut self.scene_gap,
+            _ => return,
+        };
+        if gap.is_none() {
+            *gap = Some(event.sequence());
+        }
+    }
+
+    fn flush(&mut self, writer: &Writer) -> io::Result<()> {
+        for _ in 0..MAX_OBSERVATIONS_PER_TICK {
+            let Some(event) = self.queue.pop_front() else {
+                break;
+            };
+            match event {
+                QueuedObservation::Source {
+                    source_id,
+                    source_revision,
+                    changed_fields,
+                    sequence,
+                } => writer.write_record(
+                    messages::SOURCE_CHANGED,
+                    source_id,
+                    &messages::source_changed(messages::SourceChanged {
+                        source_id,
+                        source_revision,
+                        changed_fields,
+                        observation_sequence: sequence,
+                        first_lost_sequence: self.source_gap.take(),
+                    })?,
+                )?,
+                QueuedObservation::Scene { scene_revision, reason_mask, sequence } => writer
+                    .write_record(
+                        messages::SCENE_CHANGED,
+                        0,
+                        &messages::scene_changed(messages::SceneChanged {
+                            scene_revision,
+                            reason_mask,
+                            observation_sequence: sequence,
+                            first_lost_sequence: self.scene_gap.take(),
+                        })?,
+                    )?,
+                QueuedObservation::Playback { source_id, snapshot, source_revision, sequence } => {
+                    writer.write_record(
+                        messages::PLAYBACK_STATE,
+                        source_id,
+                        &messages::playback_state(messages::PlaybackState {
+                            source_id,
+                            snapshot,
+                            source_revision,
+                            observation_sequence: sequence,
+                        })?,
+                    )?
+                },
+            }
+        }
+        Ok(())
+    }
+}
+
+fn source_changed_fields_after(source: SourceObservation, revision: SourceRevision) -> u64 {
+    source.field_revisions.iter().enumerate().fold(0, |fields, (bit, changed_at)| {
+        fields | (u64::from(*changed_at > revision.get()) * (1 << bit))
+    })
 }
 
 pub struct VividService {
@@ -238,6 +500,53 @@ impl VividService {
 
     pub fn scene(&self) -> SharedScene {
         self.scene.clone()
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn automation_source_status(
+        &self,
+        session_id: SessionId,
+        source_id: u64,
+    ) -> Option<messages::SourceStatus> {
+        self.scene.source_status(
+            (session_id, source_id),
+            INITIAL_BYTE_CREDITS,
+            INITIAL_PACKET_CREDITS,
+        )
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn automation_source_keys(&self) -> Vec<SourceKey> {
+        self.scene.source_keys()
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn automation_scene_status(
+        &self,
+        session_id: SessionId,
+        maximum_nodes: u64,
+    ) -> messages::SceneStatus {
+        self.scene
+            .scene_status(
+                session_id,
+                &messages::SceneQuery {
+                    expected_revision: None,
+                    cursor: None,
+                    maximum_nodes: Some(maximum_nodes),
+                },
+            )
+            .expect("unconditional scene query cannot fail")
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn automation_evaluate_wait(
+        &self,
+        session_id: SessionId,
+        source_id: u64,
+        condition: u64,
+        value: Option<u64>,
+    ) -> SourceWaitEvaluation {
+        self.scene.evaluate_wait((session_id, source_id), condition, value)
     }
 
     pub fn update_metrics(&self, mut metrics: DisplayMetrics) {
@@ -615,6 +924,9 @@ fn handle_control(reader: &mut Reader, shared: Arc<ServiceShared>) -> io::Result
 
     let mut transactions: HashMap<u64, Vec<SceneMutation>> = HashMap::new();
     let pending = Arc::new(PendingOperations::default());
+    let mut waits = HashMap::new();
+    let mut observations = ObservationTracker::default();
+    observations.configure(0, shared.scene.take_observation_snapshot(session_id));
     let result = 'control: loop {
         for (request_id, object_id) in pending.expire(Instant::now()) {
             if let Err(error) = writer.write_record(
@@ -628,6 +940,18 @@ fn handle_control(reader: &mut Reader, shared: Arc<ServiceShared>) -> io::Result
             ) {
                 break 'control Err(error);
             }
+        }
+        if let Err(error) =
+            service_source_waits(&shared.scene, session_id, &writer, &mut waits, Instant::now())
+        {
+            break Err(error);
+        }
+        if let Err(error) = observations.collect(shared.scene.take_observation_snapshot(session_id))
+        {
+            break Err(error);
+        }
+        if let Err(error) = observations.flush(&writer) {
+            break Err(error);
         }
         match reader.wait_readable(CONTROL_POLL_INTERVAL) {
             Ok(true) => {},
@@ -647,6 +971,8 @@ fn handle_control(reader: &mut Reader, shared: Arc<ServiceShared>) -> io::Result
             &writer,
             &pending,
             &mut transactions,
+            &mut waits,
+            &mut observations,
         );
         match result {
             Ok(ControlAction::Continue) => {},
@@ -690,6 +1016,7 @@ fn is_supported_feature(feature: u64) -> bool {
             | messages::FEATURE_AUDIO_ACCESS_UNIT_V1
             | messages::FEATURE_NODE_CLIP_RECT_V1
             | messages::FEATURE_DECODER_DESCRIPTION_V1
+            | messages::FEATURE_OBSERVABILITY_CORE_V1
     )
 }
 
@@ -733,6 +1060,7 @@ fn media_time_reached(shared: &Arc<ServiceShared>, source: SourceKey, pts_us: i6
     shared.scene.presentation_due(source, pts_us)
 }
 
+#[derive(Debug)]
 enum ControlAction {
     Continue,
     Goodbye,
@@ -931,6 +1259,55 @@ fn spawn_audio_source_open(
     Ok(())
 }
 
+fn service_source_waits(
+    scene: &SharedScene,
+    session_id: SessionId,
+    writer: &Writer,
+    waits: &mut HashMap<u64, RegisteredWait>,
+    now: Instant,
+) -> io::Result<()> {
+    let request_ids = waits.keys().copied().collect::<Vec<_>>();
+    for request_id in request_ids {
+        let Some(wait) = waits.get(&request_id).copied() else {
+            continue;
+        };
+        let evaluation =
+            scene.evaluate_wait((session_id, wait.source_id), wait.condition, wait.value);
+        let completion = match evaluation {
+            SourceWaitEvaluation::Satisfied(satisfied) => {
+                Some((messages::WAIT_SATISFIED, messages::wait_satisfied(request_id, satisfied)?))
+            },
+            SourceWaitEvaluation::NotVisible => Some((
+                messages::ERROR,
+                messages::error(
+                    request_id,
+                    messages::ERROR_NOT_VISIBLE,
+                    "source has no eligible visible placement",
+                ),
+            )),
+            SourceWaitEvaluation::NotFound => Some((
+                messages::ERROR,
+                messages::error(
+                    request_id,
+                    messages::ERROR_CANCELLED,
+                    "source was destroyed while waiting",
+                ),
+            )),
+            SourceWaitEvaluation::Pending if wait.deadline <= now => Some((
+                messages::ERROR,
+                messages::error(request_id, messages::ERROR_TIMEOUT, "source wait timed out"),
+            )),
+            SourceWaitEvaluation::Pending => None,
+        };
+        if let Some((record_type, body)) = completion {
+            waits.remove(&request_id);
+            writer.write_record(record_type, wait.source_id, &body)?;
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 fn dispatch_control(
     record: &Record,
     session_id: SessionId,
@@ -939,8 +1316,16 @@ fn dispatch_control(
     writer: &Arc<Writer>,
     pending: &Arc<PendingOperations>,
     transactions: &mut HashMap<u64, Vec<SceneMutation>>,
+    waits: &mut HashMap<u64, RegisteredWait>,
+    observations: &mut ObservationTracker,
 ) -> Result<ControlAction, ProtocolError> {
     let bad = |message| ProtocolError { code: messages::ERROR_BAD_MESSAGE, message, fatal: false };
+    if record.record_type != messages::CANCEL_WAIT
+        && let Ok(envelope) = messages::decode_control(&record.body)
+        && waits.contains_key(&envelope.request_id)
+    {
+        return Err(bad("request ID already has a registered wait"));
+    }
     match record.record_type {
         messages::PING => {
             let envelope =
@@ -949,6 +1334,282 @@ fn dispatch_control(
                 return Err(bad("PING is not a correlated session-level request"));
             }
             writer.write_pong(envelope.request_id).map_err(|_| bad("could not send PONG"))?;
+        },
+        messages::SET_OBSERVATION => {
+            if !negotiated(shared, session_id, messages::FEATURE_OBSERVABILITY_CORE_V1) {
+                return Err(ProtocolError {
+                    code: messages::ERROR_UNSUPPORTED_FEATURE,
+                    message: "observability was not negotiated",
+                    fatal: false,
+                });
+            }
+            let (envelope, mask) = messages::parse_set_observation(&record.body)
+                .map_err(|_| bad("invalid SET_OBSERVATION"))?;
+            if record.object_id != 0 {
+                return Err(bad("SET_OBSERVATION must be session-level"));
+            }
+            observations.configure(mask, shared.scene.take_observation_snapshot(session_id));
+            writer
+                .write_ok(messages::OK, 0, envelope.request_id)
+                .map_err(|_| bad("could not acknowledge SET_OBSERVATION"))?;
+        },
+        messages::QUERY_SOURCE => {
+            if !negotiated(shared, session_id, messages::FEATURE_OBSERVABILITY_CORE_V1) {
+                return Err(ProtocolError {
+                    code: messages::ERROR_UNSUPPORTED_FEATURE,
+                    message: "observability was not negotiated",
+                    fatal: false,
+                });
+            }
+            let (envelope, source_id) = messages::parse_query_source(&record.body)
+                .map_err(|_| bad("invalid QUERY_SOURCE"))?;
+            if record.object_id != source_id {
+                return Err(bad("QUERY_SOURCE object ID mismatch"));
+            }
+            let status = shared
+                .scene
+                .source_status(
+                    (session_id, source_id),
+                    INITIAL_BYTE_CREDITS,
+                    INITIAL_PACKET_CREDITS,
+                )
+                .ok_or(ProtocolError {
+                    code: messages::ERROR_NOT_FOUND,
+                    message: "source does not exist",
+                    fatal: false,
+                })?;
+            let body = messages::source_status(envelope.request_id, &status)
+                .map_err(|_| bad("could not encode SOURCE_STATUS"))?;
+            writer
+                .write_record(messages::SOURCE_STATUS, source_id, &body)
+                .map_err(|_| bad("could not send SOURCE_STATUS"))?;
+        },
+        messages::QUERY_SCENE => {
+            if !negotiated(shared, session_id, messages::FEATURE_OBSERVABILITY_CORE_V1) {
+                return Err(ProtocolError {
+                    code: messages::ERROR_UNSUPPORTED_FEATURE,
+                    message: "observability was not negotiated",
+                    fatal: false,
+                });
+            }
+            let (envelope, query) = messages::parse_query_scene(&record.body)
+                .map_err(|_| bad("invalid QUERY_SCENE"))?;
+            if record.object_id != 0 {
+                return Err(bad("QUERY_SCENE must be session-level"));
+            }
+            let mut status = match shared.scene.scene_status(session_id, &query) {
+                Ok(status) => status,
+                Err(precondition) => {
+                    let mut detail = messages::ErrorDetail::new();
+                    detail.insert_u64(
+                        messages::ERROR_DETAIL_SCENE_REVISION,
+                        precondition.current_revision.get(),
+                    );
+                    let body = messages::error_with_detail(
+                        envelope.request_id,
+                        messages::ERROR_PRECONDITION_FAILED,
+                        false,
+                        &detail,
+                        "scene revision precondition failed",
+                    )
+                    .map_err(|_| bad("could not encode scene precondition error"))?;
+                    writer
+                        .write_record(messages::ERROR, 0, &body)
+                        .map_err(|_| bad("could not send scene precondition error"))?;
+                    return Ok(ControlAction::Continue);
+                },
+            };
+            let first_offset = query.cursor.map_or(0, |cursor| cursor.offset);
+            let body = loop {
+                match messages::scene_status(envelope.request_id, &status) {
+                    Ok(body) => break body,
+                    Err(_) if status.nodes.len() > 1 => {
+                        status.nodes.pop();
+                        status.cursor = Some(messages::SceneCursor {
+                            scene_revision: status.scene_revision,
+                            offset: first_offset + status.nodes.len() as u64,
+                        });
+                    },
+                    Err(_) => {
+                        return Err(ProtocolError {
+                            code: messages::ERROR_LIMIT_EXCEEDED,
+                            message: "one scene node exceeds the status reply limit",
+                            fatal: false,
+                        });
+                    },
+                }
+            };
+            writer
+                .write_record(messages::SCENE_STATUS, 0, &body)
+                .map_err(|_| bad("could not send SCENE_STATUS"))?;
+        },
+        messages::QUERY_ANCHOR => {
+            if !negotiated(shared, session_id, messages::FEATURE_OBSERVABILITY_CORE_V1) {
+                return Err(ProtocolError {
+                    code: messages::ERROR_UNSUPPORTED_FEATURE,
+                    message: "observability was not negotiated",
+                    fatal: false,
+                });
+            }
+            let (envelope, anchor_id) = messages::parse_query_anchor(&record.body)
+                .map_err(|_| bad("invalid QUERY_ANCHOR"))?;
+            if record.object_id != anchor_id {
+                return Err(bad("QUERY_ANCHOR object ID mismatch"));
+            }
+            let metrics = *lock_metrics(shared);
+            let (_, display_offset) = *lock_render_state(shared);
+            let status = shared.scene.anchor_status(
+                session_id,
+                anchor_id,
+                metrics.columns,
+                metrics.rows,
+                display_offset,
+                metrics.generation,
+            );
+            let body = messages::anchor_status(envelope.request_id, status)
+                .map_err(|_| bad("could not encode ANCHOR_STATUS"))?;
+            writer
+                .write_record(messages::ANCHOR_STATUS, anchor_id, &body)
+                .map_err(|_| bad("could not send ANCHOR_STATUS"))?;
+        },
+        messages::QUERY_LIMITS => {
+            if !negotiated(shared, session_id, messages::FEATURE_OBSERVABILITY_CORE_V1) {
+                return Err(ProtocolError {
+                    code: messages::ERROR_UNSUPPORTED_FEATURE,
+                    message: "observability was not negotiated",
+                    fatal: false,
+                });
+            }
+            let envelope = messages::parse_query_limits(&record.body)
+                .map_err(|_| bad("invalid QUERY_LIMITS"))?;
+            if record.object_id != 0 {
+                return Err(bad("QUERY_LIMITS must be session-level"));
+            }
+            let counts = shared.scene.counts(session_id);
+            let body = messages::limits_status(
+                envelope.request_id,
+                messages::LimitsStatus {
+                    maximum_sources: 64,
+                    maximum_nodes: messages::MAX_SCENE_NODES as u64,
+                    maximum_transactions: MAX_TRANSACTIONS as u64,
+                    maximum_anchors: messages::MAX_SCENE_NODES as u64,
+                    maximum_control_body: u64::from(vivid_protocol::CONTROL_MAX_RECORD_BODY),
+                    maximum_media_body: u64::from(vivid_protocol::HARD_MAX_RECORD_BODY),
+                    maximum_waits: MAX_REGISTERED_WAITS as u64,
+                    maximum_pending_requests: MAX_PENDING_REQUESTS as u64,
+                    rolling_byte_window: INITIAL_BYTE_CREDITS,
+                    rolling_packet_window: INITIAL_PACKET_CREDITS,
+                    retained_pixel_budget: 8192 * 8192 * 2,
+                    current_sources: counts.sources,
+                    current_nodes: counts.nodes,
+                    current_retained_pixels: counts.retained_pixels,
+                    image_cache_budget: None,
+                },
+            )
+            .map_err(|_| bad("could not encode LIMITS_STATUS"))?;
+            writer
+                .write_record(messages::LIMITS_STATUS, 0, &body)
+                .map_err(|_| bad("could not send LIMITS_STATUS"))?;
+        },
+        messages::WAIT_SOURCE => {
+            if !negotiated(shared, session_id, messages::FEATURE_OBSERVABILITY_CORE_V1) {
+                return Err(ProtocolError {
+                    code: messages::ERROR_UNSUPPORTED_FEATURE,
+                    message: "observability was not negotiated",
+                    fatal: false,
+                });
+            }
+            let (envelope, wait) = messages::parse_wait_source(&record.body)
+                .map_err(|_| bad("invalid WAIT_SOURCE"))?;
+            if record.object_id != wait.source_id {
+                return Err(bad("WAIT_SOURCE object ID mismatch"));
+            }
+            if waits.contains_key(&envelope.request_id) || pending.contains(envelope.request_id) {
+                return Err(bad("request ID already has a registered wait"));
+            }
+            if waits.len() >= MAX_REGISTERED_WAITS {
+                return Err(ProtocolError {
+                    code: messages::ERROR_LIMIT_EXCEEDED,
+                    message: "source wait quota exceeded",
+                    fatal: false,
+                });
+            }
+            let timeout = Duration::from_micros(wait.timeout_us);
+            if timeout > MAX_WAIT_TIMEOUT {
+                return Err(ProtocolError {
+                    code: messages::ERROR_LIMIT_EXCEEDED,
+                    message: "source wait timeout exceeds the presenter limit",
+                    fatal: false,
+                });
+            }
+            match shared.scene.evaluate_wait(
+                (session_id, wait.source_id),
+                wait.condition,
+                wait.value,
+            ) {
+                SourceWaitEvaluation::Satisfied(satisfied) => {
+                    let body = messages::wait_satisfied(envelope.request_id, satisfied)
+                        .map_err(|_| bad("could not encode WAIT_SATISFIED"))?;
+                    writer
+                        .write_record(messages::WAIT_SATISFIED, wait.source_id, &body)
+                        .map_err(|_| bad("could not send WAIT_SATISFIED"))?;
+                },
+                SourceWaitEvaluation::NotVisible => {
+                    return Err(ProtocolError {
+                        code: messages::ERROR_NOT_VISIBLE,
+                        message: "source has no eligible visible placement",
+                        fatal: false,
+                    });
+                },
+                SourceWaitEvaluation::NotFound => {
+                    return Err(ProtocolError {
+                        code: messages::ERROR_NOT_FOUND,
+                        message: "source does not exist",
+                        fatal: false,
+                    });
+                },
+                SourceWaitEvaluation::Pending => {
+                    waits.insert(
+                        envelope.request_id,
+                        RegisteredWait {
+                            source_id: wait.source_id,
+                            condition: wait.condition,
+                            value: wait.value,
+                            deadline: Instant::now() + timeout,
+                        },
+                    );
+                },
+            }
+        },
+        messages::CANCEL_WAIT => {
+            if !negotiated(shared, session_id, messages::FEATURE_OBSERVABILITY_CORE_V1) {
+                return Err(ProtocolError {
+                    code: messages::ERROR_UNSUPPORTED_FEATURE,
+                    message: "observability was not negotiated",
+                    fatal: false,
+                });
+            }
+            let (envelope, wait_request_id) = messages::parse_cancel_wait(&record.body)
+                .map_err(|_| bad("invalid CANCEL_WAIT"))?;
+            if record.object_id != 0 {
+                return Err(bad("CANCEL_WAIT must be session-level"));
+            }
+            writer
+                .write_ok(messages::OK, 0, envelope.request_id)
+                .map_err(|_| bad("could not acknowledge CANCEL_WAIT"))?;
+            if let Some(wait) = waits.remove(&wait_request_id) {
+                writer
+                    .write_record(
+                        messages::ERROR,
+                        wait.source_id,
+                        &messages::error(
+                            wait_request_id,
+                            messages::ERROR_CANCELLED,
+                            "source wait was cancelled",
+                        ),
+                    )
+                    .map_err(|_| bad("could not report cancelled source wait"))?;
+            }
         },
         messages::PROBE_VIDEO_CONFIG => {
             let (envelope, config) = messages::parse_create_video(&record.body)
@@ -1243,13 +1904,21 @@ fn dispatch_control(
             {
                 return Err(bad("BEGIN_TXN transaction ID mismatch"));
             }
-            if transactions.insert(transaction_id, Vec::new()).is_some() {
+            if transactions.contains_key(&transaction_id) {
                 return Err(ProtocolError {
                     code: messages::ERROR_DUPLICATE_ID,
                     message: "transaction ID already exists",
                     fatal: false,
                 });
             }
+            if transactions.len() >= MAX_TRANSACTIONS {
+                return Err(ProtocolError {
+                    code: messages::ERROR_LIMIT_EXCEEDED,
+                    message: "transaction quota exceeded",
+                    fatal: false,
+                });
+            }
+            transactions.insert(transaction_id, Vec::new());
             writer
                 .write_ok(messages::OK, 0, envelope.request_id)
                 .map_err(|_| bad("could not acknowledge transaction"))?;
@@ -1685,6 +2354,7 @@ fn handle_media(
         (ticket, writer)
     };
     shared.scene.mark_attached(ticket.source_key).map_err(invalid)?;
+    wake(&shared);
     let max_media_body = match shared.scene.source_config(ticket.source_key) {
         Some(SourceConfig::Raster(config)) => {
             media::rgba8_raw_frame_body_len(config.width, config.height)
@@ -2514,6 +3184,17 @@ mod tests {
         (client, server)
     }
 
+    fn read_correlated(connection: &mut Connection, record_type: u16, request_id: u64) -> Record {
+        loop {
+            let record = connection.read_record().unwrap();
+            if record.record_type == record_type
+                && messages::request_id(&record.body).unwrap() == request_id
+            {
+                return record;
+            }
+        }
+    }
+
     #[test]
     fn pending_operations_are_bounded_and_timeout_once() {
         let pending = PendingOperations::default();
@@ -2561,6 +3242,8 @@ mod tests {
         );
         let pending = Arc::new(PendingOperations::default());
         let mut transactions = HashMap::new();
+        let mut waits = HashMap::new();
+        let mut observations = ObservationTracker::default();
         let drain_body = messages::drain(41, 11);
         dispatch_control(
             &Record {
@@ -2576,6 +3259,8 @@ mod tests {
             &writer,
             &pending,
             &mut transactions,
+            &mut waits,
+            &mut observations,
         )
         .unwrap();
         assert_eq!(
@@ -2598,6 +3283,8 @@ mod tests {
             &writer,
             &pending,
             &mut transactions,
+            &mut waits,
+            &mut observations,
         )
         .unwrap();
         dispatch_control(
@@ -2614,6 +3301,8 @@ mod tests {
             &writer,
             &pending,
             &mut transactions,
+            &mut waits,
+            &mut observations,
         )
         .unwrap();
         let mut replies = Vec::new();
@@ -2640,6 +3329,300 @@ mod tests {
         );
 
         pending.cancel_all();
+        output.stop();
+    }
+
+    #[test]
+    fn observation_queue_is_bounded_coalesced_and_reports_gaps() {
+        let mut tracker = ObservationTracker {
+            mask: messages::OBSERVATION_CLASS_MASK,
+            ..ObservationTracker::default()
+        };
+        for source_id in 1..=(MAX_OBSERVATION_QUEUE as u64 + 1) {
+            let sequence = tracker.next_sequence().unwrap();
+            tracker.push(QueuedObservation::Source {
+                source_id,
+                source_revision: SourceRevision::new(source_id),
+                changed_fields: messages::SOURCE_CHANGED_LIFECYCLE,
+                sequence,
+            });
+        }
+        assert_eq!(tracker.queue.len(), MAX_OBSERVATION_QUEUE);
+        assert_eq!(tracker.source_gap, Some(ObservationSequence::new(1)));
+
+        let sequence = tracker.next_sequence().unwrap();
+        tracker.push(QueuedObservation::Source {
+            source_id: MAX_OBSERVATION_QUEUE as u64 + 1,
+            source_revision: SourceRevision::new(99),
+            changed_fields: messages::SOURCE_CHANGED_MILESTONES,
+            sequence,
+        });
+        let latest = tracker.queue.back().copied().unwrap();
+        assert!(matches!(
+            latest,
+            QueuedObservation::Source {
+                source_revision,
+                changed_fields,
+                ..
+            } if source_revision == SourceRevision::new(99)
+                && changed_fields
+                    == messages::SOURCE_CHANGED_LIFECYCLE
+                        | messages::SOURCE_CHANGED_MILESTONES
+        ));
+        assert_eq!(tracker.queue.len(), MAX_OBSERVATION_QUEUE);
+    }
+
+    #[test]
+    fn playback_observation_emits_transitions_not_clock_ticks() {
+        let (shared, output) = linked_av_shared();
+        let mut tracker = ObservationTracker::default();
+        tracker
+            .configure(messages::OBSERVATION_CLASS_MASK, shared.scene.take_observation_snapshot(1));
+
+        thread::sleep(Duration::from_millis(2));
+        tracker.collect(shared.scene.take_observation_snapshot(1)).unwrap();
+        assert!(tracker.queue.is_empty(), "clock progress is not an observation transition");
+
+        shared.scene.pause_playback((1, 10)).unwrap();
+        tracker.collect(shared.scene.take_observation_snapshot(1)).unwrap();
+        assert!(
+            tracker
+                .queue
+                .iter()
+                .any(|event| matches!(event, QueuedObservation::Playback { source_id: 10, .. }))
+        );
+        assert!(tracker.queue.iter().any(|event| matches!(
+            event,
+            QueuedObservation::Source {
+                source_id: 10,
+                changed_fields,
+                ..
+            } if changed_fields & messages::SOURCE_CHANGED_PLAYBACK != 0
+        )));
+        output.stop();
+    }
+
+    #[test]
+    fn source_wait_registry_is_bounded_and_cancel_is_correlated() {
+        let (shared, output) = linked_av_shared();
+        let (mut client, server) = stream_pair();
+        client
+            .write_all(&vivid_protocol::wire::encode_preface(ConnectionKind::Control, 4096))
+            .unwrap();
+        let (reader, _) = Reader::new(server).unwrap();
+        let writer = Arc::new(reader.writer().unwrap());
+        lock_registry(&shared).sessions.insert(
+            1,
+            SessionRuntime {
+                writer: Arc::downgrade(&writer),
+                tag: [0; 16],
+                anchor_key: anchor::derive_key(&[0; 32], &[0; 16]),
+                seen_anchors: HashSet::new(),
+                last_visibility: HashMap::new(),
+                accepted_features: HashSet::from([messages::FEATURE_OBSERVABILITY_CORE_V1]),
+            },
+        );
+        let pending = Arc::new(PendingOperations::default());
+        let mut transactions = HashMap::new();
+        let mut waits = HashMap::new();
+        let mut observations = ObservationTracker::default();
+        for request_id in 1..=MAX_REGISTERED_WAITS as u64 {
+            dispatch_control(
+                &Record {
+                    record_type: messages::WAIT_SOURCE,
+                    flags: 0,
+                    object_id: 10,
+                    sequence: request_id,
+                    body: messages::wait_source(
+                        request_id,
+                        messages::WaitSource {
+                            source_id: 10,
+                            condition: messages::WAIT_SOURCE_REVISION,
+                            value: Some(u64::MAX),
+                            timeout_us: 1_000_000,
+                        },
+                    )
+                    .unwrap(),
+                },
+                1,
+                1,
+                &shared,
+                &writer,
+                &pending,
+                &mut transactions,
+                &mut waits,
+                &mut observations,
+            )
+            .unwrap();
+        }
+        let overflow = dispatch_control(
+            &Record {
+                record_type: messages::WAIT_SOURCE,
+                flags: 0,
+                object_id: 10,
+                sequence: 100,
+                body: messages::wait_source(
+                    100,
+                    messages::WaitSource {
+                        source_id: 10,
+                        condition: messages::WAIT_SOURCE_REVISION,
+                        value: Some(u64::MAX),
+                        timeout_us: 1_000_000,
+                    },
+                )
+                .unwrap(),
+            },
+            1,
+            1,
+            &shared,
+            &writer,
+            &pending,
+            &mut transactions,
+            &mut waits,
+            &mut observations,
+        )
+        .unwrap_err();
+        assert_eq!(overflow.code, messages::ERROR_LIMIT_EXCEEDED);
+
+        dispatch_control(
+            &Record {
+                record_type: messages::CANCEL_WAIT,
+                flags: 0,
+                object_id: 0,
+                sequence: 101,
+                body: messages::cancel_wait(101, 1).unwrap(),
+            },
+            1,
+            1,
+            &shared,
+            &writer,
+            &pending,
+            &mut transactions,
+            &mut waits,
+            &mut observations,
+        )
+        .unwrap();
+        let mut replies = Vec::new();
+        let mut cancelled_code = None;
+        for _ in 0..2 {
+            let mut header = [0; vivid_protocol::wire::HEADER_SIZE];
+            client.read_exact(&mut header).unwrap();
+            let header = vivid_protocol::wire::RecordHeader::decode(header);
+            let mut body = vec![0; header.body_length as usize];
+            client.read_exact(&mut body).unwrap();
+            if header.record_type == messages::ERROR {
+                cancelled_code = Some(messages::parse_error_reply(&body).unwrap().code);
+            }
+            replies.push((header.record_type, messages::request_id(&body).unwrap()));
+        }
+        assert_eq!(replies, [(messages::OK, 101), (messages::ERROR, 1)]);
+        assert_eq!(cancelled_code, Some(messages::ERROR_CANCELLED));
+        assert!(!waits.contains_key(&1));
+        output.stop();
+    }
+
+    #[test]
+    fn source_waits_timeout_and_cancel_when_the_source_is_destroyed() {
+        let (shared, output) = linked_av_shared();
+        let (mut client, server) = stream_pair();
+        client
+            .write_all(&vivid_protocol::wire::encode_preface(ConnectionKind::Control, 4096))
+            .unwrap();
+        let (reader, _) = Reader::new(server).unwrap();
+        let writer = reader.writer().unwrap();
+        let mut waits = HashMap::from([
+            (
+                1,
+                RegisteredWait {
+                    source_id: 10,
+                    condition: messages::WAIT_SOURCE_REVISION,
+                    value: Some(u64::MAX),
+                    deadline: Instant::now() - Duration::from_millis(1),
+                },
+            ),
+            (
+                2,
+                RegisteredWait {
+                    source_id: 11,
+                    condition: messages::WAIT_SOURCE_REVISION,
+                    value: Some(u64::MAX),
+                    deadline: Instant::now() + Duration::from_secs(1),
+                },
+            ),
+        ]);
+        shared.scene.remove_source((1, 11)).unwrap();
+        service_source_waits(&shared.scene, 1, &writer, &mut waits, Instant::now()).unwrap();
+        assert!(waits.is_empty());
+
+        let mut codes = HashMap::new();
+        for _ in 0..2 {
+            let mut header = [0; vivid_protocol::wire::HEADER_SIZE];
+            client.read_exact(&mut header).unwrap();
+            let header = vivid_protocol::wire::RecordHeader::decode(header);
+            assert_eq!(header.record_type, messages::ERROR);
+            let mut body = vec![0; header.body_length as usize];
+            client.read_exact(&mut body).unwrap();
+            let error = messages::parse_error_reply(&body).unwrap();
+            codes.insert(error.request_id, error.code);
+        }
+        assert_eq!(codes.get(&1), Some(&messages::ERROR_TIMEOUT));
+        assert_eq!(codes.get(&2), Some(&messages::ERROR_CANCELLED));
+        output.stop();
+    }
+
+    #[test]
+    fn play_acknowledges_admission_before_preroll_completes() {
+        let (shared, output) = linked_av_shared();
+        let (mut client, server) = stream_pair();
+        client
+            .write_all(&vivid_protocol::wire::encode_preface(ConnectionKind::Control, 4096))
+            .unwrap();
+        let (reader, _) = Reader::new(server).unwrap();
+        let writer = Arc::new(reader.writer().unwrap());
+        lock_registry(&shared).sessions.insert(
+            1,
+            SessionRuntime {
+                writer: Arc::downgrade(&writer),
+                tag: [0; 16],
+                anchor_key: anchor::derive_key(&[0; 32], &[0; 16]),
+                seen_anchors: HashSet::new(),
+                last_visibility: HashMap::new(),
+                accepted_features: HashSet::from([messages::FEATURE_VIDEO_CONTROL_V1]),
+            },
+        );
+        let pending = Arc::new(PendingOperations::default());
+        let mut transactions = HashMap::new();
+        let mut waits = HashMap::new();
+        let mut observations = ObservationTracker::default();
+        let started = Instant::now();
+        dispatch_control(
+            &Record {
+                record_type: messages::PLAY,
+                flags: 0,
+                object_id: 10,
+                sequence: 1,
+                body: messages::play(77, 10, 500_000),
+            },
+            1,
+            1,
+            &shared,
+            &writer,
+            &pending,
+            &mut transactions,
+            &mut waits,
+            &mut observations,
+        )
+        .unwrap();
+        assert!(started.elapsed() < Duration::from_millis(50));
+        assert_eq!(shared.scene.presentation_due((1, 10), 0), Some(false));
+
+        let mut header = [0; vivid_protocol::wire::HEADER_SIZE];
+        client.read_exact(&mut header).unwrap();
+        let header = vivid_protocol::wire::RecordHeader::decode(header);
+        assert_eq!(header.record_type, messages::OK);
+        let mut body = vec![0; header.body_length as usize];
+        client.read_exact(&mut body).unwrap();
+        assert_eq!(messages::request_id(&body).unwrap(), 77);
         output.stop();
     }
 
@@ -3005,6 +3988,169 @@ mod tests {
         }
 
         control.write_record(messages::GOODBYE, 0, 0, &messages::goodbye(6)).unwrap();
+    }
+
+    #[test]
+    fn live_observability_queries_events_and_waits_share_authoritative_state() {
+        let service = VividService::start_with_wake(
+            DisplayMetrics {
+                viewport_width: 800,
+                viewport_height: 600,
+                columns: 80,
+                rows: 30,
+                cell_width: 10,
+                cell_height: 20,
+                generation: 1,
+            },
+            Arc::new(|| {}),
+        )
+        .unwrap();
+        let endpoint = Endpoint::parse(service.endpoint()).unwrap();
+        let mut control = Connection::open(&endpoint, ConnectionKind::Control).unwrap();
+        control.write_record(messages::HELLO, 0, 0, &messages::hello(1, service.token())).unwrap();
+        let welcome = parse_welcome(&control.read_record().unwrap().body).unwrap();
+        assert!(welcome.accepted_features.contains(&messages::FEATURE_OBSERVABILITY_CORE_V1));
+
+        control
+            .write_record(
+                messages::SET_OBSERVATION,
+                0,
+                0,
+                &messages::set_observation(2, messages::OBSERVATION_CLASS_MASK).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(control.read_record().unwrap().record_type, messages::OK);
+
+        control
+            .write_record(messages::CREATE_RASTER, 0, 1, &messages::create_raster(3, 1, 2, 1))
+            .unwrap();
+        let first = control.read_record().unwrap();
+        let second = control.read_record().unwrap();
+        let (ready_record, changed_record) = if first.record_type == messages::SOURCE_READY {
+            (first, second)
+        } else {
+            (second, first)
+        };
+        let ready = parse_source_ready(&ready_record.body).unwrap();
+        assert_eq!(changed_record.record_type, messages::SOURCE_CHANGED);
+        let created = messages::parse_source_changed(&changed_record.body).unwrap();
+        assert_eq!(created.source_id, 1);
+        assert_ne!(created.changed_fields & messages::SOURCE_CHANGED_LIFECYCLE, 0);
+
+        control
+            .write_record(messages::QUERY_SOURCE, 0, 1, &messages::query_source(4, 1).unwrap())
+            .unwrap();
+        let source_status_record = read_correlated(&mut control, messages::SOURCE_STATUS, 4);
+        let (_, source_status) = messages::parse_source_status(&source_status_record.body).unwrap();
+        assert_eq!(source_status.source_revision, SourceRevision::new(1));
+        assert_eq!(source_status.attachment_state, messages::ATTACHMENT_NEVER);
+
+        control
+            .write_record(
+                messages::WAIT_SOURCE,
+                0,
+                1,
+                &messages::wait_source(
+                    5,
+                    messages::WaitSource {
+                        source_id: 1,
+                        condition: messages::WAIT_MEDIA_ATTACHED,
+                        value: None,
+                        timeout_us: 1_000_000,
+                    },
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let mut media_channel = Connection::open(&endpoint, ConnectionKind::Raster).unwrap();
+        media_channel
+            .write_record(
+                messages::ATTACH_CHANNEL,
+                0,
+                1,
+                &messages::attach_channel(&ready.media_ticket),
+            )
+            .unwrap();
+        media_channel
+            .write_record(
+                messages::RASTER_FRAME,
+                0,
+                1,
+                &media::raster_frame_body(1, 1, 2, 1, &[255, 0, 0, 255, 0, 255, 0, 255]).unwrap(),
+            )
+            .unwrap();
+
+        let mut attached_wait = None;
+        let mut attached_change = None;
+        while attached_wait.is_none() || attached_change.is_none() {
+            let record = control.read_record().unwrap();
+            match record.record_type {
+                messages::WAIT_SATISFIED => {
+                    attached_wait = Some(messages::parse_wait_satisfied(&record.body).unwrap().1);
+                },
+                messages::SOURCE_CHANGED => {
+                    attached_change = Some(messages::parse_source_changed(&record.body).unwrap());
+                },
+                _ => {},
+            }
+        }
+        assert_eq!(attached_wait.unwrap().condition, messages::WAIT_MEDIA_ATTACHED);
+        assert_ne!(
+            attached_change.unwrap().changed_fields & messages::SOURCE_CHANGED_ATTACHMENT,
+            0
+        );
+
+        control.write_record(messages::QUERY_LIMITS, 0, 0, &messages::query_limits(6)).unwrap();
+        let limits = read_correlated(&mut control, messages::LIMITS_STATUS, 6);
+        let (_, limits) = messages::parse_limits_status(&limits.body).unwrap();
+        assert!(limits.maximum_waits >= 32);
+        assert_eq!(limits.current_sources, 1);
+
+        control
+            .write_record(messages::BEGIN_TXN, 0, 0, &messages::begin_transaction(7, 1))
+            .unwrap();
+        read_correlated(&mut control, messages::OK, 7);
+        control
+            .write_record(
+                messages::CREATE_NODE,
+                0,
+                1,
+                &messages::create_node(
+                    8,
+                    1,
+                    NodeConfig {
+                        node_id: 1,
+                        source_id: 1,
+                        context_id: welcome.root_context_id,
+                        columns: 2,
+                        rows: 1,
+                        anchor_id: None,
+                    },
+                ),
+            )
+            .unwrap();
+        read_correlated(&mut control, messages::OK, 8);
+        control
+            .write_record(messages::COMMIT_TXN, 0, 0, &messages::commit_transaction(9, 1, 1))
+            .unwrap();
+        let mut presented = None;
+        let mut scene_changed = None;
+        while presented.is_none() || scene_changed.is_none() {
+            let record = control.read_record().unwrap();
+            match record.record_type {
+                messages::PRESENTED => {
+                    presented = Some(messages::parse_presented(&record.body).unwrap());
+                },
+                messages::SCENE_CHANGED => {
+                    scene_changed = Some(messages::parse_scene_changed(&record.body).unwrap());
+                },
+                _ => {},
+            }
+        }
+        assert_eq!(presented.unwrap().1, SceneRevision::new(1));
+        assert_ne!(scene_changed.unwrap().reason_mask & messages::SCENE_CHANGED_PRODUCER_COMMIT, 0);
+
+        control.write_record(messages::GOODBYE, 0, 0, &messages::goodbye(10)).unwrap();
     }
 
     #[cfg(windows)]
