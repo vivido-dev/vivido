@@ -604,6 +604,18 @@ impl SharedScene {
         self.lock().scene_revisions.get(&session_id).copied().unwrap_or_default()
     }
 
+    pub fn note_context_revocation(
+        &self,
+        authority_root_session: SessionId,
+    ) -> Result<SceneRevision, &'static str> {
+        let mut state = self.lock();
+        advance_scene_revision(
+            &mut state,
+            authority_root_session,
+            messages::SCENE_CHANGED_CONTEXT_REVOKED,
+        )
+    }
+
     pub fn source_observation(&self, key: SourceKey) -> Option<SourceObservation> {
         let mut state = self.lock();
         purge_expired_tombstones(&mut state, Instant::now());
@@ -790,6 +802,20 @@ impl SharedScene {
                 .map(|frame| u64::from(frame.width) * u64::from(frame.height))
                 .sum(),
         }
+    }
+
+    pub fn configured_pixel_capacity(&self, session_id: SessionId) -> u64 {
+        self.lock()
+            .sources
+            .iter()
+            .filter(|((owner, _), _)| *owner == session_id)
+            .map(|(_, source)| match &source.config {
+                SourceConfig::Raster(config) => u64::from(config.width) * u64::from(config.height),
+                SourceConfig::Video(config) => u64::from(config.width) * u64::from(config.height),
+                SourceConfig::Image(config) => u64::from(config.width) * u64::from(config.height),
+                SourceConfig::Audio(_) => 0,
+            })
+            .sum()
     }
 
     pub fn evaluate_wait(
