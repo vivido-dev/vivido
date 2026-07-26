@@ -29,8 +29,14 @@ pub const RASTER_DAMAGE_FRAME_EQUIVALENTS: u64 = 8;
 pub enum SourceConfig {
     Raster(RasterSourceConfig),
     Video(ParsedVideoSourceConfig),
-    Image(ImageSourceConfig),
+    Image(ImageSourceState),
     Audio(ParsedAudioSourceConfig),
+}
+
+#[derive(Debug, Clone)]
+pub struct ImageSourceState {
+    pub config: ImageSourceConfig,
+    pub cache_lookup: bool,
 }
 
 impl SourceConfig {
@@ -38,7 +44,7 @@ impl SourceConfig {
         match self {
             Self::Raster(config) => (config.width, config.height),
             Self::Video(config) => (config.width, config.height),
-            Self::Image(config) => (config.width, config.height),
+            Self::Image(image) => (image.config.width, image.config.height),
             Self::Audio(_) => (0, 0),
         }
     }
@@ -51,7 +57,7 @@ impl SourceConfig {
             Self::Video(config) => {
                 media::video_body_len(config.max_access_unit_bytes).ok().map(u64::from)
             },
-            Self::Image(config) => Some(u64::from(config.encoded_length)),
+            Self::Image(image) => Some(u64::from(image.config.encoded_length)),
             Self::Audio(config) => {
                 media::audio_body_len(config.max_access_unit_bytes).ok().map(u64::from)
             },
@@ -1229,7 +1235,9 @@ impl SharedScene {
             .map(|(_, source)| match &source.config {
                 SourceConfig::Raster(config) => u64::from(config.width) * u64::from(config.height),
                 SourceConfig::Video(config) => u64::from(config.width) * u64::from(config.height),
-                SourceConfig::Image(config) => u64::from(config.width) * u64::from(config.height),
+                SourceConfig::Image(image) => {
+                    u64::from(image.config.width) * u64::from(image.config.height)
+                },
                 SourceConfig::Audio(_) => 0,
             })
             .sum()

@@ -43,8 +43,8 @@ use crate::terminal::term::{ResizePoint, Term};
 use crate::vivid::audio::AudioOutput;
 use crate::vivid::decoder::{DecodedFrame, Decoder};
 use crate::vivid::scene::{
-    Frame, MediaBarrierWait, RasterDeltaRejection, SceneMutation, SceneNode, SessionId,
-    SessionObservationSnapshot, SharedScene, SourceConfig, SourceKey, SourceObservation,
+    Frame, ImageSourceState, MediaBarrierWait, RasterDeltaRejection, SceneMutation, SceneNode,
+    SessionId, SessionObservationSnapshot, SharedScene, SourceConfig, SourceKey, SourceObservation,
     SourceWaitEvaluation,
 };
 use crate::vivid::transport::{Reader, TraceChannel, Writer};
@@ -76,6 +76,9 @@ const PENDING_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
 const MEDIA_ORDER_BARRIER_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 const CONTROL_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const IMAGE_CACHE_BUDGET_BYTES: usize = 64 * 1024 * 1024;
+const IMAGE_CACHE_OUTPUT_RGBA8_STRAIGHT: u64 = 1;
+const IMAGE_CACHE_DECODE_PROFILE: u64 = 1;
 
 fn root_context_quotas() -> messages::ContextQuotas {
     messages::ContextQuotas {
@@ -147,10 +150,154 @@ struct SessionRuntime {
     revoked: bool,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct ContextKey {
     authority_root_session: SessionId,
     context_id: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ImageCacheKey {
+    context: ContextKey,
+    encoding: u64,
+    sha256: [u8; 32],
+    encoded_length: u32,
+    width: u32,
+    height: u32,
+    output_color: u64,
+    decode_profile: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[allow(dead_code)] // Exposed for platform diagnostics and focused cache regression tests.
+pub struct ImageCacheSnapshot {
+    pub entries: u64,
+    pub retained_bytes: u64,
+    pub hits: u64,
+    pub misses: u64,
+    pub evictions: u64,
+}
+
+struct ImageCache {
+    budget_bytes: usize,
+    entries: HashMap<ImageCacheKey, Arc<[u8]>>,
+    lru: VecDeque<ImageCacheKey>,
+    retained_bytes: usize,
+    hits: u64,
+    misses: u64,
+    evictions: u64,
+}
+
+impl Default for ImageCache {
+    fn default() -> Self {
+        Self {
+            budget_bytes: IMAGE_CACHE_BUDGET_BYTES,
+            entries: HashMap::new(),
+            lru: VecDeque::new(),
+            retained_bytes: 0,
+            hits: 0,
+            misses: 0,
+            evictions: 0,
+        }
+    }
+}
+
+impl ImageCache {
+    #[cfg(test)]
+    fn with_budget(budget_bytes: usize) -> Self {
+        Self { budget_bytes, ..Self::default() }
+    }
+
+    fn lookup(&mut self, key: &ImageCacheKey) -> Option<Arc<[u8]>> {
+        let value = self.entries.get(key).cloned();
+        if value.is_some() {
+            self.hits = self.hits.saturating_add(1);
+            self.touch(key);
+        } else {
+            self.misses = self.misses.saturating_add(1);
+        }
+        value
+    }
+
+    fn insert(&mut self, key: ImageCacheKey, rgba: Arc<[u8]>) -> bool {
+        let bytes = rgba.len();
+        if bytes > self.budget_bytes {
+            return false;
+        }
+        if let Some(old) = self.entries.remove(&key) {
+            self.retained_bytes = self.retained_bytes.saturating_sub(old.len());
+            self.lru.retain(|candidate| candidate != &key);
+        }
+        if !self.evict_to_fit(bytes) {
+            return false;
+        }
+        self.retained_bytes = self.retained_bytes.saturating_add(bytes);
+        self.lru.push_back(key.clone());
+        self.entries.insert(key, rgba);
+        true
+    }
+
+    fn evict_to_fit(&mut self, additional: usize) -> bool {
+        let mut examined = 0;
+        while self.retained_bytes.saturating_add(additional) > self.budget_bytes {
+            if examined >= self.lru.len() {
+                return false;
+            }
+            let Some(candidate) = self.lru.pop_front() else {
+                return false;
+            };
+            let evictable =
+                self.entries.get(&candidate).is_some_and(|rgba| Arc::strong_count(rgba) == 1);
+            if evictable {
+                if let Some(rgba) = self.entries.remove(&candidate) {
+                    self.retained_bytes = self.retained_bytes.saturating_sub(rgba.len());
+                    self.evictions = self.evictions.saturating_add(1);
+                }
+                examined = 0;
+            } else {
+                self.lru.push_back(candidate);
+                examined += 1;
+            }
+        }
+        true
+    }
+
+    fn touch(&mut self, key: &ImageCacheKey) {
+        self.lru.retain(|candidate| candidate != key);
+        self.lru.push_back(key.clone());
+    }
+
+    fn remove(&mut self, key: &ImageCacheKey) {
+        if let Some(rgba) = self.entries.remove(key) {
+            self.retained_bytes = self.retained_bytes.saturating_sub(rgba.len());
+        }
+        self.lru.retain(|candidate| candidate != key);
+    }
+
+    fn purge_contexts(&mut self, contexts: &HashSet<ContextKey>) {
+        self.retain(|key| !contexts.contains(&key.context));
+    }
+
+    fn purge_authority(&mut self, authority_root_session: SessionId) {
+        self.retain(|key| key.context.authority_root_session != authority_root_session);
+    }
+
+    fn retain(&mut self, mut keep: impl FnMut(&ImageCacheKey) -> bool) {
+        self.entries.retain(|key, _| keep(key));
+        self.lru.retain(|key| self.entries.contains_key(key));
+        self.retained_bytes = self.entries.values().map(|rgba| rgba.len()).sum();
+    }
+
+    #[allow(dead_code)] // Used by service diagnostics on platforms that expose the native service.
+    fn snapshot(&self) -> ImageCacheSnapshot {
+        ImageCacheSnapshot {
+            entries: self.entries.len() as u64,
+            retained_bytes: self.retained_bytes as u64,
+            hits: self.hits,
+            misses: self.misses,
+            evictions: self.evictions,
+        }
+    }
 }
 
 struct ContextEntry {
@@ -189,6 +336,8 @@ struct ServiceShared {
     audio_device_available: AtomicBool,
     active_connections: AtomicUsize,
     audio_outputs: Mutex<HashMap<SourceKey, Arc<AudioOutput>>>,
+    image_cache: Mutex<ImageCache>,
+    clock_origin: Instant,
     /// Last `(renderable, display_offset)` reported by the UI thread. Cached so scene changes
     /// applied on the control-dispatcher thread (e.g. a newly committed node) can recompute
     /// source visibility without the UI-thread inputs directly at hand.
@@ -699,6 +848,8 @@ impl VividService {
             audio_device_available: AtomicBool::new(true),
             active_connections: AtomicUsize::new(0),
             audio_outputs: Mutex::new(HashMap::new()),
+            image_cache: Mutex::new(ImageCache::default()),
+            clock_origin: Instant::now(),
             render_state: Mutex::new((true, 0)),
             wake,
             trace,
@@ -733,6 +884,11 @@ impl VividService {
 
     pub fn scene(&self) -> SharedScene {
         self.scene.clone()
+    }
+
+    #[allow(dead_code)] // Platform diagnostics can surface this without affecting wire behavior.
+    pub fn image_cache_snapshot(&self) -> ImageCacheSnapshot {
+        lock_image_cache(&self.shared).snapshot()
     }
 
     /// Snapshot bounded accept-to-credit-return latency observations for diagnostics.
@@ -1534,6 +1690,8 @@ fn is_supported_feature(feature: u64) -> bool {
             | messages::FEATURE_SOURCE_DESCRIPTOR_V1
             | messages::FEATURE_RASTER_DELTA_V1
             | messages::FEATURE_MEDIA_ORDER_BARRIER_V1
+            | messages::FEATURE_IMAGE_CACHE_V1
+            | messages::FEATURE_CLOCK_SAMPLING_V1
     )
 }
 
@@ -1559,6 +1717,30 @@ fn session_quotas(
     session_id: SessionId,
 ) -> Option<messages::ContextQuotas> {
     lock_registry(shared).sessions.get(&session_id).map(|session| session.context_quotas)
+}
+
+fn session_context_key(shared: &Arc<ServiceShared>, session_id: SessionId) -> Option<ContextKey> {
+    lock_registry(shared).sessions.get(&session_id).map(|session| ContextKey {
+        authority_root_session: session.authority_root_session,
+        context_id: session.bound_context_id,
+    })
+}
+
+fn image_cache_key(
+    shared: &Arc<ServiceShared>,
+    session_id: SessionId,
+    config: &messages::ImageSourceConfig,
+) -> Option<ImageCacheKey> {
+    Some(ImageCacheKey {
+        context: session_context_key(shared, session_id)?,
+        encoding: config.encoding,
+        sha256: config.sha256?,
+        encoded_length: config.encoded_length,
+        width: config.width,
+        height: config.height,
+        output_color: IMAGE_CACHE_OUTPUT_RGBA8_STRAIGHT,
+        decode_profile: IMAGE_CACHE_DECODE_PROFILE,
+    })
 }
 
 fn required_context_class(record_type: u16) -> Option<u64> {
@@ -2465,7 +2647,7 @@ fn dispatch_control(
             if record.object_id != context_id {
                 return Err(bad("REVOKE_CONTEXT object ID mismatch"));
             }
-            let (revoked_sessions, changed_writers) = {
+            let (revoked_sessions, changed_writers, revoked_contexts) = {
                 let mut registry = lock_registry(shared);
                 let session = registry.sessions.get(&session_id).ok_or(ProtocolError {
                     code: messages::ERROR_CONTEXT_REVOKED,
@@ -2523,8 +2705,9 @@ fn dispatch_control(
                         changed_writers.push(target_writer);
                     }
                 }
-                (revoked_sessions, changed_writers)
+                (revoked_sessions, changed_writers, revoked)
             };
+            lock_image_cache(shared).purge_contexts(&revoked_contexts);
             for (revoked_session, target_writer, revoked_context) in &revoked_sessions {
                 if let Some(target_writer) = target_writer {
                     let _ = target_writer.write_record(
@@ -2570,12 +2753,31 @@ fn dispatch_control(
                 .map_err(|_| bad("could not acknowledge REVOKE_CONTEXT"))?;
         },
         messages::PING => {
-            let envelope =
-                messages::decode_control(&record.body).map_err(|_| bad("invalid PING"))?;
-            if record.object_id != 0 || envelope.request_id == 0 {
+            let responder_receive_us =
+                u64::try_from(shared.clock_origin.elapsed().as_micros()).unwrap_or(u64::MAX);
+            let ping = messages::parse_clock_ping(&record.body).map_err(|_| bad("invalid PING"))?;
+            if record.object_id != 0 {
                 return Err(bad("PING is not a correlated session-level request"));
             }
-            writer.write_pong(envelope.request_id).map_err(|_| bad("could not send PONG"))?;
+            if ping.sender_transmit_us.is_some()
+                && !negotiated(shared, session_id, messages::FEATURE_CLOCK_SAMPLING_V1)
+            {
+                return Err(ProtocolError {
+                    code: messages::ERROR_UNSUPPORTED_FEATURE,
+                    message: "clock sampling was not negotiated",
+                    fatal: false,
+                });
+            }
+            let timestamps =
+                ping.sender_transmit_us.map(|sender_transmit_us| messages::ClockPongTimestamps {
+                    echoed_sender_transmit_us: sender_transmit_us,
+                    responder_receive_us,
+                    responder_transmit_us: u64::try_from(shared.clock_origin.elapsed().as_micros())
+                        .unwrap_or(u64::MAX),
+                });
+            writer
+                .write_pong(ping.request_id, timestamps)
+                .map_err(|_| bad("could not send PONG"))?;
         },
         messages::SET_OBSERVATION => {
             if !negotiated(shared, session_id, messages::FEATURE_OBSERVABILITY_CORE_V1) {
@@ -2739,7 +2941,12 @@ fn dispatch_control(
                     current_sources: counts.sources,
                     current_nodes: counts.nodes,
                     current_retained_pixels: counts.retained_pixels,
-                    image_cache_budget: None,
+                    image_cache_budget: negotiated(
+                        shared,
+                        session_id,
+                        messages::FEATURE_IMAGE_CACHE_V1,
+                    )
+                    .then_some(IMAGE_CACHE_BUDGET_BYTES as u64),
                 },
             )
             .map_err(|_| bad("could not encode LIMITS_STATUS"))?;
@@ -3155,7 +3362,7 @@ fn dispatch_control(
             }
         },
         messages::CREATE_IMAGE => {
-            let (envelope, config, capture_policy, descriptor) =
+            let (envelope, config, cache_lookup, capture_policy, descriptor) =
                 messages::parse_create_image_with_extensions(&record.body)
                     .map_err(|_| bad("invalid CREATE_IMAGE"))?;
             writer.mark_source_policy(config.source_id, capture_policy);
@@ -3168,6 +3375,13 @@ fn dispatch_control(
             }
             if record.object_id != config.source_id {
                 return Err(bad("CREATE_IMAGE object ID mismatch"));
+            }
+            if cache_lookup && !negotiated(shared, session_id, messages::FEATURE_IMAGE_CACHE_V1) {
+                return Err(ProtocolError {
+                    code: messages::ERROR_UNSUPPORTED_FEATURE,
+                    message: "image cache lookup was not negotiated",
+                    fatal: false,
+                });
             }
             if envelope.payload.map_value(9).is_some()
                 && !negotiated(shared, session_id, messages::FEATURE_SOURCE_CAPTURE_POLICY_V1)
@@ -3205,12 +3419,19 @@ fn dispatch_control(
                 u64::from(config.width) * u64::from(config.height),
                 config.encoded_length,
             )?;
+            let eligible_cache_key = (cache_lookup
+                && capture_policy & messages::CAPTURE_POLICY_DENY_CACHE == 0)
+                .then(|| image_cache_key(shared, session_id, &config))
+                .flatten();
+            let cached_rgba = eligible_cache_key
+                .as_ref()
+                .and_then(|cache_key| lock_image_cache(shared).lookup(cache_key));
             shared
                 .scene
                 .add_source_with_extensions(
                     session_id,
                     config.source_id,
-                    SourceConfig::Image(config.clone()),
+                    SourceConfig::Image(ImageSourceState { config: config.clone(), cache_lookup }),
                     capture_policy,
                     descriptor,
                 )
@@ -3219,6 +3440,38 @@ fn dispatch_control(
                     message,
                     fatal: false,
                 })?;
+            if let Some(rgba) = cached_rgba {
+                let source_key = (session_id, config.source_id);
+                let publish = shared.scene.mark_decoder_initialized(source_key).and_then(|()| {
+                    shared.scene.publish_frame(
+                        source_key,
+                        1,
+                        Frame {
+                            frame_id: 1,
+                            pts_us: 0,
+                            width: config.width,
+                            height: config.height,
+                            rgba,
+                            alpha_mode: messages::ALPHA_STRAIGHT,
+                            sar_num: 1,
+                            sar_den: 1,
+                            damage: None,
+                        },
+                    )
+                });
+                if let Err(message) = publish {
+                    let _ = shared.scene.remove_source(source_key);
+                    return Err(ProtocolError {
+                        code: messages::ERROR_LIMIT_EXCEEDED,
+                        message,
+                        fatal: false,
+                    });
+                }
+                issue_cached_source_ready(shared, writer, envelope.request_id, source_key)
+                    .map_err(|_| bad("could not report cached image source"))?;
+                wake(shared);
+                return Ok(ControlAction::Continue);
+            }
             issue_source_ready(
                 shared,
                 writer,
@@ -3254,6 +3507,13 @@ fn dispatch_control(
                     fatal: false,
                 },
             )?;
+            if requested & messages::CAPTURE_POLICY_DENY_CACHE != 0
+                && let Some(SourceConfig::Image(image)) =
+                    shared.scene.source_config((session_id, source_id))
+                && let Some(cache_key) = image_cache_key(shared, session_id, &image.config)
+            {
+                lock_image_cache(shared).remove(&cache_key);
+            }
             writer
                 .write_ok(messages::OK, source_id, envelope.request_id)
                 .map_err(|_| bad("could not acknowledge source policy"))?;
@@ -3727,6 +3987,36 @@ fn issue_source_ready(
     writer.write_record(messages::SOURCE_READY, source_key.1, &body)
 }
 
+fn issue_cached_source_ready(
+    shared: &Arc<ServiceShared>,
+    writer: &Arc<Writer>,
+    request_id: u64,
+    source_key: SourceKey,
+) -> io::Result<()> {
+    let initial_source_revision = shared
+        .scene
+        .source_observation(source_key)
+        .ok_or_else(|| invalid("cached source disappeared before SOURCE_READY"))?
+        .revision;
+    let body = messages::source_ready_with_observability(
+        request_id,
+        &messages::SourceReady {
+            source_id: source_key.1,
+            media_ticket: Vec::new(),
+            byte_credits: 0,
+            packet_credits: 0,
+            fragment_credits: 0,
+            max_media_body: 0,
+            rolling_byte_window: 0,
+            rolling_packet_window: 0,
+            initial_source_revision,
+            media_connection_required: false,
+            delta_operation_limit: None,
+        },
+    )?;
+    writer.write_record(messages::SOURCE_READY, source_key.1, &body)
+}
+
 fn prepare_source_ready(
     shared: &Arc<ServiceShared>,
     request_id: u64,
@@ -3849,7 +4139,7 @@ fn handle_media(
         },
         Some(SourceConfig::Video(config)) => media::video_body_len(config.max_access_unit_bytes)
             .map_err(|_| invalid("invalid video source size"))?,
-        Some(SourceConfig::Image(config)) => config.encoded_length,
+        Some(SourceConfig::Image(image)) => image.config.encoded_length,
         Some(SourceConfig::Audio(config)) => media::audio_body_len(config.max_access_unit_bytes)
             .map_err(|_| invalid("invalid audio source size"))?,
         None => return Err(invalid("media ticket references a missing source")),
@@ -4386,10 +4676,11 @@ fn handle_image(
     writer: &Arc<Writer>,
     key: SourceKey,
 ) -> io::Result<()> {
-    let config = match shared.scene.source_config(key) {
-        Some(SourceConfig::Image(config)) => config,
+    let image_source = match shared.scene.source_config(key) {
+        Some(SourceConfig::Image(image)) => image,
         _ => return Err(invalid("image ticket references a non-image source")),
     };
+    let config = image_source.config;
     let mut body = Vec::new();
     let record = reader.read_record_into(&mut body)?;
     let mut charge = ChargedBody::new(shared, writer, key, record.body.len() as u64)?;
@@ -4428,7 +4719,7 @@ fn handle_image(
     if decoded.dimensions() != (config.width, config.height) {
         return Err(invalid("decoded image dimensions differ from declaration"));
     }
-    let rgba = decoded.into_rgba8().into_raw();
+    let rgba: Arc<[u8]> = Arc::from(decoded.into_rgba8().into_raw());
     shared
         .scene
         .publish_frame(
@@ -4439,7 +4730,7 @@ fn handle_image(
                 pts_us: 0,
                 width: config.width,
                 height: config.height,
-                rgba: Arc::from(rgba),
+                rgba: rgba.clone(),
                 alpha_mode: messages::ALPHA_STRAIGHT,
                 sar_num: 1,
                 sar_den: 1,
@@ -4449,6 +4740,14 @@ fn handle_image(
         .map_err(invalid)?;
     shared.scene.mark_media_accepted(key, 1, 1, record.sequence, false).map_err(invalid)?;
     charge.accepted(record.record_type, record.sequence);
+    let cache_allowed = image_source.cache_lookup
+        && shared
+            .scene
+            .source_capture_policy(key)
+            .is_some_and(|policy| policy & messages::CAPTURE_POLICY_DENY_CACHE == 0);
+    if cache_allowed && let Some(cache_key) = image_cache_key(shared, key.0, &config) {
+        lock_image_cache(shared).insert(cache_key, rgba);
+    }
     wake(shared);
     Ok(())
 }
@@ -4635,6 +4934,7 @@ fn cleanup_session(shared: &Arc<ServiceShared>, session_id: SessionId) {
         registry
             .capabilities
             .retain(|binding| binding.context.authority_root_session != root_authority);
+        lock_image_cache(shared).purge_authority(root_authority);
     }
     registry.sessions.remove(&session_id);
     registry.tickets.retain(|_, ticket| ticket.session_id != session_id);
@@ -4670,6 +4970,10 @@ fn cleanup_session(shared: &Arc<ServiceShared>, session_id: SessionId) {
 
 fn lock_registry(shared: &Arc<ServiceShared>) -> std::sync::MutexGuard<'_, Registry> {
     shared.registry.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn lock_image_cache(shared: &Arc<ServiceShared>) -> std::sync::MutexGuard<'_, ImageCache> {
+    shared.image_cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn lock_metrics(shared: &Arc<ServiceShared>) -> std::sync::MutexGuard<'_, DisplayMetrics> {
@@ -4939,6 +5243,61 @@ mod tests {
         }
     }
 
+    fn test_image_cache_key(context_id: u64, digest_byte: u8) -> ImageCacheKey {
+        ImageCacheKey {
+            context: ContextKey { authority_root_session: 1, context_id },
+            encoding: messages::IMAGE_PNG,
+            sha256: [digest_byte; 32],
+            encoded_length: 1,
+            width: 1,
+            height: 1,
+            output_color: IMAGE_CACHE_OUTPUT_RGBA8_STRAIGHT,
+            decode_profile: IMAGE_CACHE_DECODE_PROFILE,
+        }
+    }
+
+    #[test]
+    fn image_cache_is_context_scoped_and_never_evicts_active_pixels() {
+        let mut cache = ImageCache::with_budget(4);
+        let first_key = test_image_cache_key(10, 1);
+        let foreign_key = test_image_cache_key(11, 1);
+        let first: Arc<[u8]> = Arc::from([1, 2, 3, 4]);
+        assert!(cache.insert(first_key.clone(), first));
+
+        let active_frame = cache.lookup(&first_key).unwrap();
+        assert!(cache.lookup(&foreign_key).is_none());
+        assert!(
+            !cache.insert(test_image_cache_key(10, 2), Arc::from([5, 6, 7, 8])),
+            "an active frame must pin its cache entry instead of exceeding the budget"
+        );
+        assert_eq!(&*active_frame, &[1, 2, 3, 4]);
+
+        drop(active_frame);
+        assert!(cache.insert(test_image_cache_key(10, 2), Arc::from([5, 6, 7, 8])));
+        let snapshot = cache.snapshot();
+        assert_eq!(snapshot.entries, 1);
+        assert_eq!(snapshot.retained_bytes, 4);
+        assert_eq!(snapshot.hits, 1);
+        assert_eq!(snapshot.misses, 1);
+        assert_eq!(snapshot.evictions, 1);
+    }
+
+    #[test]
+    fn image_cache_purges_revoked_contexts_without_invalidating_active_frames() {
+        let mut cache = ImageCache::with_budget(8);
+        let revoked_key = test_image_cache_key(10, 1);
+        let retained_key = test_image_cache_key(11, 2);
+        assert!(cache.insert(revoked_key.clone(), Arc::from([1, 2, 3, 4])));
+        assert!(cache.insert(retained_key.clone(), Arc::from([5, 6, 7, 8])));
+        let active_frame = cache.lookup(&revoked_key).unwrap();
+
+        cache.purge_contexts(&HashSet::from([revoked_key.context]));
+
+        assert!(cache.lookup(&revoked_key).is_none());
+        assert!(cache.lookup(&retained_key).is_some());
+        assert_eq!(&*active_frame, &[1, 2, 3, 4]);
+    }
+
     fn context_hello(request_id: u64, credential: &str, authentication_kind: u64) -> Vec<u8> {
         messages::try_encode_hello(
             request_id,
@@ -4964,6 +5323,184 @@ mod tests {
             },
         )
         .unwrap()
+    }
+
+    fn performance_hello(request_id: u64, token: &str) -> Vec<u8> {
+        messages::try_encode_hello(
+            request_id,
+            &messages::HelloConfig {
+                minimum_major: 1,
+                minimum_minor: 1,
+                maximum_major: 1,
+                maximum_minor: 1,
+                token,
+                producer: "performance-test",
+                producer_version: "1",
+                required_features: &[
+                    messages::FEATURE_RASTER_RGBA8,
+                    messages::FEATURE_SCENE_TRANSACTIONS,
+                    messages::FEATURE_GRID_CELL_NODES,
+                    messages::FEATURE_CREDIT_FLOW_CONTROL,
+                    messages::FEATURE_TEXT_ANCHORS_V2,
+                ],
+                optional_features: &[
+                    messages::FEATURE_ENCODED_IMAGE_V1,
+                    messages::FEATURE_OBSERVABILITY_CORE_V1,
+                    messages::FEATURE_SOURCE_CAPTURE_POLICY_V1,
+                    messages::FEATURE_IMAGE_CACHE_V1,
+                    messages::FEATURE_CLOCK_SAMPLING_V1,
+                ],
+                maximum_record_body: vivid_protocol::CONTROL_MAX_RECORD_BODY,
+                authentication_kind: messages::AUTHENTICATION_WINDOW_ROOT,
+                preserved_fields: &[],
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn live_image_cache_skips_repeat_decode_and_clock_ping_is_timestamped() {
+        let service = VividService::start_with_wake(
+            DisplayMetrics {
+                viewport_width: 800,
+                viewport_height: 600,
+                columns: 80,
+                rows: 30,
+                cell_width: 10,
+                cell_height: 20,
+                generation: 1,
+            },
+            Arc::new(|| {}),
+        )
+        .unwrap();
+        let endpoint = Endpoint::parse(service.endpoint()).unwrap();
+        let mut control = Connection::open(&endpoint, ConnectionKind::Control).unwrap();
+        control
+            .write_record(messages::HELLO, 0, 0, &performance_hello(1, service.token()))
+            .unwrap();
+        let welcome = parse_welcome(&control.read_record().unwrap().body).unwrap();
+        assert!(welcome.accepted_features.contains(&messages::FEATURE_IMAGE_CACHE_V1));
+        assert!(welcome.accepted_features.contains(&messages::FEATURE_CLOCK_SAMPLING_V1));
+
+        control
+            .write_record(messages::PING, 0, 0, &messages::clock_ping(2, Some(123_456)).unwrap())
+            .unwrap();
+        let pong =
+            messages::parse_clock_pong(&read_correlated(&mut control, messages::PONG, 2).body)
+                .unwrap();
+        let timestamps = pong.timestamps.expect("negotiated clock PING must be timestamped");
+        assert_eq!(timestamps.echoed_sender_transmit_us, 123_456);
+        assert!(timestamps.responder_transmit_us >= timestamps.responder_receive_us);
+
+        let image = image::RgbaImage::from_raw(1, 1, vec![10, 20, 30, 255]).unwrap();
+        let mut png = Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image).write_to(&mut png, image::ImageFormat::Png).unwrap();
+        let png = png.into_inner();
+        let hash: [u8; 32] = Sha256::digest(&png).into();
+        let config = |source_id| messages::ImageSourceConfig {
+            source_id,
+            encoding: messages::IMAGE_PNG,
+            width: 1,
+            height: 1,
+            encoded_length: u32::try_from(png.len()).unwrap(),
+            sha256: Some(hash),
+        };
+
+        control
+            .write_record(
+                messages::CREATE_IMAGE,
+                0,
+                1,
+                &messages::create_image_with_cache_extensions(3, &config(1), true, 0, None)
+                    .unwrap(),
+            )
+            .unwrap();
+        let first_ready =
+            parse_source_ready(&read_correlated(&mut control, messages::SOURCE_READY, 3).body)
+                .unwrap();
+        assert!(first_ready.media_connection_required);
+        let mut blob = Connection::open(&endpoint, ConnectionKind::Blob).unwrap();
+        blob.write_record(
+            messages::ATTACH_CHANNEL,
+            0,
+            1,
+            &messages::attach_channel(&first_ready.media_ticket),
+        )
+        .unwrap();
+        blob.write_record(messages::IMAGE_DATA, 0, 1, &png).unwrap();
+        drop(blob);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while service.image_cache_snapshot().entries != 1 {
+            assert!(Instant::now() < deadline, "validated image was not cached");
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        control
+            .write_record(messages::DESTROY_SOURCE, 0, 1, &messages::destroy_source(4, 1))
+            .unwrap();
+        read_correlated(&mut control, messages::OK, 4);
+        control
+            .write_record(
+                messages::CREATE_IMAGE,
+                0,
+                2,
+                &messages::create_image_with_cache_extensions(5, &config(2), true, 0, None)
+                    .unwrap(),
+            )
+            .unwrap();
+        let cached_ready =
+            parse_source_ready(&read_correlated(&mut control, messages::SOURCE_READY, 5).body)
+                .unwrap();
+        assert!(!cached_ready.media_connection_required);
+        assert!(cached_ready.media_ticket.is_empty());
+        assert_eq!(service.image_cache_snapshot().hits, 1);
+
+        control
+            .write_record(
+                messages::SET_SOURCE_POLICY,
+                0,
+                2,
+                &messages::set_source_policy(6, 2, messages::CAPTURE_POLICY_DENY_CACHE),
+            )
+            .unwrap();
+        read_correlated(&mut control, messages::OK, 6);
+        assert_eq!(
+            service.image_cache_snapshot().entries,
+            0,
+            "tightening policy must purge retained cache data before replying"
+        );
+        control
+            .write_record(messages::DESTROY_SOURCE, 0, 2, &messages::destroy_source(7, 2))
+            .unwrap();
+        read_correlated(&mut control, messages::OK, 7);
+        control
+            .write_record(
+                messages::CREATE_IMAGE,
+                0,
+                3,
+                &messages::create_image_with_cache_extensions(
+                    8,
+                    &config(3),
+                    true,
+                    messages::CAPTURE_POLICY_DENY_CACHE,
+                    None,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let denied_ready =
+            parse_source_ready(&read_correlated(&mut control, messages::SOURCE_READY, 8).body)
+                .unwrap();
+        assert!(denied_ready.media_connection_required);
+        assert_eq!(service.image_cache_snapshot().hits, 1);
+
+        control.write_record(messages::QUERY_LIMITS, 0, 0, &messages::query_limits(9)).unwrap();
+        let (_, limits) = messages::parse_limits_status(
+            &read_correlated(&mut control, messages::LIMITS_STATUS, 9).body,
+        )
+        .unwrap();
+        assert_eq!(limits.image_cache_budget, Some(IMAGE_CACHE_BUDGET_BYTES as u64));
+        control.write_record(messages::GOODBYE, 0, 0, &messages::goodbye(10)).unwrap();
     }
 
     #[test]
@@ -5552,6 +6089,8 @@ mod tests {
             audio_device_available: AtomicBool::new(true),
             active_connections: AtomicUsize::new(0),
             audio_outputs: Mutex::new(HashMap::from([((1, 11), output.clone())])),
+            image_cache: Mutex::new(ImageCache::default()),
+            clock_origin: Instant::now(),
             render_state: Mutex::new((true, 0)),
             wake: Arc::new(|| {}),
             trace: None,

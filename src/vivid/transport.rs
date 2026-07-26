@@ -315,9 +315,12 @@ impl Writer {
         self.write_record(record_type, object_id, &body)
     }
 
-    pub fn write_pong(&self, request_id: u64) -> io::Result<()> {
-        let mut body = self.control_body.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        messages::pong_into(&mut body, request_id);
+    pub fn write_pong(
+        &self,
+        request_id: u64,
+        timestamps: Option<messages::ClockPongTimestamps>,
+    ) -> io::Result<()> {
+        let body = messages::clock_pong(request_id, timestamps)?;
         self.write_record(messages::PONG, 0, &body)
     }
 
@@ -345,9 +348,9 @@ fn body_restricts_trace(record_type: u16, body: &[u8]) -> bool {
         messages::CREATE_RASTER => {
             messages::parse_create_raster_with_extensions(body).ok().map(|(_, _, policy, _)| policy)
         },
-        messages::CREATE_IMAGE => {
-            messages::parse_create_image_with_extensions(body).ok().map(|(_, _, policy, _)| policy)
-        },
+        messages::CREATE_IMAGE => messages::parse_create_image_with_extensions(body)
+            .ok()
+            .map(|(_, _, _, policy, _)| policy),
         messages::CREATE_VIDEO => {
             messages::parse_create_video_with_extensions(body).ok().map(|(_, _, policy, _)| policy)
         },
