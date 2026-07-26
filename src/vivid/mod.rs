@@ -1182,10 +1182,7 @@ fn listener_loop(listener: LocalListener, shared: Arc<ServiceShared>, shutdown: 
                     move || {
                         let _connection = ActiveConnection(&connection_shared.active_connections);
                         if let Err(error) = handle_connection(stream, worker_shared)
-                            && !matches!(
-                                error.kind(),
-                                ErrorKind::UnexpectedEof | ErrorKind::BrokenPipe
-                            )
+                            && !is_expected_peer_disconnect(&error)
                         {
                             log::warn!("Vivid connection failed: {error}");
                         }
@@ -1205,6 +1202,19 @@ fn listener_loop(listener: LocalListener, shared: Arc<ServiceShared>, shutdown: 
             },
         }
     }
+}
+
+fn is_expected_peer_disconnect(error: &io::Error) -> bool {
+    // Ctrl+C and other producer exits are EOF on some local transports, but Winsock can surface
+    // the same peer teardown as reset, aborted, broken-pipe, or not-connected errors.
+    matches!(
+        error.kind(),
+        ErrorKind::UnexpectedEof
+            | ErrorKind::ConnectionReset
+            | ErrorKind::ConnectionAborted
+            | ErrorKind::BrokenPipe
+            | ErrorKind::NotConnected
+    )
 }
 
 fn handle_connection(stream: LocalStream, shared: Arc<ServiceShared>) -> io::Result<()> {
@@ -1514,11 +1524,12 @@ fn handle_control(reader: &mut Reader, shared: Arc<ServiceShared>) -> io::Result
         match reader.wait_readable(CONTROL_POLL_INTERVAL) {
             Ok(true) => {},
             Ok(false) => continue,
+            Err(error) if is_expected_peer_disconnect(&error) => break Ok(()),
             Err(error) => break Err(error),
         }
         let record = match reader.read_record() {
             Ok(record) => record,
-            Err(error) if error.kind() == ErrorKind::UnexpectedEof => break Ok(()),
+            Err(error) if is_expected_peer_disconnect(&error) => break Ok(()),
             Err(error) => break Err(error),
         };
         let envelope = match messages::decode_control(&record.body) {
@@ -4232,7 +4243,7 @@ fn handle_raster(
     loop {
         let record = match reader.read_record_into(&mut body) {
             Ok(record) => record,
-            Err(error) if error.kind() == ErrorKind::UnexpectedEof => return Ok(()),
+            Err(error) if is_expected_peer_disconnect(&error) => return Ok(()),
             Err(error) => return Err(error),
         };
         let mut charge = ChargedBody::new(shared, writer, key, record.body.len() as u64)?;
@@ -4451,15 +4462,20 @@ fn handle_video(
             thread::sleep(Duration::from_millis(2));
             continue;
         }
-        if !reader.wait_readable(Duration::from_millis(10))? {
-            if shared.scene.eos_epoch(key).is_some() {
-                break;
-            }
-            continue;
+        match reader.wait_readable(Duration::from_millis(10)) {
+            Ok(true) => {},
+            Ok(false) => {
+                if shared.scene.eos_epoch(key).is_some() {
+                    break;
+                }
+                continue;
+            },
+            Err(error) if is_expected_peer_disconnect(&error) => break,
+            Err(error) => return Err(error),
         }
         let record = match reader.read_record_into(&mut body) {
             Ok(record) => record,
-            Err(error) if error.kind() == ErrorKind::UnexpectedEof => break,
+            Err(error) if is_expected_peer_disconnect(&error) => break,
             Err(error) => return Err(error),
         };
         let mut charge = ChargedBody::new(shared, writer, key, record.body.len() as u64)?;
@@ -4619,15 +4635,20 @@ fn handle_audio(
         let mut decoder_epoch = None;
         let mut body = Vec::new();
         loop {
-            if !reader.wait_readable(Duration::from_millis(50))? {
-                if shared.scene.eos_epoch(key).is_some() {
-                    break;
-                }
-                continue;
+            match reader.wait_readable(Duration::from_millis(50)) {
+                Ok(true) => {},
+                Ok(false) => {
+                    if shared.scene.eos_epoch(key).is_some() {
+                        break;
+                    }
+                    continue;
+                },
+                Err(error) if is_expected_peer_disconnect(&error) => break,
+                Err(error) => return Err(error),
             }
             let record = match reader.read_record_into(&mut body) {
                 Ok(record) => record,
-                Err(error) if error.kind() == ErrorKind::UnexpectedEof => break,
+                Err(error) if is_expected_peer_disconnect(&error) => break,
                 Err(error) => return Err(error),
             };
             let mut charge = ChargedBody::new(shared, writer, key, record.body.len() as u64)?;
@@ -5219,6 +5240,28 @@ mod tests {
         let client = TcpStream::connect(address).unwrap();
         let (server, _) = listener.accept().unwrap();
         (client, server)
+    }
+
+    #[test]
+    fn expected_peer_disconnects_are_not_connection_failures() {
+        for kind in [
+            ErrorKind::UnexpectedEof,
+            ErrorKind::ConnectionReset,
+            ErrorKind::ConnectionAborted,
+            ErrorKind::BrokenPipe,
+            ErrorKind::NotConnected,
+        ] {
+            assert!(is_expected_peer_disconnect(&io::Error::from(kind)));
+        }
+        assert!(!is_expected_peer_disconnect(&invalid("malformed record")));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn winsock_forcibly_closed_error_is_an_expected_peer_disconnect() {
+        let error = io::Error::from_raw_os_error(10054);
+        assert_eq!(error.kind(), ErrorKind::ConnectionReset);
+        assert!(is_expected_peer_disconnect(&error));
     }
 
     fn read_correlated(connection: &mut Connection, record_type: u16, request_id: u64) -> Record {
