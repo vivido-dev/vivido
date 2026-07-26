@@ -1430,7 +1430,12 @@ impl SharedScene {
         visible: bool,
     ) -> Result<(), &'static str> {
         let mut state = self.lock();
-        let source = state.sources.get_mut(&key).ok_or("source does not exist")?;
+        let Some(source) = state.sources.get_mut(&key) else {
+            // Rendering happens from a cloned scene snapshot. A source may be destroyed after that
+            // snapshot is taken but before the GPU submission is recorded as presented. The frame
+            // was valid when selected, and there is no remaining source state to update.
+            return Ok(());
+        };
         source.last_presentation_id =
             source.last_presentation_id.checked_add(1).ok_or("presentation ID exhausted")?;
         source.last_presented_media_id = media_id;
@@ -3334,6 +3339,24 @@ mod tests {
         );
         scene.remove_source((1, 1)).unwrap();
         assert!(scene.source_config((1, 1)).is_none());
+    }
+
+    #[test]
+    fn stale_render_snapshot_can_finish_after_source_removal() {
+        let scene = SharedScene::default();
+        let key = (1, 50);
+        add_delta_raster(&scene, key.1, 1, 1);
+        accept_raster_full(&scene, key, 1, 7, 1, 1, vec![0, 0, 0, 255]);
+        scene.commit_mutations(1, vec![SceneMutation::Create(video_node(1, key.1, 1))]).unwrap();
+
+        let (_, items) = scene.snapshot();
+        let item = items.first().expect("render snapshot contains the source");
+        scene.remove_source(key).unwrap();
+
+        assert_eq!(
+            scene.mark_presented(item.source_key, item.frame.frame_id, item.frame.pts_us, true),
+            Ok(())
+        );
     }
 
     #[test]
