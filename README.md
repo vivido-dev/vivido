@@ -6,7 +6,7 @@ Linux uses Wayland exclusively.
 
 ## Vivid Protocol
 
-Vivido accepts Vivid Protocol 1.0 only, using the same version in the connection preface. Its
+Vivido accepts Vivid Protocol 1.1 only, using the same version in the connection preface. Its
 private per-window service supports authenticated marker-v2 anchors, raw/zstd raster with straight
 or premultiplied alpha, retained PNG/JPEG images, portable video and audio access units, visibility
 events, complete buffered `PLAY`, pause/flush/EOS, keyframe recovery, and source-scoped failure.
@@ -14,7 +14,7 @@ Local peer origin and the per-window token are verified before session resources
 
 Portable video includes H.264/HEVC Annex B, VP9 frames, and AV1 low-overhead temporal units.
 Portable audio includes MP3, AAC, ALAC, PCM, Opus, Vorbis, and FLAC. Opus, Vorbis, and FLAC require
-the canonical container-independent initialization defined by Vivid 1.0; Vivido validates it before
+the canonical container-independent initialization defined by Vivid 1.1; Vivido validates it before
 decoder or device allocation and applies trim/pre-skip exactly once.
 
 `PLAY` retains all existing protocol fields, starts at the exact requested PTS after its minimum
