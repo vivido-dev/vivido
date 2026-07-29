@@ -3068,6 +3068,7 @@ pub enum ClickState {
     None,
     Click,
     DoubleClick,
+    TripleClick,
 }
 
 impl Mouse {
