@@ -33,7 +33,10 @@ sudo apt install cmake g++ pkg-config libfontconfig1-dev libfreetype6-dev \
 cargo build --release
 ```
 
-There is intentionally no X11 feature or fallback. Run Vivido inside a Wayland session.
+There is intentionally no X11 feature or fallback. Windowed Vivido runs inside a Wayland session.
+Linux `vivido --headless` does not connect to Wayland, but still requires a compatible Vulkan
+adapter. Mesa lavapipe is suitable for CPU-rendered CI; a missing Vulkan adapter is a provisioning
+error rather than a skipped headless test.
 
 ### macOS
 

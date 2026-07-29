@@ -34,6 +34,7 @@ mod automation;
 mod cli;
 mod clipboard;
 mod config;
+mod context;
 mod daemon;
 mod display;
 mod event;
@@ -46,6 +47,7 @@ mod message_bar;
 mod panic;
 #[cfg(unix)]
 mod polling;
+mod runtime;
 mod scheduler;
 #[cfg(unix)]
 mod screenshot;
@@ -142,12 +144,22 @@ impl Drop for TemporaryFiles {
 /// Creates a window, the terminal state, PTY, I/O event loop, input processor,
 /// config change monitor, and runs the main display loop.
 fn vivido(mut options: Options) -> Result<(), Box<dyn Error>> {
+    if options.headless {
+        #[cfg(unix)]
+        return headless(options);
+        #[cfg(not(unix))]
+        return Err(
+            io::Error::new(io::ErrorKind::Unsupported, "headless mode requires Unix").into()
+        );
+    }
+
     // Setup winit event loop.
     let window_event_loop = EventLoop::<Event>::with_user_event().build()?;
 
     // Initialize the logger as soon as possible as to capture output from other subsystems.
-    let log_file = logging::initialize(&options, window_event_loop.create_proxy())
-        .expect("Unable to initialize logger");
+    let runtime_proxy = runtime::RuntimeProxy::from(window_event_loop.create_proxy());
+    let log_file =
+        logging::initialize(&options, runtime_proxy.clone()).expect("Unable to initialize logger");
 
     info!("Welcome to Vivido");
     info!("Version {}", env!("VERSION"));
@@ -183,7 +195,7 @@ fn vivido(mut options: Options) -> Result<(), Box<dyn Error>> {
 
     // Spawn the Unix I/O event polling thread.
     #[cfg(unix)]
-    let socket_path = match IoListener::spawn(&config, &options, window_event_loop.create_proxy()) {
+    let socket_path = match IoListener::spawn(&config, &options, runtime_proxy) {
         Ok(handle) => handle.ipc_socket_path,
         Err(err) if options.daemon => return Err(err.into()),
         Err(err) => {
@@ -233,6 +245,53 @@ fn vivido(mut options: Options) -> Result<(), Box<dyn Error>> {
 
     info!("Goodbye");
 
+    result
+}
+
+/// Run Vivido without constructing winit or connecting to a display server.
+#[cfg(unix)]
+fn headless(mut options: Options) -> Result<(), Box<dyn Error>> {
+    #[cfg(not(target_os = "linux"))]
+    if options.headless {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "headless mode is currently supported only on Linux",
+        )
+        .into());
+    }
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let runtime_proxy = runtime::RuntimeProxy::Headless(sender);
+    let log_file =
+        logging::initialize(&options, runtime_proxy.clone()).expect("Unable to initialize logger");
+
+    info!("Welcome to Vivido");
+    info!("Version {}", env!("VERSION"));
+    info!("Running headless with an offscreen Vulkan renderer");
+
+    let config = config::load(&mut options);
+    log_config_path(&config);
+    log::set_max_level(config.debug.log_level);
+    tty::setup_env();
+    for (key, value) in config.env.iter() {
+        unsafe { env::set_var(key, value) };
+    }
+
+    let socket_path = match IoListener::spawn(&config, &options, runtime_proxy.clone()) {
+        Ok(handle) => handle.ipc_socket_path,
+        Err(err) if options.daemon => return Err(err.into()),
+        Err(err) => {
+            log::warn!("Unable to create socket: {err:?}");
+            None
+        },
+    };
+    let log_cleanup = log_file.filter(|_| !config.debug.persistent_logging);
+    let _files = TemporaryFiles { socket_path, log_file: log_cleanup };
+
+    let mut processor = Processor::new_headless(config, options, runtime_proxy);
+    let result = processor.run_headless(receiver);
+    if let Some(config_monitor) = processor.config_monitor.take() {
+        config_monitor.shutdown();
+    }
     result
 }
 

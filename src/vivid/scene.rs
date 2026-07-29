@@ -2953,21 +2953,76 @@ mod tests {
                 }),
             )
             .unwrap();
+        scene.add_anchor(1, 7, 0, 0).unwrap();
+        scene.add_anchor(2, 7, 1, 0).unwrap();
 
+        let mut first_node = video_node(1, 1, 1);
+        first_node.anchor_id = Some(7);
+        let mut second_node = video_node(2, 1, 1);
+        second_node.anchor_id = Some(7);
         assert_eq!(
-            scene.commit_mutations(1, vec![SceneMutation::Create(video_node(1, 1, 1))]).unwrap(),
+            scene.commit_mutations(1, vec![SceneMutation::Create(first_node)]).unwrap(),
             SceneRevision::new(1)
         );
         assert_eq!(
-            scene.commit_mutations(2, vec![SceneMutation::Create(video_node(2, 1, 1))]).unwrap(),
+            scene.commit_mutations(2, vec![SceneMutation::Create(second_node)]).unwrap(),
             SceneRevision::new(1)
         );
+        for (session_id, red) in [(1, 32), (2, 224)] {
+            scene
+                .publish_frame(
+                    (session_id, 1),
+                    1,
+                    Frame {
+                        frame_id: 1,
+                        pts_us: 0,
+                        width: 16,
+                        height: 16,
+                        rgba: Arc::from([red, 0, 0, 255].repeat(16 * 16)),
+                        alpha_mode: messages::ALPHA_STRAIGHT,
+                        sar_num: 1,
+                        sar_den: 1,
+                        damage: None,
+                    },
+                )
+                .unwrap();
+        }
+        assert_eq!(scene.snapshot().1.len(), 2);
         assert_eq!(scene.scene_revision(1), SceneRevision::new(1));
         assert_eq!(scene.scene_revision(2), SceneRevision::new(1));
 
         scene.lose_source((1, 1), messages::ERROR_DEVICE_LOST).unwrap();
         assert_eq!(scene.scene_revision(1), SceneRevision::new(2));
         assert_eq!(scene.scene_revision(2), SceneRevision::new(1));
+        let surviving = scene.snapshot().1;
+        assert_eq!(surviving.len(), 1);
+        assert_eq!(surviving[0].source_key, (2, 1));
+        assert_eq!(surviving[0].frame.frame_id, 1);
+        assert!(
+            scene
+                .aggregate_visibility(80, 24, 0, true)
+                .unwrap()
+                .into_iter()
+                .any(|(key, visible, _)| key == (2, 1) && visible)
+        );
+        scene
+            .publish_frame(
+                (2, 1),
+                1,
+                Frame {
+                    frame_id: 2,
+                    pts_us: 1,
+                    width: 16,
+                    height: 16,
+                    rgba: Arc::from([0, 224, 0, 255].repeat(16 * 16)),
+                    alpha_mode: messages::ALPHA_STRAIGHT,
+                    sar_num: 1,
+                    sar_den: 1,
+                    damage: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(scene.snapshot().1[0].frame.frame_id, 2);
 
         assert!(
             scene

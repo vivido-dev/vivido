@@ -12,6 +12,8 @@ use std::fmt::Debug;
 use std::os::unix::io::RawFd;
 use std::path::PathBuf;
 use std::rc::Rc;
+#[cfg(unix)]
+use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 use std::{env, f32, mem};
 
@@ -24,7 +26,7 @@ use winit::event::{
     ElementState, Event as WinitEvent, Ime, Modifiers, MouseButton, StartCause,
     Touch as TouchEvent, WindowEvent,
 };
-use winit::event_loop::{ActiveEventLoop, ControlFlow, DeviceEvents, EventLoop, EventLoopProxy};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, DeviceEvents, EventLoop};
 use winit::raw_window_handle::HasDisplayHandle;
 use winit::window::WindowId;
 
@@ -48,6 +50,7 @@ use crate::clipboard::Clipboard;
 use crate::config::font::FontSize;
 use crate::config::ui_config::{HintAction, HintInternalAction};
 use crate::config::{self, UiConfig};
+use crate::context::ContextId;
 #[cfg(not(windows))]
 use crate::daemon::foreground_process_path;
 use crate::daemon::spawn_daemon;
@@ -62,6 +65,7 @@ use crate::message_bar::{Message, MessageBuffer};
 use crate::polling::ipc::IpcRequest;
 #[cfg(unix)]
 use crate::polling::ipc::{IpcError, MAX_INPUT_BYTES, MAX_IPC_TEXT_BYTES};
+use crate::runtime::RuntimeProxy;
 use crate::scheduler::{Scheduler, TimerId, Topic};
 use crate::vivid::VividService;
 use crate::window_context::WindowContext;
@@ -92,8 +96,12 @@ pub struct Processor {
     scheduler: Scheduler,
     initial_window_options: Option<WindowOptions>,
     initial_window_error: Option<Box<dyn Error>>,
-    windows: HashMap<WindowId, WindowContext, RandomState>,
-    proxy: EventLoopProxy<Event>,
+    windows: HashMap<ContextId, WindowContext, RandomState>,
+    platform_windows: HashMap<WindowId, ContextId, RandomState>,
+    next_context_id: u64,
+    proxy: RuntimeProxy,
+    headless: bool,
+    exit_requested: bool,
     #[cfg(unix)]
     global_ipc_options: ParsedOptions,
     #[cfg(unix)]
@@ -109,7 +117,7 @@ impl Processor {
         cli_options: CliOptions,
         event_loop: &EventLoop<Event>,
     ) -> Processor {
-        let proxy = event_loop.create_proxy();
+        let proxy = RuntimeProxy::from(event_loop.create_proxy());
         let scheduler = Scheduler::new(proxy.clone());
         let initial_window_options = Some(cli_options.window_options.clone());
 
@@ -126,8 +134,7 @@ impl Processor {
         // config changes are processed in the main loop.
         let mut config_monitor = None;
         if config.live_config_reload() {
-            config_monitor =
-                ConfigMonitor::new(config.config_paths.clone(), event_loop.create_proxy());
+            config_monitor = ConfigMonitor::new(config.config_paths.clone(), proxy.clone());
         }
 
         Processor {
@@ -139,6 +146,10 @@ impl Processor {
             config: Rc::new(config),
             clipboard,
             windows: Default::default(),
+            platform_windows: Default::default(),
+            next_context_id: 1,
+            headless: false,
+            exit_requested: false,
             #[cfg(unix)]
             global_ipc_options: Default::default(),
             #[cfg(unix)]
@@ -147,40 +158,83 @@ impl Processor {
         }
     }
 
-    /// Create the initial window and its Vello/wgpu surface.
-    pub fn create_initial_window(
-        &mut self,
-        event_loop: &ActiveEventLoop,
-        window_options: WindowOptions,
-    ) -> Result<u64, Box<dyn Error>> {
-        let window_context = WindowContext::initial(
-            event_loop,
-            self.proxy.clone(),
-            self.config.clone(),
-            window_options,
-        )?;
-        #[cfg(unix)]
-        let mut window_context = window_context;
+    #[cfg(unix)]
+    pub fn new_headless(
+        config: UiConfig,
+        cli_options: CliOptions,
+        proxy: RuntimeProxy,
+    ) -> Processor {
+        let scheduler = Scheduler::new(proxy.clone());
+        let initial_window_options = Some(cli_options.window_options.clone());
+        let config_monitor = config
+            .live_config_reload()
+            .then(|| ConfigMonitor::new(config.config_paths.clone(), proxy.clone()))
+            .flatten();
+        Processor {
+            config_monitor,
+            clipboard: Clipboard::new_nop(),
+            scheduler,
+            initial_window_options,
+            initial_window_error: None,
+            windows: Default::default(),
+            platform_windows: Default::default(),
+            next_context_id: 1,
+            proxy,
+            headless: true,
+            exit_requested: false,
+            #[cfg(unix)]
+            global_ipc_options: Default::default(),
+            #[cfg(unix)]
+            automation: Default::default(),
+            cli_options,
+            config: Rc::new(config),
+        }
+    }
 
+    fn allocate_context_id(&mut self) -> ContextId {
+        let id = ContextId::new(self.next_context_id);
+        self.next_context_id = self.next_context_id.checked_add(1).expect("context ID exhausted");
+        id
+    }
+
+    fn register_context(&mut self, mut window_context: WindowContext) -> u64 {
         #[cfg(unix)]
         {
             window_context.automation.creation_index = self.automation.next_creation_index();
         }
-        let platform_id = window_context.id();
+        let context_id = window_context.id();
+        if let Some(platform_id) = window_context.display.window.platform_id() {
+            self.platform_windows.insert(platform_id, context_id);
+        }
         #[cfg(unix)]
         let ipc_window_id = window_context.ipc_window_id();
         #[cfg(not(unix))]
-        let ipc_window_id = u64::from(platform_id);
-        self.windows.insert(platform_id, window_context);
-
+        let ipc_window_id = context_id.get();
+        self.windows.insert(context_id, window_context);
         #[cfg(unix)]
         self.automation.emit(
             Some(ipc_window_id),
             "window_created",
             serde_json::json!({"window_id": ipc_window_id}),
         );
+        ipc_window_id
+    }
 
-        Ok(ipc_window_id)
+    /// Create the initial window and its Vello/wgpu surface.
+    pub fn create_initial_window(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        window_options: WindowOptions,
+    ) -> Result<u64, Box<dyn Error>> {
+        let context_id = self.allocate_context_id();
+        let window_context = WindowContext::initial(
+            event_loop,
+            self.proxy.clone(),
+            context_id,
+            self.config.clone(),
+            window_options,
+        )?;
+        Ok(self.register_context(window_context))
     }
 
     /// Create a new terminal window.
@@ -191,10 +245,7 @@ impl Processor {
     ) -> Result<u64, Box<dyn Error>> {
         #[cfg(unix)]
         if let Some(ipc_window_id) = options.ipc_window_id
-            && self
-                .windows
-                .values()
-                .any(|window_context| window_context.ipc_window_id() == ipc_window_id)
+            && ipc_id_in_use(self.windows.values().map(WindowContext::ipc_window_id), ipc_window_id)
         {
             return Err(std::io::Error::other(format!(
                 "IPC window ID {ipc_window_id} is already in use"
@@ -209,22 +260,20 @@ impl Processor {
         let mut config = self.config.clone();
         config = config_overrides.override_config_rc(config);
 
+        let context_id = self.allocate_context_id();
         let window_context = WindowContext::additional(
             event_loop,
             self.proxy.clone(),
+            context_id,
             config,
             options,
             config_overrides,
         )?;
         #[cfg(unix)]
-        let mut window_context = window_context;
-
-        #[cfg(unix)]
-        if self
-            .windows
-            .values()
-            .any(|existing| existing.ipc_window_id() == window_context.ipc_window_id())
-        {
+        if ipc_id_in_use(
+            self.windows.values().map(WindowContext::ipc_window_id),
+            window_context.ipc_window_id(),
+        ) {
             return Err(std::io::Error::other(format!(
                 "IPC window ID {} is already in use",
                 window_context.ipc_window_id()
@@ -232,23 +281,185 @@ impl Processor {
             .into());
         }
 
+        Ok(self.register_context(window_context))
+    }
+
+    pub fn create_headless(&mut self, options: WindowOptions) -> Result<u64, Box<dyn Error>> {
+        #[cfg(unix)]
+        if let Some(ipc_window_id) = options.ipc_window_id
+            && ipc_id_in_use(self.windows.values().map(WindowContext::ipc_window_id), ipc_window_id)
+        {
+            return Err(std::io::Error::other(format!(
+                "IPC window ID {ipc_window_id} is already in use"
+            ))
+            .into());
+        }
+
+        let mut config_overrides = options.config_overrides();
+        #[cfg(unix)]
+        config_overrides.extend_from_slice(&self.global_ipc_options);
+        let config = config_overrides.override_config_rc(self.config.clone());
+        let context_id = self.allocate_context_id();
+        let mut context = if self.windows.is_empty() {
+            WindowContext::initial_headless(self.proxy.clone(), context_id, config, options)?
+        } else {
+            WindowContext::additional_headless(
+                self.proxy.clone(),
+                context_id,
+                config,
+                options,
+                config_overrides,
+            )?
+        };
+        #[cfg(unix)]
+        if ipc_id_in_use(
+            self.windows.values().map(WindowContext::ipc_window_id),
+            context.ipc_window_id(),
+        ) {
+            return Err(std::io::Error::other(format!(
+                "IPC window ID {} is already in use",
+                context.ipc_window_id()
+            ))
+            .into());
+        }
+        context.dirty = true;
+        context.display.damage_tracker.frame().mark_fully_damaged();
+        context.display.window.request_redraw();
+        Ok(self.register_context(context))
+    }
+
+    #[cfg(unix)]
+    pub fn run_headless(&mut self, receiver: Receiver<Event>) -> Result<(), Box<dyn Error>> {
+        if !self.cli_options.daemon
+            && let Some(options) = self.initial_window_options.take()
+        {
+            self.create_headless(options)?;
+        }
+        info!("Headless initialisation complete");
+
+        while !self.exit_requested {
+            while let Ok(event) = receiver.try_recv() {
+                self.process_user_event(None, event);
+            }
+            let deadline = self.process_headless_cycle();
+            if self.exit_requested {
+                break;
+            }
+            let next = match deadline {
+                Some(deadline) => {
+                    let timeout = deadline.saturating_duration_since(Instant::now());
+                    match receiver.recv_timeout(timeout) {
+                        Ok(event) => Some(event),
+                        Err(RecvTimeoutError::Timeout) => None,
+                        Err(RecvTimeoutError::Disconnected) => break,
+                    }
+                },
+                None => receiver.recv().ok(),
+            };
+            if let Some(event) = next {
+                self.process_user_event(None, event);
+            }
+        }
+
+        self.shutdown_contexts();
+        match self.initial_window_error.take() {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    #[cfg(unix)]
+    fn process_headless_cycle(&mut self) -> Option<Instant> {
+        #[cfg(not(target_os = "macos"))]
+        for context in self.windows.values_mut() {
+            context.handle_event(
+                &self.proxy,
+                &mut self.clipboard,
+                &mut self.scheduler,
+                WinitEvent::AboutToWait,
+            );
+        }
+
         #[cfg(unix)]
         {
-            window_context.automation.creation_index = self.automation.next_creation_index();
+            let context_ids: Vec<_> = self.windows.keys().copied().collect();
+            for context_id in &context_ids {
+                self.apply_automation_confirmations(*context_id);
+            }
+            let mut changes = Vec::new();
+            for (context_id, window) in &mut self.windows {
+                if let Some((screen_sequence, rows)) = window.sync_automation_screen() {
+                    let grid = window
+                        .automation_grid(None, None, Some(screen_sequence.saturating_sub(1)))
+                        .ok();
+                    changes.push((
+                        *context_id,
+                        window.ipc_window_id(),
+                        screen_sequence,
+                        rows,
+                        grid,
+                    ));
+                }
+            }
+            for (_, window_id, screen_sequence, rows, grid) in changes {
+                self.automation.emit(
+                    Some(window_id),
+                    "screen_changed",
+                    serde_json::json!({
+                        "screen_sequence": screen_sequence,
+                        "full": rows.is_none(),
+                        "rows": rows,
+                        "grid": grid,
+                    }),
+                );
+            }
+            for context_id in context_ids {
+                self.evaluate_waiters(context_id);
+                self.schedule_automation_timer(context_id);
+            }
         }
-        let platform_id = window_context.id();
+
+        let render_ids = self
+            .windows
+            .iter()
+            .filter_map(|(id, context)| {
+                (context.display.window.requested_redraw && context.display.window.has_frame)
+                    .then_some(*id)
+            })
+            .collect::<Vec<_>>();
+        for context_id in render_ids {
+            let context = self.windows.get_mut(&context_id).expect("context exists");
+            if context.draw(&mut self.scheduler) {
+                #[cfg(unix)]
+                {
+                    context.start_fresh_screenshot_readback();
+                    let ipc_window_id = context.ipc_window_id();
+                    let frame_sequence = context.automation.record_frame();
+                    self.automation.emit(
+                        Some(ipc_window_id),
+                        "frame_presented",
+                        serde_json::json!({"frame_sequence": frame_sequence}),
+                    );
+                }
+            }
+            #[cfg(unix)]
+            {
+                self.evaluate_waiters(context_id);
+                self.schedule_automation_timer(context_id);
+            }
+        }
+
+        self.scheduler.update()
+    }
+
+    fn shutdown_contexts(&mut self) {
         #[cfg(unix)]
-        let ipc_window_id = window_context.ipc_window_id();
-        #[cfg(not(unix))]
-        let ipc_window_id = u64::from(platform_id);
-        self.windows.insert(platform_id, window_context);
-        #[cfg(unix)]
-        self.automation.emit(
-            Some(ipc_window_id),
-            "window_created",
-            serde_json::json!({"window_id": ipc_window_id}),
-        );
-        Ok(ipc_window_id)
+        for window in self.windows.values_mut() {
+            window.fail_automation_requests("pty_closed", "Vivido event loop is shutting down");
+        }
+        self.windows.clear();
+        self.platform_windows.clear();
+        self.clipboard = Clipboard::new_nop();
     }
 
     /// Run the event loop.
@@ -285,7 +496,7 @@ impl Processor {
 
     /// Resolve the public stable window ID or focused-window fallback.
     #[cfg(unix)]
-    fn resolve_ipc_target(&self, requested: Option<u64>) -> Result<WindowId, IpcError> {
+    fn resolve_ipc_target(&self, requested: Option<u64>) -> Result<ContextId, IpcError> {
         match requested {
             Some(requested) => self
                 .windows
@@ -301,12 +512,13 @@ impl Processor {
                 .windows
                 .iter()
                 .find_map(|(id, window)| window.is_focused().then_some(*id))
+                .or_else(|| headless_singleton_target(self.headless, self.windows.keys().copied()))
                 .ok_or_else(|| IpcError::new("no_focused_window", "no focused Vivido window")),
         }
     }
 
     #[cfg(unix)]
-    fn handle_ipc_request(&mut self, event_loop: &ActiveEventLoop, request: IpcRequest) {
+    fn handle_ipc_request(&mut self, event_loop: Option<&ActiveEventLoop>, request: IpcRequest) {
         use crate::cli::{
             IpcConfig, IpcGetConfig, IpcGetGrid, IpcGetText, IpcInputRoute, IpcKey, IpcMouse,
             IpcPaste, IpcResize, IpcScreenshot, IpcSignal, IpcSubscribe, IpcTarget, IpcTranscript,
@@ -349,10 +561,18 @@ impl Processor {
                         return;
                     },
                 };
-                let created = if self.windows.is_empty() {
-                    self.create_initial_window(event_loop, options)
+                let created = if self.headless {
+                    self.create_headless(options)
+                } else if self.windows.is_empty() {
+                    self.create_initial_window(
+                        event_loop.expect("windowed runtime has an active event loop"),
+                        options,
+                    )
                 } else {
-                    self.create_window(event_loop, options)
+                    self.create_window(
+                        event_loop.expect("windowed runtime has an active event loop"),
+                        options,
+                    )
                 };
                 match created {
                     Ok(window_id) => request
@@ -361,7 +581,7 @@ impl Processor {
                     Err(error) => request.connection.error(
                         request.id,
                         IpcError::new(
-                            "invalid_params",
+                            if self.headless { "unsupported" } else { "invalid_params" },
                             format!("failed to create window: {error}"),
                         ),
                     ),
@@ -511,7 +731,7 @@ impl Processor {
                             &params,
                             repeat_index > 0,
                             #[cfg(target_os = "macos")]
-                            event_loop,
+                            event_loop.expect("windowed runtime has an active event loop"),
                             &self.proxy,
                             &mut self.clipboard,
                             &mut self.scheduler,
@@ -558,7 +778,7 @@ impl Processor {
                         IpcInputRoute::Ui => self.windows.get_mut(&target).unwrap().ui_paste(
                             &params.text,
                             #[cfg(target_os = "macos")]
-                            event_loop,
+                            event_loop.expect("windowed runtime has an active event loop"),
                             &self.proxy,
                             &mut self.clipboard,
                             &mut self.scheduler,
@@ -611,7 +831,7 @@ impl Processor {
                         let result = self.windows.get_mut(&target).unwrap().ui_mouse(
                             &params,
                             #[cfg(target_os = "macos")]
-                            event_loop,
+                            event_loop.expect("windowed runtime has an active event loop"),
                             &self.proxy,
                             &mut self.clipboard,
                             &mut self.scheduler,
@@ -657,7 +877,7 @@ impl Processor {
                     ))
                 } else {
                     let after_resize = self.windows[&target].automation.resize_confirmation;
-                    match self.windows[&target].request_automation_resize(
+                    match self.windows.get_mut(&target).unwrap().request_automation_resize(
                         params.columns,
                         params.rows,
                         params.width,
@@ -666,6 +886,16 @@ impl Processor {
                         Ok((width, height, grid)) => {
                             let (columns, rows) =
                                 grid.map_or((None, None), |(c, r)| (Some(c), Some(r)));
+                            let headless = self.windows[&target].display.window.is_headless();
+                            let after_frame =
+                                headless.then_some(self.windows[&target].automation.frame_sequence);
+                            if headless {
+                                self.automation.emit(
+                                    Some(self.windows[&target].ipc_window_id()),
+                                    "resized",
+                                    serde_json::json!({"width": width, "height": height}),
+                                );
+                            }
                             self.register_wait_for_target(
                                 target,
                                 5_000,
@@ -675,6 +905,7 @@ impl Processor {
                                     width,
                                     height,
                                     after_resize,
+                                    after_frame,
                                     pty_token: None,
                                     pty_complete: false,
                                 },
@@ -1171,6 +1402,15 @@ impl Processor {
                 };
                 match self.resolve_ipc_target(params.window_id) {
                     Ok(target) => {
+                        if self.windows[&target].display.window.is_headless() {
+                            return request.connection.error(
+                                request.id,
+                                IpcError::new(
+                                    "unsupported",
+                                    "focus is unavailable for a headless terminal",
+                                ),
+                            );
+                        }
                         if self.windows[&target]
                             .automation
                             .waiters
@@ -1278,7 +1518,7 @@ impl Processor {
     #[cfg(unix)]
     fn register_wait_for_target(
         &mut self,
-        target: WindowId,
+        target: ContextId,
         timeout_ms: u64,
         kind: WaitKind,
         request: &IpcRequest,
@@ -1301,7 +1541,7 @@ impl Processor {
     }
 
     #[cfg(unix)]
-    fn automation_tick(&mut self, window_id: WindowId) {
+    fn automation_tick(&mut self, window_id: ContextId) {
         let Some(window) = self.windows.get_mut(&window_id) else {
             return;
         };
@@ -1325,7 +1565,7 @@ impl Processor {
 
     /// Keep exactly one timer at the nearest automation deadline for this window.
     #[cfg(unix)]
-    fn schedule_automation_timer(&mut self, window_id: WindowId) {
+    fn schedule_automation_timer(&mut self, window_id: ContextId) {
         let timer_id = TimerId::new(Topic::Automation, window_id);
         self.scheduler.unschedule(timer_id);
         let Some(window) = self.windows.get(&window_id) else {
@@ -1361,7 +1601,7 @@ impl Processor {
 
     /// Apply focus/resize confirmations after batched winit events have updated window state.
     #[cfg(unix)]
-    fn apply_automation_confirmations(&mut self, window_id: WindowId) {
+    fn apply_automation_confirmations(&mut self, window_id: ContextId) {
         let Some(window) = self.windows.get_mut(&window_id) else {
             return;
         };
@@ -1429,7 +1669,7 @@ impl Processor {
     }
 
     #[cfg(unix)]
-    fn evaluate_waiters(&mut self, window_id: WindowId) {
+    fn evaluate_waiters(&mut self, window_id: ContextId) {
         use std::os::unix::process::ExitStatusExt;
 
         let Some(window) = self.windows.get_mut(&window_id) else {
@@ -1560,6 +1800,7 @@ impl Processor {
                     width,
                     height,
                     after_resize,
+                    after_frame,
                     pty_complete,
                     ..
                 } => {
@@ -1571,6 +1812,7 @@ impl Processor {
                     });
                     (window.automation.resize_confirmation > *after_resize
                         && *pty_complete
+                        && after_frame.is_none_or(|after| window.automation.frame_sequence > after)
                         && grid_matches
                         && pixels.width == *width
                         && pixels.height == *height)
@@ -1608,6 +1850,24 @@ fn decode_ipc_params<T: DeserializeOwned>(request: &IpcRequest) -> Result<T, Ipc
 #[cfg(unix)]
 fn default_vivid_scene_nodes() -> u64 {
     64
+}
+
+#[cfg(unix)]
+fn ipc_id_in_use(ids: impl IntoIterator<Item = u64>, candidate: u64) -> bool {
+    ids.into_iter().any(|id| id == candidate)
+}
+
+#[cfg(unix)]
+fn headless_singleton_target(
+    headless: bool,
+    ids: impl IntoIterator<Item = ContextId>,
+) -> Option<ContextId> {
+    if !headless {
+        return None;
+    }
+    let mut ids = ids.into_iter();
+    let target = ids.next()?;
+    ids.next().is_none().then_some(target)
 }
 
 #[cfg(unix)]
@@ -1667,7 +1927,10 @@ impl ApplicationHandler<Event> for Processor {
             return;
         }
 
-        let window_context = match self.windows.get_mut(&window_id) {
+        let Some(context_id) = self.platform_windows.get(&window_id).copied() else {
+            return;
+        };
+        let window_context = match self.windows.get_mut(&context_id) {
             Some(window_context) => window_context,
             None => return,
         };
@@ -1731,12 +1994,29 @@ impl ApplicationHandler<Event> for Processor {
         #[cfg(unix)]
         {
             let _ = window_context;
-            self.evaluate_waiters(window_id);
-            self.schedule_automation_timer(window_id);
+            self.evaluate_waiters(context_id);
+            self.schedule_automation_timer(context_id);
         }
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: Event) {
+        self.process_user_event(Some(event_loop), event);
+        if self.exit_requested {
+            event_loop.exit();
+        }
+    }
+
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        self.process_about_to_wait(event_loop);
+    }
+
+    fn exiting(&mut self, event_loop: &ActiveEventLoop) {
+        self.process_exiting(event_loop);
+    }
+}
+
+impl Processor {
+    fn process_user_event(&mut self, event_loop: Option<&ActiveEventLoop>, event: Event) {
         if self.config.debug.print_events {
             info!(target: LOG_TARGET_WINIT, "{event:?}");
         }
@@ -1794,26 +2074,36 @@ impl ApplicationHandler<Event> for Processor {
             },
             // Create a new terminal window.
             (EventType::CreateWindow(options), _) => {
-                if self.windows.is_empty() {
-                    // Handle initial window creation in daemon mode.
-                    if let Err(err) = self.create_initial_window(event_loop, options) {
-                        self.initial_window_error = Some(err);
-                        event_loop.exit();
+                if self.headless {
+                    if let Err(err) = self.create_headless(options) {
+                        error!("Could not open headless terminal: {err:?}");
                     }
-                } else if let Err(err) = self.create_window(event_loop, options) {
+                } else if self.windows.is_empty() {
+                    // Handle initial window creation in daemon mode.
+                    if let Err(err) = self.create_initial_window(
+                        event_loop.expect("windowed runtime has an active event loop"),
+                        options,
+                    ) {
+                        self.initial_window_error = Some(err);
+                        self.exit_requested = true;
+                    }
+                } else if let Err(err) = self.create_window(
+                    event_loop.expect("windowed runtime has an active event loop"),
+                    options,
+                ) {
                     error!("Could not open window: {err:?}");
                 }
             },
             // Shutdown all windows.
             #[cfg(unix)]
-            (EventType::Shutdown, _) => event_loop.exit(),
+            (EventType::Shutdown, _) => self.exit_requested = true,
             // Process events affecting all windows.
             (payload, None) => {
                 let event = WinitEvent::UserEvent(Event::new(payload, None));
                 for window_context in self.windows.values_mut() {
                     window_context.handle_event(
                         #[cfg(target_os = "macos")]
-                        event_loop,
+                        event_loop.expect("windowed runtime has an active event loop"),
                         &self.proxy,
                         &mut self.clipboard,
                         &mut self.scheduler,
@@ -1831,7 +2121,7 @@ impl ApplicationHandler<Event> for Processor {
                 if let Some(window_context) = self.windows.get_mut(window_id) {
                     window_context.handle_event(
                         #[cfg(target_os = "macos")]
-                        event_loop,
+                        event_loop.expect("windowed runtime has an active event loop"),
                         &self.proxy,
                         &mut self.clipboard,
                         &mut self.scheduler,
@@ -1856,7 +2146,7 @@ impl ApplicationHandler<Event> for Processor {
                 if let Some(window_context) = self.windows.get_mut(window_id) {
                     window_context.handle_event(
                         #[cfg(target_os = "macos")]
-                        event_loop,
+                        event_loop.expect("windowed runtime has an active event loop"),
                         &self.proxy,
                         &mut self.clipboard,
                         &mut self.scheduler,
@@ -1877,7 +2167,7 @@ impl ApplicationHandler<Event> for Processor {
                 if let Some(window_context) = self.windows.get_mut(window_id) {
                     window_context.handle_event(
                         #[cfg(target_os = "macos")]
-                        event_loop,
+                        event_loop.expect("windowed runtime has an active event loop"),
                         &self.proxy,
                         &mut self.clipboard,
                         &mut self.scheduler,
@@ -1984,6 +2274,9 @@ impl ApplicationHandler<Event> for Processor {
                     },
                     _ => return,
                 };
+                if let Some(platform_id) = window_context.display.window.platform_id() {
+                    self.platform_windows.remove(&platform_id);
+                }
                 #[cfg(unix)]
                 let mut window_context = window_context;
 
@@ -2008,7 +2301,7 @@ impl ApplicationHandler<Event> for Processor {
                         window_context.write_ref_test_results();
                     }
 
-                    event_loop.exit();
+                    self.exit_requested = true;
                 }
             },
             // NOTE: This event bypasses batching to minimize input latency.
@@ -2029,7 +2322,7 @@ impl ApplicationHandler<Event> for Processor {
                 if let Some(window_context) = self.windows.get_mut(window_id) {
                     window_context.handle_event(
                         #[cfg(target_os = "macos")]
-                        event_loop,
+                        event_loop.expect("windowed runtime has an active event loop"),
                         &self.proxy,
                         &mut self.clipboard,
                         &mut self.scheduler,
@@ -2039,8 +2332,10 @@ impl ApplicationHandler<Event> for Processor {
             },
         };
     }
+}
 
-    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+impl Processor {
+    fn process_about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         if self.config.debug.print_events {
             info!(target: LOG_TARGET_WINIT, "About to wait");
         }
@@ -2106,20 +2401,12 @@ impl ApplicationHandler<Event> for Processor {
         event_loop.set_control_flow(control_flow);
     }
 
-    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+    fn process_exiting(&mut self, _event_loop: &ActiveEventLoop) {
         if self.config.debug.print_events {
             info!("Exiting the event loop");
         }
 
-        #[cfg(unix)]
-        for window in self.windows.values_mut() {
-            window.fail_automation_requests("pty_closed", "Vivido event loop is shutting down");
-        }
-        self.windows.clear();
-
-        // SAFETY: The clipboard must be dropped before the event loop, so use the nop clipboard
-        // as a safe placeholder.
-        self.clipboard = Clipboard::new_nop();
+        self.shutdown_contexts();
     }
 }
 
@@ -2127,14 +2414,14 @@ impl ApplicationHandler<Event> for Processor {
 #[derive(Debug, Clone)]
 pub struct Event {
     /// Limit event to a specific window.
-    window_id: Option<WindowId>,
+    window_id: Option<ContextId>,
 
     /// Event payload.
     payload: EventType,
 }
 
 impl Event {
-    pub fn new<I: Into<Option<WindowId>>>(payload: EventType, window_id: I) -> Self {
+    pub fn new<I: Into<Option<ContextId>>>(payload: EventType, window_id: I) -> Self {
         Self { window_id: window_id.into(), payload }
     }
 }
@@ -2268,7 +2555,7 @@ pub struct ActionContext<'a, N, T> {
     pub prev_bell_cmd: &'a mut Option<Instant>,
     #[cfg(target_os = "macos")]
     pub event_loop: &'a ActiveEventLoop,
-    pub event_proxy: &'a EventLoopProxy<Event>,
+    pub event_proxy: &'a RuntimeProxy,
     pub scheduler: &'a mut Scheduler,
     pub search_state: &'a mut SearchState,
     pub dirty: &'a mut bool,
@@ -3373,35 +3660,53 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
 
 #[derive(Debug, Clone)]
 pub struct EventProxy {
-    proxy: EventLoopProxy<Event>,
-    window_id: WindowId,
+    proxy: RuntimeProxy,
+    context_id: ContextId,
 }
 
 impl EventProxy {
-    pub fn new(proxy: EventLoopProxy<Event>, window_id: WindowId) -> Self {
-        Self { proxy, window_id }
+    pub fn new(proxy: RuntimeProxy, context_id: ContextId) -> Self {
+        Self { proxy, context_id }
     }
 
     /// Send an event to the event loop.
     pub fn send_event(&self, event: EventType) {
-        let _ = self.proxy.send_event(Event::new(event, self.window_id));
+        let _ = self.proxy.send_event(Event::new(event, self.context_id));
     }
 }
 
 impl EventListener for EventProxy {
     fn send_event(&self, event: TerminalEvent) {
-        let _ = self.proxy.send_event(Event::new(event.into(), self.window_id));
+        let _ = self.proxy.send_event(Event::new(event.into(), self.context_id));
     }
 }
 
 #[cfg(all(test, unix))]
 mod ipc_wait_tests {
-    use super::pattern_find;
+    use super::{headless_singleton_target, ipc_id_in_use, pattern_find};
+    use crate::context::ContextId;
 
     #[test]
     fn literal_and_regex_wait_matching_report_byte_ranges() {
         assert_eq!(pattern_find(b"before ready> after", b"ready>", false), Some((7, 13)));
         assert_eq!(pattern_find(b"status=1234", br"status=\d+", true), Some((0, 11)));
         assert_eq!(pattern_find("界面 ready".as_bytes(), "界面".as_bytes(), false), Some((0, 6)));
+    }
+
+    #[test]
+    fn public_id_collision_is_detected_independently_of_internal_identity() {
+        let next_internal = ContextId::new(2);
+        assert!(ipc_id_in_use([41, next_internal.get()], next_internal.get()));
+        assert!(!ipc_id_in_use([41, 42], next_internal.get()));
+    }
+
+    #[test]
+    fn headless_target_fallback_requires_exactly_one_session() {
+        let first = ContextId::new(1);
+        let second = ContextId::new(2);
+        assert_eq!(headless_singleton_target(true, [first]), Some(first));
+        assert_eq!(headless_singleton_target(true, []), None);
+        assert_eq!(headless_singleton_target(true, [first, second]), None);
+        assert_eq!(headless_singleton_target(false, [first]), None);
     }
 }

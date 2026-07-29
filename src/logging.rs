@@ -12,12 +12,11 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 use std::{env, process};
 
-use log::{Level, LevelFilter};
-use winit::event_loop::EventLoopProxy;
-
 use crate::cli::Options;
 use crate::event::{Event, EventType};
 use crate::message_bar::{Message, MessageType};
+use crate::runtime::RuntimeProxy;
+use log::{Level, LevelFilter};
 
 /// Logging target for IPC config error messages.
 pub const LOG_TARGET_IPC_CONFIG: &str = "vivido_log_window_config";
@@ -59,7 +58,7 @@ const ALLOWED_TARGETS: &[&str] = &[
 /// Initialize the logger to its defaults.
 pub fn initialize(
     options: &Options,
-    event_proxy: EventLoopProxy<Event>,
+    event_proxy: RuntimeProxy,
 ) -> Result<Option<PathBuf>, log::SetLoggerError> {
     log::set_max_level(options.log_level());
 
@@ -73,12 +72,12 @@ pub fn initialize(
 pub struct Logger {
     logfile: Mutex<OnDemandLogFile>,
     stdout: Mutex<LineWriter<Stdout>>,
-    event_proxy: Mutex<EventLoopProxy<Event>>,
+    event_proxy: Mutex<RuntimeProxy>,
     start: Instant,
 }
 
 impl Logger {
-    fn new(event_proxy: EventLoopProxy<Event>) -> Self {
+    fn new(event_proxy: RuntimeProxy) -> Self {
         let logfile = Mutex::new(OnDemandLogFile::new());
         let stdout = Mutex::new(LineWriter::new(io::stdout()));
 

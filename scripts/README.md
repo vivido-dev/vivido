@@ -1,6 +1,18 @@
 Scripts
 =======
 
+## Linux headless Vivid smoke test
+
+Build Vivido and Vivi, start a display-independent Vulkan presenter, submit a generated image
+through the inherited Vivid endpoint, wait for presentation, and validate a fresh screenshot:
+
+```sh
+./headless-vivi-smoke.sh
+```
+
+The test requires Linux, a Vulkan adapter (Mesa lavapipe is sufficient), Python 3, and the normal
+Vivido/Vivi build dependencies. It never prints inherited Vivid endpoint credentials.
+
 ## Flamegraph
 
 Run the release version of Vivido while recording call stacks. After the

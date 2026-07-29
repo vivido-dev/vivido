@@ -16,7 +16,7 @@ use crate::terminal::tty::Options as PtyOptions;
 
 use crate::config::UiConfig;
 use crate::config::ui_config::Program;
-use crate::config::window::{Class, Identity};
+use crate::config::window::{Class, Dimensions, Identity};
 use crate::logging::LOG_TARGET_IPC_CONFIG;
 
 /// CLI options for the main Vivido executable.
@@ -58,6 +58,10 @@ pub struct Options {
     /// Do not spawn an initial window.
     #[clap(long)]
     pub daemon: bool,
+
+    /// Run terminal sessions with an offscreen renderer and no native windows.
+    #[clap(long)]
+    pub headless: bool,
 
     /// CLI options for config overrides.
     #[clap(skip)]
@@ -135,6 +139,25 @@ fn parse_class(input: &str) -> Result<Class, String> {
     };
 
     Ok(Class::new(general, instance))
+}
+
+/// Parse a terminal grid size in `COLUMNSxROWS` form.
+fn parse_dimensions(input: &str) -> Result<Dimensions, String> {
+    let Some((columns, lines)) = input.split_once(['x', 'X']) else {
+        return Err(String::from("dimensions must use COLUMNSxROWS form"));
+    };
+    let columns = columns
+        .parse::<usize>()
+        .map_err(|_| String::from("dimension columns must be an integer"))?;
+    let lines =
+        lines.parse::<usize>().map_err(|_| String::from("dimension rows must be an integer"))?;
+    if columns < 2 || lines < 1 {
+        return Err(String::from("dimensions must be at least 2x1"));
+    }
+    if columns > usize::from(u16::MAX) || lines > usize::from(u16::MAX) {
+        return Err(String::from("dimensions must not exceed 65535x65535"));
+    }
+    Ok(Dimensions { columns, lines })
 }
 
 /// Terminal specific cli options which can be passed to new windows via IPC.
@@ -254,7 +277,7 @@ pub enum SocketMessage {
     /// Read terminal text.
     GetText(IpcGetText),
 
-    /// Capture the last displayed terminal frame.
+    /// Capture a terminal frame as a private PNG.
     Screenshot(IpcScreenshot),
 
     /// Print supported automation methods, events, and limits.
@@ -284,6 +307,18 @@ pub enum SocketMessage {
     /// Inspect one terminal window.
     Inspect(IpcTarget),
 
+    /// List Vivid sources owned by one terminal.
+    VividSources(IpcTarget),
+
+    /// Inspect one Vivid source.
+    VividSourceStatus(IpcVividSource),
+
+    /// Inspect the retained Vivid scene for one session.
+    VividSceneStatus(IpcVividScene),
+
+    /// Inspect presentation milestones for one Vivid source.
+    VividMilestones(IpcVividSource),
+
     /// Read a structured terminal grid snapshot or delta.
     GetGrid(IpcGetGrid),
 
@@ -306,6 +341,10 @@ pub struct WindowOptions {
     #[cfg(unix)]
     #[clap(short = 'w', long = "window-id", value_name = "WINDOW_ID")]
     pub ipc_window_id: Option<u64>,
+
+    /// Initial terminal grid dimensions in columns by rows.
+    #[clap(long, value_name = "COLSxROWS", value_parser = parse_dimensions)]
+    pub dimensions: Option<Dimensions>,
 
     /// Terminal options which can be passed via IPC.
     #[clap(flatten)]
@@ -761,6 +800,69 @@ pub struct IpcWaitFrame {
     pub common: IpcWaitCommon,
 }
 
+/// Vivid source identification shared by inspection commands.
+#[cfg(unix)]
+#[derive(Args, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct IpcVividSource {
+    /// Vivid session ID.
+    #[clap(long)]
+    pub session_id: u64,
+
+    /// Producer-owned Vivid source ID.
+    #[clap(long)]
+    pub source_id: u64,
+
+    #[clap(flatten)]
+    #[serde(flatten)]
+    pub target: IpcTarget,
+}
+
+/// Vivid retained-scene inspection parameters.
+#[cfg(unix)]
+#[derive(Args, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct IpcVividScene {
+    /// Vivid session ID.
+    #[clap(long)]
+    pub session_id: u64,
+
+    /// Maximum number of nodes returned.
+    #[clap(long, default_value_t = 64, value_parser = clap::value_parser!(u64).range(1..=256))]
+    pub maximum_nodes: u64,
+
+    #[clap(flatten)]
+    #[serde(flatten)]
+    pub target: IpcTarget,
+}
+
+/// Wait for one Vivid source milestone.
+#[cfg(unix)]
+#[derive(Args, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct IpcWaitVividSource {
+    /// Vivid session ID.
+    #[clap(long)]
+    pub session_id: u64,
+
+    /// Producer-owned Vivid source ID.
+    #[clap(long)]
+    pub source_id: u64,
+
+    /// Vivid WAIT_SOURCE condition ID (1 through 9).
+    #[clap(long, value_parser = clap::value_parser!(u64).range(1..=9))]
+    pub condition: u64,
+
+    /// Required value for revision, raster-frame, and video-PTS conditions.
+    #[clap(long)]
+    pub value: Option<u64>,
+
+    /// Maximum wait (for example 500ms, 30s, 2m, or 1h).
+    #[clap(long, default_value = "30s", value_parser = parse_ipc_duration)]
+    pub timeout: u64,
+
+    #[clap(flatten)]
+    #[serde(flatten)]
+    pub target: IpcTarget,
+}
+
 /// Available wait conditions.
 #[cfg(unix)]
 #[derive(Subcommand, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -772,6 +874,7 @@ pub enum IpcWaitCondition {
     ScreenStable(IpcWaitStable),
     Frame(IpcWaitFrame),
     Exit(IpcWaitCommon),
+    VividSource(IpcWaitVividSource),
 }
 
 /// Parameters to the `wait` IPC subcommand.
@@ -1022,6 +1125,72 @@ mod tests {
             panic!("expected create-window message");
         };
         assert_eq!(window_options.ipc_window_id, Some(5678));
+    }
+
+    #[test]
+    fn parse_headless_dimensions_and_limits() {
+        let options =
+            Options::try_parse_from(["vivido", "--headless", "--daemon", "--dimensions", "120x40"])
+                .unwrap();
+        assert!(options.headless);
+        assert!(options.daemon);
+        assert_eq!(options.window_options.dimensions, Some(Dimensions { columns: 120, lines: 40 }));
+
+        assert!(Options::try_parse_from(["vivido", "--headless", "--dimensions", "1x24"]).is_err());
+        assert!(
+            Options::try_parse_from(["vivido", "--headless", "--dimensions", "80-by-24"]).is_err()
+        );
+        assert!(
+            Options::try_parse_from(["vivido", "--headless", "--dimensions", "65536x24"]).is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parse_headless_create_and_vivid_agent_commands() {
+        let options =
+            Options::try_parse_from(["vivido", "msg", "create-window", "--dimensions", "90x30"])
+                .unwrap();
+        let Some(Subcommands::Msg(message)) = options.subcommands else {
+            panic!("expected msg subcommand");
+        };
+        let SocketMessage::CreateWindow(window) = message.message else {
+            panic!("expected create-window message");
+        };
+        assert_eq!(window.dimensions, Some(Dimensions { columns: 90, lines: 30 }));
+
+        let options = Options::try_parse_from([
+            "vivido",
+            "msg",
+            "wait",
+            "vivid-source",
+            "--session-id",
+            "7",
+            "--source-id",
+            "11",
+            "--condition",
+            "2",
+            "--window-id",
+            "42",
+        ])
+        .unwrap();
+        let Some(Subcommands::Msg(message)) = options.subcommands else {
+            panic!("expected msg subcommand");
+        };
+        let SocketMessage::Wait(wait) = message.message else {
+            panic!("expected wait message");
+        };
+        let IpcWaitCondition::VividSource(wait) = wait.condition else {
+            panic!("expected Vivid source wait");
+        };
+        assert_eq!(wait.session_id, 7);
+        assert_eq!(wait.source_id, 11);
+        assert_eq!(wait.condition, 2);
+        assert_eq!(wait.target.window_id, Some(42));
+        let wire = serde_json::to_value(&wait).unwrap();
+        assert_eq!(wire["window_id"], 42);
+        assert_eq!(wire["timeout"], 30_000);
+        assert!(wire.get("target").is_none());
     }
 
     #[cfg(unix)]

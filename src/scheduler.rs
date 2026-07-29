@@ -3,21 +3,20 @@
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
-use winit::event_loop::EventLoopProxy;
-use winit::window::WindowId;
-
+use crate::context::ContextId;
 use crate::event::Event;
+use crate::runtime::RuntimeProxy;
 
 /// ID uniquely identifying a timer.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct TimerId {
     topic: Topic,
-    window_id: WindowId,
+    context_id: ContextId,
 }
 
 impl TimerId {
-    pub fn new(topic: Topic, window_id: WindowId) -> Self {
-        Self { topic, window_id }
+    pub fn new(topic: Topic, context_id: ContextId) -> Self {
+        Self { topic, context_id }
     }
 }
 
@@ -48,11 +47,11 @@ pub struct Timer {
 /// Scheduler tracking all pending timers.
 pub struct Scheduler {
     timers: VecDeque<Timer>,
-    event_proxy: EventLoopProxy<Event>,
+    event_proxy: RuntimeProxy,
 }
 
 impl Scheduler {
-    pub fn new(event_proxy: EventLoopProxy<Event>) -> Self {
+    pub fn new(event_proxy: RuntimeProxy) -> Self {
         Self { timers: VecDeque::new(), event_proxy }
     }
 
@@ -109,7 +108,42 @@ impl Scheduler {
     ///
     /// This must be called when a window is removed to ensure that timers on intervals do not
     /// stick around forever and cause a memory leak.
-    pub fn unschedule_window(&mut self, window_id: WindowId) {
-        self.timers.retain(|timer| timer.id.window_id != window_id);
+    pub fn unschedule_window(&mut self, context_id: ContextId) {
+        self.timers.retain(|timer| timer.id.context_id != context_id);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Scheduler, TimerId, Topic};
+    use crate::context::ContextId;
+    use crate::event::{Event, EventType};
+    use crate::runtime::RuntimeProxy;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    #[test]
+    fn timers_are_ordered_and_removed_by_internal_context() {
+        let (sender, _receiver) = mpsc::channel();
+        let mut scheduler = Scheduler::new(RuntimeProxy::Headless(sender));
+        let first = ContextId::new(1);
+        let second = ContextId::new(2);
+
+        scheduler.schedule(
+            Event::new(EventType::Frame, first),
+            Duration::from_secs(2),
+            false,
+            TimerId::new(Topic::Frame, first),
+        );
+        scheduler.schedule(
+            Event::new(EventType::Frame, second),
+            Duration::from_secs(1),
+            false,
+            TimerId::new(Topic::Frame, second),
+        );
+
+        assert_eq!(scheduler.timers.front().unwrap().id.context_id, second);
+        scheduler.unschedule_window(second);
+        assert_eq!(scheduler.timers.front().unwrap().id.context_id, first);
     }
 }

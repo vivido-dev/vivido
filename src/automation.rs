@@ -252,6 +252,7 @@ pub enum WaitKind {
         width: u32,
         height: u32,
         after_resize: u64,
+        after_frame: Option<u64>,
         pty_token: Option<u64>,
         pty_complete: bool,
     },

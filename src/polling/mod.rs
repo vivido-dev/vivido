@@ -5,17 +5,15 @@ use std::io::Error as IoError;
 use std::path::PathBuf;
 use std::process;
 
+use crate::terminal::thread;
 use log::error;
 use std::result::Result;
-use winit::event_loop::EventLoopProxy;
-
-use crate::terminal::thread;
 
 use crate::UiConfig;
 use crate::cli::Options;
-use crate::event::Event;
 use crate::polling::ipc::IpcListener;
 use crate::polling::signal::SignalListener;
+use crate::runtime::RuntimeProxy;
 
 pub mod ipc;
 mod signal;
@@ -39,7 +37,7 @@ impl IoListener {
     pub fn spawn(
         config: &UiConfig,
         options: &Options,
-        event_proxy: EventLoopProxy<Event>,
+        event_proxy: RuntimeProxy,
     ) -> Result<IoListenerHandle, IoError> {
         let poller = Poller::new()?;
         let events = Events::new();

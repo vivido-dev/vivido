@@ -27,6 +27,8 @@ Window-targeted CLI commands resolve their target in this order:
 2. inherited `VIVIDO_WINDOW_ID`;
 3. the currently focused Vivido window.
 
+In a headless process, step 3 selects the only live session. With zero or multiple live sessions it
+returns `no_focused_window`, so callers must discover IDs with `list-windows` and target explicitly.
 Use `list-windows` when a caller did not inherit the per-window environment. An explicit missing ID
 returns `window_not_found`; a command requiring the focused fallback returns `no_focused_window`
 when no Vivido window is focused. `subscribe --all` intentionally bypasses target resolution.
@@ -98,8 +100,10 @@ physical modifiers pressed.
 - `ping {}`: wire-only liveness request; returns `{"pong":true}`.
 - `create_window`: synchronously constructs a complete window and returns `{"window_id":ID}`.
   The CLI is `vivido msg create-window` with its existing window, command, directory, hold, title,
-  class, and config options. `ipc_window_id` is optional and must be unique. The response does not
-  wait for the first rendered frame.
+  class, config, and `--dimensions COLSxROWS` options. `ipc_window_id` is optional and must be
+  unique. In a headless daemon this creates an offscreen session; if no compatible Vulkan adapter
+  exists it returns `unsupported` and leaves the daemon alive. The response does not wait for the
+  first rendered frame.
 - `config` and `get_config`: back the existing `config` and `get-config` commands. Configuration
   updates now always receive a correlated response. The special config ID `-1` means all/global.
 - `typing {"text":"...","window_id":ID}`: writes literal UTF-8 bytes without paste handling or an
@@ -110,12 +114,13 @@ physical modifiers pressed.
   physical rows at the live bottom, including scrollback. The CLI writes text exactly, without an
   added newline. Styling, cursor, media, search, and message overlays are excluded.
 - `screenshot {"window_id":ID}`: returns `{"path":"/absolute/private/file.png"}`. The CLI prints
-  the path plus a newline. The PNG is the last successfully presented client-area frame at physical
-  resolution and includes terminal rendering, cursor, selection, Vivido overlays, and Vivid media.
-  It excludes OS decorations and desktop content. Straight alpha is preserved. The persistent temp
-  file has mode `0600`; its caller owns cleanup. A resize invalidates the stored frame until another
-  frame is presented. Only one readback per window may run at once and raw allocation is capped at
-  256 MiB.
+  the path plus a newline. For a native window, the PNG is the last successfully presented
+  client-area frame. For a headless session, Vivido first drains already queued runtime events,
+  forces a newly composed offscreen frame, and replies only after GPU rendering and readback
+  complete. It includes terminal rendering, cursor, selection, Vivido overlays, and Vivid media,
+  but excludes OS decorations and desktop content. Straight alpha is preserved. The persistent
+  temp file has mode `0600`; its caller owns cleanup. Only one serialized render/readback per
+  window may run at once and raw allocation is capped at 256 MiB.
 
 ### Mode-aware input and process control
 
@@ -138,12 +143,15 @@ physical modifiers pressed.
 - `resize {"columns":C,"rows":R,"width":null,"height":null,"target":{...}}` requests exact grid
   dimensions; replace the grid pair with `width`/`height` for exact physical client pixels. Grid
   size is at least 2 by 1 and must fit renderer and PTY limits. Only one resize per window is active.
-  Success waits for both the OS size and terminal/PTY size; failure after five seconds is
-  `resize_mismatch` with requested/actual details where available.
+  Native success waits for both the OS size and terminal/PTY size. Headless success waits for the
+  logical viewport, render texture, terminal grid, PTY acknowledgement, Vivid display metrics, and
+  first newly sized frame. Failure after five seconds is `resize_mismatch` with requested/actual
+  details where available.
 - `focus {"window_id":ID}` requests real operating-system activation. It succeeds only after an
   actual focused event and otherwise returns `focus_denied` after two seconds. Vivido never
-  synthesizes terminal focus state. On Wayland, the request uses `xdg_activation_v1` to obtain and
-  apply a compositor-approved client activation token when that protocol is available.
+  synthesizes terminal focus state. Headless sessions return `unsupported`. On Wayland, the request
+  uses `xdg_activation_v1` to obtain and apply a compositor-approved client activation token when
+  that protocol is available.
 - `signal {"signal":"INT","target":{...}}` accepts `INT`, `TERM`, `HUP`, `QUIT`, `TSTP`, `CONT`,
   `WINCH`, `KILL`, and `STOP`. It sends only the explicitly named signal to the current foreground
   process group, falling back to the PTY child group. KILL and STOP have no implicit aliases.
@@ -151,13 +159,28 @@ physical modifiers pressed.
 ### Discovery and inspection
 
 - `list_windows {}` returns `{"windows":[...]}` sorted by monotonic `creation_index`. Each entry
-  contains window ID, title, focus/occlusion/hold state, grid/pixel dimensions, process state, and
-  current screen/frame/output sequences.
+  contains window ID, `headless`, title, focus/occlusion/hold state, grid/pixel dimensions, process
+  state, and current screen/frame/output sequences.
 - `inspect {"window_id":ID}` returns the list entry plus cell dimensions, scale, scrollback,
   display offset, primary/alternate screen, terminal mode names, cursor, selection, shell PID,
   foreground process group, optional executable basename/current directory, echo state, exit
   status, global event sequence, and effective automation limits. It never returns process
   arguments, environment values, Vivid tokens, tickets, authenticators, or derived capabilities.
+
+### Vivid inspection and waits
+
+- `vivid_sources` / `vivido msg vivid-sources` lists owner-scoped sources and their session IDs.
+- `vivid_source_status` / `vivid-source-status` and `vivid_milestones` / `vivid-milestones` accept
+  `--session-id`, `--source-id`, and an optional window target.
+- `vivid_scene_status` / `vivid-scene-status` accepts `--session-id`, `--maximum-nodes`, and a
+  target, returning bounded retained-scene state.
+- `wait_vivid_source` / `vivido msg wait vivid-source` accepts the same source identity,
+  `--condition 1..9`, an optional `--value`, and a timeout. Conditions are source revision, first
+  visible presentation, raster frame, video PTS, playback started, playback ended, media attached,
+  media closed, and source lost. Conditions 1, 3, and 4 require a value.
+
+All source operations use the complete session/source identity. They do not expose Vivid endpoint
+tokens, tickets, authenticators, or derived capability material.
 
 ### Structured grid
 
@@ -194,7 +217,7 @@ a monotonic `event_sequence`.
 - Screen sequence changes represent the visible terminal model: physical rows, cursor, selection,
   dimensions, display offset, screen, and terminal input modes. Cursor blink phase, visual-bell
   animation, search/message overlays, and Vivid media do not increment it.
-- Frame sequence increments only after successful surface acquisition, rendering, and presentation.
+- Frame sequence increments only after successful native presentation or offscreen GPU submission.
 - Output offset counts retained sanitized PTY bytes before ring eviction; it never resets.
 - Event sequence orders replayable automation events across all windows.
 
@@ -213,6 +236,8 @@ through 24 hours. CLI duration values accept bare milliseconds or `ms`, `s`, `m`
 - `wait_frame`: params are `after_frame` and `common`; omitted means the next presented frame.
 - `wait_exit`: params are `timeout` and `target`. Held windows with retained status return
   immediately; unheld windows complete from child exit before removal.
+- `wait_vivid_source`: params are `window_id`, `session_id`, `source_id`, `condition`, optional
+  `value`, and `timeout`; it observes only normal composed-frame presentation milestones.
 
 Regex patterns are limited to 8 KiB and use linear-time matching. Disconnecting cancels waits,
 pending tagged input, resize/focus requests, and subscriptions immediately.

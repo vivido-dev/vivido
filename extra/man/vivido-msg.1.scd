@@ -26,7 +26,9 @@ source distribution for the complete wire contract and JSON schemas.
 
 Targeted commands use an explicit _--window-id_, then _$VIVIDO_WINDOW_ID_, then
 the currently focused Vivido window. Use *list-windows* when these environment
-variables were not inherited. Missing and unfocused targets return errors.
+variables were not inherited. In a headless process, the final fallback selects
+the only live session; zero or multiple sessions require an explicit ID. Missing
+and ambiguous targets return errors.
 
 # MESSAGES
 
@@ -44,6 +46,11 @@ variables were not inherited. Missing and unfocused targets return errors.
 
 			Assign a stable IPC ID to the new window. The ID must be unique within
 			the Vivido process and is exported to its PTY as _$VIVIDO_WINDOW_ID_.
+
+		*--dimensions* _<COLSxROWS>_
+
+			Set the initial grid dimensions, at least _2x1_. This also applies when
+			the owning Vivido process is headless.
 
 		*--working-directory* _<WORKING_DIRECTORY>_
 
@@ -177,13 +184,15 @@ variables were not inherited. Missing and unfocused targets return errors.
 *resize*
 
 	Request either exact grid dimensions with _--columns/--rows_ or exact physical
-	client pixels with _--width/--height_. Success waits for the OS and PTY resize;
-	the operation fails after five seconds if the actual size does not match.
+	client pixels with _--width/--height_. Native success waits for the OS and PTY
+	resize. Headless success also waits for the resized render texture and first
+	newly sized frame. The operation fails after five seconds if sizes do not match.
 
 *focus*
 
 	Request real operating-system focus. Success requires a real focused event
-	within two seconds; Vivido never synthesizes terminal focus state.
+	within two seconds; Vivido never synthesizes terminal focus state. Headless
+	sessions return _unsupported_.
 
 *signal* _INT|TERM|HUP|QUIT|TSTP|CONT|WINCH|KILL|STOP_
 
@@ -193,7 +202,7 @@ variables were not inherited. Missing and unfocused targets return errors.
 *list-windows*
 
 	Print deterministic JSON window discovery data including titles, focus/hold/
-	occlusion state, dimensions, process state, and automation sequences.
+	occlusion/headless state, dimensions, process state, and automation sequences.
 
 *inspect*
 
@@ -201,6 +210,20 @@ variables were not inherited. Missing and unfocused targets return errors.
 	screen and terminal modes, cursor/selection, process metadata, exit state, and
 	automation limits. Process arguments, environments, and Vivid credentials are
 	never returned.
+
+*vivid-sources*
+
+	List owner-scoped Vivid sources and session IDs for one terminal.
+
+*vivid-source-status*, *vivid-milestones*
+
+	Inspect one source with _--session-id_, _--source-id_, and optional
+	_--window-id_.
+
+*vivid-scene-status*
+
+	Inspect bounded retained-scene state with _--session-id_,
+	_--maximum-nodes_, and optional _--window-id_.
 
 *get-grid*
 
@@ -242,6 +265,13 @@ variables were not inherited. Missing and unfocused targets return errors.
 
 	Wait for the terminal child exit status. Held windows return retained status
 	immediately.
+
+*wait vivid-source*
+
+	Wait for an owner-scoped Vivid milestone with _--session-id_, _--source-id_,
+	_--condition 1..9_, optional _--value_, _--timeout_, and _--window-id_.
+	Condition 2 is first visible presentation. Conditions 1, 3, and 4 require a
+	value.
 
 	All waits accept _--timeout DURATION_ and _--window-id_. Timeout defaults to
 	_30s_ and accepts _1ms_ through _24h_.
@@ -287,9 +317,11 @@ variables were not inherited. Missing and unfocused targets return errors.
 
 *screenshot*
 
-	Capture the last successfully displayed Vivido client-area frame and write it
-	to a private temporary PNG. The returned absolute filename is written to
-	standard output. The caller is responsible for deleting the file.
+	Capture a Vivido client-area frame and write it to a private temporary PNG.
+	Native windows use the last successfully displayed frame. Headless sessions
+	drain queued runtime events and force a fresh composed frame before GPU
+	readback. The returned absolute filename is written to standard output. The
+	caller is responsible for deleting the file.
 
 	The PNG includes terminal rendering, cursor, selection, overlays, and Vivid
 	media. It preserves transparency and excludes operating-system window

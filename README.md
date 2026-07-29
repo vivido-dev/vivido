@@ -52,6 +52,38 @@ sanitized PTY transcripts, and replayable event subscriptions. Start with
 `vivido msg capabilities` and `vivido msg list-windows`. The complete CLI and JSON wire contract is
 documented in [Agent automation IPC](docs/ipc.md).
 
+### Linux headless automation
+
+`vivido --headless` creates PTY-backed terminal sessions without connecting to Wayland or creating
+OS windows. It uses an offscreen Vulkan renderer and a silent 48 kHz stereo audio clock, so
+terminal rendering, Vivid images/video, linked audio/video timing, waits, and screenshots follow
+the normal presenter path. A Vulkan adapter is required; CI machines without hardware Vulkan
+should install Mesa lavapipe.
+
+An agent can use a private explicit socket and deterministic grid:
+
+```sh
+socket="${TMPDIR:-/tmp}/vivido-agent-$$.sock"
+vivido --headless --daemon --socket "$socket" &
+vivido_pid=$!
+
+window_id=$(vivido msg --socket "$socket" create-window --dimensions 100x30)
+vivido msg --socket "$socket" typing --window-id "$window_id" 'printf "ready\n"'
+vivido msg --socket "$socket" key --window-id "$window_id" Enter
+vivido msg --socket "$socket" wait text --window-id "$window_id" ready
+vivido msg --socket "$socket" inspect --window-id "$window_id"
+png=$(vivido msg --socket "$socket" screenshot --window-id "$window_id")
+
+kill "$vivido_pid"
+wait "$vivido_pid" || true
+rm -f "$socket" "$png"
+```
+
+Without `--daemon`, one initial session is created. In a headless process, commands may omit
+`--window-id` only when exactly one session is live. `--dimensions` takes precedence over
+configured `window.dimensions`; the deterministic headless fallback is 80x24. Headless screenshots
+force a newly composed frame and complete only after GPU readback.
+
 ## Compatibility
 
 Vivido continues to use the `vivido` terminfo entry when it is installed, falling back to

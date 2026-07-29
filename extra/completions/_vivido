@@ -19,6 +19,7 @@ _vivido() {
 '--socket=[Path for IPC socket creation]:SOCKET:_files' \
 '-w+[Stable IPC ID assigned to this window]:WINDOW_ID:_default' \
 '--window-id=[Stable IPC ID assigned to this window]:WINDOW_ID:_default' \
+'--dimensions=[Initial terminal grid dimensions in columns by rows]:COLSxROWS:_default' \
 '--working-directory=[Start the shell in the specified working directory]:WORKING_DIRECTORY:_files' \
 '*-e+[Command and args to execute (must be last argument)]:COMMAND:_default' \
 '*--command=[Command and args to execute (must be last argument)]:COMMAND:_default' \
@@ -32,6 +33,7 @@ _vivido() {
 '(-v)*-q[Reduces the level of verbosity (the min level is -qq)]' \
 '(-q)*-v[Increases the level of verbosity (the max level is -vvv)]' \
 '--daemon[Do not spawn an initial window]' \
+'--headless[Run terminal sessions with an offscreen renderer and no native windows]' \
 '--hold[Remain open after child process exit]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
@@ -66,6 +68,7 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 '-w+[Stable IPC ID assigned to this window]:WINDOW_ID:_default' \
 '--window-id=[Stable IPC ID assigned to this window]:WINDOW_ID:_default' \
+'--dimensions=[Initial terminal grid dimensions in columns by rows]:COLSxROWS:_default' \
 '--working-directory=[Start the shell in the specified working directory]:WORKING_DIRECTORY:_files' \
 '*-e+[Command and args to execute (must be last argument)]:COMMAND:_default' \
 '*--command=[Command and args to execute (must be last argument)]:COMMAND:_default' \
@@ -375,6 +378,44 @@ _arguments "${_arguments_options[@]}" : \
 '--help[Print help]' \
 && ret=0
 ;;
+(vivid-sources)
+_arguments "${_arguments_options[@]}" : \
+'-w+[Window ID. The focused window is used when this is omitted]:WINDOW_ID:_default' \
+'--window-id=[Window ID. The focused window is used when this is omitted]:WINDOW_ID:_default' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(vivid-source-status)
+_arguments "${_arguments_options[@]}" : \
+'--session-id=[Vivid session ID]:SESSION_ID:_default' \
+'--source-id=[Producer-owned Vivid source ID]:SOURCE_ID:_default' \
+'-w+[Window ID. The focused window is used when this is omitted]:WINDOW_ID:_default' \
+'--window-id=[Window ID. The focused window is used when this is omitted]:WINDOW_ID:_default' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(vivid-scene-status)
+_arguments "${_arguments_options[@]}" : \
+'--session-id=[Vivid session ID]:SESSION_ID:_default' \
+'--maximum-nodes=[Maximum number of nodes returned]:MAXIMUM_NODES:_default' \
+'-w+[Window ID. The focused window is used when this is omitted]:WINDOW_ID:_default' \
+'--window-id=[Window ID. The focused window is used when this is omitted]:WINDOW_ID:_default' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(vivid-milestones)
+_arguments "${_arguments_options[@]}" : \
+'--session-id=[Vivid session ID]:SESSION_ID:_default' \
+'--source-id=[Producer-owned Vivid source ID]:SOURCE_ID:_default' \
+'-w+[Window ID. The focused window is used when this is omitted]:WINDOW_ID:_default' \
+'--window-id=[Window ID. The focused window is used when this is omitted]:WINDOW_ID:_default' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
 (get-grid)
 _arguments "${_arguments_options[@]}" : \
 '(--since-screen)--start-line=[First signed physical grid line in retained scrollback/live-screen coordinates]:START_LINE:_default' \
@@ -465,6 +506,19 @@ _arguments "${_arguments_options[@]}" : \
 '--help[Print help]' \
 && ret=0
 ;;
+(vivid-source)
+_arguments "${_arguments_options[@]}" : \
+'--session-id=[Vivid session ID]:SESSION_ID:_default' \
+'--source-id=[Producer-owned Vivid source ID]:SOURCE_ID:_default' \
+'--condition=[Vivid WAIT_SOURCE condition ID (1 through 9)]:CONDITION:_default' \
+'--value=[Required value for revision, raster-frame, and video-PTS conditions]:VALUE:_default' \
+'--timeout=[Maximum wait (for example 500ms, 30s, 2m, or 1h)]:TIMEOUT:_default' \
+'-w+[Window ID. The focused window is used when this is omitted]:WINDOW_ID:_default' \
+'--window-id=[Window ID. The focused window is used when this is omitted]:WINDOW_ID:_default' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
 (help)
 _arguments "${_arguments_options[@]}" : \
 ":: :_vivido__msg__wait__help_commands" \
@@ -498,6 +552,10 @@ _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
 (exit)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(vivid-source)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
@@ -647,6 +705,22 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
+(vivid-sources)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(vivid-source-status)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(vivid-scene-status)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(vivid-milestones)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
 (get-grid)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
@@ -684,6 +758,10 @@ _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
 (exit)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(vivid-source)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
@@ -835,6 +913,22 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
+(vivid-sources)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(vivid-source-status)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(vivid-scene-status)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(vivid-milestones)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
 (get-grid)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
@@ -872,6 +966,10 @@ _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
 (exit)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(vivid-source)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
@@ -933,7 +1031,7 @@ _vivido__help__msg_commands() {
 'get-config:Read runtime Vivido configuration' \
 'typing:Type literal text into a terminal' \
 'get-text:Read terminal text' \
-'screenshot:Capture the last displayed terminal frame' \
+'screenshot:Capture a terminal frame as a private PNG' \
 'capabilities:Print supported automation methods, events, and limits' \
 'key:Send one mode-aware key to a terminal' \
 'paste:Paste literal text into a terminal' \
@@ -943,6 +1041,10 @@ _vivido__help__msg_commands() {
 'signal:Send an explicit signal to the foreground process group' \
 'list-windows:List all windows in deterministic creation order' \
 'inspect:Inspect one terminal window' \
+'vivid-sources:List Vivid sources owned by one terminal' \
+'vivid-source-status:Inspect one Vivid source' \
+'vivid-scene-status:Inspect the retained Vivid scene for one session' \
+'vivid-milestones:Inspect presentation milestones for one Vivid source' \
 'get-grid:Read a structured terminal grid snapshot or delta' \
 'wait:Wait for terminal state or output' \
 'transcript:Read retained sanitized PTY output' \
@@ -1083,6 +1185,26 @@ _vivido__help__msg__typing_commands() {
     local commands; commands=()
     _describe -t commands 'vivido help msg typing commands' commands "$@"
 }
+(( $+functions[_vivido__help__msg__vivid-milestones_commands] )) ||
+_vivido__help__msg__vivid-milestones_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido help msg vivid-milestones commands' commands "$@"
+}
+(( $+functions[_vivido__help__msg__vivid-scene-status_commands] )) ||
+_vivido__help__msg__vivid-scene-status_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido help msg vivid-scene-status commands' commands "$@"
+}
+(( $+functions[_vivido__help__msg__vivid-source-status_commands] )) ||
+_vivido__help__msg__vivid-source-status_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido help msg vivid-source-status commands' commands "$@"
+}
+(( $+functions[_vivido__help__msg__vivid-sources_commands] )) ||
+_vivido__help__msg__vivid-sources_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido help msg vivid-sources commands' commands "$@"
+}
 (( $+functions[_vivido__help__msg__wait_commands] )) ||
 _vivido__help__msg__wait_commands() {
     local commands; commands=(
@@ -1092,6 +1214,7 @@ _vivido__help__msg__wait_commands() {
 'screen-stable:Screen stability wait parameters' \
 'frame:Frame wait parameters' \
 'exit:Common timeout for wait commands, represented as milliseconds on the wire' \
+'vivid-source:Wait for one Vivid source milestone' \
     )
     _describe -t commands 'vivido help msg wait commands' commands "$@"
 }
@@ -1125,6 +1248,11 @@ _vivido__help__msg__wait__text_commands() {
     local commands; commands=()
     _describe -t commands 'vivido help msg wait text commands' commands "$@"
 }
+(( $+functions[_vivido__help__msg__wait__vivid-source_commands] )) ||
+_vivido__help__msg__wait__vivid-source_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido help msg wait vivid-source commands' commands "$@"
+}
 (( $+functions[_vivido__msg_commands] )) ||
 _vivido__msg_commands() {
     local commands; commands=(
@@ -1133,7 +1261,7 @@ _vivido__msg_commands() {
 'get-config:Read runtime Vivido configuration' \
 'typing:Type literal text into a terminal' \
 'get-text:Read terminal text' \
-'screenshot:Capture the last displayed terminal frame' \
+'screenshot:Capture a terminal frame as a private PNG' \
 'capabilities:Print supported automation methods, events, and limits' \
 'key:Send one mode-aware key to a terminal' \
 'paste:Paste literal text into a terminal' \
@@ -1143,6 +1271,10 @@ _vivido__msg_commands() {
 'signal:Send an explicit signal to the foreground process group' \
 'list-windows:List all windows in deterministic creation order' \
 'inspect:Inspect one terminal window' \
+'vivid-sources:List Vivid sources owned by one terminal' \
+'vivid-source-status:Inspect one Vivid source' \
+'vivid-scene-status:Inspect the retained Vivid scene for one session' \
+'vivid-milestones:Inspect presentation milestones for one Vivid source' \
 'get-grid:Read a structured terminal grid snapshot or delta' \
 'wait:Wait for terminal state or output' \
 'transcript:Read retained sanitized PTY output' \
@@ -1194,7 +1326,7 @@ _vivido__msg__help_commands() {
 'get-config:Read runtime Vivido configuration' \
 'typing:Type literal text into a terminal' \
 'get-text:Read terminal text' \
-'screenshot:Capture the last displayed terminal frame' \
+'screenshot:Capture a terminal frame as a private PNG' \
 'capabilities:Print supported automation methods, events, and limits' \
 'key:Send one mode-aware key to a terminal' \
 'paste:Paste literal text into a terminal' \
@@ -1204,6 +1336,10 @@ _vivido__msg__help_commands() {
 'signal:Send an explicit signal to the foreground process group' \
 'list-windows:List all windows in deterministic creation order' \
 'inspect:Inspect one terminal window' \
+'vivid-sources:List Vivid sources owned by one terminal' \
+'vivid-source-status:Inspect one Vivid source' \
+'vivid-scene-status:Inspect the retained Vivid scene for one session' \
+'vivid-milestones:Inspect presentation milestones for one Vivid source' \
 'get-grid:Read a structured terminal grid snapshot or delta' \
 'wait:Wait for terminal state or output' \
 'transcript:Read retained sanitized PTY output' \
@@ -1350,6 +1486,26 @@ _vivido__msg__help__typing_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg help typing commands' commands "$@"
 }
+(( $+functions[_vivido__msg__help__vivid-milestones_commands] )) ||
+_vivido__msg__help__vivid-milestones_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg help vivid-milestones commands' commands "$@"
+}
+(( $+functions[_vivido__msg__help__vivid-scene-status_commands] )) ||
+_vivido__msg__help__vivid-scene-status_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg help vivid-scene-status commands' commands "$@"
+}
+(( $+functions[_vivido__msg__help__vivid-source-status_commands] )) ||
+_vivido__msg__help__vivid-source-status_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg help vivid-source-status commands' commands "$@"
+}
+(( $+functions[_vivido__msg__help__vivid-sources_commands] )) ||
+_vivido__msg__help__vivid-sources_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg help vivid-sources commands' commands "$@"
+}
 (( $+functions[_vivido__msg__help__wait_commands] )) ||
 _vivido__msg__help__wait_commands() {
     local commands; commands=(
@@ -1359,6 +1515,7 @@ _vivido__msg__help__wait_commands() {
 'screen-stable:Screen stability wait parameters' \
 'frame:Frame wait parameters' \
 'exit:Common timeout for wait commands, represented as milliseconds on the wire' \
+'vivid-source:Wait for one Vivid source milestone' \
     )
     _describe -t commands 'vivido msg help wait commands' commands "$@"
 }
@@ -1391,6 +1548,11 @@ _vivido__msg__help__wait__screen-stable_commands() {
 _vivido__msg__help__wait__text_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg help wait text commands' commands "$@"
+}
+(( $+functions[_vivido__msg__help__wait__vivid-source_commands] )) ||
+_vivido__msg__help__wait__vivid-source_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg help wait vivid-source commands' commands "$@"
 }
 (( $+functions[_vivido__msg__inspect_commands] )) ||
 _vivido__msg__inspect_commands() {
@@ -1545,6 +1707,26 @@ _vivido__msg__typing_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg typing commands' commands "$@"
 }
+(( $+functions[_vivido__msg__vivid-milestones_commands] )) ||
+_vivido__msg__vivid-milestones_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg vivid-milestones commands' commands "$@"
+}
+(( $+functions[_vivido__msg__vivid-scene-status_commands] )) ||
+_vivido__msg__vivid-scene-status_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg vivid-scene-status commands' commands "$@"
+}
+(( $+functions[_vivido__msg__vivid-source-status_commands] )) ||
+_vivido__msg__vivid-source-status_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg vivid-source-status commands' commands "$@"
+}
+(( $+functions[_vivido__msg__vivid-sources_commands] )) ||
+_vivido__msg__vivid-sources_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg vivid-sources commands' commands "$@"
+}
 (( $+functions[_vivido__msg__wait_commands] )) ||
 _vivido__msg__wait_commands() {
     local commands; commands=(
@@ -1554,6 +1736,7 @@ _vivido__msg__wait_commands() {
 'screen-stable:Screen stability wait parameters' \
 'frame:Frame wait parameters' \
 'exit:Common timeout for wait commands, represented as milliseconds on the wire' \
+'vivid-source:Wait for one Vivid source milestone' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'vivido msg wait commands' commands "$@"
@@ -1577,6 +1760,7 @@ _vivido__msg__wait__help_commands() {
 'screen-stable:Screen stability wait parameters' \
 'frame:Frame wait parameters' \
 'exit:Common timeout for wait commands, represented as milliseconds on the wire' \
+'vivid-source:Wait for one Vivid source milestone' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'vivido msg wait help commands' commands "$@"
@@ -1616,6 +1800,11 @@ _vivido__msg__wait__help__text_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg wait help text commands' commands "$@"
 }
+(( $+functions[_vivido__msg__wait__help__vivid-source_commands] )) ||
+_vivido__msg__wait__help__vivid-source_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg wait help vivid-source commands' commands "$@"
+}
 (( $+functions[_vivido__msg__wait__output_commands] )) ||
 _vivido__msg__wait__output_commands() {
     local commands; commands=()
@@ -1635,6 +1824,11 @@ _vivido__msg__wait__screen-stable_commands() {
 _vivido__msg__wait__text_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg wait text commands' commands "$@"
+}
+(( $+functions[_vivido__msg__wait__vivid-source_commands] )) ||
+_vivido__msg__wait__vivid-source_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg wait vivid-source commands' commands "$@"
 }
 
 if [ "$funcstack[1]" = "_vivido" ]; then

@@ -29,8 +29,7 @@ use winit::dpi::PhysicalPosition;
 #[cfg(unix)]
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, TouchPhase};
 use winit::event::{Event as WinitEvent, Modifiers, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, EventLoopProxy};
-use winit::window::WindowId;
+use winit::event_loop::ActiveEventLoop;
 
 use crate::terminal::event::Event as TerminalEvent;
 #[cfg(unix)]
@@ -62,6 +61,7 @@ use crate::cli::{
 use crate::cli::{ParsedOptions, WindowOptions};
 use crate::clipboard::Clipboard;
 use crate::config::UiConfig;
+use crate::context::ContextId;
 use crate::display::Display;
 #[cfg(unix)]
 use crate::display::ScreenshotReadback;
@@ -75,6 +75,7 @@ use crate::logging::LOG_TARGET_IPC_CONFIG;
 use crate::message_bar::MessageBuffer;
 #[cfg(unix)]
 use crate::polling::ipc::{IpcConnection, IpcError};
+use crate::runtime::RuntimeProxy;
 use crate::scheduler::{Scheduler, TimerId, Topic};
 #[cfg(unix)]
 use crate::screenshot;
@@ -131,6 +132,7 @@ pub struct WindowContext {
     config: Rc<UiConfig>,
     vivid_service: VividService,
     vivid_resize_settled: Option<u64>,
+    context_id: ContextId,
     #[cfg(unix)]
     ipc_window_id: u64,
     #[cfg(unix)]
@@ -143,7 +145,8 @@ pub struct WindowContext {
 
 #[cfg(unix)]
 struct PendingScreenshot {
-    readback: ScreenshotReadback,
+    readback: Option<ScreenshotReadback>,
+    started: Instant,
     connection: IpcConnection,
     request_id: u64,
 }
@@ -155,26 +158,55 @@ const SCREENSHOT_POLL_INTERVAL: Duration = Duration::from_millis(5);
 const SCREENSHOT_READBACK_TIMEOUT: Duration = Duration::from_secs(5);
 
 impl WindowContext {
+    /// Create an initial headless terminal context.
+    pub fn initial_headless(
+        proxy: RuntimeProxy,
+        context_id: ContextId,
+        config: Rc<UiConfig>,
+        options: WindowOptions,
+    ) -> Result<Self, Box<dyn Error>> {
+        let mut identity = config.window.identity.clone();
+        options.window_identity.override_identity_config(&mut identity);
+        let window = Window::headless(&identity, &options, context_id);
+        let display = Display::new(window, &config, false, options.dimensions)?;
+        Self::new(display, config, options, proxy, context_id)
+    }
+
+    /// Create an additional headless terminal context.
+    pub fn additional_headless(
+        proxy: RuntimeProxy,
+        context_id: ContextId,
+        config: Rc<UiConfig>,
+        options: WindowOptions,
+        config_overrides: ParsedOptions,
+    ) -> Result<Self, Box<dyn Error>> {
+        let mut context = Self::initial_headless(proxy, context_id, config, options)?;
+        context.window_config = config_overrides;
+        Ok(context)
+    }
+
     /// Create initial window context.
     pub fn initial(
         event_loop: &ActiveEventLoop,
-        proxy: EventLoopProxy<Event>,
+        proxy: RuntimeProxy,
+        context_id: ContextId,
         config: Rc<UiConfig>,
         mut options: WindowOptions,
     ) -> Result<Self, Box<dyn Error>> {
         let mut identity = config.window.identity.clone();
         options.window_identity.override_identity_config(&mut identity);
 
-        let window = Window::new(event_loop, &config, &identity, &mut options)?;
-        let display = Display::new(window, &config, false)?;
+        let window = Window::new(event_loop, &config, &identity, &mut options, context_id)?;
+        let display = Display::new(window, &config, false, options.dimensions)?;
 
-        Self::new(display, config, options, proxy)
+        Self::new(display, config, options, proxy, context_id)
     }
 
     /// Create additional context.
     pub fn additional(
         event_loop: &ActiveEventLoop,
-        proxy: EventLoopProxy<Event>,
+        proxy: RuntimeProxy,
+        context_id: ContextId,
         config: Rc<UiConfig>,
         mut options: WindowOptions,
         config_overrides: ParsedOptions,
@@ -189,10 +221,10 @@ impl WindowContext {
         #[cfg(not(target_os = "macos"))]
         let tabbed = false;
 
-        let window = Window::new(event_loop, &config, &identity, &mut options)?;
-        let display = Display::new(window, &config, tabbed)?;
+        let window = Window::new(event_loop, &config, &identity, &mut options, context_id)?;
+        let display = Display::new(window, &config, tabbed, options.dimensions)?;
 
-        let mut window_context = Self::new(display, config, options, proxy)?;
+        let mut window_context = Self::new(display, config, options, proxy, context_id)?;
 
         // Set the config overrides at startup.
         //
@@ -207,14 +239,17 @@ impl WindowContext {
         mut display: Display,
         config: Rc<UiConfig>,
         options: WindowOptions,
-        proxy: EventLoopProxy<Event>,
+        proxy: RuntimeProxy,
+        context_id: ContextId,
     ) -> Result<Self, Box<dyn Error>> {
         let mut pty_config = config.pty_config();
         options.terminal_options.override_pty_config(&mut pty_config);
 
         let preserve_title = options.window_identity.title.is_some();
         #[cfg(unix)]
-        let ipc_window_id = options.ipc_window_id.unwrap_or_else(|| display.window.id().into());
+        let ipc_window_id = options.ipc_window_id.unwrap_or_else(|| {
+            display.window.platform_id().map(u64::from).unwrap_or_else(|| context_id.get())
+        });
 
         info!(
             "PTY dimensions: {:?} x {:?}",
@@ -222,7 +257,7 @@ impl WindowContext {
             display.size_info.columns()
         );
 
-        let event_proxy = EventProxy::new(proxy, display.window.id());
+        let event_proxy = EventProxy::new(proxy, context_id);
 
         let vivid_service = {
             let size = display.size_info;
@@ -237,6 +272,7 @@ impl WindowContext {
                     generation: 1,
                 },
                 event_proxy.clone(),
+                display.window.is_headless(),
             )?;
             pty_config.env.insert("VIVID_ENDPOINT".into(), service.endpoint().into());
             pty_config.env.insert("VIVID_TOKEN".into(), service.token().into());
@@ -249,7 +285,11 @@ impl WindowContext {
         // This object contains all of the state about what's being displayed. It's
         // wrapped in a clonable mutex since both the I/O loop and display need to
         // access it.
-        let terminal = Term::new(config.term_options(), &display.size_info, event_proxy.clone());
+        let mut terminal =
+            Term::new(config.term_options(), &display.size_info, event_proxy.clone());
+        if display.window.is_headless() {
+            terminal.is_focused = false;
+        }
         let terminal = Arc::new(FairMutex::new(terminal));
 
         // Create the PTY.
@@ -260,7 +300,7 @@ impl WindowContext {
         #[cfg(unix)]
         let terminal_window_id = ipc_window_id;
         #[cfg(not(unix))]
-        let terminal_window_id = display.window.id().into();
+        let terminal_window_id = context_id.get();
         let pty = tty::new(&pty_config, display.size_info.into(), terminal_window_id)?;
 
         #[cfg(not(windows))]
@@ -322,6 +362,7 @@ impl WindowContext {
             dirty: Default::default(),
             vivid_service,
             vivid_resize_settled: None,
+            context_id,
             #[cfg(unix)]
             ipc_window_id,
             #[cfg(unix)]
@@ -478,7 +519,7 @@ impl WindowContext {
     pub fn handle_event(
         &mut self,
         #[cfg(target_os = "macos")] event_loop: &ActiveEventLoop,
-        event_proxy: &EventLoopProxy<Event>,
+        event_proxy: &RuntimeProxy,
         clipboard: &mut Clipboard,
         scheduler: &mut Scheduler,
         event: WinitEvent<Event>,
@@ -615,8 +656,8 @@ impl WindowContext {
     }
 
     /// ID of this terminal context.
-    pub fn id(&self) -> WindowId {
-        self.display.window.id()
+    pub fn id(&self) -> ContextId {
+        self.context_id
     }
 
     /// Stable external ID used to target this window through IPC.
@@ -688,7 +729,7 @@ impl WindowContext {
         &mut self,
         text: &str,
         #[cfg(target_os = "macos")] event_loop: &ActiveEventLoop,
-        event_proxy: &EventLoopProxy<Event>,
+        event_proxy: &RuntimeProxy,
         clipboard: &mut Clipboard,
         scheduler: &mut Scheduler,
     ) -> Vec<u8> {
@@ -742,7 +783,7 @@ impl WindowContext {
         key: &IpcKey,
         repeated: bool,
         #[cfg(target_os = "macos")] event_loop: &ActiveEventLoop,
-        event_proxy: &EventLoopProxy<Event>,
+        event_proxy: &RuntimeProxy,
         clipboard: &mut Clipboard,
         scheduler: &mut Scheduler,
     ) -> Result<Vec<u8>, IpcError> {
@@ -788,7 +829,7 @@ impl WindowContext {
         &mut self,
         mouse: &IpcMouse,
         #[cfg(target_os = "macos")] event_loop: &ActiveEventLoop,
-        event_proxy: &EventLoopProxy<Event>,
+        event_proxy: &RuntimeProxy,
         clipboard: &mut Clipboard,
         scheduler: &mut Scheduler,
     ) -> Result<Vec<u8>, IpcError> {
@@ -1085,7 +1126,7 @@ impl WindowContext {
     /// Request an exact client-area size.
     #[cfg(unix)]
     pub fn request_automation_resize(
-        &self,
+        &mut self,
         columns: Option<u16>,
         rows: Option<u16>,
         width: Option<u32>,
@@ -1135,6 +1176,15 @@ impl WindowContext {
             ));
         }
         self.display.window.request_inner_size(winit::dpi::PhysicalSize::new(width, height));
+        if self.display.window.is_headless() {
+            self.display
+                .pending_update
+                .set_dimensions(winit::dpi::PhysicalSize::new(width, height));
+            self.automation.pending_resize_confirmations =
+                self.automation.pending_resize_confirmations.saturating_add(1);
+            self.dirty = true;
+            self.display.window.request_redraw();
+        }
         Ok((width, height, grid))
     }
 
@@ -1239,6 +1289,7 @@ impl WindowContext {
         let pixels = self.display.window.inner_size();
         json_value!({
             "window_id": self.ipc_window_id,
+            "headless": self.display.window.is_headless(),
             "creation_index": self.automation.creation_index,
             "title": self.display.window.title(),
             "focused": terminal.is_focused,
@@ -1587,7 +1638,7 @@ impl WindowContext {
         })
     }
 
-    /// Start reading back the last successfully presented frame.
+    /// Start reading back a frame.
     #[cfg(unix)]
     pub fn request_screenshot(
         &mut self,
@@ -1599,8 +1650,17 @@ impl WindowContext {
             return Err(String::from("a screenshot is already in progress for this window"));
         }
 
-        let readback = self.display.begin_screenshot().map_err(|err| err.to_string())?;
-        self.screenshot = Some(PendingScreenshot { readback, connection, request_id });
+        let readback = if self.display.window.is_headless() {
+            self.dirty = true;
+            self.display.damage_tracker.frame().mark_fully_damaged();
+            self.display.window.has_frame = true;
+            self.display.window.request_redraw();
+            None
+        } else {
+            Some(self.display.begin_screenshot().map_err(|err| err.to_string())?)
+        };
+        self.screenshot =
+            Some(PendingScreenshot { readback, started: Instant::now(), connection, request_id });
         self.screenshot_busy = true;
 
         let window_id = self.id();
@@ -1610,21 +1670,39 @@ impl WindowContext {
         Ok(())
     }
 
+    /// Bind a fresh headless screenshot request to the frame which just completed.
+    #[cfg(unix)]
+    pub fn start_fresh_screenshot_readback(&mut self) {
+        let Some(pending) = self.screenshot.as_mut() else {
+            return;
+        };
+        if pending.readback.is_none() {
+            match self.display.begin_screenshot() {
+                Ok(readback) => pending.readback = Some(readback),
+                Err(error) => {
+                    pending
+                        .connection
+                        .error(pending.request_id, IpcError::new("unsupported", error.to_string()));
+                    self.screenshot = None;
+                    self.screenshot_busy = false;
+                },
+            }
+        }
+    }
+
     /// Poll screenshot readback and move PNG encoding off the event-loop thread.
     #[cfg(unix)]
-    pub fn poll_screenshot(
-        &mut self,
-        scheduler: &mut Scheduler,
-        event_proxy: &EventLoopProxy<Event>,
-    ) {
+    pub fn poll_screenshot(&mut self, scheduler: &mut Scheduler, event_proxy: &RuntimeProxy) {
         let Some(pending) = self.screenshot.as_ref() else {
             return;
         };
 
-        let result = if pending.readback.started.elapsed() >= SCREENSHOT_READBACK_TIMEOUT {
+        let result = if pending.started.elapsed() >= SCREENSHOT_READBACK_TIMEOUT {
             Err(String::from("screenshot readback timed out"))
+        } else if pending.readback.is_none() {
+            Ok(None)
         } else {
-            match self.display.poll_screenshot(&pending.readback) {
+            match self.display.poll_screenshot(pending.readback.as_ref().unwrap()) {
                 Ok(Some(pixels)) => Ok(Some(pixels)),
                 Ok(None) => Ok(None),
                 Err(err) => Err(err.to_string()),

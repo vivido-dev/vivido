@@ -8,6 +8,7 @@ use winit::window::ActivationToken;
 #[cfg(not(any(target_os = "macos", windows)))]
 use winit::platform::wayland::WindowAttributesExtWayland;
 
+use std::cell::Cell;
 use std::fmt::{self, Display, Formatter};
 use std::sync::Arc;
 
@@ -36,6 +37,7 @@ use crate::terminal::index::Point;
 use crate::cli::WindowOptions;
 use crate::config::UiConfig;
 use crate::config::window::{Decorations, Identity, WindowConfig};
+use crate::context::ContextId;
 use crate::display::SizeInfo;
 
 /// This should match the definition of IDI_ICON from `Vivido.rc`.
@@ -90,7 +92,8 @@ pub struct Window {
     /// Hold the window when terminal exits.
     pub hold: bool,
 
-    window: Arc<WinitWindow>,
+    backend: WindowBackend,
+    context_id: ContextId,
 
     /// Current window title.
     title: String,
@@ -98,6 +101,11 @@ pub struct Window {
     current_mouse_cursor: CursorIcon,
     mouse_visible: bool,
     ime_inhibitor: ImeInhibitor,
+}
+
+enum WindowBackend {
+    Windowed(Arc<WinitWindow>),
+    Headless(Cell<PhysicalSize<u32>>),
 }
 
 impl Window {
@@ -109,6 +117,7 @@ impl Window {
         config: &UiConfig,
         identity: &Identity,
         options: &mut WindowOptions,
+        context_id: ContextId,
     ) -> Result<Window> {
         let identity = identity.clone();
         let mut window_attributes = Window::get_platform_window(
@@ -173,35 +182,73 @@ impl Window {
             mouse_visible: true,
             has_frame: true,
             scale_factor,
-            window,
+            backend: WindowBackend::Windowed(window),
+            context_id,
             ime_inhibitor: Default::default(),
         })
+    }
+
+    /// Create a logical viewport with no operating-system window.
+    pub fn headless(identity: &Identity, options: &WindowOptions, context_id: ContextId) -> Self {
+        Self {
+            has_frame: true,
+            scale_factor: 1.0,
+            requested_redraw: false,
+            hold: options.terminal_options.hold,
+            backend: WindowBackend::Headless(Cell::new(PhysicalSize::new(1, 1))),
+            context_id,
+            title: identity.title.clone(),
+            current_mouse_cursor: CursorIcon::Text,
+            mouse_visible: true,
+            ime_inhibitor: Default::default(),
+        }
+    }
+
+    fn native(&self) -> Option<&Arc<WinitWindow>> {
+        match &self.backend {
+            WindowBackend::Windowed(window) => Some(window),
+            WindowBackend::Headless(_) => None,
+        }
+    }
+
+    pub fn is_headless(&self) -> bool {
+        matches!(self.backend, WindowBackend::Headless(_))
     }
 
     #[cfg(target_os = "macos")]
     #[inline]
     pub fn raw_window_handle(&self) -> RawWindowHandle {
-        self.window.window_handle().unwrap().as_raw()
+        self.native().expect("native window").window_handle().unwrap().as_raw()
     }
 
     #[inline]
-    pub fn winit_window(&self) -> Arc<WinitWindow> {
-        Arc::clone(&self.window)
+    pub fn winit_window(&self) -> Option<Arc<WinitWindow>> {
+        self.native().map(Arc::clone)
     }
 
     #[inline]
     pub fn request_inner_size(&self, size: PhysicalSize<u32>) {
-        let _ = self.window.request_inner_size(size);
+        match &self.backend {
+            WindowBackend::Windowed(window) => {
+                let _ = window.request_inner_size(size);
+            },
+            WindowBackend::Headless(current) => current.set(size),
+        }
     }
 
     #[inline]
     pub fn inner_size(&self) -> PhysicalSize<u32> {
-        self.window.inner_size()
+        match &self.backend {
+            WindowBackend::Windowed(window) => window.inner_size(),
+            WindowBackend::Headless(size) => size.get(),
+        }
     }
 
     #[inline]
     pub fn set_visible(&self, visibility: bool) {
-        self.window.set_visible(visibility);
+        if let Some(window) = self.native() {
+            window.set_visible(visibility);
+        }
     }
 
     #[inline]
@@ -209,16 +256,20 @@ impl Window {
     pub fn focus_window(&self) {
         // Direct focus is intentionally a no-op on Wayland. Winit's attention request uses
         // xdg_activation_v1 to obtain and apply a compositor-approved activation token.
-        #[cfg(target_os = "linux")]
-        self.window.request_user_attention(Some(UserAttentionType::Critical));
-        self.window.focus_window();
+        if let Some(window) = self.native() {
+            #[cfg(target_os = "linux")]
+            window.request_user_attention(Some(UserAttentionType::Critical));
+            window.focus_window();
+        }
     }
 
     /// Set the window title.
     #[inline]
     pub fn set_title(&mut self, title: String) {
         self.title = title;
-        self.window.set_title(&self.title);
+        if let Some(window) = self.native() {
+            window.set_title(&self.title);
+        }
     }
 
     /// Get the window title.
@@ -231,7 +282,9 @@ impl Window {
     pub fn request_redraw(&mut self) {
         if !self.requested_redraw {
             self.requested_redraw = true;
-            self.window.request_redraw();
+            if let Some(window) = self.native() {
+                window.request_redraw();
+            }
         }
     }
 
@@ -239,7 +292,9 @@ impl Window {
     pub fn set_mouse_cursor(&mut self, cursor: CursorIcon) {
         if cursor != self.current_mouse_cursor {
             self.current_mouse_cursor = cursor;
-            self.window.set_cursor(cursor);
+            if let Some(window) = self.native() {
+                window.set_cursor(cursor);
+            }
         }
     }
 
@@ -247,7 +302,9 @@ impl Window {
     pub fn set_mouse_visible(&mut self, visible: bool) {
         if visible != self.mouse_visible {
             self.mouse_visible = visible;
-            self.window.set_cursor_visible(visible);
+            if let Some(window) = self.native() {
+                window.set_cursor_visible(visible);
+            }
         }
     }
 
@@ -307,79 +364,113 @@ impl Window {
     pub fn set_urgent(&self, is_urgent: bool) {
         let attention = if is_urgent { Some(UserAttentionType::Critical) } else { None };
 
-        self.window.request_user_attention(attention);
+        if let Some(window) = self.native() {
+            window.request_user_attention(attention);
+        }
     }
 
-    pub fn id(&self) -> WindowId {
-        self.window.id()
+    pub fn id(&self) -> ContextId {
+        self.context_id
+    }
+
+    pub fn platform_id(&self) -> Option<WindowId> {
+        self.native().map(|window| window.id())
     }
 
     pub fn set_transparent(&self, transparent: bool) {
-        self.window.set_transparent(transparent);
+        if let Some(window) = self.native() {
+            window.set_transparent(transparent);
+        }
     }
 
     pub fn set_blur(&self, blur: bool) {
-        self.window.set_blur(blur);
+        if let Some(window) = self.native() {
+            window.set_blur(blur);
+        }
     }
 
     pub fn set_maximized(&self, maximized: bool) {
-        self.window.set_maximized(maximized);
+        if let Some(window) = self.native() {
+            window.set_maximized(maximized);
+        }
     }
 
     pub fn set_minimized(&self, minimized: bool) {
-        self.window.set_minimized(minimized);
+        if let Some(window) = self.native() {
+            window.set_minimized(minimized);
+        }
     }
 
     pub fn set_resize_increments(&self, increments: PhysicalSize<f32>) {
-        self.window.set_resize_increments(Some(increments));
+        if let Some(window) = self.native() {
+            window.set_resize_increments(Some(increments));
+        }
     }
 
     /// Toggle the window's fullscreen state.
     pub fn toggle_fullscreen(&self) {
-        self.set_fullscreen(self.window.fullscreen().is_none());
+        if let Some(window) = self.native() {
+            self.set_fullscreen(window.fullscreen().is_none());
+        }
     }
 
     /// Toggle the window's maximized state.
     pub fn toggle_maximized(&self) {
-        self.set_maximized(!self.window.is_maximized());
+        if let Some(window) = self.native() {
+            self.set_maximized(!window.is_maximized());
+        }
     }
 
     /// Inform windowing system about presenting to the window.
     ///
     /// Should be called right before presenting the rendered frame to the window surface.
     pub fn pre_present_notify(&self) {
-        self.window.pre_present_notify();
+        if let Some(window) = self.native() {
+            window.pre_present_notify();
+        }
     }
 
     pub fn set_theme(&self, theme: Option<Theme>) {
-        self.window.set_theme(theme);
+        if let Some(window) = self.native() {
+            window.set_theme(theme);
+        }
     }
 
     #[cfg(target_os = "macos")]
     pub fn toggle_simple_fullscreen(&self) {
-        self.set_simple_fullscreen(!self.window.simple_fullscreen());
+        if let Some(window) = self.native() {
+            self.set_simple_fullscreen(!window.simple_fullscreen());
+        }
     }
 
     #[cfg(target_os = "macos")]
     pub fn set_option_as_alt(&self, option_as_alt: OptionAsAlt) {
-        self.window.set_option_as_alt(option_as_alt);
+        if let Some(window) = self.native() {
+            window.set_option_as_alt(option_as_alt);
+        }
     }
 
     pub fn set_fullscreen(&self, fullscreen: bool) {
         if fullscreen {
-            self.window.set_fullscreen(Some(Fullscreen::Borderless(None)));
+            if let Some(window) = self.native() {
+                window.set_fullscreen(Some(Fullscreen::Borderless(None)));
+            }
         } else {
-            self.window.set_fullscreen(None);
+            if let Some(window) = self.native() {
+                window.set_fullscreen(None);
+            }
         }
     }
 
     pub fn current_monitor(&self) -> Option<MonitorHandle> {
-        self.window.current_monitor()
+        self.native().and_then(|window| window.current_monitor())
     }
 
     #[cfg(target_os = "macos")]
     pub fn set_simple_fullscreen(&self, simple_fullscreen: bool) {
-        self.window.set_simple_fullscreen(simple_fullscreen);
+        if let Some(window) = self.native() {
+            window.set_simple_fullscreen(simple_fullscreen);
+        }
     }
 
     /// Set IME inhibitor state and disable IME while any are present.
@@ -388,7 +479,9 @@ impl Window {
     pub fn set_ime_inhibitor(&mut self, inhibitor: ImeInhibitor, inhibit: bool) {
         if self.ime_inhibitor.contains(inhibitor) != inhibit {
             self.ime_inhibitor.set(inhibitor, inhibit);
-            self.window.set_ime_allowed(self.ime_inhibitor.is_empty());
+            if let Some(window) = self.native() {
+                window.set_ime_allowed(self.ime_inhibitor.is_empty());
+            }
         }
     }
 
@@ -403,10 +496,12 @@ impl Window {
         let width = size.cell_width() as f64 * 2.;
         let height = size.cell_height as f64;
 
-        self.window.set_ime_cursor_area(
-            PhysicalPosition::new(nspot_x, nspot_y),
-            PhysicalSize::new(width, height),
-        );
+        if let Some(window) = self.native() {
+            window.set_ime_cursor_area(
+                PhysicalPosition::new(nspot_x, nspot_y),
+                PhysicalSize::new(width, height),
+            );
+        }
     }
 
     /// Disable macOS window shadows.
@@ -428,30 +523,31 @@ impl Window {
     /// Select tab at the given `index`.
     #[cfg(target_os = "macos")]
     pub fn select_tab_at_index(&self, index: usize) {
-        self.window.select_tab_at_index(index);
+        self.native().expect("native window").select_tab_at_index(index);
     }
 
     /// Select the last tab.
     #[cfg(target_os = "macos")]
     pub fn select_last_tab(&self) {
-        self.window.select_tab_at_index(self.window.num_tabs() - 1);
+        let window = self.native().expect("native window");
+        window.select_tab_at_index(window.num_tabs() - 1);
     }
 
     /// Select next tab.
     #[cfg(target_os = "macos")]
     pub fn select_next_tab(&self) {
-        self.window.select_next_tab();
+        self.native().expect("native window").select_next_tab();
     }
 
     /// Select previous tab.
     #[cfg(target_os = "macos")]
     pub fn select_previous_tab(&self) {
-        self.window.select_previous_tab();
+        self.native().expect("native window").select_previous_tab();
     }
 
     #[cfg(target_os = "macos")]
     pub fn tabbing_id(&self) -> String {
-        self.window.tabbing_identifier()
+        self.native().expect("native window").tabbing_identifier()
     }
 }
 

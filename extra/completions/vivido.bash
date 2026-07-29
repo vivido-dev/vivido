@@ -82,6 +82,18 @@ _vivido() {
             vivido__help__msg,typing)
                 cmd="vivido__help__msg__typing"
                 ;;
+            vivido__help__msg,vivid-milestones)
+                cmd="vivido__help__msg__vivid__milestones"
+                ;;
+            vivido__help__msg,vivid-scene-status)
+                cmd="vivido__help__msg__vivid__scene__status"
+                ;;
+            vivido__help__msg,vivid-source-status)
+                cmd="vivido__help__msg__vivid__source__status"
+                ;;
+            vivido__help__msg,vivid-sources)
+                cmd="vivido__help__msg__vivid__sources"
+                ;;
             vivido__help__msg,wait)
                 cmd="vivido__help__msg__wait"
                 ;;
@@ -123,6 +135,9 @@ _vivido() {
                 ;;
             vivido__help__msg__wait,text)
                 cmd="vivido__help__msg__wait__text"
+                ;;
+            vivido__help__msg__wait,vivid-source)
+                cmd="vivido__help__msg__wait__vivid__source"
                 ;;
             vivido__msg,capabilities)
                 cmd="vivido__msg__capabilities"
@@ -180,6 +195,18 @@ _vivido() {
                 ;;
             vivido__msg,typing)
                 cmd="vivido__msg__typing"
+                ;;
+            vivido__msg,vivid-milestones)
+                cmd="vivido__msg__vivid__milestones"
+                ;;
+            vivido__msg,vivid-scene-status)
+                cmd="vivido__msg__vivid__scene__status"
+                ;;
+            vivido__msg,vivid-source-status)
+                cmd="vivido__msg__vivid__source__status"
+                ;;
+            vivido__msg,vivid-sources)
+                cmd="vivido__msg__vivid__sources"
                 ;;
             vivido__msg,wait)
                 cmd="vivido__msg__wait"
@@ -241,6 +268,18 @@ _vivido() {
             vivido__msg__help,typing)
                 cmd="vivido__msg__help__typing"
                 ;;
+            vivido__msg__help,vivid-milestones)
+                cmd="vivido__msg__help__vivid__milestones"
+                ;;
+            vivido__msg__help,vivid-scene-status)
+                cmd="vivido__msg__help__vivid__scene__status"
+                ;;
+            vivido__msg__help,vivid-source-status)
+                cmd="vivido__msg__help__vivid__source__status"
+                ;;
+            vivido__msg__help,vivid-sources)
+                cmd="vivido__msg__help__vivid__sources"
+                ;;
             vivido__msg__help,wait)
                 cmd="vivido__msg__help__wait"
                 ;;
@@ -282,6 +321,9 @@ _vivido() {
                 ;;
             vivido__msg__help__wait,text)
                 cmd="vivido__msg__help__wait__text"
+                ;;
+            vivido__msg__help__wait,vivid-source)
+                cmd="vivido__msg__help__wait__vivid__source"
                 ;;
             vivido__msg__mouse,click)
                 cmd="vivido__msg__mouse__click"
@@ -352,6 +394,9 @@ _vivido() {
             vivido__msg__wait,text)
                 cmd="vivido__msg__wait__text"
                 ;;
+            vivido__msg__wait,vivid-source)
+                cmd="vivido__msg__wait__vivid__source"
+                ;;
             vivido__msg__wait__help,exit)
                 cmd="vivido__msg__wait__help__exit"
                 ;;
@@ -373,6 +418,9 @@ _vivido() {
             vivido__msg__wait__help,text)
                 cmd="vivido__msg__wait__help__text"
                 ;;
+            vivido__msg__wait__help,vivid-source)
+                cmd="vivido__msg__wait__help__vivid__source"
+                ;;
             *)
                 ;;
         esac
@@ -380,7 +428,7 @@ _vivido() {
 
     case "${cmd}" in
         vivido)
-            opts="-q -v -w -e -T -o -h -V --print-events --ref-test --config-file --socket --daemon --window-id --working-directory --hold --command --title --class --option --help --version msg help"
+            opts="-q -v -w -e -T -o -h -V --print-events --ref-test --config-file --socket --daemon --headless --window-id --dimensions --working-directory --hold --command --title --class --option --help --version msg help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 1 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -421,6 +469,10 @@ _vivido() {
                     return 0
                     ;;
                 -w)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --dimensions)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
@@ -503,7 +555,7 @@ _vivido() {
             return 0
             ;;
         vivido__help__msg)
-            opts="create-window config get-config typing get-text screenshot capabilities key paste mouse resize focus signal list-windows inspect get-grid wait transcript subscribe"
+            opts="create-window config get-config typing get-text screenshot capabilities key paste mouse resize focus signal list-windows inspect vivid-sources vivid-source-status vivid-scene-status vivid-milestones get-grid wait transcript subscribe"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -866,8 +918,64 @@ _vivido() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
+        vivido__help__msg__vivid__milestones)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        vivido__help__msg__vivid__scene__status)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        vivido__help__msg__vivid__source__status)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        vivido__help__msg__vivid__sources)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
         vivido__help__msg__wait)
-            opts="text output screen-change screen-stable frame exit"
+            opts="text output screen-change screen-stable frame exit vivid-source"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -964,8 +1072,22 @@ _vivido() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
+        vivido__help__msg__wait__vivid__source)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 5 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
         vivido__msg)
-            opts="-s -h --socket --help create-window config get-config typing get-text screenshot capabilities key paste mouse resize focus signal list-windows inspect get-grid wait transcript subscribe help"
+            opts="-s -h --socket --help create-window config get-config typing get-text screenshot capabilities key paste mouse resize focus signal list-windows inspect vivid-sources vivid-source-status vivid-scene-status vivid-milestones get-grid wait transcript subscribe help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -1045,7 +1167,7 @@ _vivido() {
             return 0
             ;;
         vivido__msg__create__window)
-            opts="-w -e -T -o -h --window-id --working-directory --hold --command --title --class --option --help"
+            opts="-w -e -T -o -h --window-id --dimensions --working-directory --hold --command --title --class --option --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -1056,6 +1178,10 @@ _vivido() {
                     return 0
                     ;;
                 -w)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --dimensions)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
@@ -1214,7 +1340,7 @@ _vivido() {
             return 0
             ;;
         vivido__msg__help)
-            opts="create-window config get-config typing get-text screenshot capabilities key paste mouse resize focus signal list-windows inspect get-grid wait transcript subscribe help"
+            opts="create-window config get-config typing get-text screenshot capabilities key paste mouse resize focus signal list-windows inspect vivid-sources vivid-source-status vivid-scene-status vivid-milestones get-grid wait transcript subscribe help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -1591,8 +1717,64 @@ _vivido() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
+        vivido__msg__help__vivid__milestones)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        vivido__msg__help__vivid__scene__status)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        vivido__msg__help__vivid__source__status)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        vivido__msg__help__vivid__sources)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
         vivido__msg__help__wait)
-            opts="text output screen-change screen-stable frame exit"
+            opts="text output screen-change screen-stable frame exit vivid-source"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -1676,6 +1858,20 @@ _vivido() {
             return 0
             ;;
         vivido__msg__help__wait__text)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 5 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        vivido__msg__help__wait__vivid__source)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 5 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
@@ -2439,8 +2635,120 @@ _vivido() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
+        vivido__msg__vivid__milestones)
+            opts="-w -h --session-id --source-id --window-id --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --session-id)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --source-id)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --window-id)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                -w)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        vivido__msg__vivid__scene__status)
+            opts="-w -h --session-id --maximum-nodes --window-id --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --session-id)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --maximum-nodes)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --window-id)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                -w)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        vivido__msg__vivid__source__status)
+            opts="-w -h --session-id --source-id --window-id --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --session-id)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --source-id)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --window-id)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                -w)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        vivido__msg__vivid__sources)
+            opts="-w -h --window-id --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --window-id)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                -w)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
         vivido__msg__wait)
-            opts="-h --help text output screen-change screen-stable frame exit help"
+            opts="-h --help text output screen-change screen-stable frame exit vivid-source help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -2510,7 +2818,7 @@ _vivido() {
             return 0
             ;;
         vivido__msg__wait__help)
-            opts="text output screen-change screen-stable frame exit help"
+            opts="text output screen-change screen-stable frame exit vivid-source help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -2608,6 +2916,20 @@ _vivido() {
             return 0
             ;;
         vivido__msg__wait__help__text)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 5 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        vivido__msg__wait__help__vivid__source)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 5 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
@@ -2723,6 +3045,48 @@ _vivido() {
             fi
             case "${prev}" in
                 --after-screen)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --timeout)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --window-id)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                -w)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        vivido__msg__wait__vivid__source)
+            opts="-w -h --session-id --source-id --condition --value --timeout --window-id --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --session-id)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --source-id)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --condition)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --value)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;

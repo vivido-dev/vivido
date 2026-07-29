@@ -25,6 +25,11 @@ set of features with high performance.
 
 	Do not spawn an initial window.
 
+*--headless*
+
+	Run without Wayland or native windows using an offscreen Vulkan renderer.
+	Without *--daemon*, one initial PTY-backed session is created. Linux only.
+
 *--print-events*
 
 	Print all events to STDOUT.
@@ -46,6 +51,12 @@ set of features with high performance.
 	Prints version information.
 
 # OPTIONS
+
+*--dimensions* _<COLSxROWS>_
+
+	Set initial terminal grid dimensions. Values must be at least _2x1_. In
+	headless mode the precedence is this option, configured _window.dimensions_,
+	then _80x24_.
 
 *--class* _<GENERAL>_ | _<GENERAL>_,_<INSTANCE>_
 
@@ -92,7 +103,8 @@ set of features with high performance.
 
 	Assign a stable IPC ID to the initial window. Vivido exports this value as
 	_$VIVIDO_WINDOW_ID_ inside the window, and *vivido msg* accepts it for explicit
-	window targeting. When omitted, the platform window ID is used.
+	window targeting. When omitted, the platform window ID is used for native
+	windows and the monotonic process-local context ID is used in headless mode.
 
 	A launching shell can choose both IPC environment values before startup:
 

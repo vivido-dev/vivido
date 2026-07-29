@@ -137,6 +137,7 @@ pub struct AudioOutput {
     shared: Arc<Shared>,
     producer: Mutex<HeapProd<f32>>,
     _stream: Option<Stream>,
+    null_thread: Option<thread::JoinHandle<()>>,
     sample_rate: u32,
     channels: u16,
 }
@@ -205,8 +206,69 @@ impl AudioOutput {
             shared,
             producer: Mutex::new(producer),
             _stream: Some(stream),
+            null_thread: None,
             sample_rate: config.sample_rate,
             channels: config.channels,
+        }))
+    }
+
+    /// Open a device-independent output which consumes samples against a wall clock.
+    pub fn open_null() -> io::Result<Arc<Self>> {
+        let sample_rate = 48_000;
+        let channels = 2;
+        let shared = Arc::new(Shared {
+            enabled: AtomicBool::new(false),
+            prebuffered: AtomicBool::new(false),
+            received_samples: AtomicBool::new(false),
+            stopped: AtomicBool::new(false),
+            decode_done: AtomicBool::new(false),
+            eos_observed: AtomicBool::new(false),
+            queued_samples: AtomicU64::new(0),
+            played_samples: AtomicU64::new(0),
+            discard_samples: AtomicU64::new(0),
+            rendered_samples: AtomicU64::new(0),
+            timeline_origin_us: AtomicI64::new(UNSET_PTS),
+            first_audio_pts_us: AtomicI64::new(UNSET_PTS),
+            leading_silence_samples: AtomicU64::new(0),
+            prebuffer_samples: AtomicU64::new(
+                u64::from(sample_rate)
+                    .saturating_mul(u64::from(channels))
+                    .saturating_mul(PREBUFFER_MILLISECONDS)
+                    / 1_000,
+            ),
+            requested_start_pts_us: AtomicI64::new(UNSET_PTS),
+            play_configured_at: Mutex::new(None),
+            error: Mutex::new(None),
+        });
+        let ring = HeapRb::<f32>::new(
+            (sample_rate as usize * channels as usize * RING_BUFFER_SECONDS).max(1),
+        );
+        let (producer, mut consumer) = ring.split();
+        let thread_shared = shared.clone();
+        let null_thread =
+            thread::Builder::new().name("vivid-null-audio".into()).spawn(move || {
+                let interval = Duration::from_millis(10);
+                let samples_per_tick =
+                    sample_rate as usize * channels as usize * interval.as_millis() as usize
+                        / 1_000;
+                let mut deadline = Instant::now();
+                while !thread_shared.stopped.load(Ordering::SeqCst) {
+                    deadline += interval;
+                    consume_audio(&mut consumer, &thread_shared, samples_per_tick, |_| {});
+                    if let Some(delay) = deadline.checked_duration_since(Instant::now()) {
+                        thread::sleep(delay);
+                    } else {
+                        deadline = Instant::now();
+                    }
+                }
+            })?;
+        Ok(Arc::new(Self {
+            shared,
+            producer: Mutex::new(producer),
+            _stream: None,
+            null_thread: Some(null_thread),
+            sample_rate,
+            channels,
         }))
     }
 
@@ -236,6 +298,7 @@ impl AudioOutput {
             shared,
             producer: Mutex::new(producer),
             _stream: None,
+            null_thread: None,
             sample_rate: 48_000,
             channels: 2,
         })
@@ -464,68 +527,89 @@ where
         .build_output_stream(
             *config,
             move |output: &mut [T], _| {
-                let mut discarded = 0_u64;
-                while discarded < output.len() as u64 {
-                    if shared.discard_samples.load(Ordering::SeqCst) == 0 {
-                        break;
-                    }
-                    if consumer.try_pop().is_none() {
-                        break;
-                    }
-                    let _ = shared.discard_samples.fetch_update(
-                        Ordering::SeqCst,
-                        Ordering::SeqCst,
-                        |remaining| remaining.checked_sub(1),
-                    );
-                    discarded += 1;
-                }
-                if discarded > 0 {
-                    shared.played_samples.fetch_add(discarded, Ordering::SeqCst);
-                    output.fill_with(|| T::from_sample(0.0));
-                    return;
-                }
-                if !shared.enabled.load(Ordering::SeqCst) {
-                    output.fill_with(|| T::from_sample(0.0));
-                    return;
-                }
-                if !shared.prebuffered.load(Ordering::SeqCst) {
-                    let buffered = shared
-                        .queued_samples
-                        .load(Ordering::SeqCst)
-                        .saturating_sub(shared.played_samples.load(Ordering::SeqCst));
-                    if buffered < shared.prebuffer_samples.load(Ordering::SeqCst)
-                        && !shared.decode_done.load(Ordering::SeqCst)
-                    {
-                        output.fill_with(|| T::from_sample(0.0));
-                        return;
-                    }
-                    shared.prebuffered.store(true, Ordering::SeqCst);
-                }
-                let rendered = output.len() as u64;
-                let mut played = 0_u64;
-                for sample in output {
-                    let emit_silence = shared
-                        .leading_silence_samples
-                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
-                            remaining.checked_sub(1)
-                        })
-                        .is_ok();
-                    if emit_silence {
-                        *sample = T::from_sample(0.0);
-                    } else if let Some(value) = consumer.try_pop() {
-                        *sample = T::from_sample(value);
-                        played += 1;
-                    } else {
-                        *sample = T::from_sample(0.0);
-                    }
-                }
-                shared.played_samples.fetch_add(played, Ordering::SeqCst);
-                shared.rendered_samples.fetch_add(rendered, Ordering::SeqCst);
+                let mut index = 0;
+                consume_audio(&mut consumer, &shared, output.len(), |value| {
+                    output[index] = T::from_sample(value);
+                    index += 1;
+                });
             },
             move |error| error_shared.set_error(format!("audio output stream error: {error}")),
             None,
         )
         .map_err(|error| io::Error::other(format!("could not build audio output: {error}")))
+}
+
+fn consume_audio<C, F>(consumer: &mut C, shared: &Shared, length: usize, mut emit: F)
+where
+    C: Consumer<Item = f32>,
+    F: FnMut(f32),
+{
+    let mut discarded = 0_u64;
+    while discarded < length as u64 {
+        if shared.discard_samples.load(Ordering::SeqCst) == 0 || consumer.try_pop().is_none() {
+            break;
+        }
+        let _ =
+            shared.discard_samples.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                remaining.checked_sub(1)
+            });
+        discarded += 1;
+    }
+    if discarded > 0 {
+        shared.played_samples.fetch_add(discarded, Ordering::SeqCst);
+        for _ in 0..length {
+            emit(0.0);
+        }
+        return;
+    }
+    if !shared.enabled.load(Ordering::SeqCst) {
+        for _ in 0..length {
+            emit(0.0);
+        }
+        return;
+    }
+    if !shared.prebuffered.load(Ordering::SeqCst) {
+        let buffered = shared
+            .queued_samples
+            .load(Ordering::SeqCst)
+            .saturating_sub(shared.played_samples.load(Ordering::SeqCst));
+        if buffered < shared.prebuffer_samples.load(Ordering::SeqCst)
+            && !shared.decode_done.load(Ordering::SeqCst)
+        {
+            for _ in 0..length {
+                emit(0.0);
+            }
+            return;
+        }
+        shared.prebuffered.store(true, Ordering::SeqCst);
+    }
+    let mut played = 0_u64;
+    for _ in 0..length {
+        let emit_silence = shared
+            .leading_silence_samples
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| remaining.checked_sub(1))
+            .is_ok();
+        let value = if emit_silence {
+            0.0
+        } else if let Some(value) = consumer.try_pop() {
+            played += 1;
+            value
+        } else {
+            0.0
+        };
+        emit(value);
+    }
+    shared.played_samples.fetch_add(played, Ordering::SeqCst);
+    shared.rendered_samples.fetch_add(length as u64, Ordering::SeqCst);
+}
+
+impl Drop for AudioOutput {
+    fn drop(&mut self) {
+        self.shared.stopped.store(true, Ordering::SeqCst);
+        if let Some(thread) = self.null_thread.take() {
+            let _ = thread.join();
+        }
+    }
 }
 
 pub struct AudioDecoder {
@@ -1032,6 +1116,29 @@ mod tests {
         assert_eq!(rendered_pts_us(20_000, 48_000 * 2, 48_000, 2), 1_020_000);
         assert_eq!(leading_silence_sample_count(0, 100_000, 48_000, 2), 9_600);
         assert_eq!(leading_silence_sample_count(100_000, 0, 48_000, 2), 0);
+    }
+
+    #[test]
+    fn null_output_drains_eos_and_freezes_while_paused() {
+        let output = AudioOutput::open_null().unwrap();
+        output.configure_play(0, 0);
+        output.observe_audio_pts(0);
+        output.push(&vec![0.25; 1_920]).unwrap();
+        output.finish_decode();
+        output.signal_eos();
+        output.start();
+        output.wait_drained().unwrap();
+        assert!(output.pts_reached(5_000));
+
+        output.pause();
+        let paused = output.shared.rendered_samples.load(Ordering::SeqCst);
+        thread::sleep(Duration::from_millis(30));
+        assert_eq!(output.shared.rendered_samples.load(Ordering::SeqCst), paused);
+
+        output.flush();
+        assert!(!output.pts_reached(0));
+        assert_eq!(output.shared.rendered_samples.load(Ordering::SeqCst), 0);
+        output.stop();
     }
 
     #[test]

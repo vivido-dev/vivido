@@ -14,15 +14,14 @@ use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use crate::cli::{IpcMouseAction, IpcWaitCondition, MessageOptions, Options, SocketMessage};
+use crate::event::{Event, EventType};
+use crate::runtime::RuntimeProxy;
+use crate::terminal::thread;
 use base64::Engine;
 use log::{error, warn};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use winit::event_loop::EventLoopProxy;
-
-use crate::cli::{IpcMouseAction, IpcWaitCondition, MessageOptions, Options, SocketMessage};
-use crate::event::{Event, EventType};
-use crate::terminal::thread;
 
 /// Formal Vivido automation protocol version.
 pub const PROTOCOL_VERSION: u16 = 1;
@@ -363,17 +362,13 @@ impl Drop for ConnectionGuard {
 /// IPC socket listener.
 pub struct IpcListener {
     pub socket: UnixListener,
-    event_proxy: EventLoopProxy<Event>,
+    event_proxy: RuntimeProxy,
     connection_count: Arc<AtomicUsize>,
     next_connection_id: AtomicU64,
 }
 
 impl IpcListener {
-    pub fn new(
-        options: &Options,
-        event_proxy: EventLoopProxy<Event>,
-        path: &Path,
-    ) -> Result<Self, IoError> {
+    pub fn new(options: &Options, event_proxy: RuntimeProxy, path: &Path) -> Result<Self, IoError> {
         let socket = bind_socket(path)?;
         unsafe { env::set_var(VIVIDO_SOCKET_ENV, path.as_os_str()) };
         if options.daemon {
@@ -416,7 +411,7 @@ impl IpcListener {
 fn spawn_connection(
     stream: UnixStream,
     connection_id: u64,
-    event_proxy: EventLoopProxy<Event>,
+    event_proxy: RuntimeProxy,
     guard: ConnectionGuard,
 ) {
     // The listener is nonblocking for the polling thread. Accepted sockets inherit that flag on
@@ -476,11 +471,7 @@ fn configure_connection(stream: &UnixStream) -> io::Result<()> {
     stream.set_nonblocking(false)
 }
 
-fn run_connection(
-    stream: UnixStream,
-    connection: IpcConnection,
-    event_proxy: &EventLoopProxy<Event>,
-) {
+fn run_connection(stream: UnixStream, connection: IpcConnection, event_proxy: &RuntimeProxy) {
     let mut reader = BufReader::new(stream);
     let Some(first) = read_request_frame(&mut reader, &connection) else {
         return;
@@ -767,6 +758,16 @@ fn message_request(message: &SocketMessage) -> io::Result<(&'static str, Value)>
         SocketMessage::Signal(params) => Ok(("signal", serialize_params(params)?)),
         SocketMessage::ListWindows => Ok(("list_windows", json!({}))),
         SocketMessage::Inspect(params) => Ok(("inspect", serialize_params(params)?)),
+        SocketMessage::VividSources(params) => Ok(("vivid_sources", serialize_params(params)?)),
+        SocketMessage::VividSourceStatus(params) => {
+            Ok(("vivid_source_status", serialize_params(params)?))
+        },
+        SocketMessage::VividSceneStatus(params) => {
+            Ok(("vivid_scene_status", serialize_params(params)?))
+        },
+        SocketMessage::VividMilestones(params) => {
+            Ok(("vivid_milestones", serialize_params(params)?))
+        },
         SocketMessage::GetGrid(params) => Ok(("get_grid", serialize_params(params)?)),
         SocketMessage::Transcript(params) => Ok(("transcript", serialize_params(params)?)),
         SocketMessage::Subscribe(params) => Ok(("subscribe", serialize_params(params)?)),
@@ -781,6 +782,9 @@ fn message_request(message: &SocketMessage) -> io::Result<(&'static str, Value)>
             },
             IpcWaitCondition::Frame(params) => Ok(("wait_frame", serialize_params(params)?)),
             IpcWaitCondition::Exit(params) => Ok(("wait_exit", serialize_params(params)?)),
+            IpcWaitCondition::VividSource(params) => {
+                Ok(("wait_vivid_source", serialize_params(params)?))
+            },
         },
     }
 }
@@ -873,6 +877,10 @@ fn write_cli_result(message: &SocketMessage, result: &Value) -> io::Result<()> {
         SocketMessage::Capabilities
         | SocketMessage::ListWindows
         | SocketMessage::Inspect(_)
+        | SocketMessage::VividSources(_)
+        | SocketMessage::VividSourceStatus(_)
+        | SocketMessage::VividSceneStatus(_)
+        | SocketMessage::VividMilestones(_)
         | SocketMessage::GetGrid(_)
         | SocketMessage::Wait(_)
         | SocketMessage::Transcript(_)

@@ -334,6 +334,7 @@ struct ServiceShared {
     pending_display_change: Mutex<Option<PendingDisplayChange>>,
     capability_generation: AtomicU64,
     audio_device_available: AtomicBool,
+    null_audio: bool,
     active_connections: AtomicUsize,
     audio_outputs: Mutex<HashMap<SourceKey, Arc<AudioOutput>>>,
     image_cache: Mutex<ImageCache>,
@@ -817,16 +818,22 @@ pub struct VividService {
 }
 
 impl VividService {
-    pub fn start(metrics: DisplayMetrics, event_proxy: EventProxy) -> io::Result<Self> {
+    pub fn start(
+        metrics: DisplayMetrics,
+        event_proxy: EventProxy,
+        null_audio: bool,
+    ) -> io::Result<Self> {
         Self::start_with_wake(
             metrics,
             Arc::new(move || event_proxy.send_event(EventType::VividFrame)),
+            null_audio,
         )
     }
 
     fn start_with_wake(
         metrics: DisplayMetrics,
         wake: Arc<dyn Fn() + Send + Sync>,
+        null_audio: bool,
     ) -> io::Result<Self> {
         let (listener, endpoint, directory) = bind_local_listener()?;
 
@@ -846,6 +853,7 @@ impl VividService {
             pending_display_change: Mutex::new(None),
             capability_generation: AtomicU64::new(1),
             audio_device_available: AtomicBool::new(true),
+            null_audio,
             active_connections: AtomicUsize::new(0),
             audio_outputs: Mutex::new(HashMap::new()),
             image_cache: Mutex::new(ImageCache::default()),
@@ -2042,16 +2050,20 @@ fn spawn_audio_source_open(
         .name("vivid-audio-open".into())
         .spawn(move || {
             let opened = if audio::supports(&config) {
-                AudioOutput::open()
-                    .inspect(|_| update_audio_device_availability(&worker_shared, true))
-                    .map_err(|_| {
-                        update_audio_device_availability(&worker_shared, false);
-                        ProtocolError {
-                            code: messages::ERROR_DEVICE_LOST,
-                            message: "default audio output is unavailable",
-                            fatal: false,
-                        }
-                    })
+                if worker_shared.null_audio {
+                    AudioOutput::open_null()
+                } else {
+                    AudioOutput::open()
+                }
+                .inspect(|_| update_audio_device_availability(&worker_shared, true))
+                .map_err(|_| {
+                    update_audio_device_availability(&worker_shared, false);
+                    ProtocolError {
+                        code: messages::ERROR_DEVICE_LOST,
+                        message: "default audio output is unavailable",
+                        fatal: false,
+                    }
+                })
             } else {
                 Err(ProtocolError {
                     code: messages::ERROR_UNSUPPORTED_CONFIG,
@@ -5414,6 +5426,7 @@ mod tests {
                 generation: 1,
             },
             Arc::new(|| {}),
+            false,
         )
         .unwrap();
         let endpoint = Endpoint::parse(service.endpoint()).unwrap();
@@ -6130,6 +6143,7 @@ mod tests {
             pending_display_change: Mutex::new(None),
             capability_generation: AtomicU64::new(1),
             audio_device_available: AtomicBool::new(true),
+            null_audio: false,
             active_connections: AtomicUsize::new(0),
             audio_outputs: Mutex::new(HashMap::from([((1, 11), output.clone())])),
             image_cache: Mutex::new(ImageCache::default()),
@@ -6299,6 +6313,7 @@ mod tests {
                 generation: 1,
             },
             Arc::new(|| {}),
+            false,
         )
         .unwrap();
         let endpoint = Endpoint::parse(service.endpoint()).unwrap();
@@ -6471,6 +6486,7 @@ mod tests {
                 generation: 1,
             },
             Arc::new(|| {}),
+            false,
         )
         .unwrap();
         let endpoint = Endpoint::parse(service.endpoint()).unwrap();
@@ -6606,6 +6622,7 @@ mod tests {
                 generation: 1,
             },
             Arc::new(|| {}),
+            false,
         )
         .unwrap();
         let root_token = service.token().as_bytes().to_vec();
@@ -6897,6 +6914,7 @@ mod tests {
                 generation: 1,
             },
             Arc::new(|| {}),
+            false,
         )
         .unwrap();
         let endpoint = Endpoint::parse(service.endpoint()).unwrap();
@@ -7064,6 +7082,7 @@ mod tests {
                 generation: 1,
             },
             Arc::new(|| {}),
+            false,
         )
         .unwrap();
         let endpoint = Endpoint::parse(service.endpoint()).unwrap();
@@ -7169,6 +7188,7 @@ mod tests {
                 generation: 1,
             },
             Arc::new(|| {}),
+            false,
         )
         .unwrap();
         let endpoint = Endpoint::parse(service.endpoint()).unwrap();

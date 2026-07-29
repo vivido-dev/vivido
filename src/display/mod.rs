@@ -339,7 +339,12 @@ impl Display {
             == PhysicalSize::new(width, height)
     }
 
-    pub fn new(window: Window, config: &UiConfig, _tabbed: bool) -> Result<Display, Error> {
+    pub fn new(
+        window: Window,
+        config: &UiConfig,
+        _tabbed: bool,
+        initial_dimensions: Option<Dimensions>,
+    ) -> Result<Display, Error> {
         let scale_factor = window.scale_factor as f32;
         let font_size = config.font.size().scale(scale_factor);
         let font = config.font.clone().with_size(font_size);
@@ -347,7 +352,12 @@ impl Display {
         let metrics = text_system.metrics();
 
         let mut viewport_size = window.inner_size();
-        if let Some(dimensions) = config.window.dimensions() {
+        let dimensions = resolve_initial_dimensions(
+            initial_dimensions,
+            config.window.dimensions(),
+            window.is_headless(),
+        );
+        if let Some(dimensions) = dimensions {
             viewport_size = window_size(
                 config,
                 dimensions,
@@ -358,11 +368,12 @@ impl Display {
             window.request_inner_size(viewport_size);
         }
 
-        let scene_renderer = SceneRenderer::new(
-            window.winit_window(),
-            viewport_size,
-            config.window_opacity() < 1.0,
-        )?;
+        let scene_renderer = match window.winit_window() {
+            Some(native) => {
+                SceneRenderer::new(native, viewport_size, config.window_opacity() < 1.0)?
+            },
+            None => SceneRenderer::new_headless(viewport_size)?,
+        };
         let viewport_size = scene_renderer.clamp_render_size(viewport_size);
         let padding = config.window.padding(window.scale_factor as f32);
         let size_info = SizeInfo::new(
@@ -372,7 +383,7 @@ impl Display {
             metrics.cell_height,
             padding.0,
             padding.1,
-            config.window.dynamic_padding && config.window.dimensions().is_none(),
+            config.window.dynamic_padding && dimensions.is_none(),
         );
 
         info!("Cell size: {} x {}", metrics.cell_width, metrics.cell_height);
@@ -387,7 +398,9 @@ impl Display {
                 .set_resize_increments(PhysicalSize::new(metrics.cell_width, metrics.cell_height));
         }
 
-        window.set_visible(true);
+        if !window.is_headless() {
+            window.set_visible(true);
+        }
 
         #[cfg(target_os = "macos")]
         window.focus_window();
@@ -1193,9 +1206,18 @@ fn text_cell_width(text: &str) -> usize {
     text.chars().map(char_cell_width).sum()
 }
 
+fn resolve_initial_dimensions(
+    cli: Option<Dimensions>,
+    configured: Option<Dimensions>,
+    headless: bool,
+) -> Option<Dimensions> {
+    cli.or(configured).or_else(|| headless.then_some(Dimensions { columns: 80, lines: 24 }))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{scene_glyph_from_layout, text_cell_width};
+    use super::{resolve_initial_dimensions, scene_glyph_from_layout, text_cell_width};
+    use crate::config::window::Dimensions;
 
     #[test]
     fn scene_glyphs_use_baseline_relative_y_coordinates() {
@@ -1215,6 +1237,18 @@ mod tests {
         assert_eq!(text_cell_width("abc"), 3);
         assert_eq!(text_cell_width("今a"), 3);
         assert_eq!(text_cell_width(""), 0);
+    }
+
+    #[test]
+    fn headless_dimensions_use_cli_then_config_then_deterministic_default() {
+        let cli = Dimensions { columns: 120, lines: 40 };
+        let configured = Dimensions { columns: 100, lines: 30 };
+        let fallback = Dimensions { columns: 80, lines: 24 };
+
+        assert_eq!(resolve_initial_dimensions(Some(cli), Some(configured), true), Some(cli));
+        assert_eq!(resolve_initial_dimensions(None, Some(configured), true), Some(configured));
+        assert_eq!(resolve_initial_dimensions(None, None, true), Some(fallback));
+        assert_eq!(resolve_initial_dimensions(None, None, false), None);
     }
 }
 
