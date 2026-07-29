@@ -528,6 +528,12 @@ impl<T> Term<T> {
 
                 res += self.line_to_string(end.line, start.column..end.column, true).trim_end();
             },
+            // A line selection is a whole logical line, so it carries the terminating newline
+            // that distinguishes it from a drag covering the same cells. `bounds_to_string`
+            // strips at most one, so exactly one survives.
+            Some(Selection { ty: SelectionType::Lines, .. }) => {
+                res = self.bounds_to_string(start, end) + "\n";
+            },
             _ => {
                 res = self.bounds_to_string(start, end);
             },
@@ -2741,6 +2747,32 @@ mod tests {
             Side::Left,
         ));
         assert_eq!(hard_break.selection_to_string().as_deref(), Some("def"));
+    }
+
+    #[test]
+    fn line_selection_joins_wrapped_rows_and_terminates_with_a_newline() {
+        // `mock_term` treats "\n" as a soft wrap, so this is one logical line across two rows.
+        let mut wrapped = mock_term("abc\ndef");
+        wrapped.selection =
+            Some(Selection::new(SelectionType::Lines, Point::new(Line(1), Column(1)), Side::Left));
+        assert_eq!(wrapped.selection_to_string().as_deref(), Some("abcdef\n"));
+    }
+
+    #[test]
+    fn line_selection_stops_at_a_hard_line_break() {
+        let mut hard_break = mock_term("abc\r\ndef");
+        hard_break.selection =
+            Some(Selection::new(SelectionType::Lines, Point::new(Line(1), Column(1)), Side::Left));
+        assert_eq!(hard_break.selection_to_string().as_deref(), Some("def\n"));
+    }
+
+    #[test]
+    fn line_selection_ignores_the_anchor_side_and_column() {
+        // Anchoring on the far edge with the opposite side must select the same line.
+        let mut term = mock_term("abc\r\ndef");
+        term.selection =
+            Some(Selection::new(SelectionType::Lines, Point::new(Line(0), Column(2)), Side::Right));
+        assert_eq!(term.selection_to_string().as_deref(), Some("abc\n"));
     }
 
     #[test]

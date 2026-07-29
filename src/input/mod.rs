@@ -61,7 +61,7 @@ const SELECTION_SCROLLING_STEP: f64 = 20.;
 /// Distance before a touch input is considered a drag.
 const MAX_TAP_DISTANCE: f64 = 20.;
 
-/// Maximum delay between two clicks in a double-click sequence.
+/// Maximum delay between two clicks in a double-click or triple-click sequence.
 const CLICK_THRESHOLD: Duration = Duration::from_millis(400);
 
 const SELECTION_CLIPBOARDS: [ClipboardType; 2] =
@@ -73,6 +73,10 @@ fn next_click_state(mouse: &Mouse, button: MouseButton, point: Point, now: Insta
 
     match mouse.click_state {
         ClickState::Click if same_target && elapsed < CLICK_THRESHOLD => ClickState::DoubleClick,
+        ClickState::DoubleClick if same_target && elapsed < CLICK_THRESHOLD => {
+            ClickState::TripleClick
+        },
+        // A fourth click matches no arm and so restarts the sequence at a single click.
         _ => ClickState::Click,
     }
 }
@@ -518,7 +522,12 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
                 self.ctx.mouse_mut().block_hint_launcher = true;
                 self.ctx.start_selection(SelectionType::Semantic, point, side);
             },
-            ClickState::None | ClickState::DoubleClick => (),
+            ClickState::TripleClick if !control => {
+                self.ctx.mouse_mut().block_hint_launcher = true;
+                self.ctx.start_selection(SelectionType::Lines, point, side);
+            },
+            // Control is reserved for the block selection started on the first click.
+            ClickState::None | ClickState::DoubleClick | ClickState::TripleClick => (),
         }
     }
 
@@ -1011,6 +1020,67 @@ mod tests {
         let now = Instant::now();
         let mut mouse = Mouse {
             click_state: ClickState::Click,
+            last_click_timestamp: now - CLICK_THRESHOLD,
+            last_click_button: MouseButton::Left,
+            last_click_point: Some(point),
+            ..Mouse::default()
+        };
+
+        assert_eq!(next_click_state(&mouse, MouseButton::Left, point, now), ClickState::Click);
+
+        mouse.last_click_timestamp = now - Duration::from_millis(100);
+        assert_eq!(next_click_state(&mouse, MouseButton::Right, point, now), ClickState::Click);
+        assert_eq!(
+            next_click_state(
+                &mouse,
+                MouseButton::Left,
+                Point::new(point.line, point.column + 1),
+                now,
+            ),
+            ClickState::Click
+        );
+    }
+
+    #[test]
+    fn click_state_detects_same_cell_triple_click() {
+        let point = Point::new(Line(2), Column(3));
+        let now = Instant::now();
+        let mouse = Mouse {
+            click_state: ClickState::DoubleClick,
+            last_click_timestamp: now - Duration::from_millis(100),
+            last_click_button: MouseButton::Left,
+            last_click_point: Some(point),
+            ..Mouse::default()
+        };
+
+        assert_eq!(
+            next_click_state(&mouse, MouseButton::Left, point, now),
+            ClickState::TripleClick
+        );
+    }
+
+    #[test]
+    fn click_state_restarts_the_sequence_after_a_triple_click() {
+        let point = Point::new(Line(2), Column(3));
+        let now = Instant::now();
+        let mouse = Mouse {
+            click_state: ClickState::TripleClick,
+            last_click_timestamp: now - Duration::from_millis(100),
+            last_click_button: MouseButton::Left,
+            last_click_point: Some(point),
+            ..Mouse::default()
+        };
+
+        // A fourth rapid click wraps back around to a single click rather than staying on lines.
+        assert_eq!(next_click_state(&mouse, MouseButton::Left, point, now), ClickState::Click);
+    }
+
+    #[test]
+    fn click_state_rejects_triple_click_on_timeout_button_and_cell_changes() {
+        let point = Point::new(Line(2), Column(3));
+        let now = Instant::now();
+        let mut mouse = Mouse {
+            click_state: ClickState::DoubleClick,
             last_click_timestamp: now - CLICK_THRESHOLD,
             last_click_button: MouseButton::Left,
             last_click_point: Some(point),

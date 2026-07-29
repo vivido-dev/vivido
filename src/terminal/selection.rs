@@ -94,6 +94,7 @@ pub enum SelectionType {
     Simple,
     Block,
     Semantic,
+    Lines,
 }
 
 /// Describes a region of a 2-dimensional area.
@@ -205,7 +206,9 @@ impl Selection {
                         && start.side == Side::Left
                         && end.side == Side::Right)
             },
-            SelectionType::Semantic => false,
+            // Both expand from their anchors at range time, so they always cover at least one
+            // cell -- a triple click on a blank line still selects that line.
+            SelectionType::Semantic | SelectionType::Lines => false,
         }
     }
 
@@ -276,12 +279,24 @@ impl Selection {
             SelectionType::Simple => self.range_simple(start, end, columns),
             SelectionType::Block => self.range_block(start, end),
             SelectionType::Semantic => Some(Self::range_semantic(term, start.point, end.point)),
+            SelectionType::Lines => Some(Self::range_lines(term, start.point, end.point)),
         }
     }
 
     fn range_semantic<T>(term: &Term<T>, start: Point, end: Point) -> SelectionRange {
         let start = term.semantic_search_left(start);
         let end = term.semantic_search_right(end);
+
+        SelectionRange { start, end, is_block: false }
+    }
+
+    /// Expand to the logical lines the anchors sit on, crossing soft wraps.
+    ///
+    /// The anchors' sides are deliberately ignored: a line selection always spans the full grid
+    /// width, so where the click landed within the row does not matter.
+    fn range_lines<T>(term: &Term<T>, start: Point, end: Point) -> SelectionRange {
+        let start = term.line_search_left(start);
+        let end = term.line_search_right(end);
 
         SelectionRange { start, end, is_block: false }
     }
@@ -511,6 +526,52 @@ mod tests {
                 is_block: true
             }
         );
+    }
+
+    /// A line selection covers the full grid width, whichever cell and side it was anchored on.
+    ///
+    /// 1. [  ][ B][  ][  ][  ]
+    /// 2. [BX][XX][XX][XX][XE]
+    #[test]
+    fn line_selection_spans_the_full_width() {
+        let size = (10, 5);
+        let selection =
+            Selection::new(SelectionType::Lines, Point::new(Line(2), Column(1)), Side::Right);
+
+        assert_eq!(
+            selection.to_range(&term(size.0, size.1)).unwrap(),
+            SelectionRange {
+                start: Point::new(Line(2), Column(0)),
+                end: Point::new(Line(2), Column(4)),
+                is_block: false,
+            }
+        );
+    }
+
+    /// Dragging after a triple click keeps snapping whole lines in.
+    #[test]
+    fn line_selection_extends_by_whole_lines() {
+        let size = (10, 5);
+        let mut selection =
+            Selection::new(SelectionType::Lines, Point::new(Line(2), Column(3)), Side::Right);
+        selection.update(Point::new(Line(4), Column(1)), Side::Left);
+
+        assert_eq!(
+            selection.to_range(&term(size.0, size.1)).unwrap(),
+            SelectionRange {
+                start: Point::new(Line(2), Column(0)),
+                end: Point::new(Line(4), Column(4)),
+                is_block: false,
+            }
+        );
+    }
+
+    #[test]
+    fn line_is_never_empty() {
+        let selection =
+            Selection::new(SelectionType::Lines, Point::new(Line(1), Column(0)), Side::Right);
+
+        assert!(!selection.is_empty());
     }
 
     #[test]
