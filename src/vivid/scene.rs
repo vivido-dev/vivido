@@ -12,6 +12,8 @@ use vivid_protocol::revision::{
     TrackRevision,
 };
 use vivid_protocol::scene::SceneNode;
+
+use crate::vivid::target::{ClipRect, NodePlacement, PresentationTarget, TerminalTarget};
 use vivid_protocol::surface::SurfaceDefinition;
 use vivid_protocol::track::{
     KindConfiguration, MILESTONE_BUFFERED_ENDED, MILESTONE_CHANNEL_ACCEPTED,
@@ -49,14 +51,6 @@ pub struct Frame {
     pub alpha_mode: u64,
     pub rgba: Arc<[u8]>,
     pub damage: Option<Arc<[RasterDamageRect]>>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ClipRect {
-    pub x: i64,
-    pub y: i64,
-    pub width: i64,
-    pub height: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -271,6 +265,7 @@ struct State {
 struct Inner {
     state: Mutex<State>,
     changed: Condvar,
+    target: Arc<dyn PresentationTarget>,
 }
 
 #[derive(Clone)]
@@ -278,7 +273,23 @@ pub struct SharedScene(Arc<Inner>);
 
 impl Default for SharedScene {
     fn default() -> Self {
-        Self(Arc::new(Inner { state: Mutex::new(State::default()), changed: Condvar::new() }))
+        Self::new(Arc::new(TerminalTarget))
+    }
+}
+
+impl SharedScene {
+    /// Build a scene for one presentation target. The target decides what node geometry means,
+    /// so it is fixed for the scene's lifetime exactly as it is for a session (core §1).
+    pub fn new(target: Arc<dyn PresentationTarget>) -> Self {
+        Self(Arc::new(Inner {
+            state: Mutex::new(State::default()),
+            changed: Condvar::new(),
+            target,
+        }))
+    }
+
+    pub fn target(&self) -> &Arc<dyn PresentationTarget> {
+        &self.0.target
     }
 }
 
@@ -346,7 +357,7 @@ impl SharedScene {
         let mut posters = Vec::new();
         let mut retained_pixels = 0_u64;
         for node in scene.nodes.values() {
-            if let Some((poster, pixels)) = retained_poster(&state, session, node)
+            if let Some((poster, pixels)) = retained_poster(&*self.0.target, &state, session, node)
                 && retained_pixels.saturating_add(pixels) <= MAX_RETAINED_POSTER_PIXELS
             {
                 retained_pixels = retained_pixels.saturating_add(pixels);
@@ -1280,7 +1291,7 @@ impl SharedScene {
         for mutation in mutations {
             match mutation {
                 NodeMutation::Create(node) => {
-                    validate_terminal_node(&node).map_err(CommitRejection::Failed)?;
+                    self.0.target.validate_node(&node).map_err(CommitRejection::Failed)?;
                     let identity = context
                         .node(node.node_id)
                         .map_err(|_| CommitRejection::Failed("invalid node ID"))?;
@@ -1301,7 +1312,7 @@ impl SharedScene {
                     candidate.insert(identity, node);
                 },
                 NodeMutation::Update(node) => {
-                    validate_terminal_node(&node).map_err(CommitRejection::Failed)?;
+                    self.0.target.validate_node(&node).map_err(CommitRejection::Failed)?;
                     let identity = context
                         .node(node.node_id)
                         .map_err(|_| CommitRejection::Failed("invalid node ID"))?;
@@ -1363,12 +1374,12 @@ impl SharedScene {
         let mut items = Vec::new();
         for (session_identity, scene) in &state.scenes {
             for node in scene.nodes.values().filter(|node| node.visible) {
-                let Some((mut x, mut y, width, height, text_layer, text_anchored)) =
-                    terminal_geometry(node)
-                else {
+                let Some(placement) = self.0.target.placement(node) else {
                     continue;
                 };
-                let mut clip = terminal_clip(node);
+                let NodePlacement { width, height, text_layer, text_anchored, .. } = placement;
+                let (mut x, mut y) = (placement.x, placement.y);
+                let mut clip = self.0.target.clip(node);
                 if text_anchored {
                     let Some(anchor_identity) = node_anchor_identity(*session_identity, node)
                     else {
@@ -1632,6 +1643,7 @@ fn node_anchor_identity(session: SessionIdentity, node: &SceneNode) -> Option<An
 }
 
 fn retained_poster(
+    target: &dyn PresentationTarget,
     state: &State,
     session: SessionIdentity,
     node: &SceneNode,
@@ -1639,7 +1651,8 @@ fn retained_poster(
     if !node.visible {
         return None;
     }
-    let (x, y, width, height, text_layer, text_anchored) = terminal_geometry(node)?;
+    let placement = target.placement(node)?;
+    let NodePlacement { x, y, width, height, text_layer, text_anchored } = placement;
     if !text_anchored {
         return None;
     }
@@ -1673,7 +1686,7 @@ fn retained_poster(
             height,
             text_layer,
             z_index: node.z_index,
-            clip: terminal_clip(node),
+            clip: target.clip(node),
             frame: frame.clone(),
             capture_policy: surface.definition.policy,
         },
@@ -1740,51 +1753,6 @@ fn track_status(identity: TrackIdentity, track: &Track) -> TrackStatus {
         maximum_channel_bytes: track.maximum_channel_bytes,
         maximum_channel_records: track.maximum_channel_records,
     }
-}
-
-fn validate_terminal_node(node: &SceneNode) -> Result<(), &'static str> {
-    node.validate().map_err(|_| "invalid scene node")?;
-    terminal_geometry(node).ok_or("invalid terminal node geometry")?;
-    if terminal_clip(node).is_none() && node.clip.is_some() {
-        return Err("invalid terminal node clip");
-    }
-    Ok(())
-}
-
-fn terminal_geometry(node: &SceneNode) -> Option<(i64, i64, i64, i64, u64, bool)> {
-    let value = |key| node.geometry.iter().find(|entry| entry.0 == key).map(|entry| &entry.1);
-    let coordinate_space = value(0)?.as_u64()?;
-    let x = value(1)?.as_i64()?;
-    let y = value(2)?.as_i64()?;
-    let width = value(3)?.as_i64()?;
-    let height = value(4)?.as_i64()?;
-    let layer = value(5)?.as_u64()?;
-    if width <= 0
-        || height <= 0
-        || layer > 2
-        || !matches!(coordinate_space, 1 | 2)
-        || (coordinate_space == 1 && node.geometry.len() != 6)
-        || (coordinate_space == 2
-            && (node.geometry.len() != 8 || value(6)?.as_u64()? == 0 || value(7)?.as_u64()? == 0))
-    {
-        return None;
-    }
-    Some((x, y, width, height, layer, coordinate_space == 2))
-}
-
-fn terminal_clip(node: &SceneNode) -> Option<ClipRect> {
-    let clip = node.clip.as_ref()?;
-    if clip.len() != 4 {
-        return None;
-    }
-    let value = |key| clip.iter().find(|entry| entry.0 == key).map(|entry| &entry.1);
-    let result = ClipRect {
-        x: value(0)?.as_i64()?,
-        y: value(1)?.as_i64()?,
-        width: value(2)?.as_i64()?,
-        height: value(3)?.as_i64()?,
-    };
-    (result.width > 0 && result.height > 0).then_some(result)
 }
 
 pub fn track_kind_name(configuration: &TrackConfiguration) -> &'static str {

@@ -3,6 +3,7 @@
 mod audio;
 mod decoder;
 pub mod scene;
+pub mod target;
 mod transport;
 
 use std::collections::{HashMap, HashSet};
@@ -26,7 +27,7 @@ use vivid_protocol::anchor::{self, AnchorKey};
 use vivid_protocol::auth::{self, Secret32};
 use vivid_protocol::cbor::Value;
 use vivid_protocol::context::{
-    ContextDefinition, ContextState, OP_KNOWN_MASK, OP_SURFACE_TRACK_MEDIA, OP_TERMINAL_ANCHOR,
+    ContextDefinition, ContextState, OP_SURFACE_TRACK_MEDIA, OP_TERMINAL_ANCHOR,
 };
 use vivid_protocol::identity::{
     AnchorIdentity, ContextIdentity, PresenterInstanceId, SessionIdentity, SurfaceIdentity,
@@ -308,6 +309,9 @@ impl VividService {
     }
 
     pub fn handle_terminal_marker(&self, marker: &str, line: i32, column: usize, alternate: bool) {
+        if !self.scene.target().accepts_anchors() {
+            return;
+        }
         let Ok(marker) = anchor::parse_marker(marker) else {
             return;
         };
@@ -606,27 +610,22 @@ fn establish_root_session(
         )?;
         return Err(io::Error::new(ErrorKind::PermissionDenied, "root authentication failed"));
     }
-    if hello.target_profile != registry::TERMINAL_SURFACE {
+    let target = shared.scene.target().clone();
+    if hello.target_profile != target.profile_name() {
         return Err(send_fatal(
             &writer,
             request_id,
             messages::ERROR_UNSUPPORTED_PROFILE,
-            "Vivido is a terminal-surface-v1 target",
+            "this window presents a different target profile",
         ));
     }
-    let supported = [
-        registry::CORE_CONTROL,
-        registry::LIVE_MEDIA,
-        registry::OBSERVABILITY,
-        registry::TERMINAL_SURFACE,
-        registry::TIMED_MEDIA,
-    ];
+    let supported = target.supported_profiles();
     if hello.required_profiles.iter().any(|profile| !supported.contains(&profile.as_str())) {
         return Err(send_fatal(
             &writer,
             request_id,
             messages::ERROR_UNSUPPORTED_PROFILE,
-            "a required profile is not implemented by the terminal target",
+            "a required profile is not implemented by this target",
         ));
     }
     let mut accepted = hello.required_profiles.clone();
@@ -673,7 +672,7 @@ fn establish_root_session(
         session_tag,
         root_context_id: root_context.context_id,
         target_generation: metrics.generation,
-        target_profile: registry::TERMINAL_SURFACE.into(),
+        target_profile: target.profile_name().into(),
         target_descriptor: target_descriptor(metrics.geometry, metrics.settled),
         accepted_profiles: accepted,
         maximum_control_body: hello
@@ -707,7 +706,7 @@ fn establish_root_session(
             ContextState::root(
                 identity,
                 root_context.context_id,
-                OP_KNOWN_MASK & !vivid_protocol::context::OP_DESKTOP_INPUT,
+                target.root_operation_classes(),
                 presenter_contract(),
             )
             .map_err(io::Error::other)?,
