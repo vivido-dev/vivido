@@ -49,6 +49,7 @@ use vivid_protocol::track::{
 };
 use vivid_protocol::wire::{ConnectionKind, RECORD_OPTIONAL, Record};
 
+use crate::display::SizeInfo;
 use crate::event::{EventProxy, EventType};
 use crate::terminal::event::EventListener;
 use crate::terminal::grid::Dimensions;
@@ -80,15 +81,37 @@ const CHANNEL_FLOW_RECORDS: u64 = 128;
 const CHANNEL_OPEN_DEADLINE_US: u64 = 30_000_000;
 const MAX_SCENE_NODES: usize = 256;
 
-#[derive(Debug, Clone, Copy)]
-pub struct DisplayMetrics {
+/// Geometry of the `terminal-surface-v1` presentation target.
+///
+/// The target generation is owned by the service and assigned when a geometry is accepted, so it
+/// is deliberately not part of this type: a caller cannot supply, reuse, or skip a generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DisplayGeometry {
     pub viewport_width: u32,
     pub viewport_height: u32,
     pub columns: u32,
     pub rows: u32,
     pub cell_width: u32,
     pub cell_height: u32,
-    pub generation: u64,
+}
+
+impl From<SizeInfo> for DisplayGeometry {
+    fn from(size: SizeInfo) -> Self {
+        Self {
+            viewport_width: size.width() as u32,
+            viewport_height: size.height() as u32,
+            columns: size.columns() as u32,
+            rows: size.screen_lines() as u32,
+            cell_width: size.cell_width().round() as u32,
+            cell_height: size.cell_height().round() as u32,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DisplayMetrics {
+    geometry: DisplayGeometry,
+    generation: u64,
 }
 
 struct SessionRuntime {
@@ -134,18 +157,19 @@ pub struct VividService {
 }
 
 impl VividService {
-    pub fn start(metrics: DisplayMetrics, event_proxy: EventProxy) -> io::Result<Self> {
+    pub fn start(geometry: DisplayGeometry, event_proxy: EventProxy) -> io::Result<Self> {
         Self::start_with_wake(
-            metrics,
+            geometry,
             Arc::new(move || event_proxy.send_event(EventType::VividFrame)),
         )
     }
 
     fn start_with_wake(
-        metrics: DisplayMetrics,
+        geometry: DisplayGeometry,
         wake: Arc<dyn Fn() + Send + Sync>,
     ) -> io::Result<Self> {
-        validate_metrics(metrics)?;
+        validate_geometry(geometry)?;
+        let metrics = DisplayMetrics { geometry, generation: 1 };
         let (listener, control_endpoint, directory) = bind_local_listener()?;
         let mut secret = [0_u8; 32];
         getrandom::fill(&mut secret).map_err(|error| {
@@ -198,33 +222,43 @@ impl VividService {
         self.scene.clone()
     }
 
-    pub fn update_metrics(&self, mut metrics: DisplayMetrics) -> Option<u64> {
-        if validate_metrics(metrics).is_err() {
+    /// Accept a new terminal geometry, returning the target generation assigned to it.
+    ///
+    /// Every later `WELCOME` reports the accepted geometry, and the change is queued for the next
+    /// `flush_display_change` so live sessions observe it as `TARGET_CHANGED`.
+    pub fn update_metrics(&self, geometry: DisplayGeometry) -> Option<u64> {
+        if validate_geometry(geometry).is_err() {
             return None;
         }
         let mut current = lock(&self.shared.metrics);
-        if current.viewport_width == metrics.viewport_width
-            && current.viewport_height == metrics.viewport_height
-            && current.columns == metrics.columns
-            && current.rows == metrics.rows
-            && current.cell_width == metrics.cell_width
-            && current.cell_height == metrics.cell_height
-        {
+        if current.geometry == geometry {
             return None;
         }
-        metrics.generation = current.generation.checked_add(1)?;
-        *current = metrics;
-        *lock(&self.shared.pending_metrics) = Some(metrics);
-        Some(metrics.generation)
+        let generation = current.generation.checked_add(1)?;
+        *current = DisplayMetrics { geometry, generation };
+        *lock(&self.shared.pending_metrics) = Some(*current);
+        Some(generation)
     }
 
+    /// Announce a queued display change, or re-announce the current one as settled.
+    ///
+    /// A resize is announced unsettled on the frame that applies it, and the settle timer only
+    /// fires afterwards. The settled announcement therefore has to be rebuilt from the current
+    /// metrics, because the queued change was already consumed by that earlier frame.
     pub fn flush_display_change(&self, settled_generation: Option<u64>) {
-        let metrics = lock(&self.shared.pending_metrics).take();
-        let Some(metrics) = metrics else {
-            return;
+        let pending = lock(&self.shared.pending_metrics).take();
+        let metrics = match pending {
+            Some(metrics) => metrics,
+            None => {
+                let current = *lock(&self.shared.metrics);
+                if settled_generation != Some(current.generation) {
+                    return;
+                }
+                current
+            },
         };
         let settled = settled_generation == Some(metrics.generation);
-        let mut payload = target_descriptor(metrics, settled);
+        let mut payload = target_descriptor(metrics.geometry, settled);
         payload.push((9, Value::Unsigned(metrics.generation)));
         payload.push((10, Value::Unsigned(0x1f)));
         let body = Envelope::new(0, payload).encode().expect("target-change payload is valid");
@@ -635,7 +669,7 @@ fn establish_root_session(
         root_context_id: root_context.context_id,
         target_generation: metrics.generation,
         target_profile: registry::TERMINAL_SURFACE.into(),
-        target_descriptor: target_descriptor(metrics, true),
+        target_descriptor: target_descriptor(metrics.geometry, true),
         accepted_profiles: accepted,
         maximum_control_body: hello
             .maximum_control_body
@@ -2513,33 +2547,29 @@ fn presenter_contract() -> ResourceContract {
     contract
 }
 
-fn target_descriptor(metrics: DisplayMetrics, settled: bool) -> Vec<(u64, Value)> {
+fn target_descriptor(geometry: DisplayGeometry, settled: bool) -> Vec<(u64, Value)> {
     vec![
-        (0, Value::Unsigned(u64::from(metrics.viewport_width))),
-        (1, Value::Unsigned(u64::from(metrics.viewport_height))),
-        (2, Value::Unsigned(u64::from(metrics.columns))),
-        (3, Value::Unsigned(u64::from(metrics.rows))),
-        (4, Value::Unsigned(u64::from(metrics.cell_width))),
-        (5, Value::Unsigned(u64::from(metrics.cell_height))),
+        (0, Value::Unsigned(u64::from(geometry.viewport_width))),
+        (1, Value::Unsigned(u64::from(geometry.viewport_height))),
+        (2, Value::Unsigned(u64::from(geometry.columns))),
+        (3, Value::Unsigned(u64::from(geometry.rows))),
+        (4, Value::Unsigned(u64::from(geometry.cell_width))),
+        (5, Value::Unsigned(u64::from(geometry.cell_height))),
         (6, Value::Bool(settled)),
         (7, Value::Unsigned(3)),
         (8, Value::Unsigned(MAX_ACTIVE_ANCHORS as u64)),
     ]
 }
 
-fn validate_metrics(metrics: DisplayMetrics) -> io::Result<()> {
-    if metrics.viewport_width == 0
-        || metrics.viewport_height == 0
-        || metrics.columns == 0
-        || metrics.rows == 0
-        || metrics.cell_width == 0
-        || metrics.cell_height == 0
-        || metrics.generation == 0
+fn validate_geometry(geometry: DisplayGeometry) -> io::Result<()> {
+    if geometry.viewport_width == 0
+        || geometry.viewport_height == 0
+        || geometry.columns == 0
+        || geometry.rows == 0
+        || geometry.cell_width == 0
+        || geometry.cell_height == 0
     {
-        Err(io::Error::new(
-            ErrorKind::InvalidInput,
-            "terminal target metrics and generation must be positive",
-        ))
+        Err(io::Error::new(ErrorKind::InvalidInput, "terminal target geometry must be positive"))
     } else {
         Ok(())
     }
@@ -2692,9 +2722,50 @@ mod tests {
     use vivid_protocol::track::{KindConfiguration, TrackConfiguration, TrackMode};
     use vivid_sdk::{
         CoordinateModel, MILESTONE_OUTPUT_READY, ProducerAuthentication, ProducerConfig,
-        RasterConfiguration, RequestMetadata, SceneNode, SlotBinding, SurfaceDefinition,
-        SurfaceDescriptor, SurfaceRole, TrackWaitCondition,
+        RasterConfiguration, RequestMetadata, SceneNode, SessionEvent, SlotBinding,
+        SurfaceDefinition, SurfaceDescriptor, SurfaceRole, TrackWaitCondition,
     };
+
+    fn test_geometry() -> DisplayGeometry {
+        DisplayGeometry {
+            viewport_width: 800,
+            viewport_height: 600,
+            columns: 80,
+            rows: 24,
+            cell_width: 10,
+            cell_height: 25,
+        }
+    }
+
+    fn connect(service: &VividService) -> vivid_sdk::Session {
+        vivid_sdk::Session::connect(ProducerConfig {
+            endpoint_control: Some(service.control_endpoint().to_owned()),
+            authentication: ProducerAuthentication::root_hex(service.root_secret()).unwrap(),
+            ..ProducerConfig::default()
+        })
+        .unwrap()
+    }
+
+    /// Read the columns, rows, and settled flag out of a terminal target descriptor.
+    fn descriptor_summary(descriptor: &[(u64, Value)]) -> (u64, u64, bool) {
+        (
+            descriptor[2].1.as_u64().unwrap(),
+            descriptor[3].1.as_u64().unwrap(),
+            descriptor[6].1.as_bool().unwrap(),
+        )
+    }
+
+    fn next_target_change(session: &vivid_sdk::Session) -> messages::PayloadMap {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            match session.take_event().unwrap() {
+                Some(SessionEvent::TargetChanged(payload)) => return payload,
+                Some(_) => continue,
+                None => thread::sleep(Duration::from_millis(1)),
+            }
+        }
+        panic!("presenter never sent TARGET_CHANGED");
+    }
 
     #[test]
     fn contract_is_finite_and_terminal_only() {
@@ -2713,16 +2784,58 @@ mod tests {
 
     #[test]
     fn target_descriptor_advertises_anchor_v3() {
-        let metrics = DisplayMetrics {
-            viewport_width: 800,
-            viewport_height: 600,
-            columns: 80,
-            rows: 24,
-            cell_width: 10,
-            cell_height: 25,
-            generation: 1,
+        assert_eq!(target_descriptor(test_geometry(), true)[7].1.as_u64(), Some(3));
+    }
+
+    /// A window resize has to reach producers. The startup geometry is only correct until the
+    /// first resize, so a producer started afterwards must be told the terminal's real size in
+    /// `WELCOME`, and a producer that is already running must see it as `TARGET_CHANGED`.
+    #[test]
+    fn a_display_change_reaches_live_and_later_sessions() {
+        let service = VividService::start_with_wake(test_geometry(), Arc::new(|| {})).unwrap();
+        let live = connect(&service);
+        assert_eq!(descriptor_summary(&live.info().target_descriptor), (80, 24, true));
+
+        let resized = DisplayGeometry {
+            viewport_width: 1550,
+            viewport_height: 1450,
+            columns: 155,
+            rows: 58,
+            ..test_geometry()
         };
-        assert_eq!(target_descriptor(metrics, true)[7].1.as_u64(), Some(3));
+        let generation = service.update_metrics(resized).expect("a resize is a new generation");
+        assert_eq!(generation, 2);
+
+        service.flush_display_change(None);
+        let announced = next_target_change(&live);
+        assert_eq!(descriptor_summary(&announced), (155, 58, false));
+        assert_eq!(announced[9].1.as_u64(), Some(generation));
+
+        // The settle timer fires after the unsettled announcement was already consumed.
+        service.flush_display_change(Some(generation));
+        let settled = next_target_change(&live);
+        assert_eq!(descriptor_summary(&settled), (155, 58, true));
+        assert_eq!(settled[9].1.as_u64(), Some(generation));
+
+        let later = connect(&service);
+        assert_eq!(descriptor_summary(&later.info().target_descriptor), (155, 58, true));
+        assert_eq!(later.info().target_generation.get(), generation);
+    }
+
+    #[test]
+    fn an_unchanged_stale_or_degenerate_display_change_is_never_announced() {
+        let service = VividService::start_with_wake(test_geometry(), Arc::new(|| {})).unwrap();
+        let live = connect(&service);
+
+        assert_eq!(service.update_metrics(test_geometry()), None);
+        assert_eq!(service.update_metrics(DisplayGeometry { rows: 0, ..test_geometry() }), None);
+        service.flush_display_change(None);
+        // A settle timer from a superseded generation must not re-announce the current target.
+        service.flush_display_change(Some(0));
+
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(live.take_event().unwrap(), None);
+        assert_eq!(live.info().target_generation.get(), 1);
     }
 
     #[test]
@@ -2757,22 +2870,8 @@ mod tests {
 
     #[test]
     fn migrated_sdk_submits_a_live_raster_over_an_authenticated_channel() {
-        let metrics = DisplayMetrics {
-            viewport_width: 800,
-            viewport_height: 600,
-            columns: 80,
-            rows: 24,
-            cell_width: 10,
-            cell_height: 25,
-            generation: 1,
-        };
-        let service = VividService::start_with_wake(metrics, Arc::new(|| {})).unwrap();
-        let config = ProducerConfig {
-            endpoint_control: Some(service.control_endpoint().to_owned()),
-            authentication: ProducerAuthentication::root_hex(service.root_secret()).unwrap(),
-            ..ProducerConfig::default()
-        };
-        let mut session = vivid_sdk::Session::connect(config).unwrap();
+        let service = VividService::start_with_wake(test_geometry(), Arc::new(|| {})).unwrap();
+        let mut session = connect(&service);
         let context_id = session.info().root_context_id;
         let surface = session
             .create_surface(
