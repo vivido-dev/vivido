@@ -2,9 +2,10 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use vivid_protocol::identity::{
-    ContextIdentity, NodeIdentity, SessionIdentity, SurfaceIdentity, TrackIdentity,
+    AnchorIdentity, ContextIdentity, NodeIdentity, SessionIdentity, SurfaceIdentity, TrackIdentity,
 };
 use vivid_protocol::revision::{
     ChannelGeneration, SceneRevision, SurfaceGeneration, SurfaceRevision, TargetGeneration,
@@ -14,8 +15,9 @@ use vivid_protocol::scene::SceneNode;
 use vivid_protocol::surface::SurfaceDefinition;
 use vivid_protocol::track::{
     KindConfiguration, MILESTONE_BUFFERED_ENDED, MILESTONE_CHANNEL_ACCEPTED,
-    MILESTONE_CHANNEL_DETACHED, MILESTONE_CLOCK_STARTED, MILESTONE_OUTPUT_READY,
-    MILESTONE_PRESENTED, MILESTONE_TRACK_LOST, TrackConfiguration, TrackState,
+    MILESTONE_CHANNEL_DETACHED, MILESTONE_CLOCK_STARTED, MILESTONE_EOS_ACCEPTED,
+    MILESTONE_OUTPUT_READY, MILESTONE_PRESENTED, MILESTONE_TRACK_LOST, TrackConfiguration,
+    TrackMode, TrackState,
 };
 
 pub type SurfaceKey = SurfaceIdentity;
@@ -26,6 +28,7 @@ pub const SLOT_AUDIO: u64 = 2;
 pub const SLOT_RASTER: u64 = 3;
 pub const SLOT_POSTER: u64 = 4;
 pub const ALPHA_STRAIGHT: u64 = 1;
+const MAX_RETAINED_POSTER_PIXELS: u64 = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RasterDamageRect {
@@ -147,6 +150,59 @@ struct Track {
     last_presentation_id: u64,
     maximum_channel_bytes: u64,
     maximum_channel_records: u64,
+    playback: Option<PlaybackClock>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PlaybackClock {
+    start_pts_us: i64,
+    started_at: Option<Instant>,
+    played_before_pause: Duration,
+    eos: bool,
+}
+
+impl PlaybackClock {
+    fn started(start_pts_us: i64) -> Self {
+        Self {
+            start_pts_us,
+            started_at: Some(Instant::now()),
+            played_before_pause: Duration::ZERO,
+            eos: false,
+        }
+    }
+
+    fn current_pts_us(self) -> i64 {
+        let elapsed = self
+            .started_at
+            .map(|started| started.elapsed())
+            .unwrap_or_default()
+            .saturating_add(self.played_before_pause);
+        self.start_pts_us.saturating_add(i64::try_from(elapsed.as_micros()).unwrap_or(i64::MAX))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TextAnchor {
+    column: usize,
+    line: i32,
+    alternate: bool,
+}
+
+#[derive(Debug, Clone)]
+struct RetainedPoster {
+    anchor: AnchorIdentity,
+    track_key: TrackIdentity,
+    surface_generation: SurfaceGeneration,
+    channel_generation: ChannelGeneration,
+    x: i64,
+    y: i64,
+    width: i64,
+    height: i64,
+    text_layer: u64,
+    z_index: i64,
+    clip: Option<ClipRect>,
+    frame: Arc<Frame>,
+    capture_policy: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -169,6 +225,11 @@ struct State {
     surfaces: HashMap<SurfaceIdentity, Surface>,
     tracks: HashMap<TrackIdentity, Track>,
     scenes: HashMap<SessionIdentity, SessionScene>,
+    anchors: HashMap<AnchorIdentity, TextAnchor>,
+    gone_anchors: HashSet<AnchorIdentity>,
+    detached_sessions: HashSet<SessionIdentity>,
+    retained_posters: Vec<RetainedPoster>,
+    alternate_screen: bool,
 }
 
 struct Inner {
@@ -214,6 +275,49 @@ impl SharedScene {
         state.surfaces.retain(|identity, _| identity.context.session != session);
         state.tracks.retain(|identity, _| identity.surface.context.session != session);
         state.scenes.remove(&session);
+        state.anchors.retain(|identity, _| identity.context.session != session);
+        state.gone_anchors.retain(|identity| identity.context.session != session);
+        state.detached_sessions.remove(&session);
+        state.retained_posters.retain(|poster| poster.anchor.context.session != session);
+        self.0.changed.notify_all();
+    }
+
+    /// End protocol authority while retaining only policy-permitted anchored visual posters.
+    ///
+    /// The retained objects are no longer addressable protocol state. They exist solely as
+    /// terminal presentation snapshots and are reclaimed with their authenticated anchors.
+    pub fn detach_session(&self, session: SessionIdentity) {
+        let mut state = self.lock();
+        let Some(scene) = state.scenes.get(&session) else {
+            return;
+        };
+        let mut posters = Vec::new();
+        let mut retained_pixels = 0_u64;
+        for node in scene.nodes.values() {
+            if let Some((poster, pixels)) = retained_poster(&state, session, node)
+                && retained_pixels.saturating_add(pixels) <= MAX_RETAINED_POSTER_PIXELS
+            {
+                retained_pixels = retained_pixels.saturating_add(pixels);
+                posters.push(poster);
+            }
+        }
+
+        let retained_anchors = posters.iter().map(|poster| poster.anchor).collect::<HashSet<_>>();
+        state.surfaces.retain(|identity, _| identity.context.session != session);
+        state.tracks.retain(|identity, _| identity.surface.context.session != session);
+        state.scenes.remove(&session);
+        state.anchors.retain(|identity, _| {
+            identity.context.session != session || retained_anchors.contains(identity)
+        });
+        state.gone_anchors.retain(|identity| identity.context.session != session);
+        state.retained_posters.retain(|poster| poster.anchor.context.session != session);
+        state.retained_posters.extend(posters);
+        if retained_anchors.is_empty() {
+            state.detached_sessions.remove(&session);
+        } else {
+            state.detached_sessions.insert(session);
+        }
+        gc_detached_sessions(&mut state);
         self.0.changed.notify_all();
     }
 
@@ -239,7 +343,142 @@ impl SharedScene {
                 scene.revision = next;
             }
         }
+        state.anchors.retain(|identity, _| {
+            identity.context.session != session || !contexts.contains(&identity.context.context_id)
+        });
+        state.gone_anchors.retain(|identity| {
+            identity.context.session != session || !contexts.contains(&identity.context.context_id)
+        });
+        state.retained_posters.retain(|poster| {
+            poster.anchor.context.session != session
+                || !contexts.contains(&poster.anchor.context.context_id)
+        });
+        gc_detached_sessions(&mut state);
         self.0.changed.notify_all();
+    }
+
+    pub fn anchor_positions(&self) -> Vec<(AnchorIdentity, usize, i32, bool)> {
+        let state = self.lock();
+        state
+            .anchors
+            .iter()
+            .map(|(&identity, anchor)| (identity, anchor.column, anchor.line, anchor.alternate))
+            .collect()
+    }
+
+    pub fn add_anchor(
+        &self,
+        identity: AnchorIdentity,
+        column: usize,
+        line: i32,
+        alternate: bool,
+    ) -> Result<(), &'static str> {
+        let mut state = self.lock();
+        if state.anchors.contains_key(&identity) || state.gone_anchors.contains(&identity) {
+            return Err("anchor identity was already used");
+        }
+        state.anchors.insert(identity, TextAnchor { column, line, alternate });
+        self.0.changed.notify_all();
+        Ok(())
+    }
+
+    pub fn anchor_status(&self, identity: AnchorIdentity) -> (u64, Option<(usize, i32, bool)>) {
+        let state = self.lock();
+        if let Some(anchor) = state.anchors.get(&identity) {
+            (1, Some((anchor.column, anchor.line, anchor.alternate)))
+        } else if state.gone_anchors.contains(&identity) {
+            (2, None)
+        } else {
+            (0, None)
+        }
+    }
+
+    pub fn apply_anchor_resize(
+        &self,
+        positions: impl IntoIterator<Item = (AnchorIdentity, Option<(usize, i32, bool)>)>,
+    ) -> Vec<AnchorIdentity> {
+        let mut state = self.lock();
+        let mut removed = Vec::new();
+        for (identity, position) in positions {
+            match (state.anchors.get_mut(&identity), position) {
+                (Some(anchor), Some((column, line, alternate))) => {
+                    *anchor = TextAnchor { column, line, alternate };
+                },
+                (Some(_), None) => removed.push(identity),
+                _ => {},
+            }
+        }
+        remove_anchors(&mut state, &removed);
+        self.0.changed.notify_all();
+        removed
+    }
+
+    /// Move terminal-semantic anchors with a grid scroll. Positive `lines` moves content up.
+    pub fn scroll_anchors(
+        &self,
+        origin: i32,
+        end: i32,
+        lines: i32,
+        history_size: usize,
+    ) -> Vec<AnchorIdentity> {
+        if lines == 0 || origin >= end {
+            return Vec::new();
+        }
+        let minimum_line = -(history_size.min(i32::MAX as usize) as i32);
+        let mut state = self.lock();
+        let mut removed = Vec::new();
+        for (&identity, anchor) in &mut state.anchors {
+            let old = anchor.line;
+            let next = if lines > 0 {
+                if origin == 0 && old < end {
+                    Some(old.saturating_sub(lines))
+                } else if (origin..end).contains(&old) {
+                    (old >= origin.saturating_add(lines)).then_some(old.saturating_sub(lines))
+                } else {
+                    Some(old)
+                }
+            } else if (origin..end).contains(&old) {
+                let amount = lines.saturating_abs();
+                (old < end.saturating_sub(amount)).then_some(old.saturating_add(amount))
+            } else {
+                Some(old)
+            };
+            match next {
+                Some(line) if line >= minimum_line => anchor.line = line,
+                _ => removed.push(identity),
+            }
+        }
+        remove_anchors(&mut state, &removed);
+        self.0.changed.notify_all();
+        removed
+    }
+
+    pub fn clear_terminal(&self) -> Vec<AnchorIdentity> {
+        let mut state = self.lock();
+        let removed = state.anchors.keys().copied().collect::<Vec<_>>();
+        remove_anchors(&mut state, &removed);
+        self.0.changed.notify_all();
+        removed
+    }
+
+    pub fn set_alternate_screen(&self, alternate: bool) -> Vec<AnchorIdentity> {
+        let mut state = self.lock();
+        if state.alternate_screen == alternate {
+            return Vec::new();
+        }
+        state.alternate_screen = alternate;
+        let removed = if alternate {
+            Vec::new()
+        } else {
+            state
+                .anchors
+                .iter()
+                .filter_map(|(&identity, anchor)| anchor.alternate.then_some(identity))
+                .collect::<Vec<_>>()
+        };
+        remove_anchors(&mut state, &removed);
+        self.0.changed.notify_all();
+        removed
     }
 
     pub fn create_surface(
@@ -339,7 +578,13 @@ impl SharedScene {
     }
 
     pub fn surface_keys(&self) -> Vec<SurfaceIdentity> {
-        let mut keys = self.lock().surfaces.keys().copied().collect::<Vec<_>>();
+        let state = self.lock();
+        let mut keys = state
+            .surfaces
+            .keys()
+            .filter(|identity| !state.detached_sessions.contains(&identity.context.session))
+            .copied()
+            .collect::<Vec<_>>();
         keys.sort();
         keys
     }
@@ -379,6 +624,7 @@ impl SharedScene {
             last_presentation_id: 0,
             maximum_channel_bytes: 0,
             maximum_channel_records: 0,
+            playback: None,
         };
         let status = track_status(identity, &track);
         state.tracks.insert(identity, track);
@@ -451,8 +697,25 @@ impl SharedScene {
         self.lock().tracks.get(&identity).and_then(|track| track.frame.clone())
     }
 
+    pub fn active_track(
+        &self,
+        surface_identity: SurfaceIdentity,
+        slot: u64,
+    ) -> Option<TrackIdentity> {
+        let state = self.lock();
+        let track_id = *state.surfaces.get(&surface_identity)?.active_slots.get(&slot)?;
+        let identity = TrackIdentity { surface: surface_identity, track_id };
+        state.tracks.get(&identity).is_some_and(|track| track.lifecycle == 1).then_some(identity)
+    }
+
     pub fn track_keys(&self) -> Vec<TrackIdentity> {
-        let mut keys = self.lock().tracks.keys().copied().collect::<Vec<_>>();
+        let state = self.lock();
+        let mut keys = state
+            .tracks
+            .keys()
+            .filter(|identity| !state.detached_sessions.contains(&identity.surface.context.session))
+            .copied()
+            .collect::<Vec<_>>();
         keys.sort();
         keys
     }
@@ -635,6 +898,163 @@ impl SharedScene {
         Ok(())
     }
 
+    pub fn start_playback(
+        &self,
+        identity: TrackIdentity,
+        start_pts_us: i64,
+    ) -> Result<(), &'static str> {
+        let mut state = self.lock();
+        let master = state.tracks.get(&identity).ok_or("track does not exist")?;
+        if master.configuration.mode != TrackMode::Timed || master.lifecycle != 1 {
+            return Err("PLAY requires a live timed track");
+        }
+        let active = state
+            .surfaces
+            .get(&identity.surface)
+            .ok_or("surface does not exist")?
+            .active_slots
+            .values()
+            .copied()
+            .map(|track_id| TrackIdentity { surface: identity.surface, track_id })
+            .collect::<Vec<_>>();
+        let mut started = false;
+        for candidate in active {
+            let Some(track) = state.tracks.get_mut(&candidate) else {
+                continue;
+            };
+            if track.configuration.mode != TrackMode::Timed || track.lifecycle != 1 {
+                continue;
+            }
+            track.playback = Some(PlaybackClock::started(start_pts_us));
+            track.state.milestones |= MILESTONE_CLOCK_STARTED;
+            track.state.revision =
+                track.state.revision.advance().map_err(|_| "track revision exhausted")?;
+            started = true;
+        }
+        if !started {
+            return Err("PLAY surface has no active timed tracks");
+        }
+        self.0.changed.notify_all();
+        Ok(())
+    }
+
+    pub fn pause_playback(&self, identity: TrackIdentity) -> Result<(), &'static str> {
+        let mut state = self.lock();
+        let surface = identity.surface;
+        if !state.tracks.contains_key(&identity) {
+            return Err("track does not exist");
+        }
+        for track in state
+            .tracks
+            .iter_mut()
+            .filter_map(|(candidate, track)| (candidate.surface == surface).then_some(track))
+        {
+            if let Some(playback) = track.playback.as_mut()
+                && let Some(started) = playback.started_at.take()
+            {
+                playback.played_before_pause =
+                    playback.played_before_pause.saturating_add(started.elapsed());
+                track.state.revision =
+                    track.state.revision.advance().map_err(|_| "track revision exhausted")?;
+            }
+        }
+        self.0.changed.notify_all();
+        Ok(())
+    }
+
+    pub fn flush_playback(
+        &self,
+        identity: TrackIdentity,
+        new_epoch: u32,
+    ) -> Result<(), &'static str> {
+        let mut state = self.lock();
+        let track = state.tracks.get_mut(&identity).ok_or("track does not exist")?;
+        if track.configuration.mode != TrackMode::Timed || new_epoch <= track.state.media_epoch {
+            return Err("FLUSH requires a greater epoch on a timed track");
+        }
+        track.playback = None;
+        track.frame = None;
+        track.state.media_epoch = new_epoch;
+        track.state.milestones &= MILESTONE_CHANNEL_ACCEPTED;
+        track.state.revision =
+            track.state.revision.advance().map_err(|_| "track revision exhausted")?;
+        self.0.changed.notify_all();
+        Ok(())
+    }
+
+    pub fn mark_eos(
+        &self,
+        identity: TrackIdentity,
+        generation: ChannelGeneration,
+    ) -> Result<(), &'static str> {
+        let mut state = self.lock();
+        let track = state.tracks.get_mut(&identity).ok_or("track does not exist")?;
+        if track.state.channel_generation != generation {
+            return Err("stale channel generation");
+        }
+        if let Some(playback) = track.playback.as_mut() {
+            playback.eos = true;
+        }
+        track.state.milestones |= MILESTONE_EOS_ACCEPTED;
+        track.state.revision =
+            track.state.revision.advance().map_err(|_| "track revision exhausted")?;
+        self.0.changed.notify_all();
+        Ok(())
+    }
+
+    pub fn mark_buffered_ended(
+        &self,
+        identity: TrackIdentity,
+        generation: ChannelGeneration,
+    ) -> Result<(), &'static str> {
+        let mut state = self.lock();
+        let track = state.tracks.get_mut(&identity).ok_or("track does not exist")?;
+        if track.state.channel_generation != generation {
+            return Err("stale channel generation");
+        }
+        track.state.milestones |= MILESTONE_EOS_ACCEPTED | MILESTONE_BUFFERED_ENDED;
+        track.state.revision =
+            track.state.revision.advance().map_err(|_| "track revision exhausted")?;
+        self.0.changed.notify_all();
+        Ok(())
+    }
+
+    /// Pace decoded timed output against the surface-group PLAY clock.
+    ///
+    /// The first decoded frame is admitted immediately so the producer can satisfy
+    /// `MILESTONE_OUTPUT_READY`, activate slots, and issue PLAY without a startup deadlock.
+    pub fn wait_until_due(&self, identity: TrackIdentity, pts_us: i64) -> Result<(), &'static str> {
+        let mut state = self.lock();
+        loop {
+            let track = state.tracks.get(&identity).ok_or("track does not exist")?;
+            if track.configuration.mode != TrackMode::Timed
+                || track.frame.is_none()
+                || pts_us == i64::MIN
+            {
+                return Ok(());
+            }
+            let Some(playback) = track.playback else {
+                // Once one decoded output has primed the track, hold subsequent output until PLAY.
+                // Otherwise a fast channel can decode an entire file before the producer observes
+                // OUTPUT_READY and atomically activates the timed slots.
+                state = self.0.changed.wait(state).unwrap_or_else(|poisoned| poisoned.into_inner());
+                continue;
+            };
+            let remaining = pts_us.saturating_sub(playback.current_pts_us());
+            if remaining <= 0 {
+                return Ok(());
+            }
+            let wait = Duration::from_micros(u64::try_from(remaining).unwrap_or(u64::MAX))
+                .min(Duration::from_millis(20));
+            let result = self
+                .0
+                .changed
+                .wait_timeout(state, wait)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state = result.0;
+        }
+    }
+
     pub fn return_channel_capacity(
         &self,
         identity: TrackIdentity,
@@ -679,6 +1099,24 @@ impl SharedScene {
             return Err("transaction already exists");
         }
         Ok(())
+    }
+
+    pub fn transaction_context(
+        &self,
+        session: SessionIdentity,
+        transaction_id: u64,
+    ) -> Result<ContextIdentity, &'static str> {
+        let state = self.lock();
+        let scene = state.scenes.get(&session).ok_or("session does not exist")?;
+        let mut matches = scene
+            .pending
+            .keys()
+            .filter_map(|(context, candidate)| (*candidate == transaction_id).then_some(*context));
+        let context = matches.next().ok_or("transaction does not exist")?;
+        if matches.next().is_some() {
+            return Err("transaction ID is ambiguous within the session");
+        }
+        Ok(context)
     }
 
     pub fn queue_node_create(
@@ -820,11 +1258,46 @@ impl SharedScene {
         let mut items = Vec::new();
         for (session_identity, scene) in &state.scenes {
             for node in scene.nodes.values().filter(|node| node.visible) {
-                let Some((x, y, width, height, text_layer, text_anchored)) =
+                let Some((mut x, mut y, width, height, text_layer, text_anchored)) =
                     terminal_geometry(node)
                 else {
                     continue;
                 };
+                let mut clip = terminal_clip(node);
+                if text_anchored {
+                    let Some(anchor_identity) = node_anchor_identity(*session_identity, node)
+                    else {
+                        continue;
+                    };
+                    let Some(anchor) = state.anchors.get(&anchor_identity) else {
+                        continue;
+                    };
+                    if anchor.alternate != state.alternate_screen {
+                        continue;
+                    }
+                    let Some(anchor_x) = fixed_cells_i64(anchor.column) else {
+                        continue;
+                    };
+                    let anchor_y = i64::from(anchor.line) << 32;
+                    let Some(positioned_x) = x.checked_add(anchor_x) else {
+                        continue;
+                    };
+                    let Some(positioned_y) = y.checked_add(anchor_y) else {
+                        continue;
+                    };
+                    x = positioned_x;
+                    y = positioned_y;
+                    if let Some(value) = clip.as_mut() {
+                        let Some(positioned_x) = value.x.checked_add(anchor_x) else {
+                            continue;
+                        };
+                        let Some(positioned_y) = value.y.checked_add(anchor_y) else {
+                            continue;
+                        };
+                        value.x = positioned_x;
+                        value.y = positioned_y;
+                    }
+                }
                 let context = session_identity.context(node.surface_context_id).ok();
                 let Some(surface_key) = context.and_then(|context| {
                     context
@@ -859,11 +1332,59 @@ impl SharedScene {
                     text_anchored,
                     text_layer,
                     z_index: node.z_index,
-                    clip: terminal_clip(node),
+                    clip,
                     frame: frame.clone(),
                     capture_policy: surface.definition.policy,
                 });
             }
+        }
+        for poster in &state.retained_posters {
+            let Some(anchor) = state.anchors.get(&poster.anchor) else {
+                continue;
+            };
+            if anchor.alternate != state.alternate_screen {
+                continue;
+            }
+            let Some(anchor_x) = fixed_cells_i64(anchor.column) else {
+                continue;
+            };
+            let anchor_y = i64::from(anchor.line) << 32;
+            let Some(x) = poster.x.checked_add(anchor_x) else {
+                continue;
+            };
+            let Some(y) = poster.y.checked_add(anchor_y) else {
+                continue;
+            };
+            let clip = match poster.clip {
+                Some(mut clip) => {
+                    let Some(x) = clip.x.checked_add(anchor_x) else {
+                        continue;
+                    };
+                    let Some(y) = clip.y.checked_add(anchor_y) else {
+                        continue;
+                    };
+                    clip.x = x;
+                    clip.y = y;
+                    Some(clip)
+                },
+                None => None,
+            };
+            items.push(RenderItem {
+                track_key: poster.track_key,
+                surface_key: poster.track_key.surface,
+                surface_generation: poster.surface_generation,
+                channel_generation: poster.channel_generation,
+                x,
+                y,
+                width: poster.width,
+                height: poster.height,
+                text_anchored: true,
+                text_layer: poster.text_layer,
+                z_index: poster.z_index,
+                clip,
+                frame: poster.frame.clone(),
+                capture_policy: poster.capture_policy,
+            });
         }
         items.sort_by_key(|item| (item.text_layer, item.z_index));
         (revision, items)
@@ -878,11 +1399,16 @@ impl SharedScene {
         pts_us: i64,
     ) -> Result<(), &'static str> {
         let mut state = self.lock();
-        let surface = state.surfaces.get(&identity.surface).ok_or("surface does not exist")?;
+        let Some(surface) = state.surfaces.get(&identity.surface) else {
+            // Retained terminal-native posters have no live track milestone to acknowledge.
+            return Ok(());
+        };
         if surface.generation != surface_generation {
             return Err("stale surface generation");
         }
-        let track = state.tracks.get_mut(&identity).ok_or("track does not exist")?;
+        let Some(track) = state.tracks.get_mut(&identity) else {
+            return Ok(());
+        };
         if track.state.channel_generation != channel_generation
             || track.frame.as_ref().is_none_or(|frame| frame.frame_id != frame_id)
         {
@@ -953,7 +1479,13 @@ impl SharedScene {
     }
 
     pub fn session_ids(&self) -> Vec<SessionIdentity> {
-        let mut sessions = self.lock().scenes.keys().copied().collect::<Vec<_>>();
+        let state = self.lock();
+        let mut sessions = state
+            .scenes
+            .keys()
+            .filter(|session| !state.detached_sessions.contains(session))
+            .copied()
+            .collect::<Vec<_>>();
         sessions.sort();
         sessions
     }
@@ -976,6 +1508,98 @@ impl SharedScene {
 
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
         self.0.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+fn node_anchor_identity(session: SessionIdentity, node: &SceneNode) -> Option<AnchorIdentity> {
+    (node.geometry.iter().find(|entry| entry.0 == 0)?.1.as_u64()? == 2).then_some(())?;
+    let context_id = node.geometry.iter().find(|entry| entry.0 == 6)?.1.as_u64()?;
+    let anchor_id = node.geometry.iter().find(|entry| entry.0 == 7)?.1.as_u64()?;
+    session.context(context_id).ok()?.anchor(anchor_id).ok()
+}
+
+fn retained_poster(
+    state: &State,
+    session: SessionIdentity,
+    node: &SceneNode,
+) -> Option<(RetainedPoster, u64)> {
+    if !node.visible {
+        return None;
+    }
+    let (x, y, width, height, text_layer, text_anchored) = terminal_geometry(node)?;
+    if !text_anchored {
+        return None;
+    }
+    let anchor = node_anchor_identity(session, node)?;
+    state.anchors.get(&anchor)?;
+    let surface_key =
+        session.context(node.surface_context_id).ok()?.surface(node.surface_id).ok()?;
+    let surface = state.surfaces.get(&surface_key)?;
+    if surface.definition.policy & vivid_protocol::surface::POLICY_DENY_POSTER_RETENTION != 0 {
+        return None;
+    }
+    let (track_key, track, frame) =
+        [SLOT_PRIMARY_VIDEO, SLOT_RASTER, SLOT_POSTER].into_iter().find_map(|slot| {
+            let track_id = *surface.active_slots.get(&slot)?;
+            let track_key = TrackIdentity { surface: surface_key, track_id };
+            let track = state.tracks.get(&track_key)?;
+            (track.lifecycle == 1)
+                .then_some(track.frame.as_ref().map(|frame| (track_key, track, frame)))
+                .flatten()
+        })?;
+    let pixels = u64::from(frame.width).checked_mul(u64::from(frame.height))?;
+    Some((
+        RetainedPoster {
+            anchor,
+            track_key,
+            surface_generation: surface.generation,
+            channel_generation: track.state.channel_generation,
+            x,
+            y,
+            width,
+            height,
+            text_layer,
+            z_index: node.z_index,
+            clip: terminal_clip(node),
+            frame: frame.clone(),
+            capture_policy: surface.definition.policy,
+        },
+        pixels,
+    ))
+}
+
+fn fixed_cells_i64(cells: usize) -> Option<i64> {
+    i64::try_from(cells).ok()?.checked_shl(32)
+}
+
+fn remove_anchors(state: &mut State, removed: &[AnchorIdentity]) {
+    if removed.is_empty() {
+        return;
+    }
+    let removed = removed.iter().copied().collect::<HashSet<_>>();
+    for identity in &removed {
+        state.anchors.remove(identity);
+        state.gone_anchors.insert(*identity);
+    }
+    for (session, scene) in &mut state.scenes {
+        scene.nodes.retain(|_, node| {
+            node_anchor_identity(*session, node).is_none_or(|anchor| !removed.contains(&anchor))
+        });
+    }
+    state.retained_posters.retain(|poster| !removed.contains(&poster.anchor));
+    gc_detached_sessions(state);
+}
+
+fn gc_detached_sessions(state: &mut State) {
+    let detached = state.detached_sessions.iter().copied().collect::<Vec<_>>();
+    for session in detached {
+        let has_posters =
+            state.retained_posters.iter().any(|poster| poster.anchor.context.session == session);
+        if !has_posters {
+            state.detached_sessions.remove(&session);
+            state.anchors.retain(|identity, _| identity.context.session != session);
+            state.gone_anchors.retain(|identity| identity.context.session != session);
+        }
     }
 }
 
@@ -1063,7 +1687,9 @@ mod tests {
     use super::*;
     use vivid_protocol::cbor::Value;
     use vivid_protocol::identity::PresenterInstanceId;
+    use vivid_protocol::messages::LaneClass;
     use vivid_protocol::surface::{CoordinateModel, SurfaceDescriptor, SurfaceRole};
+    use vivid_protocol::track::{KindConfiguration, RasterConfiguration, VideoConfiguration};
 
     fn session(presenter: u8, id: u64) -> SessionIdentity {
         SessionIdentity::new(PresenterInstanceId([presenter; 16]), id).unwrap()
@@ -1147,5 +1773,219 @@ mod tests {
                 .is_err()
         );
         assert_eq!(scene.scene_status(session, 10).revision, SceneRevision::ZERO);
+    }
+
+    #[test]
+    fn authenticated_anchor_positions_and_retains_a_clean_goodbye_poster() {
+        let scene = SharedScene::default();
+        let session = session(2, 1);
+        let context = session.context(1).unwrap();
+        let surface_identity = context.surface(1).unwrap();
+        let track_identity = surface_identity.track(1).unwrap();
+        let anchor_identity = context.anchor(9).unwrap();
+        scene.register_session(session, TargetGeneration::ONE).unwrap();
+        scene.create_surface(surface_identity, definition(1, 1)).unwrap();
+        scene
+            .create_track(
+                track_identity,
+                TrackConfiguration {
+                    context_id: 1,
+                    surface_id: 1,
+                    track_id: 1,
+                    slot: SLOT_RASTER,
+                    mode: TrackMode::Live,
+                    lane: LaneClass::Bulk,
+                    maximum_record_body: 128,
+                    maximum_rate_millihertz: 1_000,
+                    maximum_encoded_bits_per_second: 8_192,
+                    maximum_records_per_second: 1,
+                    maximum_inflight_body_bytes: 1_024,
+                    kind: KindConfiguration::Raster(RasterConfiguration {
+                        width: 1,
+                        height: 1,
+                        alpha_mode: ALPHA_STRAIGHT,
+                        delta_enabled: false,
+                        maximum_delta_operations: 1,
+                        zstd_enabled: false,
+                    }),
+                    target_latency_us: 0,
+                    maximum_latency_us: 1_000_000,
+                    retained_pixel_charge: 1,
+                },
+            )
+            .unwrap();
+        scene.accept_channel(track_identity, ChannelGeneration::ONE, 1_024, 8).unwrap();
+        scene
+            .publish_frame(
+                track_identity,
+                ChannelGeneration::ONE,
+                80,
+                1,
+                1,
+                true,
+                Frame {
+                    frame_id: 1,
+                    pts_us: 0,
+                    width: 1,
+                    height: 1,
+                    sar_num: 1,
+                    sar_den: 1,
+                    alpha_mode: ALPHA_STRAIGHT,
+                    rgba: Arc::from([255, 0, 0, 255]),
+                    damage: None,
+                },
+            )
+            .unwrap();
+        scene
+            .activate_tracks(
+                surface_identity,
+                SurfaceRevision::ONE,
+                &[(SLOT_RASTER, 1, ChannelGeneration::ONE, MILESTONE_OUTPUT_READY)],
+            )
+            .unwrap();
+        scene.add_anchor(anchor_identity, 3, 5, false).unwrap();
+        scene.begin_transaction(context, 1).unwrap();
+        scene
+            .queue_node_create(
+                context,
+                1,
+                SceneNode {
+                    owning_context_id: 1,
+                    node_id: 1,
+                    surface_context_id: 1,
+                    surface_id: 1,
+                    geometry: vec![
+                        (0, Value::Unsigned(2)),
+                        (1, Value::Unsigned(0)),
+                        (2, Value::Unsigned(0)),
+                        (3, Value::Unsigned(2_u64 << 32)),
+                        (4, Value::Unsigned(1_u64 << 32)),
+                        (5, Value::Unsigned(1)),
+                        (6, Value::Unsigned(1)),
+                        (7, Value::Unsigned(9)),
+                    ],
+                    fit: vivid_protocol::scene::Fit::Contain,
+                    linear_sampling: true,
+                    z_index: 0,
+                    visible: true,
+                    opacity: u16::MAX,
+                    clip: None,
+                },
+            )
+            .unwrap();
+        scene
+            .commit_transaction(context, 1, TargetGeneration::ONE, Some(SceneRevision::ZERO))
+            .unwrap();
+        let item = scene.snapshot().1.pop().unwrap();
+        assert_eq!((item.x, item.y), (3_i64 << 32, 5_i64 << 32));
+
+        scene.detach_session(session);
+        assert_eq!(scene.snapshot().1.len(), 1);
+        assert!(scene.scroll_anchors(0, 24, 2, 0).is_empty());
+        assert_eq!(scene.snapshot().1[0].y, 3_i64 << 32);
+        assert_eq!(scene.clear_terminal(), vec![anchor_identity]);
+        assert!(scene.snapshot().1.is_empty());
+    }
+
+    #[test]
+    fn timed_output_primes_once_then_waits_for_playback_clock() {
+        let scene = SharedScene::default();
+        let session = session(3, 1);
+        let context = session.context(1).unwrap();
+        let surface_identity = context.surface(1).unwrap();
+        let track_identity = surface_identity.track(1).unwrap();
+        let maximum_record_body = vivid_protocol::media::video_body_len(16).unwrap();
+        scene.register_session(session, TargetGeneration::ONE).unwrap();
+        scene.create_surface(surface_identity, definition(1, 1)).unwrap();
+        scene
+            .create_track(
+                track_identity,
+                TrackConfiguration {
+                    context_id: 1,
+                    surface_id: 1,
+                    track_id: 1,
+                    slot: SLOT_PRIMARY_VIDEO,
+                    mode: TrackMode::Timed,
+                    lane: LaneClass::Bulk,
+                    maximum_record_body,
+                    maximum_rate_millihertz: 30_000,
+                    maximum_encoded_bits_per_second: 1_000_000,
+                    maximum_records_per_second: 30,
+                    maximum_inflight_body_bytes: u64::from(maximum_record_body) * 2,
+                    kind: KindConfiguration::Video(VideoConfiguration {
+                        codec: "av1".into(),
+                        packetization: "av1-low-overhead-tu-v1".into(),
+                        extradata: vec![],
+                        coded_width: 1,
+                        coded_height: 1,
+                        profile: 0,
+                        level: 0,
+                        maximum_reorder_depth: 1,
+                        color_primaries: 1,
+                        transfer: 1,
+                        matrix: 0,
+                        signal_range: 1,
+                        aspect_numerator: 1,
+                        aspect_denominator: 1,
+                        maximum_access_unit_bytes: 16,
+                        codec_string: None,
+                        decoder_configuration: None,
+                    }),
+                    target_latency_us: 0,
+                    maximum_latency_us: 1_000_000,
+                    retained_pixel_charge: 1,
+                },
+            )
+            .unwrap();
+        scene.accept_channel(track_identity, ChannelGeneration::ONE, 1_024, 8).unwrap();
+        scene
+            .publish_decoded_frame(
+                track_identity,
+                ChannelGeneration::ONE,
+                Frame {
+                    frame_id: 1,
+                    pts_us: 0,
+                    width: 1,
+                    height: 1,
+                    sar_num: 1,
+                    sar_den: 1,
+                    alpha_mode: ALPHA_STRAIGHT,
+                    rgba: Arc::from([0, 0, 0, 255]),
+                    damage: None,
+                },
+            )
+            .unwrap();
+        scene
+            .activate_tracks(
+                surface_identity,
+                SurfaceRevision::ONE,
+                &[(SLOT_PRIMARY_VIDEO, 1, ChannelGeneration::ONE, MILESTONE_OUTPUT_READY)],
+            )
+            .unwrap();
+
+        let waiting_scene = scene.clone();
+        let waiting =
+            std::thread::spawn(move || waiting_scene.wait_until_due(track_identity, 40_000));
+        std::thread::sleep(Duration::from_millis(10));
+        assert!(
+            !waiting.is_finished(),
+            "a second decoded frame must not replace the priming frame before PLAY"
+        );
+
+        let playback_started = Instant::now();
+        scene.start_playback(track_identity, 0).unwrap();
+        waiting.join().unwrap().unwrap();
+        assert!(playback_started.elapsed() >= Duration::from_millis(25));
+        assert!(matches!(
+            scene.evaluate_track_wait(track_identity, ChannelGeneration::ONE, 5, None),
+            TrackWaitEvaluation::Satisfied(_)
+        ));
+
+        scene.mark_eos(track_identity, ChannelGeneration::ONE).unwrap();
+        scene.mark_buffered_ended(track_identity, ChannelGeneration::ONE).unwrap();
+        assert!(matches!(
+            scene.evaluate_track_wait(track_identity, ChannelGeneration::ONE, 6, None),
+            TrackWaitEvaluation::Satisfied(_)
+        ));
     }
 }

@@ -358,7 +358,6 @@ impl AudioOutput {
         samples.drain(..discard);
     }
 
-    #[allow(dead_code)]
     pub fn pts_reached(&self, pts_us: i64) -> bool {
         if !self.shared.enabled.load(Ordering::SeqCst)
             || !self.shared.prebuffered.load(Ordering::SeqCst)
@@ -376,7 +375,6 @@ impl AudioOutput {
                 )
     }
 
-    #[allow(dead_code)]
     pub fn video_gate_stalled(&self) -> bool {
         self.shared.enabled.load(Ordering::SeqCst)
             && !self.shared.prebuffered.load(Ordering::SeqCst)

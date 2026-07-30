@@ -29,7 +29,8 @@ use vivid_protocol::context::{
     ContextDefinition, ContextState, OP_KNOWN_MASK, OP_SURFACE_TRACK_MEDIA, OP_TERMINAL_ANCHOR,
 };
 use vivid_protocol::identity::{
-    ContextIdentity, PresenterInstanceId, SessionIdentity, SurfaceIdentity, TrackIdentity,
+    AnchorIdentity, ContextIdentity, PresenterInstanceId, SessionIdentity, SurfaceIdentity,
+    TrackIdentity,
 };
 use vivid_protocol::media;
 use vivid_protocol::messages::{
@@ -51,7 +52,8 @@ use vivid_protocol::wire::{ConnectionKind, RECORD_OPTIONAL, Record};
 use crate::event::{EventProxy, EventType};
 use crate::terminal::event::EventListener;
 use crate::terminal::grid::Dimensions;
-use crate::terminal::term::Term;
+use crate::terminal::index::{Column, Line, Point};
+use crate::terminal::term::{ResizePoint, Term};
 use crate::vivid::audio::{AudioOutput, supports as supports_audio};
 use crate::vivid::decoder::Decoder;
 use crate::vivid::scene::{
@@ -243,16 +245,30 @@ impl VividService {
         T: EventListener,
         S: Dimensions,
     {
-        terminal.resize(size);
+        let anchors = self.scene.anchor_positions();
+        let mut positions = anchors
+            .iter()
+            .map(|(_, column, line, alternate)| {
+                Some(ResizePoint {
+                    point: Point::new(Line(*line), Column(*column)),
+                    alternate: *alternate,
+                })
+            })
+            .collect::<Vec<_>>();
+        terminal.resize_with_tracking(size, &mut positions);
+        let updates = anchors.into_iter().zip(positions).map(|((identity, _, _, _), position)| {
+            (
+                identity,
+                position.map(|position| {
+                    (position.point.column.0, position.point.line.0, position.alternate)
+                }),
+            )
+        });
+        let removed = self.scene.apply_anchor_resize(updates);
+        self.notify_anchor_events(messages::ANCHOR_GONE, &removed);
     }
 
-    pub fn handle_terminal_marker(
-        &self,
-        marker: &str,
-        _line: i32,
-        _column: usize,
-        _alternate: bool,
-    ) {
+    pub fn handle_terminal_marker(&self, marker: &str, line: i32, column: usize, alternate: bool) {
         let Ok(marker) = anchor::parse_marker(marker) else {
             return;
         };
@@ -271,11 +287,22 @@ impl VividService {
         {
             return;
         }
+        let Ok(context) = session.identity.context(marker.context_id) else {
+            return;
+        };
+        let Ok(identity) = context.anchor(marker.anchor_id) else {
+            return;
+        };
         let mut seen = lock(&session.seen_anchors);
         if seen.len() >= MAX_SEEN_ANCHORS
             || !seen.insert((marker.context_id, marker.anchor_id))
             || seen.len() > MAX_ACTIVE_ANCHORS
         {
+            return;
+        }
+        drop(seen);
+        if let Err(error) = self.scene.add_anchor(identity, column, line, alternate) {
+            log::debug!("rejected Vivid anchor {identity:?}: {error}");
             return;
         }
         let body = Envelope::new(
@@ -284,21 +311,34 @@ impl VividService {
                 (0, Value::Unsigned(marker.context_id)),
                 (1, Value::Unsigned(marker.anchor_id)),
                 (2, Value::Unsigned(1)),
+                (3, Value::Unsigned(column as u64)),
+                (4, Value::Unsigned(u64::try_from(line).unwrap_or_default())),
+                (5, Value::Bool(line >= 0)),
+                (6, Value::Unsigned(lock(&self.shared.metrics).generation)),
             ],
         )
         .encode()
         .expect("anchor event is valid");
         let _ = session.writer.write_record(messages::ANCHOR_READY, marker.anchor_id, &body);
+        (self.shared.wake)();
     }
 
-    pub fn handle_grid_scroll(&self, _origin: i32, _end: i32, _lines: i32, _history_size: usize) {}
+    pub fn handle_grid_scroll(&self, origin: i32, end: i32, lines: i32, history_size: usize) {
+        let removed = self.scene.scroll_anchors(origin, end, lines, history_size);
+        self.notify_anchor_events(messages::ANCHOR_GONE, &removed);
+        (self.shared.wake)();
+    }
 
     pub fn handle_terminal_clear(&self) {
-        self.clear_anchors();
+        let removed = self.scene.clear_terminal();
+        self.notify_anchor_events(messages::ANCHOR_GONE, &removed);
+        (self.shared.wake)();
     }
 
-    pub fn handle_screen_swap(&self, _alternate: bool) {
-        self.clear_anchors();
+    pub fn handle_screen_swap(&self, alternate: bool) {
+        let removed = self.scene.set_alternate_screen(alternate);
+        self.notify_anchor_events(messages::ANCHOR_GONE, &removed);
+        (self.shared.wake)();
     }
 
     pub fn update_visibility(&self, _visible: bool, _display_offset: usize) {}
@@ -354,9 +394,27 @@ impl VividService {
         self.scene.evaluate_track_wait(identity, generation, condition, value)
     }
 
-    fn clear_anchors(&self) {
-        for session in lock(&self.shared.registry).sessions.values() {
-            lock(&session.seen_anchors).clear();
+    fn notify_anchor_events(&self, record_type: u16, anchors: &[AnchorIdentity]) {
+        if anchors.is_empty() {
+            return;
+        }
+        let sessions = lock(&self.shared.registry).sessions.clone();
+        for identity in anchors {
+            let Some(session) = sessions.get(&identity.context.session.session_id) else {
+                continue;
+            };
+            let body = Envelope::new(
+                0,
+                vec![
+                    (0, Value::Unsigned(identity.context.context_id)),
+                    (1, Value::Unsigned(identity.anchor_id)),
+                    (2, Value::Unsigned(2)),
+                ],
+            )
+            .encode();
+            if let Ok(body) = body {
+                let _ = session.writer.write_record(record_type, identity.anchor_id, &body);
+            }
         }
     }
 }
@@ -415,6 +473,7 @@ fn handle_control(
     let session = establish_root_session(shared, writer.clone(), preface, &hello, hello_request)?;
     reader.set_maximum(hello.maximum_control_body)?;
     writer.set_maximum(hello.maximum_control_body)?;
+    let mut clean_goodbye = false;
     loop {
         let record = match reader.read_record(ConnectionKind::Control) {
             Ok(record) => record,
@@ -442,6 +501,7 @@ fn handle_control(
             },
         }
         if record.record_type == messages::GOODBYE {
+            clean_goodbye = true;
             break;
         }
     }
@@ -458,7 +518,12 @@ fn handle_control(
     for output in removed_audio {
         output.stop();
     }
-    shared.scene.remove_session(session.identity);
+    if clean_goodbye {
+        shared.scene.detach_session(session.identity);
+    } else {
+        shared.scene.remove_session(session.identity);
+    }
+    (shared.wake)();
     Ok(())
 }
 
@@ -1070,12 +1135,10 @@ fn dispatch_control(
         },
         messages::ABORT_TXN => {
             let transaction = envelope.transaction_id.unwrap_or(record.object_id);
-            let context_id = envelope
-                .payload
-                .first()
-                .and_then(|entry| entry.1.as_u64())
-                .ok_or_else(|| ControlError::bad_message("abort omits context"))?;
-            let context = context_identity(session, context_id)?;
+            let context = shared
+                .scene
+                .transaction_context(session.identity, transaction)
+                .map_err(ControlError::state)?;
             if !shared.scene.abort_transaction(context, transaction) {
                 return Err(ControlError::not_found("transaction does not exist"));
             }
@@ -1083,12 +1146,16 @@ fn dispatch_control(
         },
         messages::COMMIT_TXN => {
             let transaction = envelope.transaction_id.unwrap_or(record.object_id);
-            let context_id = envelope
-                .payload
-                .first()
-                .and_then(|entry| entry.1.as_u64())
-                .unwrap_or(session.root_context.context_id);
-            let context = context_identity(session, context_id)?;
+            let map = StrictMap::new("COMMIT_TXN", &value, &[0])
+                .map_err(|_| ControlError::bad_message("invalid transaction commit"))?;
+            if map.required_u64(0).map_err(|_| ControlError::bad_message("presentation mode"))? != 0
+            {
+                return Err(ControlError::unsupported("unsupported presentation mode"));
+            }
+            let context = shared
+                .scene
+                .transaction_context(session.identity, transaction)
+                .map_err(ControlError::state)?;
             let expected_target = envelope
                 .expected_target_generation
                 .map(TargetGeneration::new)
@@ -1124,6 +1191,32 @@ fn dispatch_control(
                 0,
                 Envelope::new(request_id, scene_status_payload(&status)).encode(),
             )
+        },
+        messages::QUERY_ANCHOR => {
+            let map = StrictMap::new("QUERY_ANCHOR", &value, &[0, 1])
+                .map_err(|_| ControlError::bad_message("invalid anchor query"))?;
+            let context_id =
+                map.required_u64(0).map_err(|_| ControlError::bad_message("anchor context"))?;
+            let anchor_id =
+                map.required_u64(1).map_err(|_| ControlError::bad_message("anchor ID"))?;
+            let identity = context_identity(session, context_id)?
+                .anchor(anchor_id)
+                .map_err(|_| ControlError::bad_message("anchor ID is zero"))?;
+            let (state, position) = shared.scene.anchor_status(identity);
+            let mut payload = vec![
+                (0, Value::Unsigned(context_id)),
+                (1, Value::Unsigned(anchor_id)),
+                (2, Value::Unsigned(state)),
+            ];
+            if let Some((column, line, _)) = position {
+                payload.push((3, Value::Unsigned(column as u64)));
+                if line >= 0 {
+                    payload.push((4, Value::Unsigned(line as u64)));
+                }
+                payload.push((5, Value::Bool(true)));
+            }
+            payload.push((6, Value::Unsigned(lock(&shared.metrics).generation)));
+            (messages::ANCHOR_STATUS, anchor_id, Envelope::new(request_id, payload).encode())
         },
         messages::WAIT_TRACK => {
             let map = StrictMap::new("WAIT_TRACK", &value, &[0, 1, 2, 3, 4, 5, 6])
@@ -1318,63 +1411,82 @@ fn dispatch_control(
             (messages::OK, record.object_id, Ok(messages::ok(request_id)))
         },
         messages::PLAY | messages::PAUSE | messages::FLUSH | messages::DRAIN => {
-            // Timed state is track-local. The media channel remains ordered and EOS never pauses.
             let identity = payload_track_identity(session, &value)?;
-            if shared.scene.track_status(identity).is_none() {
-                return Err(ControlError::not_found("track does not exist"));
-            }
-            if let Some(output) = lock(&shared.audio_outputs).get(&identity).cloned() {
-                match record.record_type {
-                    messages::PLAY => {
-                        let map =
-                            StrictMap::new("PLAY", &value, &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
-                                .map_err(|_| ControlError::bad_message("invalid PLAY schema"))?;
-                        let start = map
-                            .required(3)
-                            .map_err(|_| ControlError::bad_message("PLAY start PTS"))?
-                            .as_i64()
-                            .ok_or_else(|| ControlError::bad_message("PLAY start PTS"))?;
-                        let minimum = map
-                            .required_u64(4)
-                            .map_err(|_| ControlError::bad_message("PLAY minimum buffer"))?;
-                        let maximum = map
-                            .required_u64(5)
-                            .map_err(|_| ControlError::bad_message("PLAY maximum latency"))?;
-                        let rate = map
-                            .required(6)
-                            .map_err(|_| ControlError::bad_message("PLAY rate"))?
-                            .as_i64()
-                            .ok_or_else(|| ControlError::bad_message("PLAY rate"))?;
-                        let generation = map
-                            .required_u64(10)
-                            .map_err(|_| ControlError::bad_message("PLAY generation"))?;
-                        if minimum > maximum
-                            || rate != 1_i64 << 32
-                            || map.required_u64(7).ok() != Some(1)
-                            || map.required_u64(8).ok() != Some(0)
-                            || map.required_u64(9).ok() != Some(1)
-                            || generation
-                                != shared
-                                    .scene
-                                    .track_status(identity)
-                                    .map(|status| status.state.channel_generation.get())
-                                    .unwrap_or(0)
-                        {
-                            return Err(ControlError::bad_state(
-                                "PLAY policy, latency, rate, or generation is invalid",
-                            ));
-                        }
+            let status = shared
+                .scene
+                .track_status(identity)
+                .ok_or_else(|| ControlError::not_found("track does not exist"))?;
+            let output = lock(&shared.audio_outputs).get(&identity).cloned();
+            match record.record_type {
+                messages::PLAY => {
+                    let map = StrictMap::new("PLAY", &value, &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
+                        .map_err(|_| ControlError::bad_message("invalid PLAY schema"))?;
+                    let start = map
+                        .required(3)
+                        .map_err(|_| ControlError::bad_message("PLAY start PTS"))?
+                        .as_i64()
+                        .ok_or_else(|| ControlError::bad_message("PLAY start PTS"))?;
+                    let minimum = map
+                        .required_u64(4)
+                        .map_err(|_| ControlError::bad_message("PLAY minimum buffer"))?;
+                    let maximum = map
+                        .required_u64(5)
+                        .map_err(|_| ControlError::bad_message("PLAY maximum latency"))?;
+                    let rate = map
+                        .required(6)
+                        .map_err(|_| ControlError::bad_message("PLAY rate"))?
+                        .as_i64()
+                        .ok_or_else(|| ControlError::bad_message("PLAY rate"))?;
+                    let generation = map
+                        .required_u64(10)
+                        .map_err(|_| ControlError::bad_message("PLAY generation"))?;
+                    if minimum > maximum
+                        || rate != 1_i64 << 32
+                        || map.required_u64(7).ok() != Some(1)
+                        || map.required_u64(8).ok() != Some(0)
+                        || map.required_u64(9).ok() != Some(1)
+                        || generation != status.state.channel_generation.get()
+                    {
+                        return Err(ControlError::bad_state(
+                            "PLAY policy, latency, rate, or generation is invalid",
+                        ));
+                    }
+                    shared.scene.start_playback(identity, start).map_err(ControlError::state)?;
+                    if let Some(output) = output {
                         output.configure_play(start, minimum);
                         output.start();
-                    },
-                    messages::PAUSE => output.pause(),
-                    messages::FLUSH => output.flush(),
-                    messages::DRAIN => {
+                    }
+                },
+                messages::PAUSE => {
+                    shared.scene.pause_playback(identity).map_err(ControlError::state)?;
+                    if let Some(output) = output {
+                        output.pause();
+                    }
+                },
+                messages::FLUSH => {
+                    let epoch = StrictMap::new("FLUSH", &value, &[0, 1, 2, 3])
+                        .map_err(|_| ControlError::bad_message("invalid FLUSH schema"))?
+                        .required_u64(3)
+                        .ok()
+                        .and_then(|value| u32::try_from(value).ok())
+                        .ok_or_else(|| ControlError::bad_message("FLUSH epoch"))?;
+                    shared.scene.flush_playback(identity, epoch).map_err(ControlError::state)?;
+                    if let Some(output) = output {
+                        output.flush();
+                    }
+                },
+                messages::DRAIN => {
+                    if let Some(output) = output {
                         output.signal_eos();
                         let writer = session.writer.clone();
                         let object_id = record.object_id;
+                        let scene = shared.scene.clone();
+                        let generation = status.state.channel_generation;
                         thread::spawn(move || {
                             let result = output.wait_drained();
+                            if result.is_ok() {
+                                let _ = scene.mark_buffered_ended(identity, generation);
+                            }
                             let succeeded = result.is_ok();
                             let body = match result {
                                 Ok(()) => messages::ok(request_id),
@@ -1391,9 +1503,13 @@ fn dispatch_control(
                             let _ = writer.write_record(record_type, object_id, &body);
                         });
                         return Ok(None);
-                    },
-                    _ => unreachable!(),
-                }
+                    }
+                    shared
+                        .scene
+                        .mark_buffered_ended(identity, status.state.channel_generation)
+                        .map_err(ControlError::state)?;
+                },
+                _ => unreachable!(),
             }
             (messages::OK, record.object_id, Ok(messages::ok(request_id)))
         },
@@ -1788,7 +1904,7 @@ fn channel_loop(
                         )
                     })?
                     .push(packet)?;
-                if let Some(decoded) = frames.into_iter().last() {
+                for decoded in frames {
                     let (sar_num, sar_den) = match &configuration.kind {
                         KindConfiguration::Video(configuration) => (
                             u32::try_from(configuration.aspect_numerator).unwrap_or(u32::MAX),
@@ -1796,6 +1912,7 @@ fn channel_loop(
                         ),
                         _ => unreachable!(),
                     };
+                    wait_until_video_due(shared, identity, decoded.pts_us)?;
                     shared
                         .scene
                         .publish_decoded_frame(
@@ -1842,37 +1959,44 @@ fn channel_loop(
                 shared.scene.mark_output_ready(identity, generation).map_err(io::Error::other)?;
             },
             messages::CHANNEL_EOS => {
-                if let Some(decoder) = video_decoder.as_mut()
-                    && let Some(decoded) = decoder.finish()?.into_iter().last()
-                {
-                    let (sar_num, sar_den) = match &configuration.kind {
-                        KindConfiguration::Video(configuration) => (
-                            u32::try_from(configuration.aspect_numerator).unwrap_or(u32::MAX),
-                            u32::try_from(configuration.aspect_denominator).unwrap_or(u32::MAX),
-                        ),
-                        _ => unreachable!(),
-                    };
+                shared.scene.mark_eos(identity, generation).map_err(io::Error::other)?;
+                if let Some(decoder) = video_decoder.as_mut() {
+                    for decoded in decoder.finish()? {
+                        let (sar_num, sar_den) = match &configuration.kind {
+                            KindConfiguration::Video(configuration) => (
+                                u32::try_from(configuration.aspect_numerator).unwrap_or(u32::MAX),
+                                u32::try_from(configuration.aspect_denominator).unwrap_or(u32::MAX),
+                            ),
+                            _ => unreachable!(),
+                        };
+                        wait_until_video_due(shared, identity, decoded.pts_us)?;
+                        shared
+                            .scene
+                            .publish_decoded_frame(
+                                identity,
+                                generation,
+                                Frame {
+                                    frame_id: shared
+                                        .scene
+                                        .track_status(identity)
+                                        .map(|status| status.state.last_media_id)
+                                        .unwrap_or(0),
+                                    pts_us: decoded.pts_us,
+                                    width: decoded.width,
+                                    height: decoded.height,
+                                    sar_num,
+                                    sar_den,
+                                    alpha_mode: scene::ALPHA_STRAIGHT,
+                                    rgba: Arc::from(decoded.rgba),
+                                    damage: None,
+                                },
+                            )
+                            .map_err(io::Error::other)?;
+                        (shared.wake)();
+                    }
                     shared
                         .scene
-                        .publish_decoded_frame(
-                            identity,
-                            generation,
-                            Frame {
-                                frame_id: shared
-                                    .scene
-                                    .track_status(identity)
-                                    .map(|status| status.state.last_media_id)
-                                    .unwrap_or(0),
-                                pts_us: decoded.pts_us,
-                                width: decoded.width,
-                                height: decoded.height,
-                                sar_num,
-                                sar_den,
-                                alpha_mode: scene::ALPHA_STRAIGHT,
-                                rgba: Arc::from(decoded.rgba),
-                                damage: None,
-                            },
-                        )
+                        .mark_buffered_ended(identity, generation)
                         .map_err(io::Error::other)?;
                 }
                 if let Some((output, decoder)) = audio.as_mut() {
@@ -1918,6 +2042,32 @@ fn channel_loop(
                 .encode()?,
             )?;
         }
+    }
+}
+
+fn wait_until_video_due(
+    shared: &Arc<ServiceShared>,
+    identity: TrackIdentity,
+    pts_us: i64,
+) -> io::Result<()> {
+    if shared.scene.latest_frame(identity).is_none() {
+        return Ok(());
+    }
+    loop {
+        let audio = shared
+            .scene
+            .active_track(identity.surface, scene::SLOT_AUDIO)
+            .and_then(|identity| lock(&shared.audio_outputs).get(&identity).cloned());
+        let Some(audio) = audio else {
+            return shared.scene.wait_until_due(identity, pts_us).map_err(io::Error::other);
+        };
+        if audio.pts_reached(pts_us) {
+            return Ok(());
+        }
+        if audio.video_gate_stalled() {
+            return shared.scene.wait_until_due(identity, pts_us).map_err(io::Error::other);
+        }
+        thread::sleep(Duration::from_millis(2));
     }
 }
 
@@ -2404,8 +2554,8 @@ mod tests {
     use vivid_protocol::track::{KindConfiguration, TrackConfiguration, TrackMode};
     use vivid_sdk::{
         CoordinateModel, MILESTONE_OUTPUT_READY, ProducerAuthentication, ProducerConfig,
-        RasterConfiguration, RequestMetadata, SurfaceDefinition, SurfaceDescriptor, SurfaceRole,
-        TrackWaitCondition,
+        RasterConfiguration, RequestMetadata, SceneNode, SlotBinding, SurfaceDefinition,
+        SurfaceDescriptor, SurfaceRole, TrackWaitCondition,
     };
 
     #[test]
@@ -2455,10 +2605,11 @@ mod tests {
             ..ProducerConfig::default()
         };
         let mut session = vivid_sdk::Session::connect(config).unwrap();
+        let context_id = session.info().root_context_id;
         let surface = session
             .create_surface(
                 SurfaceDefinition {
-                    context_id: session.info().root_context_id,
+                    context_id,
                     surface_id: 7,
                     semantic_profile: registry::TERMINAL_CONTENT.into(),
                     coordinate_model: CoordinateModel::TerminalContentCells,
@@ -2480,6 +2631,39 @@ mod tests {
                 &RequestMetadata::default(),
             )
             .unwrap();
+        let anchor_id = 11;
+        let marker = session.anchor_marker(context_id, anchor_id).unwrap();
+        service.handle_terminal_marker(&marker[2..marker.len() - 2], 4, 3, false);
+        let anchor = session.query_anchor(context_id, anchor_id).unwrap();
+        assert_eq!(anchor.state, 1);
+        let commit = session
+            .create_node(
+                &SceneNode {
+                    owning_context_id: context_id,
+                    node_id: 8,
+                    surface_context_id: context_id,
+                    surface_id: surface.id(),
+                    geometry: vec![
+                        (0, Value::Unsigned(2)),
+                        (1, Value::Unsigned(0)),
+                        (2, Value::Unsigned(0)),
+                        (3, Value::Unsigned(2_u64 << 32)),
+                        (4, Value::Unsigned(2_u64 << 32)),
+                        (5, Value::Unsigned(1)),
+                        (6, Value::Unsigned(context_id)),
+                        (7, Value::Unsigned(anchor_id)),
+                    ],
+                    fit: vivid_sdk::Fit::Contain,
+                    linear_sampling: true,
+                    z_index: 0,
+                    visible: true,
+                    opacity: u16::MAX,
+                    clip: None,
+                },
+                &RequestMetadata::default(),
+            )
+            .unwrap();
+        assert_eq!(commit.scene_revision, SceneRevision::ONE);
         let track = session
             .create_track(
                 TrackConfiguration {
@@ -2521,7 +2705,31 @@ mod tests {
             .unwrap();
         let status = session.query_track(&track).unwrap();
         assert_eq!(status.last_media_id, 1);
+        session
+            .activate_tracks(
+                &surface,
+                &[SlotBinding {
+                    slot: scene::SLOT_RASTER,
+                    track_id: track.id(),
+                    expected_channel_generation: track.channel_generation(),
+                    required_milestone: MILESTONE_OUTPUT_READY,
+                }],
+                &RequestMetadata::default(),
+            )
+            .unwrap();
+        let item = service.scene.snapshot().1.pop().unwrap();
+        assert_eq!((item.x, item.y), (3_i64 << 32, 4_i64 << 32));
         drop(channel);
         session.close().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !service.scene.session_ids().is_empty() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(service.scene.session_ids().is_empty());
+        assert_eq!(
+            service.scene.snapshot().1.len(),
+            1,
+            "clean GOODBYE must preserve an anchored, policy-permitted terminal poster"
+        );
     }
 }
