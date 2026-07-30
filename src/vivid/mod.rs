@@ -34,8 +34,8 @@ use vivid_protocol::identity::{
 };
 use vivid_protocol::media;
 use vivid_protocol::messages::{
-    self, ChannelOpen, Envelope, ErrorDetail, ErrorReply, Hello, HelloAuthentication, StrictMap,
-    Welcome, WelcomeAuthentication,
+    self, ChannelOpen, Envelope, ErrorDetail, ErrorReply, Hello, HelloAuthentication, PayloadMap,
+    StrictMap, Welcome, WelcomeAuthentication,
 };
 use vivid_protocol::registry;
 use vivid_protocol::resource::{Resource, ResourceContract, TokenBucket};
@@ -91,6 +91,27 @@ pub struct DisplayMetrics {
     pub generation: u64,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct PendingTargetChange {
+    metrics: DisplayMetrics,
+    last_unsettled_generation: Option<u64>,
+}
+
+impl PendingTargetChange {
+    fn payload(&mut self, settled: bool) -> Option<PayloadMap> {
+        if !settled && self.last_unsettled_generation == Some(self.metrics.generation) {
+            return None;
+        }
+        if !settled {
+            self.last_unsettled_generation = Some(self.metrics.generation);
+        }
+        let mut payload = target_descriptor(self.metrics, settled);
+        payload.push((9, Value::Unsigned(self.metrics.generation)));
+        payload.push((10, Value::Unsigned(0x1f)));
+        Some(payload)
+    }
+}
+
 struct SessionRuntime {
     identity: SessionIdentity,
     root_context: ContextIdentity,
@@ -116,7 +137,7 @@ struct ServiceShared {
     scene: SharedScene,
     registry: Mutex<Registry>,
     metrics: Mutex<DisplayMetrics>,
-    pending_metrics: Mutex<Option<DisplayMetrics>>,
+    pending_metrics: Mutex<Option<PendingTargetChange>>,
     audio_outputs: Mutex<HashMap<TrackIdentity, Arc<AudioOutput>>>,
     next_session: AtomicU64,
     active_connections: AtomicUsize,
@@ -214,19 +235,26 @@ impl VividService {
         }
         metrics.generation = current.generation.checked_add(1)?;
         *current = metrics;
-        *lock(&self.shared.pending_metrics) = Some(metrics);
+        *lock(&self.shared.pending_metrics) =
+            Some(PendingTargetChange { metrics, last_unsettled_generation: None });
         Some(metrics.generation)
     }
 
     pub fn flush_display_change(&self, settled_generation: Option<u64>) {
-        let metrics = lock(&self.shared.pending_metrics).take();
-        let Some(metrics) = metrics else {
+        let payload = {
+            let mut pending = lock(&self.shared.pending_metrics);
+            let settled = pending
+                .as_ref()
+                .is_some_and(|change| settled_generation == Some(change.metrics.generation));
+            let payload = pending.as_mut().and_then(|change| change.payload(settled));
+            if settled {
+                *pending = None;
+            }
+            payload
+        };
+        let Some(payload) = payload else {
             return;
         };
-        let settled = settled_generation == Some(metrics.generation);
-        let mut payload = target_descriptor(metrics, settled);
-        payload.push((9, Value::Unsigned(metrics.generation)));
-        payload.push((10, Value::Unsigned(0x1f)));
         let body = Envelope::new(0, payload).encode().expect("target-change payload is valid");
         let writers = lock(&self.shared.registry)
             .sessions
@@ -2692,8 +2720,8 @@ mod tests {
     use vivid_protocol::track::{KindConfiguration, TrackConfiguration, TrackMode};
     use vivid_sdk::{
         CoordinateModel, MILESTONE_OUTPUT_READY, ProducerAuthentication, ProducerConfig,
-        RasterConfiguration, RequestMetadata, SceneNode, SlotBinding, SurfaceDefinition,
-        SurfaceDescriptor, SurfaceRole, TrackWaitCondition,
+        RasterConfiguration, RequestMetadata, SceneNode, SessionEvent, SlotBinding,
+        SurfaceDefinition, SurfaceDescriptor, SurfaceRole, TrackWaitCondition,
     };
 
     #[test]
@@ -2723,6 +2751,95 @@ mod tests {
             generation: 1,
         };
         assert_eq!(target_descriptor(metrics, true)[7].1.as_u64(), Some(3));
+    }
+
+    #[test]
+    fn target_changes_emit_one_unsettled_update_and_a_final_same_generation_settle() {
+        let metrics = DisplayMetrics {
+            viewport_width: 800,
+            viewport_height: 600,
+            columns: 80,
+            rows: 24,
+            cell_width: 10,
+            cell_height: 25,
+            generation: 2,
+        };
+        let mut pending = PendingTargetChange { metrics, last_unsettled_generation: None };
+        let unsettled = pending.payload(false).unwrap();
+        assert_eq!(unsettled[6].1.as_bool(), Some(false));
+        assert_eq!(unsettled[9].1.as_u64(), Some(2));
+        assert!(
+            pending.payload(false).is_none(),
+            "one geometry generation is emitted unsettled at most once"
+        );
+
+        let settled = pending.payload(true).unwrap();
+        assert_eq!(settled[6].1.as_bool(), Some(true));
+        assert_eq!(
+            settled[9].1.as_u64(),
+            Some(2),
+            "settling does not invent a geometry generation"
+        );
+        assert!(
+            unsettled
+                .iter()
+                .filter(|(key, _)| *key != 6)
+                .eq(settled.iter().filter(|(key, _)| *key != 6)),
+            "settling changes only the descriptor's settled flag"
+        );
+    }
+
+    #[test]
+    fn live_resize_reaches_the_sdk_as_a_same_generation_final_settle() {
+        let initial = DisplayMetrics {
+            viewport_width: 800,
+            viewport_height: 600,
+            columns: 80,
+            rows: 24,
+            cell_width: 10,
+            cell_height: 25,
+            generation: 1,
+        };
+        let service = VividService::start_with_wake(initial, Arc::new(|| {})).unwrap();
+        let config = ProducerConfig {
+            endpoint_control: Some(service.control_endpoint().to_owned()),
+            authentication: ProducerAuthentication::root_hex(service.root_secret()).unwrap(),
+            ..ProducerConfig::default()
+        };
+        let mut session = vivid_sdk::Session::connect(config).unwrap();
+        let generation = service
+            .update_metrics(DisplayMetrics {
+                viewport_width: 1200,
+                viewport_height: 800,
+                columns: 120,
+                rows: 40,
+                cell_width: 10,
+                cell_height: 20,
+                generation: 1,
+            })
+            .unwrap();
+
+        let take_target_change = |session: &vivid_sdk::Session| {
+            let deadline = Instant::now() + Duration::from_secs(1);
+            loop {
+                if let Some(SessionEvent::TargetChanged(payload)) = session.take_event().unwrap() {
+                    break payload;
+                }
+                assert!(Instant::now() < deadline, "presenter did not deliver TARGET_CHANGED");
+                thread::sleep(Duration::from_millis(1));
+            }
+        };
+
+        service.flush_display_change(None);
+        let unsettled = take_target_change(&session);
+        assert_eq!(session.apply_target_changed(&unsettled).unwrap().get(), generation);
+        assert_eq!(session.info().target_descriptor[6].1.as_bool(), Some(false));
+
+        service.flush_display_change(Some(generation));
+        let settled = take_target_change(&session);
+        assert_eq!(session.apply_target_changed(&settled).unwrap().get(), generation);
+        assert_eq!(session.info().target_descriptor[6].1.as_bool(), Some(true));
+        session.close().unwrap();
     }
 
     #[test]
