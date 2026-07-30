@@ -58,8 +58,8 @@ use crate::terminal::term::{ResizePoint, Term};
 use crate::vivid::audio::{AudioOutput, supports as supports_audio};
 use crate::vivid::decoder::Decoder;
 use crate::vivid::scene::{
-    Frame, SceneStatus, SharedScene, SurfaceStatus, TrackStatus, TrackWaitEvaluation,
-    TrackWaitSatisfied,
+    CommitRejection, Frame, SceneStatus, SharedScene, SurfaceStatus, TrackStatus,
+    TrackWaitEvaluation, TrackWaitSatisfied,
 };
 use crate::vivid::transport::{Reader, Writer};
 
@@ -112,6 +112,8 @@ impl From<SizeInfo> for DisplayGeometry {
 struct DisplayMetrics {
     geometry: DisplayGeometry,
     generation: u64,
+    /// Whether this generation has been announced as final rather than mid-resize.
+    settled: bool,
 }
 
 struct SessionRuntime {
@@ -169,7 +171,7 @@ impl VividService {
         wake: Arc<dyn Fn() + Send + Sync>,
     ) -> io::Result<Self> {
         validate_geometry(geometry)?;
-        let metrics = DisplayMetrics { geometry, generation: 1 };
+        let metrics = DisplayMetrics { geometry, generation: 1, settled: true };
         let (listener, control_endpoint, directory) = bind_local_listener()?;
         let mut secret = [0_u8; 32];
         getrandom::fill(&mut secret).map_err(|error| {
@@ -235,7 +237,7 @@ impl VividService {
             return None;
         }
         let generation = current.generation.checked_add(1)?;
-        *current = DisplayMetrics { geometry, generation };
+        *current = DisplayMetrics { geometry, generation, settled: false };
         *lock(&self.shared.pending_metrics) = Some(*current);
         Some(generation)
     }
@@ -246,22 +248,25 @@ impl VividService {
     /// fires afterwards. The settled announcement therefore has to be rebuilt from the current
     /// metrics, because the queued change was already consumed by that earlier frame.
     pub fn flush_display_change(&self, settled_generation: Option<u64>) {
+        // Taken in the same order as `update_metrics` acquires them.
+        let mut current = lock(&self.shared.metrics);
         let pending = lock(&self.shared.pending_metrics).take();
         let metrics = match pending {
             Some(metrics) => metrics,
-            None => {
-                let current = *lock(&self.shared.metrics);
-                if settled_generation != Some(current.generation) {
-                    return;
-                }
-                current
-            },
+            None if settled_generation == Some(current.generation) => *current,
+            None => return,
         };
         let settled = settled_generation == Some(metrics.generation);
-        let mut payload = target_descriptor(metrics.geometry, settled);
-        payload.push((9, Value::Unsigned(metrics.generation)));
-        payload.push((10, Value::Unsigned(0x1f)));
-        let body = Envelope::new(0, payload).encode().expect("target-change payload is valid");
+        if settled && current.generation == metrics.generation {
+            current.settled = true;
+        }
+        drop(current);
+
+        // The scene validates every commit against the generation it was planned for, so it has
+        // to reach the new target before any producer can name it.
+        self.scene.advance_target_generation(TargetGeneration::new(metrics.generation));
+
+        let body = target_change_body(DisplayMetrics { settled, ..metrics });
         let writers = lock(&self.shared.registry)
             .sessions
             .values()
@@ -669,7 +674,7 @@ fn establish_root_session(
         root_context_id: root_context.context_id,
         target_generation: metrics.generation,
         target_profile: registry::TERMINAL_SURFACE.into(),
-        target_descriptor: target_descriptor(metrics.geometry, true),
+        target_descriptor: target_descriptor(metrics.geometry, metrics.settled),
         accepted_profiles: accepted,
         maximum_control_body: hello
             .maximum_control_body
@@ -1200,10 +1205,33 @@ fn dispatch_control(
                 .find(|entry| entry.0 == 0)
                 .and_then(|entry| entry.1.as_u64())
                 .map(SceneRevision::new);
-            let revision = shared
-                .scene
-                .commit_transaction(context, transaction, expected_target, expected_scene)
-                .map_err(ControlError::state)?;
+            let revision = match shared.scene.commit_transaction(
+                context,
+                transaction,
+                expected_target,
+                expected_scene,
+            ) {
+                Ok(revision) => revision,
+                Err(CommitRejection::StaleTarget) => {
+                    // The producer planned this commit against the target it last saw, so the
+                    // rejection has to say what the target is now. The announcement precedes the
+                    // error on this ordered connection, which is what lets the producer re-plan
+                    // and commit again instead of failing.
+                    let metrics = *lock(&shared.metrics);
+                    if let Err(error) = session.writer.write_record(
+                        messages::TARGET_CHANGED,
+                        0,
+                        &target_change_body(metrics),
+                    ) {
+                        log::debug!("could not re-announce the target for a stale commit: {error}");
+                    }
+                    return Err(ControlError::stale_target());
+                },
+                Err(CommitRejection::StaleRevision) => {
+                    return Err(ControlError::precondition("stale scene revision"));
+                },
+                Err(CommitRejection::Failed(message)) => return Err(ControlError::state(message)),
+            };
             (shared.wake)();
             (
                 messages::SCENE_PRESENTED,
@@ -2473,6 +2501,14 @@ impl ControlError {
         Self { code: messages::ERROR_NOT_FOUND, message }
     }
 
+    const fn precondition(message: &'static str) -> Self {
+        Self { code: messages::ERROR_PRECONDITION_FAILED, message }
+    }
+
+    const fn stale_target() -> Self {
+        Self { code: registry::error::STALE_TARGET_GENERATION, message: "stale target generation" }
+    }
+
     const fn unsupported(message: &'static str) -> Self {
         Self { code: messages::ERROR_UNSUPPORTED_CONFIG, message }
     }
@@ -2559,6 +2595,14 @@ fn target_descriptor(geometry: DisplayGeometry, settled: bool) -> Vec<(u64, Valu
         (7, Value::Unsigned(3)),
         (8, Value::Unsigned(MAX_ACTIVE_ANCHORS as u64)),
     ]
+}
+
+/// Encode one `TARGET_CHANGED` body for the given target, announcement or re-announcement alike.
+fn target_change_body(metrics: DisplayMetrics) -> Vec<u8> {
+    let mut payload = target_descriptor(metrics.geometry, metrics.settled);
+    payload.push((9, Value::Unsigned(metrics.generation)));
+    payload.push((10, Value::Unsigned(0x1f)));
+    Envelope::new(0, payload).encode().expect("target-change payload is valid")
 }
 
 fn validate_geometry(geometry: DisplayGeometry) -> io::Result<()> {
@@ -2820,6 +2864,129 @@ mod tests {
         let later = connect(&service);
         assert_eq!(descriptor_summary(&later.info().target_descriptor), (155, 58, true));
         assert_eq!(later.info().target_generation.get(), generation);
+    }
+
+    fn grid_surface(session: &mut vivid_sdk::Session, surface_id: u64) -> vivid_sdk::Surface {
+        let context_id = session.info().root_context_id;
+        session
+            .create_surface(
+                SurfaceDefinition {
+                    context_id,
+                    surface_id,
+                    semantic_profile: registry::TERMINAL_CONTENT.into(),
+                    coordinate_model: CoordinateModel::TerminalContentCells,
+                    logical_width: 2,
+                    logical_height: 2,
+                    scale_numerator: 1,
+                    scale_denominator: 1,
+                    rotation: 0,
+                    descriptor: SurfaceDescriptor {
+                        role: SurfaceRole::Figure,
+                        title: "target follow".into(),
+                        semantic_content_revision: 1,
+                        semantic_availability: 0,
+                        locator_hint: String::new(),
+                    },
+                    policy: 0,
+                    profile_parameters: vec![],
+                },
+                &RequestMetadata::default(),
+            )
+            .unwrap()
+    }
+
+    fn grid_node(
+        context_id: u64,
+        node_id: u64,
+        surface: &vivid_sdk::Surface,
+        cols: u64,
+    ) -> SceneNode {
+        SceneNode {
+            owning_context_id: context_id,
+            node_id,
+            surface_context_id: surface.context_id(),
+            surface_id: surface.id(),
+            geometry: vec![
+                (0, Value::Unsigned(1)),
+                (1, Value::Unsigned(0)),
+                (2, Value::Unsigned(0)),
+                (3, Value::Unsigned(cols << 32)),
+                (4, Value::Unsigned(2_u64 << 32)),
+                (5, Value::Unsigned(1)),
+            ],
+            fit: vivid_sdk::Fit::Contain,
+            linear_sampling: true,
+            z_index: 0,
+            visible: true,
+            opacity: u16::MAX,
+            clip: None,
+        }
+    }
+
+    /// A scene commit names the target generation it was planned against, so an announced resize
+    /// has to carry every live scene onto the new target. Leaving a scene behind rejects the
+    /// commits a producer makes in response to the announcement it was just sent, which is fatal
+    /// for a producer that re-places its node on every resize.
+    #[test]
+    fn an_announced_display_change_carries_every_live_scene_onto_the_new_target() {
+        let service = VividService::start_with_wake(test_geometry(), Arc::new(|| {})).unwrap();
+        let mut first = connect(&service);
+        let mut second = connect(&service);
+        let mut unaware = connect(&service);
+        // The three producers deliberately reuse the same numeric surface and node IDs.
+        let surfaces: Vec<_> = [&mut first, &mut second, &mut unaware]
+            .into_iter()
+            .map(|session| grid_surface(session, 4))
+            .collect();
+        for (session, surface) in [&mut first, &mut second, &mut unaware].into_iter().zip(&surfaces)
+        {
+            let context_id = session.info().root_context_id;
+            session
+                .create_node(&grid_node(context_id, 5, surface, 80), &RequestMetadata::default())
+                .unwrap();
+        }
+
+        let resized = DisplayGeometry { columns: 100, rows: 40, ..test_geometry() };
+        let generation = service.update_metrics(resized).expect("a resize is a new generation");
+        service.flush_display_change(Some(generation));
+
+        for (session, surface) in [&mut first, &mut second].into_iter().zip(&surfaces) {
+            let announced = next_target_change(session);
+            assert_eq!(session.apply_target_changed(&announced).unwrap().get(), generation);
+            let context_id = session.info().root_context_id;
+            let commit = session
+                .update_node(&grid_node(context_id, 5, surface, 100), &RequestMetadata::default())
+                .expect("a commit naming the announced target must be accepted");
+            assert_eq!(commit.target_generation.get(), generation);
+        }
+
+        // A producer that has not consumed the announcement is still planning against the target
+        // it last knew, and that commit stays rejected rather than reaching the new target.
+        let context_id = unaware.info().root_context_id;
+        let error = unaware
+            .update_node(&grid_node(context_id, 5, &surfaces[2], 100), &RequestMetadata::default())
+            .expect_err("a commit naming the previous target must be rejected");
+        let code = error
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<vivid_sdk::PresenterError>())
+            .map(|error| error.code);
+        assert_eq!(code, Some(registry::error::STALE_TARGET_GENERATION));
+
+        // The rejection is actionable: the current target precedes it, so the producer can re-plan
+        // against the target it was just told about rather than waiting for the next resize.
+        let announced = next_target_change(&unaware);
+        assert_eq!(announced[9].1.as_u64(), Some(generation));
+        assert_eq!(descriptor_summary(&announced), (100, 40, true));
+
+        // The rejection is scoped to the producer that earned it: the other scenes are unchanged.
+        for (session, cols) in [(&first, 100_u64), (&second, 100), (&unaware, 80)] {
+            let identity =
+                SessionIdentity::new(service.shared.presenter, session.info().session_id).unwrap();
+            let status = service.scene().scene_status(identity, 8);
+            assert_eq!(status.target_generation.get(), generation);
+            assert_eq!(status.nodes.len(), 1);
+            assert_eq!(status.nodes[0].node.geometry[3].1, Value::Unsigned(cols << 32));
+        }
     }
 
     #[test]

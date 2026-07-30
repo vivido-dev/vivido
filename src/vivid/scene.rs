@@ -115,6 +115,20 @@ pub struct SceneStatus {
     pub nodes: Vec<SceneNodeStatus>,
 }
 
+/// Why a scene commit did not apply.
+///
+/// The three cases carry different registered error codes and different producer recoveries, so
+/// they stay distinguishable instead of collapsing into one opaque state failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommitRejection {
+    /// The commit was planned against a target the presentation has already moved past.
+    StaleTarget,
+    /// The scene-revision precondition no longer holds.
+    StaleRevision,
+    /// The transaction, or one of the mutations in it, is not applicable.
+    Failed(&'static str),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TrackWaitSatisfied {
     pub revision: TrackRevision,
@@ -271,6 +285,22 @@ impl SharedScene {
         );
         self.0.changed.notify_all();
         Ok(())
+    }
+
+    /// Move every live session's scene onto a newly announced target generation.
+    ///
+    /// A scene commit names the target generation it was planned against, so the generation the
+    /// scene validates commits against has to follow the presentation target. Leaving it behind
+    /// rejects every commit that correctly names the new target as stale. The move is monotonic:
+    /// an announcement can only carry the scene forward.
+    pub fn advance_target_generation(&self, target_generation: TargetGeneration) {
+        let mut state = self.lock();
+        for scene in state.scenes.values_mut() {
+            if scene.target_generation < target_generation {
+                scene.target_generation = target_generation;
+            }
+        }
+        self.0.changed.notify_all();
     }
 
     pub fn remove_session(&self, session: SessionIdentity) {
@@ -642,9 +672,16 @@ impl SharedScene {
             return Err("track does not exist");
         }
         if let Some(surface) = state.surfaces.get_mut(&identity.surface) {
+            let slots = surface.active_slots.len();
             surface.active_slots.retain(|_, track_id| *track_id != identity.track_id);
-            surface.revision =
-                surface.revision.advance().map_err(|_| "surface revision exhausted")?;
+            // Only a vacated slot mutates the surface. Advancing the revision for a track that
+            // held no slot moves presenter truth away from the revision the producer holds, with
+            // nothing said about it, and the producer's next surface update is rejected as stale.
+            // Retiring a replaced track is exactly that case.
+            if surface.active_slots.len() != slots {
+                surface.revision =
+                    surface.revision.advance().map_err(|_| "surface revision exhausted")?;
+            }
         }
         self.0.changed.notify_all();
         Ok(())
@@ -1202,7 +1239,7 @@ impl SharedScene {
         transaction_id: u64,
         expected_target: TargetGeneration,
         expected_revision: Option<SceneRevision>,
-    ) -> Result<SceneRevision, &'static str> {
+    ) -> Result<SceneRevision, CommitRejection> {
         let mut state = self.lock();
         let session = context.session;
         let mutations = state
@@ -1210,57 +1247,64 @@ impl SharedScene {
             .get(&session)
             .and_then(|scene| scene.pending.get(&(context, transaction_id)))
             .cloned()
-            .ok_or("transaction does not exist")?;
+            .ok_or(CommitRejection::Failed("transaction does not exist"))?;
         {
             let scene = state.scenes.get(&session).unwrap();
             if scene.target_generation != expected_target {
-                return Err("stale target generation");
+                return Err(CommitRejection::StaleTarget);
             }
             if expected_revision.is_some_and(|revision| revision != scene.revision) {
-                return Err("stale scene revision");
+                return Err(CommitRejection::StaleRevision);
             }
         }
         let mut candidate = state.scenes.get(&session).unwrap().nodes.clone();
         for mutation in mutations {
             match mutation {
                 NodeMutation::Create(node) => {
-                    validate_terminal_node(&node)?;
-                    let identity = context.node(node.node_id).map_err(|_| "invalid node ID")?;
+                    validate_terminal_node(&node).map_err(CommitRejection::Failed)?;
+                    let identity = context
+                        .node(node.node_id)
+                        .map_err(|_| CommitRejection::Failed("invalid node ID"))?;
                     if node.owning_context_id != context.context_id
                         || candidate.contains_key(&identity)
                     {
-                        return Err("duplicate or misowned node");
+                        return Err(CommitRejection::Failed("duplicate or misowned node"));
                     }
                     let surface_identity = context
                         .session
                         .context(node.surface_context_id)
-                        .map_err(|_| "invalid surface context")?
+                        .map_err(|_| CommitRejection::Failed("invalid surface context"))?
                         .surface(node.surface_id)
-                        .map_err(|_| "invalid surface ID")?;
+                        .map_err(|_| CommitRejection::Failed("invalid surface ID"))?;
                     if !state.surfaces.contains_key(&surface_identity) {
-                        return Err("node references a missing surface");
+                        return Err(CommitRejection::Failed("node references a missing surface"));
                     }
                     candidate.insert(identity, node);
                 },
                 NodeMutation::Update(node) => {
-                    validate_terminal_node(&node)?;
-                    let identity = context.node(node.node_id).map_err(|_| "invalid node ID")?;
+                    validate_terminal_node(&node).map_err(CommitRejection::Failed)?;
+                    let identity = context
+                        .node(node.node_id)
+                        .map_err(|_| CommitRejection::Failed("invalid node ID"))?;
                     if node.owning_context_id != context.context_id
                         || !candidate.contains_key(&identity)
                     {
-                        return Err("missing or misowned node");
+                        return Err(CommitRejection::Failed("missing or misowned node"));
                     }
                     candidate.insert(identity, node);
                 },
                 NodeMutation::Delete(identity) => {
                     if identity.context != context || candidate.remove(&identity).is_none() {
-                        return Err("missing or misowned node");
+                        return Err(CommitRejection::Failed("missing or misowned node"));
                     }
                 },
             }
         }
         let scene = state.scenes.get_mut(&session).unwrap();
-        scene.revision = scene.revision.advance().map_err(|_| "scene revision exhausted")?;
+        scene.revision = scene
+            .revision
+            .advance()
+            .map_err(|_| CommitRejection::Failed("scene revision exhausted"))?;
         scene.nodes = candidate;
         scene.pending.remove(&(context, transaction_id));
         let revision = scene.revision;
@@ -1819,6 +1863,83 @@ mod tests {
                 .is_err()
         );
         assert_eq!(scene.scene_status(session, 10).revision, SceneRevision::ZERO);
+    }
+
+    /// Retiring a replaced track leaves the surface untouched, so it must not move the revision
+    /// the producer is holding: the producer names that revision in its next surface update, and
+    /// a silent advance rejects the update it makes on the following resize.
+    #[test]
+    fn destroying_a_track_moves_the_surface_revision_only_when_it_vacates_a_slot() {
+        let scene = SharedScene::default();
+        let session = session(4, 1);
+        let context = session.context(1).unwrap();
+        let surface_identity = context.surface(1).unwrap();
+        scene.register_session(session, TargetGeneration::ONE).unwrap();
+        scene.create_surface(surface_identity, definition(1, 1)).unwrap();
+        let raster = |track_id: u64| TrackConfiguration {
+            context_id: 1,
+            surface_id: 1,
+            track_id,
+            slot: SLOT_RASTER,
+            mode: TrackMode::Live,
+            lane: LaneClass::Bulk,
+            maximum_record_body: 128,
+            maximum_rate_millihertz: 1_000,
+            maximum_encoded_bits_per_second: 8_192,
+            maximum_records_per_second: 1,
+            maximum_inflight_body_bytes: 1_024,
+            kind: KindConfiguration::Raster(RasterConfiguration {
+                width: 1,
+                height: 1,
+                alpha_mode: ALPHA_STRAIGHT,
+                delta_enabled: false,
+                maximum_delta_operations: 1,
+                zstd_enabled: false,
+            }),
+            target_latency_us: 0,
+            maximum_latency_us: 1_000_000,
+            retained_pixel_charge: 1,
+        };
+        let ready = |track_id: u64| {
+            let identity = surface_identity.track(track_id).unwrap();
+            scene.create_track(identity, raster(track_id)).unwrap();
+            scene.accept_channel(identity, ChannelGeneration::ONE, 1_024, 8).unwrap();
+            scene.mark_output_ready(identity, ChannelGeneration::ONE).unwrap();
+            identity
+        };
+        let retired = ready(1);
+        let replacement = ready(2);
+
+        // The replacement takes the slot, exactly as a settled resize does.
+        scene
+            .activate_tracks(
+                surface_identity,
+                SurfaceRevision::ONE,
+                &[(SLOT_RASTER, 1, ChannelGeneration::ONE, MILESTONE_OUTPUT_READY)],
+            )
+            .unwrap();
+        scene
+            .activate_tracks(
+                surface_identity,
+                SurfaceRevision::new(2),
+                &[(SLOT_RASTER, 2, ChannelGeneration::ONE, MILESTONE_OUTPUT_READY)],
+            )
+            .unwrap();
+        let after_activation = scene.surface_status(surface_identity).unwrap().revision;
+
+        scene.destroy_track(retired).unwrap();
+        assert_eq!(
+            scene.surface_status(surface_identity).unwrap().revision,
+            after_activation,
+            "retiring a track that held no slot changed the surface revision"
+        );
+
+        // Destroying the track that does hold the slot is a real surface mutation.
+        scene.destroy_track(replacement).unwrap();
+        assert_eq!(
+            scene.surface_status(surface_identity).unwrap().revision,
+            after_activation.advance().unwrap()
+        );
     }
 
     #[test]
