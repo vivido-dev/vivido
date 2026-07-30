@@ -1594,6 +1594,9 @@ impl Processor {
                         })))
                     },
                     crate::vivid::scene::TrackWaitEvaluation::Pending => None,
+                    crate::vivid::scene::TrackWaitEvaluation::Lost => {
+                        Some(Err(IpcError::new("track_lost", "Vivid track was lost")))
+                    },
                     crate::vivid::scene::TrackWaitEvaluation::NotVisible => {
                         Some(Err(IpcError::new(
                             "not_visible",

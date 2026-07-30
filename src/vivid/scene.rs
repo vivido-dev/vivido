@@ -96,6 +96,7 @@ pub struct TrackStatus {
     pub last_decoded_pts_us: Option<i64>,
     pub last_presented_pts_us: Option<i64>,
     pub last_presentation_id: u64,
+    pub last_media_record_sequence: u64,
     pub maximum_channel_bytes: u64,
     pub maximum_channel_records: u64,
 }
@@ -125,6 +126,7 @@ pub struct TrackWaitSatisfied {
 pub enum TrackWaitEvaluation {
     Satisfied(TrackWaitSatisfied),
     Pending,
+    Lost,
     NotVisible,
     NotFound,
     StaleGeneration,
@@ -148,6 +150,7 @@ struct Track {
     last_decoded_pts_us: Option<i64>,
     last_presented_pts_us: Option<i64>,
     last_presentation_id: u64,
+    last_media_record_sequence: u64,
     maximum_channel_bytes: u64,
     maximum_channel_records: u64,
     playback: Option<PlaybackClock>,
@@ -622,6 +625,7 @@ impl SharedScene {
             last_decoded_pts_us: None,
             last_presented_pts_us: None,
             last_presentation_id: 0,
+            last_media_record_sequence: 0,
             maximum_channel_bytes: 0,
             maximum_channel_records: 0,
             playback: None,
@@ -671,13 +675,22 @@ impl SharedScene {
             }
             let track_identity = TrackIdentity { surface: surface_identity, track_id };
             let track = state.tracks.get(&track_identity).ok_or("track does not exist")?;
-            if track.configuration.slot != slot
-                || track.state.channel_generation != expected_generation
-                || required_milestone.count_ones() != 1
+            if track.lifecycle == 6 {
+                return Err("track was lost before slot activation");
+            }
+            if track.configuration.slot != slot {
+                return Err("track configuration does not permit the requested slot");
+            }
+            if track.state.channel_generation != expected_generation {
+                return Err("slot activation names a stale channel generation");
+            }
+            if required_milestone.count_ones() != 1
                 || track.state.milestones & required_milestone == 0
-                || track.lifecycle != 1
             {
-                return Err("track is not eligible for the requested slot");
+                return Err("track has not reached the required activation milestone");
+            }
+            if track.lifecycle != 1 {
+                return Err("track lifecycle is not eligible for slot activation");
             }
             candidate.insert(slot, track_id);
         }
@@ -762,6 +775,7 @@ impl SharedScene {
             .map_err(|_| "channel generation could not advance")?;
         track.maximum_channel_bytes = 0;
         track.maximum_channel_records = 0;
+        track.last_media_record_sequence = 0;
         track.frame = None;
         let result = track_status(identity, track);
         self.0.changed.notify_all();
@@ -777,6 +791,7 @@ impl SharedScene {
         media_epoch: u32,
         media_id: u64,
         random_access: bool,
+        record_sequence: u64,
         frame: Frame,
     ) -> Result<(), &'static str> {
         let expected_len = usize::try_from(
@@ -794,7 +809,15 @@ impl SharedScene {
         {
             return Err("invalid decoded frame");
         }
-        self.admit_media(identity, generation, body_length, media_epoch, media_id, random_access)?;
+        self.admit_media(
+            identity,
+            generation,
+            body_length,
+            media_epoch,
+            media_id,
+            random_access,
+            record_sequence,
+        )?;
         self.publish_decoded_frame(identity, generation, frame)
     }
 
@@ -813,6 +836,7 @@ impl SharedScene {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn admit_media(
         &self,
         identity: TrackIdentity,
@@ -821,7 +845,11 @@ impl SharedScene {
         media_epoch: u32,
         media_id: u64,
         random_access: bool,
+        record_sequence: u64,
     ) -> Result<(), &'static str> {
+        if record_sequence <= 1 {
+            return Err("media record sequence does not follow CHANNEL_OPEN");
+        }
         let mut state = self.lock();
         let track = state.tracks.get_mut(&identity).ok_or("track does not exist")?;
         if track.state.channel_generation != generation || track.lifecycle != 1 {
@@ -831,6 +859,7 @@ impl SharedScene {
             .state
             .admit_media(generation, body_length, media_epoch, media_id, random_access)
             .map_err(|_| "stale media epoch, media ID, or flow allowance")?;
+        track.last_media_record_sequence = record_sequence;
         self.0.changed.notify_all();
         Ok(())
     }
@@ -873,7 +902,8 @@ impl SharedScene {
     pub fn lose_track(&self, identity: TrackIdentity) -> Result<(), &'static str> {
         let mut state = self.lock();
         let track = state.tracks.get_mut(&identity).ok_or("track does not exist")?;
-        track.lifecycle = 2;
+        track.lifecycle = 6;
+        track.state.milestones = 0;
         track.state.lose().map_err(|_| "track revision exhausted")?;
         self.0.changed.notify_all();
         Ok(())
@@ -986,11 +1016,16 @@ impl SharedScene {
         &self,
         identity: TrackIdentity,
         generation: ChannelGeneration,
+        media_epoch: u32,
+        last_media_record_sequence: u64,
     ) -> Result<(), &'static str> {
         let mut state = self.lock();
         let track = state.tracks.get_mut(&identity).ok_or("track does not exist")?;
-        if track.state.channel_generation != generation {
-            return Err("stale channel generation");
+        if track.state.channel_generation != generation
+            || track.state.media_epoch != media_epoch
+            || track.last_media_record_sequence != last_media_record_sequence
+        {
+            return Err("CHANNEL_EOS does not match accepted channel progress");
         }
         if let Some(playback) = track.playback.as_mut() {
             playback.eos = true;
@@ -1438,6 +1473,9 @@ impl SharedScene {
         if track.state.channel_generation != generation {
             return TrackWaitEvaluation::StaleGeneration;
         }
+        if track.lifecycle == 6 && condition != 9 {
+            return TrackWaitEvaluation::Lost;
+        }
         if matches!(condition, 3 | 4)
             && !state.scenes.get(&identity.surface.context.session).is_some_and(|scene| {
                 scene.nodes.values().any(|node| {
@@ -1623,6 +1661,7 @@ fn track_status(identity: TrackIdentity, track: &Track) -> TrackStatus {
         last_decoded_pts_us: track.last_decoded_pts_us,
         last_presented_pts_us: track.last_presented_pts_us,
         last_presentation_id: track.last_presentation_id,
+        last_media_record_sequence: track.last_media_record_sequence,
         maximum_channel_bytes: track.maximum_channel_bytes,
         maximum_channel_records: track.maximum_channel_records,
     }
@@ -1823,6 +1862,7 @@ mod tests {
                 1,
                 1,
                 true,
+                2,
                 Frame {
                     frame_id: 1,
                     pts_us: 0,
@@ -1836,6 +1876,9 @@ mod tests {
                 },
             )
             .unwrap();
+        assert_eq!(scene.track_status(track_identity).unwrap().last_media_record_sequence, 2);
+        assert!(scene.mark_eos(track_identity, ChannelGeneration::ONE, 1, 1).is_err());
+        scene.mark_eos(track_identity, ChannelGeneration::ONE, 1, 2).unwrap();
         scene
             .activate_tracks(
                 surface_identity,
@@ -1981,10 +2024,24 @@ mod tests {
             TrackWaitEvaluation::Satisfied(_)
         ));
 
-        scene.mark_eos(track_identity, ChannelGeneration::ONE).unwrap();
+        scene.mark_eos(track_identity, ChannelGeneration::ONE, 0, 0).unwrap();
         scene.mark_buffered_ended(track_identity, ChannelGeneration::ONE).unwrap();
         assert!(matches!(
             scene.evaluate_track_wait(track_identity, ChannelGeneration::ONE, 6, None),
+            TrackWaitEvaluation::Satisfied(_)
+        ));
+        scene.lose_track(track_identity).unwrap();
+        assert!(matches!(
+            scene.evaluate_track_wait(
+                track_identity,
+                ChannelGeneration::ONE,
+                2,
+                Some(MILESTONE_OUTPUT_READY)
+            ),
+            TrackWaitEvaluation::Lost
+        ));
+        assert!(matches!(
+            scene.evaluate_track_wait(track_identity, ChannelGeneration::ONE, 9, None),
             TrackWaitEvaluation::Satisfied(_)
         ));
     }

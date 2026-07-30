@@ -1261,6 +1261,9 @@ fn dispatch_control(
                 TrackWaitEvaluation::NotFound => {
                     return Err(ControlError::not_found("track does not exist"));
                 },
+                TrackWaitEvaluation::Lost => {
+                    return Err(ControlError::bad_state("track was lost while waiting"));
+                },
                 TrackWaitEvaluation::StaleGeneration => {
                     return Err(ControlError {
                         code: messages::ERROR_STALE_CHANNEL_GENERATION,
@@ -1332,6 +1335,22 @@ fn dispatch_control(
                                         messages::ERROR_NOT_FOUND,
                                         false,
                                         "track was destroyed while waiting",
+                                    );
+                                    if let Ok(body) = body {
+                                        let _ = session.writer.write_record(
+                                            messages::ERROR,
+                                            object_id,
+                                            &body,
+                                        );
+                                    }
+                                    break;
+                                },
+                                TrackWaitEvaluation::Lost => {
+                                    let body = protocol_error(
+                                        request_id,
+                                        messages::ERROR_BAD_STATE,
+                                        false,
+                                        "track was lost while waiting",
                                     );
                                     if let Ok(body) = body {
                                         let _ = session.writer.write_record(
@@ -1645,20 +1664,41 @@ fn handle_track_channel(reader: &mut Reader, shared: &Arc<ServiceShared>) -> io:
         state.transport_lost(generation);
     }
     let _ = shared.scene.detach_channel(identity, generation);
-    if result.is_err() {
+    if let Err(error) = &result {
         let _ = shared.scene.lose_track(identity);
+        let status = shared.scene.track_status(identity);
+        let diagnostic = error.to_string().chars().take(4_096).collect::<String>();
+        let error_code = if diagnostic.contains("rate exceeded") {
+            messages::ERROR_RATE_LIMITED
+        } else if diagnostic.contains("flow allowance") {
+            messages::ERROR_FLOW_CONTROL
+        } else if matches!(
+            error.kind(),
+            ErrorKind::NotFound | ErrorKind::NotConnected | ErrorKind::BrokenPipe
+        ) {
+            messages::ERROR_DEVICE_LOST
+        } else {
+            messages::ERROR_DECODER
+        };
         let body = Envelope::new(
             0,
             vec![
                 (0, Value::Unsigned(identity.surface.context.context_id)),
                 (1, Value::Unsigned(identity.surface.surface_id)),
                 (2, Value::Unsigned(identity.track_id)),
-                (3, Value::Unsigned(generation.get())),
-                (4, Value::Unsigned(messages::ERROR_DECODER)),
+                (3, Value::Unsigned(error_code)),
+                (
+                    4,
+                    Value::Unsigned(
+                        status.as_ref().map_or(1, |status| status.state.revision.get()),
+                    ),
+                ),
+                (5, Value::Map(vec![])),
+                (6, Value::Text(diagnostic)),
             ],
         )
         .encode()?;
-        let _ = writer.write_record(messages::TRACK_LOST, identity.track_id, &body);
+        let _ = session.writer.write_record(messages::TRACK_LOST, identity.track_id, &body);
     }
     result
 }
@@ -1719,17 +1759,12 @@ fn channel_loop(
                 | messages::RASTER_FRAME
                 | messages::IMAGE_DATA
         ) {
-            let now = Instant::now();
-            let elapsed = now.saturating_duration_since(last_rate_update);
-            last_rate_update = now;
-            byte_bucket.replenish(elapsed).map_err(io::Error::other)?;
-            record_bucket.replenish(elapsed).map_err(io::Error::other)?;
-            byte_bucket.charge(u64::try_from(record.body.len()).unwrap_or(u64::MAX)).map_err(
-                |_| io::Error::new(ErrorKind::InvalidData, "sustained encoded-byte rate exceeded"),
+            pace_ingress(
+                &mut byte_bucket,
+                &mut record_bucket,
+                &mut last_rate_update,
+                u64::try_from(record.body.len()).unwrap_or(u64::MAX),
             )?;
-            record_bucket.charge(1).map_err(|_| {
-                io::Error::new(ErrorKind::InvalidData, "sustained media-record rate exceeded")
-            })?;
             lock(&shared.registry)
                 .channel_opens
                 .get_mut(&identity)
@@ -1812,6 +1847,7 @@ fn channel_loop(
                         )?,
                         frame.frame_id,
                         frame.damage.is_none(),
+                        record.sequence,
                         frame,
                     )
                     .map_err(io::Error::other)?;
@@ -1864,6 +1900,7 @@ fn channel_loop(
                         0,
                         1,
                         true,
+                        record.sequence,
                         Frame {
                             frame_id: 1,
                             pts_us: 0,
@@ -1893,6 +1930,7 @@ fn channel_loop(
                         packet.epoch,
                         packet.packet_id,
                         random_access,
+                        record.sequence,
                     )
                     .map_err(io::Error::other)?;
                 let frames = video_decoder
@@ -1947,6 +1985,7 @@ fn channel_loop(
                         packet.epoch,
                         packet.packet_id,
                         true,
+                        record.sequence,
                     )
                     .map_err(io::Error::other)?;
                 let (output, decoder) = audio.as_mut().ok_or_else(|| {
@@ -1959,7 +1998,42 @@ fn channel_loop(
                 shared.scene.mark_output_ready(identity, generation).map_err(io::Error::other)?;
             },
             messages::CHANNEL_EOS => {
-                shared.scene.mark_eos(identity, generation).map_err(io::Error::other)?;
+                let envelope = messages::decode_control(&record.body)?;
+                if envelope.request_id != 0 {
+                    return Err(io::Error::new(
+                        ErrorKind::InvalidData,
+                        "CHANNEL_EOS must be uncorrelated",
+                    ));
+                }
+                let value = Value::Map(envelope.payload);
+                let eos = StrictMap::new("CHANNEL_EOS", &value, &[0, 1, 2, 3, 4, 5])
+                    .map_err(io::Error::other)?;
+                let eos_epoch = eos
+                    .required_u64(4)
+                    .ok()
+                    .and_then(|value| u32::try_from(value).ok())
+                    .ok_or_else(|| {
+                        io::Error::new(ErrorKind::InvalidData, "invalid CHANNEL_EOS media epoch")
+                    })?;
+                if eos.required_u64(0).ok() != Some(identity.surface.context.context_id)
+                    || eos.required_u64(1).ok() != Some(identity.surface.surface_id)
+                    || eos.required_u64(2).ok() != Some(identity.track_id)
+                    || eos.required_u64(3).ok() != Some(generation.get())
+                {
+                    return Err(io::Error::new(
+                        ErrorKind::InvalidData,
+                        "CHANNEL_EOS does not name this track generation",
+                    ));
+                }
+                shared
+                    .scene
+                    .mark_eos(
+                        identity,
+                        generation,
+                        eos_epoch,
+                        eos.required_u64(5).map_err(io::Error::other)?,
+                    )
+                    .map_err(io::Error::other)?;
                 if let Some(decoder) = video_decoder.as_mut() {
                     for decoded in decoder.finish()? {
                         let (sar_num, sar_den) = match &configuration.kind {
@@ -2042,6 +2116,34 @@ fn channel_loop(
                 .encode()?,
             )?;
         }
+    }
+}
+
+fn pace_ingress(
+    byte_bucket: &mut TokenBucket,
+    record_bucket: &mut TokenBucket,
+    last_update: &mut Instant,
+    body_bytes: u64,
+) -> io::Result<()> {
+    loop {
+        let now = Instant::now();
+        let elapsed = now.saturating_duration_since(*last_update);
+        *last_update = now;
+        byte_bucket.replenish(elapsed).map_err(io::Error::other)?;
+        record_bucket.replenish(elapsed).map_err(io::Error::other)?;
+        let mut next_bytes = byte_bucket.clone();
+        let mut next_records = record_bucket.clone();
+        if next_bytes.charge(body_bytes).is_ok() && next_records.charge(1).is_ok() {
+            *byte_bucket = next_bytes;
+            *record_bucket = next_records;
+            return Ok(());
+        }
+
+        // Transport scheduling can turn a correctly paced producer stream into an arrival burst
+        // after SSH, WebTransport, or WebSocket buffering. Shape admission here instead of
+        // destroying the track for that transport artifact. Absolute channel flow remains the
+        // finite bound and no capacity is returned until this record is reusable.
+        thread::sleep(Duration::from_millis(1));
     }
 }
 
@@ -2139,11 +2241,28 @@ fn track_status_payload(status: &TrackStatus) -> Vec<(u64, Value)> {
         (5, Value::Unsigned(status.configuration.mode as u64)),
         (6, Value::Unsigned(status.lifecycle)),
         (7, Value::Unsigned(status.state.channel_generation.get())),
-        (8, Value::Unsigned(u64::from(status.maximum_channel_bytes != 0))),
+        (
+            8,
+            Value::Unsigned(
+                if status.lifecycle == 6
+                    || status.state.milestones & vivid_protocol::track::MILESTONE_CHANNEL_DETACHED
+                        != 0
+                {
+                    2
+                } else if status.state.milestones
+                    & vivid_protocol::track::MILESTONE_CHANNEL_ACCEPTED
+                    != 0
+                {
+                    1
+                } else {
+                    0
+                },
+            ),
+        ),
         (9, Value::Unsigned(status.state.milestones)),
         (10, Value::Unsigned(u64::from(status.state.media_epoch))),
         (11, Value::Unsigned(status.state.last_media_id)),
-        (12, Value::Unsigned(status.state.flow.sent_media_records)),
+        (12, Value::Unsigned(status.last_media_record_sequence)),
         (13, signed(status.last_decoded_pts_us.unwrap_or(0))),
         (14, signed(status.last_presented_pts_us.unwrap_or(0))),
         (15, Value::Unsigned(status.last_presentation_id)),
