@@ -17,6 +17,8 @@ _vivido() {
     _arguments "${_arguments_options[@]}" : \
 '--config-file=[Specify alternative configuration file \[default\: \$XDG_CONFIG_HOME/vivido/vivido.toml\]]:CONFIG_FILE:_files' \
 '--socket=[Path for IPC socket creation]:SOCKET:_files' \
+'--vivid-target=[Present a \`desktop-surface-v1\` Vivid target instead of the terminal target]:TARGET:((terminal\:"\`terminal-surface-v1\`\: a grid of cells with a text plane and anchors"
+desktop\:"\`desktop-surface-v1\`\: a virtual desktop in logical pixels, with no grid and no anchors"))' \
 '-w+[Stable IPC ID assigned to this window]:WINDOW_ID:_default' \
 '--window-id=[Stable IPC ID assigned to this window]:WINDOW_ID:_default' \
 '--working-directory=[Start the shell in the specified working directory]:WORKING_DIRECTORY:_files' \
@@ -64,6 +66,8 @@ _arguments "${_arguments_options[@]}" : \
         case $line[1] in
             (create-window)
 _arguments "${_arguments_options[@]}" : \
+'--vivid-target=[Present a \`desktop-surface-v1\` Vivid target instead of the terminal target]:TARGET:((terminal\:"\`terminal-surface-v1\`\: a grid of cells with a text plane and anchors"
+desktop\:"\`desktop-surface-v1\`\: a virtual desktop in logical pixels, with no grid and no anchors"))' \
 '-w+[Stable IPC ID assigned to this window]:WINDOW_ID:_default' \
 '--window-id=[Stable IPC ID assigned to this window]:WINDOW_ID:_default' \
 '--working-directory=[Start the shell in the specified working directory]:WORKING_DIRECTORY:_files' \

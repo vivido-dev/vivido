@@ -13,7 +13,7 @@ use vivid_protocol::revision::{
 };
 use vivid_protocol::scene::SceneNode;
 
-use crate::vivid::target::{ClipRect, NodePlacement, PresentationTarget, TerminalTarget};
+use crate::vivid::target::{ClipRect, NodePlacement, PresentationTarget};
 use vivid_protocol::surface::SurfaceDefinition;
 use vivid_protocol::track::{
     KindConfiguration, MILESTONE_BUFFERED_ENDED, MILESTONE_CHANNEL_ACCEPTED,
@@ -271,12 +271,6 @@ struct Inner {
 #[derive(Clone)]
 pub struct SharedScene(Arc<Inner>);
 
-impl Default for SharedScene {
-    fn default() -> Self {
-        Self::new(Arc::new(TerminalTarget))
-    }
-}
-
 impl SharedScene {
     /// Build a scene for one presentation target. The target decides what node geometry means,
     /// so it is fixed for the scene's lifetime exactly as it is for a session (core §1).
@@ -290,6 +284,22 @@ impl SharedScene {
 
     pub fn target(&self) -> &Arc<dyn PresentationTarget> {
         &self.0.target
+    }
+
+    /// A scene on a default terminal target, for tests that do not care about placement.
+    #[cfg(test)]
+    pub fn for_test() -> Self {
+        Self::new(Arc::new(
+            crate::vivid::target::TerminalTarget::new(crate::vivid::target::DisplayGeometry {
+                viewport_width: 800,
+                viewport_height: 600,
+                columns: 80,
+                rows: 24,
+                cell_width: 10,
+                cell_height: 25,
+            })
+            .expect("test geometry"),
+        ))
     }
 }
 
@@ -550,6 +560,7 @@ impl SharedScene {
         definition: SurfaceDefinition,
     ) -> Result<SurfaceStatus, &'static str> {
         definition.validate().map_err(|_| "invalid surface definition")?;
+        self.0.target.validate_surface(&definition)?;
         if definition.context_id != identity.context.context_id
             || definition.surface_id != identity.surface_id
         {
@@ -583,6 +594,7 @@ impl SharedScene {
         replacement: SurfaceDefinition,
     ) -> Result<SurfaceStatus, &'static str> {
         replacement.validate().map_err(|_| "invalid surface replacement")?;
+        self.0.target.validate_surface(&replacement)?;
         let mut state = self.lock();
         let surface = state.surfaces.get_mut(&identity).ok_or("surface does not exist")?;
         if surface.revision != expected_revision || surface.generation != expected_generation {
@@ -1802,7 +1814,7 @@ mod tests {
 
     #[test]
     fn reused_local_ids_are_isolated_by_complete_owner() {
-        let scene = SharedScene::default();
+        let scene = SharedScene::for_test();
         let first = session(1, 1);
         let second = session(1, 2);
         scene.register_session(first, TargetGeneration::ONE).unwrap();
@@ -1818,7 +1830,7 @@ mod tests {
 
     #[test]
     fn scene_commit_is_atomic_on_a_missing_surface() {
-        let scene = SharedScene::default();
+        let scene = SharedScene::for_test();
         let session = session(1, 1);
         let context = session.context(1).unwrap();
         scene.register_session(session, TargetGeneration::ONE).unwrap();
@@ -1862,7 +1874,7 @@ mod tests {
     /// a silent advance rejects the update it makes on the following resize.
     #[test]
     fn destroying_a_track_moves_the_surface_revision_only_when_it_vacates_a_slot() {
-        let scene = SharedScene::default();
+        let scene = SharedScene::for_test();
         let session = session(4, 1);
         let context = session.context(1).unwrap();
         let surface_identity = context.surface(1).unwrap();
@@ -1939,7 +1951,7 @@ mod tests {
     /// and it must stay distinguishable from a record that genuinely could not be advanced.
     #[test]
     fn a_presentation_a_resize_overtook_is_superseded_rather_than_failed() {
-        let scene = SharedScene::default();
+        let scene = SharedScene::for_test();
         let session = session(6, 1);
         let context = session.context(1).unwrap();
         let surface_identity = context.surface(1).unwrap();
@@ -2019,7 +2031,7 @@ mod tests {
 
     #[test]
     fn authenticated_anchor_positions_and_retains_a_clean_goodbye_poster() {
-        let scene = SharedScene::default();
+        let scene = SharedScene::for_test();
         let session = session(2, 1);
         let context = session.context(1).unwrap();
         let surface_identity = context.surface(1).unwrap();
@@ -2135,7 +2147,7 @@ mod tests {
 
     #[test]
     fn a_complete_priming_record_precedes_playback_clock_pacing() {
-        let scene = SharedScene::default();
+        let scene = SharedScene::for_test();
         let session = session(3, 1);
         let context = session.context(1).unwrap();
         let surface_identity = context.surface(1).unwrap();

@@ -751,7 +751,7 @@ mod tests {
                 .expect("headless wgpu device");
         let mut renderer = Renderer::new(&device, RendererOptions::default()).expect("Vello");
         let mut media = VividMediaRenderer::new(&device);
-        let scene = SharedScene::default();
+        let scene = SharedScene::for_test();
         scene.add_anchor(1, 1, 0, -1).unwrap();
 
         for (source_id, rgba) in
@@ -874,7 +874,7 @@ mod tests {
                 .expect("headless wgpu device");
         let mut renderer = Renderer::new(&device, RendererOptions::default()).expect("Vello");
         let mut media = VividMediaRenderer::new(&device);
-        let scene = SharedScene::default();
+        let scene = SharedScene::for_test();
         scene.add_anchor(1, 1, 0, 0).unwrap();
         scene
             .add_source(

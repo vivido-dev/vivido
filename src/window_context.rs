@@ -61,7 +61,7 @@ use crate::automation::{AutomationWindowState, Transcript};
 use crate::cli::{
     IpcKey, IpcMouse, IpcMouseAction, IpcMouseButton, IpcMousePosition, IpcSignalName,
 };
-use crate::cli::{ParsedOptions, WindowOptions};
+use crate::cli::{ParsedOptions, VividTarget, WindowOptions};
 use crate::clipboard::Clipboard;
 use crate::config::UiConfig;
 use crate::display::Display;
@@ -227,7 +227,14 @@ impl WindowContext {
         let event_proxy = EventProxy::new(proxy, display.window.id());
 
         let vivid_service = {
-            let service = VividService::start(display.size_info.into(), event_proxy.clone())?;
+            let service = match options.vivid_target {
+                VividTarget::Terminal => {
+                    VividService::start(display.size_info.into(), event_proxy.clone())?
+                },
+                VividTarget::Desktop => {
+                    VividService::start_desktop(display.size_info.into(), event_proxy.clone())?
+                },
+            };
             pty_config
                 .env
                 .insert("VIVID_ENDPOINT_CONTROL".into(), service.control_endpoint().into());

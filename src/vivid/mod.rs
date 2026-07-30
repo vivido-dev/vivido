@@ -52,7 +52,6 @@ use vivid_protocol::track::{
 };
 use vivid_protocol::wire::{ConnectionKind, RECORD_OPTIONAL, Record};
 
-use crate::display::SizeInfo;
 use crate::event::{EventProxy, EventType};
 use crate::terminal::event::EventListener;
 use crate::terminal::grid::Dimensions;
@@ -65,6 +64,8 @@ use crate::vivid::scene::{
     CommitRejection, Frame, SceneStatus, SharedScene, SurfaceStatus, TrackStatus,
     TrackWaitEvaluation, TrackWaitSatisfied,
 };
+pub use crate::vivid::target::DisplayGeometry;
+use crate::vivid::target::{DesktopTarget, PresentationTarget, TerminalTarget};
 use crate::vivid::transport::{ReadShutdown, Reader, Writer};
 
 #[cfg(windows)]
@@ -84,41 +85,6 @@ const CHANNEL_FLOW_BYTES: u64 = 8 * 1024 * 1024;
 const CHANNEL_FLOW_RECORDS: u64 = 128;
 const CHANNEL_OPEN_DEADLINE_US: u64 = 30_000_000;
 const MAX_SCENE_NODES: usize = 256;
-
-/// Geometry of the `terminal-surface-v1` presentation target.
-///
-/// The target generation is owned by the service and assigned when a geometry is accepted, so it
-/// is deliberately not part of this type: a caller cannot supply, reuse, or skip a generation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DisplayGeometry {
-    pub viewport_width: u32,
-    pub viewport_height: u32,
-    pub columns: u32,
-    pub rows: u32,
-    pub cell_width: u32,
-    pub cell_height: u32,
-}
-
-impl From<SizeInfo> for DisplayGeometry {
-    fn from(size: SizeInfo) -> Self {
-        Self {
-            viewport_width: size.width() as u32,
-            viewport_height: size.height() as u32,
-            columns: size.columns() as u32,
-            rows: size.screen_lines() as u32,
-            cell_width: size.cell_width().round() as u32,
-            cell_height: size.cell_height().round() as u32,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct DisplayMetrics {
-    geometry: DisplayGeometry,
-    generation: u64,
-    /// Whether this generation has been announced as final rather than mid-resize.
-    settled: bool,
-}
 
 struct SessionRuntime {
     identity: SessionIdentity,
@@ -142,8 +108,6 @@ struct ServiceShared {
     presenter: PresenterInstanceId,
     scene: SharedScene,
     registry: Mutex<Registry>,
-    metrics: Mutex<DisplayMetrics>,
-    pending_metrics: Mutex<Option<DisplayMetrics>>,
     audio_outputs: Mutex<HashMap<TrackIdentity, Arc<AudioOutput>>>,
     next_session: AtomicU64,
     active_connections: AtomicUsize,
@@ -168,12 +132,30 @@ impl VividService {
         )
     }
 
+    /// Start a window that presents `desktop-surface-v1` instead of a terminal.
+    ///
+    /// Stage 1 D1: a window presents exactly one target profile, chosen when it is created, so a
+    /// session never has to reconcile two coordinate truths.
+    pub fn start_desktop(geometry: DisplayGeometry, event_proxy: EventProxy) -> io::Result<Self> {
+        let target = Arc::new(DesktopTarget::new(geometry).map_err(io::Error::other)?);
+        Self::start_with_target(
+            target,
+            Arc::new(move || event_proxy.send_event(EventType::VividFrame)),
+        )
+    }
+
     fn start_with_wake(
         geometry: DisplayGeometry,
         wake: Arc<dyn Fn() + Send + Sync>,
     ) -> io::Result<Self> {
-        validate_geometry(geometry)?;
-        let metrics = DisplayMetrics { geometry, generation: 1, settled: true };
+        let target = Arc::new(TerminalTarget::new(geometry).map_err(io::Error::other)?);
+        Self::start_with_target(target, wake)
+    }
+
+    fn start_with_target(
+        target: Arc<dyn PresentationTarget>,
+        wake: Arc<dyn Fn() + Send + Sync>,
+    ) -> io::Result<Self> {
         let (listener, control_endpoint, directory) = bind_local_listener()?;
         let mut secret = [0_u8; 32];
         getrandom::fill(&mut secret).map_err(|error| {
@@ -184,14 +166,12 @@ impl VividService {
             io::Error::other(format!("could not generate presenter identity: {error}"))
         })?;
         let root_secret = encode_hex(&secret);
-        let scene = SharedScene::default();
+        let scene = SharedScene::new(target);
         let shared = Arc::new(ServiceShared {
             root_secret: Secret32::new(secret),
             presenter: PresenterInstanceId(presenter),
             scene: scene.clone(),
             registry: Mutex::new(Registry::default()),
-            metrics: Mutex::new(metrics),
-            pending_metrics: Mutex::new(None),
             audio_outputs: Mutex::new(HashMap::new()),
             next_session: AtomicU64::new(1),
             active_connections: AtomicUsize::new(0),
@@ -231,17 +211,7 @@ impl VividService {
     /// Every later `WELCOME` reports the accepted geometry, and the change is queued for the next
     /// `flush_display_change` so live sessions observe it as `TARGET_CHANGED`.
     pub fn update_metrics(&self, geometry: DisplayGeometry) -> Option<u64> {
-        if validate_geometry(geometry).is_err() {
-            return None;
-        }
-        let mut current = lock(&self.shared.metrics);
-        if current.geometry == geometry {
-            return None;
-        }
-        let generation = current.generation.checked_add(1)?;
-        *current = DisplayMetrics { geometry, generation, settled: false };
-        *lock(&self.shared.pending_metrics) = Some(*current);
-        Some(generation)
+        self.shared.scene.target().offer_geometry(geometry)
     }
 
     /// Announce a queued display change, or re-announce the current one as settled.
@@ -250,25 +220,15 @@ impl VividService {
     /// fires afterwards. The settled announcement therefore has to be rebuilt from the current
     /// metrics, because the queued change was already consumed by that earlier frame.
     pub fn flush_display_change(&self, settled_generation: Option<u64>) {
-        // Taken in the same order as `update_metrics` acquires them.
-        let mut current = lock(&self.shared.metrics);
-        let pending = lock(&self.shared.pending_metrics).take();
-        let metrics = match pending {
-            Some(metrics) => metrics,
-            None if settled_generation == Some(current.generation) => *current,
-            None => return,
+        let Some(change) = self.shared.scene.target().take_change(settled_generation) else {
+            return;
         };
-        let settled = settled_generation == Some(metrics.generation);
-        if settled && current.generation == metrics.generation {
-            current.settled = true;
-        }
-        drop(current);
 
         // The scene validates every commit against the generation it was planned for, so it has
         // to reach the new target before any producer can name it.
-        self.scene.advance_target_generation(TargetGeneration::new(metrics.generation));
+        self.scene.advance_target_generation(TargetGeneration::new(change.generation));
 
-        let body = target_change_body(DisplayMetrics { settled, ..metrics });
+        let body = target_change_body(&change);
         let writers = lock(&self.shared.registry)
             .sessions
             .values()
@@ -358,7 +318,7 @@ impl VividService {
                 (3, Value::Unsigned(column as u64)),
                 (4, Value::Unsigned(u64::try_from(line).unwrap_or_default())),
                 (5, Value::Bool(line >= 0)),
-                (6, Value::Unsigned(lock(&self.shared.metrics).generation)),
+                (6, Value::Unsigned(self.shared.scene.target().generation())),
             ],
         )
         .encode()
@@ -758,14 +718,14 @@ fn establish_root_session(
         &[0; 32],
     );
     let (keys, anchor_key) = auth::derive_session_keys(&prk, session_id, 0, &session_tag);
-    let metrics = *lock(&shared.metrics);
+
     let mut welcome = Welcome {
         session_id,
         session_tag,
         root_context_id: root_context.context_id,
-        target_generation: metrics.generation,
+        target_generation: target.generation(),
         target_profile: target.profile_name().into(),
-        target_descriptor: target_descriptor(metrics.geometry, metrics.settled),
+        target_descriptor: target.descriptor(),
         accepted_profiles: accepted,
         maximum_control_body: hello
             .maximum_control_body
@@ -807,7 +767,7 @@ fn establish_root_session(
     });
     shared
         .scene
-        .register_session(identity, TargetGeneration::new(metrics.generation))
+        .register_session(identity, TargetGeneration::new(target.generation()))
         .map_err(io::Error::other)?;
     registry.sessions.insert(session_id, runtime.clone());
     Ok(runtime)
@@ -842,7 +802,7 @@ fn dispatch_control(
                     (0, Value::Unsigned(session.identity.session_id)),
                     (1, Value::Bytes(session.session_tag.to_vec())),
                     (2, Value::Unsigned(session.root_context.context_id)),
-                    (3, Value::Unsigned(lock(&shared.metrics).generation)),
+                    (3, Value::Unsigned(shared.scene.target().generation())),
                     (4, Value::Unsigned(1)),
                     (5, Value::Unsigned(0)),
                 ],
@@ -941,12 +901,13 @@ fn dispatch_control(
             let definition = SurfaceDefinition::decode_create(record.object_id, &value)
                 .map_err(|_| ControlError::bad_message("invalid surface definition"))?;
             require_context_operation(session, definition.context_id, OP_SURFACE_TRACK_MEDIA)?;
+            // Which semantic profiles are presentable is the target's decision, not the session's.
             if !matches!(
                 definition.semantic_profile.as_str(),
-                registry::GENERIC_CONTENT | registry::TERMINAL_CONTENT
+                registry::GENERIC_CONTENT | registry::TERMINAL_CONTENT | registry::DESKTOP_CONTENT
             ) {
                 return Err(ControlError::unsupported(
-                    "Vivido accepts generic-content-v1 and terminal-content-v1 surfaces",
+                    "Vivido presents generic, terminal, and desktop content surfaces",
                 ));
             }
             let identity = surface_identity(session, definition.context_id, definition.surface_id)?;
@@ -1308,11 +1269,16 @@ fn dispatch_control(
                     // rejection has to say what the target is now. The announcement precedes the
                     // error on this ordered connection, which is what lets the producer re-plan
                     // and commit again instead of failing.
-                    let metrics = *lock(&shared.metrics);
+                    let target = shared.scene.target();
+                    let current = crate::vivid::target::TargetChange {
+                        descriptor: target.descriptor(),
+                        generation: target.generation(),
+                        reason: 0,
+                    };
                     if let Err(error) = session.writer.write_record(
                         messages::TARGET_CHANGED,
                         0,
-                        &target_change_body(metrics),
+                        &target_change_body(&current),
                     ) {
                         log::debug!("could not re-announce the target for a stale commit: {error}");
                     }
@@ -1368,7 +1334,7 @@ fn dispatch_control(
                 }
                 payload.push((5, Value::Bool(true)));
             }
-            payload.push((6, Value::Unsigned(lock(&shared.metrics).generation)));
+            payload.push((6, Value::Unsigned(shared.scene.target().generation())));
             (messages::ANCHOR_STATUS, anchor_id, Envelope::new(request_id, payload).encode())
         },
         messages::WAIT_TRACK => {
@@ -2555,40 +2521,12 @@ fn presenter_contract() -> ResourceContract {
     contract
 }
 
-fn target_descriptor(geometry: DisplayGeometry, settled: bool) -> Vec<(u64, Value)> {
-    vec![
-        (0, Value::Unsigned(u64::from(geometry.viewport_width))),
-        (1, Value::Unsigned(u64::from(geometry.viewport_height))),
-        (2, Value::Unsigned(u64::from(geometry.columns))),
-        (3, Value::Unsigned(u64::from(geometry.rows))),
-        (4, Value::Unsigned(u64::from(geometry.cell_width))),
-        (5, Value::Unsigned(u64::from(geometry.cell_height))),
-        (6, Value::Bool(settled)),
-        (7, Value::Unsigned(3)),
-        (8, Value::Unsigned(MAX_ACTIVE_ANCHORS as u64)),
-    ]
-}
-
 /// Encode one `TARGET_CHANGED` body for the given target, announcement or re-announcement alike.
-fn target_change_body(metrics: DisplayMetrics) -> Vec<u8> {
-    let mut payload = target_descriptor(metrics.geometry, metrics.settled);
-    payload.push((9, Value::Unsigned(metrics.generation)));
-    payload.push((10, Value::Unsigned(0x1f)));
+fn target_change_body(change: &crate::vivid::target::TargetChange) -> Vec<u8> {
+    let mut payload = change.descriptor.clone();
+    payload.push((9, Value::Unsigned(change.generation)));
+    payload.push((10, Value::Unsigned(change.reason)));
     Envelope::new(0, payload).encode().expect("target-change payload is valid")
-}
-
-fn validate_geometry(geometry: DisplayGeometry) -> io::Result<()> {
-    if geometry.viewport_width == 0
-        || geometry.viewport_height == 0
-        || geometry.columns == 0
-        || geometry.rows == 0
-        || geometry.cell_width == 0
-        || geometry.cell_height == 0
-    {
-        Err(io::Error::new(ErrorKind::InvalidInput, "terminal target geometry must be positive"))
-    } else {
-        Ok(())
-    }
 }
 
 fn image_format(encoding: u64) -> io::Result<image::ImageFormat> {
@@ -2800,7 +2738,8 @@ mod tests {
 
     #[test]
     fn target_descriptor_advertises_anchor_v3() {
-        assert_eq!(target_descriptor(test_geometry(), true)[7].1.as_u64(), Some(3));
+        let target = TerminalTarget::new(test_geometry()).unwrap();
+        assert_eq!(target.descriptor()[7].1.as_u64(), Some(3));
     }
 
     /// A window resize has to reach producers. The startup geometry is only correct until the
@@ -3136,6 +3075,260 @@ mod tests {
             service.scene.snapshot().1.len(),
             1,
             "clean GOODBYE must preserve an anchored, policy-permitted terminal poster"
+        );
+    }
+
+    fn desktop_service() -> VividService {
+        let target = Arc::new(DesktopTarget::new(test_geometry()).unwrap());
+        VividService::start_with_target(target, Arc::new(|| {})).unwrap()
+    }
+
+    fn connect_desktop(service: &VividService) -> vivid_sdk::Session {
+        let mut required = vec![
+            registry::CORE_CONTROL.to_owned(),
+            registry::DESKTOP_SURFACE.to_owned(),
+            registry::LIVE_MEDIA.to_owned(),
+        ];
+        required.sort();
+        vivid_sdk::Session::connect(ProducerConfig {
+            endpoint_control: Some(service.control_endpoint().to_owned()),
+            authentication: ProducerAuthentication::root_hex(service.root_secret()).unwrap(),
+            target_profile: registry::DESKTOP_SURFACE.to_owned(),
+            required_profiles: required,
+            optional_profiles: vec![registry::OBSERVABILITY.to_owned()],
+            ..ProducerConfig::default()
+        })
+        .unwrap()
+    }
+
+    fn desktop_surface(context_id: u64, width: u64) -> SurfaceDefinition {
+        SurfaceDefinition {
+            context_id,
+            surface_id: 5,
+            semantic_profile: registry::DESKTOP_CONTENT.into(),
+            coordinate_model: CoordinateModel::DesktopLogicalPixels,
+            logical_width: width,
+            logical_height: 1080,
+            scale_numerator: 1,
+            scale_denominator: 1,
+            rotation: 0,
+            descriptor: SurfaceDescriptor {
+                role: SurfaceRole::Desktop,
+                title: "desktop".into(),
+                semantic_content_revision: 1,
+                semantic_availability: 0,
+                locator_hint: String::new(),
+            },
+            policy: 0,
+            profile_parameters: vivid_protocol::surface::DesktopSurfaceParameters {
+                captured_origin_x: 0,
+                captured_origin_y: 0,
+                topology: vec![],
+                semantic_generation: 1,
+                input_capabilities: 0,
+            }
+            .encode(),
+        }
+    }
+
+    #[test]
+    fn a_desktop_window_presents_the_desktop_target_profile() {
+        let service = desktop_service();
+        let session = connect_desktop(&service);
+        assert_eq!(session.info().target_profile, registry::DESKTOP_SURFACE);
+
+        // Desktop §1 keys 0 through 6, and nothing that could name a device.
+        let descriptor = &session.info().target_descriptor;
+        assert_eq!(descriptor.len(), 7);
+        assert_eq!(descriptor[2].1.as_u64(), Some(800));
+        assert_eq!(descriptor[3].1.as_u64(), Some(600));
+        for (_, value) in descriptor {
+            let leaves = match value {
+                Value::Array(entries) => entries.clone(),
+                other => vec![other.clone()],
+            };
+            for leaf in leaves {
+                match leaf {
+                    Value::Map(entries) => assert!(
+                        entries
+                            .iter()
+                            .all(|(_, item)| !matches!(item, Value::Text(_) | Value::Bytes(_))),
+                        "an output descriptor carried free-form data"
+                    ),
+                    Value::Text(_) | Value::Bytes(_) => {
+                        panic!("the desktop descriptor carried text")
+                    },
+                    _ => {},
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_terminal_producer_cannot_attach_to_a_desktop_window() {
+        // Stage 1 D1: a window presents exactly one target profile.
+        let service = desktop_service();
+        assert!(
+            vivid_sdk::Session::connect(ProducerConfig {
+                endpoint_control: Some(service.control_endpoint().to_owned()),
+                authentication: ProducerAuthentication::root_hex(service.root_secret()).unwrap(),
+                ..ProducerConfig::default()
+            })
+            .is_err(),
+            "a terminal-surface-v1 producer must be refused by a desktop window"
+        );
+    }
+
+    #[test]
+    fn each_target_refuses_the_other_semantic_surface_profile() {
+        let desktop = desktop_service();
+        let mut session = connect_desktop(&desktop);
+        let context_id = session.info().root_context_id;
+        let mut terminal_shaped = desktop_surface(context_id, 1920);
+        terminal_shaped.semantic_profile = registry::TERMINAL_CONTENT.into();
+        terminal_shaped.coordinate_model = CoordinateModel::TerminalContentCells;
+        assert!(
+            session.create_surface(terminal_shaped, &RequestMetadata::default()).is_err(),
+            "a desktop target cannot present terminal content"
+        );
+
+        let terminal = VividService::start_with_wake(test_geometry(), Arc::new(|| {})).unwrap();
+        let mut session = connect(&terminal);
+        let context_id = session.info().root_context_id;
+        assert!(
+            session
+                .create_surface(desktop_surface(context_id, 1920), &RequestMetadata::default())
+                .is_err(),
+            "a terminal target cannot present desktop content"
+        );
+    }
+
+    #[test]
+    fn malformed_desktop_profile_parameters_are_refused() {
+        let service = desktop_service();
+        let mut session = connect_desktop(&service);
+        let context_id = session.info().root_context_id;
+        let mut broken = desktop_surface(context_id, 1920);
+        // Semantic generation zero, which desktop §2 forbids.
+        broken.profile_parameters = vivid_protocol::surface::DesktopSurfaceParameters {
+            captured_origin_x: 0,
+            captured_origin_y: 0,
+            topology: vec![],
+            semantic_generation: 0,
+            input_capabilities: 0,
+        }
+        .encode();
+        assert!(session.create_surface(broken, &RequestMetadata::default()).is_err());
+    }
+
+    #[test]
+    fn a_desktop_dimension_change_advances_the_surface_generation() {
+        // The W3 acceptance: a coordinate-mapping change advances the generation, and nothing
+        // about media does. Desktop §2 and core §8.3.
+        let service = desktop_service();
+        let mut session = connect_desktop(&service);
+        let context_id = session.info().root_context_id;
+        let surface = session
+            .create_surface(desktop_surface(context_id, 1920), &RequestMetadata::default())
+            .unwrap();
+        assert_eq!(surface.generation(), SurfaceGeneration::ONE);
+
+        session
+            .update_surface(
+                &surface,
+                desktop_surface(context_id, 2560),
+                &RequestMetadata::default(),
+            )
+            .unwrap();
+        assert_eq!(surface.generation().get(), 2, "a width change is a coordinate-mapping change");
+
+        // A descriptor-only update is not a mapping change, so the generation holds.
+        let mut retitled = desktop_surface(context_id, 2560);
+        retitled.descriptor.title = "renamed".into();
+        retitled.descriptor.semantic_content_revision = 2;
+        session.update_surface(&surface, retitled, &RequestMetadata::default()).unwrap();
+        assert_eq!(
+            surface.generation().get(),
+            2,
+            "a descriptor change must not advance the surface generation"
+        );
+        assert_eq!(surface.revision().get(), 3, "but it is still a revision");
+    }
+
+    #[test]
+    fn a_full_root_node_covers_the_whole_desktop_target() {
+        let service = desktop_service();
+        let mut session = connect_desktop(&service);
+        let context_id = session.info().root_context_id;
+        let surface = session
+            .create_surface(desktop_surface(context_id, 1920), &RequestMetadata::default())
+            .unwrap();
+        session
+            .create_node(
+                &SceneNode {
+                    owning_context_id: context_id,
+                    node_id: 3,
+                    surface_context_id: context_id,
+                    surface_id: surface.id(),
+                    geometry: vivid_protocol::geometry::NodeGeometry::full_target().encode(),
+                    fit: vivid_sdk::Fit::Contain,
+                    linear_sampling: true,
+                    z_index: 0,
+                    visible: true,
+                    opacity: u16::MAX,
+                    clip: None,
+                },
+                &RequestMetadata::default(),
+            )
+            .unwrap();
+
+        // Normalized geometry projects against the current target extent, in logical pixels.
+        let target = service.scene.target();
+        let placement = target
+            .placement(&SceneNode {
+                owning_context_id: context_id,
+                node_id: 3,
+                surface_context_id: context_id,
+                surface_id: surface.id(),
+                geometry: vivid_protocol::geometry::NodeGeometry::full_target().encode(),
+                fit: vivid_sdk::Fit::Contain,
+                linear_sampling: true,
+                z_index: 0,
+                visible: true,
+                opacity: u16::MAX,
+                clip: None,
+            })
+            .unwrap();
+        assert_eq!(placement.x, 0);
+        assert_eq!(placement.width, 800_i64 << 32);
+        assert_eq!(placement.height, 600_i64 << 32);
+        assert!(!placement.text_anchored, "a desktop node is never text-anchored");
+    }
+
+    #[test]
+    fn a_desktop_resize_announces_a_target_change_with_its_reason() {
+        let service = desktop_service();
+        let session = connect_desktop(&service);
+        assert_eq!(session.info().target_generation.get(), 1);
+
+        let resized =
+            DisplayGeometry { viewport_width: 1280, viewport_height: 720, ..test_geometry() };
+        let generation = service.update_metrics(resized).unwrap();
+        assert_eq!(generation, 2);
+        service.flush_display_change(None);
+
+        let payload = next_target_change(&session);
+        // Look up by key: a desktop descriptor is seven entries, not the terminal's nine.
+        let field = |key: u64| {
+            payload.iter().find(|entry| entry.0 == key).and_then(|entry| entry.1.as_u64())
+        };
+        assert_eq!(field(2), Some(1280));
+        assert_eq!(field(3), Some(720));
+        assert_eq!(field(9), Some(2), "the new target generation");
+        let reason = field(10).unwrap();
+        assert!(
+            reason & vivid_protocol::target::reason::VIRTUAL_BOUNDS != 0,
+            "a resize changes the virtual bounds"
         );
     }
 

@@ -380,7 +380,7 @@ _vivido() {
 
     case "${cmd}" in
         vivido)
-            opts="-q -v -w -e -T -o -h -V --print-events --ref-test --config-file --socket --daemon --window-id --working-directory --hold --command --title --class --option --help --version msg help"
+            opts="-q -v -w -e -T -o -h -V --print-events --ref-test --config-file --socket --daemon --vivid-target --window-id --working-directory --hold --command --title --class --option --help --version msg help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 1 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -414,6 +414,10 @@ _vivido() {
                     if [[ "${BASH_VERSINFO[0]}" -ge 4 ]]; then
                         compopt -o filenames
                     fi
+                    return 0
+                    ;;
+                --vivid-target)
+                    COMPREPLY=($(compgen -W "terminal desktop" -- "${cur}"))
                     return 0
                     ;;
                 --window-id)
@@ -1045,12 +1049,16 @@ _vivido() {
             return 0
             ;;
         vivido__msg__create__window)
-            opts="-w -e -T -o -h --window-id --working-directory --hold --command --title --class --option --help"
+            opts="-w -e -T -o -h --vivid-target --window-id --working-directory --hold --command --title --class --option --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
             fi
             case "${prev}" in
+                --vivid-target)
+                    COMPREPLY=($(compgen -W "terminal desktop" -- "${cur}"))
+                    return 0
+                    ;;
                 --window-id)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0

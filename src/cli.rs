@@ -137,6 +137,17 @@ fn parse_class(input: &str) -> Result<Class, String> {
     Ok(Class::new(general, instance))
 }
 
+/// Which Vivid presentation target a window presents.
+#[derive(Serialize, Deserialize, clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum VividTarget {
+    /// `terminal-surface-v1`: a grid of cells with a text plane and anchors.
+    #[default]
+    Terminal,
+    /// `desktop-surface-v1`: a virtual desktop in logical pixels, with no grid and no anchors.
+    Desktop,
+}
+
 /// Terminal specific cli options which can be passed to new windows via IPC.
 #[derive(Serialize, Deserialize, Args, Default, Debug, Clone, PartialEq, Eq)]
 pub struct TerminalOptions {
@@ -300,6 +311,15 @@ pub enum SocketMessage {
 /// Subset of options that we pass to 'create-window' IPC subcommand.
 #[derive(Serialize, Deserialize, Args, Default, Clone, Debug, PartialEq, Eq)]
 pub struct WindowOptions {
+    /// Present a `desktop-surface-v1` Vivid target instead of the terminal target.
+    ///
+    /// A window presents exactly one target profile for its lifetime, because a session has
+    /// exactly one presentation target and the two describe different coordinate truths: a
+    /// terminal has a grid, cell metrics, and anchors; a desktop has logical pixels and an output
+    /// topology. A desktop window carries no shell.
+    #[clap(long = "vivid-target", value_name = "TARGET", default_value = "terminal")]
+    pub vivid_target: VividTarget,
+
     /// Stable IPC ID assigned to this window.
     ///
     /// When omitted, Vivido uses the platform window ID.

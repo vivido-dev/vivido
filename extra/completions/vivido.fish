@@ -1,6 +1,6 @@
 # Print an optspec for argparse to handle cmd's options that are independent of any subcommand.
 function __fish_vivido_global_optspecs
-	string join \n print-events ref-test config-file= socket= q v daemon w/window-id= working-directory= hold e/command= T/title= class= o/option= h/help V/version
+	string join \n print-events ref-test config-file= socket= q v daemon vivid-target= w/window-id= working-directory= hold e/command= T/title= class= o/option= h/help V/version
 end
 
 function __fish_vivido_needs_command
@@ -26,6 +26,8 @@ end
 
 complete -c vivido -n "__fish_vivido_needs_command" -l config-file -d 'Specify alternative configuration file [default: $XDG_CONFIG_HOME/vivido/vivido.toml]' -r -F
 complete -c vivido -n "__fish_vivido_needs_command" -l socket -d 'Path for IPC socket creation' -r -F
+complete -c vivido -n "__fish_vivido_needs_command" -l vivid-target -d 'Present a `desktop-surface-v1` Vivid target instead of the terminal target' -r -f -a "terminal\t'`terminal-surface-v1`: a grid of cells with a text plane and anchors'
+desktop\t'`desktop-surface-v1`: a virtual desktop in logical pixels, with no grid and no anchors'"
 complete -c vivido -n "__fish_vivido_needs_command" -s w -l window-id -d 'Stable IPC ID assigned to this window' -r
 complete -c vivido -n "__fish_vivido_needs_command" -l working-directory -d 'Start the shell in the specified working directory' -r -F
 complete -c vivido -n "__fish_vivido_needs_command" -s e -l command -d 'Command and args to execute (must be last argument)' -r
@@ -64,6 +66,8 @@ complete -c vivido -n "__fish_vivido_using_subcommand msg; and not __fish_seen_s
 complete -c vivido -n "__fish_vivido_using_subcommand msg; and not __fish_seen_subcommand_from create-window config get-config typing get-text screenshot capabilities key paste mouse resize focus signal list-windows inspect get-grid wait transcript subscribe help" -f -a "transcript" -d 'Read retained sanitized PTY output'
 complete -c vivido -n "__fish_vivido_using_subcommand msg; and not __fish_seen_subcommand_from create-window config get-config typing get-text screenshot capabilities key paste mouse resize focus signal list-windows inspect get-grid wait transcript subscribe help" -f -a "subscribe" -d 'Stream automation events until interrupted'
 complete -c vivido -n "__fish_vivido_using_subcommand msg; and not __fish_seen_subcommand_from create-window config get-config typing get-text screenshot capabilities key paste mouse resize focus signal list-windows inspect get-grid wait transcript subscribe help" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
+complete -c vivido -n "__fish_vivido_using_subcommand msg; and __fish_seen_subcommand_from create-window" -l vivid-target -d 'Present a `desktop-surface-v1` Vivid target instead of the terminal target' -r -f -a "terminal\t'`terminal-surface-v1`: a grid of cells with a text plane and anchors'
+desktop\t'`desktop-surface-v1`: a virtual desktop in logical pixels, with no grid and no anchors'"
 complete -c vivido -n "__fish_vivido_using_subcommand msg; and __fish_seen_subcommand_from create-window" -s w -l window-id -d 'Stable IPC ID assigned to this window' -r
 complete -c vivido -n "__fish_vivido_using_subcommand msg; and __fish_seen_subcommand_from create-window" -l working-directory -d 'Start the shell in the specified working directory' -r -F
 complete -c vivido -n "__fish_vivido_using_subcommand msg; and __fish_seen_subcommand_from create-window" -s e -l command -d 'Command and args to execute (must be last argument)' -r
