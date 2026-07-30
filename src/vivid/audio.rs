@@ -103,7 +103,6 @@ struct AVChannelLayout {
 struct Shared {
     enabled: AtomicBool,
     prebuffered: AtomicBool,
-    received_samples: AtomicBool,
     stopped: AtomicBool,
     decode_done: AtomicBool,
     eos_observed: AtomicBool,
@@ -117,7 +116,13 @@ struct Shared {
     prebuffer_samples: AtomicU64,
     requested_start_pts_us: AtomicI64,
     play_configured_at: Mutex<Option<Instant>>,
+    clock_progress: Mutex<ClockProgress>,
     error: Mutex<Option<String>>,
+}
+
+struct ClockProgress {
+    rendered_samples: u64,
+    observed_at: Instant,
 }
 
 impl Shared {
@@ -155,7 +160,6 @@ impl AudioOutput {
         let shared = Arc::new(Shared {
             enabled: AtomicBool::new(false),
             prebuffered: AtomicBool::new(false),
-            received_samples: AtomicBool::new(false),
             stopped: AtomicBool::new(false),
             decode_done: AtomicBool::new(false),
             eos_observed: AtomicBool::new(false),
@@ -174,6 +178,10 @@ impl AudioOutput {
             ),
             requested_start_pts_us: AtomicI64::new(UNSET_PTS),
             play_configured_at: Mutex::new(None),
+            clock_progress: Mutex::new(ClockProgress {
+                rendered_samples: 0,
+                observed_at: Instant::now(),
+            }),
             error: Mutex::new(None),
         });
         let ring = HeapRb::<f32>::new(
@@ -215,7 +223,6 @@ impl AudioOutput {
         let shared = Arc::new(Shared {
             enabled: AtomicBool::new(false),
             prebuffered: AtomicBool::new(false),
-            received_samples: AtomicBool::new(false),
             stopped: AtomicBool::new(false),
             decode_done: AtomicBool::new(false),
             eos_observed: AtomicBool::new(false),
@@ -229,6 +236,10 @@ impl AudioOutput {
             prebuffer_samples: AtomicU64::new(0),
             requested_start_pts_us: AtomicI64::new(UNSET_PTS),
             play_configured_at: Mutex::new(None),
+            clock_progress: Mutex::new(ClockProgress {
+                rendered_samples: 0,
+                observed_at: Instant::now(),
+            }),
             error: Mutex::new(None),
         });
         let (producer, _consumer) = HeapRb::<f32>::new(32).split();
@@ -246,6 +257,11 @@ impl AudioOutput {
     pub(super) fn force_video_gate_stall_for_test(&self) {
         *self.shared.play_configured_at.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
             Some(Instant::now() - LINKED_AUDIO_STALL_FALLBACK - Duration::from_millis(1));
+        self.shared
+            .clock_progress
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .observed_at = Instant::now() - LINKED_AUDIO_STALL_FALLBACK - Duration::from_millis(1);
     }
 
     pub fn decoder(&self, config: &AudioConfiguration) -> io::Result<AudioDecoder> {
@@ -269,6 +285,11 @@ impl AudioOutput {
         self.shared.prebuffered.store(false, Ordering::SeqCst);
         *self.shared.play_configured_at.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
             Some(Instant::now());
+        *self.shared.clock_progress.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            ClockProgress {
+                rendered_samples: self.shared.rendered_samples.load(Ordering::SeqCst),
+                observed_at: Instant::now(),
+            };
     }
 
     pub fn pause(&self) {
@@ -284,7 +305,6 @@ impl AudioOutput {
             .saturating_sub(self.shared.played_samples.load(Ordering::SeqCst));
         self.shared.discard_samples.store(outstanding, Ordering::SeqCst);
         self.shared.prebuffered.store(false, Ordering::SeqCst);
-        self.shared.received_samples.store(false, Ordering::SeqCst);
         self.shared.decode_done.store(false, Ordering::SeqCst);
         self.shared.eos_observed.store(false, Ordering::SeqCst);
         self.shared.rendered_samples.store(0, Ordering::SeqCst);
@@ -294,6 +314,8 @@ impl AudioOutput {
         self.shared.leading_silence_samples.store(0, Ordering::SeqCst);
         *self.shared.play_configured_at.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
             None;
+        *self.shared.clock_progress.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            ClockProgress { rendered_samples: 0, observed_at: Instant::now() };
     }
 
     fn observe_timeline_pts(&self, pts_us: i64) {
@@ -376,21 +398,33 @@ impl AudioOutput {
     }
 
     pub fn video_gate_stalled(&self) -> bool {
-        self.shared.enabled.load(Ordering::SeqCst)
-            && !self.shared.prebuffered.load(Ordering::SeqCst)
-            && !self.shared.received_samples.load(Ordering::SeqCst)
-            && self
+        if !self.shared.enabled.load(Ordering::SeqCst)
+            || !self
                 .shared
                 .play_configured_at
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .is_some_and(|configured| configured.elapsed() > LINKED_AUDIO_STALL_FALLBACK)
+        {
+            return false;
+        }
+        let rendered_samples = self.shared.rendered_samples.load(Ordering::SeqCst);
+        let mut progress =
+            self.shared.clock_progress.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if rendered_samples != progress.rendered_samples {
+            progress.rendered_samples = rendered_samples;
+            progress.observed_at = Instant::now();
+            return false;
+        }
+        if progress.observed_at.elapsed() <= LINKED_AUDIO_STALL_FALLBACK {
+            return false;
+        }
+        drop(progress);
+        self.shared.set_error("linked audio output clock stalled");
+        true
     }
 
     pub fn push(&self, samples: &[f32]) -> io::Result<()> {
-        if !samples.is_empty() {
-            self.shared.received_samples.store(true, Ordering::SeqCst);
-        }
         let mut producer = self.producer.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         for &sample in samples {
             let mut sample = sample;
@@ -979,24 +1013,21 @@ mod tests {
     use vivid_protocol::track::AudioConfiguration;
 
     #[test]
-    fn video_gate_stall_requires_enabled_and_empty_ingress() {
+    fn video_gate_stall_requires_enabled_and_absent_clock_progress() {
         let output = AudioOutput::test_output();
         assert!(!output.video_gate_stalled());
 
         output.configure_play(0, 100_000);
         output.start();
         assert!(!output.video_gate_stalled());
-        *output.shared.play_configured_at.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
-            Some(Instant::now() - LINKED_AUDIO_STALL_FALLBACK - Duration::from_millis(1));
+        output.force_video_gate_stall_for_test();
         assert!(output.video_gate_stalled());
+        assert_eq!(output.shared.error().as_deref(), Some("linked audio output clock stalled"));
 
-        output.push(&[0.0, 0.0]).unwrap();
-        assert!(!output.video_gate_stalled());
         output.pause();
         assert!(!output.video_gate_stalled());
         output.flush();
         assert!(!output.video_gate_stalled());
-        assert!(!output.shared.received_samples.load(Ordering::SeqCst));
         assert!(
             output
                 .shared
@@ -1005,6 +1036,17 @@ mod tests {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .is_none()
         );
+    }
+
+    #[test]
+    fn video_gate_observes_audio_clock_progress_before_declaring_a_stall() {
+        let output = AudioOutput::test_output();
+        output.configure_play(0, 100_000);
+        output.start();
+        output.force_video_gate_stall_for_test();
+        output.shared.rendered_samples.store(256, Ordering::SeqCst);
+        assert!(!output.video_gate_stalled());
+        assert!(output.shared.error().is_none());
     }
 
     #[test]

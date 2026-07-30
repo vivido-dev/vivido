@@ -1239,7 +1239,7 @@ fn dispatch_control(
                 _ => false,
             };
             if timeout_us == 0
-                || timeout_us > 30_000_000
+                || timeout_us > vivid_protocol::MAX_TRACK_WAIT_TIMEOUT_US
                 || generation.get() == 0
                 || !value_is_valid
             {
@@ -1665,6 +1665,7 @@ fn handle_track_channel(reader: &mut Reader, shared: &Arc<ServiceShared>) -> io:
     }
     let _ = shared.scene.detach_channel(identity, generation);
     if let Err(error) = &result {
+        stop_failed_audio_output(&shared.audio_outputs, identity);
         let _ = shared.scene.lose_track(identity);
         let status = shared.scene.track_status(identity);
         let diagnostic = error.to_string().chars().take(4_096).collect::<String>();
@@ -1919,6 +1920,11 @@ fn channel_loop(
             messages::VIDEO_PACKET => {
                 let packet = media::parse_video_packet(&record.body)?;
                 let random_access = packet.flags & media::VIDEO_PACKET_KEY != 0;
+                // A decoder may release multiple reordered frames for one encoded record. Treat
+                // every output from the first output-bearing record as part of the same priming
+                // unit: the producer cannot observe OUTPUT_READY or issue PLAY until its record
+                // write completes. Later records remain paced against the playback clock.
+                let priming_record = shared.scene.latest_frame(identity).is_none();
                 shared
                     .scene
                     .admit_media(
@@ -1950,7 +1956,7 @@ fn channel_loop(
                         ),
                         _ => unreachable!(),
                     };
-                    wait_until_video_due(shared, identity, decoded.pts_us)?;
+                    wait_until_video_due(shared, identity, decoded.pts_us, priming_record)?;
                     shared
                         .scene
                         .publish_decoded_frame(
@@ -2035,6 +2041,9 @@ fn channel_loop(
                     )
                     .map_err(io::Error::other)?;
                 if let Some(decoder) = video_decoder.as_mut() {
+                    // CHANNEL_EOS is also one channel record. If draining it produces the first
+                    // output, complete that bounded priming unit before waiting for PLAY.
+                    let priming_record = shared.scene.latest_frame(identity).is_none();
                     for decoded in decoder.finish()? {
                         let (sar_num, sar_den) = match &configuration.kind {
                             KindConfiguration::Video(configuration) => (
@@ -2043,7 +2052,7 @@ fn channel_loop(
                             ),
                             _ => unreachable!(),
                         };
-                        wait_until_video_due(shared, identity, decoded.pts_us)?;
+                        wait_until_video_due(shared, identity, decoded.pts_us, priming_record)?;
                         shared
                             .scene
                             .publish_decoded_frame(
@@ -2151,9 +2160,10 @@ fn wait_until_video_due(
     shared: &Arc<ServiceShared>,
     identity: TrackIdentity,
     pts_us: i64,
+    priming_record: bool,
 ) -> io::Result<()> {
-    if shared.scene.latest_frame(identity).is_none() {
-        return Ok(());
+    if priming_record {
+        return shared.scene.wait_until_due(identity, pts_us, true).map_err(io::Error::other);
     }
     loop {
         let audio = shared
@@ -2161,13 +2171,13 @@ fn wait_until_video_due(
             .active_track(identity.surface, scene::SLOT_AUDIO)
             .and_then(|identity| lock(&shared.audio_outputs).get(&identity).cloned());
         let Some(audio) = audio else {
-            return shared.scene.wait_until_due(identity, pts_us).map_err(io::Error::other);
+            return shared.scene.wait_until_due(identity, pts_us, false).map_err(io::Error::other);
         };
         if audio.pts_reached(pts_us) {
             return Ok(());
         }
         if audio.video_gate_stalled() {
-            return shared.scene.wait_until_due(identity, pts_us).map_err(io::Error::other);
+            return shared.scene.wait_until_due(identity, pts_us, false).map_err(io::Error::other);
         }
         thread::sleep(Duration::from_millis(2));
     }
@@ -2631,6 +2641,15 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+fn stop_failed_audio_output(
+    outputs: &Mutex<HashMap<TrackIdentity, Arc<AudioOutput>>>,
+    identity: TrackIdentity,
+) {
+    if let Some(output) = lock(outputs).remove(&identity) {
+        output.stop();
+    }
+}
+
 #[cfg(unix)]
 fn bind_local_listener() -> io::Result<(LocalListener, String, Option<TempDir>)> {
     let directory = tempfile::Builder::new().prefix("vivido-vivid-1.5-").tempdir()?;
@@ -2704,6 +2723,36 @@ mod tests {
             generation: 1,
         };
         assert_eq!(target_descriptor(metrics, true)[7].1.as_u64(), Some(3));
+    }
+
+    #[test]
+    fn failed_audio_cleanup_is_scoped_by_complete_track_identity() {
+        let first = SessionIdentity::new(PresenterInstanceId([1; 16]), 1)
+            .unwrap()
+            .context(1)
+            .unwrap()
+            .surface(1)
+            .unwrap()
+            .track(1)
+            .unwrap();
+        let second = SessionIdentity::new(PresenterInstanceId([2; 16]), 1)
+            .unwrap()
+            .context(1)
+            .unwrap()
+            .surface(1)
+            .unwrap()
+            .track(1)
+            .unwrap();
+        let outputs = Mutex::new(HashMap::from([
+            (first, AudioOutput::test_output()),
+            (second, AudioOutput::test_output()),
+        ]));
+
+        stop_failed_audio_output(&outputs, first);
+
+        let outputs = lock(&outputs);
+        assert!(!outputs.contains_key(&first));
+        assert!(outputs.contains_key(&second));
     }
 
     #[test]

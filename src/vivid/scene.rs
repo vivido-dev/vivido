@@ -1056,15 +1056,22 @@ impl SharedScene {
 
     /// Pace decoded timed output against the surface-group PLAY clock.
     ///
-    /// The first decoded frame is admitted immediately so the producer can satisfy
-    /// `MILESTONE_OUTPUT_READY`, activate slots, and issue PLAY without a startup deadlock.
-    pub fn wait_until_due(&self, identity: TrackIdentity, pts_us: i64) -> Result<(), &'static str> {
+    /// Every output released by the first output-bearing record is admitted immediately so the
+    /// producer can finish that record, observe `MILESTONE_OUTPUT_READY`, and issue PLAY without
+    /// a startup deadlock. Output from subsequent records is paced against the playback clock.
+    pub fn wait_until_due(
+        &self,
+        identity: TrackIdentity,
+        pts_us: i64,
+        priming_record: bool,
+    ) -> Result<(), &'static str> {
         let mut state = self.lock();
         loop {
             let track = state.tracks.get(&identity).ok_or("track does not exist")?;
             if track.configuration.mode != TrackMode::Timed
                 || track.frame.is_none()
                 || pts_us == i64::MIN
+                || priming_record
             {
                 return Ok(());
             }
@@ -1931,7 +1938,7 @@ mod tests {
     }
 
     #[test]
-    fn timed_output_primes_once_then_waits_for_playback_clock() {
+    fn a_complete_priming_record_precedes_playback_clock_pacing() {
         let scene = SharedScene::default();
         let session = session(3, 1);
         let context = session.context(1).unwrap();
@@ -2006,9 +2013,23 @@ mod tests {
             )
             .unwrap();
 
+        let priming_scene = scene.clone();
+        let (priming_done_tx, priming_done_rx) = std::sync::mpsc::channel();
+        let priming = std::thread::spawn(move || {
+            let result = priming_scene.wait_until_due(track_identity, 20_000, true);
+            priming_done_tx.send(()).unwrap();
+            result
+        });
+        if priming_done_rx.recv_timeout(Duration::from_millis(250)).is_err() {
+            scene.start_playback(track_identity, 0).unwrap();
+            let _ = priming.join();
+            panic!("all decoder outputs from the priming record must finish before PLAY");
+        }
+        priming.join().unwrap().unwrap();
+
         let waiting_scene = scene.clone();
         let waiting =
-            std::thread::spawn(move || waiting_scene.wait_until_due(track_identity, 40_000));
+            std::thread::spawn(move || waiting_scene.wait_until_due(track_identity, 40_000, false));
         std::thread::sleep(Duration::from_millis(10));
         assert!(
             !waiting.is_finished(),
