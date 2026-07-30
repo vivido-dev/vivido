@@ -157,7 +157,8 @@ physical modifiers pressed.
   display offset, primary/alternate screen, terminal mode names, cursor, selection, shell PID,
   foreground process group, optional executable basename/current directory, echo state, exit
   status, global event sequence, and effective automation limits. It never returns process
-  arguments, environment values, Vivid tokens, tickets, authenticators, or derived capabilities.
+  arguments, environment values, Vivid root/resume secrets, channel authenticators, or derived
+  capabilities.
 
 ### Structured grid
 
@@ -217,6 +218,25 @@ through 24 hours. CLI duration values accept bare milliseconds or `ms`, `s`, `m`
 Regex patterns are limited to 8 KiB and use linear-time matching. Disconnecting cancels waits,
 pending tagged input, resize/focus requests, and subscriptions immediately.
 
+### Vivid Protocol 1.5 inspection
+
+IPC v2 exposes the presenter without projecting 1.5 objects back into the removed source model:
+
+- `vivid_sessions` and `vivid_surfaces` enumerate complete owners and stable surfaces.
+- `vivid_surface_status` requires `session_id`, `context_id`, and `surface_id`.
+- `vivid_tracks` enumerates immutable tracks.
+- `vivid_track_status` adds `track_id` and returns track revision, channel generation, immutable
+  kind/slot/mode/lane, lifecycle, generation-local milestones, media progress, cumulative and
+  maximum flow counters, and playback state.
+- `vivid_scene_status` requires `session_id` and returns surface-referencing nodes plus independent
+  scene revision and target generation.
+- `wait_vivid_track` requires the complete track identity, current `channel_generation`, condition,
+  optional value, and millisecond `timeout`.
+
+There are no IPC v1 aliases for `vivid_sources`, `vivid_source_status`, `vivid_milestones`, or
+`wait_vivid_source`. The wire service never returns root secrets, channel keys, authenticators, or
+resume material through automation.
+
 ### Transcript and subscriptions
 
 Each window retains a 1 MiB sanitized byte-exact PTY ring after Vivid marker envelopes have been
@@ -233,7 +253,7 @@ per process and each has at most 256 queued events.
 Event frames have this shape:
 
 ```json
-{"version":1,"subscription_id":7,"event_sequence":123,"window_id":42,"event":{"type":"screen_changed","data":{}}}
+{"version":2,"subscription_id":7,"event_sequence":123,"window_id":42,"event":{"type":"screen_changed","data":{}}}
 ```
 
 Kinds are `screen_changed`, `output`, `frame_presented`, `title_changed`, `focus_changed`, `resized`,

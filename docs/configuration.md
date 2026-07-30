@@ -7,7 +7,7 @@ but Vivido has removed are listed under [Removed options](#removed-options) so a
 config does not surprise you.
 
 Vivido has no vi mode, no X11/OpenGL backends, and no built-in box-drawing shim. Those knobs are
-gone. In their place Vivido adds a GPU renderer (Vello/wgpu) and the Vivid Protocol 1.1 media side
+gone. In their place Vivido adds a GPU renderer (Vello/wgpu) and the Vivid Protocol 1.5 media side
 channel, which is configured through the environment rather than this file — see
 [Vivid media and the environment](#vivid-media-and-the-environment).
 
@@ -456,24 +456,25 @@ render_timer = false
 
 ## Vivid media and the environment
 
-Vivido is the reference **Vivid Protocol 1.1** presenter: it decodes and composites images, video,
+Vivido is a **Vivid Protocol 1.5** terminal presenter: it decodes and composites images, video,
 and audio delivered over an authenticated per-window side channel (see the project `README.md` and
 `docs/vivid_protocol_spec.md`). This pathway is **not** configured through `vivido.toml`. There are
-no TOML knobs for codecs, buffering, credits, or endpoints — the presenter negotiates all of that at
+no TOML knobs for codecs, buffering, flow limits, or endpoints — the presenter negotiates that at
 runtime and keeps media bytes off the PTY.
 
 What you interact with instead is the environment Vivido sets for programs it launches:
 
-- `VIVID_ENDPOINT` — the private per-window control endpoint. Vivido exports this to its child
-  shell automatically; producers such as `vivi` read it.
-- `VIVID_TOKEN` — the per-window capability token. **Never** print, log, copy into shell history,
+- `VIVID_ENDPOINT_CONTROL` — the private per-window control endpoint. Vivido exports this to its
+  child shell automatically; 1.5 producers read it.
+- `VIVID_ROOT_SECRET` — the per-window root authentication secret. **Never** print, log, copy into shell history,
   pass as a command argument, or commit it. Treat it like a password.
+- `VIVID_ENDPOINT_REALTIME` — optional realtime-track discovery. If absent, producers use the
+  bulk endpoint and then the control endpoint according to the 1.5 fallback order.
 - `VIVID_ENDPOINT_BULK` — an optional separate media transport advertised by `vvssh` for remote
-  sessions. It is transport discovery only; control always stays on `VIVID_ENDPOINT`.
+  sessions. It is transport discovery only; control always stays on `VIVID_ENDPOINT_CONTROL`.
 
 For remote display, use the bundled `vvssh` wrapper rather than plain `ssh`, which does not forward
 the media endpoint. See `docs/vivi-over-ssh.md`.
 
 Rendering backend is fixed per platform and not configurable: Metal on macOS, DirectX 12 on
 Windows, Vulkan on Linux (Wayland only).
-

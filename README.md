@@ -6,20 +6,20 @@ Linux uses Wayland exclusively.
 
 ## Vivid Protocol
 
-Vivido accepts Vivid Protocol 1.1 only, using the same version in the connection preface. Its
-private per-window service supports authenticated marker-v2 anchors, raw/zstd raster with straight
-or premultiplied alpha, retained PNG/JPEG images, portable video and audio access units, visibility
-events, complete buffered `PLAY`, pause/flush/EOS, keyframe recovery, and source-scoped failure.
-Local peer origin and the per-window token are verified before session resources are created.
+Vivido accepts Vivid Protocol 1.5 only. It is a `terminal-surface-v1` presentation target and
+implements core control, generic and terminal content surfaces, immutable live/timed media tracks,
+observability, authenticated track channels, absolute flow limits, and marker-v3 anchors. Desktop,
+canvas, input, web-carrier, multiplexed-carrier, and auxiliary-slot profiles are rejected.
+Transcript-bound root authentication is verified before session resources are created.
 
 Portable video includes H.264/HEVC Annex B, VP9 frames, and AV1 low-overhead temporal units.
 Portable audio includes MP3, AAC, ALAC, PCM, Opus, Vorbis, and FLAC. Opus, Vorbis, and FLAC require
-the canonical container-independent initialization defined by Vivid 1.1; Vivido validates it before
+the canonical container-independent initialization defined by Vivid 1.5; Vivido validates it before
 decoder or device allocation and applies trim/pre-skip exactly once.
 
 `PLAY` retains all existing protocol fields, starts at the exact requested PTS after its minimum
 buffer (or EOS-shortened pre-roll), and uses linked audio as the video master clock. Presentation
-queues are source-scoped: slow or exhausted video cannot block audio, terminal rendering, or
+queues are track-scoped: slow or exhausted video cannot block audio, terminal rendering, or
 control traffic. Live control handling is full duplex and immediately answers a valid inbound
 `PING` with its correlated `PONG`.
 
@@ -46,7 +46,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 ## Agent automation
 
-On Unix, `vivido msg` exposes a versioned owner-only IPC service for terminal input, window and
+On Unix, `vivido msg` exposes the version-2 owner-only IPC service for terminal input, window and
 process control, deterministic discovery, structured grid snapshots, state waits, screenshots,
 sanitized PTY transcripts, and replayable event subscriptions. Start with
 `vivido msg capabilities` and `vivido msg list-windows`. The complete CLI and JSON wire contract is
@@ -71,8 +71,11 @@ vvssh --separate-media-transport user@host
 
 The opt-in helper creates a distinct lifecycle-bound SSH TCP connection and private remote socket,
 exports it as `VIVID_ENDPOINT_BULK`, avoids OpenSSH control-master reuse for that helper, and cleans
-up the process and socket with the main session. The Vivid token still travels only through the
-protected setup channel, never in command arguments.
+up the process and socket with the main session. `VIVID_ROOT_SECRET` travels only through the
+protected temporary-file setup channel, never in command arguments or logs.
+
+The 1.1 wire protocol and automation interface are intentionally not supported. See the
+[Vivido 1.1 to 1.5 migration guide](docs/vivid-1.1-to-1.5-migration.md).
 
 ## Deliberate differences from Alacritty
 
