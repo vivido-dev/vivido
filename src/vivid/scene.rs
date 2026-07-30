@@ -225,6 +225,7 @@ enum NodeMutation {
 
 #[derive(Default)]
 struct State {
+    target_generation: TargetGeneration,
     surfaces: HashMap<SurfaceIdentity, Surface>,
     tracks: HashMap<TrackIdentity, Track>,
     scenes: HashMap<SessionIdentity, SessionScene>,
@@ -260,6 +261,13 @@ impl SharedScene {
         if state.scenes.contains_key(&session) {
             return Err("session already exists");
         }
+        if target_generation > state.target_generation {
+            state.target_generation = target_generation;
+            for scene in state.scenes.values_mut() {
+                scene.target_generation = target_generation;
+            }
+        }
+        let target_generation = state.target_generation;
         state.scenes.insert(
             session,
             SessionScene {
@@ -269,6 +277,25 @@ impl SharedScene {
                 pending: BTreeMap::new(),
             },
         );
+        self.0.changed.notify_all();
+        Ok(())
+    }
+
+    pub fn update_target_generation(
+        &self,
+        target_generation: TargetGeneration,
+    ) -> Result<(), &'static str> {
+        target_generation.require_nonzero().map_err(|_| "target generation must be nonzero")?;
+        let mut state = self.lock();
+        if state.target_generation != TargetGeneration::ZERO
+            && target_generation <= state.target_generation
+        {
+            return Err("target generation did not advance");
+        }
+        state.target_generation = target_generation;
+        for scene in state.scenes.values_mut() {
+            scene.target_generation = target_generation;
+        }
         self.0.changed.notify_all();
         Ok(())
     }
@@ -1778,6 +1805,28 @@ mod tests {
         scene.destroy_surface(first_surface).unwrap();
         assert!(scene.surface_status(first_surface).is_none());
         assert!(scene.surface_status(second_surface).is_some());
+    }
+
+    #[test]
+    fn target_generation_advances_for_live_and_late_sessions() {
+        let scene = SharedScene::default();
+        let first = session(1, 1);
+        let second = session(1, 2);
+        let late = session(1, 3);
+        scene.register_session(first, TargetGeneration::ONE).unwrap();
+        scene.register_session(second, TargetGeneration::ONE).unwrap();
+
+        let resized = TargetGeneration::new(2);
+        scene.update_target_generation(resized).unwrap();
+        assert_eq!(scene.scene_status(first, 0).target_generation, resized);
+        assert_eq!(scene.scene_status(second, 0).target_generation, resized);
+
+        scene.register_session(late, TargetGeneration::ONE).unwrap();
+        assert_eq!(scene.scene_status(late, 0).target_generation, resized);
+        assert_eq!(
+            scene.update_target_generation(resized),
+            Err("target generation did not advance")
+        );
     }
 
     #[test]

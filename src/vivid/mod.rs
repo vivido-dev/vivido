@@ -220,7 +220,9 @@ impl VividService {
     }
 
     pub fn update_metrics(&self, mut metrics: DisplayMetrics) -> Option<u64> {
-        if validate_metrics(metrics).is_err() {
+        // Callers report geometry, while the service owns the target-generation sequence.  The
+        // production window path deliberately supplies generation zero as an unassigned sentinel.
+        if validate_metric_geometry(metrics).is_err() {
             return None;
         }
         let mut current = lock(&self.shared.metrics);
@@ -234,6 +236,10 @@ impl VividService {
             return None;
         }
         metrics.generation = current.generation.checked_add(1)?;
+        self.shared
+            .scene
+            .update_target_generation(TargetGeneration::new(metrics.generation))
+            .ok()?;
         *current = metrics;
         *lock(&self.shared.pending_metrics) =
             Some(PendingTargetChange { metrics, last_unsettled_generation: None });
@@ -2556,18 +2562,25 @@ fn target_descriptor(metrics: DisplayMetrics, settled: bool) -> Vec<(u64, Value)
 }
 
 fn validate_metrics(metrics: DisplayMetrics) -> io::Result<()> {
+    validate_metric_geometry(metrics)?;
+    if metrics.generation == 0 {
+        return Err(io::Error::new(
+            ErrorKind::InvalidInput,
+            "terminal target generation must be positive",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_metric_geometry(metrics: DisplayMetrics) -> io::Result<()> {
     if metrics.viewport_width == 0
         || metrics.viewport_height == 0
         || metrics.columns == 0
         || metrics.rows == 0
         || metrics.cell_width == 0
         || metrics.cell_height == 0
-        || metrics.generation == 0
     {
-        Err(io::Error::new(
-            ErrorKind::InvalidInput,
-            "terminal target metrics and generation must be positive",
-        ))
+        Err(io::Error::new(ErrorKind::InvalidInput, "terminal target dimensions must be positive"))
     } else {
         Ok(())
     }
@@ -2719,7 +2732,7 @@ mod tests {
     use vivid_protocol::messages::LaneClass;
     use vivid_protocol::track::{KindConfiguration, TrackConfiguration, TrackMode};
     use vivid_sdk::{
-        CoordinateModel, MILESTONE_OUTPUT_READY, ProducerAuthentication, ProducerConfig,
+        CoordinateModel, Fit, MILESTONE_OUTPUT_READY, ProducerAuthentication, ProducerConfig,
         RasterConfiguration, RequestMetadata, SceneNode, SessionEvent, SlotBinding,
         SurfaceDefinition, SurfaceDescriptor, SurfaceRole, TrackWaitCondition,
     };
@@ -2815,7 +2828,7 @@ mod tests {
                 rows: 40,
                 cell_width: 10,
                 cell_height: 20,
-                generation: 1,
+                generation: 0,
             })
             .unwrap();
 
@@ -2839,6 +2852,58 @@ mod tests {
         let settled = take_target_change(&session);
         assert_eq!(session.apply_target_changed(&settled).unwrap().get(), generation);
         assert_eq!(session.info().target_descriptor[6].1.as_bool(), Some(true));
+
+        let context_id = session.info().root_context_id;
+        let surface = session
+            .create_surface(
+                SurfaceDefinition {
+                    context_id,
+                    surface_id: 71,
+                    semantic_profile: registry::GENERIC_CONTENT.into(),
+                    coordinate_model: CoordinateModel::DesktopLogicalPixels,
+                    logical_width: 1200,
+                    logical_height: 780,
+                    scale_numerator: 1,
+                    scale_denominator: 1,
+                    rotation: 0,
+                    descriptor: SurfaceDescriptor {
+                        role: SurfaceRole::Document,
+                        title: "resized target".into(),
+                        semantic_content_revision: 1,
+                        semantic_availability: 0,
+                        locator_hint: String::new(),
+                    },
+                    policy: 0,
+                    profile_parameters: vec![],
+                },
+                &RequestMetadata::default(),
+            )
+            .unwrap();
+        session
+            .create_node(
+                &SceneNode {
+                    owning_context_id: context_id,
+                    node_id: 72,
+                    surface_context_id: context_id,
+                    surface_id: surface.id(),
+                    geometry: vec![
+                        (0, Value::Unsigned(1)),
+                        (1, Value::Unsigned(0)),
+                        (2, Value::Unsigned(0)),
+                        (3, Value::Unsigned(120_u64 << 32)),
+                        (4, Value::Unsigned(39_u64 << 32)),
+                        (5, Value::Unsigned(1)),
+                    ],
+                    fit: Fit::Contain,
+                    linear_sampling: true,
+                    z_index: 0,
+                    visible: true,
+                    opacity: u16::MAX,
+                    clip: None,
+                },
+                &RequestMetadata::default(),
+            )
+            .expect("a resize event and the presenter's scene precondition must agree");
         session.close().unwrap();
     }
 
