@@ -10,7 +10,7 @@ use vello::{Renderer, wgpu};
 use crate::terminal::graphics::{DeleteTarget, GraphicsCommand, GraphicsProtocol};
 
 use crate::display::SizeInfo;
-use crate::vivid::scene::{RenderItem, SharedScene, TrackKey};
+use crate::vivid::scene::{PresentationRejection, RenderItem, SharedScene, TrackKey};
 
 const MAX_NODES: usize = 256;
 
@@ -335,17 +335,24 @@ impl VividMediaRenderer {
         }
         queue.submit([encoder.finish()]);
         for (item, _) in &rendered {
-            if let Err(error) = scene.mark_presented(
+            match scene.mark_presented(
                 item.track_key,
                 item.channel_generation,
                 item.surface_generation,
                 item.frame.frame_id,
                 item.frame.pts_us,
             ) {
-                log::warn!(
+                Ok(()) => {},
+                // Every resize supersedes frames already in flight. Reporting that as a presenter
+                // problem puts a warning on screen for ordinary window movement.
+                Err(error @ PresentationRejection::Superseded(_)) => log::debug!(
+                    "Vivid presentation for track {:?} was superseded: {error}",
+                    item.track_key
+                ),
+                Err(error @ PresentationRejection::Failed(_)) => log::warn!(
                     "Could not record Vivid presentation for track {:?}: {error}",
                     item.track_key
-                );
+                ),
             }
         }
         renderer.mark_override_image_dirty(&target.image);

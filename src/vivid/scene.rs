@@ -115,6 +115,25 @@ pub struct SceneStatus {
     pub nodes: Vec<SceneNodeStatus>,
 }
 
+/// Why a composited frame did not advance its track's presentation record.
+///
+/// The two cases are not equally interesting. A resize replaces the surface mapping and the track
+/// under a frame that is already in flight, so a superseded record is the expected outcome of
+/// ordinary window movement: the frame really was composited, and the record it would have advanced
+/// no longer describes what is on screen. A failure is a presenter anomaly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PresentationRejection {
+    Superseded(&'static str),
+    Failed(&'static str),
+}
+
+impl std::fmt::Display for PresentationRejection {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (Self::Superseded(reason) | Self::Failed(reason)) = self;
+        formatter.write_str(reason)
+    }
+}
+
 /// Why a scene commit did not apply.
 ///
 /// The three cases carry different registered error codes and different producer recoveries, so
@@ -1483,14 +1502,14 @@ impl SharedScene {
         surface_generation: SurfaceGeneration,
         frame_id: u64,
         pts_us: i64,
-    ) -> Result<(), &'static str> {
+    ) -> Result<(), PresentationRejection> {
         let mut state = self.lock();
         let Some(surface) = state.surfaces.get(&identity.surface) else {
             // Retained terminal-native posters have no live track milestone to acknowledge.
             return Ok(());
         };
         if surface.generation != surface_generation {
-            return Err("stale surface generation");
+            return Err(PresentationRejection::Superseded("stale surface generation"));
         }
         let Some(track) = state.tracks.get_mut(&identity) else {
             return Ok(());
@@ -1498,14 +1517,19 @@ impl SharedScene {
         if track.state.channel_generation != channel_generation
             || track.frame.as_ref().is_none_or(|frame| frame.frame_id != frame_id)
         {
-            return Err("stale frame presentation");
+            return Err(PresentationRejection::Superseded("stale frame presentation"));
         }
         track.last_presented_pts_us = Some(pts_us);
-        track.last_presentation_id =
-            track.last_presentation_id.checked_add(1).ok_or("presentation ID exhausted")?;
+        track.last_presentation_id = track
+            .last_presentation_id
+            .checked_add(1)
+            .ok_or(PresentationRejection::Failed("presentation ID exhausted"))?;
         track.state.milestones |= MILESTONE_PRESENTED;
-        track.state.revision =
-            track.state.revision.advance().map_err(|_| "track revision exhausted")?;
+        track.state.revision = track
+            .state
+            .revision
+            .advance()
+            .map_err(|_| PresentationRejection::Failed("track revision exhausted"))?;
         self.0.changed.notify_all();
         Ok(())
     }
@@ -1939,6 +1963,89 @@ mod tests {
         assert_eq!(
             scene.surface_status(surface_identity).unwrap().revision,
             after_activation.advance().unwrap()
+        );
+    }
+
+    /// A frame is composited from a snapshot and acknowledged after the GPU submit, so a resize
+    /// landing in between supersedes it. That is ordinary window movement, not a presenter fault,
+    /// and it must stay distinguishable from a record that genuinely could not be advanced.
+    #[test]
+    fn a_presentation_a_resize_overtook_is_superseded_rather_than_failed() {
+        let scene = SharedScene::default();
+        let session = session(6, 1);
+        let context = session.context(1).unwrap();
+        let surface_identity = context.surface(1).unwrap();
+        let track_identity = surface_identity.track(1).unwrap();
+        scene.register_session(session, TargetGeneration::ONE).unwrap();
+        scene.create_surface(surface_identity, definition(1, 1)).unwrap();
+        scene
+            .create_track(
+                track_identity,
+                TrackConfiguration {
+                    context_id: 1,
+                    surface_id: 1,
+                    track_id: 1,
+                    slot: SLOT_RASTER,
+                    mode: TrackMode::Live,
+                    lane: LaneClass::Bulk,
+                    maximum_record_body: 128,
+                    maximum_rate_millihertz: 1_000,
+                    maximum_encoded_bits_per_second: 8_192,
+                    maximum_records_per_second: 1,
+                    maximum_inflight_body_bytes: 1_024,
+                    kind: KindConfiguration::Raster(RasterConfiguration {
+                        width: 1,
+                        height: 1,
+                        alpha_mode: ALPHA_STRAIGHT,
+                        delta_enabled: false,
+                        maximum_delta_operations: 1,
+                        zstd_enabled: false,
+                    }),
+                    target_latency_us: 0,
+                    maximum_latency_us: 1_000_000,
+                    retained_pixel_charge: 1,
+                },
+            )
+            .unwrap();
+        scene.accept_channel(track_identity, ChannelGeneration::ONE, 1_024, 8).unwrap();
+        scene.mark_output_ready(track_identity, ChannelGeneration::ONE).unwrap();
+        let frame = Frame {
+            frame_id: 1,
+            pts_us: 0,
+            width: 1,
+            height: 1,
+            sar_num: 1,
+            sar_den: 1,
+            alpha_mode: ALPHA_STRAIGHT,
+            rgba: Arc::from([0_u8, 0, 0, 255].as_slice()),
+            damage: None,
+        };
+        scene.publish_decoded_frame(track_identity, ChannelGeneration::ONE, frame).unwrap();
+        let generation = scene.surface_status(surface_identity).unwrap().generation;
+
+        // The frame that was composited against the current surface records normally.
+        scene
+            .mark_presented(track_identity, ChannelGeneration::ONE, generation, 1, 0)
+            .expect("a frame composited against the live surface must record its presentation");
+
+        // A resize replaces the surface mapping. The frame still on screen belongs to the target
+        // that just went away.
+        let mut resized = definition(1, 1);
+        resized.logical_width = 20;
+        let status = scene.surface_status(surface_identity).unwrap();
+        scene
+            .update_surface(surface_identity, status.revision, status.generation, resized)
+            .unwrap();
+        assert_eq!(
+            scene.mark_presented(track_identity, ChannelGeneration::ONE, generation, 1, 0),
+            Err(PresentationRejection::Superseded("stale surface generation"))
+        );
+
+        // A newer frame under the current surface supersedes an older frame's acknowledgement too.
+        let current = scene.surface_status(surface_identity).unwrap().generation;
+        assert_eq!(
+            scene.mark_presented(track_identity, ChannelGeneration::ONE, current, 7, 0),
+            Err(PresentationRejection::Superseded("stale frame presentation"))
         );
     }
 
