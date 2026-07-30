@@ -48,18 +48,18 @@ fn run() -> Result<u8, String> {
     let separate_media = take_separate_media_flag(&mut arguments);
     validate_arguments(&arguments)?;
 
-    let endpoint = env::var("VIVID_ENDPOINT")
-        .map_err(|_| "VIVID_ENDPOINT is not set; run vvssh inside Vivido".to_owned())?;
-    let token = env::var("VIVID_TOKEN")
-        .map_err(|_| "VIVID_TOKEN is not set; run vvssh inside Vivido".to_owned())?;
-    if token.is_empty() {
-        return Err("VIVID_TOKEN is empty; start a fresh Vivido window".into());
+    let endpoint = env::var("VIVID_ENDPOINT_CONTROL")
+        .map_err(|_| "VIVID_ENDPOINT_CONTROL is not set; run vvssh inside Vivido".to_owned())?;
+    let root_secret = env::var("VIVID_ROOT_SECRET")
+        .map_err(|_| "VIVID_ROOT_SECRET is not set; run vvssh inside Vivido".to_owned())?;
+    if root_secret.is_empty() {
+        return Err("VIVID_ROOT_SECRET is empty; start a fresh Vivido window".into());
     }
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_nanos())
         .unwrap_or_default();
-    let (setup_arguments, ssh_arguments, token_file, bulk_arguments, bulk_socket) =
+    let (setup_arguments, ssh_arguments, secret_file, bulk_arguments, bulk_socket) =
         build_ssh_arguments(arguments, &endpoint, std::process::id(), nonce, separate_media)?;
 
     let ssh = env::var_os("VVSSH_SSH").unwrap_or_else(|| OsString::from("ssh"));
@@ -68,20 +68,21 @@ fn run() -> Result<u8, String> {
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .spawn()
-        .map_err(|error| format!("could not provision remote Vivid token: {error}"))?;
+        .map_err(|error| format!("could not provision remote Vivid root secret: {error}"))?;
     let transfer_result = setup
         .stdin
         .take()
-        .ok_or_else(|| "could not open protected token channel".to_owned())?
-        .write_all(token.as_bytes());
-    let setup_status = setup.wait().map_err(|error| format!("token setup failed: {error}"))?;
+        .ok_or_else(|| "could not open protected root-secret channel".to_owned())?
+        .write_all(root_secret.as_bytes());
+    let setup_status =
+        setup.wait().map_err(|error| format!("root-secret setup failed: {error}"))?;
     if let Err(error) = transfer_result {
-        let _ = cleanup_remote_token(&ssh, &setup_arguments, &token_file);
-        return Err(format!("could not transfer Vivid token: {error}"));
+        let _ = cleanup_remote_secret(&ssh, &setup_arguments, &secret_file);
+        return Err(format!("could not transfer Vivid root secret: {error}"));
     }
     if !setup_status.success() {
-        let _ = cleanup_remote_token(&ssh, &setup_arguments, &token_file);
-        return Err("remote host rejected the protected Vivid token setup channel".into());
+        let _ = cleanup_remote_secret(&ssh, &setup_arguments, &secret_file);
+        return Err("remote host rejected the protected Vivid root-secret setup channel".into());
     }
     let mut bulk = if let Some(arguments) = bulk_arguments {
         let mut child = match Command::new(&ssh)
@@ -95,7 +96,7 @@ fn run() -> Result<u8, String> {
                 let _ = cleanup_remote_paths(
                     &ssh,
                     &setup_arguments,
-                    &token_file,
+                    &secret_file,
                     bulk_socket.as_deref(),
                 );
                 return Err(format!("could not start separate media transport: {error}"));
@@ -112,14 +113,14 @@ fn run() -> Result<u8, String> {
             let _ = child.kill();
             let _ = child.wait();
             let _ =
-                cleanup_remote_paths(&ssh, &setup_arguments, &token_file, bulk_socket.as_deref());
+                cleanup_remote_paths(&ssh, &setup_arguments, &secret_file, bulk_socket.as_deref());
             return Err(error);
         }
         if &ready != b"VIVID-BULK-READY" {
             let _ = child.kill();
             let _ = child.wait();
             let _ =
-                cleanup_remote_paths(&ssh, &setup_arguments, &token_file, bulk_socket.as_deref());
+                cleanup_remote_paths(&ssh, &setup_arguments, &secret_file, bulk_socket.as_deref());
             return Err("separate media transport returned an invalid readiness marker".into());
         }
         Some(child)
@@ -134,7 +135,7 @@ fn run() -> Result<u8, String> {
                 let _ = child.wait();
             }
             let _ =
-                cleanup_remote_paths(&ssh, &setup_arguments, &token_file, bulk_socket.as_deref());
+                cleanup_remote_paths(&ssh, &setup_arguments, &secret_file, bulk_socket.as_deref());
             return Err(format!("could not run {}: {error}", Path::new(&ssh).display()));
         },
     };
@@ -143,7 +144,7 @@ fn run() -> Result<u8, String> {
         let _ = child.kill();
         let _ = child.wait();
     }
-    let _ = cleanup_remote_paths(&ssh, &setup_arguments, &token_file, bulk_socket.as_deref());
+    let _ = cleanup_remote_paths(&ssh, &setup_arguments, &secret_file, bulk_socket.as_deref());
 
     Ok(status.code().and_then(|code| u8::try_from(code).ok()).unwrap_or(1))
 }
@@ -187,7 +188,7 @@ fn build_ssh_arguments(
 ) -> Result<BuiltSshArguments, String> {
     let local_target = local_forward_target(endpoint)?;
     let remote_socket = format!("/tmp/vivido-vivid-{process_id}-{nonce}.sock");
-    let token_file = format!("/tmp/vivido-vivid-{process_id}-{nonce}.token");
+    let secret_file = format!("/tmp/vivido-vivid-{process_id}-{nonce}.secret");
     let remote_endpoint = format!("unix:{remote_socket}");
     let bulk_socket =
         separate_media.then(|| format!("/tmp/vivido-vivid-{process_id}-{nonce}-bulk.sock"));
@@ -200,15 +201,15 @@ fn build_ssh_arguments(
         .map(|socket| format!(" VIVID_ENDPOINT_BULK={}", shell_quote(&format!("unix:{socket}"))))
         .unwrap_or_default();
     let remote_command = format!(
-        "VIVID_TOKEN=$(cat {}) && rm -f {} && export VIVID_TOKEN && env VIVID_REMOTE=1{anchor_transport} VIVID_ENDPOINT={}{bulk_environment} \"$SHELL\" -l",
-        shell_quote(&token_file),
-        shell_quote(&token_file),
+        "VIVID_ROOT_SECRET=$(cat {}) && rm -f {} && export VIVID_ROOT_SECRET && env VIVID_REMOTE=1{anchor_transport} VIVID_ENDPOINT_CONTROL={}{bulk_environment} \"$SHELL\" -l",
+        shell_quote(&secret_file),
+        shell_quote(&secret_file),
         shell_quote(&remote_endpoint),
     );
     let remote_forward = format!("{remote_socket}:{local_target}");
 
     let mut setup = passthrough.clone();
-    setup.push(OsString::from(format!("umask 077 && cat > {}", shell_quote(&token_file))));
+    setup.push(OsString::from(format!("umask 077 && cat > {}", shell_quote(&secret_file))));
     let mut arguments = vec![
         OsString::from("-tt"),
         OsString::from("-o"),
@@ -243,56 +244,59 @@ fn build_ssh_arguments(
         arguments.push(OsString::from("printf VIVID-BULK-READY; cat >/dev/null"));
         arguments
     });
-    Ok((setup, arguments, token_file, bulk_arguments, bulk_socket))
+    Ok((setup, arguments, secret_file, bulk_arguments, bulk_socket))
 }
 
 fn local_forward_target(endpoint: &str) -> Result<String, String> {
     if let Some(local_socket) = endpoint.strip_prefix("unix:") {
         if !Path::new(local_socket).is_absolute() {
-            return Err(format!("VIVID_ENDPOINT socket path is not absolute: {local_socket}"));
+            return Err(format!(
+                "VIVID_ENDPOINT_CONTROL socket path is not absolute: {local_socket}"
+            ));
         }
         if local_socket.contains(':') {
             return Err(
-                "VIVID_ENDPOINT socket path contains ':' and cannot be forwarded by OpenSSH".into(),
+                "VIVID_ENDPOINT_CONTROL socket path contains ':' and cannot be forwarded by OpenSSH"
+                    .into(),
             );
         }
         return Ok(local_socket.to_owned());
     }
     if let Some(address) = endpoint.strip_prefix("tcp:") {
-        let address: SocketAddr = address
-            .parse()
-            .map_err(|_| format!("VIVID_ENDPOINT contains an invalid TCP address: {address}"))?;
+        let address: SocketAddr = address.parse().map_err(|_| {
+            format!("VIVID_ENDPOINT_CONTROL contains an invalid TCP address: {address}")
+        })?;
         if address.ip() != IpAddr::V4(std::net::Ipv4Addr::LOCALHOST) {
-            return Err("VIVID_ENDPOINT TCP address is not IPv4 loopback".into());
+            return Err("VIVID_ENDPOINT_CONTROL TCP address is not IPv4 loopback".into());
         }
         return Ok(format!("127.0.0.1:{}", address.port()));
     }
-    Err(format!("expected a unix: or loopback tcp: VIVID_ENDPOINT, got {endpoint}"))
+    Err(format!("expected a unix: or loopback tcp: VIVID_ENDPOINT_CONTROL, got {endpoint}"))
 }
 
-fn cleanup_remote_token(
+fn cleanup_remote_secret(
     ssh: &OsStr,
     setup_arguments: &[OsString],
-    token_file: &str,
+    secret_file: &str,
 ) -> Result<(), String> {
     let mut arguments = setup_arguments[..setup_arguments.len().saturating_sub(1)].to_vec();
-    arguments.push(OsString::from(format!("rm -f {}", shell_quote(token_file))));
+    arguments.push(OsString::from(format!("rm -f {}", shell_quote(secret_file))));
     Command::new(ssh)
         .args(arguments)
         .status()
         .map(|_| ())
-        .map_err(|error| format!("could not clean remote token: {error}"))
+        .map_err(|error| format!("could not clean remote root secret: {error}"))
 }
 
 fn cleanup_remote_paths(
     ssh: &OsStr,
     setup_arguments: &[OsString],
-    token_file: &str,
+    secret_file: &str,
     bulk_socket: Option<&str>,
 ) -> Result<(), String> {
     let mut arguments = setup_arguments[..setup_arguments.len().saturating_sub(1)].to_vec();
     let bulk = bulk_socket.map(|socket| format!(" {}", shell_quote(socket))).unwrap_or_default();
-    arguments.push(OsString::from(format!("rm -f {}{bulk}", shell_quote(token_file))));
+    arguments.push(OsString::from(format!("rm -f {}{bulk}", shell_quote(secret_file))));
     Command::new(ssh)
         .args(arguments)
         .status()
@@ -311,7 +315,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn builds_private_stream_local_forward() {
-        let (_, arguments, token_file, _, _) = build_ssh_arguments(
+        let (_, arguments, secret_file, _, _) = build_ssh_arguments(
             vec![OsString::from("-p"), OsString::from("2222"), OsString::from("user@host")],
             "unix:/private/tmp/vivido/endpoint.sock",
             42,
@@ -331,7 +335,9 @@ mod tests {
                 .contains(&"/tmp/vivido-vivid-42-99.sock:/private/tmp/vivido/endpoint.sock".into())
         );
         assert_eq!(&arguments[9..12], &["-p", "2222", "user@host"]);
-        assert!(arguments[12].contains(&token_file));
+        assert!(arguments[12].contains(&secret_file));
+        assert!(arguments[12].contains("VIVID_ROOT_SECRET"));
+        assert!(arguments[12].contains("VIVID_ENDPOINT_CONTROL"));
         assert!(!arguments[12].contains("VIVID_ANCHOR_TRANSPORT"));
         assert!(!arguments.iter().any(|argument| argument.contains("0123abcd")));
     }

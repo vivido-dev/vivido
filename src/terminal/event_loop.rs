@@ -538,9 +538,9 @@ impl State {
 }
 
 #[cfg(not(windows))]
-const VIVID_MARKER_PREFIX: &[u8] = b"\x1b_VIVID;2;";
+const VIVID_MARKER_PREFIX: &[u8] = b"\x1b_VIVID;3;";
 #[cfg(windows)]
-const VIVID_MARKER_PREFIX: &[u8] = b"VIVID;2;";
+const VIVID_MARKER_PREFIX: &[u8] = b"VIVID;3;";
 #[cfg(not(windows))]
 const VIVID_MARKER_TERMINATOR: &[u8] = b"\x1b\\";
 #[cfg(windows)]
@@ -550,9 +550,9 @@ const VIVID_MARKER_PAYLOAD_SKIP: usize = 2;
 #[cfg(windows)]
 const VIVID_MARKER_PAYLOAD_SKIP: usize = 0;
 #[cfg(not(windows))]
-const MAX_VIVID_MARKER_BYTES: usize = 128;
+const MAX_VIVID_MARKER_BYTES: usize = vivid_protocol::anchor::MAX_MARKER_BYTES;
 #[cfg(windows)]
-const MAX_VIVID_MARKER_BYTES: usize = 160;
+const MAX_VIVID_MARKER_BYTES: usize = vivid_protocol::anchor::MAX_MARKER_BYTES;
 
 enum VividChunk {
     Bytes(Vec<u8>),
@@ -703,9 +703,9 @@ mod vivid_marker_tests {
     #[test]
     fn marker_is_recognized_across_every_read_boundary() {
         #[cfg(not(windows))]
-        let input = b"before\x1b_VIVID;2;A;AAAAAAAAAAAAAAAAAAAAAA;0000000000000007;AAAAAAAAAAAAAAAAAAAAAA\x1b\\after";
+        let input = b"before\x1b_VIVID;3;A;AAAAAAAAAAAAAAAAAAAAAA;0000000000000003;0000000000000007;AAAAAAAAAAAAAAAAAAAAAA\x1b\\after";
         #[cfg(windows)]
-        let input = b"beforeVIVID;2;A;AAAAAAAAAAAAAAAAAAAAAA;0000000000000007;AAAAAAAAAAAAAAAAAAAAAA;VIVID-ENDafter";
+        let input = b"beforeVIVID;3;A;AAAAAAAAAAAAAAAAAAAAAA;0000000000000003;0000000000000007;AAAAAAAAAAAAAAAAAAAAAA;VIVID-ENDafter";
         let mut scanner = VividMarkerScanner::default();
         let mut text = Vec::new();
         let mut markers = Vec::new();
@@ -725,7 +725,9 @@ mod vivid_marker_tests {
         assert_eq!(text, b"beforeafter");
         assert_eq!(
             markers,
-            ["VIVID;2;A;AAAAAAAAAAAAAAAAAAAAAA;0000000000000007;AAAAAAAAAAAAAAAAAAAAAA"]
+            [
+                "VIVID;3;A;AAAAAAAAAAAAAAAAAAAAAA;0000000000000003;0000000000000007;AAAAAAAAAAAAAAAAAAAAAA"
+            ]
         );
         assert!(scanner.pending.is_empty());
     }

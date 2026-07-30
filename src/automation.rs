@@ -239,9 +239,12 @@ pub enum WaitKind {
     Frame {
         after: u64,
     },
-    VividSource {
+    VividTrack {
         session_id: u64,
-        source_id: u64,
+        context_id: u64,
+        surface_id: u64,
+        track_id: u64,
+        channel_generation: u64,
         condition: u64,
         value: Option<u64>,
     },

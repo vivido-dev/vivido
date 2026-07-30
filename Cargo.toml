@@ -1,6 +1,6 @@
 [package]
 name = "vivido"
-version = "0.3.0"
+version = "0.4.0"
 authors = ["Wensheng Wang <wenshengwang@gmail.com>"]
 license = "Apache-2.0"
 description = "A fast cross-platform terminal emulator with protocol-neutral media hooks"
@@ -62,7 +62,7 @@ toml = "1.1"
 toml_edit = "0.25"
 unicode-width = "0.2.0"
 unicode-script = "0.5"
-vivid_protocol = { version = "1.4", path = "../vivid_protocol" }
+vivid_protocol = { version = "1.5", path = "../vivid_protocol" }
 vte = { version = "0.15.0", default-features = false, features = [
   "std",
   "ansi",
@@ -79,6 +79,7 @@ pkg-config = "0.3"
 
 [dev-dependencies]
 clap_complete = "4.2.3"
+vivid_sdk = { version = "1.5", path = "../vivid_sdk" }
 
 [target.'cfg(not(windows))'.dependencies]
 xdg = "3.0.0"

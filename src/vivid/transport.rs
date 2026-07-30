@@ -1,123 +1,62 @@
-use std::collections::HashSet;
+//! Accepted-side Vivid 1.5 framing for the private presenter endpoint.
+
 use std::io::{self, IoSlice, Read, Write};
 #[cfg(windows)]
 use std::net::TcpStream as LocalStream;
 #[cfg(unix)]
-use std::os::fd::AsRawFd;
-#[cfg(unix)]
-use std::os::unix::net::UnixStream;
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::os::unix::net::UnixStream as LocalStream;
+use std::sync::Mutex;
 
-#[cfg(unix)]
-type LocalStream = UnixStream;
-
-use vivid_protocol::messages;
-use vivid_protocol::trace::{TraceDirection, TraceEmitter, TraceOutcome};
 use vivid_protocol::wire::{
-    BorrowedRecord, HEADER_SIZE, PREFACE_SIZE, Preface, RECORD_KNOWN_FLAGS, Record, RecordHeader,
+    ConnectionKind, HEADER_SIZE, PREFACE_SIZE, Preface, PrefaceClassification, RECORD_KNOWN_FLAGS,
+    Record, RecordHeader,
 };
-use vivid_protocol::{CONTROL_MAX_RECORD_BODY, HARD_MAX_RECORD_BODY, VIVID_MAJOR, VIVID_MINOR};
+use vivid_protocol::{CONTROL_MAX_RECORD_BODY, HARD_MAX_RECORD_BODY};
 
 pub struct Reader {
     stream: LocalStream,
     negotiated_maximum: u32,
     maximum: u32,
     sequence: u64,
-    trace: Option<TraceChannel>,
-}
-
-#[derive(Clone)]
-pub struct TraceChannel {
-    emitter: TraceEmitter,
-    restricted_sources: Arc<Mutex<HashSet<u64>>>,
-}
-
-impl TraceChannel {
-    pub fn new(emitter: TraceEmitter) -> Self {
-        Self { emitter, restricted_sources: Arc::new(Mutex::new(HashSet::new())) }
-    }
-
-    pub fn mark_source_policy(&self, source_id: u64, capture_policy: u64) {
-        if capture_policy & messages::CAPTURE_POLICY_REDUCE_DIAGNOSTICS != 0 {
-            self.restricted_sources
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .insert(source_id);
-        }
-    }
-
-    fn emit(&self, direction: TraceDirection, header: RecordHeader, body: &[u8]) {
-        let restricted = header.record_type == messages::ATTACH_CHANNEL
-            || (header.object_id != 0
-                && (self
-                    .restricted_sources
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .contains(&header.object_id)
-                    || body_restricts_trace(header.record_type, body)));
-        if restricted {
-            self.emitter.emit_restricted_source(
-                direction,
-                header.record_type,
-                u64::from(header.body_length),
-                header.sequence,
-            );
-        } else if header.record_type >= messages::ATTACH_CHANNEL {
-            self.emitter.emit(
-                direction,
-                header.record_type,
-                u64::from(header.body_length),
-                header.sequence,
-                vivid_protocol::trace::object_kind(header.record_type, header.object_id),
-                (header.object_id != 0).then_some(header.object_id),
-                None,
-                None,
-                TraceOutcome::Ok,
-            );
-        } else {
-            self.emitter.emit_control(
-                direction,
-                header.record_type,
-                body,
-                header.sequence,
-                vivid_protocol::trace::object_kind(header.record_type, header.object_id),
-                (header.object_id != 0).then_some(header.object_id),
-                TraceOutcome::Ok,
-            );
-        }
-    }
+    first_record: bool,
 }
 
 impl Reader {
-    pub fn new(mut stream: LocalStream) -> io::Result<(Self, Preface)> {
+    pub fn new(mut stream: LocalStream) -> io::Result<(Self, Preface, [u8; PREFACE_SIZE])> {
         let mut bytes = [0_u8; PREFACE_SIZE];
         stream.read_exact(&mut bytes)?;
-        let preface = Preface::decode(bytes)?;
-        if preface.major != VIVID_MAJOR || preface.minor != VIVID_MINOR {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("unsupported Vivid major version {}", preface.major),
-            ));
-        }
+        let preface = match Preface::classify(bytes)? {
+            PrefaceClassification::Accepted(preface) => preface,
+            PrefaceClassification::UnsupportedVersion(_) => {
+                stream.write_all(&vivid_protocol::wire::unsupported_version_record())?;
+                stream.flush()?;
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "unsupported Vivid protocol version",
+                ));
+            },
+        };
+        let maximum = preface.initiator_tx_body_limit.min(HARD_MAX_RECORD_BODY);
         Ok((
             Self {
                 stream,
-                negotiated_maximum: preface.initiator_tx_body_limit.min(HARD_MAX_RECORD_BODY),
-                maximum: preface
-                    .initiator_tx_body_limit
-                    .min(HARD_MAX_RECORD_BODY)
-                    .min(CONTROL_MAX_RECORD_BODY),
+                negotiated_maximum: maximum,
+                maximum: if preface.kind == ConnectionKind::Control {
+                    maximum.min(CONTROL_MAX_RECORD_BODY)
+                } else {
+                    maximum
+                },
                 sequence: 0,
-                trace: None,
+                first_record: true,
             },
             preface,
+            bytes,
         ))
     }
 
-    pub fn read_record(&mut self) -> io::Result<Record> {
+    pub fn read_record(&mut self, kind: ConnectionKind) -> io::Result<Record> {
         let mut body = Vec::new();
-        let header = self.read_record_body_into(&mut body)?;
+        let header = self.read_record_body_into(kind, &mut body)?;
         Ok(Record {
             record_type: header.record_type,
             flags: header.flags,
@@ -127,21 +66,11 @@ impl Reader {
         })
     }
 
-    pub fn read_record_into<'a>(
+    fn read_record_body_into(
         &mut self,
-        body: &'a mut Vec<u8>,
-    ) -> io::Result<BorrowedRecord<'a>> {
-        let header = self.read_record_body_into(body)?;
-        Ok(BorrowedRecord {
-            record_type: header.record_type,
-            flags: header.flags,
-            object_id: header.object_id,
-            sequence: header.sequence,
-            body,
-        })
-    }
-
-    fn read_record_body_into(&mut self, body: &mut Vec<u8>) -> io::Result<RecordHeader> {
+        kind: ConnectionKind,
+        body: &mut Vec<u8>,
+    ) -> io::Result<RecordHeader> {
         let mut bytes = [0_u8; HEADER_SIZE];
         self.stream.read_exact(&mut bytes)?;
         let header = RecordHeader::decode(bytes);
@@ -154,7 +83,7 @@ impl Reader {
         if header.body_length > self.maximum || header.body_length > HARD_MAX_RECORD_BODY {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "Vivid record exceeds negotiated maximum",
+                "Vivid record exceeds the accepted body limit",
             ));
         }
         let expected = self.sequence.checked_add(1).ok_or_else(|| {
@@ -163,87 +92,47 @@ impl Reader {
         if header.sequence != expected {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("Vivid record sequence {} does not match {expected}", header.sequence),
+                "Vivid record sequence is not contiguous",
             ));
+        }
+        if self.first_record {
+            kind.validate_first_record(&header)?;
+            self.first_record = false;
         }
         self.sequence = header.sequence;
         body.resize(header.body_length as usize, 0);
         self.stream.read_exact(body)?;
-        if let Some(trace) = &self.trace {
-            trace.emit(TraceDirection::Receive, header, body);
-        }
         Ok(header)
     }
 
-    pub fn writer(&self) -> io::Result<Writer> {
+    pub fn writer(&self, kind: ConnectionKind) -> io::Result<Writer> {
         Ok(Writer {
             inner: Mutex::new(WriterInner {
                 stream: self.stream.try_clone()?,
-                maximum: CONTROL_MAX_RECORD_BODY,
+                maximum: if kind == ConnectionKind::Control {
+                    CONTROL_MAX_RECORD_BODY
+                } else {
+                    HARD_MAX_RECORD_BODY
+                },
                 sequence: 0,
             }),
-            control_body: Mutex::new(Vec::with_capacity(64)),
-            trace: self.trace.clone(),
         })
     }
 
-    pub fn set_maximum(&mut self, maximum: u32) {
+    pub fn set_maximum(&mut self, maximum: u32) -> io::Result<()> {
+        if maximum == 0 || maximum > HARD_MAX_RECORD_BODY {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid incoming record limit",
+            ));
+        }
         self.maximum = self.negotiated_maximum.min(maximum);
+        Ok(())
     }
-
-    pub fn set_trace(&mut self, trace: TraceChannel) {
-        self.trace = Some(trace);
-    }
-
-    pub fn mark_source_policy(&self, source_id: u64, capture_policy: u64) {
-        if let Some(trace) = &self.trace {
-            trace.mark_source_policy(source_id, capture_policy);
-        }
-    }
-
-    #[cfg(unix)]
-    pub fn wait_readable(&self, timeout: Duration) -> io::Result<bool> {
-        let mut descriptor =
-            libc::pollfd { fd: self.stream.as_raw_fd(), events: libc::POLLIN, revents: 0 };
-        let timeout_ms = timeout.as_millis().min(c_int_max() as u128) as libc::c_int;
-        let result = unsafe { libc::poll(&mut descriptor, 1, timeout_ms) };
-        if result < 0 {
-            let error = io::Error::last_os_error();
-            if error.kind() == io::ErrorKind::Interrupted {
-                return Ok(false);
-            }
-            return Err(error);
-        }
-        Ok(result > 0)
-    }
-
-    #[cfg(windows)]
-    pub fn wait_readable(&self, timeout: Duration) -> io::Result<bool> {
-        self.stream.set_read_timeout(Some(timeout))?;
-        let mut byte = [0_u8; 1];
-        let result = match self.stream.peek(&mut byte) {
-            Ok(_) => Ok(true),
-            Err(error)
-                if matches!(error.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) =>
-            {
-                Ok(false)
-            },
-            Err(error) => Err(error),
-        };
-        self.stream.set_read_timeout(None)?;
-        result
-    }
-}
-
-#[cfg(unix)]
-const fn c_int_max() -> libc::c_int {
-    libc::c_int::MAX
 }
 
 pub struct Writer {
     inner: Mutex<WriterInner>,
-    control_body: Mutex<Vec<u8>>,
-    trace: Option<TraceChannel>,
 }
 
 struct WriterInner {
@@ -257,11 +146,10 @@ impl Writer {
         if maximum == 0 || maximum > HARD_MAX_RECORD_BODY {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "invalid outgoing Vivid record limit",
+                "invalid outgoing record limit",
             ));
         }
-        self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).maximum =
-            maximum.min(CONTROL_MAX_RECORD_BODY);
+        self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).maximum = maximum;
         Ok(())
     }
 
@@ -286,11 +174,11 @@ impl Writer {
         if body_length > inner.maximum || body_length > HARD_MAX_RECORD_BODY {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "outgoing Vivid record exceeds negotiated maximum",
+                "outgoing Vivid record exceeds the accepted body limit",
             ));
         }
         inner.sequence = inner.sequence.checked_add(1).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "outgoing record sequence exhausted")
+            io::Error::new(io::ErrorKind::InvalidData, "outgoing sequence exhausted")
         })?;
         let header = RecordHeader {
             body_length,
@@ -300,109 +188,35 @@ impl Writer {
             sequence: inner.sequence,
         };
         write_parts(&mut inner.stream, &header.encode(), parts)?;
-        inner.stream.flush()?;
-        drop(inner);
-        if let Some(trace) = &self.trace {
-            let body = parts.first().copied().unwrap_or_default();
-            trace.emit(TraceDirection::Send, header, body);
-        }
-        Ok(())
+        inner.stream.flush()
     }
-
-    pub fn write_ok(&self, record_type: u16, object_id: u64, request_id: u64) -> io::Result<()> {
-        let mut body = self.control_body.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        messages::ok_into(&mut body, request_id);
-        self.write_record(record_type, object_id, &body)
-    }
-
-    pub fn write_pong(
-        &self,
-        request_id: u64,
-        timestamps: Option<messages::ClockPongTimestamps>,
-    ) -> io::Result<()> {
-        let body = messages::clock_pong(request_id, timestamps)?;
-        self.write_record(messages::PONG, 0, &body)
-    }
-
-    pub fn write_credit(
-        &self,
-        object_id: u64,
-        bytes: u64,
-        packets: u64,
-        fragments: u64,
-    ) -> io::Result<()> {
-        let mut body = self.control_body.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        messages::credit_into(&mut body, bytes, packets, fragments);
-        self.write_record(messages::CREDIT, object_id, &body)
-    }
-
-    pub fn mark_source_policy(&self, source_id: u64, capture_policy: u64) {
-        if let Some(trace) = &self.trace {
-            trace.mark_source_policy(source_id, capture_policy);
-        }
-    }
-}
-
-fn body_restricts_trace(record_type: u16, body: &[u8]) -> bool {
-    let policy = match record_type {
-        messages::CREATE_RASTER => {
-            messages::parse_create_raster_with_extensions(body).ok().map(|(_, _, policy, _)| policy)
-        },
-        messages::CREATE_IMAGE => messages::parse_create_image_with_extensions(body)
-            .ok()
-            .map(|(_, _, _, policy, _)| policy),
-        messages::CREATE_VIDEO => {
-            messages::parse_create_video_with_extensions(body).ok().map(|(_, _, policy, _)| policy)
-        },
-        messages::CREATE_AUDIO => {
-            messages::parse_create_audio_with_extensions(body).ok().map(|(_, _, policy, _)| policy)
-        },
-        messages::SET_SOURCE_POLICY => {
-            messages::parse_set_source_policy(body).ok().map(|(_, _, policy)| policy)
-        },
-        _ => None,
-    };
-    policy.is_some_and(|policy| policy & messages::CAPTURE_POLICY_REDUCE_DIAGNOSTICS != 0)
 }
 
 fn write_parts(stream: &mut LocalStream, header: &[u8], parts: &[&[u8]]) -> io::Result<()> {
-    let mut part_index = 0;
-    let mut part_offset = 0;
-    while part_index <= parts.len() {
-        let mut slices = [IoSlice::new(&[]); 16];
-        let mut slice_count = 0;
-        for logical_index in part_index..=parts.len() {
-            let part = if logical_index == 0 { header } else { parts[logical_index - 1] };
-            let offset = if logical_index == part_index { part_offset } else { 0 };
-            if offset < part.len() {
-                slices[slice_count] = IoSlice::new(&part[offset..]);
-                slice_count += 1;
-                if slice_count == slices.len() {
-                    break;
-                }
-            }
-        }
-        if slice_count == 0 {
-            return Ok(());
-        }
-        let written = stream.write_vectored(&slices[..slice_count])?;
+    let mut buffers = Vec::with_capacity(parts.len() + 1);
+    buffers.push(IoSlice::new(header));
+    buffers.extend(parts.iter().map(|part| IoSlice::new(part)));
+    let mut index = 0;
+    let mut offset = 0;
+    while index < buffers.len() {
+        let current = &buffers[index..];
+        let mut adjusted = Vec::with_capacity(current.len());
+        adjusted.push(IoSlice::new(&current[0][offset..]));
+        adjusted.extend(current[1..].iter().map(|slice| IoSlice::new(slice)));
+        let written = stream.write_vectored(&adjusted)?;
         if written == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::WriteZero,
-                "failed to write Vivid record parts",
-            ));
+            return Err(io::Error::new(io::ErrorKind::WriteZero, "failed to write Vivid record"));
         }
         let mut remaining = written;
-        while part_index <= parts.len() {
-            let part = if part_index == 0 { header } else { parts[part_index - 1] };
-            let available = part.len().saturating_sub(part_offset);
+        while index < buffers.len() {
+            let available = buffers[index].len() - offset;
             if remaining < available {
-                part_offset += remaining;
+                offset += remaining;
                 break;
             }
             remaining -= available;
-            part_index += 1;
-            part_offset = 0;
+            index += 1;
+            offset = 0;
             if remaining == 0 {
                 break;
             }
@@ -414,14 +228,11 @@ fn write_parts(stream: &mut LocalStream, header: &[u8], parts: &[&[u8]]) -> io::
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
-
-    use vivid_protocol::trace::{TraceComponent, TraceGuard, TraceHop};
     use vivid_protocol::wire::{ConnectionKind, encode_preface};
 
     #[cfg(unix)]
     fn stream_pair() -> (LocalStream, LocalStream) {
-        UnixStream::pair().unwrap()
+        LocalStream::pair().unwrap()
     }
 
     #[cfg(windows)]
@@ -429,242 +240,40 @@ mod tests {
         use std::net::{Ipv4Addr, TcpListener};
 
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let address = listener.local_addr().unwrap();
-        let client = LocalStream::connect(address).unwrap();
+        let client = LocalStream::connect(listener.local_addr().unwrap()).unwrap();
         let (server, _) = listener.accept().unwrap();
         (client, server)
     }
 
     #[test]
-    fn rejects_out_of_order_records_before_body_dispatch() {
+    fn validates_kind_specific_first_record() {
         let (mut client, server) = stream_pair();
-        client.write_all(&encode_preface(ConnectionKind::Control, 1024)).unwrap();
+        client.write_all(&encode_preface(ConnectionKind::Track, 1024)).unwrap();
         client
             .write_all(
                 &RecordHeader {
                     body_length: 0,
-                    record_type: 1,
+                    record_type: vivid_protocol::messages::HELLO,
                     flags: 0,
-                    object_id: 0,
-                    sequence: 2,
-                }
-                .encode(),
-            )
-            .unwrap();
-        let (mut reader, _) = Reader::new(server).unwrap();
-        assert!(reader.read_record().is_err());
-    }
-
-    #[test]
-    fn read_record_into_reuses_body_capacity() {
-        let (mut client, server) = stream_pair();
-        client.write_all(&encode_preface(ConnectionKind::Raster, 1024)).unwrap();
-        for sequence in 1..=2 {
-            client
-                .write_all(
-                    &RecordHeader {
-                        body_length: 128,
-                        record_type: 1,
-                        flags: 0,
-                        object_id: 7,
-                        sequence,
-                    }
-                    .encode(),
-                )
-                .unwrap();
-            client.write_all(&[sequence as u8; 128]).unwrap();
-        }
-        let (mut reader, _) = Reader::new(server).unwrap();
-        let mut body = Vec::new();
-        let first = reader.read_record_into(&mut body).unwrap();
-        assert_eq!(first.body, &[1; 128]);
-        let pointer = first.body.as_ptr();
-        let second = reader.read_record_into(&mut body).unwrap();
-        assert_eq!(second.body, &[2; 128]);
-        assert_eq!(second.body.as_ptr(), pointer);
-    }
-
-    #[test]
-    fn rejects_reserved_record_flags_before_body_dispatch() {
-        let (mut client, server) = stream_pair();
-        client.write_all(&encode_preface(ConnectionKind::Control, 1024)).unwrap();
-        client
-            .write_all(
-                &RecordHeader {
-                    body_length: 0,
-                    record_type: 1,
-                    flags: 2,
                     object_id: 0,
                     sequence: 1,
                 }
                 .encode(),
             )
             .unwrap();
-        let (mut reader, _) = Reader::new(server).unwrap();
-        assert!(reader.read_record().is_err());
+        let (mut reader, preface, _) = Reader::new(server).unwrap();
+        assert!(reader.read_record(preface.kind).is_err());
     }
 
     #[test]
-    fn accepts_split_writes_at_every_framing_boundary() {
-        let body = b"split-me";
-        let header = RecordHeader {
-            body_length: body.len() as u32,
-            record_type: 7,
-            flags: 0,
-            object_id: 9,
-            sequence: 1,
-        }
-        .encode();
-        let mut wire = encode_preface(ConnectionKind::Control, 1024).to_vec();
-        wire.extend_from_slice(&header);
-        wire.extend_from_slice(body);
-
-        for split in 0..=wire.len() {
-            let (mut client, server) = stream_pair();
-            let bytes = wire.clone();
-            let writer = std::thread::spawn(move || {
-                client.write_all(&bytes[..split]).unwrap();
-                client.write_all(&bytes[split..]).unwrap();
-            });
-            let (mut reader, _) = Reader::new(server).unwrap();
-            let record = reader.read_record().unwrap();
-            assert_eq!(record.body, body);
-            writer.join().unwrap();
-        }
-    }
-
-    #[test]
-    fn diagnostic_trace_never_serializes_control_secrets_or_restricted_source_ids() {
-        let records = Arc::new(Mutex::new(Vec::new()));
-        let output = records.clone();
-        let guard = TraceGuard::callback(
-            TraceComponent::Vivido,
-            TraceHop::Presenter,
-            [0x55; 16],
-            move |record| output.lock().unwrap().push(record),
-        )
-        .unwrap();
-        let channel = TraceChannel::new(guard.emitter());
-        let token = "abababababababababababababababababababababababababababababababab";
-        let hello = messages::encode_hello(
-            7,
-            &messages::HelloConfig {
-                minimum_major: 1,
-                minimum_minor: 1,
-                maximum_major: 1,
-                maximum_minor: 1,
-                token,
-                producer: "private producer title",
-                producer_version: "1",
-                required_features: &[],
-                optional_features: &[],
-                maximum_record_body: 4096,
-                authentication_kind: messages::AUTHENTICATION_WINDOW_ROOT,
-                preserved_fields: &[],
-            },
-        );
-        channel.emit(
-            TraceDirection::Receive,
-            RecordHeader {
-                body_length: hello.len() as u32,
-                record_type: messages::HELLO,
-                flags: 0,
-                object_id: 0,
-                sequence: 1,
-            },
-            &hello,
-        );
-        channel.mark_source_policy(91, messages::CAPTURE_POLICY_REDUCE_DIAGNOSTICS);
-        channel.emit(
-            TraceDirection::Receive,
-            RecordHeader {
-                body_length: 32,
-                record_type: messages::VIDEO_PACKET,
-                flags: 0,
-                object_id: 91,
-                sequence: 2,
-            },
-            b"private-media-body-is-never-traced",
-        );
-        let cbor_shaped_media = messages::ok(999);
-        channel.emit(
-            TraceDirection::Receive,
-            RecordHeader {
-                body_length: cbor_shaped_media.len() as u32,
-                record_type: messages::VIDEO_PACKET,
-                flags: 0,
-                object_id: 93,
-                sequence: 3,
-            },
-            &cbor_shaped_media,
-        );
-        let capability = [b'K'; messages::CONTEXT_CAPABILITY_BYTES];
-        let capability_reply = messages::context_capability(10, 5, &capability);
-        channel.emit(
-            TraceDirection::Send,
-            RecordHeader {
-                body_length: capability_reply.len() as u32,
-                record_type: messages::CONTEXT_CAPABILITY,
-                flags: 0,
-                object_id: 5,
-                sequence: 4,
-            },
-            &capability_reply,
-        );
-        let ticket = [b'T'; 32];
-        let ready = messages::source_ready(
-            11,
-            95,
-            &ticket,
-            messages::Credits { bytes: 4096, packets: 1, fragments: 0 },
-            4096,
-        );
-        channel.emit(
-            TraceDirection::Send,
-            RecordHeader {
-                body_length: ready.len() as u32,
-                record_type: messages::SOURCE_READY,
-                flags: 0,
-                object_id: 95,
-                sequence: 5,
-            },
-            &ready,
-        );
-        let cookie = "vvbridge_session=COOKIE-SENTINEL";
-        let marker = "\u{1b}_GVIVID1;MARKER-SENTINEL\u{1b}\\";
-        let diagnostic =
-            messages::error(12, messages::ERROR_BAD_MESSAGE, &format!("{cookie} {marker}"));
-        channel.emit(
-            TraceDirection::Send,
-            RecordHeader {
-                body_length: diagnostic.len() as u32,
-                record_type: messages::ERROR,
-                flags: 0,
-                object_id: 0,
-                sequence: 6,
-            },
-            &diagnostic,
-        );
-        drop(channel);
-        drop(guard);
-
-        let records = records.lock().unwrap();
-        assert_eq!(records.len(), 6);
-        assert_eq!(records[1].outcome, TraceOutcome::Restricted);
-        assert_eq!(records[1].object_id, None);
-        assert_eq!(records[2].request_id, None, "media bytes are never decoded as control CBOR");
-        let trace = records.iter().map(|record| record.ndjson_line()).collect::<String>();
-        for forbidden in [
-            token,
-            "private producer title",
-            "private-media-body",
-            "\"object_id\":91",
-            "KKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKK",
-            "TTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTT",
-            cookie,
-            "MARKER-SENTINEL",
-        ] {
-            assert!(!trace.contains(forbidden), "trace leaked {forbidden}");
-        }
+    fn emits_one_typed_error_for_a_well_formed_version_mismatch() {
+        let (mut client, server) = stream_pair();
+        let mut preface = encode_preface(ConnectionKind::Control, 1024);
+        preface[5] = preface[5].wrapping_add(1);
+        client.write_all(&preface).unwrap();
+        assert!(Reader::new(server).is_err());
+        let mut bytes = Vec::new();
+        client.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, vivid_protocol::wire::unsupported_version_record());
     }
 }

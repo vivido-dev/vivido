@@ -763,7 +763,7 @@ impl Processor {
                     self.windows[&target].automation_inspect(self.automation.event_sequence())
                 })
             },
-            "vivid_sources" => {
+            "vivid_sessions" => {
                 let params: IpcTarget = match decode_ipc_params(&request) {
                     Ok(params) => params,
                     Err(error) => {
@@ -772,14 +772,26 @@ impl Processor {
                     },
                 };
                 self.resolve_ipc_target(params.window_id)
-                    .map(|target| self.windows[&target].automation_vivid_sources())
+                    .map(|target| self.windows[&target].automation_vivid_sessions())
             },
-            "vivid_source_status" | "vivid_milestones" => {
+            "vivid_surfaces" => {
+                let params: IpcTarget = match decode_ipc_params(&request) {
+                    Ok(params) => params,
+                    Err(error) => {
+                        request.connection.error(request.id, error);
+                        return;
+                    },
+                };
+                self.resolve_ipc_target(params.window_id)
+                    .map(|target| self.windows[&target].automation_vivid_surfaces())
+            },
+            "vivid_surface_status" => {
                 #[derive(serde::Deserialize)]
                 struct Params {
                     window_id: Option<u64>,
                     session_id: u64,
-                    source_id: u64,
+                    context_id: u64,
+                    surface_id: u64,
                 }
                 let params: Params = match decode_ipc_params(&request) {
                     Ok(params) => params,
@@ -789,23 +801,47 @@ impl Processor {
                     },
                 };
                 self.resolve_ipc_target(params.window_id).and_then(|target| {
-                    self.windows[&target]
-                        .automation_vivid_source(params.session_id, params.source_id)
-                        .map(|status| {
-                            if request.method == "vivid_milestones" {
-                                serde_json::json!({
-                                    "window_id": status["window_id"],
-                                    "session_id": params.session_id,
-                                    "source_id": params.source_id,
-                                    "source_revision": status["source_revision"],
-                                    "milestones": status["milestones"],
-                                    "lifecycle": status["lifecycle"],
-                                    "terminal_loss_code": status["terminal_loss_code"],
-                                })
-                            } else {
-                                status
-                            }
-                        })
+                    self.windows[&target].automation_vivid_surface(
+                        params.session_id,
+                        params.context_id,
+                        params.surface_id,
+                    )
+                })
+            },
+            "vivid_tracks" => {
+                let params: IpcTarget = match decode_ipc_params(&request) {
+                    Ok(params) => params,
+                    Err(error) => {
+                        request.connection.error(request.id, error);
+                        return;
+                    },
+                };
+                self.resolve_ipc_target(params.window_id)
+                    .map(|target| self.windows[&target].automation_vivid_tracks())
+            },
+            "vivid_track_status" => {
+                #[derive(serde::Deserialize)]
+                struct Params {
+                    window_id: Option<u64>,
+                    session_id: u64,
+                    context_id: u64,
+                    surface_id: u64,
+                    track_id: u64,
+                }
+                let params: Params = match decode_ipc_params(&request) {
+                    Ok(params) => params,
+                    Err(error) => {
+                        request.connection.error(request.id, error);
+                        return;
+                    },
+                };
+                self.resolve_ipc_target(params.window_id).and_then(|target| {
+                    self.windows[&target].automation_vivid_track(
+                        params.session_id,
+                        params.context_id,
+                        params.surface_id,
+                        params.track_id,
+                    )
                 })
             },
             "vivid_scene_status" => {
@@ -1118,12 +1154,15 @@ impl Processor {
                 );
                 return;
             },
-            "wait_vivid_source" => {
+            "wait_vivid_track" => {
                 #[derive(serde::Deserialize)]
                 struct Params {
                     window_id: Option<u64>,
                     session_id: u64,
-                    source_id: u64,
+                    context_id: u64,
+                    surface_id: u64,
+                    track_id: u64,
+                    channel_generation: u64,
                     condition: u64,
                     value: Option<u64>,
                     timeout: u64,
@@ -1135,24 +1174,26 @@ impl Processor {
                         return;
                     },
                 };
-                let wait = vivid_protocol::messages::WaitSource {
-                    source_id: params.source_id,
-                    condition: params.condition,
-                    value: params.value,
-                    timeout_us: params.timeout.saturating_mul(1_000),
+                let value_is_valid = match params.condition {
+                    1..=4 => params.value.is_some(),
+                    5..=9 => params.value.is_none(),
+                    _ => false,
                 };
-                if vivid_protocol::messages::wait_source(1, wait).is_err() {
+                if params.channel_generation == 0 || params.timeout == 0 || !value_is_valid {
                     Err(IpcError::new(
                         "invalid_params",
-                        "invalid Vivid source wait condition or value",
+                        "invalid Vivid track wait identity, generation, condition, value, or timeout",
                     ))
                 } else {
                     self.register_wait(
                         params.window_id,
                         params.timeout,
-                        WaitKind::VividSource {
+                        WaitKind::VividTrack {
                             session_id: params.session_id,
-                            source_id: params.source_id,
+                            context_id: params.context_id,
+                            surface_id: params.surface_id,
+                            track_id: params.track_id,
+                            channel_generation: params.channel_generation,
                             condition: params.condition,
                             value: params.value,
                         },
@@ -1523,27 +1564,50 @@ impl Processor {
                 },
                 WaitKind::Frame { after } => (frame_sequence > *after)
                     .then(|| Ok(serde_json::json!({"frame_sequence": frame_sequence}))),
-                WaitKind::VividSource { session_id, source_id, condition, value } => match window
-                    .automation_vivid_wait(*session_id, *source_id, *condition, *value)
-                {
-                    crate::vivid::scene::SourceWaitEvaluation::Satisfied(satisfied) => {
+                WaitKind::VividTrack {
+                    session_id,
+                    context_id,
+                    surface_id,
+                    track_id,
+                    channel_generation,
+                    condition,
+                    value,
+                } => match window.automation_vivid_wait(
+                    *session_id,
+                    *context_id,
+                    *surface_id,
+                    *track_id,
+                    *channel_generation,
+                    *condition,
+                    *value,
+                ) {
+                    crate::vivid::scene::TrackWaitEvaluation::Satisfied(satisfied) => {
                         Some(Ok(serde_json::json!({
                             "session_id": session_id,
-                            "source_id": source_id,
-                            "source_revision": satisfied.source_revision.get(),
+                            "context_id": context_id,
+                            "surface_id": surface_id,
+                            "track_id": track_id,
+                            "track_revision": satisfied.revision.get(),
+                            "channel_generation": satisfied.channel_generation.get(),
                             "condition": condition,
                             "observed_value": satisfied.observed_value,
                         })))
                     },
-                    crate::vivid::scene::SourceWaitEvaluation::Pending => None,
-                    crate::vivid::scene::SourceWaitEvaluation::NotVisible => {
+                    crate::vivid::scene::TrackWaitEvaluation::Pending => None,
+                    crate::vivid::scene::TrackWaitEvaluation::NotVisible => {
                         Some(Err(IpcError::new(
                             "not_visible",
-                            "Vivid source has no eligible visible placement",
+                            "Vivid track has no eligible visible surface placement",
                         )))
                     },
-                    crate::vivid::scene::SourceWaitEvaluation::NotFound => {
-                        Some(Err(IpcError::new("source_not_found", "Vivid source does not exist")))
+                    crate::vivid::scene::TrackWaitEvaluation::NotFound => {
+                        Some(Err(IpcError::new("track_not_found", "Vivid track does not exist")))
+                    },
+                    crate::vivid::scene::TrackWaitEvaluation::StaleGeneration => {
+                        Some(Err(IpcError::new(
+                            "stale_channel_generation",
+                            "Vivid track wait names a stale channel generation",
+                        )))
                     },
                 },
                 WaitKind::Exit => exit_status.map(|status| {

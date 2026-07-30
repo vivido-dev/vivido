@@ -25,7 +25,7 @@ use crate::event::{Event, EventType};
 use crate::terminal::thread;
 
 /// Formal Vivido automation protocol version.
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 
 /// Maximum request frame size.
 pub const MAX_REQUEST_FRAME_BYTES: usize = 1024 * 1024;
@@ -79,10 +79,12 @@ pub const METHODS: &[&str] = &[
     "signal",
     "list_windows",
     "inspect",
-    "vivid_sources",
-    "vivid_source_status",
+    "vivid_sessions",
+    "vivid_surfaces",
+    "vivid_surface_status",
+    "vivid_tracks",
+    "vivid_track_status",
     "vivid_scene_status",
-    "vivid_milestones",
     "get_grid",
     "wait_text",
     "wait_output",
@@ -90,7 +92,7 @@ pub const METHODS: &[&str] = &[
     "wait_screen_stable",
     "wait_frame",
     "wait_exit",
-    "wait_vivid_source",
+    "wait_vivid_track",
     "transcript",
     "subscribe",
 ];
@@ -1144,17 +1146,24 @@ mod tests {
     #[test]
     fn hello_advertises_required_limits() {
         let hello = hello_result();
-        assert_eq!(hello["protocol_version"], 1);
+        assert_eq!(hello["protocol_version"], 2);
         assert_eq!(hello["limits"]["connections"], 32);
         assert!(hello["methods"].as_array().unwrap().iter().any(|value| value == "get_grid"));
         for method in [
-            "vivid_sources",
-            "vivid_source_status",
+            "vivid_sessions",
+            "vivid_surfaces",
+            "vivid_surface_status",
+            "vivid_tracks",
+            "vivid_track_status",
             "vivid_scene_status",
-            "vivid_milestones",
-            "wait_vivid_source",
+            "wait_vivid_track",
         ] {
             assert!(hello["methods"].as_array().unwrap().iter().any(|value| value == method));
+        }
+        for retired in
+            ["vivid_sources", "vivid_source_status", "vivid_milestones", "wait_vivid_source"]
+        {
+            assert!(!hello["methods"].as_array().unwrap().iter().any(|value| value == retired));
         }
     }
 }

@@ -11,7 +11,7 @@ use cpal::{FromSample, I24, SampleFormat, SizedSample, Stream, StreamConfig, U24
 use ringbuf::traits::{Consumer, Producer, Split};
 use ringbuf::{HeapProd, HeapRb};
 use vivid_protocol::media::ParsedAudioPacket;
-use vivid_protocol::messages::ParsedAudioSourceConfig;
+use vivid_protocol::track::AudioConfiguration;
 
 const AVMEDIA_TYPE_AUDIO: c_int = 1;
 const AV_INPUT_BUFFER_PADDING_SIZE: usize = 64;
@@ -24,8 +24,8 @@ const POLL_INTERVAL: Duration = Duration::from_millis(2);
 const LINKED_AUDIO_STALL_FALLBACK: Duration = Duration::from_secs(2);
 const UNSET_PTS: i64 = i64::MIN;
 
-pub fn supports(config: &ParsedAudioSourceConfig) -> bool {
-    AudioDecoder::new(config, config.sample_rate, config.channels).is_ok()
+pub fn supports(config: &AudioConfiguration) -> bool {
+    AudioDecoder::new(config, config.sample_rate, u16::from(config.channels)).is_ok()
 }
 
 #[repr(C)]
@@ -242,12 +242,13 @@ impl AudioOutput {
     }
 
     #[cfg(test)]
+    #[allow(dead_code)]
     pub(super) fn force_video_gate_stall_for_test(&self) {
         *self.shared.play_configured_at.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
             Some(Instant::now() - LINKED_AUDIO_STALL_FALLBACK - Duration::from_millis(1));
     }
 
-    pub fn decoder(&self, config: &ParsedAudioSourceConfig) -> io::Result<AudioDecoder> {
+    pub fn decoder(&self, config: &AudioConfiguration) -> io::Result<AudioDecoder> {
         AudioDecoder::new(config, self.sample_rate, self.channels)
     }
 
@@ -357,6 +358,7 @@ impl AudioOutput {
         samples.drain(..discard);
     }
 
+    #[allow(dead_code)]
     pub fn pts_reached(&self, pts_us: i64) -> bool {
         if !self.shared.enabled.load(Ordering::SeqCst)
             || !self.shared.prebuffered.load(Ordering::SeqCst)
@@ -374,6 +376,7 @@ impl AudioOutput {
                 )
     }
 
+    #[allow(dead_code)]
     pub fn video_gate_stalled(&self) -> bool {
         self.shared.enabled.load(Ordering::SeqCst)
             && !self.shared.prebuffered.load(Ordering::SeqCst)
@@ -444,7 +447,7 @@ impl AudioOutput {
         self.shared.stopped.store(true, Ordering::SeqCst);
         // Session teardown must silence the device immediately. The stopped flag unblocks
         // decoders and waiters; leaving enabled set would let the callback continue draining
-        // already queued samples after the source and its nodes had been removed.
+        // already queued samples after the track and its surface nodes had been removed.
         self.shared.enabled.store(false, Ordering::SeqCst);
     }
 }
@@ -543,7 +546,7 @@ pub struct AudioDecoder {
 
 impl AudioDecoder {
     fn new(
-        config: &ParsedAudioSourceConfig,
+        config: &AudioConfiguration,
         output_rate: u32,
         output_channels: u16,
     ) -> io::Result<Self> {
@@ -570,7 +573,7 @@ impl AudioDecoder {
             let parameters = unsafe { &mut *(parameters as *mut AVCodecParametersPrefix) };
             parameters.codec_type = AVMEDIA_TYPE_AUDIO;
             parameters.codec_id = codec.id;
-            parameters.bit_rate = i64::try_from(config.bitrate).unwrap_or(i64::MAX);
+            parameters.bit_rate = 0;
             if !config.extradata.is_empty() {
                 let size = config
                     .extradata
@@ -975,7 +978,7 @@ unsafe extern "C" {
 mod tests {
     use super::*;
     use vivid_protocol::media::ParsedAudioPacket;
-    use vivid_protocol::messages::ParsedAudioSourceConfig;
+    use vivid_protocol::track::AudioConfiguration;
 
     #[test]
     fn video_gate_stall_requires_enabled_and_empty_ingress() {
@@ -1036,17 +1039,14 @@ mod tests {
 
     #[test]
     fn ffmpeg_decodes_pcm_access_units_without_an_output_device() {
-        let config = ParsedAudioSourceConfig {
-            source_id: 1,
-            linked_video_source_id: None,
+        let config = AudioConfiguration {
             codec: "pcm_s16le".into(),
             packetization: "pcm-packet-v1".into(),
             extradata: Vec::new(),
             sample_rate: 48_000,
             channels: 2,
             channel_mask: 3,
-            bitrate: 1_536_000,
-            max_access_unit_bytes: 4_096,
+            maximum_access_unit_bytes: 4_096,
             codec_string: None,
         };
         let encoded = vec![0_u8; 480 * 2 * 2];

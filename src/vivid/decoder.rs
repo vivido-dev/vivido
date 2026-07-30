@@ -5,7 +5,7 @@ use std::io;
 use std::ptr;
 
 use vivid_protocol::media::ParsedVideoPacket;
-use vivid_protocol::messages::ParsedVideoSourceConfig;
+use vivid_protocol::track::VideoConfiguration;
 
 const AVMEDIA_TYPE_VIDEO: c_int = 0;
 const AV_INPUT_BUFFER_PADDING_SIZE: usize = 64;
@@ -101,7 +101,7 @@ pub struct Decoder {
 }
 
 impl Decoder {
-    pub fn new(config: &ParsedVideoSourceConfig) -> io::Result<Self> {
+    pub fn new(config: &VideoConfiguration) -> io::Result<Self> {
         // FFmpeg's native `av1` decoder can open when only a hardware path is available, then fail
         // on the first packet on systems without supported AV1 hardware. Require the bounded
         // software implementation for predictable decoding on every supported platform.
@@ -130,11 +130,11 @@ impl Decoder {
             parameters_prefix.codec_id = codec_prefix.id;
             parameters_prefix.profile = config.profile;
             parameters_prefix.level = config.level;
-            parameters_prefix.width = c_int::try_from(config.width)
+            parameters_prefix.width = c_int::try_from(config.coded_width)
                 .map_err(|_| invalid("video width exceeds FFmpeg limits"))?;
-            parameters_prefix.height = c_int::try_from(config.height)
+            parameters_prefix.height = c_int::try_from(config.coded_height)
                 .map_err(|_| invalid("video height exceeds FFmpeg limits"))?;
-            parameters_prefix.bit_rate = i64::try_from(config.bitrate).unwrap_or(i64::MAX);
+            parameters_prefix.bit_rate = 0;
 
             if !config.extradata.is_empty() {
                 let allocation = config
@@ -217,7 +217,7 @@ impl Decoder {
                 3 => 9, // ITU-R BT.2020
                 _ => 1, // RGB/identity input; coefficients are unused by RGB paths
             },
-            source_full_range: c_int::from(config.range == 2),
+            source_full_range: c_int::from(config.signal_range == 2),
         })
     }
 
@@ -484,26 +484,25 @@ unsafe extern "C" {
 mod tests {
     use super::*;
 
-    fn video_config(codec: &str, extradata: Vec<u8>) -> ParsedVideoSourceConfig {
-        ParsedVideoSourceConfig {
-            source_id: 1,
+    fn video_config(codec: &str, extradata: Vec<u8>) -> VideoConfiguration {
+        VideoConfiguration {
             codec: codec.into(),
             packetization: format!("{codec}-test"),
             extradata,
-            width: 640,
-            height: 480,
+            coded_width: 640,
+            coded_height: 480,
             profile: 0,
             level: 4,
-            bitrate: 0,
+            maximum_reorder_depth: 0,
             color_primaries: 1,
             transfer: 1,
             matrix: 1,
-            range: 1,
-            sar_num: 1,
-            sar_den: 1,
-            max_access_unit_bytes: 1024 * 1024,
+            signal_range: 1,
+            aspect_numerator: 1,
+            aspect_denominator: 1,
+            maximum_access_unit_bytes: 1024 * 1024,
             codec_string: None,
-            decoder_config: None,
+            decoder_configuration: None,
         }
     }
 

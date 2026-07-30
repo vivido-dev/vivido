@@ -20,6 +20,8 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+#[cfg(unix)]
+use base64::Engine;
 use log::info;
 use serde_json as json;
 #[cfg(unix)]
@@ -81,7 +83,7 @@ use crate::screenshot;
 #[cfg(unix)]
 use crate::terminal::thread;
 #[cfg(unix)]
-use crate::vivid::scene::SourceWaitEvaluation;
+use crate::vivid::scene::TrackWaitEvaluation;
 use crate::vivid::{DisplayMetrics, VividService};
 
 #[cfg(unix)]
@@ -238,8 +240,10 @@ impl WindowContext {
                 },
                 event_proxy.clone(),
             )?;
-            pty_config.env.insert("VIVID_ENDPOINT".into(), service.endpoint().into());
-            pty_config.env.insert("VIVID_TOKEN".into(), service.token().into());
+            pty_config
+                .env
+                .insert("VIVID_ENDPOINT_CONTROL".into(), service.control_endpoint().into());
+            pty_config.env.insert("VIVID_ROOT_SECRET".into(), service.root_secret().into());
             display.set_vivid_scene(service.scene());
             service
         };
@@ -1304,30 +1308,91 @@ impl WindowContext {
     }
 
     #[cfg(unix)]
-    pub fn automation_vivid_sources(&self) -> Value {
-        let sources = self
+    pub fn automation_vivid_sessions(&self) -> Value {
+        let sessions = self
             .vivid_service
-            .automation_source_keys()
+            .automation_sessions()
             .into_iter()
-            .filter_map(|(session_id, source_id)| {
-                self.vivid_service
-                    .automation_source_status(session_id, source_id)
-                    .map(|status| vivid_source_status_json(self.ipc_window_id, session_id, &status))
+            .map(|identity| {
+                json_value!({
+                    "session_id": identity.session_id,
+                    "presenter_instance_id": hex_bytes(&identity.presenter.0),
+                })
             })
             .collect::<Vec<_>>();
-        json_value!({"window_id": self.ipc_window_id, "sources": sources})
+        json_value!({"window_id": self.ipc_window_id, "sessions": sessions})
     }
 
     #[cfg(unix)]
-    pub fn automation_vivid_source(
+    pub fn automation_vivid_surfaces(&self) -> Value {
+        let surfaces = self
+            .vivid_service
+            .automation_surface_keys()
+            .into_iter()
+            .filter_map(|identity| {
+                self.vivid_service
+                    .automation_surface_status(identity)
+                    .map(|status| vivid_surface_status_json(self.ipc_window_id, &status))
+            })
+            .collect::<Vec<_>>();
+        json_value!({"window_id": self.ipc_window_id, "surfaces": surfaces})
+    }
+
+    #[cfg(unix)]
+    pub fn automation_vivid_surface(
         &self,
         session_id: u64,
-        source_id: u64,
+        context_id: u64,
+        surface_id: u64,
     ) -> Result<Value, IpcError> {
         self.vivid_service
-            .automation_source_status(session_id, source_id)
-            .map(|status| vivid_source_status_json(self.ipc_window_id, session_id, &status))
-            .ok_or_else(|| IpcError::new("source_not_found", "Vivid source does not exist"))
+            .automation_surface_keys()
+            .into_iter()
+            .find(|identity| {
+                identity.context.session.session_id == session_id
+                    && identity.context.context_id == context_id
+                    && identity.surface_id == surface_id
+            })
+            .and_then(|identity| self.vivid_service.automation_surface_status(identity))
+            .map(|status| vivid_surface_status_json(self.ipc_window_id, &status))
+            .ok_or_else(|| IpcError::new("surface_not_found", "Vivid surface does not exist"))
+    }
+
+    #[cfg(unix)]
+    pub fn automation_vivid_tracks(&self) -> Value {
+        let tracks = self
+            .vivid_service
+            .automation_track_keys()
+            .into_iter()
+            .filter_map(|identity| {
+                self.vivid_service
+                    .automation_track_status(identity)
+                    .map(|status| vivid_track_status_json(self.ipc_window_id, &status))
+            })
+            .collect::<Vec<_>>();
+        json_value!({"window_id": self.ipc_window_id, "tracks": tracks})
+    }
+
+    #[cfg(unix)]
+    pub fn automation_vivid_track(
+        &self,
+        session_id: u64,
+        context_id: u64,
+        surface_id: u64,
+        track_id: u64,
+    ) -> Result<Value, IpcError> {
+        self.vivid_service
+            .automation_track_keys()
+            .into_iter()
+            .find(|identity| {
+                identity.surface.context.session.session_id == session_id
+                    && identity.surface.context.context_id == context_id
+                    && identity.surface.surface_id == surface_id
+                    && identity.track_id == track_id
+            })
+            .and_then(|identity| self.vivid_service.automation_track_status(identity))
+            .map(|status| vivid_track_status_json(self.ipc_window_id, &status))
+            .ok_or_else(|| IpcError::new("track_not_found", "Vivid track does not exist"))
     }
 
     #[cfg(unix)]
@@ -1336,54 +1401,73 @@ impl WindowContext {
         session_id: u64,
         maximum_nodes: u64,
     ) -> Result<Value, IpcError> {
-        if maximum_nodes == 0 || maximum_nodes > vivid_protocol::messages::MAX_SCENE_NODES as u64 {
+        if maximum_nodes == 0 || maximum_nodes > 256 {
             return Err(IpcError::new("invalid_params", "maximum_nodes must be 1 through 256"));
         }
-        let status = self.vivid_service.automation_scene_status(session_id, maximum_nodes);
+        let session = self
+            .vivid_service
+            .automation_sessions()
+            .into_iter()
+            .find(|identity| identity.session_id == session_id)
+            .ok_or_else(|| IpcError::new("session_not_found", "Vivid session does not exist"))?;
+        let status = self.vivid_service.automation_scene_status(session, maximum_nodes);
         let nodes = status
             .nodes
             .into_iter()
             .map(|node| {
                 json_value!({
+                    "presenter_instance_id": hex_bytes(&node.identity.context.session.presenter.0),
                     "node_id": node.node.node_id,
-                    "source_id": node.node.source_id,
-                    "context_id": node.node.context_id,
-                    "x": node.node.x,
-                    "y": node.node.y,
-                    "width": node.node.width,
-                    "height": node.node.height,
-                    "text_layer": node.node.text_layer,
+                    "owning_context_id": node.node.owning_context_id,
+                    "surface_context_id": node.node.surface_context_id,
+                    "surface_id": node.node.surface_id,
+                    "geometry": cbor_map_json(&node.node.geometry),
                     "z_index": node.node.z_index,
                     "visible": node.node.visible,
-                    "anchor_id": node.node.anchor_id,
-                    "clip": node.clip.map(|clip| json_value!({
-                        "x": clip.x,
-                        "y": clip.y,
-                        "width": clip.width,
-                        "height": clip.height,
-                    })),
+                    "opacity": node.node.opacity,
+                    "clip": node.node.clip.as_ref().map(|clip| cbor_map_json(clip)),
                 })
             })
             .collect::<Vec<_>>();
         Ok(json_value!({
             "window_id": self.ipc_window_id,
+            "presenter_instance_id": hex_bytes(&status.session.presenter.0),
             "session_id": session_id,
-            "scene_revision": status.scene_revision.get(),
-            "total_nodes": status.total_nodes,
+            "scene_revision": status.revision.get(),
+            "target_generation": status.target_generation.get(),
+            "total_nodes": nodes.len(),
             "nodes": nodes,
-            "truncated": status.cursor.is_some(),
+            "truncated": false,
         }))
     }
 
     #[cfg(unix)]
+    #[allow(clippy::too_many_arguments)]
     pub fn automation_vivid_wait(
         &self,
         session_id: u64,
-        source_id: u64,
+        context_id: u64,
+        surface_id: u64,
+        track_id: u64,
+        channel_generation: u64,
         condition: u64,
         value: Option<u64>,
-    ) -> SourceWaitEvaluation {
-        self.vivid_service.automation_evaluate_wait(session_id, source_id, condition, value)
+    ) -> TrackWaitEvaluation {
+        let identity = self.vivid_service.automation_track_keys().into_iter().find(|identity| {
+            identity.surface.context.session.session_id == session_id
+                && identity.surface.context.context_id == context_id
+                && identity.surface.surface_id == surface_id
+                && identity.track_id == track_id
+        });
+        let Some(identity) = identity else {
+            return TrackWaitEvaluation::NotFound;
+        };
+        self.vivid_service.automation_evaluate_wait(
+            identity,
+            vivid_protocol::revision::ChannelGeneration::new(channel_generation),
+            condition,
+            value,
+        )
     }
 
     /// Structured physical-cell grid snapshot or current-state delta.
@@ -1776,64 +1860,93 @@ fn exit_status_json(status: Option<&std::process::ExitStatus>) -> Value {
 }
 
 #[cfg(unix)]
-fn vivid_source_status_json(
-    window_id: u64,
-    session_id: u64,
-    status: &vivid_protocol::messages::SourceStatus,
-) -> Value {
-    let playback = status.playback.map(|playback| {
-        json_value!({
-            "state": playback.state,
-            "clock_pts_us": playback.clock_pts_us,
-            "epoch": playback.epoch,
-            "buffered_ahead_us": playback.buffered_ahead_us,
-            "underrun_count": playback.underrun_count,
-            "late_drop_count": playback.late_drop_count,
-            "eos_state": playback.eos_state,
-        })
-    });
-    let descriptor = status.descriptor.as_ref().map(|descriptor| match descriptor {
-        vivid_protocol::messages::ReportedSourceDescriptor::Full(descriptor) => json_value!({
-            "role": descriptor.role,
-            "title": descriptor.title,
-            "content_revision": descriptor.content_revision,
-            "semantic_availability": descriptor.semantic_availability,
-            "locator": descriptor.locator,
-        }),
-        vivid_protocol::messages::ReportedSourceDescriptor::RoleOnly { role } => {
-            json_value!({"role": role})
-        },
-    });
+fn vivid_surface_status_json(window_id: u64, status: &crate::vivid::scene::SurfaceStatus) -> Value {
+    let descriptor = &status.definition.descriptor;
     json_value!({
         "window_id": window_id,
-        "session_id": session_id,
-        "source_id": status.source_id,
-        "source_revision": status.source_revision.get(),
-        "kind": status.kind,
-        "lifecycle": status.lifecycle,
-        "epoch": status.epoch,
-        "attachment": {
-            "state": status.attachment_state,
-            "generation": status.attachment_generation,
+        "session_id": status.identity.context.session.session_id,
+        "context_id": status.identity.context.context_id,
+        "surface_id": status.identity.surface_id,
+        "surface_revision": status.revision.get(),
+        "surface_generation": status.generation.get(),
+        "semantic_profile": status.definition.semantic_profile,
+        "coordinate_model": status.definition.coordinate_model as u64,
+        "logical_width": status.definition.logical_width,
+        "logical_height": status.definition.logical_height,
+        "scale_numerator": status.definition.scale_numerator,
+        "scale_denominator": status.definition.scale_denominator,
+        "rotation": status.definition.rotation,
+        "policy": status.definition.policy,
+        "descriptor": {
+            "role": descriptor.role as u64,
+            "title": descriptor.title,
+            "semantic_content_revision": descriptor.semantic_content_revision,
+            "semantic_availability": descriptor.semantic_availability,
+            "locator_hint": descriptor.locator_hint,
         },
-        "last_media_id": status.last_media_id,
-        "last_media_sequence": status.last_media_sequence,
+        "active_slots": status.active_slots,
+        "profile_parameters": cbor_map_json(&status.definition.profile_parameters),
+        "lifecycle": status.lifecycle,
+    })
+}
+
+#[cfg(unix)]
+fn vivid_track_status_json(window_id: u64, status: &crate::vivid::scene::TrackStatus) -> Value {
+    json_value!({
+        "window_id": window_id,
+        "session_id": status.identity.surface.context.session.session_id,
+        "context_id": status.identity.surface.context.context_id,
+        "surface_id": status.identity.surface.surface_id,
+        "track_id": status.identity.track_id,
+        "track_revision": status.state.revision.get(),
+        "channel_generation": status.state.channel_generation.get(),
+        "kind": crate::vivid::scene::track_kind_name(&status.configuration),
+        "slot": status.configuration.slot,
+        "mode": status.configuration.mode as u64,
+        "lane": status.configuration.lane as u64,
+        "lifecycle": status.lifecycle,
+        "milestones": status.state.milestones,
+        "media_epoch": status.state.media_epoch,
+        "last_media_id": status.state.last_media_id,
         "last_decoded_pts_us": status.last_decoded_pts_us,
         "last_presented_pts_us": status.last_presented_pts_us,
         "last_presentation_id": status.last_presentation_id,
-        "visible": status.visible,
-        "capture_policy": status.capture_policy,
-        "descriptor": descriptor,
-        "linked_source_id": status.linked_source_id,
-        "milestones": status.milestones,
-        "credits": {
-            "bytes": status.outstanding_byte_credit,
-            "packets": status.outstanding_packet_credit,
+        "flow": {
+            "cumulative_body_bytes": status.state.flow.sent_body_bytes,
+            "cumulative_media_records": status.state.flow.sent_media_records,
+            "maximum_body_bytes": status.maximum_channel_bytes,
+            "maximum_media_records": status.maximum_channel_records,
         },
-        "ingress_queue_depth": status.ingress_queue_depth,
-        "playback": playback,
-        "terminal_loss_code": status.terminal_loss_code,
+        "playback": {
+            "state": if status.configuration.mode as u64 == 2 { "timed" } else { "live" },
+            "media_epoch": status.state.media_epoch,
+        },
     })
+}
+
+#[cfg(unix)]
+fn cbor_map_json(map: &[(u64, vivid_protocol::cbor::Value)]) -> Value {
+    Value::Object(map.iter().map(|(key, value)| (key.to_string(), cbor_json(value))).collect())
+}
+
+#[cfg(unix)]
+fn cbor_json(value: &vivid_protocol::cbor::Value) -> Value {
+    use vivid_protocol::cbor::Value as Cbor;
+    match value {
+        Cbor::Unsigned(value) => Value::from(*value),
+        Cbor::Negative(value) => Value::from(*value),
+        Cbor::Bytes(value) => Value::from(base64::engine::general_purpose::STANDARD.encode(value)),
+        Cbor::Text(value) => Value::from(value.clone()),
+        Cbor::Array(value) => Value::Array(value.iter().map(cbor_json).collect()),
+        Cbor::Map(value) => cbor_map_json(value),
+        Cbor::Bool(value) => Value::from(*value),
+        Cbor::Null => Value::Null,
+    }
+}
+
+#[cfg(unix)]
+fn hex_bytes(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 #[cfg(all(unix, target_os = "linux"))]
