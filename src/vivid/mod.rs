@@ -1,5 +1,6 @@
 //! Per-window Vivid Protocol 1.5 presenter.
 
+mod actor;
 mod audio;
 mod decoder;
 pub mod scene;
@@ -17,6 +18,7 @@ use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -56,13 +58,14 @@ use crate::terminal::event::EventListener;
 use crate::terminal::grid::Dimensions;
 use crate::terminal::index::{Column, Line, Point};
 use crate::terminal::term::{ResizePoint, Term};
+use crate::vivid::actor::{AdmissionError, Egress, Pending, PendingSet};
 use crate::vivid::audio::{AudioOutput, supports as supports_audio};
 use crate::vivid::decoder::Decoder;
 use crate::vivid::scene::{
     CommitRejection, Frame, SceneStatus, SharedScene, SurfaceStatus, TrackStatus,
     TrackWaitEvaluation, TrackWaitSatisfied,
 };
-use crate::vivid::transport::{Reader, Writer};
+use crate::vivid::transport::{ReadShutdown, Reader, Writer};
 
 #[cfg(windows)]
 type LocalListener = TcpListener;
@@ -126,8 +129,6 @@ struct SessionRuntime {
     writer: Arc<Writer>,
     contexts: Mutex<HashMap<u64, ContextState>>,
     seen_anchors: Mutex<HashSet<(u64, u64)>>,
-    pending_waits: AtomicUsize,
-    cancelled_waits: Mutex<HashSet<u64>>,
 }
 
 #[derive(Default)]
@@ -516,38 +517,130 @@ fn handle_control(
     let session = establish_root_session(shared, writer.clone(), preface, &hello, hello_request)?;
     reader.set_maximum(hello.maximum_control_body)?;
     writer.set_maximum(hello.maximum_control_body)?;
-    let mut clean_goodbye = false;
+
+    // A session is a reader, an actor, and an egress. This thread is the reader: it parses and
+    // enqueues, and never writes, so a peer that stops draining its replies cannot stall parsing.
+    let egress = Egress::start(writer);
+    let (records, incoming) = mpsc::sync_channel::<Record>(actor::INGRESS_CAPACITY);
+    let clean_goodbye = Arc::new(AtomicBool::new(false));
+    let shutdown = reader.shutdown_handle()?;
+    let actor = {
+        let shared = shared.clone();
+        let session = session.clone();
+        let egress = egress.clone();
+        let clean_goodbye = clean_goodbye.clone();
+        thread::Builder::new()
+            .name("vivid-control-actor".into())
+            .spawn(move || actor_loop(shared, session, incoming, egress, clean_goodbye, shutdown))?
+    };
+
     loop {
         let record = match reader.read_record(ConnectionKind::Control) {
             Ok(record) => record,
             Err(error) if error.kind() == ErrorKind::UnexpectedEof => break,
-            Err(error) => return Err(error),
-        };
-        match dispatch_control(shared, &session, &record) {
-            Ok(Some((record_type, object_id, body))) => {
-                writer.write_record(record_type, object_id, &body)?;
-            },
-            Ok(None) => {},
             Err(error) => {
-                let request_id = messages::decode_control(&record.body)
-                    .map(|envelope| envelope.request_id)
-                    .unwrap_or(0);
-                let fatal = request_id == 0;
-                writer.write_record(
-                    messages::ERROR,
-                    record.object_id,
-                    &protocol_error(request_id, error.code, fatal, error.message)?,
-                )?;
-                if fatal {
-                    break;
-                }
+                drop(records);
+                let _ = actor.join();
+                egress.close();
+                egress.join();
+                finish_session(shared, &session, false);
+                return Err(error);
             },
-        }
-        if record.record_type == messages::GOODBYE {
-            clean_goodbye = true;
+        };
+        if records.send(record).is_err() {
             break;
         }
     }
+    drop(records);
+    let _ = actor.join();
+    egress.close();
+    egress.join();
+    if egress.overflowed() {
+        log::debug!(
+            "Vivid session {} closed: the producer stopped draining its control replies",
+            session.identity.session_id
+        );
+    }
+    let clean_goodbye = clean_goodbye.load(Ordering::Acquire);
+    finish_session(shared, &session, clean_goodbye);
+    Ok(())
+}
+
+/// The session actor: owns mutable session state, applies mutations in receive order, and services
+/// outstanding operations on a tick so a long one never blocks the next record.
+fn actor_loop(
+    shared: Arc<ServiceShared>,
+    session: Arc<SessionRuntime>,
+    incoming: mpsc::Receiver<Record>,
+    egress: Arc<Egress>,
+    clean_goodbye: Arc<AtomicBool>,
+    shutdown: ReadShutdown,
+) {
+    let contract = presenter_contract();
+    let mut pending = PendingSet::new(
+        contract.get(Resource::RegisteredWaits),
+        contract.get(Resource::PendingRequests),
+    );
+    let mut cancelled = HashSet::new();
+    loop {
+        match incoming.recv_timeout(actor::TICK) {
+            Ok(record) => {
+                if !dispatch_and_reply(
+                    &shared,
+                    &session,
+                    &record,
+                    &egress,
+                    &mut pending,
+                    &mut cancelled,
+                ) {
+                    break;
+                }
+                if record.record_type == messages::GOODBYE {
+                    clean_goodbye.store(true, Ordering::Release);
+                    break;
+                }
+            },
+            Err(mpsc::RecvTimeoutError::Timeout) => {},
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+        if !pending.is_empty() {
+            pending.service(&shared.scene, &egress, &mut cancelled, Instant::now());
+        }
+    }
+    egress.close();
+    // Release the reader, which is parked on a peer that has no obligation to close promptly.
+    shutdown.stop();
+}
+
+/// Dispatch one record and deliver whatever it produced. Returns false when the session must end.
+fn dispatch_and_reply(
+    shared: &Arc<ServiceShared>,
+    session: &Arc<SessionRuntime>,
+    record: &Record,
+    egress: &Egress,
+    pending: &mut PendingSet,
+    cancelled: &mut HashSet<u64>,
+) -> bool {
+    match dispatch_control(shared, session, record, pending, cancelled) {
+        Ok(Some(reply)) => actor::deliver(egress, reply).is_ok(),
+        Ok(None) => true,
+        Err(error) => {
+            let request_id = messages::decode_control(&record.body)
+                .map(|envelope| envelope.request_id)
+                .unwrap_or(0);
+            let fatal = request_id == 0;
+            let Ok(body) = protocol_error(request_id, error.code, fatal, error.message) else {
+                return false;
+            };
+            if !egress.send(messages::ERROR, record.object_id, body) {
+                return false;
+            }
+            !fatal
+        },
+    }
+}
+
+fn finish_session(shared: &Arc<ServiceShared>, session: &Arc<SessionRuntime>, clean: bool) {
     lock(&shared.registry).sessions.remove(&session.identity.session_id);
     let removed_audio = {
         let mut outputs = lock(&shared.audio_outputs);
@@ -561,13 +654,12 @@ fn handle_control(
     for output in removed_audio {
         output.stop();
     }
-    if clean_goodbye {
+    if clean {
         shared.scene.detach_session(session.identity);
     } else {
         shared.scene.remove_session(session.identity);
     }
     (shared.wake)();
-    Ok(())
 }
 
 fn establish_root_session(
@@ -712,8 +804,6 @@ fn establish_root_session(
             .map_err(io::Error::other)?,
         )])),
         seen_anchors: Mutex::new(HashSet::new()),
-        pending_waits: AtomicUsize::new(0),
-        cancelled_waits: Mutex::new(HashSet::new()),
     });
     shared
         .scene
@@ -727,6 +817,8 @@ fn dispatch_control(
     shared: &Arc<ServiceShared>,
     session: &Arc<SessionRuntime>,
     record: &Record,
+    pending: &mut PendingSet,
+    cancelled: &mut HashSet<u64>,
 ) -> Result<Option<(u16, u64, Vec<u8>)>, ControlError> {
     if record.flags & !RECORD_OPTIONAL != 0 {
         return Err(ControlError::bad_message("unknown record flags"));
@@ -1338,145 +1430,27 @@ fn dispatch_control(
                     });
                 },
                 TrackWaitEvaluation::Pending => {
-                    if session.pending_waits.fetch_add(1, Ordering::AcqRel) >= 64 {
-                        session.pending_waits.fetch_sub(1, Ordering::AcqRel);
-                        return Err(ControlError {
+                    let entry = Pending::TrackWait {
+                        request_id,
+                        object_id: record.object_id,
+                        identity,
+                        generation,
+                        condition,
+                        value: condition_value,
+                        deadline: Instant::now()
+                            .checked_add(Duration::from_micros(timeout_us))
+                            .unwrap_or_else(Instant::now),
+                    };
+                    pending.register(entry).map_err(|error| match error {
+                        AdmissionError::Waits => ControlError {
                             code: messages::ERROR_LIMIT_EXCEEDED,
                             message: "registered wait capacity is exhausted",
-                        });
-                    }
-                    let scene = shared.scene.clone();
-                    let session = session.clone();
-                    let object_id = record.object_id;
-                    thread::spawn(move || {
-                        let deadline = Instant::now()
-                            .checked_add(Duration::from_micros(timeout_us))
-                            .unwrap_or_else(Instant::now);
-                        loop {
-                            if lock(&session.cancelled_waits).remove(&request_id) {
-                                let body = protocol_error(
-                                    request_id,
-                                    messages::ERROR_CANCELLED,
-                                    false,
-                                    "track wait was cancelled",
-                                );
-                                if let Ok(body) = body {
-                                    let _ = session.writer.write_record(
-                                        messages::ERROR,
-                                        object_id,
-                                        &body,
-                                    );
-                                }
-                                break;
-                            }
-                            match scene.evaluate_track_wait(
-                                identity,
-                                generation,
-                                condition,
-                                condition_value,
-                            ) {
-                                TrackWaitEvaluation::Satisfied(satisfied) => {
-                                    if let Ok(body) = Envelope::new(
-                                        request_id,
-                                        wait_satisfied_payload(identity, condition, satisfied),
-                                    )
-                                    .encode()
-                                    {
-                                        let _ = session.writer.write_record(
-                                            messages::WAIT_SATISFIED,
-                                            object_id,
-                                            &body,
-                                        );
-                                    }
-                                    break;
-                                },
-                                TrackWaitEvaluation::NotFound => {
-                                    let body = protocol_error(
-                                        request_id,
-                                        messages::ERROR_NOT_FOUND,
-                                        false,
-                                        "track was destroyed while waiting",
-                                    );
-                                    if let Ok(body) = body {
-                                        let _ = session.writer.write_record(
-                                            messages::ERROR,
-                                            object_id,
-                                            &body,
-                                        );
-                                    }
-                                    break;
-                                },
-                                TrackWaitEvaluation::Lost => {
-                                    let body = protocol_error(
-                                        request_id,
-                                        messages::ERROR_BAD_STATE,
-                                        false,
-                                        "track was lost while waiting",
-                                    );
-                                    if let Ok(body) = body {
-                                        let _ = session.writer.write_record(
-                                            messages::ERROR,
-                                            object_id,
-                                            &body,
-                                        );
-                                    }
-                                    break;
-                                },
-                                TrackWaitEvaluation::StaleGeneration => {
-                                    let body = protocol_error(
-                                        request_id,
-                                        messages::ERROR_STALE_CHANNEL_GENERATION,
-                                        false,
-                                        "channel generation advanced while waiting",
-                                    );
-                                    if let Ok(body) = body {
-                                        let _ = session.writer.write_record(
-                                            messages::ERROR,
-                                            object_id,
-                                            &body,
-                                        );
-                                    }
-                                    break;
-                                },
-                                TrackWaitEvaluation::NotVisible => {
-                                    let body = protocol_error(
-                                        request_id,
-                                        messages::ERROR_NOT_VISIBLE,
-                                        false,
-                                        "track has no eligible visible placement",
-                                    );
-                                    if let Ok(body) = body {
-                                        let _ = session.writer.write_record(
-                                            messages::ERROR,
-                                            object_id,
-                                            &body,
-                                        );
-                                    }
-                                    break;
-                                },
-                                TrackWaitEvaluation::Pending if Instant::now() < deadline => {
-                                    thread::sleep(Duration::from_millis(2));
-                                },
-                                TrackWaitEvaluation::Pending => {
-                                    let body = protocol_error(
-                                        request_id,
-                                        messages::ERROR_TIMEOUT,
-                                        false,
-                                        "track wait timed out",
-                                    );
-                                    if let Ok(body) = body {
-                                        let _ = session.writer.write_record(
-                                            messages::ERROR,
-                                            object_id,
-                                            &body,
-                                        );
-                                    }
-                                    break;
-                                },
-                            }
-                        }
-                        session.pending_waits.fetch_sub(1, Ordering::AcqRel);
-                    });
+                        },
+                        AdmissionError::Requests => ControlError {
+                            code: messages::ERROR_LIMIT_EXCEEDED,
+                            message: "pending request capacity is exhausted",
+                        },
+                    })?;
                     return Ok(None);
                 },
             }
@@ -1484,10 +1458,10 @@ fn dispatch_control(
         messages::CANCEL_WAIT => {
             let map = StrictMap::new("CANCEL_WAIT", &value, &[0])
                 .map_err(|_| ControlError::bad_message("invalid CANCEL_WAIT schema"))?;
-            let cancelled = map
+            let target = map
                 .required_u64(0)
                 .map_err(|_| ControlError::bad_message("CANCEL_WAIT request ID"))?;
-            lock(&session.cancelled_waits).insert(cancelled);
+            cancelled.insert(target);
             (messages::OK, record.object_id, Ok(messages::ok(request_id)))
         },
         messages::PLAY | messages::PAUSE | messages::FLUSH | messages::DRAIN => {
@@ -1558,30 +1532,18 @@ fn dispatch_control(
                 messages::DRAIN => {
                     if let Some(output) = output {
                         output.signal_eos();
-                        let writer = session.writer.clone();
-                        let object_id = record.object_id;
-                        let scene = shared.scene.clone();
-                        let generation = status.state.channel_generation;
-                        thread::spawn(move || {
-                            let result = output.wait_drained();
-                            if result.is_ok() {
-                                let _ = scene.mark_buffered_ended(identity, generation);
-                            }
-                            let succeeded = result.is_ok();
-                            let body = match result {
-                                Ok(()) => messages::ok(request_id),
-                                Err(error) => protocol_error(
-                                    request_id,
-                                    messages::ERROR_DEVICE_LOST,
-                                    false,
-                                    error.to_string(),
-                                )
-                                .unwrap_or_else(|_| messages::ok(request_id)),
-                            };
-                            let record_type =
-                                if succeeded { messages::OK } else { messages::ERROR };
-                            let _ = writer.write_record(record_type, object_id, &body);
-                        });
+                        pending
+                            .register(Pending::AudioDrain {
+                                request_id,
+                                object_id: record.object_id,
+                                identity,
+                                generation: status.state.channel_generation,
+                                output,
+                            })
+                            .map_err(|_| ControlError {
+                                code: messages::ERROR_LIMIT_EXCEEDED,
+                                message: "pending request capacity is exhausted",
+                            })?;
                         return Ok(None);
                     }
                     shared
@@ -2363,6 +2325,17 @@ fn scene_status_payload(status: &SceneStatus) -> Vec<(u64, Value)> {
     ]
 }
 
+pub(crate) fn wait_satisfied_body(
+    request_id: u64,
+    identity: TrackIdentity,
+    condition: u64,
+    satisfied: TrackWaitSatisfied,
+) -> Vec<u8> {
+    Envelope::new(request_id, wait_satisfied_payload(identity, condition, satisfied))
+        .encode()
+        .unwrap_or_else(|_| messages::ok(request_id))
+}
+
 fn wait_satisfied_payload(
     identity: TrackIdentity,
     condition: u64,
@@ -2525,7 +2498,7 @@ fn send_fatal(writer: &Writer, request_id: u64, code: u64, diagnostic: &str) -> 
     io::Error::new(ErrorKind::InvalidData, diagnostic.to_owned())
 }
 
-fn protocol_error(
+pub(crate) fn protocol_error(
     request_id: u64,
     code: u64,
     fatal: bool,
@@ -2764,8 +2737,8 @@ mod tests {
     use vivid_protocol::messages::LaneClass;
     use vivid_protocol::track::{KindConfiguration, TrackConfiguration, TrackMode};
     use vivid_sdk::{
-        CoordinateModel, MILESTONE_OUTPUT_READY, ProducerAuthentication, ProducerConfig,
-        RasterConfiguration, RequestMetadata, SceneNode, SessionEvent, SlotBinding,
+        CoordinateModel, MILESTONE_OUTPUT_READY, MILESTONE_PRESENTED, ProducerAuthentication,
+        ProducerConfig, RasterConfiguration, RequestMetadata, SceneNode, SessionEvent, SlotBinding,
         SurfaceDefinition, SurfaceDescriptor, SurfaceRole, TrackWaitCondition,
     };
 
@@ -3164,5 +3137,101 @@ mod tests {
             1,
             "clean GOODBYE must preserve an anchored, policy-permitted terminal poster"
         );
+    }
+
+    #[test]
+    fn an_outstanding_wait_does_not_block_the_control_reader() {
+        // Core §5.1: a long operation becomes bounded pending state and must not stall the
+        // parser. Registering a wait that cannot be satisfied used to be harmless only because
+        // it spawned a thread; the actor now holds it, so prove the session still answers.
+        let service = VividService::start_with_wake(test_geometry(), Arc::new(|| {})).unwrap();
+        let mut session = connect(&service);
+        let context_id = session.info().root_context_id;
+        let surface = session
+            .create_surface(
+                SurfaceDefinition {
+                    context_id,
+                    surface_id: 11,
+                    semantic_profile: registry::TERMINAL_CONTENT.into(),
+                    coordinate_model: CoordinateModel::TerminalContentCells,
+                    logical_width: 2,
+                    logical_height: 2,
+                    scale_numerator: 1,
+                    scale_denominator: 1,
+                    rotation: 0,
+                    descriptor: SurfaceDescriptor {
+                        role: SurfaceRole::Figure,
+                        title: "pending wait".into(),
+                        semantic_content_revision: 1,
+                        semantic_availability: 0,
+                        locator_hint: String::new(),
+                    },
+                    policy: 0,
+                    profile_parameters: vec![],
+                },
+                &RequestMetadata::default(),
+            )
+            .unwrap();
+        let track = session
+            .create_track(
+                TrackConfiguration {
+                    context_id,
+                    surface_id: surface.id(),
+                    track_id: 12,
+                    slot: scene::SLOT_RASTER,
+                    mode: TrackMode::Live,
+                    lane: LaneClass::Bulk,
+                    maximum_record_body: 88,
+                    maximum_rate_millihertz: 60_000,
+                    maximum_encoded_bits_per_second: 1_000_000,
+                    maximum_records_per_second: 60,
+                    maximum_inflight_body_bytes: 4096,
+                    kind: KindConfiguration::Raster(RasterConfiguration {
+                        width: 2,
+                        height: 2,
+                        alpha_mode: scene::ALPHA_STRAIGHT,
+                        delta_enabled: false,
+                        maximum_delta_operations: 1,
+                        zstd_enabled: false,
+                    }),
+                    target_latency_us: 0,
+                    maximum_latency_us: 1_000_000,
+                    retained_pixel_charge: 0,
+                },
+                &RequestMetadata::default(),
+            )
+            .unwrap();
+
+        // Nothing has ever been presented, so this milestone cannot be reached and the wait sits
+        // in the actor's pending set until it times out.
+        let session = Arc::new(session);
+        let waiter = {
+            let session = session.clone();
+            let track = track.clone();
+            thread::spawn(move || {
+                session.wait_track(
+                    &track,
+                    TrackWaitCondition::MilestoneSet,
+                    Some(MILESTONE_PRESENTED),
+                    2_000_000,
+                )
+            })
+        };
+
+        // Give the wait time to reach the presenter, then keep asking unrelated questions.
+        thread::sleep(Duration::from_millis(50));
+        let started = Instant::now();
+        for _ in 0..20 {
+            session.query_surface(&surface).unwrap();
+        }
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "20 queries took {elapsed:?} while a wait was outstanding"
+        );
+
+        // The wait still resolves on its own deadline rather than being starved.
+        let outcome = waiter.join().unwrap();
+        assert!(outcome.is_err(), "an unreachable milestone must time out");
     }
 }
