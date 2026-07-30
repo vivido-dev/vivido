@@ -20,7 +20,6 @@ const AVERROR_EOF: c_int = -541_478_725;
 const PACKET_TIME_BASE: AVRational = AVRational { num: 1, den: 1_000_000 };
 const RING_BUFFER_SECONDS: usize = 2;
 const PREBUFFER_MILLISECONDS: u64 = 100;
-const POLL_INTERVAL: Duration = Duration::from_millis(2);
 const LINKED_AUDIO_STALL_FALLBACK: Duration = Duration::from_secs(2);
 const UNSET_PTS: i64 = i64::MIN;
 
@@ -458,21 +457,23 @@ impl AudioOutput {
         self.shared.eos_observed.store(true, Ordering::SeqCst);
     }
 
-    pub fn wait_drained(&self) -> io::Result<()> {
-        while !self.shared.eos_observed.load(Ordering::SeqCst)
-            || !self.shared.decode_done.load(Ordering::SeqCst)
-            || self.shared.played_samples.load(Ordering::SeqCst)
-                < self.shared.queued_samples.load(Ordering::SeqCst)
-        {
-            if self.shared.stopped.load(Ordering::SeqCst) {
-                return Err(io::Error::new(io::ErrorKind::BrokenPipe, "audio output stopped"));
-            }
-            if let Some(error) = self.shared.error() {
-                return Err(io::Error::new(io::ErrorKind::NotConnected, error));
-            }
-            thread::sleep(POLL_INTERVAL);
+    /// One non-blocking drain check.
+    ///
+    /// `None` means still draining. Media §15 makes `DRAIN` bounded pending state that must not
+    /// block control, so the session actor polls this instead of parking a thread on
+    /// [`Self::wait_drained`].
+    pub fn poll_drained(&self) -> Option<io::Result<()>> {
+        if self.shared.stopped.load(Ordering::SeqCst) {
+            return Some(Err(io::Error::new(io::ErrorKind::BrokenPipe, "audio output stopped")));
         }
-        Ok(())
+        if let Some(error) = self.shared.error() {
+            return Some(Err(io::Error::new(io::ErrorKind::NotConnected, error)));
+        }
+        let drained = self.shared.eos_observed.load(Ordering::SeqCst)
+            && self.shared.decode_done.load(Ordering::SeqCst)
+            && self.shared.played_samples.load(Ordering::SeqCst)
+                >= self.shared.queued_samples.load(Ordering::SeqCst);
+        drained.then_some(Ok(()))
     }
 
     pub fn stop(&self) {

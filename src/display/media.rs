@@ -10,7 +10,7 @@ use vello::{Renderer, wgpu};
 use crate::terminal::graphics::{DeleteTarget, GraphicsCommand, GraphicsProtocol};
 
 use crate::display::SizeInfo;
-use crate::vivid::scene::{RenderItem, SharedScene, TrackKey};
+use crate::vivid::scene::{PresentationRejection, RenderItem, SharedScene, TrackKey};
 
 const MAX_NODES: usize = 256;
 
@@ -270,6 +270,9 @@ impl VividMediaRenderer {
             return None;
         };
         let (_, items) = scene.snapshot();
+        // The target owns what a placement unit means: cells for a terminal, logical pixels for a
+        // desktop. The renderer only needs the conversion.
+        let placement_scale = scene.target().placement_scale(size);
         if items.is_empty() {
             self.tracks.clear();
             self.capture_redactions.clear();
@@ -280,7 +283,8 @@ impl VividMediaRenderer {
         let rendered = items
             .iter()
             .filter_map(|item| {
-                vertices(item, size, display_offset).map(|vertices| (item, vertices))
+                vertices(item, size, display_offset, placement_scale)
+                    .map(|vertices| (item, vertices))
             })
             .collect::<Vec<_>>();
         self.capture_redactions = rendered
@@ -335,17 +339,24 @@ impl VividMediaRenderer {
         }
         queue.submit([encoder.finish()]);
         for (item, _) in &rendered {
-            if let Err(error) = scene.mark_presented(
+            match scene.mark_presented(
                 item.track_key,
                 item.channel_generation,
                 item.surface_generation,
                 item.frame.frame_id,
                 item.frame.pts_us,
             ) {
-                log::warn!(
+                Ok(()) => {},
+                // Every resize supersedes frames already in flight. Reporting that as a presenter
+                // problem puts a warning on screen for ordinary window movement.
+                Err(error @ PresentationRejection::Superseded(_)) => log::debug!(
+                    "Vivid presentation for track {:?} was superseded: {error}",
+                    item.track_key
+                ),
+                Err(error @ PresentationRejection::Failed(_)) => log::warn!(
                     "Could not record Vivid presentation for track {:?}: {error}",
                     item.track_key
-                );
+                ),
             }
         }
         renderer.mark_override_image_dirty(&target.image);
@@ -550,12 +561,18 @@ impl VividMediaRenderer {
     }
 }
 
-fn vertices(item: &RenderItem, size: &SizeInfo, display_offset: usize) -> Option<[Vertex; 6]> {
-    let x = size.padding_x() + fixed_to_f32(item.x) * size.cell_width();
+fn vertices(
+    item: &RenderItem,
+    size: &SizeInfo,
+    display_offset: usize,
+    scale: (f32, f32),
+) -> Option<[Vertex; 6]> {
+    let (scale_x, scale_y) = scale;
+    let x = size.padding_x() + fixed_to_f32(item.x) * scale_x;
     let scroll = if item.text_anchored { display_offset as f32 } else { 0.0 };
-    let y = size.padding_y() + (fixed_to_f32(item.y) + scroll) * size.cell_height();
-    let output_width = fixed_to_f32(item.width) * size.cell_width();
-    let output_height = fixed_to_f32(item.height) * size.cell_height();
+    let y = size.padding_y() + (fixed_to_f32(item.y) + scroll) * scale_y;
+    let output_width = fixed_to_f32(item.width) * scale_x;
+    let output_height = fixed_to_f32(item.height) * scale_y;
     let display_width =
         item.frame.width as f32 * item.frame.sar_num as f32 / item.frame.sar_den.max(1) as f32;
     let scale =
@@ -572,13 +589,13 @@ fn vertices(item: &RenderItem, size: &SizeInfo, display_offset: usize) -> Option
 
     let (clip_left, clip_top, clip_right, clip_bottom) =
         item.clip.map_or((0.0, 0.0, size.width(), size.height()), |clip| {
-            let left = size.padding_x() + fixed_to_f32(clip.x) * size.cell_width();
-            let top = size.padding_y() + (fixed_to_f32(clip.y) + scroll) * size.cell_height();
+            let left = size.padding_x() + fixed_to_f32(clip.x) * scale_x;
+            let top = size.padding_y() + (fixed_to_f32(clip.y) + scroll) * scale_y;
             (
                 left.max(0.0),
                 top.max(0.0),
-                (left + fixed_to_f32(clip.width) * size.cell_width()).min(size.width()),
-                (top + fixed_to_f32(clip.height) * size.cell_height()).min(size.height()),
+                (left + fixed_to_f32(clip.width) * scale_x).min(size.width()),
+                (top + fixed_to_f32(clip.height) * scale_y).min(size.height()),
             )
         });
     let pixel_left = quad_left.max(clip_left).max(0.0);
@@ -698,7 +715,8 @@ mod tests {
             capture_policy: 0,
         };
         let size = SizeInfo::new(4.0, 2.0, 1.0, 1.0, 0.0, 0.0, false);
-        let clipped = super::vertices(&item, &size, 0).unwrap();
+        let clipped =
+            super::vertices(&item, &size, 0, (size.cell_width(), size.cell_height())).unwrap();
         assert_eq!(clipped[0].position, [-0.5, 1.0]);
         assert_eq!(clipped[5].position, [0.5, -1.0]);
         assert_eq!(clipped[0].tex_coord, [0.25, 0.0]);
@@ -713,7 +731,9 @@ mod tests {
             }),
             ..item
         };
-        assert!(super::vertices(&hidden, &size, 0).is_none());
+        assert!(
+            super::vertices(&hidden, &size, 0, (size.cell_width(), size.cell_height())).is_none()
+        );
     }
 
     #[cfg(unix)]

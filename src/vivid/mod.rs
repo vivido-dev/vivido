@@ -1,8 +1,10 @@
 //! Per-window Vivid Protocol 1.5 presenter.
 
+mod actor;
 mod audio;
 mod decoder;
 pub mod scene;
+pub mod target;
 mod transport;
 
 use std::collections::{HashMap, HashSet};
@@ -16,6 +18,7 @@ use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -26,7 +29,7 @@ use vivid_protocol::anchor::{self, AnchorKey};
 use vivid_protocol::auth::{self, Secret32};
 use vivid_protocol::cbor::Value;
 use vivid_protocol::context::{
-    ContextDefinition, ContextState, OP_KNOWN_MASK, OP_SURFACE_TRACK_MEDIA, OP_TERMINAL_ANCHOR,
+    ContextDefinition, ContextState, OP_SURFACE_TRACK_MEDIA, OP_TERMINAL_ANCHOR,
 };
 use vivid_protocol::identity::{
     AnchorIdentity, ContextIdentity, PresenterInstanceId, SessionIdentity, SurfaceIdentity,
@@ -34,8 +37,8 @@ use vivid_protocol::identity::{
 };
 use vivid_protocol::media;
 use vivid_protocol::messages::{
-    self, ChannelOpen, Envelope, ErrorDetail, ErrorReply, Hello, HelloAuthentication, PayloadMap,
-    StrictMap, Welcome, WelcomeAuthentication,
+    self, ChannelOpen, Envelope, ErrorDetail, ErrorReply, Hello, HelloAuthentication, StrictMap,
+    Welcome, WelcomeAuthentication,
 };
 use vivid_protocol::registry;
 use vivid_protocol::resource::{Resource, ResourceContract, TokenBucket};
@@ -49,18 +52,20 @@ use vivid_protocol::track::{
 };
 use vivid_protocol::wire::{ConnectionKind, RECORD_OPTIONAL, Record};
 
+use crate::display::SizeInfo;
 use crate::event::{EventProxy, EventType};
 use crate::terminal::event::EventListener;
 use crate::terminal::grid::Dimensions;
 use crate::terminal::index::{Column, Line, Point};
 use crate::terminal::term::{ResizePoint, Term};
+use crate::vivid::actor::{AdmissionError, Egress, Pending, PendingSet};
 use crate::vivid::audio::{AudioOutput, supports as supports_audio};
 use crate::vivid::decoder::Decoder;
 use crate::vivid::scene::{
-    Frame, SceneStatus, SharedScene, SurfaceStatus, TrackStatus, TrackWaitEvaluation,
-    TrackWaitSatisfied,
+    CommitRejection, Frame, SceneStatus, SharedScene, SurfaceStatus, TrackStatus,
+    TrackWaitEvaluation, TrackWaitSatisfied,
 };
-use crate::vivid::transport::{Reader, Writer};
+use crate::vivid::transport::{ReadShutdown, Reader, Writer};
 
 #[cfg(windows)]
 type LocalListener = TcpListener;
@@ -80,36 +85,39 @@ const CHANNEL_FLOW_RECORDS: u64 = 128;
 const CHANNEL_OPEN_DEADLINE_US: u64 = 30_000_000;
 const MAX_SCENE_NODES: usize = 256;
 
-#[derive(Debug, Clone, Copy)]
-pub struct DisplayMetrics {
+/// Geometry of the `terminal-surface-v1` presentation target.
+///
+/// The target generation is owned by the service and assigned when a geometry is accepted, so it
+/// is deliberately not part of this type: a caller cannot supply, reuse, or skip a generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DisplayGeometry {
     pub viewport_width: u32,
     pub viewport_height: u32,
     pub columns: u32,
     pub rows: u32,
     pub cell_width: u32,
     pub cell_height: u32,
-    pub generation: u64,
+}
+
+impl From<SizeInfo> for DisplayGeometry {
+    fn from(size: SizeInfo) -> Self {
+        Self {
+            viewport_width: size.width() as u32,
+            viewport_height: size.height() as u32,
+            columns: size.columns() as u32,
+            rows: size.screen_lines() as u32,
+            cell_width: size.cell_width().round() as u32,
+            cell_height: size.cell_height().round() as u32,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
-struct PendingTargetChange {
-    metrics: DisplayMetrics,
-    last_unsettled_generation: Option<u64>,
-}
-
-impl PendingTargetChange {
-    fn payload(&mut self, settled: bool) -> Option<PayloadMap> {
-        if !settled && self.last_unsettled_generation == Some(self.metrics.generation) {
-            return None;
-        }
-        if !settled {
-            self.last_unsettled_generation = Some(self.metrics.generation);
-        }
-        let mut payload = target_descriptor(self.metrics, settled);
-        payload.push((9, Value::Unsigned(self.metrics.generation)));
-        payload.push((10, Value::Unsigned(0x1f)));
-        Some(payload)
-    }
+struct DisplayMetrics {
+    geometry: DisplayGeometry,
+    generation: u64,
+    /// Whether this generation has been announced as final rather than mid-resize.
+    settled: bool,
 }
 
 struct SessionRuntime {
@@ -121,8 +129,6 @@ struct SessionRuntime {
     writer: Arc<Writer>,
     contexts: Mutex<HashMap<u64, ContextState>>,
     seen_anchors: Mutex<HashSet<(u64, u64)>>,
-    pending_waits: AtomicUsize,
-    cancelled_waits: Mutex<HashSet<u64>>,
 }
 
 #[derive(Default)]
@@ -137,7 +143,7 @@ struct ServiceShared {
     scene: SharedScene,
     registry: Mutex<Registry>,
     metrics: Mutex<DisplayMetrics>,
-    pending_metrics: Mutex<Option<PendingTargetChange>>,
+    pending_metrics: Mutex<Option<DisplayMetrics>>,
     audio_outputs: Mutex<HashMap<TrackIdentity, Arc<AudioOutput>>>,
     next_session: AtomicU64,
     active_connections: AtomicUsize,
@@ -155,18 +161,19 @@ pub struct VividService {
 }
 
 impl VividService {
-    pub fn start(metrics: DisplayMetrics, event_proxy: EventProxy) -> io::Result<Self> {
+    pub fn start(geometry: DisplayGeometry, event_proxy: EventProxy) -> io::Result<Self> {
         Self::start_with_wake(
-            metrics,
+            geometry,
             Arc::new(move || event_proxy.send_event(EventType::VividFrame)),
         )
     }
 
     fn start_with_wake(
-        metrics: DisplayMetrics,
+        geometry: DisplayGeometry,
         wake: Arc<dyn Fn() + Send + Sync>,
     ) -> io::Result<Self> {
-        validate_metrics(metrics)?;
+        validate_geometry(geometry)?;
+        let metrics = DisplayMetrics { geometry, generation: 1, settled: true };
         let (listener, control_endpoint, directory) = bind_local_listener()?;
         let mut secret = [0_u8; 32];
         getrandom::fill(&mut secret).map_err(|error| {
@@ -219,49 +226,49 @@ impl VividService {
         self.scene.clone()
     }
 
-    pub fn update_metrics(&self, mut metrics: DisplayMetrics) -> Option<u64> {
-        // Callers report geometry, while the service owns the target-generation sequence.  The
-        // production window path deliberately supplies generation zero as an unassigned sentinel.
-        if validate_metric_geometry(metrics).is_err() {
+    /// Accept a new terminal geometry, returning the target generation assigned to it.
+    ///
+    /// Every later `WELCOME` reports the accepted geometry, and the change is queued for the next
+    /// `flush_display_change` so live sessions observe it as `TARGET_CHANGED`.
+    pub fn update_metrics(&self, geometry: DisplayGeometry) -> Option<u64> {
+        if validate_geometry(geometry).is_err() {
             return None;
         }
         let mut current = lock(&self.shared.metrics);
-        if current.viewport_width == metrics.viewport_width
-            && current.viewport_height == metrics.viewport_height
-            && current.columns == metrics.columns
-            && current.rows == metrics.rows
-            && current.cell_width == metrics.cell_width
-            && current.cell_height == metrics.cell_height
-        {
+        if current.geometry == geometry {
             return None;
         }
-        metrics.generation = current.generation.checked_add(1)?;
-        self.shared
-            .scene
-            .update_target_generation(TargetGeneration::new(metrics.generation))
-            .ok()?;
-        *current = metrics;
-        *lock(&self.shared.pending_metrics) =
-            Some(PendingTargetChange { metrics, last_unsettled_generation: None });
-        Some(metrics.generation)
+        let generation = current.generation.checked_add(1)?;
+        *current = DisplayMetrics { geometry, generation, settled: false };
+        *lock(&self.shared.pending_metrics) = Some(*current);
+        Some(generation)
     }
 
+    /// Announce a queued display change, or re-announce the current one as settled.
+    ///
+    /// A resize is announced unsettled on the frame that applies it, and the settle timer only
+    /// fires afterwards. The settled announcement therefore has to be rebuilt from the current
+    /// metrics, because the queued change was already consumed by that earlier frame.
     pub fn flush_display_change(&self, settled_generation: Option<u64>) {
-        let payload = {
-            let mut pending = lock(&self.shared.pending_metrics);
-            let settled = pending
-                .as_ref()
-                .is_some_and(|change| settled_generation == Some(change.metrics.generation));
-            let payload = pending.as_mut().and_then(|change| change.payload(settled));
-            if settled {
-                *pending = None;
-            }
-            payload
+        // Taken in the same order as `update_metrics` acquires them.
+        let mut current = lock(&self.shared.metrics);
+        let pending = lock(&self.shared.pending_metrics).take();
+        let metrics = match pending {
+            Some(metrics) => metrics,
+            None if settled_generation == Some(current.generation) => *current,
+            None => return,
         };
-        let Some(payload) = payload else {
-            return;
-        };
-        let body = Envelope::new(0, payload).encode().expect("target-change payload is valid");
+        let settled = settled_generation == Some(metrics.generation);
+        if settled && current.generation == metrics.generation {
+            current.settled = true;
+        }
+        drop(current);
+
+        // The scene validates every commit against the generation it was planned for, so it has
+        // to reach the new target before any producer can name it.
+        self.scene.advance_target_generation(TargetGeneration::new(metrics.generation));
+
+        let body = target_change_body(DisplayMetrics { settled, ..metrics });
         let writers = lock(&self.shared.registry)
             .sessions
             .values()
@@ -303,6 +310,9 @@ impl VividService {
     }
 
     pub fn handle_terminal_marker(&self, marker: &str, line: i32, column: usize, alternate: bool) {
+        if !self.scene.target().accepts_anchors() {
+            return;
+        }
         let Ok(marker) = anchor::parse_marker(marker) else {
             return;
         };
@@ -507,38 +517,130 @@ fn handle_control(
     let session = establish_root_session(shared, writer.clone(), preface, &hello, hello_request)?;
     reader.set_maximum(hello.maximum_control_body)?;
     writer.set_maximum(hello.maximum_control_body)?;
-    let mut clean_goodbye = false;
+
+    // A session is a reader, an actor, and an egress. This thread is the reader: it parses and
+    // enqueues, and never writes, so a peer that stops draining its replies cannot stall parsing.
+    let egress = Egress::start(writer);
+    let (records, incoming) = mpsc::sync_channel::<Record>(actor::INGRESS_CAPACITY);
+    let clean_goodbye = Arc::new(AtomicBool::new(false));
+    let shutdown = reader.shutdown_handle()?;
+    let actor = {
+        let shared = shared.clone();
+        let session = session.clone();
+        let egress = egress.clone();
+        let clean_goodbye = clean_goodbye.clone();
+        thread::Builder::new()
+            .name("vivid-control-actor".into())
+            .spawn(move || actor_loop(shared, session, incoming, egress, clean_goodbye, shutdown))?
+    };
+
     loop {
         let record = match reader.read_record(ConnectionKind::Control) {
             Ok(record) => record,
             Err(error) if error.kind() == ErrorKind::UnexpectedEof => break,
-            Err(error) => return Err(error),
-        };
-        match dispatch_control(shared, &session, &record) {
-            Ok(Some((record_type, object_id, body))) => {
-                writer.write_record(record_type, object_id, &body)?;
-            },
-            Ok(None) => {},
             Err(error) => {
-                let request_id = messages::decode_control(&record.body)
-                    .map(|envelope| envelope.request_id)
-                    .unwrap_or(0);
-                let fatal = request_id == 0;
-                writer.write_record(
-                    messages::ERROR,
-                    record.object_id,
-                    &protocol_error(request_id, error.code, fatal, error.message)?,
-                )?;
-                if fatal {
-                    break;
-                }
+                drop(records);
+                let _ = actor.join();
+                egress.close();
+                egress.join();
+                finish_session(shared, &session, false);
+                return Err(error);
             },
-        }
-        if record.record_type == messages::GOODBYE {
-            clean_goodbye = true;
+        };
+        if records.send(record).is_err() {
             break;
         }
     }
+    drop(records);
+    let _ = actor.join();
+    egress.close();
+    egress.join();
+    if egress.overflowed() {
+        log::debug!(
+            "Vivid session {} closed: the producer stopped draining its control replies",
+            session.identity.session_id
+        );
+    }
+    let clean_goodbye = clean_goodbye.load(Ordering::Acquire);
+    finish_session(shared, &session, clean_goodbye);
+    Ok(())
+}
+
+/// The session actor: owns mutable session state, applies mutations in receive order, and services
+/// outstanding operations on a tick so a long one never blocks the next record.
+fn actor_loop(
+    shared: Arc<ServiceShared>,
+    session: Arc<SessionRuntime>,
+    incoming: mpsc::Receiver<Record>,
+    egress: Arc<Egress>,
+    clean_goodbye: Arc<AtomicBool>,
+    shutdown: ReadShutdown,
+) {
+    let contract = presenter_contract();
+    let mut pending = PendingSet::new(
+        contract.get(Resource::RegisteredWaits),
+        contract.get(Resource::PendingRequests),
+    );
+    let mut cancelled = HashSet::new();
+    loop {
+        match incoming.recv_timeout(actor::TICK) {
+            Ok(record) => {
+                if !dispatch_and_reply(
+                    &shared,
+                    &session,
+                    &record,
+                    &egress,
+                    &mut pending,
+                    &mut cancelled,
+                ) {
+                    break;
+                }
+                if record.record_type == messages::GOODBYE {
+                    clean_goodbye.store(true, Ordering::Release);
+                    break;
+                }
+            },
+            Err(mpsc::RecvTimeoutError::Timeout) => {},
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+        if !pending.is_empty() {
+            pending.service(&shared.scene, &egress, &mut cancelled, Instant::now());
+        }
+    }
+    egress.close();
+    // Release the reader, which is parked on a peer that has no obligation to close promptly.
+    shutdown.stop();
+}
+
+/// Dispatch one record and deliver whatever it produced. Returns false when the session must end.
+fn dispatch_and_reply(
+    shared: &Arc<ServiceShared>,
+    session: &Arc<SessionRuntime>,
+    record: &Record,
+    egress: &Egress,
+    pending: &mut PendingSet,
+    cancelled: &mut HashSet<u64>,
+) -> bool {
+    match dispatch_control(shared, session, record, pending, cancelled) {
+        Ok(Some(reply)) => actor::deliver(egress, reply).is_ok(),
+        Ok(None) => true,
+        Err(error) => {
+            let request_id = messages::decode_control(&record.body)
+                .map(|envelope| envelope.request_id)
+                .unwrap_or(0);
+            let fatal = request_id == 0;
+            let Ok(body) = protocol_error(request_id, error.code, fatal, error.message) else {
+                return false;
+            };
+            if !egress.send(messages::ERROR, record.object_id, body) {
+                return false;
+            }
+            !fatal
+        },
+    }
+}
+
+fn finish_session(shared: &Arc<ServiceShared>, session: &Arc<SessionRuntime>, clean: bool) {
     lock(&shared.registry).sessions.remove(&session.identity.session_id);
     let removed_audio = {
         let mut outputs = lock(&shared.audio_outputs);
@@ -552,13 +654,12 @@ fn handle_control(
     for output in removed_audio {
         output.stop();
     }
-    if clean_goodbye {
+    if clean {
         shared.scene.detach_session(session.identity);
     } else {
         shared.scene.remove_session(session.identity);
     }
     (shared.wake)();
-    Ok(())
 }
 
 fn establish_root_session(
@@ -601,27 +702,22 @@ fn establish_root_session(
         )?;
         return Err(io::Error::new(ErrorKind::PermissionDenied, "root authentication failed"));
     }
-    if hello.target_profile != registry::TERMINAL_SURFACE {
+    let target = shared.scene.target().clone();
+    if hello.target_profile != target.profile_name() {
         return Err(send_fatal(
             &writer,
             request_id,
             messages::ERROR_UNSUPPORTED_PROFILE,
-            "Vivido is a terminal-surface-v1 target",
+            "this window presents a different target profile",
         ));
     }
-    let supported = [
-        registry::CORE_CONTROL,
-        registry::LIVE_MEDIA,
-        registry::OBSERVABILITY,
-        registry::TERMINAL_SURFACE,
-        registry::TIMED_MEDIA,
-    ];
+    let supported = target.supported_profiles();
     if hello.required_profiles.iter().any(|profile| !supported.contains(&profile.as_str())) {
         return Err(send_fatal(
             &writer,
             request_id,
             messages::ERROR_UNSUPPORTED_PROFILE,
-            "a required profile is not implemented by the terminal target",
+            "a required profile is not implemented by this target",
         ));
     }
     let mut accepted = hello.required_profiles.clone();
@@ -668,8 +764,8 @@ fn establish_root_session(
         session_tag,
         root_context_id: root_context.context_id,
         target_generation: metrics.generation,
-        target_profile: registry::TERMINAL_SURFACE.into(),
-        target_descriptor: target_descriptor(metrics, true),
+        target_profile: target.profile_name().into(),
+        target_descriptor: target_descriptor(metrics.geometry, metrics.settled),
         accepted_profiles: accepted,
         maximum_control_body: hello
             .maximum_control_body
@@ -702,14 +798,12 @@ fn establish_root_session(
             ContextState::root(
                 identity,
                 root_context.context_id,
-                OP_KNOWN_MASK & !vivid_protocol::context::OP_DESKTOP_INPUT,
+                target.root_operation_classes(),
                 presenter_contract(),
             )
             .map_err(io::Error::other)?,
         )])),
         seen_anchors: Mutex::new(HashSet::new()),
-        pending_waits: AtomicUsize::new(0),
-        cancelled_waits: Mutex::new(HashSet::new()),
     });
     shared
         .scene
@@ -723,6 +817,8 @@ fn dispatch_control(
     shared: &Arc<ServiceShared>,
     session: &Arc<SessionRuntime>,
     record: &Record,
+    pending: &mut PendingSet,
+    cancelled: &mut HashSet<u64>,
 ) -> Result<Option<(u16, u64, Vec<u8>)>, ControlError> {
     if record.flags & !RECORD_OPTIONAL != 0 {
         return Err(ControlError::bad_message("unknown record flags"));
@@ -1200,10 +1296,33 @@ fn dispatch_control(
                 .find(|entry| entry.0 == 0)
                 .and_then(|entry| entry.1.as_u64())
                 .map(SceneRevision::new);
-            let revision = shared
-                .scene
-                .commit_transaction(context, transaction, expected_target, expected_scene)
-                .map_err(ControlError::state)?;
+            let revision = match shared.scene.commit_transaction(
+                context,
+                transaction,
+                expected_target,
+                expected_scene,
+            ) {
+                Ok(revision) => revision,
+                Err(CommitRejection::StaleTarget) => {
+                    // The producer planned this commit against the target it last saw, so the
+                    // rejection has to say what the target is now. The announcement precedes the
+                    // error on this ordered connection, which is what lets the producer re-plan
+                    // and commit again instead of failing.
+                    let metrics = *lock(&shared.metrics);
+                    if let Err(error) = session.writer.write_record(
+                        messages::TARGET_CHANGED,
+                        0,
+                        &target_change_body(metrics),
+                    ) {
+                        log::debug!("could not re-announce the target for a stale commit: {error}");
+                    }
+                    return Err(ControlError::stale_target());
+                },
+                Err(CommitRejection::StaleRevision) => {
+                    return Err(ControlError::precondition("stale scene revision"));
+                },
+                Err(CommitRejection::Failed(message)) => return Err(ControlError::state(message)),
+            };
             (shared.wake)();
             (
                 messages::SCENE_PRESENTED,
@@ -1311,145 +1430,27 @@ fn dispatch_control(
                     });
                 },
                 TrackWaitEvaluation::Pending => {
-                    if session.pending_waits.fetch_add(1, Ordering::AcqRel) >= 64 {
-                        session.pending_waits.fetch_sub(1, Ordering::AcqRel);
-                        return Err(ControlError {
+                    let entry = Pending::TrackWait {
+                        request_id,
+                        object_id: record.object_id,
+                        identity,
+                        generation,
+                        condition,
+                        value: condition_value,
+                        deadline: Instant::now()
+                            .checked_add(Duration::from_micros(timeout_us))
+                            .unwrap_or_else(Instant::now),
+                    };
+                    pending.register(entry).map_err(|error| match error {
+                        AdmissionError::Waits => ControlError {
                             code: messages::ERROR_LIMIT_EXCEEDED,
                             message: "registered wait capacity is exhausted",
-                        });
-                    }
-                    let scene = shared.scene.clone();
-                    let session = session.clone();
-                    let object_id = record.object_id;
-                    thread::spawn(move || {
-                        let deadline = Instant::now()
-                            .checked_add(Duration::from_micros(timeout_us))
-                            .unwrap_or_else(Instant::now);
-                        loop {
-                            if lock(&session.cancelled_waits).remove(&request_id) {
-                                let body = protocol_error(
-                                    request_id,
-                                    messages::ERROR_CANCELLED,
-                                    false,
-                                    "track wait was cancelled",
-                                );
-                                if let Ok(body) = body {
-                                    let _ = session.writer.write_record(
-                                        messages::ERROR,
-                                        object_id,
-                                        &body,
-                                    );
-                                }
-                                break;
-                            }
-                            match scene.evaluate_track_wait(
-                                identity,
-                                generation,
-                                condition,
-                                condition_value,
-                            ) {
-                                TrackWaitEvaluation::Satisfied(satisfied) => {
-                                    if let Ok(body) = Envelope::new(
-                                        request_id,
-                                        wait_satisfied_payload(identity, condition, satisfied),
-                                    )
-                                    .encode()
-                                    {
-                                        let _ = session.writer.write_record(
-                                            messages::WAIT_SATISFIED,
-                                            object_id,
-                                            &body,
-                                        );
-                                    }
-                                    break;
-                                },
-                                TrackWaitEvaluation::NotFound => {
-                                    let body = protocol_error(
-                                        request_id,
-                                        messages::ERROR_NOT_FOUND,
-                                        false,
-                                        "track was destroyed while waiting",
-                                    );
-                                    if let Ok(body) = body {
-                                        let _ = session.writer.write_record(
-                                            messages::ERROR,
-                                            object_id,
-                                            &body,
-                                        );
-                                    }
-                                    break;
-                                },
-                                TrackWaitEvaluation::Lost => {
-                                    let body = protocol_error(
-                                        request_id,
-                                        messages::ERROR_BAD_STATE,
-                                        false,
-                                        "track was lost while waiting",
-                                    );
-                                    if let Ok(body) = body {
-                                        let _ = session.writer.write_record(
-                                            messages::ERROR,
-                                            object_id,
-                                            &body,
-                                        );
-                                    }
-                                    break;
-                                },
-                                TrackWaitEvaluation::StaleGeneration => {
-                                    let body = protocol_error(
-                                        request_id,
-                                        messages::ERROR_STALE_CHANNEL_GENERATION,
-                                        false,
-                                        "channel generation advanced while waiting",
-                                    );
-                                    if let Ok(body) = body {
-                                        let _ = session.writer.write_record(
-                                            messages::ERROR,
-                                            object_id,
-                                            &body,
-                                        );
-                                    }
-                                    break;
-                                },
-                                TrackWaitEvaluation::NotVisible => {
-                                    let body = protocol_error(
-                                        request_id,
-                                        messages::ERROR_NOT_VISIBLE,
-                                        false,
-                                        "track has no eligible visible placement",
-                                    );
-                                    if let Ok(body) = body {
-                                        let _ = session.writer.write_record(
-                                            messages::ERROR,
-                                            object_id,
-                                            &body,
-                                        );
-                                    }
-                                    break;
-                                },
-                                TrackWaitEvaluation::Pending if Instant::now() < deadline => {
-                                    thread::sleep(Duration::from_millis(2));
-                                },
-                                TrackWaitEvaluation::Pending => {
-                                    let body = protocol_error(
-                                        request_id,
-                                        messages::ERROR_TIMEOUT,
-                                        false,
-                                        "track wait timed out",
-                                    );
-                                    if let Ok(body) = body {
-                                        let _ = session.writer.write_record(
-                                            messages::ERROR,
-                                            object_id,
-                                            &body,
-                                        );
-                                    }
-                                    break;
-                                },
-                            }
-                        }
-                        session.pending_waits.fetch_sub(1, Ordering::AcqRel);
-                    });
+                        },
+                        AdmissionError::Requests => ControlError {
+                            code: messages::ERROR_LIMIT_EXCEEDED,
+                            message: "pending request capacity is exhausted",
+                        },
+                    })?;
                     return Ok(None);
                 },
             }
@@ -1457,10 +1458,10 @@ fn dispatch_control(
         messages::CANCEL_WAIT => {
             let map = StrictMap::new("CANCEL_WAIT", &value, &[0])
                 .map_err(|_| ControlError::bad_message("invalid CANCEL_WAIT schema"))?;
-            let cancelled = map
+            let target = map
                 .required_u64(0)
                 .map_err(|_| ControlError::bad_message("CANCEL_WAIT request ID"))?;
-            lock(&session.cancelled_waits).insert(cancelled);
+            cancelled.insert(target);
             (messages::OK, record.object_id, Ok(messages::ok(request_id)))
         },
         messages::PLAY | messages::PAUSE | messages::FLUSH | messages::DRAIN => {
@@ -1531,30 +1532,18 @@ fn dispatch_control(
                 messages::DRAIN => {
                     if let Some(output) = output {
                         output.signal_eos();
-                        let writer = session.writer.clone();
-                        let object_id = record.object_id;
-                        let scene = shared.scene.clone();
-                        let generation = status.state.channel_generation;
-                        thread::spawn(move || {
-                            let result = output.wait_drained();
-                            if result.is_ok() {
-                                let _ = scene.mark_buffered_ended(identity, generation);
-                            }
-                            let succeeded = result.is_ok();
-                            let body = match result {
-                                Ok(()) => messages::ok(request_id),
-                                Err(error) => protocol_error(
-                                    request_id,
-                                    messages::ERROR_DEVICE_LOST,
-                                    false,
-                                    error.to_string(),
-                                )
-                                .unwrap_or_else(|_| messages::ok(request_id)),
-                            };
-                            let record_type =
-                                if succeeded { messages::OK } else { messages::ERROR };
-                            let _ = writer.write_record(record_type, object_id, &body);
-                        });
+                        pending
+                            .register(Pending::AudioDrain {
+                                request_id,
+                                object_id: record.object_id,
+                                identity,
+                                generation: status.state.channel_generation,
+                                output,
+                            })
+                            .map_err(|_| ControlError {
+                                code: messages::ERROR_LIMIT_EXCEEDED,
+                                message: "pending request capacity is exhausted",
+                            })?;
                         return Ok(None);
                     }
                     shared
@@ -2336,6 +2325,17 @@ fn scene_status_payload(status: &SceneStatus) -> Vec<(u64, Value)> {
     ]
 }
 
+pub(crate) fn wait_satisfied_body(
+    request_id: u64,
+    identity: TrackIdentity,
+    condition: u64,
+    satisfied: TrackWaitSatisfied,
+) -> Vec<u8> {
+    Envelope::new(request_id, wait_satisfied_payload(identity, condition, satisfied))
+        .encode()
+        .unwrap_or_else(|_| messages::ok(request_id))
+}
+
 fn wait_satisfied_payload(
     identity: TrackIdentity,
     condition: u64,
@@ -2473,6 +2473,14 @@ impl ControlError {
         Self { code: messages::ERROR_NOT_FOUND, message }
     }
 
+    const fn precondition(message: &'static str) -> Self {
+        Self { code: messages::ERROR_PRECONDITION_FAILED, message }
+    }
+
+    const fn stale_target() -> Self {
+        Self { code: registry::error::STALE_TARGET_GENERATION, message: "stale target generation" }
+    }
+
     const fn unsupported(message: &'static str) -> Self {
         Self { code: messages::ERROR_UNSUPPORTED_CONFIG, message }
     }
@@ -2490,7 +2498,7 @@ fn send_fatal(writer: &Writer, request_id: u64, code: u64, diagnostic: &str) -> 
     io::Error::new(ErrorKind::InvalidData, diagnostic.to_owned())
 }
 
-fn protocol_error(
+pub(crate) fn protocol_error(
     request_id: u64,
     code: u64,
     fatal: bool,
@@ -2547,40 +2555,37 @@ fn presenter_contract() -> ResourceContract {
     contract
 }
 
-fn target_descriptor(metrics: DisplayMetrics, settled: bool) -> Vec<(u64, Value)> {
+fn target_descriptor(geometry: DisplayGeometry, settled: bool) -> Vec<(u64, Value)> {
     vec![
-        (0, Value::Unsigned(u64::from(metrics.viewport_width))),
-        (1, Value::Unsigned(u64::from(metrics.viewport_height))),
-        (2, Value::Unsigned(u64::from(metrics.columns))),
-        (3, Value::Unsigned(u64::from(metrics.rows))),
-        (4, Value::Unsigned(u64::from(metrics.cell_width))),
-        (5, Value::Unsigned(u64::from(metrics.cell_height))),
+        (0, Value::Unsigned(u64::from(geometry.viewport_width))),
+        (1, Value::Unsigned(u64::from(geometry.viewport_height))),
+        (2, Value::Unsigned(u64::from(geometry.columns))),
+        (3, Value::Unsigned(u64::from(geometry.rows))),
+        (4, Value::Unsigned(u64::from(geometry.cell_width))),
+        (5, Value::Unsigned(u64::from(geometry.cell_height))),
         (6, Value::Bool(settled)),
         (7, Value::Unsigned(3)),
         (8, Value::Unsigned(MAX_ACTIVE_ANCHORS as u64)),
     ]
 }
 
-fn validate_metrics(metrics: DisplayMetrics) -> io::Result<()> {
-    validate_metric_geometry(metrics)?;
-    if metrics.generation == 0 {
-        return Err(io::Error::new(
-            ErrorKind::InvalidInput,
-            "terminal target generation must be positive",
-        ));
-    }
-    Ok(())
+/// Encode one `TARGET_CHANGED` body for the given target, announcement or re-announcement alike.
+fn target_change_body(metrics: DisplayMetrics) -> Vec<u8> {
+    let mut payload = target_descriptor(metrics.geometry, metrics.settled);
+    payload.push((9, Value::Unsigned(metrics.generation)));
+    payload.push((10, Value::Unsigned(0x1f)));
+    Envelope::new(0, payload).encode().expect("target-change payload is valid")
 }
 
-fn validate_metric_geometry(metrics: DisplayMetrics) -> io::Result<()> {
-    if metrics.viewport_width == 0
-        || metrics.viewport_height == 0
-        || metrics.columns == 0
-        || metrics.rows == 0
-        || metrics.cell_width == 0
-        || metrics.cell_height == 0
+fn validate_geometry(geometry: DisplayGeometry) -> io::Result<()> {
+    if geometry.viewport_width == 0
+        || geometry.viewport_height == 0
+        || geometry.columns == 0
+        || geometry.rows == 0
+        || geometry.cell_width == 0
+        || geometry.cell_height == 0
     {
-        Err(io::Error::new(ErrorKind::InvalidInput, "terminal target dimensions must be positive"))
+        Err(io::Error::new(ErrorKind::InvalidInput, "terminal target geometry must be positive"))
     } else {
         Ok(())
     }
@@ -2732,10 +2737,51 @@ mod tests {
     use vivid_protocol::messages::LaneClass;
     use vivid_protocol::track::{KindConfiguration, TrackConfiguration, TrackMode};
     use vivid_sdk::{
-        CoordinateModel, Fit, MILESTONE_OUTPUT_READY, ProducerAuthentication, ProducerConfig,
-        RasterConfiguration, RequestMetadata, SceneNode, SessionEvent, SlotBinding,
+        CoordinateModel, Fit, MILESTONE_OUTPUT_READY, MILESTONE_PRESENTED, ProducerAuthentication,
+        ProducerConfig, RasterConfiguration, RequestMetadata, SceneNode, SessionEvent, SlotBinding,
         SurfaceDefinition, SurfaceDescriptor, SurfaceRole, TrackWaitCondition,
     };
+
+    fn test_geometry() -> DisplayGeometry {
+        DisplayGeometry {
+            viewport_width: 800,
+            viewport_height: 600,
+            columns: 80,
+            rows: 24,
+            cell_width: 10,
+            cell_height: 25,
+        }
+    }
+
+    fn connect(service: &VividService) -> vivid_sdk::Session {
+        vivid_sdk::Session::connect(ProducerConfig {
+            endpoint_control: Some(service.control_endpoint().to_owned()),
+            authentication: ProducerAuthentication::root_hex(service.root_secret()).unwrap(),
+            ..ProducerConfig::default()
+        })
+        .unwrap()
+    }
+
+    /// Read the columns, rows, and settled flag out of a terminal target descriptor.
+    fn descriptor_summary(descriptor: &[(u64, Value)]) -> (u64, u64, bool) {
+        (
+            descriptor[2].1.as_u64().unwrap(),
+            descriptor[3].1.as_u64().unwrap(),
+            descriptor[6].1.as_bool().unwrap(),
+        )
+    }
+
+    fn next_target_change(session: &vivid_sdk::Session) -> messages::PayloadMap {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            match session.take_event().unwrap() {
+                Some(SessionEvent::TargetChanged(payload)) => return payload,
+                Some(_) => continue,
+                None => thread::sleep(Duration::from_millis(1)),
+            }
+        }
+        panic!("presenter never sent TARGET_CHANGED");
+    }
 
     #[test]
     fn contract_is_finite_and_terminal_only() {
@@ -2754,66 +2800,186 @@ mod tests {
 
     #[test]
     fn target_descriptor_advertises_anchor_v3() {
-        let metrics = DisplayMetrics {
-            viewport_width: 800,
-            viewport_height: 600,
-            columns: 80,
-            rows: 24,
-            cell_width: 10,
-            cell_height: 25,
-            generation: 1,
+        assert_eq!(target_descriptor(test_geometry(), true)[7].1.as_u64(), Some(3));
+    }
+
+    /// A window resize has to reach producers. The startup geometry is only correct until the
+    /// first resize, so a producer started afterwards must be told the terminal's real size in
+    /// `WELCOME`, and a producer that is already running must see it as `TARGET_CHANGED`.
+    #[test]
+    fn a_display_change_reaches_live_and_later_sessions() {
+        let service = VividService::start_with_wake(test_geometry(), Arc::new(|| {})).unwrap();
+        let live = connect(&service);
+        assert_eq!(descriptor_summary(&live.info().target_descriptor), (80, 24, true));
+
+        let resized = DisplayGeometry {
+            viewport_width: 1550,
+            viewport_height: 1450,
+            columns: 155,
+            rows: 58,
+            ..test_geometry()
         };
-        assert_eq!(target_descriptor(metrics, true)[7].1.as_u64(), Some(3));
+        let generation = service.update_metrics(resized).expect("a resize is a new generation");
+        assert_eq!(generation, 2);
+
+        service.flush_display_change(None);
+        let announced = next_target_change(&live);
+        assert_eq!(descriptor_summary(&announced), (155, 58, false));
+        assert_eq!(announced[9].1.as_u64(), Some(generation));
+
+        // The settle timer fires after the unsettled announcement was already consumed.
+        service.flush_display_change(Some(generation));
+        let settled = next_target_change(&live);
+        assert_eq!(descriptor_summary(&settled), (155, 58, true));
+        assert_eq!(settled[9].1.as_u64(), Some(generation));
+
+        let later = connect(&service);
+        assert_eq!(descriptor_summary(&later.info().target_descriptor), (155, 58, true));
+        assert_eq!(later.info().target_generation.get(), generation);
+    }
+
+    fn grid_surface(session: &mut vivid_sdk::Session, surface_id: u64) -> vivid_sdk::Surface {
+        let context_id = session.info().root_context_id;
+        session
+            .create_surface(
+                SurfaceDefinition {
+                    context_id,
+                    surface_id,
+                    semantic_profile: registry::TERMINAL_CONTENT.into(),
+                    coordinate_model: CoordinateModel::TerminalContentCells,
+                    logical_width: 2,
+                    logical_height: 2,
+                    scale_numerator: 1,
+                    scale_denominator: 1,
+                    rotation: 0,
+                    descriptor: SurfaceDescriptor {
+                        role: SurfaceRole::Figure,
+                        title: "target follow".into(),
+                        semantic_content_revision: 1,
+                        semantic_availability: 0,
+                        locator_hint: String::new(),
+                    },
+                    policy: 0,
+                    profile_parameters: vec![],
+                },
+                &RequestMetadata::default(),
+            )
+            .unwrap()
+    }
+
+    fn grid_node(
+        context_id: u64,
+        node_id: u64,
+        surface: &vivid_sdk::Surface,
+        cols: u64,
+    ) -> SceneNode {
+        SceneNode {
+            owning_context_id: context_id,
+            node_id,
+            surface_context_id: surface.context_id(),
+            surface_id: surface.id(),
+            geometry: vec![
+                (0, Value::Unsigned(1)),
+                (1, Value::Unsigned(0)),
+                (2, Value::Unsigned(0)),
+                (3, Value::Unsigned(cols << 32)),
+                (4, Value::Unsigned(2_u64 << 32)),
+                (5, Value::Unsigned(1)),
+            ],
+            fit: vivid_sdk::Fit::Contain,
+            linear_sampling: true,
+            z_index: 0,
+            visible: true,
+            opacity: u16::MAX,
+            clip: None,
+        }
+    }
+
+    /// A scene commit names the target generation it was planned against, so an announced resize
+    /// has to carry every live scene onto the new target. Leaving a scene behind rejects the
+    /// commits a producer makes in response to the announcement it was just sent, which is fatal
+    /// for a producer that re-places its node on every resize.
+    #[test]
+    fn an_announced_display_change_carries_every_live_scene_onto_the_new_target() {
+        let service = VividService::start_with_wake(test_geometry(), Arc::new(|| {})).unwrap();
+        let mut first = connect(&service);
+        let mut second = connect(&service);
+        let mut unaware = connect(&service);
+        // The three producers deliberately reuse the same numeric surface and node IDs.
+        let surfaces: Vec<_> = [&mut first, &mut second, &mut unaware]
+            .into_iter()
+            .map(|session| grid_surface(session, 4))
+            .collect();
+        for (session, surface) in [&mut first, &mut second, &mut unaware].into_iter().zip(&surfaces)
+        {
+            let context_id = session.info().root_context_id;
+            session
+                .create_node(&grid_node(context_id, 5, surface, 80), &RequestMetadata::default())
+                .unwrap();
+        }
+
+        let resized = DisplayGeometry { columns: 100, rows: 40, ..test_geometry() };
+        let generation = service.update_metrics(resized).expect("a resize is a new generation");
+        service.flush_display_change(Some(generation));
+
+        for (session, surface) in [&mut first, &mut second].into_iter().zip(&surfaces) {
+            let announced = next_target_change(session);
+            assert_eq!(session.apply_target_changed(&announced).unwrap().get(), generation);
+            let context_id = session.info().root_context_id;
+            let commit = session
+                .update_node(&grid_node(context_id, 5, surface, 100), &RequestMetadata::default())
+                .expect("a commit naming the announced target must be accepted");
+            assert_eq!(commit.target_generation.get(), generation);
+        }
+
+        // A producer that has not consumed the announcement is still planning against the target
+        // it last knew, and that commit stays rejected rather than reaching the new target.
+        let context_id = unaware.info().root_context_id;
+        let error = unaware
+            .update_node(&grid_node(context_id, 5, &surfaces[2], 100), &RequestMetadata::default())
+            .expect_err("a commit naming the previous target must be rejected");
+        let code = error
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<vivid_sdk::PresenterError>())
+            .map(|error| error.code);
+        assert_eq!(code, Some(registry::error::STALE_TARGET_GENERATION));
+
+        // The rejection is actionable: the current target precedes it, so the producer can re-plan
+        // against the target it was just told about rather than waiting for the next resize.
+        let announced = next_target_change(&unaware);
+        assert_eq!(announced[9].1.as_u64(), Some(generation));
+        assert_eq!(descriptor_summary(&announced), (100, 40, true));
+
+        // The rejection is scoped to the producer that earned it: the other scenes are unchanged.
+        for (session, cols) in [(&first, 100_u64), (&second, 100), (&unaware, 80)] {
+            let identity =
+                SessionIdentity::new(service.shared.presenter, session.info().session_id).unwrap();
+            let status = service.scene().scene_status(identity, 8);
+            assert_eq!(status.target_generation.get(), generation);
+            assert_eq!(status.nodes.len(), 1);
+            assert_eq!(status.nodes[0].node.geometry[3].1, Value::Unsigned(cols << 32));
+        }
     }
 
     #[test]
-    fn target_changes_emit_one_unsettled_update_and_a_final_same_generation_settle() {
-        let metrics = DisplayMetrics {
-            viewport_width: 800,
-            viewport_height: 600,
-            columns: 80,
-            rows: 24,
-            cell_width: 10,
-            cell_height: 25,
-            generation: 2,
-        };
-        let mut pending = PendingTargetChange { metrics, last_unsettled_generation: None };
-        let unsettled = pending.payload(false).unwrap();
-        assert_eq!(unsettled[6].1.as_bool(), Some(false));
-        assert_eq!(unsettled[9].1.as_u64(), Some(2));
-        assert!(
-            pending.payload(false).is_none(),
-            "one geometry generation is emitted unsettled at most once"
-        );
+    fn an_unchanged_stale_or_degenerate_display_change_is_never_announced() {
+        let service = VividService::start_with_wake(test_geometry(), Arc::new(|| {})).unwrap();
+        let live = connect(&service);
 
-        let settled = pending.payload(true).unwrap();
-        assert_eq!(settled[6].1.as_bool(), Some(true));
-        assert_eq!(
-            settled[9].1.as_u64(),
-            Some(2),
-            "settling does not invent a geometry generation"
-        );
-        assert!(
-            unsettled
-                .iter()
-                .filter(|(key, _)| *key != 6)
-                .eq(settled.iter().filter(|(key, _)| *key != 6)),
-            "settling changes only the descriptor's settled flag"
-        );
+        assert_eq!(service.update_metrics(test_geometry()), None);
+        assert_eq!(service.update_metrics(DisplayGeometry { rows: 0, ..test_geometry() }), None);
+        service.flush_display_change(None);
+        // A settle timer from a superseded generation must not re-announce the current target.
+        service.flush_display_change(Some(0));
+
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(live.take_event().unwrap(), None);
+        assert_eq!(live.info().target_generation.get(), 1);
     }
 
     #[test]
     fn live_resize_reaches_the_sdk_as_a_same_generation_final_settle() {
-        let initial = DisplayMetrics {
-            viewport_width: 800,
-            viewport_height: 600,
-            columns: 80,
-            rows: 24,
-            cell_width: 10,
-            cell_height: 25,
-            generation: 1,
-        };
-        let service = VividService::start_with_wake(initial, Arc::new(|| {})).unwrap();
+        let service = VividService::start_with_wake(test_geometry(), Arc::new(|| {})).unwrap();
         let config = ProducerConfig {
             endpoint_control: Some(service.control_endpoint().to_owned()),
             authentication: ProducerAuthentication::root_hex(service.root_secret()).unwrap(),
@@ -2821,14 +2987,13 @@ mod tests {
         };
         let mut session = vivid_sdk::Session::connect(config).unwrap();
         let generation = service
-            .update_metrics(DisplayMetrics {
+            .update_metrics(DisplayGeometry {
                 viewport_width: 1200,
                 viewport_height: 800,
                 columns: 120,
                 rows: 40,
                 cell_width: 10,
                 cell_height: 20,
-                generation: 0,
             })
             .unwrap();
 
@@ -2939,22 +3104,8 @@ mod tests {
 
     #[test]
     fn migrated_sdk_submits_a_live_raster_over_an_authenticated_channel() {
-        let metrics = DisplayMetrics {
-            viewport_width: 800,
-            viewport_height: 600,
-            columns: 80,
-            rows: 24,
-            cell_width: 10,
-            cell_height: 25,
-            generation: 1,
-        };
-        let service = VividService::start_with_wake(metrics, Arc::new(|| {})).unwrap();
-        let config = ProducerConfig {
-            endpoint_control: Some(service.control_endpoint().to_owned()),
-            authentication: ProducerAuthentication::root_hex(service.root_secret()).unwrap(),
-            ..ProducerConfig::default()
-        };
-        let mut session = vivid_sdk::Session::connect(config).unwrap();
+        let service = VividService::start_with_wake(test_geometry(), Arc::new(|| {})).unwrap();
+        let mut session = connect(&service);
         let context_id = session.info().root_context_id;
         let surface = session
             .create_surface(
@@ -3081,5 +3232,101 @@ mod tests {
             1,
             "clean GOODBYE must preserve an anchored, policy-permitted terminal poster"
         );
+    }
+
+    #[test]
+    fn an_outstanding_wait_does_not_block_the_control_reader() {
+        // Core §5.1: a long operation becomes bounded pending state and must not stall the
+        // parser. Registering a wait that cannot be satisfied used to be harmless only because
+        // it spawned a thread; the actor now holds it, so prove the session still answers.
+        let service = VividService::start_with_wake(test_geometry(), Arc::new(|| {})).unwrap();
+        let mut session = connect(&service);
+        let context_id = session.info().root_context_id;
+        let surface = session
+            .create_surface(
+                SurfaceDefinition {
+                    context_id,
+                    surface_id: 11,
+                    semantic_profile: registry::TERMINAL_CONTENT.into(),
+                    coordinate_model: CoordinateModel::TerminalContentCells,
+                    logical_width: 2,
+                    logical_height: 2,
+                    scale_numerator: 1,
+                    scale_denominator: 1,
+                    rotation: 0,
+                    descriptor: SurfaceDescriptor {
+                        role: SurfaceRole::Figure,
+                        title: "pending wait".into(),
+                        semantic_content_revision: 1,
+                        semantic_availability: 0,
+                        locator_hint: String::new(),
+                    },
+                    policy: 0,
+                    profile_parameters: vec![],
+                },
+                &RequestMetadata::default(),
+            )
+            .unwrap();
+        let track = session
+            .create_track(
+                TrackConfiguration {
+                    context_id,
+                    surface_id: surface.id(),
+                    track_id: 12,
+                    slot: scene::SLOT_RASTER,
+                    mode: TrackMode::Live,
+                    lane: LaneClass::Bulk,
+                    maximum_record_body: 88,
+                    maximum_rate_millihertz: 60_000,
+                    maximum_encoded_bits_per_second: 1_000_000,
+                    maximum_records_per_second: 60,
+                    maximum_inflight_body_bytes: 4096,
+                    kind: KindConfiguration::Raster(RasterConfiguration {
+                        width: 2,
+                        height: 2,
+                        alpha_mode: scene::ALPHA_STRAIGHT,
+                        delta_enabled: false,
+                        maximum_delta_operations: 1,
+                        zstd_enabled: false,
+                    }),
+                    target_latency_us: 0,
+                    maximum_latency_us: 1_000_000,
+                    retained_pixel_charge: 0,
+                },
+                &RequestMetadata::default(),
+            )
+            .unwrap();
+
+        // Nothing has ever been presented, so this milestone cannot be reached and the wait sits
+        // in the actor's pending set until it times out.
+        let session = Arc::new(session);
+        let waiter = {
+            let session = session.clone();
+            let track = track.clone();
+            thread::spawn(move || {
+                session.wait_track(
+                    &track,
+                    TrackWaitCondition::MilestoneSet,
+                    Some(MILESTONE_PRESENTED),
+                    2_000_000,
+                )
+            })
+        };
+
+        // Give the wait time to reach the presenter, then keep asking unrelated questions.
+        thread::sleep(Duration::from_millis(50));
+        let started = Instant::now();
+        for _ in 0..20 {
+            session.query_surface(&surface).unwrap();
+        }
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "20 queries took {elapsed:?} while a wait was outstanding"
+        );
+
+        // The wait still resolves on its own deadline rather than being starved.
+        let outcome = waiter.join().unwrap();
+        assert!(outcome.is_err(), "an unreachable milestone must time out");
     }
 }

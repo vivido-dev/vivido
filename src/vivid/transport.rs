@@ -54,6 +54,15 @@ impl Reader {
         ))
     }
 
+    /// A handle that can unblock a reader parked in [`Self::read_record`].
+    ///
+    /// The session actor uses it after a clean `GOODBYE`: core §6.3 has the presenter reply `OK`
+    /// and close the logical session, so the reader must stop rather than wait for a peer EOF that
+    /// a producer is not obliged to send promptly.
+    pub fn shutdown_handle(&self) -> io::Result<ReadShutdown> {
+        Ok(ReadShutdown { stream: self.stream.try_clone()? })
+    }
+
     pub fn read_record(&mut self, kind: ConnectionKind) -> io::Result<Record> {
         let mut body = Vec::new();
         let header = self.read_record_body_into(kind, &mut body)?;
@@ -128,6 +137,17 @@ impl Reader {
         }
         self.maximum = self.negotiated_maximum.min(maximum);
         Ok(())
+    }
+}
+
+/// Unblocks a parked reader by shutting the receive half of its connection.
+pub struct ReadShutdown {
+    stream: LocalStream,
+}
+
+impl ReadShutdown {
+    pub fn stop(&self) {
+        let _ = self.stream.shutdown(std::net::Shutdown::Read);
     }
 }
 

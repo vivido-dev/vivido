@@ -82,9 +82,9 @@ use crate::scheduler::{Scheduler, TimerId, Topic};
 use crate::screenshot;
 #[cfg(unix)]
 use crate::terminal::thread;
+use crate::vivid::VividService;
 #[cfg(unix)]
 use crate::vivid::scene::TrackWaitEvaluation;
-use crate::vivid::{DisplayMetrics, VividService};
 
 #[cfg(unix)]
 type AutomationResize = (u32, u32, Option<(u16, u16)>);
@@ -227,19 +227,7 @@ impl WindowContext {
         let event_proxy = EventProxy::new(proxy, display.window.id());
 
         let vivid_service = {
-            let size = display.size_info;
-            let service = VividService::start(
-                DisplayMetrics {
-                    viewport_width: size.width() as u32,
-                    viewport_height: size.height() as u32,
-                    columns: size.columns() as u32,
-                    rows: size.screen_lines() as u32,
-                    cell_width: size.cell_width().round() as u32,
-                    cell_height: size.cell_height().round() as u32,
-                    generation: 1,
-                },
-                event_proxy.clone(),
-            )?;
+            let service = VividService::start(display.size_info.into(), event_proxy.clone())?;
             pty_config
                 .env
                 .insert("VIVID_ENDPOINT_CONTROL".into(), service.control_endpoint().into());
@@ -568,16 +556,7 @@ impl WindowContext {
             }
 
             self.dirty = true;
-            let size = self.display.size_info;
-            let changed = self.vivid_service.update_metrics(DisplayMetrics {
-                viewport_width: size.width() as u32,
-                viewport_height: size.height() as u32,
-                columns: size.columns() as u32,
-                rows: size.screen_lines() as u32,
-                cell_width: size.cell_width().round() as u32,
-                cell_height: size.cell_height().round() as u32,
-                generation: 0,
-            });
+            let changed = self.vivid_service.update_metrics(self.display.size_info.into());
             if let Some(generation) = changed {
                 let window_id = self.id();
                 let timer_id = TimerId::new(Topic::VividResizeSettled, window_id);

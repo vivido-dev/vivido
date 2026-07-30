@@ -12,6 +12,8 @@ use vivid_protocol::revision::{
     TrackRevision,
 };
 use vivid_protocol::scene::SceneNode;
+
+use crate::vivid::target::{ClipRect, NodePlacement, PresentationTarget, TerminalTarget};
 use vivid_protocol::surface::SurfaceDefinition;
 use vivid_protocol::track::{
     KindConfiguration, MILESTONE_BUFFERED_ENDED, MILESTONE_CHANNEL_ACCEPTED,
@@ -49,14 +51,6 @@ pub struct Frame {
     pub alpha_mode: u64,
     pub rgba: Arc<[u8]>,
     pub damage: Option<Arc<[RasterDamageRect]>>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ClipRect {
-    pub x: i64,
-    pub y: i64,
-    pub width: i64,
-    pub height: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -113,6 +107,39 @@ pub struct SceneStatus {
     pub revision: SceneRevision,
     pub target_generation: TargetGeneration,
     pub nodes: Vec<SceneNodeStatus>,
+}
+
+/// Why a composited frame did not advance its track's presentation record.
+///
+/// The two cases are not equally interesting. A resize replaces the surface mapping and the track
+/// under a frame that is already in flight, so a superseded record is the expected outcome of
+/// ordinary window movement: the frame really was composited, and the record it would have advanced
+/// no longer describes what is on screen. A failure is a presenter anomaly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PresentationRejection {
+    Superseded(&'static str),
+    Failed(&'static str),
+}
+
+impl std::fmt::Display for PresentationRejection {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (Self::Superseded(reason) | Self::Failed(reason)) = self;
+        formatter.write_str(reason)
+    }
+}
+
+/// Why a scene commit did not apply.
+///
+/// The three cases carry different registered error codes and different producer recoveries, so
+/// they stay distinguishable instead of collapsing into one opaque state failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommitRejection {
+    /// The commit was planned against a target the presentation has already moved past.
+    StaleTarget,
+    /// The scene-revision precondition no longer holds.
+    StaleRevision,
+    /// The transaction, or one of the mutations in it, is not applicable.
+    Failed(&'static str),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -239,6 +266,7 @@ struct State {
 struct Inner {
     state: Mutex<State>,
     changed: Condvar,
+    target: Arc<dyn PresentationTarget>,
 }
 
 #[derive(Clone)]
@@ -246,7 +274,23 @@ pub struct SharedScene(Arc<Inner>);
 
 impl Default for SharedScene {
     fn default() -> Self {
-        Self(Arc::new(Inner { state: Mutex::new(State::default()), changed: Condvar::new() }))
+        Self::new(Arc::new(TerminalTarget))
+    }
+}
+
+impl SharedScene {
+    /// Build a scene for one presentation target. The target decides what node geometry means,
+    /// so it is fixed for the scene's lifetime exactly as it is for a session (core §1).
+    pub fn new(target: Arc<dyn PresentationTarget>) -> Self {
+        Self(Arc::new(Inner {
+            state: Mutex::new(State::default()),
+            changed: Condvar::new(),
+            target,
+        }))
+    }
+
+    pub fn target(&self) -> &Arc<dyn PresentationTarget> {
+        &self.0.target
     }
 }
 
@@ -281,23 +325,23 @@ impl SharedScene {
         Ok(())
     }
 
-    pub fn update_target_generation(
-        &self,
-        target_generation: TargetGeneration,
-    ) -> Result<(), &'static str> {
-        target_generation.require_nonzero().map_err(|_| "target generation must be nonzero")?;
+    /// Move every live session's scene onto a newly announced target generation.
+    ///
+    /// A scene commit names the target generation it was planned against, so the generation the
+    /// scene validates commits against has to follow the presentation target. Leaving it behind
+    /// rejects every commit that correctly names the new target as stale. The move is monotonic:
+    /// an announcement can only carry the scene forward.
+    pub fn advance_target_generation(&self, target_generation: TargetGeneration) {
         let mut state = self.lock();
-        if state.target_generation != TargetGeneration::ZERO
-            && target_generation <= state.target_generation
-        {
-            return Err("target generation did not advance");
+        if state.target_generation < target_generation {
+            state.target_generation = target_generation;
         }
-        state.target_generation = target_generation;
         for scene in state.scenes.values_mut() {
-            scene.target_generation = target_generation;
+            if scene.target_generation < target_generation {
+                scene.target_generation = target_generation;
+            }
         }
         self.0.changed.notify_all();
-        Ok(())
     }
 
     pub fn remove_session(&self, session: SessionIdentity) {
@@ -324,7 +368,7 @@ impl SharedScene {
         let mut posters = Vec::new();
         let mut retained_pixels = 0_u64;
         for node in scene.nodes.values() {
-            if let Some((poster, pixels)) = retained_poster(&state, session, node)
+            if let Some((poster, pixels)) = retained_poster(&*self.0.target, &state, session, node)
                 && retained_pixels.saturating_add(pixels) <= MAX_RETAINED_POSTER_PIXELS
             {
                 retained_pixels = retained_pixels.saturating_add(pixels);
@@ -669,9 +713,16 @@ impl SharedScene {
             return Err("track does not exist");
         }
         if let Some(surface) = state.surfaces.get_mut(&identity.surface) {
+            let slots = surface.active_slots.len();
             surface.active_slots.retain(|_, track_id| *track_id != identity.track_id);
-            surface.revision =
-                surface.revision.advance().map_err(|_| "surface revision exhausted")?;
+            // Only a vacated slot mutates the surface. Advancing the revision for a track that
+            // held no slot moves presenter truth away from the revision the producer holds, with
+            // nothing said about it, and the producer's next surface update is rejected as stale.
+            // Retiring a replaced track is exactly that case.
+            if surface.active_slots.len() != slots {
+                surface.revision =
+                    surface.revision.advance().map_err(|_| "surface revision exhausted")?;
+            }
         }
         self.0.changed.notify_all();
         Ok(())
@@ -1229,7 +1280,7 @@ impl SharedScene {
         transaction_id: u64,
         expected_target: TargetGeneration,
         expected_revision: Option<SceneRevision>,
-    ) -> Result<SceneRevision, &'static str> {
+    ) -> Result<SceneRevision, CommitRejection> {
         let mut state = self.lock();
         let session = context.session;
         let mutations = state
@@ -1237,57 +1288,64 @@ impl SharedScene {
             .get(&session)
             .and_then(|scene| scene.pending.get(&(context, transaction_id)))
             .cloned()
-            .ok_or("transaction does not exist")?;
+            .ok_or(CommitRejection::Failed("transaction does not exist"))?;
         {
             let scene = state.scenes.get(&session).unwrap();
             if scene.target_generation != expected_target {
-                return Err("stale target generation");
+                return Err(CommitRejection::StaleTarget);
             }
             if expected_revision.is_some_and(|revision| revision != scene.revision) {
-                return Err("stale scene revision");
+                return Err(CommitRejection::StaleRevision);
             }
         }
         let mut candidate = state.scenes.get(&session).unwrap().nodes.clone();
         for mutation in mutations {
             match mutation {
                 NodeMutation::Create(node) => {
-                    validate_terminal_node(&node)?;
-                    let identity = context.node(node.node_id).map_err(|_| "invalid node ID")?;
+                    self.0.target.validate_node(&node).map_err(CommitRejection::Failed)?;
+                    let identity = context
+                        .node(node.node_id)
+                        .map_err(|_| CommitRejection::Failed("invalid node ID"))?;
                     if node.owning_context_id != context.context_id
                         || candidate.contains_key(&identity)
                     {
-                        return Err("duplicate or misowned node");
+                        return Err(CommitRejection::Failed("duplicate or misowned node"));
                     }
                     let surface_identity = context
                         .session
                         .context(node.surface_context_id)
-                        .map_err(|_| "invalid surface context")?
+                        .map_err(|_| CommitRejection::Failed("invalid surface context"))?
                         .surface(node.surface_id)
-                        .map_err(|_| "invalid surface ID")?;
+                        .map_err(|_| CommitRejection::Failed("invalid surface ID"))?;
                     if !state.surfaces.contains_key(&surface_identity) {
-                        return Err("node references a missing surface");
+                        return Err(CommitRejection::Failed("node references a missing surface"));
                     }
                     candidate.insert(identity, node);
                 },
                 NodeMutation::Update(node) => {
-                    validate_terminal_node(&node)?;
-                    let identity = context.node(node.node_id).map_err(|_| "invalid node ID")?;
+                    self.0.target.validate_node(&node).map_err(CommitRejection::Failed)?;
+                    let identity = context
+                        .node(node.node_id)
+                        .map_err(|_| CommitRejection::Failed("invalid node ID"))?;
                     if node.owning_context_id != context.context_id
                         || !candidate.contains_key(&identity)
                     {
-                        return Err("missing or misowned node");
+                        return Err(CommitRejection::Failed("missing or misowned node"));
                     }
                     candidate.insert(identity, node);
                 },
                 NodeMutation::Delete(identity) => {
                     if identity.context != context || candidate.remove(&identity).is_none() {
-                        return Err("missing or misowned node");
+                        return Err(CommitRejection::Failed("missing or misowned node"));
                     }
                 },
             }
         }
         let scene = state.scenes.get_mut(&session).unwrap();
-        scene.revision = scene.revision.advance().map_err(|_| "scene revision exhausted")?;
+        scene.revision = scene
+            .revision
+            .advance()
+            .map_err(|_| CommitRejection::Failed("scene revision exhausted"))?;
         scene.nodes = candidate;
         scene.pending.remove(&(context, transaction_id));
         let revision = scene.revision;
@@ -1327,12 +1385,12 @@ impl SharedScene {
         let mut items = Vec::new();
         for (session_identity, scene) in &state.scenes {
             for node in scene.nodes.values().filter(|node| node.visible) {
-                let Some((mut x, mut y, width, height, text_layer, text_anchored)) =
-                    terminal_geometry(node)
-                else {
+                let Some(placement) = self.0.target.placement(node) else {
                     continue;
                 };
-                let mut clip = terminal_clip(node);
+                let NodePlacement { width, height, text_layer, text_anchored, .. } = placement;
+                let (mut x, mut y) = (placement.x, placement.y);
+                let mut clip = self.0.target.clip(node);
                 if text_anchored {
                     let Some(anchor_identity) = node_anchor_identity(*session_identity, node)
                     else {
@@ -1466,14 +1524,14 @@ impl SharedScene {
         surface_generation: SurfaceGeneration,
         frame_id: u64,
         pts_us: i64,
-    ) -> Result<(), &'static str> {
+    ) -> Result<(), PresentationRejection> {
         let mut state = self.lock();
         let Some(surface) = state.surfaces.get(&identity.surface) else {
             // Retained terminal-native posters have no live track milestone to acknowledge.
             return Ok(());
         };
         if surface.generation != surface_generation {
-            return Err("stale surface generation");
+            return Err(PresentationRejection::Superseded("stale surface generation"));
         }
         let Some(track) = state.tracks.get_mut(&identity) else {
             return Ok(());
@@ -1481,14 +1539,19 @@ impl SharedScene {
         if track.state.channel_generation != channel_generation
             || track.frame.as_ref().is_none_or(|frame| frame.frame_id != frame_id)
         {
-            return Err("stale frame presentation");
+            return Err(PresentationRejection::Superseded("stale frame presentation"));
         }
         track.last_presented_pts_us = Some(pts_us);
-        track.last_presentation_id =
-            track.last_presentation_id.checked_add(1).ok_or("presentation ID exhausted")?;
+        track.last_presentation_id = track
+            .last_presentation_id
+            .checked_add(1)
+            .ok_or(PresentationRejection::Failed("presentation ID exhausted"))?;
         track.state.milestones |= MILESTONE_PRESENTED;
-        track.state.revision =
-            track.state.revision.advance().map_err(|_| "track revision exhausted")?;
+        track.state.revision = track
+            .state
+            .revision
+            .advance()
+            .map_err(|_| PresentationRejection::Failed("track revision exhausted"))?;
         self.0.changed.notify_all();
         Ok(())
     }
@@ -1591,6 +1654,7 @@ fn node_anchor_identity(session: SessionIdentity, node: &SceneNode) -> Option<An
 }
 
 fn retained_poster(
+    target: &dyn PresentationTarget,
     state: &State,
     session: SessionIdentity,
     node: &SceneNode,
@@ -1598,7 +1662,8 @@ fn retained_poster(
     if !node.visible {
         return None;
     }
-    let (x, y, width, height, text_layer, text_anchored) = terminal_geometry(node)?;
+    let placement = target.placement(node)?;
+    let NodePlacement { x, y, width, height, text_layer, text_anchored } = placement;
     if !text_anchored {
         return None;
     }
@@ -1632,7 +1697,7 @@ fn retained_poster(
             height,
             text_layer,
             z_index: node.z_index,
-            clip: terminal_clip(node),
+            clip: target.clip(node),
             frame: frame.clone(),
             capture_policy: surface.definition.policy,
         },
@@ -1699,51 +1764,6 @@ fn track_status(identity: TrackIdentity, track: &Track) -> TrackStatus {
         maximum_channel_bytes: track.maximum_channel_bytes,
         maximum_channel_records: track.maximum_channel_records,
     }
-}
-
-fn validate_terminal_node(node: &SceneNode) -> Result<(), &'static str> {
-    node.validate().map_err(|_| "invalid scene node")?;
-    terminal_geometry(node).ok_or("invalid terminal node geometry")?;
-    if terminal_clip(node).is_none() && node.clip.is_some() {
-        return Err("invalid terminal node clip");
-    }
-    Ok(())
-}
-
-fn terminal_geometry(node: &SceneNode) -> Option<(i64, i64, i64, i64, u64, bool)> {
-    let value = |key| node.geometry.iter().find(|entry| entry.0 == key).map(|entry| &entry.1);
-    let coordinate_space = value(0)?.as_u64()?;
-    let x = value(1)?.as_i64()?;
-    let y = value(2)?.as_i64()?;
-    let width = value(3)?.as_i64()?;
-    let height = value(4)?.as_i64()?;
-    let layer = value(5)?.as_u64()?;
-    if width <= 0
-        || height <= 0
-        || layer > 2
-        || !matches!(coordinate_space, 1 | 2)
-        || (coordinate_space == 1 && node.geometry.len() != 6)
-        || (coordinate_space == 2
-            && (node.geometry.len() != 8 || value(6)?.as_u64()? == 0 || value(7)?.as_u64()? == 0))
-    {
-        return None;
-    }
-    Some((x, y, width, height, layer, coordinate_space == 2))
-}
-
-fn terminal_clip(node: &SceneNode) -> Option<ClipRect> {
-    let clip = node.clip.as_ref()?;
-    if clip.len() != 4 {
-        return None;
-    }
-    let value = |key| clip.iter().find(|entry| entry.0 == key).map(|entry| &entry.1);
-    let result = ClipRect {
-        x: value(0)?.as_i64()?,
-        y: value(1)?.as_i64()?,
-        width: value(2)?.as_i64()?,
-        height: value(3)?.as_i64()?,
-    };
-    (result.width > 0 && result.height > 0).then_some(result)
 }
 
 pub fn track_kind_name(configuration: &TrackConfiguration) -> &'static str {
@@ -1817,16 +1837,14 @@ mod tests {
         scene.register_session(second, TargetGeneration::ONE).unwrap();
 
         let resized = TargetGeneration::new(2);
-        scene.update_target_generation(resized).unwrap();
+        scene.advance_target_generation(resized);
         assert_eq!(scene.scene_status(first, 0).target_generation, resized);
         assert_eq!(scene.scene_status(second, 0).target_generation, resized);
 
         scene.register_session(late, TargetGeneration::ONE).unwrap();
         assert_eq!(scene.scene_status(late, 0).target_generation, resized);
-        assert_eq!(
-            scene.update_target_generation(resized),
-            Err("target generation did not advance")
-        );
+        scene.advance_target_generation(resized);
+        assert_eq!(scene.scene_status(late, 0).target_generation, resized);
     }
 
     #[test]
@@ -1868,6 +1886,166 @@ mod tests {
                 .is_err()
         );
         assert_eq!(scene.scene_status(session, 10).revision, SceneRevision::ZERO);
+    }
+
+    /// Retiring a replaced track leaves the surface untouched, so it must not move the revision
+    /// the producer is holding: the producer names that revision in its next surface update, and
+    /// a silent advance rejects the update it makes on the following resize.
+    #[test]
+    fn destroying_a_track_moves_the_surface_revision_only_when_it_vacates_a_slot() {
+        let scene = SharedScene::default();
+        let session = session(4, 1);
+        let context = session.context(1).unwrap();
+        let surface_identity = context.surface(1).unwrap();
+        scene.register_session(session, TargetGeneration::ONE).unwrap();
+        scene.create_surface(surface_identity, definition(1, 1)).unwrap();
+        let raster = |track_id: u64| TrackConfiguration {
+            context_id: 1,
+            surface_id: 1,
+            track_id,
+            slot: SLOT_RASTER,
+            mode: TrackMode::Live,
+            lane: LaneClass::Bulk,
+            maximum_record_body: 128,
+            maximum_rate_millihertz: 1_000,
+            maximum_encoded_bits_per_second: 8_192,
+            maximum_records_per_second: 1,
+            maximum_inflight_body_bytes: 1_024,
+            kind: KindConfiguration::Raster(RasterConfiguration {
+                width: 1,
+                height: 1,
+                alpha_mode: ALPHA_STRAIGHT,
+                delta_enabled: false,
+                maximum_delta_operations: 1,
+                zstd_enabled: false,
+            }),
+            target_latency_us: 0,
+            maximum_latency_us: 1_000_000,
+            retained_pixel_charge: 1,
+        };
+        let ready = |track_id: u64| {
+            let identity = surface_identity.track(track_id).unwrap();
+            scene.create_track(identity, raster(track_id)).unwrap();
+            scene.accept_channel(identity, ChannelGeneration::ONE, 1_024, 8).unwrap();
+            scene.mark_output_ready(identity, ChannelGeneration::ONE).unwrap();
+            identity
+        };
+        let retired = ready(1);
+        let replacement = ready(2);
+
+        // The replacement takes the slot, exactly as a settled resize does.
+        scene
+            .activate_tracks(
+                surface_identity,
+                SurfaceRevision::ONE,
+                &[(SLOT_RASTER, 1, ChannelGeneration::ONE, MILESTONE_OUTPUT_READY)],
+            )
+            .unwrap();
+        scene
+            .activate_tracks(
+                surface_identity,
+                SurfaceRevision::new(2),
+                &[(SLOT_RASTER, 2, ChannelGeneration::ONE, MILESTONE_OUTPUT_READY)],
+            )
+            .unwrap();
+        let after_activation = scene.surface_status(surface_identity).unwrap().revision;
+
+        scene.destroy_track(retired).unwrap();
+        assert_eq!(
+            scene.surface_status(surface_identity).unwrap().revision,
+            after_activation,
+            "retiring a track that held no slot changed the surface revision"
+        );
+
+        // Destroying the track that does hold the slot is a real surface mutation.
+        scene.destroy_track(replacement).unwrap();
+        assert_eq!(
+            scene.surface_status(surface_identity).unwrap().revision,
+            after_activation.advance().unwrap()
+        );
+    }
+
+    /// A frame is composited from a snapshot and acknowledged after the GPU submit, so a resize
+    /// landing in between supersedes it. That is ordinary window movement, not a presenter fault,
+    /// and it must stay distinguishable from a record that genuinely could not be advanced.
+    #[test]
+    fn a_presentation_a_resize_overtook_is_superseded_rather_than_failed() {
+        let scene = SharedScene::default();
+        let session = session(6, 1);
+        let context = session.context(1).unwrap();
+        let surface_identity = context.surface(1).unwrap();
+        let track_identity = surface_identity.track(1).unwrap();
+        scene.register_session(session, TargetGeneration::ONE).unwrap();
+        scene.create_surface(surface_identity, definition(1, 1)).unwrap();
+        scene
+            .create_track(
+                track_identity,
+                TrackConfiguration {
+                    context_id: 1,
+                    surface_id: 1,
+                    track_id: 1,
+                    slot: SLOT_RASTER,
+                    mode: TrackMode::Live,
+                    lane: LaneClass::Bulk,
+                    maximum_record_body: 128,
+                    maximum_rate_millihertz: 1_000,
+                    maximum_encoded_bits_per_second: 8_192,
+                    maximum_records_per_second: 1,
+                    maximum_inflight_body_bytes: 1_024,
+                    kind: KindConfiguration::Raster(RasterConfiguration {
+                        width: 1,
+                        height: 1,
+                        alpha_mode: ALPHA_STRAIGHT,
+                        delta_enabled: false,
+                        maximum_delta_operations: 1,
+                        zstd_enabled: false,
+                    }),
+                    target_latency_us: 0,
+                    maximum_latency_us: 1_000_000,
+                    retained_pixel_charge: 1,
+                },
+            )
+            .unwrap();
+        scene.accept_channel(track_identity, ChannelGeneration::ONE, 1_024, 8).unwrap();
+        scene.mark_output_ready(track_identity, ChannelGeneration::ONE).unwrap();
+        let frame = Frame {
+            frame_id: 1,
+            pts_us: 0,
+            width: 1,
+            height: 1,
+            sar_num: 1,
+            sar_den: 1,
+            alpha_mode: ALPHA_STRAIGHT,
+            rgba: Arc::from([0_u8, 0, 0, 255].as_slice()),
+            damage: None,
+        };
+        scene.publish_decoded_frame(track_identity, ChannelGeneration::ONE, frame).unwrap();
+        let generation = scene.surface_status(surface_identity).unwrap().generation;
+
+        // The frame that was composited against the current surface records normally.
+        scene
+            .mark_presented(track_identity, ChannelGeneration::ONE, generation, 1, 0)
+            .expect("a frame composited against the live surface must record its presentation");
+
+        // A resize replaces the surface mapping. The frame still on screen belongs to the target
+        // that just went away.
+        let mut resized = definition(1, 1);
+        resized.logical_width = 20;
+        let status = scene.surface_status(surface_identity).unwrap();
+        scene
+            .update_surface(surface_identity, status.revision, status.generation, resized)
+            .unwrap();
+        assert_eq!(
+            scene.mark_presented(track_identity, ChannelGeneration::ONE, generation, 1, 0),
+            Err(PresentationRejection::Superseded("stale surface generation"))
+        );
+
+        // A newer frame under the current surface supersedes an older frame's acknowledgement too.
+        let current = scene.surface_status(surface_identity).unwrap().generation;
+        assert_eq!(
+            scene.mark_presented(track_identity, ChannelGeneration::ONE, current, 7, 0),
+            Err(PresentationRejection::Superseded("stale frame presentation"))
+        );
     }
 
     #[test]
