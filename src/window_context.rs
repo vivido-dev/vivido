@@ -235,10 +235,11 @@ impl WindowContext {
                     VividService::start_desktop(display.size_info.into(), event_proxy.clone())?
                 },
             };
-            pty_config
-                .env
-                .insert("VIVID_ENDPOINT_CONTROL".into(), service.control_endpoint().into());
-            pty_config.env.insert("VIVID_ROOT_SECRET".into(), service.root_secret().into());
+            configure_vivid_pty_environment(
+                &mut pty_config.env,
+                service.control_endpoint(),
+                service.root_secret(),
+            );
             display.set_vivid_scene(service.scene());
             service
         };
@@ -1820,6 +1821,20 @@ impl WindowContext {
     }
 }
 
+fn configure_vivid_pty_environment(
+    environment: &mut std::collections::HashMap<String, String>,
+    control_endpoint: &str,
+    root_secret: &str,
+) {
+    environment.insert("VIVID_ENDPOINT_CONTROL".into(), control_endpoint.into());
+    environment.insert("VIVID_ROOT_SECRET".into(), root_secret.into());
+    // ConPTY strips APC control strings before they reach Vivido's terminal parser. Producers
+    // must therefore emit the bounded printable marker form that the Windows PTY scanner removes
+    // and authenticates before ordinary terminal parsing.
+    #[cfg(windows)]
+    environment.insert("VIVID_ANCHOR_TRANSPORT".into(), "conpty".into());
+}
+
 impl Drop for WindowContext {
     fn drop(&mut self) {
         // Shutdown the terminal's PTY.
@@ -2133,5 +2148,27 @@ fn append_legacy_mouse_coordinate(output: &mut Vec<u8>, coordinate: usize, utf8:
         output.push((0x80 + (encoded & 63)) as u8);
     } else {
         output.push(encoded as u8);
+    }
+}
+
+#[cfg(test)]
+mod vivid_environment_tests {
+    use super::configure_vivid_pty_environment;
+    use std::collections::HashMap;
+
+    #[test]
+    fn child_receives_the_platform_marker_transport() {
+        let mut environment = HashMap::new();
+        configure_vivid_pty_environment(&mut environment, "tcp:127.0.0.1:1", "secret");
+
+        assert_eq!(
+            environment.get("VIVID_ENDPOINT_CONTROL").map(String::as_str),
+            Some("tcp:127.0.0.1:1")
+        );
+        assert_eq!(environment.get("VIVID_ROOT_SECRET").map(String::as_str), Some("secret"));
+        #[cfg(windows)]
+        assert_eq!(environment.get("VIVID_ANCHOR_TRANSPORT").map(String::as_str), Some("conpty"));
+        #[cfg(not(windows))]
+        assert!(!environment.contains_key("VIVID_ANCHOR_TRANSPORT"));
     }
 }
