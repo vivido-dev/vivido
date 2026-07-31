@@ -2349,6 +2349,10 @@ pub struct ActionContext<'a, N, T> {
 }
 
 impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionContext<'a, N, T> {
+    fn send_desktop_input(&self, event: vivid_protocol::input::InputEvent) -> bool {
+        self.vivid_service.send_input(event)
+    }
+
     #[inline]
     fn write_to_pty<B: Into<Cow<'static, [u8]>>>(&self, val: B) {
         self.notifier.notify(val);

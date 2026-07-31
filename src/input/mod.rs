@@ -111,6 +111,12 @@ pub trait ActionContext<T: EventListener> {
     fn update_selection(&mut self, _point: Point, _side: Side) {}
     fn clear_selection(&mut self) {}
     fn selection_is_empty(&self) -> bool;
+    /// Offer one desktop input event to a producer holding a grant, returning whether it took it.
+    ///
+    /// The default is "no grant", which is every context that is not a live window.
+    fn send_desktop_input(&self, _event: vivid_protocol::input::InputEvent) -> bool {
+        false
+    }
     fn mouse_mut(&mut self) -> &mut Mouse;
     fn mouse(&self) -> &Mouse;
     fn touch_purpose(&mut self) -> &mut TouchPurpose;

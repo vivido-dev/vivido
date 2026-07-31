@@ -397,6 +397,26 @@ impl SharedScene {
         self.0.changed.notify_all();
     }
 
+    /// Has this surface's active primary-video track presented for the current surface generation?
+    ///
+    /// Desktop §5.1 makes milestone bit 5 on the track's *current* channel generation a
+    /// precondition of enabling input, and media §7 resets those bits on every channel advance, so
+    /// a sticky bit from an older generation must not answer this.
+    pub fn surface_has_presented(&self, identity: SurfaceIdentity) -> bool {
+        let state = self.lock();
+        let Some(surface) = state.surfaces.get(&identity) else {
+            return false;
+        };
+        let Some(track_id) = surface.active_slots.get(&SLOT_PRIMARY_VIDEO) else {
+            return false;
+        };
+        let key = TrackIdentity { surface: identity, track_id: *track_id };
+        state
+            .tracks
+            .get(&key)
+            .is_some_and(|track| track.state.milestones & MILESTONE_PRESENTED != 0)
+    }
+
     /// Whether a suspended session's retained state is still present.
     pub fn is_registered(&self, session: SessionIdentity) -> bool {
         self.lock().scenes.contains_key(&session)

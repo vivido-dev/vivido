@@ -3,6 +3,7 @@
 mod actor;
 mod audio;
 mod decoder;
+pub(crate) mod hid;
 mod lane;
 mod lease;
 pub mod scene;
@@ -31,12 +32,15 @@ use vivid_protocol::anchor::{self, AnchorKey};
 use vivid_protocol::auth::{self, Secret32};
 use vivid_protocol::cbor::Value;
 use vivid_protocol::context::{
-    ContextDefinition, ContextState, OP_DELEGATE, OP_SURFACE_TRACK_MEDIA, OP_TERMINAL_ANCHOR,
+    ContextDefinition, ContextState, OP_DELEGATE, OP_DESKTOP_INPUT, OP_SURFACE_TRACK_MEDIA,
+    OP_TERMINAL_ANCHOR,
 };
+use vivid_protocol::grant::{self, Eligibility, InputGrant, reason as grant_reason};
 use vivid_protocol::identity::{
     AnchorIdentity, ContextIdentity, PresenterInstanceId, SessionIdentity, SurfaceIdentity,
     TrackIdentity,
 };
+use vivid_protocol::input::{InputBinding, InputEvent};
 use vivid_protocol::media;
 use vivid_protocol::messages::{
     self, ChannelOpen, Envelope, ErrorDetail, ErrorReply, Hello, HelloAuthentication, LaneClass,
@@ -48,7 +52,7 @@ use vivid_protocol::revision::{
     ChannelGeneration, SceneRevision, SurfaceGeneration, SurfaceRevision, TargetGeneration,
 };
 use vivid_protocol::scene::SceneNode;
-use vivid_protocol::surface::{SurfaceDefinition, SurfaceDescriptor};
+use vivid_protocol::surface::{DesktopSurfaceParameters, SurfaceDefinition, SurfaceDescriptor};
 use vivid_protocol::track::{
     ChannelOpenDecision, ChannelOpenState, KindConfiguration, TrackConfiguration,
 };
@@ -112,6 +116,8 @@ struct SessionRuntime {
     /// Its writer, independent of the control writer and of every track writer, so a saturated
     /// bulk track cannot delay input revocation.
     lane_writer: Mutex<Option<Arc<Writer>>>,
+    /// The desktop input grant, `desktop-input-v1`.
+    grant: Mutex<InputGrant>,
 }
 
 #[derive(Default)]
@@ -365,6 +371,53 @@ impl VividService {
 
     pub fn update_visibility(&self, _visible: bool, _display_offset: usize) {}
 
+    /// Send one desktop input event to whichever session holds the grant.
+    ///
+    /// This is the presenter-to-producer direction of `desktop-input-v1`: the window's input
+    /// handler calls it, and every event carries the complete binding tuple so the producer's
+    /// final injection gate can reject a stale one. An event the presenter cannot tag is dropped
+    /// rather than sent, because sending it would only widen the window in which a stale tuple
+    /// exists on the wire.
+    pub fn send_input(&self, event: InputEvent) -> bool {
+        let sessions = lock(&self.shared.registry).sessions.values().cloned().collect::<Vec<_>>();
+        for session in sessions {
+            let tagged = {
+                let grant = lock(&session.grant);
+                grant.tag(event.class()).map(|tag| grant::event_payload(tag, &event))
+            };
+            let Some(payload) = tagged else {
+                continue;
+            };
+            let Some(writer) = lock(&session.lane_writer).clone() else {
+                continue;
+            };
+            let surface_id = payload
+                .iter()
+                .find(|entry| entry.0 == 3)
+                .and_then(|entry| entry.1.as_u64())
+                .unwrap_or(0);
+            let Ok(body) = Envelope::new(0, payload).encode() else {
+                continue;
+            };
+            if writer.write_record(event.record_type(), surface_id, &body).is_ok() {
+                // Core §7: once an event is admitted, this lane generation cannot be reopened.
+                if let Some(state) = lock(&session.lane).as_mut() {
+                    state.note_input();
+                }
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Revoke input on every session, for a focus or policy transition the window observed.
+    pub fn revoke_all_input(&self, reason: u64) {
+        let sessions = lock(&self.shared.registry).sessions.values().cloned().collect::<Vec<_>>();
+        for session in sessions {
+            revoke_input(&session, reason);
+        }
+    }
+
     #[cfg(unix)]
     pub(crate) fn automation_sessions(&self) -> Vec<SessionIdentity> {
         self.scene.session_ids()
@@ -438,6 +491,24 @@ impl VividService {
                 let _ = session.writer.write_record(record_type, identity.anchor_id, &body);
             }
         }
+    }
+}
+
+impl ServiceShared {
+    /// Build a complete track identity for a session this presenter owns.
+    #[cfg(test)]
+    fn presenter_track(
+        &self,
+        session_id: u64,
+        context_id: u64,
+        surface_id: u64,
+        track_id: u64,
+    ) -> TrackIdentity {
+        SessionIdentity::new(self.presenter, session_id)
+            .and_then(|session| session.context(context_id))
+            .and_then(|context| context.surface(surface_id))
+            .and_then(|surface| surface.track(track_id))
+            .expect("a well-formed track identity")
     }
 }
 
@@ -592,6 +663,7 @@ fn actor_loop(
             pending.service(&shared.scene, &egress, &mut cancelled, Instant::now());
         }
         expire_leases(&shared, &session);
+        service_input_renewal(&session);
     }
     egress.close();
     // Release the reader, which is parked on a peer that has no obligation to close promptly.
@@ -1184,6 +1256,7 @@ fn establish_root_session(
         resume_key: Secret32::new(*keys.resume_key()),
         lane: Mutex::new(None),
         lane_writer: Mutex::new(None),
+        grant: Mutex::new(InputGrant::new()),
     });
     // Suspension retained this session's surfaces, tracks, and nodes, so a resume re-attaches to
     // them rather than registering a second time (security §7.1).
@@ -2778,18 +2851,123 @@ fn handle_lane(reader: &mut Reader, shared: &Arc<ServiceShared>) -> io::Result<(
     writer.write_record(messages::LANE_ACCEPTED, 0, &accepted)?;
     *lock(&session.lane_writer) = Some(writer.clone());
 
-    let outcome = serve_lane(reader, &writer, &session);
+    let outcome = serve_lane(reader, &writer, &session, &shared.scene);
 
     // Losing the lane revokes input and releases held state; it does not end the session.
     lane::confirm_lost(&mut lock(&session.lane), open.lane_generation);
+    revoke_input(&session, grant_reason::LANE_LOSS);
     *lock(&session.lane_writer) = None;
     outcome
+}
+
+/// Answer one `SET_INPUT_BINDING` under the presenter's current eligibility.
+fn apply_input_binding(
+    scene: &SharedScene,
+    session: &Arc<SessionRuntime>,
+    binding: &InputBinding,
+) -> io::Result<Vec<u8>> {
+    let eligibility = input_eligibility(scene, session, binding);
+    let mut grant = lock(&session.grant);
+    let outcome = grant.apply(binding, &eligibility, Instant::now());
+    if outcome.is_err() {
+        // A lower epoch, or the same epoch with different bytes, is `BAD_STATE` (desktop §5.1).
+        return protocol_error(
+            0,
+            messages::ERROR_BAD_STATE,
+            false,
+            "input binding epoch is stale or inconsistent",
+        );
+    }
+    Envelope::new(0, grant.bound_payload(binding.producer_epoch.get()))
+        .encode()
+        .map_err(io::Error::other)
+}
+
+/// Gather the presenter's eligibility for a binding, desktop §5.1.
+fn input_eligibility(
+    scene: &SharedScene,
+    session: &Arc<SessionRuntime>,
+    binding: &InputBinding,
+) -> Eligibility {
+    let identity = session
+        .identity
+        .context(binding.context_id)
+        .ok()
+        .and_then(|context| context.surface(binding.surface_id).ok());
+    let status = identity.and_then(|identity| scene.surface_status(identity));
+    let capability_mask =
+        status.as_ref().and_then(|status| desktop_capability_mask(&status.definition)).unwrap_or(0);
+    let presented = identity.is_some_and(|identity| scene.surface_has_presented(identity));
+    let may_receive_input = lock(&session.contexts)
+        .get(&binding.context_id)
+        .is_some_and(|context| context.operation_classes & OP_DESKTOP_INPUT != 0);
+    Eligibility {
+        // Vivido has no separate consent UI yet, and a window that is presenting is the focus
+        // signal it has; both become real inputs when the desktop window mode grows a UI.
+        focused: true,
+        consented: true,
+        surface_present: status.as_ref().is_some_and(|status| status.lifecycle == 1),
+        surface_generation: status
+            .as_ref()
+            .map(|status| status.generation)
+            .unwrap_or(SurfaceGeneration::ZERO),
+        capability_mask,
+        presented,
+        lane_live: lock(&session.lane).is_some_and(|state| state.live()),
+        may_receive_input,
+    }
+}
+
+/// The input capability mask a `desktop-content-v1` surface declared, desktop §2 key 4.
+fn desktop_capability_mask(definition: &SurfaceDefinition) -> Option<u64> {
+    if definition.semantic_profile != registry::DESKTOP_CONTENT {
+        return None;
+    }
+    DesktopSurfaceParameters::decode(&definition.profile_parameters)
+        .ok()
+        .map(|parameters| parameters.input_capabilities)
+}
+
+/// Revoke a session's grant and tell the producer, if there was one to revoke.
+fn revoke_input(session: &Arc<SessionRuntime>, reason: u64) {
+    let payload = lock(&session.grant).revoke(reason);
+    let Some(payload) = payload else {
+        return;
+    };
+    let surface_id =
+        payload.iter().find(|entry| entry.0 == 3).and_then(|entry| entry.1.as_u64()).unwrap_or(0);
+    let writer = lock(&session.lane_writer).clone();
+    if let Some(writer) = writer
+        && let Ok(body) = Envelope::new(0, payload).encode()
+    {
+        let _ = writer.write_record(messages::INPUT_REVOKED, surface_id, &body);
+    }
+}
+
+/// Send any renewal that has fallen due, desktop §6.
+fn service_input_renewal(session: &Arc<SessionRuntime>) {
+    let renewal = {
+        let mut grant = lock(&session.grant);
+        grant.due_renewal(Instant::now()).and_then(|renewal| grant.renewal_payload(renewal))
+    };
+    let Some(payload) = renewal else {
+        return;
+    };
+    let surface_id =
+        payload.iter().find(|entry| entry.0 == 3).and_then(|entry| entry.1.as_u64()).unwrap_or(0);
+    let writer = lock(&session.lane_writer).clone();
+    if let Some(writer) = writer
+        && let Ok(body) = Envelope::new(0, payload).encode()
+    {
+        let _ = writer.write_record(messages::INPUT_LEASE_RENEW, surface_id, &body);
+    }
 }
 
 fn serve_lane(
     reader: &mut Reader,
     writer: &Arc<Writer>,
     session: &Arc<SessionRuntime>,
+    scene: &SharedScene,
 ) -> io::Result<()> {
     loop {
         let record = match reader.read_record(ConnectionKind::Lane) {
@@ -2814,15 +2992,29 @@ fn serve_lane(
                 writer.write_record(messages::PONG, 0, &body)?;
             },
             messages::PONG | messages::ERROR => {},
+            messages::SET_INPUT_BINDING => {
+                let envelope = messages::decode_control(&record.body)?;
+                let Ok(binding) =
+                    InputBinding::decode(record.object_id, &Value::Map(envelope.payload))
+                else {
+                    return Err(send_fatal(
+                        writer,
+                        envelope.request_id,
+                        messages::ERROR_BAD_MESSAGE,
+                        "invalid SET_INPUT_BINDING",
+                    ));
+                };
+                let body = apply_input_binding(scene, session, &binding)?;
+                writer.write_record(messages::INPUT_BOUND, binding.surface_id, &body)?;
+            },
             _ => {
-                // Input binding and events arrive here. W6 answers them; until then the lane is
-                // proven to carry and reject the right records, and its loss is observable.
-                let _ = session;
+                // Ordinary input events travel presenter-to-producer, so a producer sending one is
+                // a protocol error rather than something to translate.
                 return Err(send_fatal(
                     writer,
                     0,
-                    messages::ERROR_UNSUPPORTED_PROFILE,
-                    "desktop-input-v1 is not yet implemented",
+                    messages::ERROR_BAD_MESSAGE,
+                    "input events travel from the presenter",
                 ));
             },
         }
@@ -4659,6 +4851,42 @@ mod tests {
             read_raw(&mut self.stream)
         }
 
+        fn bind(
+            &mut self,
+            context_id: u64,
+            surface_id: u64,
+            epoch: u64,
+            surface_generation: u64,
+        ) -> io::Result<messages::PayloadMap> {
+            let body = Envelope::new(
+                0,
+                vec![
+                    (0, Value::Unsigned(epoch)),
+                    (1, Value::Unsigned(context_id)),
+                    (2, Value::Unsigned(surface_id)),
+                    (3, Value::Unsigned(surface_generation)),
+                    (4, Value::Unsigned(vivid_protocol::input::INPUT_CLASS_KEYBOARD)),
+                    (5, Value::Unsigned(6)),
+                    (6, Value::Unsigned(vivid_protocol::grant::DEFAULT_WATCHDOG_US)),
+                ],
+            )
+            .encode()
+            .map_err(io::Error::other)?;
+            self.sequence += 1;
+            write_raw(
+                &mut self.stream,
+                self.sequence,
+                messages::SET_INPUT_BINDING,
+                surface_id,
+                &body,
+            )?;
+            let record = self.read()?;
+            if record.record_type != messages::INPUT_BOUND {
+                return Err(io::Error::other("expected INPUT_BOUND"));
+            }
+            Ok(messages::decode_control(&record.body).map_err(io::Error::other)?.payload)
+        }
+
         fn ping(&mut self) -> io::Result<()> {
             let body = Envelope::new(7, Vec::new()).encode().map_err(io::Error::other)?;
             self.send(messages::PING, &body)?;
@@ -4668,6 +4896,207 @@ mod tests {
             }
             Ok(())
         }
+    }
+
+    #[test]
+    fn input_is_denied_until_the_desktop_has_presented_and_revoked_when_the_lane_dies() {
+        // Desktop §5.1: enabling requires milestone 5 on the active video track's current channel
+        // generation. This is the ordering claim the whole vvdesk input story rests on.
+        let service = desktop_service();
+        let mut session = connect_desktop(&service);
+        let context_id = session.info().root_context_id;
+        let mut definition = desktop_surface(context_id, 1920);
+        definition.profile_parameters = vivid_protocol::surface::DesktopSurfaceParameters {
+            captured_origin_x: 0,
+            captured_origin_y: 0,
+            topology: vec![],
+            semantic_generation: 1,
+            input_capabilities: vivid_protocol::input::INPUT_CLASS_KEYBOARD,
+        }
+        .encode();
+        let surface = session.create_surface(definition, &RequestMetadata::default()).unwrap();
+
+        let mut lane = RawLane::open(&service, &session, 1).unwrap();
+        let denied = lane.bind(context_id, surface.id(), 1, 1).unwrap();
+        assert_eq!(
+            denied.iter().find(|entry| entry.0 == 6).and_then(|entry| entry.1.as_u64()),
+            Some(vivid_protocol::grant::STATE_DENIED),
+            "nothing has been presented, so the binding is denied"
+        );
+
+        // Present something, then a strictly greater epoch is granted.
+        present_desktop_video(&service, &mut session, &surface, context_id);
+        let granted = lane.bind(context_id, surface.id(), 2, 1).unwrap();
+        let field = |payload: &messages::PayloadMap, key: u64| {
+            payload.iter().find(|entry| entry.0 == key).and_then(|entry| entry.1.as_u64())
+        };
+        assert_eq!(field(&granted, 6), Some(vivid_protocol::grant::STATE_ENABLED));
+        assert_eq!(
+            field(&granted, 5),
+            Some(vivid_protocol::input::INPUT_CLASS_KEYBOARD),
+            "the grant is narrowed to the surface capability mask"
+        );
+        assert_eq!(field(&granted, 8), Some(vivid_protocol::grant::DEFAULT_WATCHDOG_US));
+
+        // An event now reaches the producer, carrying the complete binding tuple.
+        assert!(service.send_input(vivid_protocol::input::InputEvent::Key {
+            binding: zero_tuple(),
+            usage: 0x04,
+            pressed: true,
+        }));
+        let event = lane.read().unwrap();
+        assert_eq!(event.record_type, messages::KEY_INPUT);
+        let payload = messages::decode_control(&event.body).unwrap().payload;
+        assert_eq!(field(&payload, 0), Some(2), "the producer epoch it was granted under");
+        assert_eq!(field(&payload, 3), Some(surface.id()));
+        assert_eq!(field(&payload, 5), Some(0x04), "the HID usage");
+
+        // Losing the lane revokes the grant and leaves the control session alone.
+        drop(lane);
+        assert!(
+            wait_until(Duration::from_secs(2), || {
+                !service.send_input(vivid_protocol::input::InputEvent::Key {
+                    binding: zero_tuple(),
+                    usage: 0x05,
+                    pressed: true,
+                })
+            }),
+            "lane loss revokes the grant"
+        );
+        assert!(session.query_session().is_ok(), "the control session survives lane loss");
+    }
+
+    #[test]
+    fn a_terminal_window_never_grants_desktop_input() {
+        // A terminal target masks off the input operation class, so the forwarding path in the
+        // keyboard handler is inert for an ordinary window.
+        let service = VividService::start_with_wake(test_geometry(), Arc::new(|| {})).unwrap();
+        let _session = connect(&service);
+        assert!(!service.send_input(vivid_protocol::input::InputEvent::Key {
+            binding: zero_tuple(),
+            usage: 0x04,
+            pressed: true,
+        }));
+    }
+
+    fn zero_tuple() -> vivid_protocol::input::InputTuple {
+        vivid_protocol::input::InputTuple {
+            producer_epoch: vivid_protocol::revision::InputEpoch::ZERO,
+            grant_generation: vivid_protocol::revision::GrantGeneration::ZERO,
+            context_id: 0,
+            surface_id: 0,
+            surface_generation: SurfaceGeneration::ZERO,
+        }
+    }
+
+    /// Activate a primary-video track and mark it presented.
+    ///
+    /// Desktop §5.1 names the *primary-video* slot specifically, so a raster track will not do.
+    /// The decoder and compositor are stood in for with the scene's own milestone seams, which is
+    /// what a renderer would call: a headless test has neither.
+    fn present_desktop_video(
+        service: &VividService,
+        session: &mut vivid_sdk::Session,
+        surface: &vivid_sdk::Surface,
+        context_id: u64,
+    ) {
+        let track = session
+            .create_track(
+                TrackConfiguration {
+                    context_id,
+                    surface_id: surface.id(),
+                    track_id: 41,
+                    slot: scene::SLOT_PRIMARY_VIDEO,
+                    mode: TrackMode::Live,
+                    lane: LaneClass::Bulk,
+                    maximum_record_body: 1 << 16,
+                    maximum_rate_millihertz: 30_000,
+                    maximum_encoded_bits_per_second: 1_000_000,
+                    maximum_records_per_second: 60,
+                    maximum_inflight_body_bytes: 1 << 20,
+                    kind: KindConfiguration::Video(vivid_protocol::track::VideoConfiguration {
+                        codec: "h264".into(),
+                        packetization: "h264-annexb-au-v1".into(),
+                        extradata: Vec::new(),
+                        coded_width: 16,
+                        coded_height: 16,
+                        profile: 77,
+                        level: 10,
+                        maximum_reorder_depth: 0,
+                        color_primaries: 1,
+                        transfer: 1,
+                        matrix: 1,
+                        signal_range: 1,
+                        aspect_numerator: 1,
+                        aspect_denominator: 1,
+                        maximum_access_unit_bytes: 4096,
+                        codec_string: None,
+                        decoder_configuration: None,
+                    }),
+                    target_latency_us: 0,
+                    maximum_latency_us: 1_000_000,
+                    retained_pixel_charge: 0,
+                },
+                &RequestMetadata::default(),
+            )
+            .unwrap();
+        let identity =
+            service.shared.presenter_track(session.info().session_id, context_id, surface.id(), 41);
+        // Stand in for the decoder: a presentation acknowledgement names a frame that exists.
+        service
+            .scene
+            .publish_decoded_frame(
+                identity,
+                ChannelGeneration::ONE,
+                scene::Frame {
+                    frame_id: 1,
+                    pts_us: 0,
+                    width: 2,
+                    height: 2,
+                    sar_num: 1,
+                    sar_den: 1,
+                    alpha_mode: scene::ALPHA_STRAIGHT,
+                    rgba: Arc::from(vec![0xff_u8; 16].into_boxed_slice()),
+                    damage: None,
+                },
+            )
+            .unwrap();
+        service.scene.mark_output_ready(identity, ChannelGeneration::ONE).unwrap();
+        session
+            .create_node(
+                &SceneNode {
+                    owning_context_id: context_id,
+                    node_id: 42,
+                    surface_context_id: context_id,
+                    surface_id: surface.id(),
+                    geometry: vivid_protocol::geometry::NodeGeometry::full_target().encode(),
+                    fit: vivid_sdk::Fit::Contain,
+                    linear_sampling: true,
+                    z_index: 0,
+                    visible: true,
+                    opacity: u16::MAX,
+                    clip: None,
+                },
+                &RequestMetadata::default(),
+            )
+            .unwrap();
+        session
+            .activate_tracks(
+                surface,
+                &[SlotBinding {
+                    slot: scene::SLOT_PRIMARY_VIDEO,
+                    track_id: 41,
+                    expected_channel_generation: ChannelGeneration::ONE,
+                    required_milestone: MILESTONE_OUTPUT_READY,
+                }],
+                &RequestMetadata::default(),
+            )
+            .unwrap();
+        service
+            .scene
+            .mark_presented(identity, ChannelGeneration::ONE, surface.generation(), 1, 0)
+            .unwrap();
+        drop(track);
     }
 
     #[test]

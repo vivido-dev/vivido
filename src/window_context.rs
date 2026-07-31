@@ -502,6 +502,12 @@ impl WindowContext {
 
         let old_is_searching = self.search_state.history_index.is_some();
 
+        // Desktop §4: focus loss revokes the effective input grant, and nothing reinstates it
+        // when focus returns — the producer must issue a strictly greater epoch.
+        if let WinitEvent::WindowEvent { event: WindowEvent::Focused(false), .. } = &event {
+            self.vivid_service.revoke_all_input(vivid_protocol::grant::reason::FOCUS_LOSS);
+        }
+
         let context = ActionContext {
             cursor_blink_timed_out: &mut self.cursor_blink_timed_out,
             prev_bell_cmd: &mut self.prev_bell_cmd,

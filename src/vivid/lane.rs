@@ -50,6 +50,17 @@ pub(crate) struct LaneState {
     admitted_input: bool,
 }
 
+impl LaneState {
+    pub(crate) fn live(&self) -> bool {
+        self.live
+    }
+
+    /// Note that an ordinary input event was admitted, which makes this generation unrepeatable.
+    pub(crate) fn note_input(&mut self) {
+        self.admitted_input = true;
+    }
+}
+
 /// Decide a `LANE_OPEN` against whatever transport the session already had.
 ///
 /// On `Accept` or `Replay` the slot is updated to the admitted transport.
@@ -103,7 +114,7 @@ mod tests {
     fn the_first_open_is_accepted() {
         let mut slot = None;
         assert_eq!(admit(&mut slot, 1, A), Admission::Accept);
-        assert!(slot.unwrap().live);
+        assert!(slot.unwrap().live());
     }
 
     #[test]
@@ -126,7 +137,7 @@ mod tests {
         admit(&mut slot, 1, A);
         confirm_lost(&mut slot, 1);
         assert_eq!(admit(&mut slot, 1, A), Admission::Replay);
-        assert!(slot.unwrap().live, "the replacement transport is live");
+        assert!(slot.unwrap().live(), "the replacement transport is live");
     }
 
     #[test]
@@ -135,7 +146,7 @@ mod tests {
         // producer must reconcile through control and bind again.
         let mut slot = None;
         admit(&mut slot, 1, A);
-        slot.as_mut().unwrap().admitted_input = true;
+        slot.as_mut().unwrap().note_input();
         confirm_lost(&mut slot, 1);
         assert_eq!(admit(&mut slot, 1, A), Admission::Refused);
     }
@@ -152,11 +163,11 @@ mod tests {
     fn a_greater_generation_replaces_and_clears_the_input_flag() {
         let mut slot = None;
         admit(&mut slot, 1, A);
-        slot.as_mut().unwrap().admitted_input = true;
+        slot.as_mut().unwrap().note_input();
         assert_eq!(admit(&mut slot, 2, B), Admission::Accept);
         let state = slot.unwrap();
         assert_eq!(state.generation, 2);
-        assert!(state.live);
+        assert!(state.live());
     }
 
     #[test]
@@ -173,7 +184,7 @@ mod tests {
         admit(&mut slot, 1, A);
         admit(&mut slot, 2, B);
         confirm_lost(&mut slot, 1);
-        assert!(slot.unwrap().live, "generation two is still the live transport");
+        assert!(slot.unwrap().live(), "generation two is still the live transport");
     }
 
     #[test]
