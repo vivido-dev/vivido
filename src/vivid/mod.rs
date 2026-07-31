@@ -3,6 +3,7 @@
 mod actor;
 mod audio;
 mod decoder;
+mod lease;
 pub mod scene;
 pub mod target;
 mod transport;
@@ -29,7 +30,7 @@ use vivid_protocol::anchor::{self, AnchorKey};
 use vivid_protocol::auth::{self, Secret32};
 use vivid_protocol::cbor::Value;
 use vivid_protocol::context::{
-    ContextDefinition, ContextState, OP_SURFACE_TRACK_MEDIA, OP_TERMINAL_ANCHOR,
+    ContextDefinition, ContextState, OP_DELEGATE, OP_SURFACE_TRACK_MEDIA, OP_TERMINAL_ANCHOR,
 };
 use vivid_protocol::identity::{
     AnchorIdentity, ContextIdentity, PresenterInstanceId, SessionIdentity, SurfaceIdentity,
@@ -60,6 +61,7 @@ use crate::terminal::term::{ResizePoint, Term};
 use crate::vivid::actor::{AdmissionError, Egress, Pending, PendingSet};
 use crate::vivid::audio::{AudioOutput, supports as supports_audio};
 use crate::vivid::decoder::Decoder;
+use crate::vivid::lease::{Lease, LeaseKey, LeaseTable, profile_fingerprint, reason};
 use crate::vivid::scene::{
     CommitRejection, Frame, SceneStatus, SharedScene, SurfaceStatus, TrackStatus,
     TrackWaitEvaluation, TrackWaitSatisfied,
@@ -67,6 +69,7 @@ use crate::vivid::scene::{
 pub use crate::vivid::target::DisplayGeometry;
 use crate::vivid::target::{DesktopTarget, PresentationTarget, TerminalTarget};
 use crate::vivid::transport::{ReadShutdown, Reader, Writer};
+use vivid_protocol::lease::{AttemptDecision, SessionLeaseDefinition};
 
 #[cfg(windows)]
 type LocalListener = TcpListener;
@@ -85,6 +88,8 @@ const CHANNEL_FLOW_BYTES: u64 = 8 * 1024 * 1024;
 const CHANNEL_FLOW_RECORDS: u64 = 128;
 const CHANNEL_OPEN_DEADLINE_US: u64 = 30_000_000;
 const MAX_SCENE_NODES: usize = 256;
+const MAX_LEASES: usize = 32;
+const MAX_STATUS_ENTRIES: usize = 64;
 
 struct SessionRuntime {
     identity: SessionIdentity,
@@ -95,12 +100,15 @@ struct SessionRuntime {
     writer: Arc<Writer>,
     contexts: Mutex<HashMap<u64, ContextState>>,
     seen_anchors: Mutex<HashSet<(u64, u64)>>,
+    /// The lease this session was activated from, if it is a leased child rather than a root.
+    lease: Option<LeaseKey>,
 }
 
 #[derive(Default)]
 struct Registry {
     sessions: HashMap<u64, Arc<SessionRuntime>>,
     channel_opens: HashMap<TrackIdentity, ChannelOpenState>,
+    leases: LeaseTable,
 }
 
 struct ServiceShared {
@@ -566,6 +574,7 @@ fn actor_loop(
         if !pending.is_empty() {
             pending.service(&shared.scene, &egress, &mut cancelled, Instant::now());
         }
+        expire_leases(&shared, &session);
     }
     egress.close();
     // Release the reader, which is parked on a peer that has no obligation to close promptly.
@@ -600,7 +609,73 @@ fn dispatch_and_reply(
     }
 }
 
+/// Drop leases whose activation deadline passed, releasing their reserved capacity.
+fn expire_leases(shared: &Arc<ServiceShared>, issuer: &Arc<SessionRuntime>) {
+    let now = Instant::now();
+    let expired = {
+        let registry = lock(&shared.registry);
+        registry
+            .leases
+            .expired(now)
+            .into_iter()
+            .filter(|key| key.0 == issuer.identity)
+            .collect::<Vec<_>>()
+    };
+    for key in expired {
+        revoke_lease(shared, issuer, key, reason::ACTIVATION_EXPIRY);
+    }
+}
+
+/// Revoke one lease and tear down whatever it delegated, returning its final state.
+///
+/// Security §4.3: revocation is synchronous, closes the child's transports, releases the
+/// subtree's reservations, and touches nothing outside it.
+fn revoke_lease(
+    shared: &Arc<ServiceShared>,
+    issuer: &Arc<SessionRuntime>,
+    key: LeaseKey,
+    reason: u64,
+) -> Option<()> {
+    let mut registry = lock(&shared.registry);
+    let mut lease = registry.leases.remove(&key)?;
+    let _ = lease.machine.revoke();
+    let child = lease.child.take();
+    let payload = lease.changed_payload(key.1, key.2, reason, Instant::now());
+    let child_runtime = child.and_then(|child| registry.sessions.remove(&child.session_id));
+    drop(registry);
+
+    // Release the capacity the lease held back from its owning context.
+    if let Ok(mut contexts) = issuer.contexts.lock()
+        && let Some(context) = contexts.get_mut(&key.1)
+    {
+        let _ = context.release_child(&lease.contract);
+    }
+    if let Some(child) = child {
+        shared.scene.remove_session(child);
+    }
+    drop(child_runtime);
+
+    if let Ok(body) = Envelope::new(0, payload).encode() {
+        let _ = issuer.writer.write_record(messages::SESSION_LEASE_CHANGED, key.2, &body);
+    }
+    (shared.wake)();
+    Some(())
+}
+
 fn finish_session(shared: &Arc<ServiceShared>, session: &Arc<SessionRuntime>, clean: bool) {
+    // Parent cleanup: a session's leases and their children go with it (security §4.3).
+    let issued = lock(&shared.registry).leases.issued_by(session.identity);
+    for key in issued {
+        revoke_lease(shared, session, key, reason::PARENT_CLEANUP);
+    }
+    // A leased child closing releases its own lease back to the issuer.
+    if let Some(key) = session.lease {
+        let issuer = lock(&shared.registry).sessions.get(&key.0.session_id).cloned();
+        if let Some(issuer) = issuer {
+            let reason = if clean { reason::CLEAN_CLOSE } else { reason::UNCLEAN_LOSS };
+            revoke_lease(shared, &issuer, key, reason);
+        }
+    }
     lock(&shared.registry).sessions.remove(&session.identity.session_id);
     let removed_audio = {
         let mut outputs = lock(&shared.audio_outputs);
@@ -622,6 +697,23 @@ fn finish_session(shared: &Arc<ServiceShared>, session: &Arc<SessionRuntime>, cl
     (shared.wake)();
 }
 
+/// Who a control connection authenticated as.
+enum Principal {
+    /// The window's own root secret.
+    Root,
+    /// A controller-minted lease, which delegates one child logical session to one context.
+    Lease { key: LeaseKey, secret: Secret32, attempt_id: [u8; 16] },
+}
+
+fn fail_authentication(writer: &Arc<Writer>, request_id: u64, diagnostic: &str) -> io::Error {
+    // Uniform response and diagnostic: which of "no such lease" and "wrong secret" happened is
+    // not something an unauthenticated caller gets to learn.
+    if let Ok(body) = protocol_error(request_id, messages::ERROR_AUTH_FAILED, true, diagnostic) {
+        let _ = writer.write_record(messages::ERROR, 0, &body);
+    }
+    io::Error::new(ErrorKind::PermissionDenied, diagnostic.to_owned())
+}
+
 fn establish_root_session(
     shared: &Arc<ServiceShared>,
     writer: Arc<Writer>,
@@ -629,39 +721,45 @@ fn establish_root_session(
     hello: &Hello,
     request_id: u64,
 ) -> io::Result<Arc<SessionRuntime>> {
-    let proof = match &hello.authentication {
-        HelloAuthentication::Root { proof } => proof,
-        _ => {
-            writer.write_record(
-                messages::ERROR,
-                0,
-                &protocol_error(
-                    request_id,
-                    messages::ERROR_AUTH_FAILED,
-                    true,
-                    "Vivido accepts root authentication only on a new terminal control session",
-                )?,
-            )?;
-            return Err(io::Error::new(
-                ErrorKind::PermissionDenied,
-                "unsupported session authentication",
+    // Root authentication proves possession of the window's secret; a lease activation proves
+    // possession of a secret the controller minted and the presenter only ever saw hashed.
+    let principal = match &hello.authentication {
+        HelloAuthentication::Root { proof } => {
+            let authless = hello.authless_payload()?;
+            if !auth::verify_root_hello_proof(&shared.root_secret, preface, &authless, proof) {
+                return Err(fail_authentication(&writer, request_id, "root authentication failed"));
+            }
+            Principal::Root
+        },
+        HelloAuthentication::LeaseActivation {
+            context_id,
+            lease_id,
+            activation_secret,
+            attempt_id,
+            ..
+        } => {
+            let found = lock(&shared.registry).leases.find_activation(
+                *context_id,
+                *lease_id,
+                activation_secret,
+            );
+            let Some(key) = found else {
+                return Err(fail_authentication(&writer, request_id, "lease activation failed"));
+            };
+            Principal::Lease {
+                key,
+                secret: Secret32::new(*activation_secret.expose()),
+                attempt_id: *attempt_id,
+            }
+        },
+        HelloAuthentication::Resume { .. } => {
+            return Err(fail_authentication(
+                &writer,
+                request_id,
+                "Vivido does not yet resume a suspended lease",
             ));
         },
     };
-    let authless = hello.authless_payload()?;
-    if !auth::verify_root_hello_proof(&shared.root_secret, preface, &authless, proof) {
-        writer.write_record(
-            messages::ERROR,
-            0,
-            &protocol_error(
-                request_id,
-                messages::ERROR_AUTH_FAILED,
-                true,
-                "root authentication failed",
-            )?,
-        )?;
-        return Err(io::Error::new(ErrorKind::PermissionDenied, "root authentication failed"));
-    }
     let target = shared.scene.target().clone();
     if hello.target_profile != target.profile_name() {
         return Err(send_fatal(
@@ -711,12 +809,46 @@ fn establish_root_session(
     let mut session_tag = [0_u8; messages::SESSION_TAG_BYTES];
     getrandom::fill(&mut server_nonce).map_err(io::Error::other)?;
     getrandom::fill(&mut session_tag).map_err(io::Error::other)?;
-    let prk = auth::extract_handshake_prk(
-        &shared.root_secret,
-        &hello.client_nonce,
-        &server_nonce,
-        &[0; 32],
-    );
+
+    // A leased child runs as the lease's context, with the capacity that lease reserved.
+    let (session_secret, contract, classes, authentication_kind) = match &principal {
+        Principal::Root => (
+            Secret32::new(*shared.root_secret.expose()),
+            presenter_contract(),
+            target.root_operation_classes(),
+            messages::AUTHENTICATION_ROOT,
+        ),
+        Principal::Lease { key, secret, .. } => {
+            let (contract, classes) = {
+                let lease = registry
+                    .leases
+                    .get_mut(key)
+                    .ok_or_else(|| io::Error::other("lease disappeared during activation"))?;
+                if !lease
+                    .definition
+                    .permitted_profiles
+                    .iter()
+                    .all(|permitted| supported.contains(&permitted.as_str()))
+                {
+                    return Err(fail_authentication(
+                        &writer,
+                        request_id,
+                        "lease permits a profile this target does not implement",
+                    ));
+                }
+                (lease.contract.clone(), lease.classes)
+            };
+            (
+                Secret32::new(*secret.expose()),
+                contract,
+                classes,
+                messages::AUTHENTICATION_LEASE_ACTIVATION,
+            )
+        },
+    };
+
+    let prk =
+        auth::extract_handshake_prk(&session_secret, &hello.client_nonce, &server_nonce, &[0; 32]);
     let (keys, anchor_key) = auth::derive_session_keys(&prk, session_id, 0, &session_tag);
 
     let mut welcome = Welcome {
@@ -732,20 +864,77 @@ fn establish_root_session(
             .min(vivid_protocol::CONTROL_MAX_RECORD_BODY),
         server_nonce,
         authentication: WelcomeAuthentication {
-            kind: messages::AUTHENTICATION_ROOT,
+            kind: authentication_kind,
             confirmation: [0; 32],
-            lease_state: 0,
+            // A leased child is `ACTIVE` by the time it reads its own `WELCOME`; a root session
+            // has no lease state at all.
+            lease_state: match &principal {
+                Principal::Root => 0,
+                Principal::Lease { .. } => vivid_protocol::lease::LeaseState::Active as u64,
+            },
             activation_attempt_status: 0,
         },
         session_revision: 1,
         scene_revision: 0,
-        resource_contract: presenter_contract(),
+        resource_contract: contract.clone(),
         establishment_state: 0,
         resume_generation: 0,
         extensions: vec![],
     };
     welcome.confirm(&prk)?;
-    writer.write_record(messages::WELCOME, 0, &welcome.encode(request_id)?)?;
+    let welcome_body = welcome.encode(request_id)?;
+
+    // Security §6.4: an exact retry of a lost `WELCOME` returns the same session ID, server
+    // nonce, and bytes, and concurrent attempts have exactly one winner.
+    let (session_id, session_tag, keys, anchor_key, welcome_body) = match &principal {
+        Principal::Root => (session_id, session_tag, keys, anchor_key, welcome_body),
+        Principal::Lease { key, attempt_id, .. } => {
+            let fingerprint =
+                profile_fingerprint(target.profile_name(), &welcome.accepted_profiles);
+            let lease = registry
+                .leases
+                .get_mut(key)
+                .ok_or_else(|| io::Error::other("lease disappeared during activation"))?;
+            let decision = lease
+                .machine
+                .begin_activation(
+                    *attempt_id,
+                    hello.client_nonce,
+                    &hello.authless_payload()?,
+                    fingerprint,
+                    session_id,
+                    server_nonce,
+                    welcome_body,
+                )
+                .map_err(|_| {
+                    io::Error::new(ErrorKind::PermissionDenied, "lease activation was refused")
+                })?;
+            let (decided_session, decided_nonce, decided_welcome) = match decision {
+                AttemptDecision::Fresh { session_id, server_nonce, welcome }
+                | AttemptDecision::ExactReplay { session_id, server_nonce, welcome } => {
+                    (session_id, server_nonce, welcome)
+                },
+            };
+            lease.machine.commit_welcome().ok();
+            lease.child = Some(
+                SessionIdentity::new(shared.presenter, decided_session)
+                    .map_err(io::Error::other)?,
+            );
+            // A replay reuses the original nonce, so the derived keys match the first attempt's.
+            let prk = auth::extract_handshake_prk(
+                &session_secret,
+                &hello.client_nonce,
+                &decided_nonce,
+                &[0; 32],
+            );
+            let (keys, anchor_key) =
+                auth::derive_session_keys(&prk, decided_session, 0, &session_tag);
+            (decided_session, session_tag, keys, anchor_key, decided_welcome)
+        },
+    };
+    let identity = SessionIdentity::new(shared.presenter, session_id).map_err(io::Error::other)?;
+    let root_context = identity.context(root_context.context_id).map_err(io::Error::other)?;
+    writer.write_record(messages::WELCOME, 0, &welcome_body)?;
     let runtime = Arc::new(SessionRuntime {
         identity,
         root_context,
@@ -755,15 +944,14 @@ fn establish_root_session(
         writer,
         contexts: Mutex::new(HashMap::from([(
             root_context.context_id,
-            ContextState::root(
-                identity,
-                root_context.context_id,
-                target.root_operation_classes(),
-                presenter_contract(),
-            )
-            .map_err(io::Error::other)?,
+            ContextState::root(identity, root_context.context_id, classes, contract)
+                .map_err(io::Error::other)?,
         )])),
         seen_anchors: Mutex::new(HashSet::new()),
+        lease: match &principal {
+            Principal::Root => None,
+            Principal::Lease { key, .. } => Some(*key),
+        },
     });
     shared
         .scene
@@ -793,22 +981,35 @@ fn dispatch_control(
     let reply = match record.record_type {
         messages::PING => (messages::PONG, 0, Envelope::new(request_id, envelope.payload).encode()),
         messages::GOODBYE => (messages::OK, 0, Ok(messages::ok(request_id))),
-        messages::QUERY_SESSION => (
-            messages::SESSION_STATUS,
-            0,
-            Envelope::new(
-                request_id,
-                vec![
-                    (0, Value::Unsigned(session.identity.session_id)),
-                    (1, Value::Bytes(session.session_tag.to_vec())),
-                    (2, Value::Unsigned(session.root_context.context_id)),
-                    (3, Value::Unsigned(shared.scene.target().generation())),
-                    (4, Value::Unsigned(1)),
-                    (5, Value::Unsigned(0)),
-                ],
+        messages::QUERY_SESSION => {
+            // Core §10's schema, which is what a producer reconciles against after resume. The
+            // previous payload described the session's identity rather than its revisions, so it
+            // could not serve that purpose at all.
+            let summaries =
+                shared.scene.session_revision_summary(session.identity, MAX_STATUS_ENTRIES);
+            let scene_revision = shared.scene.scene_revision(session.identity);
+            (
+                messages::SESSION_STATUS,
+                0,
+                Envelope::new(
+                    request_id,
+                    vec![
+                        (0, Value::Unsigned(summaries.session_revision)),
+                        (1, Value::Unsigned(scene_revision)),
+                        (2, Value::Unsigned(shared.scene.target().generation())),
+                        // Establishment state: active. Vivido does not suspend a session yet, so
+                        // it is never `suspended` here.
+                        (3, Value::Unsigned(1)),
+                        (4, Value::Unsigned(session.lease.map(|_| 0).unwrap_or(0))),
+                        // Input is disabled until `desktop-input-v1` lands.
+                        (5, Value::Bool(true)),
+                        (6, Value::Array(summaries.entries)),
+                        (8, shared.scene.resource_usage(session.identity)),
+                    ],
+                )
+                .encode(),
             )
-            .encode(),
-        ),
+        },
         messages::CREATE_CONTEXT => {
             let definition = ContextDefinition::decode(record.object_id, &value)
                 .map_err(|_| ControlError::bad_message("invalid context schema"))?;
@@ -846,6 +1047,76 @@ fn dispatch_control(
                 )
                 .encode(),
             )
+        },
+        messages::CREATE_SESSION_LEASE => {
+            let definition = SessionLeaseDefinition::decode(&value)
+                .map_err(|_| ControlError::bad_message("invalid session lease schema"))?;
+            if definition.lease_id != record.object_id {
+                return Err(ControlError::bad_message(
+                    "lease object ID does not match its payload",
+                ));
+            }
+            require_context_operation(session, definition.context_id, OP_DELEGATE)?;
+            // Permitted profiles form a closed set, and this target has to implement all of them.
+            let supported = shared.scene.target().supported_profiles();
+            if definition
+                .permitted_profiles
+                .iter()
+                .any(|profile| !supported.contains(&profile.as_str()))
+            {
+                return Err(ControlError::unsupported(
+                    "lease permits a profile this target does not implement",
+                ));
+            }
+            let key = (session.identity, definition.context_id, definition.lease_id);
+            let mut registry = lock(&shared.registry);
+            if registry.leases.contains(&key) {
+                return Err(ControlError::duplicate("lease identity is already live"));
+            }
+            if registry.leases.len() >= MAX_LEASES {
+                return Err(ControlError::limit("lease capacity is exhausted"));
+            }
+            // Capacity delegated to a live child is reserved, not merely checked, so a sibling
+            // cannot be handed the same capacity (security §4.3).
+            let (classes, contract) = {
+                let mut contexts = lock(&session.contexts);
+                let parent = contexts
+                    .get_mut(&definition.context_id)
+                    .ok_or_else(|| ControlError::not_found("lease context is absent"))?;
+                let request = ContextDefinition {
+                    context_id: definition.lease_id,
+                    parent_context_id: definition.context_id,
+                    operation_classes: parent.operation_classes,
+                    label: String::new(),
+                    lifetime_us: 0,
+                    requested_contract: definition.requested_contract.clone(),
+                };
+                parent
+                    .reserve_child(&request, &presenter_contract())
+                    .map_err(|_| ControlError::limit("context capacity is exhausted"))?
+            };
+            let lease = Lease::new(definition.clone(), contract, classes, Instant::now());
+            let payload = lease.ready_payload(definition.context_id, definition.lease_id);
+            registry.leases.insert(key, lease);
+            drop(registry);
+            (
+                messages::SESSION_LEASE_READY,
+                definition.lease_id,
+                Envelope::new(request_id, payload).encode(),
+            )
+        },
+        messages::REVOKE_SESSION_LEASE => {
+            let map = StrictMap::new("REVOKE_SESSION_LEASE", &value, &[0, 1])
+                .map_err(|_| ControlError::bad_message("invalid lease revoke"))?;
+            let context_id =
+                map.required_u64(0).map_err(|_| ControlError::bad_message("missing context ID"))?;
+            let lease_id =
+                map.required_u64(1).map_err(|_| ControlError::bad_message("missing lease ID"))?;
+            require_context_operation(session, context_id, OP_DELEGATE)?;
+            let key = (session.identity, context_id, lease_id);
+            revoke_lease(shared, session, key, reason::EXPLICIT_REVOKE)
+                .ok_or_else(|| ControlError::not_found("lease does not exist"))?;
+            (messages::OK, record.object_id, Ok(messages::ok(request_id)))
         },
         messages::REVOKE_CONTEXT => {
             let map = StrictMap::new("REVOKE_CONTEXT", &value, &[0, 1])
@@ -2451,6 +2722,10 @@ impl ControlError {
         Self { code: messages::ERROR_UNSUPPORTED_CONFIG, message }
     }
 
+    const fn duplicate(message: &'static str) -> Self {
+        Self { code: messages::ERROR_DUPLICATE_ID, message }
+    }
+
     const fn limit(message: &'static str) -> Self {
         Self { code: messages::ERROR_LIMIT_EXCEEDED, message }
     }
@@ -3330,6 +3605,204 @@ mod tests {
             reason & vivid_protocol::target::reason::VIRTUAL_BOUNDS != 0,
             "a resize changes the virtual bounds"
         );
+    }
+
+    fn lease_definition(
+        context_id: u64,
+        lease_id: u64,
+        secret: &Secret32,
+    ) -> SessionLeaseDefinition {
+        SessionLeaseDefinition {
+            context_id,
+            lease_id,
+            activation_verifier: auth::activation_verifier(lease_id, secret),
+            activation_timeout_us: 20_000_000,
+            requested_disconnect_grace_us: 0,
+            cleanup_policy: vivid_protocol::lease::CleanupPolicy::Immediate,
+            permitted_profiles: {
+                let mut profiles =
+                    vec![registry::CORE_CONTROL.to_owned(), registry::TERMINAL_SURFACE.to_owned()];
+                profiles.sort();
+                profiles
+            },
+            requested_contract: presenter_contract(),
+            client_public_key: None,
+        }
+    }
+
+    fn activate(
+        service: &VividService,
+        context_id: u64,
+        lease_id: u64,
+        secret: &Secret32,
+    ) -> io::Result<vivid_sdk::Session> {
+        vivid_sdk::Session::connect(ProducerConfig {
+            endpoint_control: Some(service.control_endpoint().to_owned()),
+            authentication: ProducerAuthentication::LeaseActivation {
+                context_id,
+                lease_id,
+                activation_secret: Secret32::new(*secret.expose()),
+                attempt_id: [0x77; 16],
+                proof_of_possession: None,
+            },
+            ..ProducerConfig::default()
+        })
+    }
+
+    #[test]
+    fn a_lease_reply_carries_no_secret_and_activates_a_child_session() {
+        let service = VividService::start_with_wake(test_geometry(), Arc::new(|| {})).unwrap();
+        let mut controller = connect(&service);
+        let context_id = controller.info().root_context_id;
+        let secret = Secret32::new([0x5c; 32]);
+
+        let ready = controller
+            .create_session_lease(
+                &lease_definition(context_id, 3, &secret),
+                &RequestMetadata::default(),
+            )
+            .unwrap();
+        assert_eq!(ready.lease_id, 3);
+        assert_eq!(ready.state, vivid_protocol::lease::LeaseState::Issued as u64);
+
+        // Security §6.2: the presenter only ever received a verifier, so the child authenticates
+        // with a secret the presenter cannot have leaked back.
+        let child = activate(&service, context_id, 3, &secret).unwrap();
+        assert_eq!(child.info().target_profile, registry::TERMINAL_SURFACE);
+        assert_ne!(
+            child.info().session_id,
+            controller.info().session_id,
+            "a lease activates a distinct logical session"
+        );
+    }
+
+    #[test]
+    fn a_wrong_activation_secret_is_refused() {
+        let service = VividService::start_with_wake(test_geometry(), Arc::new(|| {})).unwrap();
+        let mut controller = connect(&service);
+        let context_id = controller.info().root_context_id;
+        let secret = Secret32::new([0x11; 32]);
+        controller
+            .create_session_lease(
+                &lease_definition(context_id, 4, &secret),
+                &RequestMetadata::default(),
+            )
+            .unwrap();
+
+        assert!(
+            activate(&service, context_id, 4, &Secret32::new([0x12; 32])).is_err(),
+            "a near-miss secret must not activate"
+        );
+        assert!(
+            activate(&service, context_id, 9, &secret).is_err(),
+            "the lease ID is bound into the verifier"
+        );
+        // The real secret still works afterwards: a failed attempt must not consume the lease.
+        assert!(activate(&service, context_id, 4, &secret).is_ok());
+    }
+
+    #[test]
+    fn revoking_a_lease_closes_only_its_child() {
+        let service = VividService::start_with_wake(test_geometry(), Arc::new(|| {})).unwrap();
+        let mut controller = connect(&service);
+        let context_id = controller.info().root_context_id;
+        let first = Secret32::new([0x21; 32]);
+        let second = Secret32::new([0x22; 32]);
+        for (lease_id, secret) in [(5, &first), (6, &second)] {
+            controller
+                .create_session_lease(
+                    &lease_definition(context_id, lease_id, secret),
+                    &RequestMetadata::default(),
+                )
+                .unwrap();
+        }
+        let kept = activate(&service, context_id, 6, &second).unwrap();
+        let _doomed = activate(&service, context_id, 5, &first).unwrap();
+
+        controller.revoke_session_lease(context_id, 5, &RequestMetadata::default()).unwrap();
+
+        // The surviving child still answers, and the revoked one's session is gone.
+        assert!(kept.query_session().is_ok(), "an unrelated lease must be untouched");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while lock(&service.shared.registry).sessions.len() > 2 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            lock(&service.shared.registry).sessions.len(),
+            2,
+            "only the controller and the surviving child remain"
+        );
+    }
+
+    #[test]
+    fn closing_the_issuer_takes_its_leases_with_it() {
+        // Security §4.3: parent cleanup removes only that subtree.
+        let service = VividService::start_with_wake(test_geometry(), Arc::new(|| {})).unwrap();
+        let mut controller = connect(&service);
+        let context_id = controller.info().root_context_id;
+        let secret = Secret32::new([0x31; 32]);
+        controller
+            .create_session_lease(
+                &lease_definition(context_id, 7, &secret),
+                &RequestMetadata::default(),
+            )
+            .unwrap();
+        controller.close().unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while lock(&service.shared.registry).leases.len() > 0 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(lock(&service.shared.registry).leases.len(), 0);
+        assert!(
+            activate(&service, context_id, 7, &secret).is_err(),
+            "a lease cannot outlive the session that issued it"
+        );
+    }
+
+    #[test]
+    fn session_status_reports_revisions_a_producer_can_reconcile_against() {
+        // Core §10, and the reason the previous payload was unusable: it described identity
+        // rather than revisions, so nothing could be compared after a resume.
+        let service = VividService::start_with_wake(test_geometry(), Arc::new(|| {})).unwrap();
+        let mut session = connect(&service);
+        let context_id = session.info().root_context_id;
+        session
+            .create_surface(
+                SurfaceDefinition {
+                    context_id,
+                    surface_id: 21,
+                    semantic_profile: registry::TERMINAL_CONTENT.into(),
+                    coordinate_model: CoordinateModel::TerminalContentCells,
+                    logical_width: 2,
+                    logical_height: 2,
+                    scale_numerator: 1,
+                    scale_denominator: 1,
+                    rotation: 0,
+                    descriptor: SurfaceDescriptor {
+                        role: SurfaceRole::Figure,
+                        title: "status".into(),
+                        semantic_content_revision: 1,
+                        semantic_availability: 0,
+                        locator_hint: String::new(),
+                    },
+                    policy: 0,
+                    profile_parameters: vec![],
+                },
+                &RequestMetadata::default(),
+            )
+            .unwrap();
+
+        let status = session.query_session().unwrap();
+        let field = |key: u64| status.iter().find(|entry| entry.0 == key).map(|entry| &entry.1);
+        assert!(field(0).and_then(|value| value.as_u64()).is_some(), "session revision");
+        assert_eq!(field(2).and_then(|value| value.as_u64()), Some(1), "target generation");
+        assert_eq!(field(3).and_then(|value| value.as_u64()), Some(1), "establishment: active");
+        assert_eq!(field(5).and_then(|value| value.as_bool()), Some(true), "input disabled");
+        let Some(Value::Array(entries)) = field(6) else {
+            panic!("SESSION_STATUS must carry bounded object summaries")
+        };
+        assert_eq!(entries.len(), 1, "the one surface this session owns");
     }
 
     #[test]

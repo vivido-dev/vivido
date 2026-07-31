@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
+use vivid_protocol::cbor::Value;
 use vivid_protocol::identity::{
     AnchorIdentity, ContextIdentity, NodeIdentity, SessionIdentity, SurfaceIdentity, TrackIdentity,
 };
@@ -102,6 +103,12 @@ pub struct SceneNodeStatus {
 }
 
 #[derive(Debug, Clone)]
+/// Bounded revision summaries plus their aggregate, for `SESSION_STATUS`.
+pub struct SessionRevisionSummary {
+    pub session_revision: u64,
+    pub entries: Vec<Value>,
+}
+
 pub struct SceneStatus {
     pub session: SessionIdentity,
     pub revision: SceneRevision,
@@ -1352,6 +1359,67 @@ impl SharedScene {
         let revision = scene.revision;
         self.0.changed.notify_all();
         Ok(revision)
+    }
+
+    /// Bounded per-object revision summaries for `SESSION_STATUS` key 6.
+    ///
+    /// Core §10 makes this a producer's reconciliation root after resume: it compares context,
+    /// surface, track, and active-slot revisions against what it retained.
+    pub fn session_revision_summary(
+        &self,
+        session: SessionIdentity,
+        maximum: usize,
+    ) -> SessionRevisionSummary {
+        let state = self.lock();
+        let mut entries = Vec::new();
+        let mut session_revision = 0_u64;
+        for (identity, surface) in &state.surfaces {
+            if identity.context.session != session || entries.len() >= maximum {
+                continue;
+            }
+            session_revision = session_revision.saturating_add(surface.revision.get());
+            let tracks = state
+                .tracks
+                .iter()
+                .filter(|(key, _)| key.surface == *identity)
+                .map(|(key, track)| {
+                    Value::Map(vec![
+                        (0, Value::Unsigned(key.track_id)),
+                        (1, Value::Unsigned(track.state.revision.get())),
+                        (2, Value::Unsigned(track.state.channel_generation.get())),
+                    ])
+                })
+                .collect::<Vec<_>>();
+            entries.push(Value::Map(vec![
+                (0, Value::Unsigned(identity.context.context_id)),
+                (1, Value::Unsigned(identity.surface_id)),
+                (2, Value::Unsigned(surface.revision.get())),
+                (3, Value::Unsigned(surface.generation.get())),
+                (4, Value::Unsigned(surface.lifecycle)),
+                (5, Value::Array(tracks)),
+            ]));
+        }
+        SessionRevisionSummary { session_revision, entries }
+    }
+
+    /// The session's current scene revision.
+    pub fn scene_revision(&self, session: SessionIdentity) -> u64 {
+        self.lock().scenes.get(&session).map(|scene| scene.revision.get()).unwrap_or(0)
+    }
+
+    /// Aggregate resource use for `SESSION_STATUS` key 8.
+    pub fn resource_usage(&self, session: SessionIdentity) -> Value {
+        let state = self.lock();
+        let surfaces =
+            state.surfaces.keys().filter(|key| key.context.session == session).count() as u64;
+        let tracks =
+            state.tracks.keys().filter(|key| key.surface.context.session == session).count() as u64;
+        let nodes = state.scenes.get(&session).map(|scene| scene.nodes.len() as u64).unwrap_or(0);
+        Value::Map(vec![
+            (0, Value::Unsigned(surfaces)),
+            (1, Value::Unsigned(tracks)),
+            (2, Value::Unsigned(nodes)),
+        ])
     }
 
     pub fn scene_status(&self, session: SessionIdentity, maximum_nodes: usize) -> SceneStatus {
