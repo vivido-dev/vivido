@@ -2,6 +2,7 @@
 
 mod actor;
 mod audio;
+mod clock;
 mod decoder;
 pub(crate) mod hid;
 mod lane;
@@ -1124,7 +1125,8 @@ fn establish_root_session(
     getrandom::fill(&mut session_tag).map_err(io::Error::other)?;
 
     // A leased child runs as the lease's context, with the capacity that lease reserved.
-    let (session_secret, contract, classes, authentication_kind) = match &principal {
+    let web_carrier = accepted.iter().any(|profile| profile == registry::WEB_CARRIER);
+    let (session_secret, mut contract, classes, authentication_kind) = match &principal {
         Principal::Root => (
             Secret32::new(*shared.root_secret.expose()),
             presenter_contract(),
@@ -1173,6 +1175,9 @@ fn establish_root_session(
             )
         },
     };
+    if web_carrier {
+        clamp_contract_for_web(&mut contract);
+    }
 
     let prk =
         auth::extract_handshake_prk(&session_secret, &hello.client_nonce, &server_nonce, &[0; 32]);
@@ -1187,9 +1192,11 @@ fn establish_root_session(
         target_profile: target.profile_name().into(),
         target_descriptor: target.descriptor(),
         accepted_profiles: accepted,
-        maximum_control_body: hello
-            .maximum_control_body
-            .min(vivid_protocol::CONTROL_MAX_RECORD_BODY),
+        maximum_control_body: hello.maximum_control_body.min(if web_carrier {
+            vivid_protocol::web::MAX_CONTROL_RECORD_BODY
+        } else {
+            vivid_protocol::CONTROL_MAX_RECORD_BODY
+        }),
         server_nonce,
         authentication: WelcomeAuthentication {
             kind: authentication_kind,
@@ -3025,7 +3032,7 @@ fn apply_input_binding(
 ) -> io::Result<Vec<u8>> {
     let eligibility = input_eligibility(scene, session, binding);
     let mut grant = lock(&session.grant);
-    let outcome = grant.apply(binding, &eligibility, Instant::now());
+    let outcome = grant.apply(binding, &eligibility, clock::now());
     if outcome.is_err() {
         // A lower epoch, or the same epoch with different bytes, is `BAD_STATE` (desktop §5.1).
         return protocol_error(
@@ -3105,7 +3112,7 @@ fn revoke_input(session: &Arc<SessionRuntime>, reason: u64) {
 fn service_input_renewal(session: &Arc<SessionRuntime>) {
     let renewal = {
         let mut grant = lock(&session.grant);
-        grant.due_renewal(Instant::now()).and_then(|renewal| grant.renewal_payload(renewal))
+        grant.due_renewal(clock::now()).and_then(|renewal| grant.renewal_payload(renewal))
     };
     let Some(payload) = renewal else {
         return;
@@ -3472,6 +3479,21 @@ pub(crate) fn protocol_error(
     }
     .encode()
     .map_err(io::Error::other)
+}
+
+/// Reduce a session contract to what a browser carrier can actually deliver, web §5.2.
+///
+/// Applied only when the session negotiated `web-carrier-v1`: the WELCOME then advertises the
+/// web ceilings, and admission enforces them, so a bridge between this presenter and a browser
+/// never has to close a track the presenter claimed it could carry.
+fn clamp_contract_for_web(contract: &mut ResourceContract) {
+    for (resource, ceiling) in [
+        (Resource::ControlRecordBody, u64::from(vivid_protocol::web::MAX_CONTROL_RECORD_BODY)),
+        (Resource::MediaRecordBody, u64::from(vivid_protocol::web::MAX_MEDIA_RECORD_BODY)),
+        (Resource::InflightMediaBytes, vivid_protocol::web::MAX_AGGREGATE_REASSEMBLY),
+    ] {
+        contract.set(resource, contract.get(resource).min(ceiling));
+    }
 }
 
 fn presenter_contract() -> ResourceContract {
@@ -4092,6 +4114,84 @@ mod tests {
             ..ProducerConfig::default()
         })
         .unwrap()
+    }
+
+    #[test]
+    fn a_web_carrier_session_advertises_the_web_ceilings() {
+        // Web §5.2: a session that will ride a browser carrier must be offered ceilings the
+        // carrier can deliver, or the bridge closes tracks the presenter claimed to support.
+        let service = desktop_service();
+        let mut required = vec![
+            registry::CORE_CONTROL.to_owned(),
+            registry::DESKTOP_SURFACE.to_owned(),
+            registry::LIVE_MEDIA.to_owned(),
+        ];
+        required.sort();
+        let mut optional =
+            vec![registry::OBSERVABILITY.to_owned(), registry::WEB_CARRIER.to_owned()];
+        optional.sort();
+        let session = vivid_sdk::Session::connect(ProducerConfig {
+            endpoint_control: Some(service.control_endpoint().to_owned()),
+            authentication: ProducerAuthentication::root_hex(service.root_secret()).unwrap(),
+            target_profile: registry::DESKTOP_SURFACE.to_owned(),
+            required_profiles: required,
+            optional_profiles: optional,
+            ..ProducerConfig::default()
+        })
+        .unwrap();
+        let info = session.info();
+        assert!(
+            info.accepted_profiles.iter().any(|profile| profile == registry::WEB_CARRIER),
+            "an offered web-carrier profile is accepted"
+        );
+        let contract = &info.resource_contract;
+        assert_eq!(
+            contract.get(Resource::ControlRecordBody),
+            u64::from(vivid_protocol::web::MAX_CONTROL_RECORD_BODY)
+        );
+        assert_eq!(
+            contract.get(Resource::MediaRecordBody),
+            u64::from(vivid_protocol::web::MAX_MEDIA_RECORD_BODY)
+        );
+        assert_eq!(
+            contract.get(Resource::InflightMediaBytes),
+            vivid_protocol::web::MAX_AGGREGATE_REASSEMBLY
+        );
+        session.close().unwrap();
+    }
+
+    #[test]
+    fn a_native_session_keeps_the_native_ceilings() {
+        // Without the web-carrier profile nothing about the offer changes.
+        let service = desktop_service();
+        let session = connect_desktop(&service);
+        let info = session.info();
+        assert!(!info.accepted_profiles.iter().any(|profile| profile == registry::WEB_CARRIER));
+        let contract = &info.resource_contract;
+        assert_eq!(
+            contract.get(Resource::ControlRecordBody),
+            u64::from(vivid_protocol::CONTROL_MAX_RECORD_BODY)
+        );
+        assert_eq!(
+            contract.get(Resource::MediaRecordBody),
+            u64::from(vivid_protocol::HARD_MAX_RECORD_BODY)
+        );
+        session.close().unwrap();
+    }
+
+    #[test]
+    fn the_web_clamp_never_widens_a_contract() {
+        let mut contract = presenter_contract();
+        clamp_contract_for_web(&mut contract);
+        assert_eq!(
+            contract.get(Resource::ControlRecordBody),
+            u64::from(vivid_protocol::web::MAX_CONTROL_RECORD_BODY)
+        );
+        // A ceiling already below the web's survives: clamping takes a minimum, never a raise.
+        let mut tight = presenter_contract();
+        tight.set(Resource::MediaRecordBody, 1024);
+        clamp_contract_for_web(&mut tight);
+        assert_eq!(tight.get(Resource::MediaRecordBody), 1024);
     }
 
     fn desktop_surface(context_id: u64, width: u64) -> SurfaceDefinition {

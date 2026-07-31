@@ -165,6 +165,7 @@ impl TerminalTarget {
         registry::OBSERVABILITY,
         registry::TERMINAL_SURFACE,
         registry::TIMED_MEDIA,
+        registry::WEB_CARRIER,
     ];
 
     pub fn new(geometry: DisplayGeometry) -> Result<Self, &'static str> {
@@ -354,6 +355,7 @@ impl DesktopTarget {
         registry::LIVE_MEDIA,
         registry::OBSERVABILITY,
         registry::TIMED_MEDIA,
+        registry::WEB_CARRIER,
     ];
 
     pub fn new(geometry: DisplayGeometry) -> Result<Self, &'static str> {
