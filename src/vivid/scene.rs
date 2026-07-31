@@ -1965,7 +1965,7 @@ mod tests {
 
     #[test]
     fn target_generation_advances_for_live_and_late_sessions() {
-        let scene = SharedScene::default();
+        let scene = SharedScene::for_test();
         let first = session(1, 1);
         let second = session(1, 2);
         let late = session(1, 3);
