@@ -1719,25 +1719,26 @@ fn dispatch_control(
             let status =
                 shared.scene.create_track(identity, configuration).map_err(ControlError::state)?;
             observe_track(session, &status, TRACK_CHANGED_LIFECYCLE);
-            (
-                messages::TRACK_READY,
-                record.object_id,
-                Envelope::new(
-                    request_id,
-                    vec![
-                        (0, Value::Unsigned(identity.surface.context.context_id)),
-                        (1, Value::Unsigned(identity.surface.surface_id)),
-                        (2, Value::Unsigned(identity.track_id)),
-                        (3, Value::Unsigned(status.state.revision.get())),
-                        (4, Value::Unsigned(status.state.channel_generation.get())),
-                        (5, Value::Unsigned(CHANNEL_OPEN_DEADLINE_US)),
-                        (6, Value::Unsigned(u64::from(status.configuration.maximum_record_body))),
-                        (7, Value::Map(status.configuration.payload(false).unwrap_or_default())),
-                        (8, Value::Bool(true)),
-                    ],
-                )
-                .encode(),
-            )
+            let mut payload = vec![
+                (0, Value::Unsigned(identity.surface.context.context_id)),
+                (1, Value::Unsigned(identity.surface.surface_id)),
+                (2, Value::Unsigned(identity.track_id)),
+                (3, Value::Unsigned(status.state.revision.get())),
+                (4, Value::Unsigned(status.state.channel_generation.get())),
+                (5, Value::Unsigned(CHANNEL_OPEN_DEADLINE_US)),
+                (6, Value::Unsigned(u64::from(status.configuration.maximum_record_body))),
+                (7, Value::Map(status.configuration.payload(false).unwrap_or_default())),
+                (8, Value::Bool(true)),
+            ];
+            // A producer plans deltas against the granted limit, so a raster ingest path that
+            // accepts deltas has to say so here. Omitting key 9 grants zero operations, which
+            // reads as "full frames only" and silently retires the delta path for every producer.
+            if let KindConfiguration::Raster(raster) = &status.configuration.kind
+                && raster.delta_enabled
+            {
+                payload.push((9, Value::Unsigned(u64::from(raster.maximum_delta_operations))));
+            }
+            (messages::TRACK_READY, record.object_id, Envelope::new(request_id, payload).encode())
         },
         messages::DESTROY_TRACK => {
             let identity = payload_track_identity(session, &value)?;
@@ -4185,6 +4186,131 @@ mod tests {
             service.scene.snapshot().1.len(),
             1,
             "clean GOODBYE must preserve an anchored, policy-permitted terminal poster"
+        );
+    }
+
+    /// Media §4: `TRACK_READY` key 9 is how a producer learns it may send deltas at all.
+    ///
+    /// A presenter that applies deltas but never grants them reads to every SDK producer as
+    /// full-frames-only. A nested producer whose inner presenter did grant deltas then relays a
+    /// delta this hop refuses, which strands the relayed source on its last full frame.
+    #[test]
+    fn a_delta_capable_raster_track_grants_and_then_applies_delta_frames() {
+        let service = VividService::start_with_wake(test_geometry(), Arc::new(|| {})).unwrap();
+        let mut session = connect(&service);
+        let context_id = session.info().root_context_id;
+        let surface = session
+            .create_surface(
+                SurfaceDefinition {
+                    context_id,
+                    surface_id: 3,
+                    semantic_profile: registry::TERMINAL_CONTENT.into(),
+                    coordinate_model: CoordinateModel::TerminalContentCells,
+                    logical_width: 2,
+                    logical_height: 2,
+                    scale_numerator: 1,
+                    scale_denominator: 1,
+                    rotation: 0,
+                    descriptor: SurfaceDescriptor {
+                        role: SurfaceRole::Figure,
+                        title: "raster delta".into(),
+                        semantic_content_revision: 1,
+                        semantic_availability: 0,
+                        locator_hint: String::new(),
+                    },
+                    policy: 0,
+                    profile_parameters: vec![],
+                },
+                &RequestMetadata::default(),
+            )
+            .unwrap();
+        let track = session
+            .create_track(
+                TrackConfiguration {
+                    context_id,
+                    surface_id: surface.id(),
+                    track_id: 4,
+                    slot: scene::SLOT_RASTER,
+                    mode: TrackMode::Live,
+                    lane: LaneClass::Bulk,
+                    maximum_record_body: 4096,
+                    maximum_rate_millihertz: 60_000,
+                    maximum_encoded_bits_per_second: 8_000_000,
+                    maximum_records_per_second: 60,
+                    maximum_inflight_body_bytes: 16_384,
+                    kind: KindConfiguration::Raster(RasterConfiguration {
+                        width: 2,
+                        height: 2,
+                        alpha_mode: scene::ALPHA_STRAIGHT,
+                        delta_enabled: true,
+                        maximum_delta_operations: 4,
+                        zstd_enabled: false,
+                    }),
+                    target_latency_us: 0,
+                    maximum_latency_us: 1_000_000,
+                    retained_pixel_charge: 4,
+                },
+                &RequestMetadata::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            track.delta_operation_limit().unwrap(),
+            4,
+            "a delta-enabled raster track has to report the granted operation limit"
+        );
+
+        let channel = session.open_track_channel(&track).unwrap();
+        channel.send_raster(0, 1, &[0x11, 0x22, 0x33, 0xff].repeat(4), false).unwrap();
+        session
+            .wait_track(
+                &track,
+                TrackWaitCondition::MilestoneSet,
+                Some(MILESTONE_OUTPUT_READY),
+                1_000_000,
+            )
+            .unwrap();
+        channel
+            .send_raster_delta(
+                0,
+                2,
+                1,
+                0,
+                0,
+                &[vivid_sdk::RasterDeltaOperation::Overwrite {
+                    x: 1,
+                    y: 1,
+                    width: 1,
+                    height: 1,
+                    rgba: &[0xaa, 0xbb, 0xcc, 0xff],
+                }],
+                false,
+            )
+            .unwrap();
+
+        let identity = service
+            .scene
+            .track_keys()
+            .into_iter()
+            .find(|identity| identity.track_id == track.id())
+            .expect("the raster track is registered");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let frame = loop {
+            let frame = service.scene.latest_frame(identity).expect("a published frame");
+            if frame.frame_id == 2 || Instant::now() >= deadline {
+                break frame;
+            }
+            thread::sleep(Duration::from_millis(1));
+        };
+        assert_eq!(frame.frame_id, 2, "the delta frame was never applied");
+        assert_eq!(
+            &frame.rgba[12..16],
+            &[0xaa, 0xbb, 0xcc, 0xff],
+            "the delta overwrote the wrong pixel"
+        );
+        assert_eq!(
+            &frame.rgba[..4],
+            &[0x11, 0x22, 0x33, 0xff],
+            "the delta disturbed a pixel it did not name"
         );
     }
 
