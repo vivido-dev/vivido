@@ -259,6 +259,7 @@ enum NodeMutation {
 
 #[derive(Default)]
 struct State {
+    target_generation: TargetGeneration,
     surfaces: HashMap<SurfaceIdentity, Surface>,
     tracks: HashMap<TrackIdentity, Track>,
     scenes: HashMap<SessionIdentity, SessionScene>,
@@ -321,6 +322,13 @@ impl SharedScene {
         if state.scenes.contains_key(&session) {
             return Err("session already exists");
         }
+        if target_generation > state.target_generation {
+            state.target_generation = target_generation;
+            for scene in state.scenes.values_mut() {
+                scene.target_generation = target_generation;
+            }
+        }
+        let target_generation = state.target_generation;
         state.scenes.insert(
             session,
             SessionScene {
@@ -342,6 +350,9 @@ impl SharedScene {
     /// an announcement can only carry the scene forward.
     pub fn advance_target_generation(&self, target_generation: TargetGeneration) {
         let mut state = self.lock();
+        if state.target_generation < target_generation {
+            state.target_generation = target_generation;
+        }
         for scene in state.scenes.values_mut() {
             if scene.target_generation < target_generation {
                 scene.target_generation = target_generation;
@@ -1950,6 +1961,26 @@ mod tests {
         scene.destroy_surface(first_surface).unwrap();
         assert!(scene.surface_status(first_surface).is_none());
         assert!(scene.surface_status(second_surface).is_some());
+    }
+
+    #[test]
+    fn target_generation_advances_for_live_and_late_sessions() {
+        let scene = SharedScene::default();
+        let first = session(1, 1);
+        let second = session(1, 2);
+        let late = session(1, 3);
+        scene.register_session(first, TargetGeneration::ONE).unwrap();
+        scene.register_session(second, TargetGeneration::ONE).unwrap();
+
+        let resized = TargetGeneration::new(2);
+        scene.advance_target_generation(resized);
+        assert_eq!(scene.scene_status(first, 0).target_generation, resized);
+        assert_eq!(scene.scene_status(second, 0).target_generation, resized);
+
+        scene.register_session(late, TargetGeneration::ONE).unwrap();
+        assert_eq!(scene.scene_status(late, 0).target_generation, resized);
+        scene.advance_target_generation(resized);
+        assert_eq!(scene.scene_status(late, 0).target_generation, resized);
     }
 
     #[test]

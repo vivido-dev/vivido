@@ -3690,7 +3690,7 @@ mod tests {
     use vivid_protocol::messages::LaneClass;
     use vivid_protocol::track::{KindConfiguration, TrackConfiguration, TrackMode};
     use vivid_sdk::{
-        CoordinateModel, MILESTONE_OUTPUT_READY, MILESTONE_PRESENTED, ProducerAuthentication,
+        CoordinateModel, Fit, MILESTONE_OUTPUT_READY, MILESTONE_PRESENTED, ProducerAuthentication,
         ProducerConfig, RasterConfiguration, RequestMetadata, SceneNode, SessionEvent, SlotBinding,
         SurfaceDefinition, SurfaceDescriptor, SurfaceRole, TrackWaitCondition,
     };
@@ -3929,6 +3929,101 @@ mod tests {
         thread::sleep(Duration::from_millis(50));
         assert_eq!(live.take_event().unwrap(), None);
         assert_eq!(live.info().target_generation.get(), 1);
+    }
+
+    #[test]
+    fn live_resize_reaches_the_sdk_as_a_same_generation_final_settle() {
+        let service = VividService::start_with_wake(test_geometry(), Arc::new(|| {})).unwrap();
+        let config = ProducerConfig {
+            endpoint_control: Some(service.control_endpoint().to_owned()),
+            authentication: ProducerAuthentication::root_hex(service.root_secret()).unwrap(),
+            ..ProducerConfig::default()
+        };
+        let mut session = vivid_sdk::Session::connect(config).unwrap();
+        let generation = service
+            .update_metrics(DisplayGeometry {
+                viewport_width: 1200,
+                viewport_height: 800,
+                columns: 120,
+                rows: 40,
+                cell_width: 10,
+                cell_height: 20,
+            })
+            .unwrap();
+
+        let take_target_change = |session: &vivid_sdk::Session| {
+            let deadline = Instant::now() + Duration::from_secs(1);
+            loop {
+                if let Some(SessionEvent::TargetChanged(payload)) = session.take_event().unwrap() {
+                    break payload;
+                }
+                assert!(Instant::now() < deadline, "presenter did not deliver TARGET_CHANGED");
+                thread::sleep(Duration::from_millis(1));
+            }
+        };
+
+        service.flush_display_change(None);
+        let unsettled = take_target_change(&session);
+        assert_eq!(session.apply_target_changed(&unsettled).unwrap().get(), generation);
+        assert_eq!(session.info().target_descriptor[6].1.as_bool(), Some(false));
+
+        service.flush_display_change(Some(generation));
+        let settled = take_target_change(&session);
+        assert_eq!(session.apply_target_changed(&settled).unwrap().get(), generation);
+        assert_eq!(session.info().target_descriptor[6].1.as_bool(), Some(true));
+
+        let context_id = session.info().root_context_id;
+        let surface = session
+            .create_surface(
+                SurfaceDefinition {
+                    context_id,
+                    surface_id: 71,
+                    semantic_profile: registry::GENERIC_CONTENT.into(),
+                    coordinate_model: CoordinateModel::DesktopLogicalPixels,
+                    logical_width: 1200,
+                    logical_height: 780,
+                    scale_numerator: 1,
+                    scale_denominator: 1,
+                    rotation: 0,
+                    descriptor: SurfaceDescriptor {
+                        role: SurfaceRole::Document,
+                        title: "resized target".into(),
+                        semantic_content_revision: 1,
+                        semantic_availability: 0,
+                        locator_hint: String::new(),
+                    },
+                    policy: 0,
+                    profile_parameters: vec![],
+                },
+                &RequestMetadata::default(),
+            )
+            .unwrap();
+        session
+            .create_node(
+                &SceneNode {
+                    owning_context_id: context_id,
+                    node_id: 72,
+                    surface_context_id: context_id,
+                    surface_id: surface.id(),
+                    geometry: vec![
+                        (0, Value::Unsigned(1)),
+                        (1, Value::Unsigned(0)),
+                        (2, Value::Unsigned(0)),
+                        (3, Value::Unsigned(120_u64 << 32)),
+                        (4, Value::Unsigned(39_u64 << 32)),
+                        (5, Value::Unsigned(1)),
+                    ],
+                    fit: Fit::Contain,
+                    linear_sampling: true,
+                    z_index: 0,
+                    visible: true,
+                    opacity: u16::MAX,
+                    clip: None,
+                },
+                &RequestMetadata::default(),
+            )
+            .expect("a resize event and the presenter's scene precondition must agree");
+        session.close().unwrap();
     }
 
     #[test]
