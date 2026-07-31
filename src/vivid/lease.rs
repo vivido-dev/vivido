@@ -16,7 +16,7 @@ use sha2::{Digest, Sha256};
 use vivid_protocol::auth::{self, Secret32};
 use vivid_protocol::cbor::Value;
 use vivid_protocol::identity::SessionIdentity;
-use vivid_protocol::lease::{LeaseMachine, LeaseState, SessionLeaseDefinition};
+use vivid_protocol::lease::{CleanupPolicy, LeaseMachine, LeaseState, SessionLeaseDefinition};
 use vivid_protocol::messages::PayloadMap;
 use vivid_protocol::resource::ResourceContract;
 
@@ -33,7 +33,9 @@ pub(crate) mod reason {
     pub(crate) const UNCLEAN_LOSS: u64 = 1 << 2;
     pub(crate) const EXPLICIT_REVOKE: u64 = 1 << 4;
     pub(crate) const PARENT_CLEANUP: u64 = 1 << 5;
+    pub(crate) const RESUMED: u64 = 1 << 3;
     pub(crate) const ACTIVATION_EXPIRY: u64 = 1 << 6;
+    pub(crate) const GRACE_EXPIRY: u64 = 1 << 7;
 }
 
 /// One issued lease.
@@ -50,6 +52,11 @@ pub(crate) struct Lease {
     pub(crate) grace_deadline: Option<Instant>,
     /// The child logical session, once one exists.
     pub(crate) child: Option<SessionIdentity>,
+    /// The suspended session's resume key, which is what a resume proof is verified against.
+    ///
+    /// Held only while suspended. Security §7.2 derives the next generation's keys from it and
+    /// erases it once the new `WELCOME` confirmation is committed.
+    resume_key: Option<Secret32>,
 }
 
 impl Lease {
@@ -71,6 +78,7 @@ impl Lease {
             activation_deadline,
             grace_deadline: None,
             child: None,
+            resume_key: None,
         }
     }
 
@@ -79,6 +87,37 @@ impl Lease {
     /// Compared in constant time after an exact-length check, per security §2.
     pub(crate) fn accepts(&self, lease_id: u64, secret: &Secret32) -> bool {
         auth::verify_activation_secret(lease_id, secret, &self.definition.activation_verifier)
+    }
+
+    /// Does an unclean loss suspend this lease rather than close it?
+    pub(crate) fn suspends_on_unclean_loss(&self) -> bool {
+        self.definition.cleanup_policy == CleanupPolicy::SuspendOnUncleanLoss
+            && self.definition.requested_disconnect_grace_us > 0
+    }
+
+    /// Move to `SUSPENDED`, starting the grace and retaining the resume key.
+    pub(crate) fn suspend(&mut self, resume_key: Secret32, now: Instant) -> bool {
+        if self.machine.confirm_transport_lost(false).is_err() {
+            return false;
+        }
+        if self.machine.state() != LeaseState::Suspended {
+            return false;
+        }
+        self.resume_key = Some(resume_key);
+        self.grace_deadline =
+            now.checked_add(Duration::from_micros(self.definition.requested_disconnect_grace_us));
+        true
+    }
+
+    /// The resume key a proof is checked against, while suspended.
+    pub(crate) fn resume_key(&self) -> Option<&Secret32> {
+        self.resume_key.as_ref()
+    }
+
+    /// Clear the grace and the retained key once the session is live again.
+    pub(crate) fn resumed(&mut self) {
+        self.grace_deadline = None;
+        self.resume_key = None;
     }
 
     pub(crate) fn expired(&self, now: Instant) -> bool {
@@ -188,6 +227,27 @@ impl LeaseTable {
         found
     }
 
+    /// Find a suspended lease a resume names.
+    ///
+    /// The proof is verified by the caller against the lease's retained resume key; this only
+    /// narrows by complete identity plus the suspended session the resume claims.
+    pub(crate) fn find_resume(
+        &self,
+        context_id: u64,
+        lease_id: u64,
+        session_id: u64,
+    ) -> Option<LeaseKey> {
+        self.leases
+            .iter()
+            .find(|(key, lease)| {
+                key.1 == context_id
+                    && key.2 == lease_id
+                    && lease.machine.state() == LeaseState::Suspended
+                    && lease.child.is_some_and(|child| child.session_id == session_id)
+            })
+            .map(|(key, _)| *key)
+    }
+
     /// Every lease issued by one session, for parent cleanup.
     pub(crate) fn issued_by(&self, issuer: SessionIdentity) -> Vec<LeaseKey> {
         self.leases.keys().filter(|key| key.0 == issuer).copied().collect()
@@ -237,7 +297,7 @@ mod tests {
             activation_verifier: auth::activation_verifier(lease_id, secret),
             activation_timeout_us: 20_000_000,
             requested_disconnect_grace_us: 10_000_000,
-            cleanup_policy: vivid_protocol::lease::CleanupPolicy::SuspendOnUncleanLoss,
+            cleanup_policy: CleanupPolicy::SuspendOnUncleanLoss,
             permitted_profiles: vec!["vivid-core-control-v1".into()],
             requested_contract: ResourceContract::denied(),
             client_public_key: None,

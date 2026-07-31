@@ -366,6 +366,42 @@ impl SharedScene {
     ///
     /// The retained objects are no longer addressable protocol state. They exist solely as
     /// terminal presentation snapshots and are reclaimed with their authenticated anchors.
+    /// Suspend a session's state instead of destroying it.
+    ///
+    /// Security §7.1: unclean loss under cleanup policy one retains surface and track metadata,
+    /// scene nodes, policies, descriptors, and the active-slot mapping, while marking every track
+    /// channel detached and discarding decoded media. The retained state stays charged to the
+    /// lease's reservation until resume or grace expiry, which is why nothing is released here.
+    pub fn suspend_session(&self, session: SessionIdentity) {
+        let mut state = self.lock();
+        if !state.scenes.contains_key(&session) {
+            return;
+        }
+        let owned = state
+            .tracks
+            .keys()
+            .filter(|identity| identity.surface.context.session == session)
+            .copied()
+            .collect::<Vec<_>>();
+        for identity in owned {
+            let Some(track) = state.tracks.get_mut(&identity) else {
+                continue;
+            };
+            // Every channel needs a new generation and a fresh key or full unit after resume.
+            let _ = track.state.detach();
+            // Decoded output and ingress do not survive; a policy-permitted poster may, and it
+            // is the surface's retained frame rather than a live decoder.
+            track.playback = None;
+            track.last_decoded_pts_us = None;
+        }
+        self.0.changed.notify_all();
+    }
+
+    /// Whether a suspended session's retained state is still present.
+    pub fn is_registered(&self, session: SessionIdentity) -> bool {
+        self.lock().scenes.contains_key(&session)
+    }
+
     pub fn detach_session(&self, session: SessionIdentity) {
         let mut state = self.lock();
         let Some(scene) = state.scenes.get(&session) else {

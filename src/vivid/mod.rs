@@ -102,6 +102,8 @@ struct SessionRuntime {
     seen_anchors: Mutex<HashSet<(u64, u64)>>,
     /// The lease this session was activated from, if it is a leased child rather than a root.
     lease: Option<LeaseKey>,
+    /// This generation's resume key, handed to the lease if the transport is lost uncleanly.
+    resume_key: Secret32,
 }
 
 #[derive(Default)]
@@ -550,9 +552,16 @@ fn actor_loop(
         contract.get(Resource::PendingRequests),
     );
     let mut cancelled = HashSet::new();
+    let mut admitted_post_hello = false;
     loop {
         match incoming.recv_timeout(actor::TICK) {
             Ok(record) => {
+                // Security §6.4 step 6: once any post-`HELLO` record is admitted, the activation
+                // secret can no longer open a transport and recovery must use the resume proof.
+                if !admitted_post_hello {
+                    admitted_post_hello = true;
+                    admit_post_hello(&shared, &session);
+                }
                 if !dispatch_and_reply(
                     &shared,
                     &session,
@@ -609,6 +618,74 @@ fn dispatch_and_reply(
     }
 }
 
+/// Close the activation-retry window for a leased session.
+fn admit_post_hello(shared: &Arc<ServiceShared>, session: &Arc<SessionRuntime>) {
+    let Some(key) = session.lease else {
+        return;
+    };
+    if let Some(lease) = lock(&shared.registry).leases.get_mut(&key) {
+        let _ = lease.machine.admit_post_hello();
+    }
+}
+
+/// Suspend a leased child's state instead of destroying it, returning whether it took.
+///
+/// Security §7.1, in order: the lease and logical session become `SUSPENDED`, revisions advance,
+/// input is revoked and held state released, transports close, media ingress and decoder state are
+/// discarded, object metadata and scene nodes are retained, every track channel is marked detached
+/// and needing a new generation, the grace deadline starts, and the reservation stays charged.
+fn suspend_lease(
+    shared: &Arc<ServiceShared>,
+    session: &Arc<SessionRuntime>,
+    key: LeaseKey,
+) -> bool {
+    let now = Instant::now();
+    let (suspended, payload) = {
+        let mut registry = lock(&shared.registry);
+        let Some(lease) = registry.leases.get_mut(&key) else {
+            return false;
+        };
+        if !lease.suspends_on_unclean_loss() {
+            return false;
+        }
+        // The resume proof is checked against this generation's resume key, so it has to outlive
+        // the connection that derived it.
+        if !lease.suspend(Secret32::new(*session.resume_key.expose()), now) {
+            return false;
+        }
+        (true, lease.changed_payload(key.1, key.2, reason::UNCLEAN_LOSS, now))
+    };
+    if !suspended {
+        return false;
+    }
+    // Input is not implemented yet; when it is, its release belongs here, before anything else.
+    shared.scene.suspend_session(session.identity);
+    stop_session_audio(shared, session.identity);
+    let issuer = lock(&shared.registry).sessions.get(&key.0.session_id).cloned();
+    if let Some(issuer) = issuer
+        && let Ok(body) = Envelope::new(0, payload).encode()
+    {
+        let _ = issuer.writer.write_record(messages::SESSION_LEASE_CHANGED, key.2, &body);
+    }
+    true
+}
+
+/// Silence and drop every audio output a session owns.
+fn stop_session_audio(shared: &Arc<ServiceShared>, session: SessionIdentity) {
+    let removed = {
+        let mut outputs = lock(&shared.audio_outputs);
+        let keys = outputs
+            .keys()
+            .filter(|identity| identity.surface.context.session == session)
+            .copied()
+            .collect::<Vec<_>>();
+        keys.into_iter().filter_map(|identity| outputs.remove(&identity)).collect::<Vec<_>>()
+    };
+    for output in removed {
+        output.stop();
+    }
+}
+
 /// Drop leases whose activation deadline passed, releasing their reserved capacity.
 fn expire_leases(shared: &Arc<ServiceShared>, issuer: &Arc<SessionRuntime>) {
     let now = Instant::now();
@@ -622,7 +699,12 @@ fn expire_leases(shared: &Arc<ServiceShared>, issuer: &Arc<SessionRuntime>) {
             .collect::<Vec<_>>()
     };
     for key in expired {
-        revoke_lease(shared, issuer, key, reason::ACTIVATION_EXPIRY);
+        let suspended = lock(&shared.registry)
+            .leases
+            .get_mut(&key)
+            .is_some_and(|lease| lease.grace_deadline.is_some());
+        let cause = if suspended { reason::GRACE_EXPIRY } else { reason::ACTIVATION_EXPIRY };
+        revoke_lease(shared, issuer, key, cause);
     }
 }
 
@@ -668,10 +750,16 @@ fn finish_session(shared: &Arc<ServiceShared>, session: &Arc<SessionRuntime>, cl
     for key in issued {
         revoke_lease(shared, session, key, reason::PARENT_CLEANUP);
     }
-    // A leased child closing releases its own lease back to the issuer.
+    // A leased child closing releases its own lease back to the issuer, unless an unclean loss
+    // under cleanup policy one suspends it instead (security §7.1).
     if let Some(key) = session.lease {
         let issuer = lock(&shared.registry).sessions.get(&key.0.session_id).cloned();
         if let Some(issuer) = issuer {
+            if !clean && suspend_lease(shared, session, key) {
+                lock(&shared.registry).sessions.remove(&session.identity.session_id);
+                (shared.wake)();
+                return;
+            }
             let reason = if clean { reason::CLEAN_CLOSE } else { reason::UNCLEAN_LOSS };
             revoke_lease(shared, &issuer, key, reason);
         }
@@ -703,6 +791,22 @@ enum Principal {
     Root,
     /// A controller-minted lease, which delegates one child logical session to one context.
     Lease { key: LeaseKey, secret: Secret32, attempt_id: [u8; 16] },
+    /// A suspended lease resuming within its grace, authenticated by the prior resume key.
+    Resume {
+        key: LeaseKey,
+        prior_resume_key: Secret32,
+        attempt_id: [u8; 16],
+        session_id: u64,
+        resume_generation: u64,
+    },
+}
+
+/// The session tag inside an encoded `WELCOME`.
+///
+/// An exact activation or resume retry returns the first attempt's bytes, so the tag the producer
+/// will actually see is the one in those bytes and not the candidate this attempt generated.
+fn session_tag_of(welcome: &[u8]) -> Option<[u8; messages::SESSION_TAG_BYTES]> {
+    Welcome::decode(welcome).ok().map(|(_, welcome)| welcome.session_tag)
 }
 
 fn fail_authentication(writer: &Arc<Writer>, request_id: u64, diagnostic: &str) -> io::Error {
@@ -752,12 +856,54 @@ fn establish_root_session(
                 attempt_id: *attempt_id,
             }
         },
-        HelloAuthentication::Resume { .. } => {
-            return Err(fail_authentication(
-                &writer,
-                request_id,
-                "Vivido does not yet resume a suspended lease",
-            ));
+        HelloAuthentication::Resume {
+            context_id,
+            lease_id,
+            session_id,
+            resume_generation,
+            attempt_id,
+            proof,
+        } => {
+            let candidate =
+                lock(&shared.registry).leases.find_resume(*context_id, *lease_id, *session_id);
+            let Some(key) = candidate else {
+                return Err(fail_authentication(&writer, request_id, "resume failed"));
+            };
+            let prior = {
+                let mut registry = lock(&shared.registry);
+                let lease = registry
+                    .leases
+                    .get_mut(&key)
+                    .ok_or_else(|| io::Error::other("lease disappeared during resume"))?;
+                if lease.machine.resume_generation().get() != *resume_generation {
+                    return Err(fail_authentication(&writer, request_id, "resume failed"));
+                }
+                lease.resume_key().map(|key| Secret32::new(*key.expose()))
+            };
+            let Some(prior) = prior else {
+                return Err(fail_authentication(&writer, request_id, "resume failed"));
+            };
+            // The proof binds the preface, the complete lease and session identity, the exact
+            // generation, the attempt, and the whole `HELLO` minus the proof itself.
+            let expected = auth::resume_hello_proof(
+                prior.expose(),
+                preface,
+                *lease_id,
+                *session_id,
+                *resume_generation,
+                attempt_id,
+                &hello.authless_payload()?,
+            );
+            if !auth::verify_proof(&expected, proof) {
+                return Err(fail_authentication(&writer, request_id, "resume failed"));
+            }
+            Principal::Resume {
+                key,
+                prior_resume_key: prior,
+                attempt_id: *attempt_id,
+                session_id: *session_id,
+                resume_generation: *resume_generation,
+            }
         },
     };
     let target = shared.scene.target().clone();
@@ -803,6 +949,12 @@ fn establish_root_session(
     if session_id == 0 {
         return Err(io::Error::other("session ID exhausted"));
     }
+    // A resume keeps the suspended logical session, so the candidate `WELCOME` has to carry that
+    // ID rather than a freshly allocated one — the machine caches these exact bytes.
+    let session_id = match &principal {
+        Principal::Resume { session_id, .. } => *session_id,
+        _ => session_id,
+    };
     let identity = SessionIdentity::new(shared.presenter, session_id).map_err(io::Error::other)?;
     let root_context = identity.context(1).map_err(io::Error::other)?;
     let mut server_nonce = [0_u8; auth::NONCE_BYTES];
@@ -845,6 +997,20 @@ fn establish_root_session(
                 messages::AUTHENTICATION_LEASE_ACTIVATION,
             )
         },
+        Principal::Resume { key, prior_resume_key, .. } => {
+            // Security §7.2: the next generation's keys derive from the prior resume key, so the
+            // resumed session shares no key material with the one that was lost.
+            let lease = registry
+                .leases
+                .get_mut(key)
+                .ok_or_else(|| io::Error::other("lease disappeared during resume"))?;
+            (
+                Secret32::new(*prior_resume_key.expose()),
+                lease.contract.clone(),
+                lease.classes,
+                messages::AUTHENTICATION_RESUME,
+            )
+        },
     };
 
     let prk =
@@ -870,15 +1036,24 @@ fn establish_root_session(
             // has no lease state at all.
             lease_state: match &principal {
                 Principal::Root => 0,
-                Principal::Lease { .. } => vivid_protocol::lease::LeaseState::Active as u64,
+                Principal::Lease { .. } | Principal::Resume { .. } => {
+                    vivid_protocol::lease::LeaseState::Active as u64
+                },
             },
             activation_attempt_status: 0,
         },
         session_revision: 1,
         scene_revision: 0,
         resource_contract: contract.clone(),
-        establishment_state: 0,
-        resume_generation: 0,
+        establishment_state: match &principal {
+            Principal::Resume { .. } => 1,
+            _ => 0,
+        },
+        resume_generation: match &principal {
+            // The generation the resume advanced to, which the producer echoes on its next one.
+            Principal::Resume { resume_generation, .. } => resume_generation.saturating_add(1),
+            _ => 0,
+        },
         extensions: vec![],
     };
     welcome.confirm(&prk)?;
@@ -886,6 +1061,7 @@ fn establish_root_session(
 
     // Security §6.4: an exact retry of a lost `WELCOME` returns the same session ID, server
     // nonce, and bytes, and concurrent attempts have exactly one winner.
+    let mut resumed_announcements: Vec<(u64, u64, messages::PayloadMap)> = Vec::new();
     let (session_id, session_tag, keys, anchor_key, welcome_body) = match &principal {
         Principal::Root => (session_id, session_tag, keys, anchor_key, welcome_body),
         Principal::Lease { key, attempt_id, .. } => {
@@ -927,9 +1103,54 @@ fn establish_root_session(
                 &decided_nonce,
                 &[0; 32],
             );
+            let decided_tag = session_tag_of(&decided_welcome).unwrap_or(session_tag);
             let (keys, anchor_key) =
-                auth::derive_session_keys(&prk, decided_session, 0, &session_tag);
-            (decided_session, session_tag, keys, anchor_key, decided_welcome)
+                auth::derive_session_keys(&prk, decided_session, 0, &decided_tag);
+            (decided_session, decided_tag, keys, anchor_key, decided_welcome)
+        },
+        Principal::Resume { key, attempt_id, session_id: suspended, resume_generation, .. } => {
+            let fingerprint =
+                profile_fingerprint(target.profile_name(), &welcome.accepted_profiles);
+            let lease = registry
+                .leases
+                .get_mut(key)
+                .ok_or_else(|| io::Error::other("lease disappeared during resume"))?;
+            // The logical session ID survives the loss; only its keys and generation change.
+            let decision = lease
+                .machine
+                .begin_resume(
+                    vivid_protocol::revision::ResumeGeneration::new(*resume_generation),
+                    *attempt_id,
+                    hello.client_nonce,
+                    &hello.authless_payload()?,
+                    fingerprint,
+                    *suspended,
+                    server_nonce,
+                    welcome_body,
+                )
+                .map_err(|_| io::Error::new(ErrorKind::PermissionDenied, "resume was refused"))?;
+            let (decided_session, decided_nonce, decided_welcome) = match decision {
+                AttemptDecision::Fresh { session_id, server_nonce, welcome }
+                | AttemptDecision::ExactReplay { session_id, server_nonce, welcome } => {
+                    (session_id, server_nonce, welcome)
+                },
+            };
+            lease.machine.commit_welcome().ok();
+            // The prior resume key is erased once the new confirmation is committed.
+            lease.resumed();
+            let generation = lease.machine.resume_generation().get();
+            let announcement = lease.changed_payload(key.1, key.2, reason::RESUMED, Instant::now());
+            resumed_announcements.push((key.0.session_id, key.2, announcement));
+            let prk = auth::extract_handshake_prk(
+                &session_secret,
+                &hello.client_nonce,
+                &decided_nonce,
+                &[0; 32],
+            );
+            let decided_tag = session_tag_of(&decided_welcome).unwrap_or(session_tag);
+            let (keys, anchor_key) =
+                auth::derive_session_keys(&prk, decided_session, generation, &decided_tag);
+            (decided_session, decided_tag, keys, anchor_key, decided_welcome)
         },
     };
     let identity = SessionIdentity::new(shared.presenter, session_id).map_err(io::Error::other)?;
@@ -950,14 +1171,26 @@ fn establish_root_session(
         seen_anchors: Mutex::new(HashSet::new()),
         lease: match &principal {
             Principal::Root => None,
-            Principal::Lease { key, .. } => Some(*key),
+            Principal::Lease { key, .. } | Principal::Resume { key, .. } => Some(*key),
         },
+        resume_key: Secret32::new(*keys.resume_key()),
     });
-    shared
-        .scene
-        .register_session(identity, TargetGeneration::new(target.generation()))
-        .map_err(io::Error::other)?;
+    // Suspension retained this session's surfaces, tracks, and nodes, so a resume re-attaches to
+    // them rather than registering a second time (security §7.1).
+    if !shared.scene.is_registered(identity) {
+        shared
+            .scene
+            .register_session(identity, TargetGeneration::new(target.generation()))
+            .map_err(io::Error::other)?;
+    }
     registry.sessions.insert(session_id, runtime.clone());
+    for (issuer_session, lease_id, payload) in resumed_announcements {
+        if let Some(issuer) = registry.sessions.get(&issuer_session)
+            && let Ok(body) = Envelope::new(0, payload).encode()
+        {
+            let _ = issuer.writer.write_record(messages::SESSION_LEASE_CHANGED, lease_id, &body);
+        }
+    }
     Ok(runtime)
 }
 
@@ -3803,6 +4036,369 @@ mod tests {
             panic!("SESSION_STATUS must carry bounded object summaries")
         };
         assert_eq!(entries.len(), 1, "the one surface this session owns");
+    }
+
+    fn resumable_definition(
+        context_id: u64,
+        lease_id: u64,
+        secret: &Secret32,
+    ) -> SessionLeaseDefinition {
+        SessionLeaseDefinition {
+            requested_disconnect_grace_us: 10_000_000,
+            cleanup_policy: vivid_protocol::lease::CleanupPolicy::SuspendOnUncleanLoss,
+            ..lease_definition(context_id, lease_id, secret)
+        }
+    }
+
+    use std::io::{Read, Write};
+
+    /// A control connection driven at the wire, so a test can close the transport uncleanly.
+    ///
+    /// The SDK cannot do this today: dropping a `Session` marks its lifecycle closed but leaves
+    /// the socket open, because neither connection half owns anything shutdown-able. Suspension is
+    /// precisely the behavior that needs a real loss, so this drives it directly.
+    struct RawClient {
+        stream: LocalStream,
+        sequence: u64,
+        session_id: u64,
+        session_tag: [u8; messages::SESSION_TAG_BYTES],
+        resume_key: Secret32,
+    }
+
+    impl RawClient {
+        fn activate(
+            service: &VividService,
+            context_id: u64,
+            lease_id: u64,
+            secret: &Secret32,
+        ) -> io::Result<Self> {
+            let authentication = HelloAuthentication::LeaseActivation {
+                context_id,
+                lease_id,
+                activation_secret: Secret32::new(*secret.expose()),
+                attempt_id: [0x5a; 16],
+                proof_of_possession: None,
+            };
+            Self::open(service, authentication, |_, _| Ok(()))
+        }
+
+        fn resume(
+            service: &VividService,
+            context_id: u64,
+            lease_id: u64,
+            session_id: u64,
+            resume_generation: u64,
+            prior_resume_key: &Secret32,
+        ) -> io::Result<Self> {
+            let authentication = HelloAuthentication::Resume {
+                context_id,
+                lease_id,
+                session_id,
+                resume_generation,
+                attempt_id: [0x6b; 16],
+                proof: [0; 32],
+            };
+            let key = Secret32::new(*prior_resume_key.expose());
+            Self::open(service, authentication, move |hello: &mut Hello, preface: &[u8; 16]| {
+                hello.authenticate_resume(key.expose(), preface).map_err(io::Error::other)
+            })
+        }
+
+        fn open(
+            service: &VividService,
+            authentication: HelloAuthentication,
+            sign: impl FnOnce(&mut Hello, &[u8; 16]) -> io::Result<()>,
+        ) -> io::Result<Self> {
+            let mut stream = connect_endpoint(service.control_endpoint())?;
+            let preface = vivid_protocol::wire::encode_preface(
+                ConnectionKind::Control,
+                vivid_protocol::CONTROL_MAX_RECORD_BODY,
+            );
+            stream.write_all(&preface)?;
+            let mut required =
+                vec![registry::CORE_CONTROL.to_owned(), registry::TERMINAL_SURFACE.to_owned()];
+            required.sort();
+            let mut hello = Hello {
+                producer_name: "raw".into(),
+                producer_version: "0".into(),
+                required_profiles: required,
+                optional_profiles: Vec::new(),
+                maximum_control_body: vivid_protocol::CONTROL_MAX_RECORD_BODY,
+                client_nonce: [0x3c; 32],
+                authentication,
+                target_profile: registry::TERMINAL_SURFACE.into(),
+                extensions: Vec::new(),
+            };
+            sign(&mut hello, &preface)?;
+            let body = hello.encode(1).map_err(io::Error::other)?;
+            write_raw(&mut stream, 1, messages::HELLO, 0, &body)?;
+
+            let record = read_raw(&mut stream)?;
+            if record.record_type != messages::WELCOME {
+                return Err(io::Error::other("establishment refused"));
+            }
+            let (_, welcome) = Welcome::decode(&record.body).map_err(io::Error::other)?;
+            let session_secret = match &hello.authentication {
+                HelloAuthentication::LeaseActivation { activation_secret, .. } => {
+                    Secret32::new(*activation_secret.expose())
+                },
+                _ => Secret32::new([0; 32]),
+            };
+            let prk = auth::extract_handshake_prk(
+                &session_secret,
+                &hello.client_nonce,
+                &welcome.server_nonce,
+                &[0; 32],
+            );
+            let (keys, _) = auth::derive_session_keys(
+                &prk,
+                welcome.session_id,
+                welcome.resume_generation,
+                &welcome.session_tag,
+            );
+            Ok(Self {
+                stream,
+                sequence: 1,
+                session_id: welcome.session_id,
+                session_tag: welcome.session_tag,
+                resume_key: Secret32::new(*keys.resume_key()),
+            })
+        }
+
+        /// Send one correlated request, which closes the activation-retry window.
+        fn query_session(&mut self) -> io::Result<messages::PayloadMap> {
+            self.sequence += 1;
+            let body = Envelope::new(2, Vec::new()).encode().map_err(io::Error::other)?;
+            write_raw(&mut self.stream, self.sequence, messages::QUERY_SESSION, 0, &body)?;
+            let record = read_raw(&mut self.stream)?;
+            if record.record_type != messages::SESSION_STATUS {
+                return Err(io::Error::other("expected SESSION_STATUS"));
+            }
+            Ok(messages::decode_control(&record.body).map_err(io::Error::other)?.payload)
+        }
+    }
+
+    fn connect_endpoint(endpoint: &str) -> io::Result<LocalStream> {
+        #[cfg(unix)]
+        {
+            LocalStream::connect(endpoint.trim_start_matches("unix:"))
+        }
+        #[cfg(windows)]
+        {
+            LocalStream::connect(endpoint.trim_start_matches("tcp:"))
+        }
+    }
+
+    fn write_raw(
+        stream: &mut LocalStream,
+        sequence: u64,
+        record_type: u16,
+        object_id: u64,
+        body: &[u8],
+    ) -> io::Result<()> {
+        let header = vivid_protocol::wire::RecordHeader {
+            body_length: u32::try_from(body.len()).map_err(io::Error::other)?,
+            record_type,
+            flags: 0,
+            object_id,
+            sequence,
+        };
+        stream.write_all(&header.encode())?;
+        stream.write_all(body)?;
+        stream.flush()
+    }
+
+    fn read_raw(stream: &mut LocalStream) -> io::Result<vivid_protocol::wire::Record> {
+        let mut header = [0_u8; vivid_protocol::wire::HEADER_SIZE];
+        stream.read_exact(&mut header)?;
+        let header = vivid_protocol::wire::RecordHeader::decode(header);
+        let mut body = vec![0_u8; header.body_length as usize];
+        stream.read_exact(&mut body)?;
+        Ok(vivid_protocol::wire::Record {
+            record_type: header.record_type,
+            flags: header.flags,
+            object_id: header.object_id,
+            sequence: header.sequence,
+            body,
+        })
+    }
+
+    fn wait_until(deadline: Duration, mut condition: impl FnMut() -> bool) -> bool {
+        let end = Instant::now() + deadline;
+        while Instant::now() < end {
+            if condition() {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        condition()
+    }
+
+    #[test]
+    fn an_unclean_loss_suspends_a_resumable_lease_and_resume_restores_it() {
+        let service = VividService::start_with_wake(test_geometry(), Arc::new(|| {})).unwrap();
+        let mut controller = connect(&service);
+        let context_id = controller.info().root_context_id;
+        let secret = Secret32::new([0x61; 32]);
+        controller
+            .create_session_lease(
+                &resumable_definition(context_id, 11, &secret),
+                &RequestMetadata::default(),
+            )
+            .unwrap();
+
+        let mut child = RawClient::activate(&service, context_id, 11, &secret).unwrap();
+        let child_session = child.session_id;
+        let resume_key = Secret32::new(*child.resume_key.expose());
+        let tag = child.session_tag;
+        // A post-`HELLO` record closes the activation-retry window, so the only recovery left is
+        // the resume proof (security §6.4 step 6).
+        child.query_session().unwrap();
+        drop(child);
+
+        let identity = SessionIdentity::new(service.shared.presenter, child_session).unwrap();
+        assert!(
+            wait_until(Duration::from_secs(2), || {
+                lock(&service.shared.registry).sessions.len() == 1
+            }),
+            "the lost child leaves the session registry"
+        );
+        assert!(
+            service.scene.is_registered(identity),
+            "security §7.1 retains the suspended session's object state"
+        );
+        assert_eq!(lock(&service.shared.registry).leases.len(), 1, "the lease is still charged");
+
+        let mut resumed =
+            RawClient::resume(&service, context_id, 11, child_session, 0, &resume_key).unwrap();
+        assert_eq!(resumed.session_id, child_session, "the logical session survives the loss");
+        assert_ne!(resumed.session_tag, tag, "resume derives fresh key material");
+        assert!(resumed.query_session().is_ok(), "the resumed session serves control traffic");
+    }
+
+    #[test]
+    fn a_consumed_resume_cannot_be_replayed() {
+        let service = VividService::start_with_wake(test_geometry(), Arc::new(|| {})).unwrap();
+        let mut controller = connect(&service);
+        let context_id = controller.info().root_context_id;
+        let secret = Secret32::new([0x62; 32]);
+        controller
+            .create_session_lease(
+                &resumable_definition(context_id, 12, &secret),
+                &RequestMetadata::default(),
+            )
+            .unwrap();
+        let mut child = RawClient::activate(&service, context_id, 12, &secret).unwrap();
+        let child_session = child.session_id;
+        let resume_key = Secret32::new(*child.resume_key.expose());
+        child.query_session().unwrap();
+        drop(child);
+        assert!(wait_until(Duration::from_secs(2), || {
+            lock(&service.shared.registry).sessions.len() == 1
+        }));
+
+        let first =
+            RawClient::resume(&service, context_id, 11 + 1, child_session, 0, &resume_key).unwrap();
+        assert_eq!(first.session_id, child_session);
+        // Security §7.2: competing resume attempts cannot both advance the generation, so the
+        // same proof at generation zero is now stale.
+        assert!(
+            RawClient::resume(&service, context_id, 12, child_session, 0, &resume_key).is_err(),
+            "a consumed resume proof must not open a second session"
+        );
+    }
+
+    #[test]
+    fn a_wrong_resume_proof_is_refused() {
+        let service = VividService::start_with_wake(test_geometry(), Arc::new(|| {})).unwrap();
+        let mut controller = connect(&service);
+        let context_id = controller.info().root_context_id;
+        let secret = Secret32::new([0x65; 32]);
+        controller
+            .create_session_lease(
+                &resumable_definition(context_id, 15, &secret),
+                &RequestMetadata::default(),
+            )
+            .unwrap();
+        let mut child = RawClient::activate(&service, context_id, 15, &secret).unwrap();
+        let child_session = child.session_id;
+        child.query_session().unwrap();
+        drop(child);
+        assert!(wait_until(Duration::from_secs(2), || {
+            lock(&service.shared.registry).sessions.len() == 1
+        }));
+
+        assert!(
+            RawClient::resume(
+                &service,
+                context_id,
+                15,
+                child_session,
+                0,
+                &Secret32::new([0xff; 32]),
+            )
+            .is_err(),
+            "a resume proof under the wrong key must be refused"
+        );
+    }
+
+    #[test]
+    fn a_lease_without_grace_closes_instead_of_suspending() {
+        // Cleanup policy zero closes immediately, even on an unclean loss (security §7.1).
+        let service = VividService::start_with_wake(test_geometry(), Arc::new(|| {})).unwrap();
+        let mut controller = connect(&service);
+        let context_id = controller.info().root_context_id;
+        let secret = Secret32::new([0x63; 32]);
+        controller
+            .create_session_lease(
+                &lease_definition(context_id, 13, &secret),
+                &RequestMetadata::default(),
+            )
+            .unwrap();
+        let mut child = RawClient::activate(&service, context_id, 13, &secret).unwrap();
+        let child_session = child.session_id;
+        let resume_key = Secret32::new(*child.resume_key.expose());
+        child.query_session().unwrap();
+        drop(child);
+
+        assert!(
+            wait_until(Duration::from_secs(2), || {
+                lock(&service.shared.registry).leases.len() == 0
+            }),
+            "an immediate cleanup policy releases the lease"
+        );
+        let identity = SessionIdentity::new(service.shared.presenter, child_session).unwrap();
+        assert!(!service.scene.is_registered(identity), "and retains no object state");
+        assert!(
+            RawClient::resume(&service, context_id, 13, child_session, 0, &resume_key).is_err(),
+            "a closed lease cannot resume"
+        );
+    }
+
+    #[test]
+    fn a_suspended_lease_is_released_when_its_grace_expires() {
+        let service = VividService::start_with_wake(test_geometry(), Arc::new(|| {})).unwrap();
+        let mut controller = connect(&service);
+        let context_id = controller.info().root_context_id;
+        let secret = Secret32::new([0x66; 32]);
+        let mut definition = resumable_definition(context_id, 16, &secret);
+        definition.requested_disconnect_grace_us = 50_000;
+        controller.create_session_lease(&definition, &RequestMetadata::default()).unwrap();
+
+        let mut child = RawClient::activate(&service, context_id, 16, &secret).unwrap();
+        let child_session = child.session_id;
+        child.query_session().unwrap();
+        drop(child);
+
+        // Grace expiry performs final owner-scoped cleanup, releasing the reservation.
+        assert!(
+            wait_until(Duration::from_secs(3), || {
+                lock(&service.shared.registry).leases.len() == 0
+            }),
+            "the grace deadline releases a suspended lease"
+        );
+        let identity = SessionIdentity::new(service.shared.presenter, child_session).unwrap();
+        assert!(!service.scene.is_registered(identity), "retained state goes with it");
     }
 
     #[test]
