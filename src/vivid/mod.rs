@@ -46,6 +46,7 @@ use vivid_protocol::messages::{
     self, ChannelOpen, Envelope, ErrorDetail, ErrorReply, Hello, HelloAuthentication, LaneClass,
     StrictMap, Welcome, WelcomeAuthentication,
 };
+use vivid_protocol::observation::{self, ObservationKey, ObservationQueue};
 use vivid_protocol::registry;
 use vivid_protocol::resource::{Resource, ResourceContract, TokenBucket};
 use vivid_protocol::revision::{
@@ -97,6 +98,19 @@ const MAX_LEASES: usize = 32;
 const MAX_STATUS_ENTRIES: usize = 64;
 /// Core §4.3 caps a lane control body at 64 KiB.
 const LANE_MAX_RECORD_BODY: u32 = 64 * 1024;
+/// `SURFACE_CHANGED` changed-field bits, core §10.
+const SURFACE_CHANGED_LIFECYCLE: u64 = 1 << 0;
+const SURFACE_CHANGED_GEOMETRY: u64 = 1 << 1;
+const SURFACE_CHANGED_SLOTS: u64 = 1 << 4;
+/// `TRACK_CHANGED` changed-field bits, media §8.
+const TRACK_CHANGED_LIFECYCLE: u64 = 1 << 0;
+const TRACK_CHANGED_CHANNEL: u64 = 1 << 1;
+const TRACK_CHANGED_ACTIVATION: u64 = 1 << 3;
+/// `SCENE_CHANGED` reason bits, core §10.
+const SCENE_CHANGED_PRODUCER_COMMIT: u64 = 1 << 0;
+/// `NEED_KEYFRAME` and `NEED_FULL_FRAME` reasons, media §13.
+const NEED_KEYFRAME_DECODER_RESET: u64 = 2;
+const NEED_FULL_FRAME_NO_BASE: u64 = 1;
 
 struct SessionRuntime {
     identity: SessionIdentity,
@@ -118,6 +132,8 @@ struct SessionRuntime {
     lane_writer: Mutex<Option<Arc<Writer>>>,
     /// The desktop input grant, `desktop-input-v1`.
     grant: Mutex<InputGrant>,
+    /// The bounded, coalescing observation queue, `observability-v1`.
+    observations: Mutex<ObservationQueue>,
 }
 
 #[derive(Default)]
@@ -664,6 +680,7 @@ fn actor_loop(
         }
         expire_leases(&shared, &session);
         service_input_renewal(&session);
+        drain_observations(&session, &egress);
     }
     egress.close();
     // Release the reader, which is parked on a peer that has no obligation to close promptly.
@@ -696,6 +713,70 @@ fn dispatch_and_reply(
             !fatal
         },
     }
+}
+
+/// Write whatever observations have accumulated, oldest first.
+fn drain_observations(session: &Arc<SessionRuntime>, egress: &Egress) {
+    loop {
+        let next = lock(&session.observations).drain_next();
+        let Some(observation) = next else {
+            return;
+        };
+        let Ok(body) = Envelope::new(0, observation.payload).encode() else {
+            continue;
+        };
+        if !egress.send(observation.record_type, observation.object_id, body) {
+            return;
+        }
+    }
+}
+
+/// Queue one surface observation, core §10.
+fn observe_surface(session: &Arc<SessionRuntime>, status: &SurfaceStatus, changed: u64) {
+    lock(&session.observations).push(
+        observation::class::SURFACE,
+        ObservationKey {
+            record_type: messages::SURFACE_CHANGED,
+            context_id: status.identity.context.context_id,
+            object_id: status.identity.surface_id,
+        },
+        vec![
+            (0, Value::Unsigned(status.identity.context.context_id)),
+            (1, Value::Unsigned(status.identity.surface_id)),
+            (2, Value::Unsigned(status.revision.get())),
+            (3, Value::Unsigned(status.generation.get())),
+            (4, Value::Unsigned(changed)),
+        ],
+    );
+}
+
+/// Queue one track observation, core §10.
+fn observe_track(session: &Arc<SessionRuntime>, status: &TrackStatus, changed: u64) {
+    lock(&session.observations).push(
+        observation::class::TRACK,
+        ObservationKey {
+            record_type: messages::TRACK_CHANGED,
+            context_id: status.identity.surface.context.context_id,
+            object_id: status.identity.track_id,
+        },
+        vec![
+            (0, Value::Unsigned(status.identity.surface.context.context_id)),
+            (1, Value::Unsigned(status.identity.surface.surface_id)),
+            (2, Value::Unsigned(status.identity.track_id)),
+            (3, Value::Unsigned(status.state.revision.get())),
+            (4, Value::Unsigned(status.state.channel_generation.get())),
+            (5, Value::Unsigned(changed)),
+        ],
+    );
+}
+
+/// Queue one scene observation, core §10.
+fn observe_scene(session: &Arc<SessionRuntime>, revision: u64, reason: u64) {
+    lock(&session.observations).push(
+        observation::class::SCENE,
+        ObservationKey { record_type: messages::SCENE_CHANGED, context_id: 0, object_id: 0 },
+        vec![(0, Value::Unsigned(revision)), (1, Value::Unsigned(reason))],
+    );
 }
 
 /// Close the activation-retry window for a leased session.
@@ -1097,6 +1178,7 @@ fn establish_root_session(
         auth::extract_handshake_prk(&session_secret, &hello.client_nonce, &server_nonce, &[0; 32]);
     let (keys, anchor_key) = auth::derive_session_keys(&prk, session_id, 0, &session_tag);
 
+    let observation_capacity = contract.get(Resource::ObservationQueueEntries);
     let mut welcome = Welcome {
         session_id,
         session_tag,
@@ -1257,6 +1339,7 @@ fn establish_root_session(
         lane: Mutex::new(None),
         lane_writer: Mutex::new(None),
         grant: Mutex::new(InputGrant::new()),
+        observations: Mutex::new(ObservationQueue::new(observation_capacity)),
     });
     // Suspension retained this session's surfaces, tracks, and nodes, so a resume re-attaches to
     // them rather than registering a second time (security §7.1).
@@ -1500,6 +1583,7 @@ fn dispatch_control(
             let identity = surface_identity(session, definition.context_id, definition.surface_id)?;
             let status =
                 shared.scene.create_surface(identity, definition).map_err(ControlError::state)?;
+            observe_surface(session, &status, SURFACE_CHANGED_LIFECYCLE);
             (
                 messages::SURFACE_READY,
                 record.object_id,
@@ -1550,7 +1634,7 @@ fn dispatch_control(
                     .map_err(|_| ControlError::bad_message("profile parameters"))?
                     .to_vec(),
             };
-            let _status = shared
+            let status = shared
                 .scene
                 .update_surface(
                     identity,
@@ -1563,10 +1647,14 @@ fn dispatch_control(
                     replacement,
                 )
                 .map_err(ControlError::state)?;
+            observe_surface(session, &status, SURFACE_CHANGED_GEOMETRY);
             (messages::OK, record.object_id, Ok(messages::ok(request_id)))
         },
         messages::DESTROY_SURFACE => {
             let identity = payload_surface_identity(session, &value)?;
+            if let Some(status) = shared.scene.surface_status(identity) {
+                observe_surface(session, &status, SURFACE_CHANGED_LIFECYCLE);
+            }
             shared.scene.destroy_surface(identity).map_err(ControlError::state)?;
             (messages::OK, record.object_id, Ok(messages::ok(request_id)))
         },
@@ -1623,6 +1711,7 @@ fn dispatch_control(
             )?;
             let status =
                 shared.scene.create_track(identity, configuration).map_err(ControlError::state)?;
+            observe_track(session, &status, TRACK_CHANGED_LIFECYCLE);
             (
                 messages::TRACK_READY,
                 record.object_id,
@@ -1681,6 +1770,7 @@ fn dispatch_control(
                 return Err(ControlError::state("channel advance is not exact"));
             }
             let status = shared.scene.advance_channel(identity).map_err(ControlError::state)?;
+            observe_track(session, &status, TRACK_CHANGED_CHANNEL);
             (
                 messages::CHANNEL_ADVANCED,
                 record.object_id,
@@ -1739,6 +1829,14 @@ fn dispatch_control(
                     &bindings,
                 )
                 .map_err(ControlError::state)?;
+            observe_surface(session, &status, SURFACE_CHANGED_SLOTS);
+            for (_slot, track_id, _generation, _milestone) in &bindings {
+                if let Ok(track) = identity.track(*track_id)
+                    && let Some(track_status) = shared.scene.track_status(track)
+                {
+                    observe_track(session, &track_status, TRACK_CHANGED_ACTIVATION);
+                }
+            }
             (shared.wake)();
             (
                 messages::TRACK_ACTIVATED,
@@ -1876,6 +1974,7 @@ fn dispatch_control(
                 },
                 Err(CommitRejection::Failed(message)) => return Err(ControlError::state(message)),
             };
+            observe_scene(session, revision.get(), SCENE_CHANGED_PRODUCER_COMMIT);
             (shared.wake)();
             (
                 messages::SCENE_PRESENTED,
@@ -2108,7 +2207,17 @@ fn dispatch_control(
             }
             (messages::OK, record.object_id, Ok(messages::ok(request_id)))
         },
-        messages::SET_OBSERVATION => (messages::OK, record.object_id, Ok(messages::ok(request_id))),
+        messages::SET_OBSERVATION => {
+            let map = StrictMap::new("SET_OBSERVATION", &value, &[0])
+                .map_err(|_| ControlError::bad_message("invalid SET_OBSERVATION schema"))?;
+            let mask = map
+                .required_u64(0)
+                .map_err(|_| ControlError::bad_message("SET_OBSERVATION mask"))?;
+            lock(&session.observations)
+                .subscribe(mask)
+                .map_err(|_| ControlError::bad_message("unassigned observation class bits"))?;
+            (messages::OK, record.object_id, Ok(messages::ok(request_id)))
+        },
         _ if record.flags & RECORD_OPTIONAL != 0 => {
             return Ok(None);
         },
@@ -2280,6 +2389,45 @@ fn handle_track_channel(reader: &mut Reader, shared: &Arc<ServiceShared>) -> io:
     result
 }
 
+/// Ask the producer for a random-access unit on this channel, media §13.
+fn request_keyframe(
+    writer: &Writer,
+    identity: TrackIdentity,
+    generation: ChannelGeneration,
+    reason: u64,
+) {
+    let payload = vec![
+        (0, Value::Unsigned(identity.surface.context.context_id)),
+        (1, Value::Unsigned(identity.surface.surface_id)),
+        (2, Value::Unsigned(identity.track_id)),
+        (3, Value::Unsigned(generation.get())),
+        (4, Value::Unsigned(0)),
+        (5, Value::Unsigned(reason)),
+    ];
+    if let Ok(body) = Envelope::new(0, payload).encode() {
+        let _ = writer.write_record(messages::NEED_KEYFRAME, identity.track_id, &body);
+    }
+}
+
+/// Ask the producer for a full raster frame on this channel, media §13.
+fn request_full_frame(
+    writer: &Writer,
+    identity: TrackIdentity,
+    generation: ChannelGeneration,
+    reason: u64,
+) {
+    let payload = vec![
+        (0, Value::Unsigned(identity.surface.context.context_id)),
+        (1, Value::Unsigned(identity.surface.surface_id)),
+        (2, Value::Unsigned(identity.track_id)),
+        (3, Value::Unsigned(generation.get())),
+        (4, Value::Unsigned(reason)),
+    ];
+    if let Ok(body) = Envelope::new(0, payload).encode() {
+        let _ = writer.write_record(messages::NEED_FULL_FRAME, identity.track_id, &body);
+    }
+}
+
 fn channel_loop(
     reader: &mut Reader,
     writer: &Writer,
@@ -2391,12 +2539,11 @@ fn channel_loop(
                         raster.height,
                         u32::from(raster.maximum_delta_operations),
                     )?;
-                    let base = shared.scene.latest_frame(identity).ok_or_else(|| {
-                        io::Error::new(
-                            ErrorKind::InvalidData,
-                            "raster delta has no retained full frame",
-                        )
-                    })?;
+                    let Some(base) = shared.scene.latest_frame(identity) else {
+                        // Media §13: no base, so ask for a full frame instead of losing the track.
+                        request_full_frame(writer, identity, generation, NEED_FULL_FRAME_NO_BASE);
+                        continue;
+                    };
                     apply_raster_delta(&base, delta)?
                 };
                 shared
@@ -2523,7 +2670,17 @@ fn channel_loop(
                             "VIDEO_PACKET used a non-video track",
                         )
                     })?
-                    .push(packet)?;
+                    .push(packet);
+                let frames = match frames {
+                    Ok(frames) => frames,
+                    Err(error) => {
+                        // Media §13 reason 2: the decoder reset, so a key unit in a greater epoch
+                        // recovers the channel rather than losing the track.
+                        request_keyframe(writer, identity, generation, NEED_KEYFRAME_DECODER_RESET);
+                        log::debug!("video decode failed, asked for a key unit: {error}");
+                        continue;
+                    },
+                };
                 for decoded in frames {
                     let (sar_num, sar_den) = match &configuration.kind {
                         KindConfiguration::Video(configuration) => (
@@ -5097,6 +5254,115 @@ mod tests {
             .mark_presented(identity, ChannelGeneration::ONE, surface.generation(), 1, 0)
             .unwrap();
         drop(track);
+    }
+
+    #[test]
+    fn a_subscribed_session_observes_its_own_mutations() {
+        let service = VividService::start_with_wake(test_geometry(), Arc::new(|| {})).unwrap();
+        let mut session = connect(&service);
+        let context_id = session.info().root_context_id;
+        session.set_observation(observation::class::SURFACE).unwrap();
+
+        let surface = session
+            .create_surface(
+                SurfaceDefinition {
+                    context_id,
+                    surface_id: 51,
+                    semantic_profile: registry::TERMINAL_CONTENT.into(),
+                    coordinate_model: CoordinateModel::TerminalContentCells,
+                    logical_width: 2,
+                    logical_height: 2,
+                    scale_numerator: 1,
+                    scale_denominator: 1,
+                    rotation: 0,
+                    descriptor: SurfaceDescriptor {
+                        role: SurfaceRole::Figure,
+                        title: "observed".into(),
+                        semantic_content_revision: 1,
+                        semantic_availability: 0,
+                        locator_hint: String::new(),
+                    },
+                    policy: 0,
+                    profile_parameters: vec![],
+                },
+                &RequestMetadata::default(),
+            )
+            .unwrap();
+
+        let observed = wait_for_event(&session, messages::SURFACE_CHANGED)
+            .expect("a subscribed surface mutation is observed");
+        let field = |key: u64| observed.iter().find(|e| e.0 == key).and_then(|e| e.1.as_u64());
+        assert_eq!(field(1), Some(surface.id()));
+        assert_eq!(field(4), Some(SURFACE_CHANGED_LIFECYCLE));
+        assert_eq!(
+            field(vivid_protocol::observation::OBSERVATION_SEQUENCE_KEY),
+            Some(1),
+            "observations carry a strictly increasing sequence"
+        );
+    }
+
+    #[test]
+    fn an_unsubscribed_session_observes_nothing() {
+        let service = VividService::start_with_wake(test_geometry(), Arc::new(|| {})).unwrap();
+        let mut session = connect(&service);
+        let context_id = session.info().root_context_id;
+        // No SET_OBSERVATION: the default mask is zero, so nothing is queued at all.
+        session
+            .create_surface(
+                SurfaceDefinition {
+                    context_id,
+                    surface_id: 52,
+                    semantic_profile: registry::TERMINAL_CONTENT.into(),
+                    coordinate_model: CoordinateModel::TerminalContentCells,
+                    logical_width: 2,
+                    logical_height: 2,
+                    scale_numerator: 1,
+                    scale_denominator: 1,
+                    rotation: 0,
+                    descriptor: SurfaceDescriptor {
+                        role: SurfaceRole::Figure,
+                        title: "quiet".into(),
+                        semantic_content_revision: 1,
+                        semantic_availability: 0,
+                        locator_hint: String::new(),
+                    },
+                    policy: 0,
+                    profile_parameters: vec![],
+                },
+                &RequestMetadata::default(),
+            )
+            .unwrap();
+        thread::sleep(Duration::from_millis(60));
+        assert!(
+            wait_for_event(&session, messages::SURFACE_CHANGED).is_none(),
+            "an unsubscribed session receives no observations"
+        );
+    }
+
+    #[test]
+    fn an_unassigned_observation_class_is_refused() {
+        let service = VividService::start_with_wake(test_geometry(), Arc::new(|| {})).unwrap();
+        let session = connect(&service);
+        assert!(session.set_observation(1 << 9).is_err());
+    }
+
+    /// Drain session events looking for one record type, within a bounded wait.
+    fn wait_for_event(
+        session: &vivid_sdk::Session,
+        record_type: u16,
+    ) -> Option<messages::PayloadMap> {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            while let Ok(Some(event)) = session.take_event() {
+                if let SessionEvent::Other { record_type: seen, payload, .. } = event
+                    && seen == record_type
+                {
+                    return Some(payload);
+                }
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        None
     }
 
     #[test]
