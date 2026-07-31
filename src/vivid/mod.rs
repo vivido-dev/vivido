@@ -3,6 +3,7 @@
 mod actor;
 mod audio;
 mod decoder;
+mod lane;
 mod lease;
 pub mod scene;
 pub mod target;
@@ -38,8 +39,8 @@ use vivid_protocol::identity::{
 };
 use vivid_protocol::media;
 use vivid_protocol::messages::{
-    self, ChannelOpen, Envelope, ErrorDetail, ErrorReply, Hello, HelloAuthentication, StrictMap,
-    Welcome, WelcomeAuthentication,
+    self, ChannelOpen, Envelope, ErrorDetail, ErrorReply, Hello, HelloAuthentication, LaneClass,
+    StrictMap, Welcome, WelcomeAuthentication,
 };
 use vivid_protocol::registry;
 use vivid_protocol::resource::{Resource, ResourceContract, TokenBucket};
@@ -90,6 +91,8 @@ const CHANNEL_OPEN_DEADLINE_US: u64 = 30_000_000;
 const MAX_SCENE_NODES: usize = 256;
 const MAX_LEASES: usize = 32;
 const MAX_STATUS_ENTRIES: usize = 64;
+/// Core §4.3 caps a lane control body at 64 KiB.
+const LANE_MAX_RECORD_BODY: u32 = 64 * 1024;
 
 struct SessionRuntime {
     identity: SessionIdentity,
@@ -104,6 +107,11 @@ struct SessionRuntime {
     lease: Option<LeaseKey>,
     /// This generation's resume key, handed to the lease if the transport is lost uncleanly.
     resume_key: Secret32,
+    /// The one interactive transport this session may have, core §7.
+    lane: Mutex<Option<lane::LaneState>>,
+    /// Its writer, independent of the control writer and of every track writer, so a saturated
+    /// bulk track cannot delay input revocation.
+    lane_writer: Mutex<Option<Arc<Writer>>>,
 }
 
 #[derive(Default)]
@@ -472,7 +480,7 @@ fn handle_connection(stream: LocalStream, shared: &Arc<ServiceShared>) -> io::Re
     match preface.kind {
         ConnectionKind::Control => handle_control(&mut reader, &preface_bytes, shared),
         ConnectionKind::Track => handle_track_channel(&mut reader, shared),
-        ConnectionKind::Lane => reject_lane(&mut reader),
+        ConnectionKind::Lane => handle_lane(&mut reader, shared),
     }
 }
 
@@ -1174,6 +1182,8 @@ fn establish_root_session(
             Principal::Lease { key, .. } | Principal::Resume { key, .. } => Some(*key),
         },
         resume_key: Secret32::new(*keys.resume_key()),
+        lane: Mutex::new(None),
+        lane_writer: Mutex::new(None),
     });
     // Suspension retained this session's surfaces, tracks, and nodes, so a resume re-attaches to
     // them rather than registering a second time (security §7.1).
@@ -2676,21 +2686,147 @@ fn wait_until_video_due(
     }
 }
 
-fn reject_lane(reader: &mut Reader) -> io::Result<()> {
-    let writer = reader.writer(ConnectionKind::Lane)?;
+/// Serve one interactive-lane connection.
+///
+/// Core §7: the lane is authenticated with a tag over the session channel key, carries only
+/// input and liveness records, and its loss revokes input without disturbing the control session,
+/// surfaces, or tracks.
+fn handle_lane(reader: &mut Reader, shared: &Arc<ServiceShared>) -> io::Result<()> {
+    let writer = Arc::new(reader.writer(ConnectionKind::Lane)?);
+    reader.set_maximum(LANE_MAX_RECORD_BODY)?;
+    writer.set_maximum(LANE_MAX_RECORD_BODY)?;
     let first = reader.read_record(ConnectionKind::Lane)?;
+    if first.record_type != messages::LANE_OPEN {
+        return Err(send_fatal(
+            &writer,
+            0,
+            messages::ERROR_BAD_MESSAGE,
+            "an interactive lane opens with LANE_OPEN",
+        ));
+    }
     let request_id =
         messages::decode_control(&first.body).map(|envelope| envelope.request_id).unwrap_or(0);
-    writer.write_record(
-        messages::ERROR,
-        first.object_id,
-        &protocol_error(
+    // The decoder enforces the interactive lane class and every nonzero and length rule.
+    let Ok(open) = messages::LaneOpen::decode(&first.body) else {
+        return Err(send_fatal(
+            &writer,
             request_id,
-            messages::ERROR_UNSUPPORTED_PROFILE,
-            true,
-            "Vivido does not implement input or multiplexed carrier lanes",
-        )?,
+            messages::ERROR_BAD_MESSAGE,
+            "invalid LANE_OPEN",
+        ));
+    };
+
+    let Some(session) = lock(&shared.registry).sessions.get(&open.session_id).cloned() else {
+        return Err(send_fatal(
+            &writer,
+            request_id,
+            messages::ERROR_AUTH_FAILED,
+            "lane authentication failed",
+        ));
+    };
+    let expected = auth::lane_tag(
+        session.channel_key.expose(),
+        open.session_id,
+        LaneClass::Interactive as u32,
+        open.lane_generation,
+        &open.client_nonce,
+    );
+    if !auth::verify_tag(&expected, &open.authentication_tag) {
+        return Err(send_fatal(
+            &writer,
+            request_id,
+            messages::ERROR_AUTH_FAILED,
+            "lane authentication failed",
+        ));
+    }
+
+    let admission = {
+        let mut slot = lock(&session.lane);
+        lane::admit(&mut slot, open.lane_generation, open.client_nonce)
+    };
+    match admission {
+        lane::Admission::Accept | lane::Admission::Replay => {},
+        lane::Admission::Busy => {
+            return Err(send_fatal(
+                &writer,
+                request_id,
+                messages::ERROR_CHANNEL_BUSY,
+                "another interactive transport is live for this lane generation",
+            ));
+        },
+        lane::Admission::Refused => {
+            return Err(send_fatal(
+                &writer,
+                request_id,
+                messages::ERROR_BAD_STATE,
+                "this lane generation cannot be reopened",
+            ));
+        },
+    }
+
+    let accepted = Envelope::new(
+        request_id,
+        vec![
+            (0, Value::Unsigned(open.session_id)),
+            (1, Value::Unsigned(LaneClass::Interactive as u64)),
+            (2, Value::Unsigned(open.lane_generation)),
+            (3, Value::Unsigned(u64::from(LANE_MAX_RECORD_BODY))),
+        ],
     )
+    .encode()
+    .map_err(io::Error::other)?;
+    writer.write_record(messages::LANE_ACCEPTED, 0, &accepted)?;
+    *lock(&session.lane_writer) = Some(writer.clone());
+
+    let outcome = serve_lane(reader, &writer, &session);
+
+    // Losing the lane revokes input and releases held state; it does not end the session.
+    lane::confirm_lost(&mut lock(&session.lane), open.lane_generation);
+    *lock(&session.lane_writer) = None;
+    outcome
+}
+
+fn serve_lane(
+    reader: &mut Reader,
+    writer: &Arc<Writer>,
+    session: &Arc<SessionRuntime>,
+) -> io::Result<()> {
+    loop {
+        let record = match reader.read_record(ConnectionKind::Lane) {
+            Ok(record) => record,
+            Err(error) if error.kind() == ErrorKind::UnexpectedEof => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        if !lane::carries(record.record_type) {
+            return Err(send_fatal(
+                writer,
+                0,
+                messages::ERROR_BAD_MESSAGE,
+                "the interactive lane carries only input and liveness records",
+            ));
+        }
+        match record.record_type {
+            messages::PING => {
+                let envelope = messages::decode_control(&record.body)?;
+                let body = Envelope::new(envelope.request_id, envelope.payload)
+                    .encode()
+                    .map_err(io::Error::other)?;
+                writer.write_record(messages::PONG, 0, &body)?;
+            },
+            messages::PONG | messages::ERROR => {},
+            _ => {
+                // Input binding and events arrive here. W6 answers them; until then the lane is
+                // proven to carry and reject the right records, and its loss is observable.
+                let _ = session;
+                return Err(send_fatal(
+                    writer,
+                    0,
+                    messages::ERROR_UNSUPPORTED_PROFILE,
+                    "desktop-input-v1 is not yet implemented",
+                ));
+            },
+        }
+    }
 }
 
 fn surface_ready_payload(status: &SurfaceStatus) -> Vec<(u64, Value)> {
@@ -4399,6 +4535,139 @@ mod tests {
         );
         let identity = SessionIdentity::new(service.shared.presenter, child_session).unwrap();
         assert!(!service.scene.is_registered(identity), "retained state goes with it");
+    }
+
+    #[test]
+    fn an_authenticated_interactive_lane_opens_and_answers_ping() {
+        let service = VividService::start_with_wake(test_geometry(), Arc::new(|| {})).unwrap();
+        let session = connect(&service);
+        // The SDK opens a lane only when `desktop-input-v1` was accepted, which a terminal target
+        // does not offer, so drive the wire directly.
+        let mut lane = RawLane::open(&service, &session, 1).unwrap();
+        assert!(lane.ping().is_ok(), "the lane is serviced independently of control");
+
+        // Core §7: only one transport per generation.
+        assert!(
+            RawLane::open(&service, &session, 1).is_err(),
+            "a duplicate open while the first is live must be refused"
+        );
+
+        drop(lane);
+        // After confirmed loss the same generation may be reopened, because no input was admitted.
+        assert!(
+            wait_until(Duration::from_secs(2), || { RawLane::open(&service, &session, 1).is_ok() }),
+            "an exact retry after loss is accepted"
+        );
+        // A lower generation is always refused.
+        assert!(RawLane::open(&service, &session, 0).is_err());
+    }
+
+    #[test]
+    fn a_lane_with_a_bad_tag_or_unknown_session_is_refused() {
+        let service = VividService::start_with_wake(test_geometry(), Arc::new(|| {})).unwrap();
+        let session = connect(&service);
+        assert!(
+            RawLane::open_with_key(&service, session.info().session_id, 1, &Secret32::new([0; 32]))
+                .is_err(),
+            "a tag under the wrong key must not authenticate"
+        );
+        assert!(
+            RawLane::open_with_key(&service, 9999, 1, &Secret32::new([0; 32])).is_err(),
+            "an unknown session must not authenticate"
+        );
+    }
+
+    #[test]
+    fn the_lane_refuses_records_it_does_not_carry() {
+        let service = VividService::start_with_wake(test_geometry(), Arc::new(|| {})).unwrap();
+        let session = connect(&service);
+        let mut lane = RawLane::open(&service, &session, 1).unwrap();
+        // A control record on the interactive lane is a framing error, not a mutation.
+        assert!(
+            lane.send(messages::CREATE_SURFACE, &Envelope::new(1, Vec::new()).encode().unwrap())
+                .and_then(|()| lane.read())
+                .is_ok_and(|record| record.record_type == messages::ERROR),
+            "the lane rejects a record it does not carry"
+        );
+        // The control session is untouched by that.
+        assert!(session.query_session().is_ok());
+    }
+
+    /// An interactive-lane connection driven at the wire.
+    struct RawLane {
+        stream: LocalStream,
+        sequence: u64,
+    }
+
+    impl RawLane {
+        fn open(
+            service: &VividService,
+            session: &vivid_sdk::Session,
+            generation: u64,
+        ) -> io::Result<Self> {
+            // The SDK derives the same channel key from the handshake it completed.
+            let key = session.channel_key();
+            Self::open_with_key(service, session.info().session_id, generation, &key)
+        }
+
+        fn open_with_key(
+            service: &VividService,
+            session_id: u64,
+            generation: u64,
+            channel_key: &Secret32,
+        ) -> io::Result<Self> {
+            let mut stream = connect_endpoint(service.control_endpoint())?;
+            stream.write_all(&vivid_protocol::wire::encode_preface(
+                ConnectionKind::Lane,
+                LANE_MAX_RECORD_BODY,
+            ))?;
+            let nonce = [0x2d_u8; 16];
+            let tag = auth::lane_tag(
+                channel_key.expose(),
+                session_id,
+                LaneClass::Interactive as u32,
+                generation,
+                &nonce,
+            );
+            let body = Envelope::new(
+                1,
+                vec![
+                    (0, Value::Unsigned(session_id)),
+                    (1, Value::Unsigned(LaneClass::Interactive as u64)),
+                    (2, Value::Unsigned(generation)),
+                    (3, Value::Bytes(nonce.to_vec())),
+                    (4, Value::Bytes(tag.to_vec())),
+                ],
+            )
+            .encode()
+            .map_err(io::Error::other)?;
+            write_raw(&mut stream, 1, messages::LANE_OPEN, 0, &body)?;
+            let mut lane = Self { stream, sequence: 1 };
+            let record = lane.read()?;
+            if record.record_type != messages::LANE_ACCEPTED {
+                return Err(io::Error::other("lane open refused"));
+            }
+            Ok(lane)
+        }
+
+        fn send(&mut self, record_type: u16, body: &[u8]) -> io::Result<()> {
+            self.sequence += 1;
+            write_raw(&mut self.stream, self.sequence, record_type, 0, body)
+        }
+
+        fn read(&mut self) -> io::Result<vivid_protocol::wire::Record> {
+            read_raw(&mut self.stream)
+        }
+
+        fn ping(&mut self) -> io::Result<()> {
+            let body = Envelope::new(7, Vec::new()).encode().map_err(io::Error::other)?;
+            self.send(messages::PING, &body)?;
+            let record = self.read()?;
+            if record.record_type != messages::PONG {
+                return Err(io::Error::other("expected PONG"));
+            }
+            Ok(())
+        }
     }
 
     #[test]
