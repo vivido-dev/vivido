@@ -684,7 +684,10 @@ fn actor_loop(
         drain_observations(&session, &egress);
     }
     egress.close();
-    // Release the reader, which is parked on a peer that has no obligation to close promptly.
+    // Flush the final reply (notably GOODBYE's OK) before closing the socket. On Windows a
+    // receive-only shutdown does not reliably release another thread blocked in `recv`, so the
+    // shutdown handle closes both halves only after egress has drained.
+    egress.join();
     shutdown.stop();
 }
 

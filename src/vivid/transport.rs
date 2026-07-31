@@ -5,7 +5,7 @@ use std::io::{self, IoSlice, Read, Write};
 use std::net::TcpStream as LocalStream;
 #[cfg(unix)]
 use std::os::unix::net::UnixStream as LocalStream;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use vivid_protocol::wire::{
     ConnectionKind, HEADER_SIZE, PREFACE_SIZE, Preface, PrefaceClassification, RECORD_KNOWN_FLAGS,
@@ -14,7 +14,7 @@ use vivid_protocol::wire::{
 use vivid_protocol::{CONTROL_MAX_RECORD_BODY, HARD_MAX_RECORD_BODY};
 
 pub struct Reader {
-    stream: LocalStream,
+    stream: Arc<LocalStream>,
     negotiated_maximum: u32,
     maximum: u32,
     sequence: u64,
@@ -39,7 +39,7 @@ impl Reader {
         let maximum = preface.initiator_tx_body_limit.min(HARD_MAX_RECORD_BODY);
         Ok((
             Self {
-                stream,
+                stream: Arc::new(stream),
                 negotiated_maximum: maximum,
                 maximum: if preface.kind == ConnectionKind::Control {
                     maximum.min(CONTROL_MAX_RECORD_BODY)
@@ -60,7 +60,7 @@ impl Reader {
     /// and close the logical session, so the reader must stop rather than wait for a peer EOF that
     /// a producer is not obliged to send promptly.
     pub fn shutdown_handle(&self) -> io::Result<ReadShutdown> {
-        Ok(ReadShutdown { stream: self.stream.try_clone()? })
+        Ok(ReadShutdown { stream: self.stream.clone() })
     }
 
     pub fn read_record(&mut self, kind: ConnectionKind) -> io::Result<Record> {
@@ -81,7 +81,8 @@ impl Reader {
         body: &mut Vec<u8>,
     ) -> io::Result<RecordHeader> {
         let mut bytes = [0_u8; HEADER_SIZE];
-        self.stream.read_exact(&mut bytes)?;
+        let mut stream = self.stream.as_ref();
+        stream.read_exact(&mut bytes)?;
         let header = RecordHeader::decode(bytes);
         if header.flags & !RECORD_KNOWN_FLAGS != 0 {
             return Err(io::Error::new(
@@ -110,14 +111,14 @@ impl Reader {
         }
         self.sequence = header.sequence;
         body.resize(header.body_length as usize, 0);
-        self.stream.read_exact(body)?;
+        stream.read_exact(body)?;
         Ok(header)
     }
 
     pub fn writer(&self, kind: ConnectionKind) -> io::Result<Writer> {
         Ok(Writer {
             inner: Mutex::new(WriterInner {
-                stream: self.stream.try_clone()?,
+                stream: self.stream.clone(),
                 maximum: if kind == ConnectionKind::Control {
                     CONTROL_MAX_RECORD_BODY
                 } else {
@@ -140,14 +141,14 @@ impl Reader {
     }
 }
 
-/// Unblocks a parked reader by shutting the receive half of its connection.
+/// Unblocks a parked reader after the connection's egress has drained.
 pub struct ReadShutdown {
-    stream: LocalStream,
+    stream: Arc<LocalStream>,
 }
 
 impl ReadShutdown {
     pub fn stop(&self) {
-        let _ = self.stream.shutdown(std::net::Shutdown::Read);
+        let _ = self.stream.shutdown(std::net::Shutdown::Both);
     }
 }
 
@@ -156,7 +157,7 @@ pub struct Writer {
 }
 
 struct WriterInner {
-    stream: LocalStream,
+    stream: Arc<LocalStream>,
     maximum: u32,
     sequence: u64,
 }
@@ -207,12 +208,13 @@ impl Writer {
             object_id,
             sequence: inner.sequence,
         };
-        write_parts(&mut inner.stream, &header.encode(), parts)?;
-        inner.stream.flush()
+        let mut stream = inner.stream.as_ref();
+        write_parts(&mut stream, &header.encode(), parts)?;
+        stream.flush()
     }
 }
 
-fn write_parts(stream: &mut LocalStream, header: &[u8], parts: &[&[u8]]) -> io::Result<()> {
+fn write_parts(stream: &mut &LocalStream, header: &[u8], parts: &[&[u8]]) -> io::Result<()> {
     let mut buffers = Vec::with_capacity(parts.len() + 1);
     buffers.push(IoSlice::new(header));
     buffers.extend(parts.iter().map(|part| IoSlice::new(part)));
