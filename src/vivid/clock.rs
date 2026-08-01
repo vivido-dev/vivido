@@ -52,6 +52,9 @@ mod tests {
 
     #[test]
     fn elapsed_micros_match_the_underlying_instants() {
+        // Force the lazy origin before capturing instants: a first-read capture here would land
+        // after `base` and make every interval read as near zero.
+        let _ = *ORIGIN;
         let base = Instant::now();
         let later = base + std::time::Duration::from_millis(250);
         assert_eq!(from_instant(later).saturating_elapsed_since(from_instant(base)), 250_000);
