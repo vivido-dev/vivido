@@ -31,7 +31,8 @@ use winit::dpi::PhysicalPosition;
 #[cfg(unix)]
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, TouchPhase};
 use winit::event::{Event as WinitEvent, Modifiers, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, EventLoopProxy};
+#[cfg(target_os = "macos")]
+use winit::event_loop::ActiveEventLoop;
 use winit::window::WindowId;
 
 use crate::terminal::event::Event as TerminalEvent;
@@ -69,8 +70,10 @@ use crate::display::Display;
 use crate::display::ScreenshotReadback;
 #[cfg(unix)]
 use crate::display::color::{DIM_FACTOR, Rgb};
-use crate::display::window::Window;
-use crate::event::{ActionContext, Event, EventProxy, EventType, Mouse, SearchState, TouchPurpose};
+use crate::event::{
+    ActionContext, Event, EventProxy, EventSink, EventType, LoopHandle, Mouse, SearchState,
+    TouchPurpose,
+};
 use crate::input;
 #[cfg(unix)]
 use crate::logging::LOG_TARGET_IPC_CONFIG;
@@ -159,15 +162,15 @@ const SCREENSHOT_READBACK_TIMEOUT: Duration = Duration::from_secs(5);
 impl WindowContext {
     /// Create initial window context.
     pub fn initial(
-        event_loop: &ActiveEventLoop,
-        proxy: EventLoopProxy<Event>,
+        event_loop: LoopHandle<'_>,
+        proxy: EventSink,
         config: Rc<UiConfig>,
         mut options: WindowOptions,
     ) -> Result<Self, Box<dyn Error>> {
         let mut identity = config.window.identity.clone();
         options.window_identity.override_identity_config(&mut identity);
 
-        let window = Window::new(event_loop, &config, &identity, &mut options)?;
+        let window = event_loop.create_window(&config, &identity, &mut options)?;
         let display = Display::new(window, &config, false)?;
 
         Self::new(display, config, options, proxy)
@@ -175,8 +178,8 @@ impl WindowContext {
 
     /// Create additional context.
     pub fn additional(
-        event_loop: &ActiveEventLoop,
-        proxy: EventLoopProxy<Event>,
+        event_loop: LoopHandle<'_>,
+        proxy: EventSink,
         config: Rc<UiConfig>,
         mut options: WindowOptions,
         config_overrides: ParsedOptions,
@@ -191,7 +194,7 @@ impl WindowContext {
         #[cfg(not(target_os = "macos"))]
         let tabbed = false;
 
-        let window = Window::new(event_loop, &config, &identity, &mut options)?;
+        let window = event_loop.create_window(&config, &identity, &mut options)?;
         let display = Display::new(window, &config, tabbed)?;
 
         let mut window_context = Self::new(display, config, options, proxy)?;
@@ -209,7 +212,7 @@ impl WindowContext {
         mut display: Display,
         config: Rc<UiConfig>,
         options: WindowOptions,
-        proxy: EventLoopProxy<Event>,
+        proxy: EventSink,
     ) -> Result<Self, Box<dyn Error>> {
         let mut pty_config = config.pty_config();
         options.terminal_options.override_pty_config(&mut pty_config);
@@ -477,8 +480,8 @@ impl WindowContext {
     /// Process events for this terminal window.
     pub fn handle_event(
         &mut self,
-        #[cfg(target_os = "macos")] event_loop: &ActiveEventLoop,
-        event_proxy: &EventLoopProxy<Event>,
+        #[cfg(target_os = "macos")] event_loop: Option<&ActiveEventLoop>,
+        event_proxy: &EventSink,
         clipboard: &mut Clipboard,
         scheduler: &mut Scheduler,
         event: WinitEvent<Event>,
@@ -684,8 +687,8 @@ impl WindowContext {
     pub fn ui_paste(
         &mut self,
         text: &str,
-        #[cfg(target_os = "macos")] event_loop: &ActiveEventLoop,
-        event_proxy: &EventLoopProxy<Event>,
+        #[cfg(target_os = "macos")] event_loop: Option<&ActiveEventLoop>,
+        event_proxy: &EventSink,
         clipboard: &mut Clipboard,
         scheduler: &mut Scheduler,
     ) -> Vec<u8> {
@@ -738,8 +741,8 @@ impl WindowContext {
         &mut self,
         key: &IpcKey,
         repeated: bool,
-        #[cfg(target_os = "macos")] event_loop: &ActiveEventLoop,
-        event_proxy: &EventLoopProxy<Event>,
+        #[cfg(target_os = "macos")] event_loop: Option<&ActiveEventLoop>,
+        event_proxy: &EventSink,
         clipboard: &mut Clipboard,
         scheduler: &mut Scheduler,
     ) -> Result<Vec<u8>, IpcError> {
@@ -784,8 +787,8 @@ impl WindowContext {
     pub fn ui_mouse(
         &mut self,
         mouse: &IpcMouse,
-        #[cfg(target_os = "macos")] event_loop: &ActiveEventLoop,
-        event_proxy: &EventLoopProxy<Event>,
+        #[cfg(target_os = "macos")] event_loop: Option<&ActiveEventLoop>,
+        event_proxy: &EventSink,
         clipboard: &mut Clipboard,
         scheduler: &mut Scheduler,
     ) -> Result<Vec<u8>, IpcError> {
@@ -1676,6 +1679,13 @@ impl WindowContext {
             return Err(String::from("a screenshot is already in progress for this window"));
         }
 
+        // A headless window has no compositor asking it to paint, so the retained frame may not
+        // exist yet or may predate the terminal state the caller wants captured. Paint first so a
+        // screenshot always reflects what `get-text` would report at the same moment.
+        if self.display.window.is_headless() && (self.dirty || !self.display.has_rendered_frame()) {
+            self.draw(scheduler);
+        }
+
         let readback = self.display.begin_screenshot().map_err(|err| err.to_string())?;
         self.screenshot = Some(PendingScreenshot { readback, connection, request_id });
         self.screenshot_busy = true;
@@ -1689,11 +1699,7 @@ impl WindowContext {
 
     /// Poll screenshot readback and move PNG encoding off the event-loop thread.
     #[cfg(unix)]
-    pub fn poll_screenshot(
-        &mut self,
-        scheduler: &mut Scheduler,
-        event_proxy: &EventLoopProxy<Event>,
-    ) {
+    pub fn poll_screenshot(&mut self, scheduler: &mut Scheduler, event_proxy: &EventSink) {
         let Some(pending) = self.screenshot.as_ref() else {
             return;
         };

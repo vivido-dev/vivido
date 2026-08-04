@@ -18,10 +18,9 @@ use base64::Engine;
 use log::{error, warn};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use winit::event_loop::EventLoopProxy;
 
 use crate::cli::{IpcMouseAction, IpcWaitCondition, MessageOptions, Options, SocketMessage};
-use crate::event::{Event, EventType};
+use crate::event::{Event, EventSink, EventType};
 use crate::terminal::thread;
 
 /// Formal Vivido automation protocol version.
@@ -53,6 +52,21 @@ pub const MAX_INPUT_BYTES: usize = 1024 * 1024;
 
 /// Environment variable name for the IPC socket path.
 const VIVIDO_SOCKET_ENV: &str = "VIVIDO_SOCKET";
+
+/// Environment variable naming the headless session a client should reach.
+const VIVIDO_SESSION_ENV: &str = "VIVIDO_SESSION";
+
+/// How this instance describes itself in the `hello` capability document.
+///
+/// Whether a process is headless, and which session it serves, is fixed at startup, so it is
+/// recorded once rather than threaded through every connection.
+static INSTANCE: std::sync::OnceLock<Instance> = std::sync::OnceLock::new();
+
+#[derive(Debug, Default)]
+struct Instance {
+    headless: bool,
+    session: Option<String>,
+}
 
 /// Number of serialized frames buffered for one connection.
 const OUTPUT_QUEUE_FRAMES: usize = MAX_SUBSCRIBER_EVENTS + MAX_IN_FLIGHT_REQUESTS;
@@ -92,6 +106,7 @@ pub const METHODS: &[&str] = &[
     "wait_screen_stable",
     "wait_frame",
     "wait_exit",
+    "quit",
     "wait_vivid_track",
     "transcript",
     "subscribe",
@@ -365,19 +380,17 @@ impl Drop for ConnectionGuard {
 /// IPC socket listener.
 pub struct IpcListener {
     pub socket: UnixListener,
-    event_proxy: EventLoopProxy<Event>,
+    event_proxy: EventSink,
     connection_count: Arc<AtomicUsize>,
     next_connection_id: AtomicU64,
 }
 
 impl IpcListener {
-    pub fn new(
-        options: &Options,
-        event_proxy: EventLoopProxy<Event>,
-        path: &Path,
-    ) -> Result<Self, IoError> {
+    pub fn new(options: &Options, event_proxy: EventSink, path: &Path) -> Result<Self, IoError> {
         let socket = bind_socket(path)?;
         unsafe { env::set_var(VIVIDO_SOCKET_ENV, path.as_os_str()) };
+        let _ =
+            INSTANCE.set(Instance { headless: options.headless, session: options.session.clone() });
         if options.daemon {
             println!("VIVIDO_SOCKET={}; export VIVIDO_SOCKET", path.display());
         }
@@ -393,6 +406,15 @@ impl IpcListener {
     /// Accept and start one persistent full-duplex IPC session.
     pub fn process_message(&mut self) -> Result<(), IoError> {
         let (stream, _) = self.socket.accept()?;
+
+        // The 0600 socket mode is the first gate, but it is a property of a path that may have
+        // been created before a hostile umask or replaced under us. The peer's own credentials
+        // are not forgeable, so check them too: this connection can drive a terminal.
+        if let Err(err) = require_peer_owner(&stream) {
+            warn!("Rejected IPC connection: {err}");
+            return Ok(());
+        }
+
         let previous = self.connection_count.fetch_add(1, Ordering::AcqRel);
         if previous >= MAX_CONNECTIONS {
             self.connection_count.fetch_sub(1, Ordering::AcqRel);
@@ -418,7 +440,7 @@ impl IpcListener {
 fn spawn_connection(
     stream: UnixStream,
     connection_id: u64,
-    event_proxy: EventLoopProxy<Event>,
+    event_proxy: EventSink,
     guard: ConnectionGuard,
 ) {
     // The listener is nonblocking for the polling thread. Accepted sockets inherit that flag on
@@ -478,11 +500,7 @@ fn configure_connection(stream: &UnixStream) -> io::Result<()> {
     stream.set_nonblocking(false)
 }
 
-fn run_connection(
-    stream: UnixStream,
-    connection: IpcConnection,
-    event_proxy: &EventLoopProxy<Event>,
-) {
+fn run_connection(stream: UnixStream, connection: IpcConnection, event_proxy: &EventSink) {
     let mut reader = BufReader::new(stream);
     let Some(first) = read_request_frame(&mut reader, &connection) else {
         return;
@@ -613,9 +631,14 @@ fn decode_request(frame: &[u8]) -> Result<RequestEnvelope, IpcError> {
 }
 
 fn hello_result() -> Value {
+    let instance = INSTANCE.get();
     json!({
         "server_version": env!("CARGO_PKG_VERSION"),
         "protocol_version": PROTOCOL_VERSION,
+        // Lets an automation client tell a windowless instance from a windowed one without
+        // inferring it from a failed `focus`.
+        "headless": instance.is_some_and(|instance| instance.headless),
+        "session": instance.and_then(|instance| instance.session.clone()),
         "methods": METHODS,
         "event_kinds": EVENT_KINDS,
         "error_codes": [
@@ -648,6 +671,59 @@ fn send_direct_error(mut stream: UnixStream, id: u64, error: IpcError) {
 }
 
 /// Bind and secure the Vivido IPC socket.
+/// Refuse a peer that is not the user running this process.
+///
+/// Checked on both ends: the server will not take orders from another user, and the client will
+/// not hand a command to a socket another user planted where it expected to find ours.
+fn require_peer_owner(stream: &UnixStream) -> io::Result<()> {
+    let peer = peer_uid(stream)?;
+    // SAFETY: geteuid has no preconditions.
+    let owner = unsafe { libc::geteuid() };
+    if peer != owner {
+        return Err(IoError::new(
+            ErrorKind::PermissionDenied,
+            format!("IPC socket peer uid {peer} is not owner uid {owner}"),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn peer_uid(stream: &UnixStream) -> io::Result<libc::uid_t> {
+    use std::os::fd::AsRawFd;
+
+    let mut credential = libc::ucred { pid: 0, uid: 0, gid: 0 };
+    let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    // SAFETY: `credential` and `length` are valid writable buffers of the size getsockopt is told.
+    let result = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&raw mut credential).cast(),
+            &raw mut length,
+        )
+    };
+    if result != 0 {
+        return Err(IoError::last_os_error());
+    }
+    Ok(credential.uid)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn peer_uid(stream: &UnixStream) -> io::Result<libc::uid_t> {
+    use std::os::fd::AsRawFd;
+
+    let mut uid: libc::uid_t = 0;
+    let mut gid: libc::gid_t = 0;
+    // SAFETY: both out-parameters are valid writable locations for getpeereid.
+    let result = unsafe { libc::getpeereid(stream.as_raw_fd(), &raw mut uid, &raw mut gid) };
+    if result != 0 {
+        return Err(IoError::last_os_error());
+    }
+    Ok(uid)
+}
+
 fn bind_socket(path: &Path) -> io::Result<UnixListener> {
     let socket = UnixListener::bind(path)?;
     let result = fs::set_permissions(path, fs::Permissions::from_mode(0o600))
@@ -663,7 +739,7 @@ fn bind_socket(path: &Path) -> io::Result<UnixListener> {
 /// Send one CLI command using a versioned protocol session.
 pub fn send_message(options: MessageOptions) -> io::Result<()> {
     validate_message(&options.message)?;
-    let mut stream = find_socket(options.socket)?;
+    let mut stream = find_socket(options.socket, options.target.as_deref())?;
     stream.set_nonblocking(false)?;
     let mut reader = BufReader::new(stream.try_clone()?);
 
@@ -755,6 +831,7 @@ fn read_client_frame<R: BufRead>(reader: &mut R) -> io::Result<Option<Vec<u8>>> 
 fn message_request(message: &SocketMessage) -> io::Result<(&'static str, Value)> {
     match message {
         SocketMessage::CreateWindow(params) => Ok(("create_window", serialize_params(params)?)),
+        SocketMessage::Quit => Ok(("quit", Value::Object(Default::default()))),
         SocketMessage::Config(params) => Ok(("config", serialize_params(params)?)),
         SocketMessage::GetConfig(params) => Ok(("get_config", serialize_params(params)?)),
         SocketMessage::Typing(params) => Ok(("typing", serialize_params(params)?)),
@@ -858,6 +935,8 @@ fn write_cli_result(message: &SocketMessage, result: &Value) -> io::Result<()> {
             })?;
             writeln!(stdout, "{window_id}")
         },
+        // The instance is shutting down; acknowledging it on stdout would be noise in a script.
+        SocketMessage::Quit => Ok(()),
         SocketMessage::GetConfig(_) => {
             let config = result.get("config").unwrap_or(result);
             serde_json::to_writer(&mut stdout, config).map_err(IoError::other)?;
@@ -917,15 +996,38 @@ pub fn socket_dir() -> PathBuf {
 }
 
 /// Find a socket using an override, inherited endpoint, or current display discovery.
-fn find_socket(socket_path: Option<PathBuf>) -> io::Result<UnixStream> {
+/// Connect, refusing a socket that belongs to another user.
+fn connect_checked(path: &Path) -> io::Result<UnixStream> {
+    let stream = UnixStream::connect(path)?;
+    require_peer_owner(&stream)?;
+    Ok(stream)
+}
+
+fn find_socket(socket_path: Option<PathBuf>, target: Option<&str>) -> io::Result<UnixStream> {
     if let Some(socket_path) = socket_path {
-        return UnixStream::connect(&socket_path).map_err(|err| {
+        return connect_checked(&socket_path).map_err(|err| {
             IoError::new(err.kind(), format!("invalid socket path {socket_path:?}"))
         });
     }
 
+    // An explicitly named session must never silently fall through to a different instance.
+    if let Some(target) = target.map(str::to_owned).or_else(|| env::var(VIVIDO_SESSION_ENV).ok()) {
+        let paths = crate::session::SessionPaths::for_session(&target)?;
+        return connect_checked(&paths.socket).map_err(|err| {
+            IoError::new(err.kind(), format!("no running Vivido session named {target:?}"))
+        });
+    }
+
     if let Ok(path) = env::var(VIVIDO_SOCKET_ENV)
-        && let Ok(socket) = UnixStream::connect(path)
+        && let Ok(socket) = connect_checked(Path::new(&path))
+    {
+        return Ok(socket);
+    }
+
+    // A single live headless session is unambiguous, so an unqualified `msg` should reach it.
+    if let Ok(sessions) = crate::session::list_registries()
+        && let [session] = sessions.as_slice()
+        && let Ok(socket) = connect_checked(&session.socket)
     {
         return Ok(socket);
     }
@@ -945,7 +1047,7 @@ fn find_socket(socket_path: Option<PathBuf>) -> io::Result<UnixStream> {
     candidates.sort();
     candidates.reverse();
     for path in candidates {
-        match UnixStream::connect(&path) {
+        match connect_checked(&path) {
             Ok(socket) => return Ok(socket),
             Err(error) if error.kind() == ErrorKind::ConnectionRefused => {
                 let _ = fs::remove_file(path);
@@ -1165,5 +1267,25 @@ mod tests {
         {
             assert!(!hello["methods"].as_array().unwrap().iter().any(|value| value == retired));
         }
+    }
+
+    /// A connection from this very process is by definition the owner, so it must be accepted.
+    #[test]
+    fn the_owner_is_accepted_on_both_ends_of_a_socket() {
+        let (client, server) = UnixStream::pair().expect("socketpair");
+
+        require_peer_owner(&server).expect("the server must accept its owner");
+        require_peer_owner(&client).expect("the client must accept its owner");
+    }
+
+    /// The capability document tells a client whether it reached a windowless instance.
+    #[test]
+    fn hello_reports_whether_this_instance_is_headless() {
+        let hello = hello_result();
+
+        // `INSTANCE` is unset in tests, which must read as "windowed" rather than panic.
+        assert_eq!(hello["headless"], serde_json::json!(false));
+        assert_eq!(hello["session"], Value::Null);
+        assert!(hello["methods"].as_array().unwrap().iter().any(|value| value == "quit"));
     }
 }

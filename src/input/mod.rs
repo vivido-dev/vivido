@@ -137,7 +137,7 @@ pub trait ActionContext<T: EventListener> {
     fn message(&self) -> Option<&Message>;
     fn config(&self) -> &UiConfig;
     #[cfg(target_os = "macos")]
-    fn event_loop(&self) -> &ActiveEventLoop;
+    fn event_loop(&self) -> Option<&ActiveEventLoop>;
     fn mouse_mode(&self) -> bool;
     fn clipboard_mut(&mut self) -> &mut Clipboard;
     fn scheduler_mut(&mut self) -> &mut Scheduler;
@@ -217,9 +217,17 @@ impl<T: EventListener> Execute<T> for Action {
             #[cfg(target_os = "macos")]
             Action::ToggleSimpleFullscreen => ctx.window().toggle_simple_fullscreen(),
             #[cfg(target_os = "macos")]
-            Action::Hide => ctx.event_loop().hide_application(),
+            Action::Hide => {
+                if let Some(event_loop) = ctx.event_loop() {
+                    event_loop.hide_application();
+                }
+            },
             #[cfg(target_os = "macos")]
-            Action::HideOtherApplications => ctx.event_loop().hide_other_applications(),
+            Action::HideOtherApplications => {
+                if let Some(event_loop) = ctx.event_loop() {
+                    event_loop.hide_other_applications();
+                }
+            },
             #[cfg(not(target_os = "macos"))]
             Action::Hide => ctx.window().set_visible(false),
             Action::Minimize => ctx.window().set_minimized(true),

@@ -7,13 +7,12 @@ use std::process;
 
 use log::error;
 use std::result::Result;
-use winit::event_loop::EventLoopProxy;
 
 use crate::terminal::thread;
 
 use crate::UiConfig;
 use crate::cli::Options;
-use crate::event::Event;
+use crate::event::EventSink;
 use crate::polling::ipc::IpcListener;
 use crate::polling::signal::SignalListener;
 
@@ -39,7 +38,7 @@ impl IoListener {
     pub fn spawn(
         config: &UiConfig,
         options: &Options,
-        event_proxy: EventLoopProxy<Event>,
+        event_proxy: EventSink,
     ) -> Result<IoListenerHandle, IoError> {
         let poller = Poller::new()?;
         let events = Events::new();

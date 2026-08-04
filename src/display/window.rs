@@ -8,8 +8,10 @@ use winit::window::ActivationToken;
 #[cfg(not(any(target_os = "macos", windows)))]
 use winit::platform::wayland::WindowAttributesExtWayland;
 
+use std::cell::Cell;
 use std::fmt::{self, Display, Formatter};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[cfg(target_os = "macos")]
 use {
@@ -74,9 +76,94 @@ impl From<winit::error::OsError> for Error {
     }
 }
 
+/// Source the renderer should present into.
+///
+/// A windowed [`Window`] presents through a windowing-system surface; a headless one has no
+/// surface at all and the renderer keeps its offscreen target as the final image.
+pub enum RenderSource {
+    Surface(Arc<WinitWindow>),
+    Offscreen,
+}
+
+/// Next identifier handed to a headless window.
+///
+/// The counter starts with the high bit set so a synthesized id can never collide with one minted
+/// by a windowing system, which allocates from the bottom.
+static NEXT_HEADLESS_ID: AtomicU64 = AtomicU64::new(1 << 63);
+
+/// State a windowing system would otherwise own on our behalf.
+///
+/// Every field is a [`Cell`] because the windowing-system setters take `&self`; mirroring that
+/// signature keeps all ~50 call sites of [`Window`] unchanged.
+struct HeadlessWindow {
+    id: WindowId,
+    size: Cell<PhysicalSize<u32>>,
+    maximized: Cell<bool>,
+    fullscreen: Cell<bool>,
+    theme: Cell<Option<Theme>>,
+}
+
+impl HeadlessWindow {
+    fn new(size: PhysicalSize<u32>, theme: Option<Theme>) -> Self {
+        let id = WindowId::from(NEXT_HEADLESS_ID.fetch_add(1, Ordering::Relaxed));
+        Self {
+            id,
+            size: Cell::new(size),
+            maximized: Cell::new(false),
+            fullscreen: Cell::new(false),
+            theme: Cell::new(theme),
+        }
+    }
+}
+
+/// Where a [`Window`]'s frames go.
+enum Backend {
+    Winit(Arc<WinitWindow>),
+    Headless(HeadlessWindow),
+}
+
+impl Backend {
+    fn id(&self) -> WindowId {
+        match self {
+            Self::Winit(window) => window.id(),
+            Self::Headless(headless) => headless.id,
+        }
+    }
+
+    fn inner_size(&self) -> PhysicalSize<u32> {
+        match self {
+            Self::Winit(window) => window.inner_size(),
+            Self::Headless(headless) => headless.size.get(),
+        }
+    }
+
+    fn is_maximized(&self) -> bool {
+        match self {
+            Self::Winit(window) => window.is_maximized(),
+            Self::Headless(headless) => headless.maximized.get(),
+        }
+    }
+
+    fn is_fullscreen(&self) -> bool {
+        match self {
+            Self::Winit(window) => window.fullscreen().is_some(),
+            Self::Headless(headless) => headless.fullscreen.get(),
+        }
+    }
+
+    fn winit(&self) -> Option<&Arc<WinitWindow>> {
+        match self {
+            Self::Winit(window) => Some(window),
+            Self::Headless(_) => None,
+        }
+    }
+}
+
 /// A window which can be used for displaying the terminal.
 ///
-/// Wraps the underlying windowing library to provide a stable API in Vivido.
+/// Wraps the underlying windowing library to provide a stable API in Vivido. A window is either
+/// backed by the windowing system or, in headless mode, by nothing at all: it owns its geometry
+/// directly and every presentation-only operation becomes a no-op.
 pub struct Window {
     /// Flag tracking that we have a frame we can draw.
     pub has_frame: bool,
@@ -90,7 +177,7 @@ pub struct Window {
     /// Hold the window when terminal exits.
     pub hold: bool,
 
-    window: Arc<WinitWindow>,
+    backend: Backend,
 
     /// Current window title.
     title: String,
@@ -173,52 +260,102 @@ impl Window {
             mouse_visible: true,
             has_frame: true,
             scale_factor,
-            window,
+            backend: Backend::Winit(window),
             ime_inhibitor: Default::default(),
         })
     }
 
-    #[cfg(target_os = "macos")]
-    #[inline]
-    pub fn raw_window_handle(&self) -> RawWindowHandle {
-        self.window.window_handle().unwrap().as_raw()
+    /// Create a window with no windowing system behind it.
+    ///
+    /// The window owns its own geometry and scale factor, so it is immediately "mapped" at
+    /// `size` and never receives resize, focus, or occlusion events from a compositor.
+    pub fn headless(
+        config: &UiConfig,
+        identity: &Identity,
+        options: &WindowOptions,
+        size: PhysicalSize<u32>,
+        scale_factor: f64,
+    ) -> Window {
+        let identity = identity.clone();
+        let headless = HeadlessWindow::new(size, config.window.theme());
+        log::info!("Headless window {:?} at {}x{}", headless.id, size.width, size.height);
+
+        Self {
+            hold: options.terminal_options.hold,
+            requested_redraw: false,
+            title: identity.title,
+            current_mouse_cursor: CursorIcon::Text,
+            mouse_visible: true,
+            has_frame: true,
+            scale_factor,
+            backend: Backend::Headless(headless),
+            ime_inhibitor: Default::default(),
+        }
     }
 
+    /// Whether this window has no windowing system behind it.
     #[inline]
-    pub fn winit_window(&self) -> Arc<WinitWindow> {
-        Arc::clone(&self.window)
+    pub fn is_headless(&self) -> bool {
+        matches!(self.backend, Backend::Headless(_))
+    }
+
+    #[cfg(target_os = "macos")]
+    #[inline]
+    pub fn raw_window_handle(&self) -> Option<RawWindowHandle> {
+        Some(self.backend.winit()?.window_handle().unwrap().as_raw())
+    }
+
+    /// The source the renderer should present into.
+    #[inline]
+    pub fn render_source(&self) -> RenderSource {
+        match &self.backend {
+            Backend::Winit(window) => RenderSource::Surface(Arc::clone(window)),
+            Backend::Headless(_) => RenderSource::Offscreen,
+        }
     }
 
     #[inline]
     pub fn request_inner_size(&self, size: PhysicalSize<u32>) {
-        let _ = self.window.request_inner_size(size);
+        match &self.backend {
+            Backend::Winit(window) => {
+                let _ = window.request_inner_size(size);
+            },
+            // Nothing can refuse the request, so it takes effect immediately.
+            Backend::Headless(headless) => headless.size.set(size),
+        }
     }
 
     #[inline]
     pub fn inner_size(&self) -> PhysicalSize<u32> {
-        self.window.inner_size()
+        self.backend.inner_size()
     }
 
     #[inline]
     pub fn set_visible(&self, visibility: bool) {
-        self.window.set_visible(visibility);
+        if let Some(window) = self.backend.winit() {
+            window.set_visible(visibility);
+        }
     }
 
     #[inline]
     #[cfg(unix)]
     pub fn focus_window(&self) {
+        let Some(window) = self.backend.winit() else { return };
+
         // Direct focus is intentionally a no-op on Wayland. Winit's attention request uses
         // xdg_activation_v1 to obtain and apply a compositor-approved activation token.
         #[cfg(target_os = "linux")]
-        self.window.request_user_attention(Some(UserAttentionType::Critical));
-        self.window.focus_window();
+        window.request_user_attention(Some(UserAttentionType::Critical));
+        window.focus_window();
     }
 
     /// Set the window title.
     #[inline]
     pub fn set_title(&mut self, title: String) {
         self.title = title;
-        self.window.set_title(&self.title);
+        if let Some(window) = self.backend.winit() {
+            window.set_title(&self.title);
+        }
     }
 
     /// Get the window title.
@@ -231,7 +368,11 @@ impl Window {
     pub fn request_redraw(&mut self) {
         if !self.requested_redraw {
             self.requested_redraw = true;
-            self.window.request_redraw();
+            // Headless windows have no windowing system to ask; `requested_redraw` alone is what
+            // the headless event loop polls to decide whether to draw.
+            if let Some(window) = self.backend.winit() {
+                window.request_redraw();
+            }
         }
     }
 
@@ -239,7 +380,9 @@ impl Window {
     pub fn set_mouse_cursor(&mut self, cursor: CursorIcon) {
         if cursor != self.current_mouse_cursor {
             self.current_mouse_cursor = cursor;
-            self.window.set_cursor(cursor);
+            if let Some(window) = self.backend.winit() {
+                window.set_cursor(cursor);
+            }
         }
     }
 
@@ -247,7 +390,9 @@ impl Window {
     pub fn set_mouse_visible(&mut self, visible: bool) {
         if visible != self.mouse_visible {
             self.mouse_visible = visible;
-            self.window.set_cursor_visible(visible);
+            if let Some(window) = self.backend.winit() {
+                window.set_cursor_visible(visible);
+            }
         }
     }
 
@@ -305,81 +450,106 @@ impl Window {
     }
 
     pub fn set_urgent(&self, is_urgent: bool) {
+        let Some(window) = self.backend.winit() else { return };
         let attention = if is_urgent { Some(UserAttentionType::Critical) } else { None };
 
-        self.window.request_user_attention(attention);
+        window.request_user_attention(attention);
     }
 
     pub fn id(&self) -> WindowId {
-        self.window.id()
+        self.backend.id()
     }
 
     pub fn set_transparent(&self, transparent: bool) {
-        self.window.set_transparent(transparent);
+        if let Some(window) = self.backend.winit() {
+            window.set_transparent(transparent);
+        }
     }
 
     pub fn set_blur(&self, blur: bool) {
-        self.window.set_blur(blur);
+        if let Some(window) = self.backend.winit() {
+            window.set_blur(blur);
+        }
     }
 
     pub fn set_maximized(&self, maximized: bool) {
-        self.window.set_maximized(maximized);
+        match &self.backend {
+            Backend::Winit(window) => window.set_maximized(maximized),
+            Backend::Headless(headless) => headless.maximized.set(maximized),
+        }
     }
 
     pub fn set_minimized(&self, minimized: bool) {
-        self.window.set_minimized(minimized);
+        if let Some(window) = self.backend.winit() {
+            window.set_minimized(minimized);
+        }
     }
 
     pub fn set_resize_increments(&self, increments: PhysicalSize<f32>) {
-        self.window.set_resize_increments(Some(increments));
+        if let Some(window) = self.backend.winit() {
+            window.set_resize_increments(Some(increments));
+        }
     }
 
     /// Toggle the window's fullscreen state.
     pub fn toggle_fullscreen(&self) {
-        self.set_fullscreen(self.window.fullscreen().is_none());
+        self.set_fullscreen(!self.backend.is_fullscreen());
     }
 
     /// Toggle the window's maximized state.
     pub fn toggle_maximized(&self) {
-        self.set_maximized(!self.window.is_maximized());
+        self.set_maximized(!self.backend.is_maximized());
     }
 
     /// Inform windowing system about presenting to the window.
     ///
     /// Should be called right before presenting the rendered frame to the window surface.
     pub fn pre_present_notify(&self) {
-        self.window.pre_present_notify();
+        if let Some(window) = self.backend.winit() {
+            window.pre_present_notify();
+        }
     }
 
     pub fn set_theme(&self, theme: Option<Theme>) {
-        self.window.set_theme(theme);
+        match &self.backend {
+            Backend::Winit(window) => window.set_theme(theme),
+            Backend::Headless(headless) => headless.theme.set(theme),
+        }
     }
 
     #[cfg(target_os = "macos")]
     pub fn toggle_simple_fullscreen(&self) {
-        self.set_simple_fullscreen(!self.window.simple_fullscreen());
+        let Some(window) = self.backend.winit() else { return };
+        self.set_simple_fullscreen(!window.simple_fullscreen());
     }
 
     #[cfg(target_os = "macos")]
     pub fn set_option_as_alt(&self, option_as_alt: OptionAsAlt) {
-        self.window.set_option_as_alt(option_as_alt);
+        if let Some(window) = self.backend.winit() {
+            window.set_option_as_alt(option_as_alt);
+        }
     }
 
     pub fn set_fullscreen(&self, fullscreen: bool) {
-        if fullscreen {
-            self.window.set_fullscreen(Some(Fullscreen::Borderless(None)));
-        } else {
-            self.window.set_fullscreen(None);
+        match &self.backend {
+            Backend::Winit(window) if fullscreen => {
+                window.set_fullscreen(Some(Fullscreen::Borderless(None)))
+            },
+            Backend::Winit(window) => window.set_fullscreen(None),
+            // Headless geometry is fixed by the caller; fullscreen is bookkeeping only.
+            Backend::Headless(headless) => headless.fullscreen.set(fullscreen),
         }
     }
 
     pub fn current_monitor(&self) -> Option<MonitorHandle> {
-        self.window.current_monitor()
+        self.backend.winit()?.current_monitor()
     }
 
     #[cfg(target_os = "macos")]
     pub fn set_simple_fullscreen(&self, simple_fullscreen: bool) {
-        self.window.set_simple_fullscreen(simple_fullscreen);
+        if let Some(window) = self.backend.winit() {
+            window.set_simple_fullscreen(simple_fullscreen);
+        }
     }
 
     /// Set IME inhibitor state and disable IME while any are present.
@@ -388,12 +558,15 @@ impl Window {
     pub fn set_ime_inhibitor(&mut self, inhibitor: ImeInhibitor, inhibit: bool) {
         if self.ime_inhibitor.contains(inhibitor) != inhibit {
             self.ime_inhibitor.set(inhibitor, inhibit);
-            self.window.set_ime_allowed(self.ime_inhibitor.is_empty());
+            if let Some(window) = self.backend.winit() {
+                window.set_ime_allowed(self.ime_inhibitor.is_empty());
+            }
         }
     }
 
     /// Adjust the IME editor position according to the new location of the cursor.
     pub fn update_ime_position(&self, point: Point<usize>, size: &SizeInfo) {
+        let Some(window) = self.backend.winit() else { return };
         let nspot_x = f64::from(size.padding_x() + point.column.0 as f32 * size.cell_width());
         let nspot_y = f64::from(size.padding_y() + point.line as f32 * size.cell_height());
 
@@ -403,7 +576,7 @@ impl Window {
         let width = size.cell_width() as f64 * 2.;
         let height = size.cell_height as f64;
 
-        self.window.set_ime_cursor_area(
+        window.set_ime_cursor_area(
             PhysicalPosition::new(nspot_x, nspot_y),
             PhysicalSize::new(width, height),
         );
@@ -415,7 +588,7 @@ impl Window {
     #[cfg(target_os = "macos")]
     pub fn set_has_shadow(&self, has_shadows: bool) {
         let view = match self.raw_window_handle() {
-            RawWindowHandle::AppKit(handle) => {
+            Some(RawWindowHandle::AppKit(handle)) => {
                 assert!(MainThreadMarker::new().is_some());
                 unsafe { handle.ns_view.cast::<NSView>().as_ref() }
             },
@@ -428,30 +601,38 @@ impl Window {
     /// Select tab at the given `index`.
     #[cfg(target_os = "macos")]
     pub fn select_tab_at_index(&self, index: usize) {
-        self.window.select_tab_at_index(index);
+        if let Some(window) = self.backend.winit() {
+            window.select_tab_at_index(index);
+        }
     }
 
     /// Select the last tab.
     #[cfg(target_os = "macos")]
     pub fn select_last_tab(&self) {
-        self.window.select_tab_at_index(self.window.num_tabs() - 1);
+        if let Some(window) = self.backend.winit() {
+            window.select_tab_at_index(window.num_tabs() - 1);
+        }
     }
 
     /// Select next tab.
     #[cfg(target_os = "macos")]
     pub fn select_next_tab(&self) {
-        self.window.select_next_tab();
+        if let Some(window) = self.backend.winit() {
+            window.select_next_tab();
+        }
     }
 
     /// Select previous tab.
     #[cfg(target_os = "macos")]
     pub fn select_previous_tab(&self) {
-        self.window.select_previous_tab();
+        if let Some(window) = self.backend.winit() {
+            window.select_previous_tab();
+        }
     }
 
     #[cfg(target_os = "macos")]
     pub fn tabbing_id(&self) -> String {
-        self.window.tabbing_identifier()
+        self.backend.winit().map(|window| window.tabbing_identifier()).unwrap_or_default()
     }
 }
 

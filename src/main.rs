@@ -37,6 +37,8 @@ mod config;
 mod daemon;
 mod display;
 mod event;
+#[cfg(unix)]
+mod headless;
 mod input;
 mod logging;
 #[cfg(target_os = "macos")]
@@ -50,6 +52,8 @@ mod scheduler;
 #[cfg(unix)]
 mod screenshot;
 mod serde_replace;
+#[cfg(unix)]
+mod session;
 mod string;
 pub mod terminal;
 mod vivid;
@@ -66,7 +70,7 @@ use crate::cli::SocketMessage;
 use crate::cli::Subcommands;
 use crate::config::UiConfig;
 use crate::config::monitor::ConfigMonitor;
-use crate::event::{Event, Processor};
+use crate::event::{Event, EventSink, Processor};
 #[cfg(target_os = "macos")]
 use crate::macos::locale;
 #[cfg(unix)]
@@ -85,11 +89,16 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     // Load command line options.
-    let options = Options::new();
+    #[cfg_attr(not(unix), allow(unused_mut))]
+    let mut options = Options::new();
 
     #[cfg(unix)]
-    match options.subcommands {
+    match options.subcommands.take() {
         Some(Subcommands::Msg(options)) => msg(options)?,
+        Some(Subcommands::List) => session::print_sessions()?,
+        Some(Subcommands::KillSession { target }) => session::terminate_session(&target)?,
+        // A headless run never builds a winit event loop, so it must branch before `vivido`.
+        None if options.headless => headless::run(options)?,
         None => vivido(options)?,
     }
 
@@ -146,8 +155,9 @@ fn vivido(mut options: Options) -> Result<(), Box<dyn Error>> {
     let window_event_loop = EventLoop::<Event>::with_user_event().build()?;
 
     // Initialize the logger as soon as possible as to capture output from other subsystems.
-    let log_file = logging::initialize(&options, window_event_loop.create_proxy())
-        .expect("Unable to initialize logger");
+    let log_file =
+        logging::initialize(&options, EventSink::Winit(window_event_loop.create_proxy()))
+            .expect("Unable to initialize logger");
 
     info!("Welcome to Vivido");
     info!("Version {}", env!("VERSION"));
@@ -183,7 +193,11 @@ fn vivido(mut options: Options) -> Result<(), Box<dyn Error>> {
 
     // Spawn the Unix I/O event polling thread.
     #[cfg(unix)]
-    let socket_path = match IoListener::spawn(&config, &options, window_event_loop.create_proxy()) {
+    let socket_path = match IoListener::spawn(
+        &config,
+        &options,
+        EventSink::Winit(window_event_loop.create_proxy()),
+    ) {
         Ok(handle) => handle.ipc_socket_path,
         Err(err) if options.daemon => return Err(err.into()),
         Err(err) => {

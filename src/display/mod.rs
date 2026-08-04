@@ -320,6 +320,12 @@ impl Display {
         self.damage_tracker.frame().mark_fully_damaged();
     }
 
+    /// Whether the renderer holds a frame a screenshot could read.
+    #[cfg(unix)]
+    pub fn has_rendered_frame(&self) -> bool {
+        self.scene_renderer.has_rendered_frame()
+    }
+
     #[cfg(unix)]
     pub fn begin_screenshot(&self) -> Result<ScreenshotReadback, ScreenshotError> {
         self.scene_renderer.begin_screenshot()
@@ -359,7 +365,7 @@ impl Display {
         }
 
         let scene_renderer = SceneRenderer::new(
-            window.winit_window(),
+            window.render_source(),
             viewport_size,
             config.window_opacity() < 1.0,
         )?;

@@ -11,11 +11,10 @@ use notify::{
     Config, Error as NotifyError, Event as NotifyEvent, EventKind, RecommendedWatcher,
     RecursiveMode, Watcher,
 };
-use winit::event_loop::EventLoopProxy;
 
 use crate::terminal::thread;
 
-use crate::event::{Event, EventType};
+use crate::event::{Event, EventSink, EventType};
 
 const DEBOUNCE_DELAY: Duration = Duration::from_millis(10);
 
@@ -30,7 +29,7 @@ pub struct ConfigMonitor {
 }
 
 impl ConfigMonitor {
-    pub fn new(mut paths: Vec<PathBuf>, event_proxy: EventLoopProxy<Event>) -> Option<Self> {
+    pub fn new(mut paths: Vec<PathBuf>, event_proxy: EventSink) -> Option<Self> {
         // Don't monitor config if there is no path to watch.
         if paths.is_empty() {
             return None;

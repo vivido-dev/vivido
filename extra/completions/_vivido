@@ -16,7 +16,10 @@ _vivido() {
     local context curcontext="$curcontext" state line
     _arguments "${_arguments_options[@]}" : \
 '--config-file=[Specify alternative configuration file \[default\: \$XDG_CONFIG_HOME/vivido/vivido.toml\]]:CONFIG_FILE:_files' \
+'-s+[Path for IPC socket creation]:SOCKET:_files' \
 '--socket=[Path for IPC socket creation]:SOCKET:_files' \
+'--session=[Name of the headless session, for \`--target\` on \`msg\` \[default\: derived from the PID\]]:NAME:_default' \
+'--headless-size=[Size of the headless window, as COLUMNSxLINES or WIDTHxHEIGHTpx]:SIZE:_default' \
 '--vivid-target=[Present a \`desktop-surface-v1\` Vivid target instead of the terminal target]:TARGET:((terminal\:"\`terminal-surface-v1\`\: a grid of cells with a text plane and anchors"
 desktop\:"\`desktop-surface-v1\`\: a virtual desktop in logical pixels, with no grid and no anchors"))' \
 '-w+[Stable IPC ID assigned to this window]:WINDOW_ID:_default' \
@@ -31,6 +34,8 @@ desktop\:"\`desktop-surface-v1\`\: a virtual desktop in logical pixels, with no 
 '*--option=[Override configuration file options \[example\: '\''cursor.style="Beam"'\''\]]:OPTION:_default' \
 '--print-events[Print all events to STDOUT]' \
 '(--daemon)--ref-test[Generates ref test]' \
+'--headless[Run with no window and no compositor, serving IPC in the background]' \
+'--foreground[Keep a headless instance attached to this terminal instead of detaching]' \
 '(-v)*-q[Reduces the level of verbosity (the min level is -qq)]' \
 '(-q)*-v[Increases the level of verbosity (the max level is -vvv)]' \
 '--daemon[Do not spawn an initial window]' \
@@ -52,6 +57,8 @@ desktop\:"\`desktop-surface-v1\`\: a virtual desktop in logical pixels, with no 
 _arguments "${_arguments_options[@]}" : \
 '-s+[IPC socket connection path override]:SOCKET:_files' \
 '--socket=[IPC socket connection path override]:SOCKET:_files' \
+'(-s --socket)-t+[Name of the headless session to talk to \[default\: \$VIVIDO_SESSION, else the only session\]]:NAME:_default' \
+'(-s --socket)--target=[Name of the headless session to talk to \[default\: \$VIVIDO_SESSION, else the only session\]]:NAME:_default' \
 '-h[Print help]' \
 '--help[Print help]' \
 ":: :_vivido__msg_commands" \
@@ -81,6 +88,12 @@ desktop\:"\`desktop-surface-v1\`\: a virtual desktop in logical pixels, with no 
 '--hold[Remain open after child process exit]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(quit)
+_arguments "${_arguments_options[@]}" : \
+'-h[Print help]' \
+'--help[Print help]' \
 && ret=0
 ;;
 (config)
@@ -555,6 +568,10 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
+(quit)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
 (config)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
@@ -715,6 +732,20 @@ esac
     ;;
 esac
 ;;
+(list)
+_arguments "${_arguments_options[@]}" : \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(kill-session)
+_arguments "${_arguments_options[@]}" : \
+'-t+[Name of the session to terminate]:NAME:_default' \
+'--target=[Name of the session to terminate]:NAME:_default' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
 (help)
 _arguments "${_arguments_options[@]}" : \
 ":: :_vivido__help_commands" \
@@ -740,6 +771,10 @@ _arguments "${_arguments_options[@]}" : \
         curcontext="${curcontext%:*:*}:vivido-help-msg-command-$line[1]:"
         case $line[1] in
             (create-window)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(quit)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
@@ -895,6 +930,14 @@ _arguments "${_arguments_options[@]}" : \
     ;;
 esac
 ;;
+(list)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(kill-session)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
 (help)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
@@ -912,6 +955,8 @@ esac
 _vivido_commands() {
     local commands; commands=(
 'msg:Send a message to the Vivido socket' \
+'list:List running headless sessions' \
+'kill-session:Shut down a headless session' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'vivido commands' commands "$@"
@@ -920,6 +965,8 @@ _vivido_commands() {
 _vivido__help_commands() {
     local commands; commands=(
 'msg:Send a message to the Vivido socket' \
+'list:List running headless sessions' \
+'kill-session:Shut down a headless session' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'vivido help commands' commands "$@"
@@ -929,10 +976,21 @@ _vivido__help__help_commands() {
     local commands; commands=()
     _describe -t commands 'vivido help help commands' commands "$@"
 }
+(( $+functions[_vivido__help__kill-session_commands] )) ||
+_vivido__help__kill-session_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido help kill-session commands' commands "$@"
+}
+(( $+functions[_vivido__help__list_commands] )) ||
+_vivido__help__list_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido help list commands' commands "$@"
+}
 (( $+functions[_vivido__help__msg_commands] )) ||
 _vivido__help__msg_commands() {
     local commands; commands=(
 'create-window:Create a new window in the same Vivido process' \
+'quit:Shut down the Vivido instance, closing every window' \
 'config:Update the Vivido configuration' \
 'get-config:Read runtime Vivido configuration' \
 'typing:Type literal text into a terminal' \
@@ -1057,6 +1115,11 @@ _vivido__help__msg__paste_commands() {
     local commands; commands=()
     _describe -t commands 'vivido help msg paste commands' commands "$@"
 }
+(( $+functions[_vivido__help__msg__quit_commands] )) ||
+_vivido__help__msg__quit_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido help msg quit commands' commands "$@"
+}
 (( $+functions[_vivido__help__msg__resize_commands] )) ||
 _vivido__help__msg__resize_commands() {
     local commands; commands=()
@@ -1129,10 +1192,21 @@ _vivido__help__msg__wait__text_commands() {
     local commands; commands=()
     _describe -t commands 'vivido help msg wait text commands' commands "$@"
 }
+(( $+functions[_vivido__kill-session_commands] )) ||
+_vivido__kill-session_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido kill-session commands' commands "$@"
+}
+(( $+functions[_vivido__list_commands] )) ||
+_vivido__list_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido list commands' commands "$@"
+}
 (( $+functions[_vivido__msg_commands] )) ||
 _vivido__msg_commands() {
     local commands; commands=(
 'create-window:Create a new window in the same Vivido process' \
+'quit:Shut down the Vivido instance, closing every window' \
 'config:Update the Vivido configuration' \
 'get-config:Read runtime Vivido configuration' \
 'typing:Type literal text into a terminal' \
@@ -1194,6 +1268,7 @@ _vivido__msg__get-text_commands() {
 _vivido__msg__help_commands() {
     local commands; commands=(
 'create-window:Create a new window in the same Vivido process' \
+'quit:Shut down the Vivido instance, closing every window' \
 'config:Update the Vivido configuration' \
 'get-config:Read runtime Vivido configuration' \
 'typing:Type literal text into a terminal' \
@@ -1323,6 +1398,11 @@ _vivido__msg__help__mouse__up_commands() {
 _vivido__msg__help__paste_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg help paste commands' commands "$@"
+}
+(( $+functions[_vivido__msg__help__quit_commands] )) ||
+_vivido__msg__help__quit_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg help quit commands' commands "$@"
 }
 (( $+functions[_vivido__msg__help__resize_commands] )) ||
 _vivido__msg__help__resize_commands() {
@@ -1518,6 +1598,11 @@ _vivido__msg__mouse__up_commands() {
 _vivido__msg__paste_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg paste commands' commands "$@"
+}
+(( $+functions[_vivido__msg__quit_commands] )) ||
+_vivido__msg__quit_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg quit commands' commands "$@"
 }
 (( $+functions[_vivido__msg__resize_commands] )) ||
 _vivido__msg__resize_commands() {

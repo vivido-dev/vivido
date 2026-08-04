@@ -44,8 +44,30 @@ pub struct Options {
 
     /// Path for IPC socket creation.
     #[cfg(unix)]
-    #[clap(long, value_hint = ValueHint::FilePath)]
+    #[clap(short = 's', long, value_hint = ValueHint::FilePath)]
     pub socket: Option<PathBuf>,
+
+    /// Run with no window and no compositor, serving IPC in the background.
+    ///
+    /// Detaches and prints the socket unless `--foreground` is given.
+    #[cfg(unix)]
+    #[clap(long)]
+    pub headless: bool,
+
+    /// Name of the headless session, for `--target` on `msg` [default: derived from the PID].
+    #[cfg(unix)]
+    #[clap(long, value_name = "NAME", requires = "headless")]
+    pub session: Option<String>,
+
+    /// Keep a headless instance attached to this terminal instead of detaching.
+    #[cfg(unix)]
+    #[clap(long, requires = "headless")]
+    pub foreground: bool,
+
+    /// Size of the headless window, as COLUMNSxLINES or WIDTHxHEIGHTpx.
+    #[cfg(unix)]
+    #[clap(long, value_name = "SIZE", requires = "headless")]
+    pub headless_size: Option<HeadlessSize>,
 
     /// Reduces the level of verbosity (the min level is -qq).
     #[clap(short, conflicts_with("verbose"), action = ArgAction::Count)]
@@ -120,6 +142,53 @@ impl Options {
             (1, _) => LevelFilter::Error,
             (..) => LevelFilter::Off,
         }
+    }
+}
+
+/// Geometry for a headless window.
+///
+/// Accepts cells (`120x40`) or physical pixels (`1280x720px`). Cells are the natural unit for a
+/// terminal, but a caller driving screenshots usually wants exact pixels.
+#[cfg(unix)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum HeadlessSize {
+    Cells { columns: u16, lines: u16 },
+    Pixels { width: u32, height: u32 },
+}
+
+#[cfg(unix)]
+impl std::str::FromStr for HeadlessSize {
+    type Err = String;
+
+    fn from_str(input: &str) -> Result<Self, Self::Err> {
+        let (value, pixels) = match input.strip_suffix("px") {
+            Some(value) => (value, true),
+            None => (input, false),
+        };
+        let (width, height) = value
+            .split_once(['x', 'X'])
+            .ok_or_else(|| format!("expected COLUMNSxLINES or WIDTHxHEIGHTpx, got {input:?}"))?;
+        let parse = |field: &str, value: &str| -> Result<u32, String> {
+            value
+                .trim()
+                .parse::<u32>()
+                .map_err(|err| format!("invalid {field} in {input:?}: {err}"))
+                .and_then(|value| match value {
+                    0 => Err(format!("{field} in {input:?} must not be zero")),
+                    value => Ok(value),
+                })
+        };
+
+        let width = parse("width", width)?;
+        let height = parse("height", height)?;
+        if pixels {
+            return Ok(Self::Pixels { width, height });
+        }
+
+        let cells = |field: &str, value: u32| {
+            u16::try_from(value).map_err(|_| format!("{field} in {input:?} exceeds {}", u16::MAX))
+        };
+        Ok(Self::Cells { columns: cells("columns", width)?, lines: cells("lines", height)? })
     }
 }
 
@@ -229,8 +298,21 @@ impl WindowIdentity {
 /// Available CLI subcommands.
 #[cfg(unix)]
 #[derive(Subcommand, Debug)]
+// `Msg` carries the whole message payload while the session verbs carry at most a name. Boxing it
+// would only move the same bytes behind a pointer on a path that runs once per process.
+#[allow(clippy::large_enum_variant)]
 pub enum Subcommands {
     Msg(MessageOptions),
+
+    /// List running headless sessions.
+    List,
+
+    /// Shut down a headless session.
+    KillSession {
+        /// Name of the session to terminate.
+        #[clap(short = 't', long = "target", value_name = "NAME")]
+        target: String,
+    },
 }
 
 /// Send a message to the Vivido socket.
@@ -240,6 +322,10 @@ pub struct MessageOptions {
     /// IPC socket connection path override.
     #[clap(short, long, value_hint = ValueHint::FilePath)]
     pub socket: Option<PathBuf>,
+
+    /// Name of the headless session to talk to [default: $VIVIDO_SESSION, else the only session].
+    #[clap(short = 't', long, value_name = "NAME", conflicts_with = "socket")]
+    pub target: Option<String>,
 
     /// Message which should be sent.
     #[clap(subcommand)]
@@ -252,6 +338,9 @@ pub struct MessageOptions {
 pub enum SocketMessage {
     /// Create a new window in the same Vivido process.
     CreateWindow(WindowOptions),
+
+    /// Shut down the Vivido instance, closing every window.
+    Quit,
 
     /// Update the Vivido configuration.
     Config(IpcConfig),
@@ -354,6 +443,12 @@ impl WindowOptions {
     /// Get the parsed set of CLI config overrides.
     pub fn config_overrides(&self) -> ParsedOptions {
         ParsedOptions::from_options(&self.option)
+    }
+
+    /// Add a config override, as if it had been passed with `-o`.
+    #[cfg(unix)]
+    pub fn push_override(&mut self, option: impl Into<String>) {
+        self.option.push(option.into());
     }
 }
 

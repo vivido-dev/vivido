@@ -2,6 +2,7 @@
 
 use crate::ConfigMonitor;
 use std::borrow::Cow;
+use std::cell::Cell;
 use std::cmp::min;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -12,14 +13,18 @@ use std::fmt::Debug;
 use std::os::unix::io::RawFd;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 use std::{env, f32, mem};
 
 use ahash::RandomState;
 use log::{debug, error, info, warn};
+use parking_lot::Mutex;
 #[cfg(unix)]
 use serde::de::DeserializeOwned;
 use winit::application::ApplicationHandler;
+use winit::dpi::PhysicalSize;
 use winit::event::{
     ElementState, Event as WinitEvent, Ime, Modifiers, MouseButton, StartCause,
     Touch as TouchEvent, WindowEvent,
@@ -81,6 +86,18 @@ const TOUCH_ZOOM_FACTOR: f32 = 0.01;
 /// Cooldown between invocations of the bell command.
 const BELL_CMD_COOLDOWN: Duration = Duration::from_millis(100);
 
+/// Shortest interval between headless draws.
+///
+/// A headless renderer has no vsync to pace against, so without a cap a chatty PTY would spend the
+/// whole loop rendering frames nobody reads. 60 Hz matches a typical display.
+const HEADLESS_MIN_FRAME_INTERVAL: Duration = Duration::from_millis(16);
+
+/// How long the headless loop blocks when nothing is scheduled.
+///
+/// Any real work arrives as an event and wakes the loop immediately; this only bounds how long a
+/// shutdown request can sit unnoticed.
+const HEADLESS_IDLE_WAIT: Duration = Duration::from_millis(100);
+
 /// The event processor.
 ///
 /// Stores some state from received events and dispatches actions when they are
@@ -93,13 +110,15 @@ pub struct Processor {
     initial_window_options: Option<WindowOptions>,
     initial_window_error: Option<Box<dyn Error>>,
     windows: HashMap<WindowId, WindowContext, RandomState>,
-    proxy: EventLoopProxy<Event>,
+    proxy: EventSink,
     #[cfg(unix)]
     global_ipc_options: ParsedOptions,
     #[cfg(unix)]
     automation: AutomationHub,
     cli_options: CliOptions,
     config: Rc<UiConfig>,
+    /// Earliest time the headless loop may draw again. Unused in windowed mode.
+    next_headless_draw: Instant,
 }
 
 impl Processor {
@@ -109,9 +128,7 @@ impl Processor {
         cli_options: CliOptions,
         event_loop: &EventLoop<Event>,
     ) -> Processor {
-        let proxy = event_loop.create_proxy();
-        let scheduler = Scheduler::new(proxy.clone());
-        let initial_window_options = Some(cli_options.window_options.clone());
+        let proxy = EventSink::Winit(event_loop.create_proxy());
 
         // Disable all device events, since we don't care about them.
         event_loop.listen_device_events(DeviceEvents::Never);
@@ -120,14 +137,35 @@ impl Processor {
         // which is done in `loop_exiting`.
         let clipboard = unsafe { Clipboard::new(event_loop.display_handle().unwrap().as_raw()) };
 
+        Self::with_sink(config, cli_options, proxy, clipboard)
+    }
+
+    /// Create an event processor with no windowing system behind it.
+    ///
+    /// Events arrive over the channel paired with `proxy` rather than from a compositor, and are
+    /// drained by [`Processor::run_headless`].
+    pub fn new_headless(config: UiConfig, cli_options: CliOptions, proxy: EventSink) -> Processor {
+        // There is no windowing-system display to hold a selection, so copy and paste stay
+        // process-local: escape-sequence clipboard access still works between panes.
+        Self::with_sink(config, cli_options, proxy, Clipboard::new_nop())
+    }
+
+    fn with_sink(
+        config: UiConfig,
+        cli_options: CliOptions,
+        proxy: EventSink,
+        clipboard: Clipboard,
+    ) -> Processor {
+        let scheduler = Scheduler::new(proxy.clone());
+        let initial_window_options = Some(cli_options.window_options.clone());
+
         // Create a config monitor.
         //
         // The monitor watches the config file for changes and reloads it. Pending
         // config changes are processed in the main loop.
         let mut config_monitor = None;
         if config.live_config_reload() {
-            config_monitor =
-                ConfigMonitor::new(config.config_paths.clone(), event_loop.create_proxy());
+            config_monitor = ConfigMonitor::new(config.config_paths.clone(), proxy.clone());
         }
 
         Processor {
@@ -144,13 +182,14 @@ impl Processor {
             #[cfg(unix)]
             automation: Default::default(),
             config_monitor,
+            next_headless_draw: Instant::now(),
         }
     }
 
     /// Create the initial window and its Vello/wgpu surface.
     pub fn create_initial_window(
         &mut self,
-        event_loop: &ActiveEventLoop,
+        event_loop: LoopHandle<'_>,
         window_options: WindowOptions,
     ) -> Result<u64, Box<dyn Error>> {
         let window_context = WindowContext::initial(
@@ -186,7 +225,7 @@ impl Processor {
     /// Create a new terminal window.
     pub fn create_window(
         &mut self,
-        event_loop: &ActiveEventLoop,
+        event_loop: LoopHandle<'_>,
         options: WindowOptions,
     ) -> Result<u64, Box<dyn Error>> {
         #[cfg(unix)]
@@ -262,6 +301,123 @@ impl Processor {
         }
     }
 
+    /// Run the event loop with no windowing system.
+    ///
+    /// This stands in for `EventLoop::run_app`: events arrive over `events` instead of from a
+    /// compositor, and redraws are driven from `requested_redraw` rather than delivered as
+    /// `RedrawRequested`. Everything else — dispatch, scheduling, automation bookkeeping — runs
+    /// through the same code the windowed loop uses.
+    /// Build the initial headless window, reporting the grid size it ended up with.
+    ///
+    /// Split out of [`Processor::run_headless`] so a caller can publish a session's real geometry
+    /// before it starts serving.
+    pub fn start_headless(
+        &mut self,
+        headless: &HeadlessLoop,
+    ) -> Result<(u16, u16), Box<dyn Error>> {
+        self.on_init(LoopHandle::Headless(headless));
+        if let Some(err) = self.initial_window_error.take() {
+            self.on_exiting();
+            return Err(err);
+        }
+
+        let Some(window_context) = self.windows.values().next() else {
+            self.on_exiting();
+            return Err(std::io::Error::other("headless startup produced no window").into());
+        };
+
+        let size_info = &window_context.display.size_info;
+        Ok((
+            size_info.columns().try_into().unwrap_or(u16::MAX),
+            size_info.screen_lines().try_into().unwrap_or(u16::MAX),
+        ))
+    }
+
+    pub fn run_headless(
+        &mut self,
+        events: &mpsc::Receiver<Event>,
+        headless: &HeadlessLoop,
+    ) -> Result<(), Box<dyn Error>> {
+        let handle = LoopHandle::Headless(headless);
+
+        while !headless.exiting() {
+            // Block until the scheduler's next deadline, then drain everything already queued so
+            // a burst of PTY output costs one pass rather than one pass per event.
+            match events.recv_timeout(self.headless_wait()) {
+                Ok(event) => self.on_user_event(handle, event),
+                Err(mpsc::RecvTimeoutError::Timeout) => (),
+                // Every sender is gone, so nothing can wake this loop again.
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+            while !headless.exiting()
+                && let Ok(event) = events.try_recv()
+            {
+                self.on_user_event(handle, event);
+            }
+
+            if headless.exiting() {
+                break;
+            }
+
+            // Same per-iteration bookkeeping winit drives through `AboutToWait`.
+            self.on_about_to_wait(handle);
+
+            self.draw_headless(handle);
+        }
+
+        self.on_exiting();
+        Ok(())
+    }
+
+    /// How long the headless loop may block before it must run again.
+    fn headless_wait(&mut self) -> Duration {
+        let scheduled = self.scheduler.update();
+
+        // A window waiting to draw must not be held up by an idle scheduler. Wake at the frame
+        // cap rather than immediately, so a pending redraw cannot spin the loop.
+        let redraw_pending = self
+            .windows
+            .values()
+            .any(|window_context| window_context.display.window.requested_redraw);
+        let draw_deadline = redraw_pending.then_some(self.next_headless_draw);
+
+        let deadline = match (scheduled, draw_deadline) {
+            (Some(scheduled), Some(draw)) => Some(scheduled.min(draw)),
+            (scheduled, draw) => scheduled.or(draw),
+        };
+
+        match deadline {
+            Some(deadline) => deadline.saturating_duration_since(Instant::now()),
+            None => HEADLESS_IDLE_WAIT,
+        }
+    }
+
+    /// Draw every window that asked to be redrawn.
+    ///
+    /// With no compositor there is no vsync to pace against, so draws are capped. A screenshot
+    /// never observes a stale frame despite the cap: `request_screenshot` paints on demand when
+    /// the window is headless and dirty.
+    fn draw_headless(&mut self, event_loop: LoopHandle<'_>) {
+        if self.next_headless_draw > Instant::now() {
+            return;
+        }
+
+        let window_ids: Vec<_> = self
+            .windows
+            .iter()
+            .filter(|(_, window_context)| window_context.display.window.requested_redraw)
+            .map(|(window_id, _)| *window_id)
+            .collect();
+        if window_ids.is_empty() {
+            return;
+        }
+
+        self.next_headless_draw = Instant::now() + HEADLESS_MIN_FRAME_INTERVAL;
+        for window_id in window_ids {
+            self.on_window_event(event_loop, window_id, WindowEvent::RedrawRequested);
+        }
+    }
+
     /// Check if an event is irrelevant and can be skipped.
     fn skip_window_event(event: &WindowEvent) -> bool {
         matches!(
@@ -301,12 +457,31 @@ impl Processor {
                 .windows
                 .iter()
                 .find_map(|(id, window)| window.is_focused().then_some(*id))
-                .ok_or_else(|| IpcError::new("no_focused_window", "no focused Vivido window")),
+                // A headless window is never focused: no compositor ever sends it `Focused`. Fall
+                // back to the only window when there is exactly one, so an unqualified request is
+                // unambiguous rather than unanswerable. With several windows focus is still the
+                // only way to pick one implicitly, and the caller must name a window instead.
+                .or_else(|| match self.windows.len() {
+                    1 => self.windows.keys().next().copied(),
+                    _ => None,
+                })
+                .ok_or_else(|| {
+                    IpcError::new(
+                        "no_focused_window",
+                        match self.windows.len() {
+                            0 => String::from("this Vivido instance has no windows"),
+                            count => format!(
+                                "no focused Vivido window; pass --window-id to choose one of the \
+                                 {count} open windows"
+                            ),
+                        },
+                    )
+                }),
         }
     }
 
     #[cfg(unix)]
-    fn handle_ipc_request(&mut self, event_loop: &ActiveEventLoop, request: IpcRequest) {
+    fn handle_ipc_request(&mut self, event_loop: LoopHandle<'_>, request: IpcRequest) {
         use crate::cli::{
             IpcConfig, IpcGetConfig, IpcGetGrid, IpcGetText, IpcInputRoute, IpcKey, IpcMouse,
             IpcPaste, IpcResize, IpcScreenshot, IpcSignal, IpcSubscribe, IpcTarget, IpcTranscript,
@@ -317,6 +492,12 @@ impl Processor {
         let result = match request.method.as_str() {
             "ping" => {
                 request.connection.reply(request.id, serde_json::json!({"pong": true}));
+                return;
+            },
+            // A headless instance outlives its last window, so it needs an explicit way to stop.
+            "quit" => {
+                request.connection.reply(request.id, serde_json::json!({"quitting": true}));
+                event_loop.exit();
                 return;
             },
             "unsubscribe" => {
@@ -511,7 +692,7 @@ impl Processor {
                             &params,
                             repeat_index > 0,
                             #[cfg(target_os = "macos")]
-                            event_loop,
+                            event_loop.winit(),
                             &self.proxy,
                             &mut self.clipboard,
                             &mut self.scheduler,
@@ -558,7 +739,7 @@ impl Processor {
                         IpcInputRoute::Ui => self.windows.get_mut(&target).unwrap().ui_paste(
                             &params.text,
                             #[cfg(target_os = "macos")]
-                            event_loop,
+                            event_loop.winit(),
                             &self.proxy,
                             &mut self.clipboard,
                             &mut self.scheduler,
@@ -611,7 +792,7 @@ impl Processor {
                         let result = self.windows.get_mut(&target).unwrap().ui_mouse(
                             &params,
                             #[cfg(target_os = "macos")]
-                            event_loop,
+                            event_loop.winit(),
                             &self.proxy,
                             &mut self.clipboard,
                             &mut self.scheduler,
@@ -680,6 +861,17 @@ impl Processor {
                                 },
                                 &request,
                             );
+
+                            // A compositor would answer the size request with `Resized`, which is
+                            // what confirms the wait. Nothing will do that for a headless window,
+                            // whose size already changed, so deliver the same event ourselves.
+                            if self.windows[&target].display.window.is_headless() {
+                                self.on_window_event(
+                                    event_loop,
+                                    target,
+                                    WindowEvent::Resized(PhysicalSize::new(width, height)),
+                                );
+                            }
                             return;
                         },
                         Err(error) => Err(error),
@@ -1700,11 +1892,25 @@ fn pattern_find(haystack: &[u8], needle: &[u8], regex: bool) -> Option<(usize, u
     }
 }
 
-impl ApplicationHandler<Event> for Processor {
-    fn resumed(&mut self, _event_loop: &ActiveEventLoop) {}
+impl Processor {
+    /// Whether this instance keeps serving after its last window closes.
+    ///
+    /// A daemon has no window to begin with, and a headless session must outlive the shell it was
+    /// started to run so a client can open another window into it.
+    fn persists_without_windows(&self) -> bool {
+        #[cfg(unix)]
+        {
+            self.cli_options.daemon || self.cli_options.headless
+        }
+        #[cfg(not(unix))]
+        {
+            self.cli_options.daemon
+        }
+    }
 
-    fn new_events(&mut self, event_loop: &ActiveEventLoop, cause: StartCause) {
-        if cause != StartCause::Init || self.cli_options.daemon {
+    /// Create the startup window, if this invocation is meant to have one.
+    fn on_init(&mut self, event_loop: LoopHandle<'_>) {
+        if self.cli_options.daemon {
             return;
         }
 
@@ -1718,10 +1924,47 @@ impl ApplicationHandler<Event> for Processor {
 
         info!("Initialisation complete");
     }
+}
+
+impl ApplicationHandler<Event> for Processor {
+    fn resumed(&mut self, _event_loop: &ActiveEventLoop) {}
+
+    fn new_events(&mut self, event_loop: &ActiveEventLoop, cause: StartCause) {
+        if cause != StartCause::Init {
+            return;
+        }
+
+        self.on_init(LoopHandle::Winit(event_loop));
+    }
 
     fn window_event(
         &mut self,
-        _event_loop: &ActiveEventLoop,
+        event_loop: &ActiveEventLoop,
+        window_id: WindowId,
+        event: WindowEvent,
+    ) {
+        self.on_window_event(LoopHandle::Winit(event_loop), window_id, event);
+    }
+
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: Event) {
+        self.on_user_event(LoopHandle::Winit(event_loop), event);
+    }
+
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        self.on_about_to_wait(LoopHandle::Winit(event_loop));
+    }
+
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        self.on_exiting();
+    }
+}
+
+impl Processor {
+    // `event_loop` reaches the action layer only on macOS, whose application-level actions need it.
+    #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
+    fn on_window_event(
+        &mut self,
+        event_loop: LoopHandle<'_>,
         window_id: WindowId,
         event: WindowEvent,
     ) {
@@ -1757,7 +2000,7 @@ impl ApplicationHandler<Event> for Processor {
 
         window_context.handle_event(
             #[cfg(target_os = "macos")]
-            _event_loop,
+            event_loop.winit(),
             &self.proxy,
             &mut self.clipboard,
             &mut self.scheduler,
@@ -1803,7 +2046,7 @@ impl ApplicationHandler<Event> for Processor {
         }
     }
 
-    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: Event) {
+    fn on_user_event(&mut self, event_loop: LoopHandle<'_>, event: Event) {
         if self.config.debug.print_events {
             info!(target: LOG_TARGET_WINIT, "{event:?}");
         }
@@ -1880,7 +2123,7 @@ impl ApplicationHandler<Event> for Processor {
                 for window_context in self.windows.values_mut() {
                     window_context.handle_event(
                         #[cfg(target_os = "macos")]
-                        event_loop,
+                        event_loop.winit(),
                         &self.proxy,
                         &mut self.clipboard,
                         &mut self.scheduler,
@@ -1898,7 +2141,7 @@ impl ApplicationHandler<Event> for Processor {
                 if let Some(window_context) = self.windows.get_mut(window_id) {
                     window_context.handle_event(
                         #[cfg(target_os = "macos")]
-                        event_loop,
+                        event_loop.winit(),
                         &self.proxy,
                         &mut self.clipboard,
                         &mut self.scheduler,
@@ -1923,7 +2166,7 @@ impl ApplicationHandler<Event> for Processor {
                 if let Some(window_context) = self.windows.get_mut(window_id) {
                     window_context.handle_event(
                         #[cfg(target_os = "macos")]
-                        event_loop,
+                        event_loop.winit(),
                         &self.proxy,
                         &mut self.clipboard,
                         &mut self.scheduler,
@@ -1944,7 +2187,7 @@ impl ApplicationHandler<Event> for Processor {
                 if let Some(window_context) = self.windows.get_mut(window_id) {
                     window_context.handle_event(
                         #[cfg(target_os = "macos")]
-                        event_loop,
+                        event_loop.winit(),
                         &self.proxy,
                         &mut self.clipboard,
                         &mut self.scheduler,
@@ -2069,7 +2312,7 @@ impl ApplicationHandler<Event> for Processor {
                 self.scheduler.unschedule_window(window_context.id());
 
                 // Shutdown if no more terminals are open.
-                if self.windows.is_empty() && !self.cli_options.daemon {
+                if self.windows.is_empty() && !self.persists_without_windows() {
                     // Write ref tests of last window to disk.
                     if self.config.debug.ref_test {
                         window_context.write_ref_test_results();
@@ -2096,7 +2339,7 @@ impl ApplicationHandler<Event> for Processor {
                 if let Some(window_context) = self.windows.get_mut(window_id) {
                     window_context.handle_event(
                         #[cfg(target_os = "macos")]
-                        event_loop,
+                        event_loop.winit(),
                         &self.proxy,
                         &mut self.clipboard,
                         &mut self.scheduler,
@@ -2107,7 +2350,7 @@ impl ApplicationHandler<Event> for Processor {
         };
     }
 
-    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+    fn on_about_to_wait(&mut self, event_loop: LoopHandle<'_>) {
         if self.config.debug.print_events {
             info!(target: LOG_TARGET_WINIT, "About to wait");
         }
@@ -2116,7 +2359,7 @@ impl ApplicationHandler<Event> for Processor {
         for window_context in self.windows.values_mut() {
             window_context.handle_event(
                 #[cfg(target_os = "macos")]
-                event_loop,
+                event_loop.winit(),
                 &self.proxy,
                 &mut self.clipboard,
                 &mut self.scheduler,
@@ -2173,7 +2416,7 @@ impl ApplicationHandler<Event> for Processor {
         event_loop.set_control_flow(control_flow);
     }
 
-    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+    fn on_exiting(&mut self) {
         if self.config.debug.print_events {
             info!("Exiting the event loop");
         }
@@ -2209,6 +2452,117 @@ impl Event {
 impl From<Event> for WinitEvent<Event> {
     fn from(event: Event) -> Self {
         WinitEvent::UserEvent(event)
+    }
+}
+
+/// The sink was destroyed, so the main loop can no longer be reached.
+#[derive(Debug)]
+pub struct EventSinkClosed;
+
+/// State owned by [`Processor::run_headless`] in place of winit's `ActiveEventLoop`.
+pub struct HeadlessLoop {
+    exiting: Cell<bool>,
+    /// Geometry every headless window is created at.
+    size: PhysicalSize<u32>,
+    scale_factor: f64,
+}
+
+impl HeadlessLoop {
+    pub fn new(size: PhysicalSize<u32>, scale_factor: f64) -> Self {
+        Self { exiting: Cell::new(false), size, scale_factor }
+    }
+
+    pub fn exiting(&self) -> bool {
+        self.exiting.get()
+    }
+}
+
+/// Handle to whichever loop is driving the process.
+///
+/// Only three windowing-system operations are reachable from the processor — creating a window,
+/// exiting, and setting the wake deadline — so headless mode supplies its own for each.
+#[derive(Clone, Copy)]
+pub enum LoopHandle<'a> {
+    Winit(&'a ActiveEventLoop),
+    Headless(&'a HeadlessLoop),
+}
+
+impl<'a> LoopHandle<'a> {
+    /// Ask the loop to stop.
+    pub fn exit(&self) {
+        match self {
+            Self::Winit(event_loop) => event_loop.exit(),
+            Self::Headless(headless) => headless.exiting.set(true),
+        }
+    }
+
+    /// Set the next wake deadline.
+    ///
+    /// Headless mode derives its own deadline from the scheduler each iteration, so this is a
+    /// no-op there rather than stored state that could drift.
+    pub fn set_control_flow(&self, control_flow: ControlFlow) {
+        if let Self::Winit(event_loop) = self {
+            event_loop.set_control_flow(control_flow);
+        }
+    }
+
+    /// The winit loop, when there is one.
+    ///
+    /// Only macOS reaches for this, to run application-level actions that have no headless
+    /// equivalent; every other platform drives windows entirely through this handle.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub fn winit(&self) -> Option<&'a ActiveEventLoop> {
+        match self {
+            Self::Winit(event_loop) => Some(event_loop),
+            Self::Headless(_) => None,
+        }
+    }
+
+    /// Build the window this loop can present.
+    pub fn create_window(
+        &self,
+        config: &UiConfig,
+        identity: &crate::config::window::Identity,
+        options: &mut WindowOptions,
+    ) -> Result<Window, crate::display::window::Error> {
+        match self {
+            Self::Winit(event_loop) => Window::new(event_loop, config, identity, options),
+            Self::Headless(headless) => Ok(Window::headless(
+                config,
+                identity,
+                options,
+                headless.size,
+                headless.scale_factor,
+            )),
+        }
+    }
+}
+
+/// Sink for events destined for the main loop.
+///
+/// A windowed Vivido wakes winit's event loop through its proxy. A headless one has no windowing
+/// system to wake, so it pushes onto a channel that [`Processor::run_headless`] drains.
+///
+/// The sender is behind a mutex because this is cloned into worker threads and captured by the
+/// Vivid service's `Fn() + Send + Sync` wake closure, while `mpsc::Sender` is `!Sync`.
+#[derive(Debug, Clone)]
+pub enum EventSink {
+    Winit(EventLoopProxy<Event>),
+    Headless(Arc<Mutex<mpsc::Sender<Event>>>),
+}
+
+impl EventSink {
+    /// Create a headless sink together with the receiver the main loop drains.
+    pub fn headless() -> (Self, mpsc::Receiver<Event>) {
+        let (sender, receiver) = mpsc::channel();
+        (Self::Headless(Arc::new(Mutex::new(sender))), receiver)
+    }
+
+    pub fn send_event(&self, event: Event) -> Result<(), EventSinkClosed> {
+        match self {
+            Self::Winit(proxy) => proxy.send_event(event).map_err(|_| EventSinkClosed),
+            Self::Headless(sender) => sender.lock().send(event).map_err(|_| EventSinkClosed),
+        }
     }
 }
 
@@ -2334,8 +2688,8 @@ pub struct ActionContext<'a, N, T> {
     pub cursor_blink_timed_out: &'a mut bool,
     pub prev_bell_cmd: &'a mut Option<Instant>,
     #[cfg(target_os = "macos")]
-    pub event_loop: &'a ActiveEventLoop,
-    pub event_proxy: &'a EventLoopProxy<Event>,
+    pub event_loop: Option<&'a ActiveEventLoop>,
+    pub event_proxy: &'a EventSink,
     pub scheduler: &'a mut Scheduler,
     pub search_state: &'a mut SearchState,
     pub dirty: &'a mut bool,
@@ -2877,7 +3231,7 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
     }
 
     #[cfg(target_os = "macos")]
-    fn event_loop(&self) -> &ActiveEventLoop {
+    fn event_loop(&self) -> Option<&ActiveEventLoop> {
         self.event_loop
     }
 
@@ -3444,12 +3798,12 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
 
 #[derive(Debug, Clone)]
 pub struct EventProxy {
-    proxy: EventLoopProxy<Event>,
+    proxy: EventSink,
     window_id: WindowId,
 }
 
 impl EventProxy {
-    pub fn new(proxy: EventLoopProxy<Event>, window_id: WindowId) -> Self {
+    pub fn new(proxy: EventSink, window_id: WindowId) -> Self {
         Self { proxy, window_id }
     }
 
