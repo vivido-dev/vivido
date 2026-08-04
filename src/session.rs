@@ -563,36 +563,7 @@ fn process_birth(pid: u32) -> io::Result<ProcessBirth> {
 
 #[cfg(target_os = "macos")]
 fn process_birth(pid: u32) -> io::Result<ProcessBirth> {
-    let mut info: libc::kinfo_proc = unsafe { std::mem::zeroed() };
-    let mut size = std::mem::size_of::<libc::kinfo_proc>();
-    let mut mib = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_PID, pid as libc::c_int];
-
-    // SAFETY: `mib` has the length passed, and `info`/`size` describe one owned `kinfo_proc`.
-    let result = unsafe {
-        libc::sysctl(
-            mib.as_mut_ptr(),
-            mib.len() as libc::c_uint,
-            (&raw mut info).cast(),
-            &raw mut size,
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    if result != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // A zero-length reply means the PID does not exist rather than an error.
-    if size == 0 {
-        return Err(io::Error::from(io::ErrorKind::NotFound));
-    }
-
-    let start = info.kp_proc.p_starttime;
-    let start_micros = (start.tv_sec as u64)
-        .checked_mul(1_000_000)
-        .and_then(|seconds| seconds.checked_add(start.tv_usec as u64))
-        .ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "macOS process start time is invalid")
-        })?;
+    let start_micros = crate::macos::proc::start_time_micros(pid as libc::c_int)?;
     Ok(ProcessBirth::Macos { start_micros })
 }
 
