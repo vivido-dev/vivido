@@ -2,13 +2,29 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub fn embed_resources() {
+pub fn configure() {
+    for variable in ["VCPKG_ROOT", "VCPKG_DEFAULT_TRIPLET", "VCPKG_TARGET_TRIPLET"] {
+        println!("cargo:rerun-if-env-changed={variable}");
+    }
+
+    if env::var_os("VCPKG_ROOT").is_some() {
+        link_vcpkg_ffmpeg();
+    } else if let Some(libraries) = super::detect_pkg_config_ffmpeg() {
+        stage_pkg_config_ffmpeg_runtime(&libraries);
+    } else {
+        link_vcpkg_ffmpeg();
+    }
+
+    embed_resources();
+}
+
+fn embed_resources() {
     embed_resource::compile("./windows/vivido.rc", embed_resource::NONE)
         .manifest_required()
         .unwrap();
 }
 
-pub fn link_vcpkg_ffmpeg() {
+fn link_vcpkg_ffmpeg() {
     let root = env::var_os("VCPKG_ROOT")
         .map(PathBuf::from)
         .unwrap_or_else(|| panic!("Vivid media requires pkg-config or VCPKG_ROOT on Windows"));
@@ -33,7 +49,7 @@ pub fn link_vcpkg_ffmpeg() {
     stage_ffmpeg_runtime(&installed_directory.join("bin"));
 }
 
-pub fn stage_pkg_config_ffmpeg_runtime(libraries: &[pkg_config::Library]) {
+fn stage_pkg_config_ffmpeg_runtime(libraries: &[pkg_config::Library]) {
     let runtime_directory = libraries
         .iter()
         .flat_map(|library| &library.link_paths)

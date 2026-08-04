@@ -3,7 +3,11 @@ use std::path::Path;
 use std::process::Command;
 
 #[cfg(windows)]
-mod windows;
+#[path = "build/windows.rs"]
+mod platform;
+#[cfg(unix)]
+#[path = "build/unix.rs"]
+mod platform;
 
 fn main() {
     let mut version = String::from(env!("CARGO_PKG_VERSION"));
@@ -13,10 +17,7 @@ fn main() {
     println!("cargo:rustc-env=VERSION={version}");
 
     configure_ref_tests();
-    link_ffmpeg();
-
-    #[cfg(windows)]
-    windows::embed_resources();
+    platform::configure();
 }
 
 fn configure_ref_tests() {
@@ -27,43 +28,23 @@ fn configure_ref_tests() {
     }
 }
 
-fn link_ffmpeg() {
-    for variable in
-        ["PKG_CONFIG_PATH", "VCPKG_ROOT", "VCPKG_DEFAULT_TRIPLET", "VCPKG_TARGET_TRIPLET"]
-    {
-        println!("cargo:rerun-if-env-changed={variable}");
-    }
-
-    #[cfg(windows)]
-    if env::var_os("VCPKG_ROOT").is_some() {
-        windows::link_vcpkg_ffmpeg();
-        return;
-    }
-
+/// Discover the platform FFmpeg implementation without declaring libraries for the build script.
+fn detect_pkg_config_ffmpeg() -> Option<Vec<pkg_config::Library>> {
+    println!("cargo:rerun-if-env-changed=PKG_CONFIG_PATH");
     let libraries = ["libavcodec", "libavutil", "libswscale", "libswresample"];
     let detected = libraries
         .iter()
         .map(|library| pkg_config::Config::new().cargo_metadata(false).probe(library))
-        .collect::<Result<Vec<_>, _>>();
-    if let Ok(detected) = detected {
-        // Native library declarations live beside the FFI definitions so they are attached to the
-        // executable, not this package's proc-macro library. The build script only supplies the
-        // implementation-specific search paths discovered through pkg-config.
-        for path in detected.iter().flat_map(|library| &library.link_paths) {
-            println!("cargo:rustc-link-search=native={}", path.display());
-        }
-        #[cfg(windows)]
-        windows::stage_pkg_config_ffmpeg_runtime(&detected);
-        return;
-    }
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
 
-    #[cfg(windows)]
-    {
-        windows::link_vcpkg_ffmpeg();
+    // Native library declarations live beside the FFI definitions so they are attached to the
+    // executable, not this package's proc-macro library. The build script only supplies the
+    // implementation-specific search paths discovered through pkg-config.
+    for path in detected.iter().flat_map(|library| &library.link_paths) {
+        println!("cargo:rustc-link-search=native={}", path.display());
     }
-
-    #[cfg(not(windows))]
-    panic!("Vivid media requires FFmpeg development libraries discoverable through pkg-config");
+    Some(detected)
 }
 
 fn commit_hash() -> Option<String> {
