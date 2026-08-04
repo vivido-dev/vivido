@@ -311,7 +311,7 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
     /// Process a neutral IPC key through Vivido bindings/search/hints without mutating the
     /// persistent physical modifier state. Bytes that fall through are returned for tagged PTY
     /// delivery by the automation layer.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub fn ipc_key_input(
         &mut self,
         key: &str,
@@ -809,7 +809,7 @@ fn is_control_character(text: &str) -> bool {
 }
 
 /// Encode a protocol-neutral IPC key for the current terminal keyboard modes.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub fn encode_ipc_key_event(
     key: &str,
     modifiers: &[String],
@@ -1026,7 +1026,7 @@ pub fn encode_ipc_key_event(
     Err(crate::polling::ipc::IpcError::new("invalid_params", format!("unknown key {key:?}")))
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn kitty_modifiers(modifier_parameter: u8, mode: TermMode, repeated: bool) -> String {
     if repeated && mode.contains(TermMode::REPORT_EVENT_TYPES) {
         format!("{modifier_parameter}:2")
@@ -1035,7 +1035,7 @@ fn kitty_modifiers(modifier_parameter: u8, mode: TermMode, repeated: bool) -> St
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn ipc_modifiers(modifiers: &[String]) -> Result<SequenceModifiers, crate::polling::ipc::IpcError> {
     let mut result = SequenceModifiers::empty();
     for modifier in modifiers {
@@ -1055,7 +1055,7 @@ fn ipc_modifiers(modifiers: &[String]) -> Result<SequenceModifiers, crate::polli
     Ok(result)
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub fn ipc_modifier_state(
     modifiers: &[String],
 ) -> Result<ModifiersState, crate::polling::ipc::IpcError> {
@@ -1077,7 +1077,7 @@ pub fn ipc_modifier_state(
     Ok(result)
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn ipc_logical_key(key: &str) -> Result<(Key, KeyLocation), crate::polling::ipc::IpcError> {
     let mut characters = key.chars();
     if let (Some(character), None) = (characters.next(), characters.next()) {

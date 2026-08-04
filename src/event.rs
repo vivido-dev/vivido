@@ -21,7 +21,7 @@ use std::{env, f32, mem};
 use ahash::RandomState;
 use log::{debug, error, info, warn};
 use parking_lot::Mutex;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use serde::de::DeserializeOwned;
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
@@ -42,11 +42,11 @@ use crate::terminal::term::search::{Match, RegexSearch};
 use crate::terminal::term::{self, ClipboardType, Term, TermMode};
 use crate::terminal::vte::ansi::NamedColor;
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use crate::automation::{AutomationHub, SubscriptionRequest};
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use crate::automation::{PendingWrite, WaitKind, Waiter};
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use crate::cli::ParsedOptions;
 use crate::cli::{Options as CliOptions, WindowOptions};
 use crate::clipboard::Clipboard;
@@ -63,9 +63,9 @@ use crate::display::{Display, Preedit, SizeInfo};
 use crate::input::{self, ActionContext as _, FONT_SIZE_STEP};
 use crate::logging::{LOG_TARGET_CONFIG, LOG_TARGET_WINIT};
 use crate::message_bar::{Message, MessageBuffer};
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use crate::polling::ipc::IpcRequest;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use crate::polling::ipc::{IpcError, MAX_INPUT_BYTES, MAX_IPC_TEXT_BYTES};
 use crate::scheduler::{Scheduler, TimerId, Topic};
 use crate::vivid::VividService;
@@ -111,9 +111,9 @@ pub struct Processor {
     initial_window_error: Option<Box<dyn Error>>,
     windows: HashMap<WindowId, WindowContext, RandomState>,
     proxy: EventSink,
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     global_ipc_options: ParsedOptions,
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     automation: AutomationHub,
     cli_options: CliOptions,
     config: Rc<UiConfig>,
@@ -177,9 +177,9 @@ impl Processor {
             config: Rc::new(config),
             clipboard,
             windows: Default::default(),
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             global_ipc_options: Default::default(),
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             automation: Default::default(),
             config_monitor,
             next_headless_draw: Instant::now(),
@@ -198,21 +198,21 @@ impl Processor {
             self.config.clone(),
             window_options,
         )?;
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         let mut window_context = window_context;
 
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         {
             window_context.automation.creation_index = self.automation.next_creation_index();
         }
         let platform_id = window_context.id();
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         let ipc_window_id = window_context.ipc_window_id();
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         let ipc_window_id = u64::from(platform_id);
         self.windows.insert(platform_id, window_context);
 
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         self.automation.emit(
             Some(ipc_window_id),
             "window_created",
@@ -228,7 +228,7 @@ impl Processor {
         event_loop: LoopHandle<'_>,
         options: WindowOptions,
     ) -> Result<u64, Box<dyn Error>> {
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         if let Some(ipc_window_id) = options.ipc_window_id
             && self
                 .windows
@@ -243,7 +243,7 @@ impl Processor {
 
         // Override config with CLI/IPC options.
         let mut config_overrides = options.config_overrides();
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         config_overrides.extend_from_slice(&self.global_ipc_options);
         let mut config = self.config.clone();
         config = config_overrides.override_config_rc(config);
@@ -255,10 +255,10 @@ impl Processor {
             options,
             config_overrides,
         )?;
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         let mut window_context = window_context;
 
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         if self
             .windows
             .values()
@@ -271,17 +271,17 @@ impl Processor {
             .into());
         }
 
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         {
             window_context.automation.creation_index = self.automation.next_creation_index();
         }
         let platform_id = window_context.id();
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         let ipc_window_id = window_context.ipc_window_id();
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         let ipc_window_id = u64::from(platform_id);
         self.windows.insert(platform_id, window_context);
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         self.automation.emit(
             Some(ipc_window_id),
             "window_created",
@@ -440,7 +440,7 @@ impl Processor {
     }
 
     /// Resolve the public stable window ID or focused-window fallback.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn resolve_ipc_target(&self, requested: Option<u64>) -> Result<WindowId, IpcError> {
         match requested {
             Some(requested) => self
@@ -480,7 +480,7 @@ impl Processor {
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn handle_ipc_request(&mut self, event_loop: LoopHandle<'_>, request: IpcRequest) {
         use crate::cli::{
             IpcConfig, IpcGetConfig, IpcGetGrid, IpcGetText, IpcInputRoute, IpcKey, IpcMouse,
@@ -1441,7 +1441,7 @@ impl Processor {
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn queue_ipc_input(&mut self, requested: Option<u64>, bytes: Vec<u8>, request: &IpcRequest) {
         if bytes.len() > MAX_INPUT_BYTES + 16 {
             request
@@ -1480,7 +1480,7 @@ impl Processor {
         self.schedule_automation_timer(target);
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn handle_ipc_disconnect(&mut self, connection_id: u64) {
         self.automation.disconnect(connection_id);
         for window in self.windows.values_mut() {
@@ -1494,7 +1494,7 @@ impl Processor {
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn register_wait(
         &mut self,
         requested: Option<u64>,
@@ -1508,7 +1508,7 @@ impl Processor {
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn register_wait_for_target(
         &mut self,
         target: WindowId,
@@ -1533,7 +1533,7 @@ impl Processor {
         self.schedule_automation_timer(target);
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn automation_tick(&mut self, window_id: WindowId) {
         let Some(window) = self.windows.get_mut(&window_id) else {
             return;
@@ -1557,7 +1557,7 @@ impl Processor {
     }
 
     /// Keep exactly one timer at the nearest automation deadline for this window.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn schedule_automation_timer(&mut self, window_id: WindowId) {
         let timer_id = TimerId::new(Topic::Automation, window_id);
         self.scheduler.unschedule(timer_id);
@@ -1593,7 +1593,7 @@ impl Processor {
     }
 
     /// Apply focus/resize confirmations after batched winit events have updated window state.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn apply_automation_confirmations(&mut self, window_id: WindowId) {
         let Some(window) = self.windows.get_mut(&window_id) else {
             return;
@@ -1661,10 +1661,8 @@ impl Processor {
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn evaluate_waiters(&mut self, window_id: WindowId) {
-        use std::os::unix::process::ExitStatusExt;
-
         let Some(window) = self.windows.get_mut(&window_id) else {
             return;
         };
@@ -1809,8 +1807,8 @@ impl Processor {
                     Ok(serde_json::json!({
                         "exited": true,
                         "code": status.code(),
-                        "signal": status.signal(),
-                        "core_dumped": status.core_dumped(),
+                        "signal": exit_signal(&status),
+                        "core_dumped": exit_core_dumped(&status),
                     }))
                 }),
                 WaitKind::Resize {
@@ -1857,26 +1855,26 @@ impl Processor {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn decode_ipc_params<T: DeserializeOwned>(request: &IpcRequest) -> Result<T, IpcError> {
     serde_json::from_value(request.params.clone()).map_err(|error| {
         IpcError::new("invalid_params", format!("invalid {} parameters: {error}", request.method))
     })
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn default_vivid_scene_nodes() -> u64 {
     64
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn compile_regex(pattern: &str) -> Result<(), IpcError> {
     regex_automata::meta::Regex::new(pattern)
         .map(|_| ())
         .map_err(|error| IpcError::new("regex_invalid", error.to_string()))
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn pattern_find(haystack: &[u8], needle: &[u8], regex: bool) -> Option<(usize, usize)> {
     if regex {
         let pattern = std::str::from_utf8(needle).ok()?;
@@ -1898,14 +1896,7 @@ impl Processor {
     /// A daemon has no window to begin with, and a headless session must outlive the shell it was
     /// started to run so a client can open another window into it.
     fn persists_without_windows(&self) -> bool {
-        #[cfg(unix)]
-        {
-            self.cli_options.daemon || self.cli_options.headless
-        }
-        #[cfg(not(unix))]
-        {
-            self.cli_options.daemon
-        }
+        self.cli_options.daemon || self.cli_options.headless
     }
 
     /// Create the startup window, if this invocation is meant to have one.
@@ -1983,11 +1974,11 @@ impl Processor {
         };
 
         let is_redraw = matches!(event, WindowEvent::RedrawRequested);
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         let focus_confirmed = matches!(&event, WindowEvent::Focused(true));
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         let resize_confirmed = matches!(&event, WindowEvent::Resized(_));
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         let automation_event = match &event {
             WindowEvent::Focused(focused) => {
                 Some(("focus_changed", serde_json::json!({"focused": focused})))
@@ -2007,26 +1998,26 @@ impl Processor {
             WinitEvent::WindowEvent { window_id, event },
         );
 
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         if focus_confirmed {
             window_context.automation.pending_focus_confirmations =
                 window_context.automation.pending_focus_confirmations.saturating_add(1);
         }
 
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         if resize_confirmed {
             window_context.automation.pending_resize_confirmations =
                 window_context.automation.pending_resize_confirmations.saturating_add(1);
         }
 
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         if let Some((kind, data)) = automation_event {
             self.automation.emit(Some(window_context.ipc_window_id()), kind, data);
         }
 
         if is_redraw {
             let _presented = window_context.draw(&mut self.scheduler);
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             if _presented {
                 let ipc_window_id = window_context.ipc_window_id();
                 let frame_sequence = window_context.automation.record_frame();
@@ -2038,7 +2029,7 @@ impl Processor {
             }
         }
 
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         {
             let _ = window_context;
             self.evaluate_waiters(window_id);
@@ -2053,25 +2044,25 @@ impl Processor {
 
         // Handle events which don't mandate the WindowId.
         match (event.payload, event.window_id.as_ref()) {
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             (EventType::IpcRequest(request), _) => self.handle_ipc_request(event_loop, request),
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             (EventType::IpcDisconnect(connection_id), _) => {
                 self.handle_ipc_disconnect(connection_id);
             },
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             (EventType::ScreenshotReadback, Some(window_id)) => {
                 if let Some(window_context) = self.windows.get_mut(window_id) {
                     window_context.poll_screenshot(&mut self.scheduler, &self.proxy);
                 }
             },
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             (EventType::ScreenshotComplete, Some(window_id)) => {
                 if let Some(window_context) = self.windows.get_mut(window_id) {
                     window_context.complete_screenshot();
                 }
             },
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             (EventType::AutomationTick, Some(window_id)) => self.automation_tick(*window_id),
             (EventType::ConfigReload(path), _) => {
                 // Clear config logs from message bar for all terminals.
@@ -2115,7 +2106,7 @@ impl Processor {
                 }
             },
             // Shutdown all windows.
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             (EventType::Shutdown, _) => event_loop.exit(),
             // Process events affecting all windows.
             (payload, None) => {
@@ -2131,7 +2122,7 @@ impl Processor {
                     );
                 }
             },
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             (EventType::Terminal(TerminalEvent::Title(title)), Some(window_id)) => {
                 self.automation.emit(
                     self.windows.get(window_id).map(WindowContext::ipc_window_id),
@@ -2152,7 +2143,7 @@ impl Processor {
                     );
                 }
             },
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             (EventType::Terminal(TerminalEvent::ResetTitle), Some(window_id)) => {
                 let title = self
                     .windows
@@ -2177,7 +2168,7 @@ impl Processor {
                     );
                 }
             },
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             (EventType::Terminal(TerminalEvent::Bell), Some(window_id)) => {
                 self.automation.emit(
                     self.windows.get(window_id).map(WindowContext::ipc_window_id),
@@ -2206,7 +2197,7 @@ impl Processor {
                     }
                 }
             },
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             (EventType::Terminal(TerminalEvent::PtyOutput { start, end }), Some(window_id)) => {
                 if let Some(window) = self.windows.get(window_id) {
                     let transcript = window.automation.transcript.lock().unwrap();
@@ -2217,7 +2208,7 @@ impl Processor {
                 self.evaluate_waiters(*window_id);
                 self.schedule_automation_timer(*window_id);
             },
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             (EventType::Terminal(TerminalEvent::PtyWriteComplete(token)), Some(window_id)) => {
                 if let Some(window) = self.windows.get_mut(window_id)
                     && let Some(index) = window
@@ -2234,7 +2225,7 @@ impl Processor {
                 }
                 self.schedule_automation_timer(*window_id);
             },
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             (EventType::Terminal(TerminalEvent::PtyResizeComplete(token)), Some(window_id)) => {
                 if let Some(window) = self.windows.get_mut(window_id)
                     && let Some(waiter) = window.automation.waiters.iter_mut().find(|waiter| {
@@ -2258,25 +2249,23 @@ impl Processor {
                         window_context.display.window.request_redraw();
                     }
                 }
-                #[cfg(unix)]
+                #[cfg(any(unix, windows))]
                 {
                     self.evaluate_waiters(*window_id);
                     self.schedule_automation_timer(*window_id);
                 }
             },
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             (EventType::Terminal(TerminalEvent::ChildExit(status)), Some(window_id)) => {
                 if let Some(window) = self.windows.get_mut(window_id) {
-                    use std::os::unix::process::ExitStatusExt;
-
                     window.automation.exit_status = Some(status);
                     self.automation.emit(
                         Some(window.ipc_window_id()),
                         "child_exit",
                         serde_json::json!({
                             "code": status.code(),
-                            "signal": status.signal(),
-                            "core_dumped": status.core_dumped(),
+                            "signal": exit_signal(&status),
+                            "core_dumped": exit_core_dumped(&status),
                         }),
                     );
                     self.evaluate_waiters(*window_id);
@@ -2294,10 +2283,10 @@ impl Processor {
                     },
                     _ => return,
                 };
-                #[cfg(unix)]
+                #[cfg(any(unix, windows))]
                 let mut window_context = window_context;
 
-                #[cfg(unix)]
+                #[cfg(any(unix, windows))]
                 {
                     let ipc_window_id = window_context.ipc_window_id();
                     window_context.fail_automation_requests("pty_closed", "terminal window closed");
@@ -2367,7 +2356,7 @@ impl Processor {
             );
         }
 
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         {
             let window_ids: Vec<_> = self.windows.keys().copied().collect();
             for window_id in &window_ids {
@@ -2421,7 +2410,7 @@ impl Processor {
             info!("Exiting the event loop");
         }
 
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         for window in self.windows.values_mut() {
             window.fail_automation_requests("pty_closed", "Vivido event loop is shutting down");
         }
@@ -2575,20 +2564,20 @@ pub enum EventType {
     Message(Message),
     Scroll(Scroll),
     CreateWindow(WindowOptions),
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     IpcRequest(IpcRequest),
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     IpcDisconnect(u64),
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     ScreenshotReadback,
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     ScreenshotComplete,
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     AutomationTick,
     BlinkCursor,
     BlinkCursorTimeout,
     SearchNext,
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     Shutdown,
     Frame,
     VividResizeSettled(u64),
@@ -3639,12 +3628,12 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                     TerminalEvent::MouseCursorDirty => self.reset_mouse_cursor(),
                     TerminalEvent::CursorBlinkingChange => self.ctx.update_cursor_blinking(),
                     TerminalEvent::Exit | TerminalEvent::ChildExit(_) | TerminalEvent::Wakeup => (),
-                    #[cfg(unix)]
+                    #[cfg(any(unix, windows))]
                     TerminalEvent::PtyOutput { .. }
                     | TerminalEvent::PtyWriteComplete(_)
                     | TerminalEvent::PtyResizeComplete(_) => (),
                 },
-                #[cfg(unix)]
+                #[cfg(any(unix, windows))]
                 EventType::IpcRequest(_)
                 | EventType::IpcDisconnect(_)
                 | EventType::ScreenshotReadback
@@ -3817,6 +3806,28 @@ impl EventListener for EventProxy {
     fn send_event(&self, event: TerminalEvent) {
         let _ = self.proxy.send_event(Event::new(event.into(), self.window_id));
     }
+}
+
+#[cfg(unix)]
+fn exit_signal(status: &std::process::ExitStatus) -> Option<i32> {
+    use std::os::unix::process::ExitStatusExt;
+    status.signal()
+}
+
+#[cfg(windows)]
+fn exit_signal(_status: &std::process::ExitStatus) -> Option<i32> {
+    None
+}
+
+#[cfg(unix)]
+fn exit_core_dumped(status: &std::process::ExitStatus) -> bool {
+    use std::os::unix::process::ExitStatusExt;
+    status.core_dumped()
+}
+
+#[cfg(windows)]
+fn exit_core_dumped(_status: &std::process::ExitStatus) -> bool {
+    false
 }
 
 #[cfg(all(test, unix))]

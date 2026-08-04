@@ -29,7 +29,6 @@ use winit::event_loop::EventLoop;
 
 use crate::terminal::tty;
 
-#[cfg(unix)]
 mod automation;
 mod cli;
 mod clipboard;
@@ -37,7 +36,6 @@ mod config;
 mod daemon;
 mod display;
 mod event;
-#[cfg(unix)]
 mod headless;
 mod input;
 mod logging;
@@ -46,13 +44,10 @@ mod macos;
 mod message_bar;
 #[cfg(windows)]
 mod panic;
-#[cfg(unix)]
 mod polling;
 mod scheduler;
-#[cfg(unix)]
 mod screenshot;
 mod serde_replace;
-#[cfg(unix)]
 mod session;
 mod string;
 pub mod terminal;
@@ -61,19 +56,16 @@ mod window_context;
 
 pub use crate::serde_replace::SerdeReplace;
 
-#[cfg(unix)]
 use crate::cli::MessageOptions;
 use crate::cli::Options;
 #[cfg(not(any(target_os = "macos", windows)))]
 use crate::cli::SocketMessage;
-#[cfg(unix)]
 use crate::cli::Subcommands;
 use crate::config::UiConfig;
 use crate::config::monitor::ConfigMonitor;
 use crate::event::{Event, EventSink, Processor};
 #[cfg(target_os = "macos")]
 use crate::macos::locale;
-#[cfg(unix)]
 use crate::polling::{IoListener, ipc};
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -89,10 +81,17 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     // Load command line options.
-    #[cfg_attr(not(unix), allow(unused_mut))]
     let mut options = Options::new();
 
-    #[cfg(unix)]
+    #[cfg(windows)]
+    if let Some(readiness_handle) = options.headless_server_handle {
+        let resolved_session = options
+            .resolved_session
+            .take()
+            .ok_or("internal headless server is missing its resolved session")?;
+        return headless::run_reexec(options, resolved_session, readiness_handle);
+    }
+
     match options.subcommands.take() {
         Some(Subcommands::Msg(options)) => msg(options)?,
         Some(Subcommands::List) => session::print_sessions()?,
@@ -102,14 +101,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         None => vivido(options)?,
     }
 
-    #[cfg(not(unix))]
-    vivido(options)?;
-
     Ok(())
 }
 
 /// `msg` subcommand entrypoint.
-#[cfg(unix)]
 #[allow(unused_mut)]
 fn msg(mut options: MessageOptions) -> Result<(), Box<dyn Error>> {
     #[cfg(not(any(target_os = "macos", windows)))]
@@ -192,8 +187,8 @@ fn vivido(mut options: Options) -> Result<(), Box<dyn Error>> {
     macos::disable_autofill();
 
     // Spawn the Unix I/O event polling thread.
-    #[cfg(unix)]
-    let socket_path = match IoListener::spawn(
+    #[cfg(any(unix, windows))]
+    let ipc_endpoint = match IoListener::spawn(
         &config,
         &options,
         EventSink::Winit(window_event_loop.create_proxy()),
@@ -210,9 +205,11 @@ fn vivido(mut options: Options) -> Result<(), Box<dyn Error>> {
     let log_cleanup = log_file.filter(|_| !config.debug.persistent_logging);
     let _files = TemporaryFiles {
         #[cfg(unix)]
-        socket_path,
+        socket_path: ipc_endpoint,
         log_file: log_cleanup,
     };
+    #[cfg(windows)]
+    let _ = ipc_endpoint;
 
     // Event processor.
     let mut processor = Processor::new(config, options, &window_event_loop);

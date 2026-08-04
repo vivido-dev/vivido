@@ -16,8 +16,8 @@ _vivido() {
     local context curcontext="$curcontext" state line
     _arguments "${_arguments_options[@]}" : \
 '--config-file=[Specify alternative configuration file \[default\: \$XDG_CONFIG_HOME/vivido/vivido.toml\]]:CONFIG_FILE:_files' \
-'-s+[Path for IPC socket creation]:SOCKET:_files' \
-'--socket=[Path for IPC socket creation]:SOCKET:_files' \
+'-s+[Local IPC endpoint (a filesystem path on Unix, a named-pipe path on Windows)]:SOCKET:_files' \
+'--socket=[Local IPC endpoint (a filesystem path on Unix, a named-pipe path on Windows)]:SOCKET:_files' \
 '--session=[Name of the headless session, for \`--target\` on \`msg\` \[default\: derived from the PID\]]:NAME:_default' \
 '--headless-size=[Size of the headless window, as COLUMNSxLINES or WIDTHxHEIGHTpx]:SIZE:_default' \
 '--vivid-target=[Present a \`desktop-surface-v1\` Vivid target instead of the terminal target]:TARGET:((terminal\:"\`terminal-surface-v1\`\: a grid of cells with a text plane and anchors"
@@ -55,8 +55,8 @@ desktop\:"\`desktop-surface-v1\`\: a virtual desktop in logical pixels, with no 
         case $line[1] in
             (msg)
 _arguments "${_arguments_options[@]}" : \
-'-s+[IPC socket connection path override]:SOCKET:_files' \
-'--socket=[IPC socket connection path override]:SOCKET:_files' \
+'-s+[IPC endpoint override (a filesystem path on Unix, a named-pipe path on Windows)]:SOCKET:_files' \
+'--socket=[IPC endpoint override (a filesystem path on Unix, a named-pipe path on Windows)]:SOCKET:_files' \
 '(-s --socket)-t+[Name of the headless session to talk to \[default\: \$VIVIDO_SESSION, else the only session\]]:NAME:_default' \
 '(-s --socket)--target=[Name of the headless session to talk to \[default\: \$VIVIDO_SESSION, else the only session\]]:NAME:_default' \
 '-h[Print help]' \

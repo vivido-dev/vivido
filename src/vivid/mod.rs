@@ -435,17 +435,17 @@ impl VividService {
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub(crate) fn automation_sessions(&self) -> Vec<SessionIdentity> {
         self.scene.session_ids()
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub(crate) fn automation_surface_keys(&self) -> Vec<SurfaceIdentity> {
         self.scene.surface_keys()
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub(crate) fn automation_surface_status(
         &self,
         identity: SurfaceIdentity,
@@ -453,17 +453,17 @@ impl VividService {
         self.scene.surface_status(identity)
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub(crate) fn automation_track_keys(&self) -> Vec<TrackIdentity> {
         self.scene.track_keys()
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub(crate) fn automation_track_status(&self, identity: TrackIdentity) -> Option<TrackStatus> {
         self.scene.track_status(identity)
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub(crate) fn automation_scene_status(
         &self,
         session: SessionIdentity,
@@ -475,7 +475,7 @@ impl VividService {
         )
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub(crate) fn automation_evaluate_wait(
         &self,
         identity: TrackIdentity,

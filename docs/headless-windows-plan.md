@@ -1,15 +1,40 @@
-# Headless mode on Windows — remaining work
+# Headless mode on Windows — implementation record
 
-Status as of commit `13c7f75` (`feat(vivido): add a true headless mode`).
+Status: **completed and verified on Windows on 2026-08-04**. This document began as the handoff
+from commit `13c7f75` (`feat(vivido): add a true headless mode`) and is retained as the design and
+security checklist for the Windows implementation.
 
-`vivido --headless` is implemented and verified on Linux. macOS is *structured* for but not built
-or run. **Windows is not implemented at all**, and this document is the handoff for that work.
+Windows now supports detached and foreground `vivido --headless` sessions, named-pipe IPC,
+session discovery/list/kill, automation, input, offscreen rendering, screenshots, resize, and
+multi-session isolation. The implementation follows the platform split recommended below: Unix
+keeps `fork`, while Windows re-executes with an inherited readiness handle and detached-process
+flags.
 
-It was deferred for one reason: the development host had no Windows toolchain, so the code could
-not be compiled or even type-checked (`cargo check --target x86_64-pc-windows-gnu` fails in the C
-build with `failed to find tool "x86_64-w64-mingw32-gcc"`). Writing an owner-only named-pipe IPC
-transport plus ~250 `cfg` changes with no way to build them would have produced a large, unverified
-diff over a working Linux path. Nothing about the design is blocked — only the verification.
+Completed Windows-specific work:
+
+- Owner-and-SYSTEM-only local named pipes with protected DACLs, remote-client rejection, and SID
+  verification on both peers. Overlapped reads and writes keep each connection full duplex.
+- Process creation-time identities and handle-pinned termination, preventing stale registries from
+  targeting a recycled PID.
+- `%LOCALAPPDATA%\vivido\sessions` discovery, with `VIVIDO_RUNTIME_DIR` available for isolated
+  tests and service deployments. Registry files are discovery metadata; authenticated pipe ACLs
+  remain the authorization boundary.
+- Windows-only re-exec with a tested exhaustive option round trip, non-inherited readiness and
+  standard handles, and bounded startup diagnostics.
+- Portable end-to-end tests and a pinned Windows CI job. The suite exercises real DX12/WARP
+  rendering, input, resize, lifecycle, owner-authenticated second-process clients, and isolation
+  between sessions that reuse numeric window IDs.
+
+The completion gate is the command set in §7. It passed on the Windows development host, including
+393 unit tests (one diagnostic test ignored), six `vvssh` tests, and all five ignored headless
+integration scenarios.
+
+The work was originally deferred for one reason: the development host had no Windows toolchain,
+so the code could not be compiled or even type-checked (`cargo check --target
+x86_64-pc-windows-gnu` fails in the C build with `failed to find tool
+"x86_64-w64-mingw32-gcc"`). Writing an owner-only named-pipe IPC transport plus ~250 `cfg` changes
+with no way to build them would have produced a large, unverified diff over a working Linux path.
+Nothing about the design was blocked — only the verification.
 
 **Before starting, confirm you can actually build for Windows.** Either work on a Windows machine,
 or install `mingw-w64` (plus a Windows FFmpeg, see "Build prerequisites"). If `cargo check

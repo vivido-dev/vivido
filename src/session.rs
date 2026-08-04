@@ -8,8 +8,11 @@
 
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
+#[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
+#[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+#[cfg(unix)]
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 
@@ -36,6 +39,7 @@ pub struct SessionPaths {
 pub enum ProcessBirth {
     Linux { start_ticks: u64 },
     Macos { start_micros: u64 },
+    Windows { creation_time: u64 },
 }
 
 /// Published rendezvous for a running headless daemon.
@@ -62,12 +66,19 @@ impl SessionPaths {
 
     fn for_session_in_root(name: &str, root: &Path) -> io::Result<Self> {
         validate_session_name(name)?;
-        ensure_private_directory(root, effective_uid())?;
+        #[cfg(unix)]
+        let uid = effective_uid();
+        #[cfg(windows)]
+        let uid = 0;
+        ensure_private_directory(root, uid)?;
         let hash = hex(&Sha256::digest(name.as_bytes())[..16]);
+        #[cfg(unix)]
         let socket = root.join(format!("session-{hash}.sock"));
+        #[cfg(windows)]
+        let socket = PathBuf::from(format!(r"\\.\pipe\vivido-session-{hash}"));
         let registry = root.join(format!("session-{hash}.json"));
         let endpoint_id =
-            hex(&domain_hash(b"vivido endpoint identity v1\0", socket.as_os_str().as_bytes()));
+            hex(&domain_hash(b"vivido endpoint identity v1\0", &endpoint_identity_bytes(&socket)));
         Ok(Self { socket, registry, endpoint_id })
     }
 
@@ -116,6 +127,7 @@ impl SessionPaths {
                 self.remove_instance(&registry)?;
             },
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                #[cfg(unix)]
                 if self.socket.exists() {
                     match UnixStream::connect(&self.socket) {
                         Ok(_) => {
@@ -138,6 +150,23 @@ impl SessionPaths {
                         },
                         Err(error) => return Err(error),
                     }
+                }
+                #[cfg(windows)]
+                match crate::polling::transport::LocalStream::connect(&self.socket) {
+                    Ok(_) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::AlreadyExists,
+                            format!("vivido session {name:?} is already starting"),
+                        ));
+                    },
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            io::ErrorKind::NotFound
+                                | io::ErrorKind::ConnectionRefused
+                                | io::ErrorKind::TimedOut
+                        ) => {},
+                    Err(error) => return Err(error),
                 }
             },
             Err(error) => return Err(error),
@@ -169,6 +198,7 @@ impl SessionPaths {
         // Revalidate immediately before each mutation. A replacement daemon may legitimately use
         // the same session paths, and teardown for the old instance must never remove its files.
         if self.read_registry().is_ok_and(|current| same_instance(&current, expected)) {
+            #[cfg(unix)]
             match fs::remove_file(&self.socket) {
                 Ok(()) => {},
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {},
@@ -332,7 +362,7 @@ fn signal_session(paths: &SessionPaths, registry: &SessionRegistry) -> io::Resul
 /// macOS has no pidfd, so re-check birth time immediately before signalling.
 ///
 /// This leaves a small window a pidfd would close; it is the best the platform offers.
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
 fn signal_session(paths: &SessionPaths, registry: &SessionRegistry) -> io::Result<()> {
     if !registry_process_matches(registry) {
         let _ = paths.remove_instance(registry);
@@ -344,6 +374,34 @@ fn signal_session(paths: &SessionPaths, registry: &SessionRegistry) -> io::Resul
 
     let result = unsafe { libc::kill(registry.pid as libc::pid_t, libc::SIGTERM) };
     if result < 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
+}
+
+/// Terminate through a pinned process handle after re-verifying its creation time.
+#[cfg(windows)]
+fn signal_session(paths: &SessionPaths, registry: &SessionRegistry) -> io::Result<()> {
+    use windows_sys::Win32::System::Threading::{
+        PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE, TerminateProcess,
+    };
+
+    let process = WindowsProcessHandle::open(
+        registry.pid,
+        PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE,
+    )?;
+    let actual = process_birth_from_handle(process.raw())?;
+    if actual != registry.process_birth {
+        let _ = paths.remove_instance(registry);
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("vivido session {:?} is no longer running", registry.name),
+        ));
+    }
+
+    // This forceful path cannot run RegistryGuard; the next registry listing reaps its artifact.
+    if unsafe { TerminateProcess(process.raw(), 1) } == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
 }
 
 pub fn registry_process_matches(registry: &SessionRegistry) -> bool {
@@ -388,20 +446,40 @@ fn validate_registry(registry: &SessionRegistry) -> io::Result<()> {
 }
 
 fn read_registry_bytes(path: &Path) -> io::Result<Vec<u8>> {
-    let uid = effective_uid();
-    let mut options = OpenOptions::new();
-    options.read(true).custom_flags(libc::O_NOFOLLOW);
-    let mut file = options.open(path)?;
-    let metadata = file.metadata()?;
-    if !safe_registry_metadata(metadata.is_file(), metadata.uid(), metadata.mode(), uid) {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "unsafe vivido session registry",
-        ));
+    #[cfg(unix)]
+    {
+        let uid = effective_uid();
+        let mut options = OpenOptions::new();
+        options.read(true).custom_flags(libc::O_NOFOLLOW);
+        let mut file = options.open(path)?;
+        let metadata = file.metadata()?;
+        if !safe_registry_metadata(metadata.is_file(), metadata.uid(), metadata.mode(), uid) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "unsafe vivido session registry",
+            ));
+        }
+        read_bounded_registry(&mut file, metadata.len())
     }
-    read_bounded_registry(&mut file, metadata.len())
+
+    #[cfg(windows)]
+    {
+        // The registry is rendezvous metadata, not an authority: the named pipe independently
+        // enforces an owner/SYSTEM-only DACL and verifies both peer process owners. Keeping the
+        // file under the current user's LocalAppData prevents ordinary cross-user replacement.
+        let mut file = OpenOptions::new().read(true).open(path)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "unsafe vivido session registry",
+            ));
+        }
+        read_bounded_registry(&mut file, metadata.len())
+    }
 }
 
+#[cfg(unix)]
 fn safe_registry_metadata(is_file: bool, uid: u32, mode: u32, expected_uid: u32) -> bool {
     is_file && uid == expected_uid && mode & 0o077 == 0
 }
@@ -439,7 +517,9 @@ fn write_registry_file(path: &Path, registry: &SessionRegistry) -> io::Result<()
         &registry.instance_nonce[..16]
     ));
     let mut options = OpenOptions::new();
-    options.create_new(true).write(true).mode(0o600);
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    options.mode(0o600);
     let mut file = options.open(&temporary)?;
     let result = file.write_all(&bytes).and_then(|()| file.sync_all()).and_then(|()| {
         drop(file);
@@ -516,6 +596,58 @@ fn process_birth(pid: u32) -> io::Result<ProcessBirth> {
     Ok(ProcessBirth::Macos { start_micros })
 }
 
+#[cfg(windows)]
+fn process_birth(pid: u32) -> io::Result<ProcessBirth> {
+    use windows_sys::Win32::System::Threading::PROCESS_QUERY_LIMITED_INFORMATION;
+
+    let process = WindowsProcessHandle::open(pid, PROCESS_QUERY_LIMITED_INFORMATION)?;
+    process_birth_from_handle(process.raw())
+}
+
+#[cfg(windows)]
+fn process_birth_from_handle(
+    handle: windows_sys::Win32::Foundation::HANDLE,
+) -> io::Result<ProcessBirth> {
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::System::Threading::GetProcessTimes;
+
+    let mut creation = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+    let mut exit = creation;
+    let mut kernel = creation;
+    let mut user = creation;
+    if unsafe { GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let creation_time =
+        (u64::from(creation.dwHighDateTime) << 32) | u64::from(creation.dwLowDateTime);
+    Ok(ProcessBirth::Windows { creation_time })
+}
+
+#[cfg(windows)]
+struct WindowsProcessHandle(windows_sys::Win32::Foundation::HANDLE);
+
+#[cfg(windows)]
+impl WindowsProcessHandle {
+    fn open(pid: u32, access: u32) -> io::Result<Self> {
+        use windows_sys::Win32::System::Threading::OpenProcess;
+
+        let handle = unsafe { OpenProcess(access, 0, pid) };
+        if handle.is_null() { Err(io::Error::last_os_error()) } else { Ok(Self(handle)) }
+    }
+
+    fn raw(&self) -> windows_sys::Win32::Foundation::HANDLE {
+        self.0
+    }
+}
+
+#[cfg(windows)]
+impl Drop for WindowsProcessHandle {
+    fn drop(&mut self) {
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(self.0) };
+    }
+}
+
+#[cfg(unix)]
 fn runtime_root() -> io::Result<PathBuf> {
     let uid = effective_uid();
     let root = if let Some(path) = std::env::var_os("XDG_RUNTIME_DIR") {
@@ -529,6 +661,23 @@ fn runtime_root() -> io::Result<PathBuf> {
     Ok(root)
 }
 
+#[cfg(windows)]
+fn runtime_root() -> io::Result<PathBuf> {
+    let root = if let Some(root) = std::env::var_os("VIVIDO_RUNTIME_DIR") {
+        // An explicit root is useful for hermetic service accounts and tests. Registry files are
+        // discovery metadata only; the named pipe remains protected by its DACL and peer SID.
+        PathBuf::from(root)
+    } else {
+        dirs::data_local_dir()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "LOCALAPPDATA is unavailable"))?
+            .join("vivido")
+            .join("sessions")
+    };
+    ensure_private_directory(&root, 0)?;
+    Ok(root)
+}
+
+#[cfg(unix)]
 fn validate_runtime_parent(path: &Path, uid: u32) -> io::Result<()> {
     let metadata = fs::symlink_metadata(path)?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() || metadata.uid() != uid {
@@ -540,6 +689,7 @@ fn validate_runtime_parent(path: &Path, uid: u32) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 fn ensure_private_directory(path: &Path, uid: u32) -> io::Result<()> {
     match fs::symlink_metadata(path) {
         Ok(metadata) => {
@@ -574,8 +724,37 @@ fn ensure_private_directory(path: &Path, uid: u32) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(windows)]
+fn ensure_private_directory(path: &Path, _uid: u32) -> io::Result<()> {
+    // `%LOCALAPPDATA%` is a per-user known folder. Endpoint authorization does not rely on this
+    // directory: each named pipe has a protected owner/SYSTEM-only DACL and validates peer SIDs.
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() => Ok(()),
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("unsafe vivido runtime directory {}", path.display()),
+        )),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => fs::create_dir_all(path),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(unix)]
 fn effective_uid() -> u32 {
     unsafe { libc::geteuid() }
+}
+
+fn endpoint_identity_bytes(path: &Path) -> Vec<u8> {
+    #[cfg(unix)]
+    {
+        path.as_os_str().as_bytes().to_vec()
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+
+        path.as_os_str().encode_wide().flat_map(u16::to_le_bytes).collect()
+    }
 }
 
 fn domain_hash(domain: &[u8], value: &[u8]) -> [u8; 32] {
@@ -667,6 +846,7 @@ mod tests {
         let paths = SessionPaths::for_session_in_root("scoped", &root).unwrap();
 
         let live = paths.write_registry("scoped", &[1; 32], (80, 24)).unwrap();
+        #[cfg(unix)]
         fs::write(&paths.socket, b"").unwrap();
 
         // Same PID and name, but a different instance nonce: a replacement daemon.
@@ -674,11 +854,13 @@ mod tests {
         stale.instance_nonce = hex(&[9; 32]);
         assert!(!paths.remove_instance(&stale).unwrap(), "a foreign instance must not be removed");
         assert!(paths.registry.exists(), "the live registry survived");
+        #[cfg(unix)]
         assert!(paths.socket.exists(), "the live socket survived");
 
         // The true owner may remove its own artifacts.
         assert!(paths.remove_instance(&live).unwrap());
         assert!(!paths.registry.exists());
+        #[cfg(unix)]
         assert!(!paths.socket.exists());
 
         let _ = fs::remove_dir_all(&root);
@@ -698,6 +880,9 @@ mod tests {
             },
             ProcessBirth::Macos { start_micros } => {
                 ProcessBirth::Macos { start_micros: start_micros.wrapping_add(1) }
+            },
+            ProcessBirth::Windows { creation_time } => {
+                ProcessBirth::Windows { creation_time: creation_time.wrapping_add(1) }
             },
         };
         write_registry_file(&paths.registry, &registry).unwrap();
@@ -721,6 +906,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn group_or_world_readable_registries_are_refused() {
         assert!(safe_registry_metadata(true, 1000, 0o600, 1000));
         assert!(!safe_registry_metadata(true, 1000, 0o640, 1000), "group readable");

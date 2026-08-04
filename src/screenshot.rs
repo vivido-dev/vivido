@@ -1,7 +1,9 @@
 //! Screenshot pixel conversion and private PNG persistence.
 
+#[cfg(unix)]
 use std::fs;
 use std::io::{Error as IoError, ErrorKind, Result as IoResult, Write};
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
@@ -21,7 +23,10 @@ pub fn save(mut pixels: ScreenshotPixels) -> IoResult<PathBuf> {
         .prefix("vivido-screenshot-")
         .suffix(".png")
         .tempfile_in(temp_dir)?;
+    #[cfg(unix)]
     fs::set_permissions(file.path(), fs::Permissions::from_mode(0o600))?;
+    // Windows creates this inside the current user's temp directory. The PNG contains no
+    // authority, while the IPC endpoint that requests it independently enforces owner-only ACLs.
     image::codecs::png::PngEncoder::new(file.as_file_mut())
         .write_image(&pixels.bytes, pixels.width, pixels.height, image::ExtendedColorType::Rgba8)
         .map_err(IoError::other)?;
@@ -114,6 +119,7 @@ fn compact_and_unpremultiply(pixels: &mut ScreenshotPixels) -> IoResult<()> {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
     use image::GenericImageView;
@@ -166,11 +172,13 @@ mod tests {
 
         let path = save(pixels).unwrap();
         let image = image::open(&path).unwrap();
+        #[cfg(unix)]
         let mode = path.metadata().unwrap().permissions().mode();
 
         assert!(path.is_absolute());
         assert_eq!(image.dimensions(), (1, 1));
         assert_eq!(image.to_rgba8().as_raw(), &[255, 64, 32, 255]);
+        #[cfg(unix)]
         assert_eq!(mode & 0o777, 0o600);
         fs::remove_file(path).unwrap();
     }

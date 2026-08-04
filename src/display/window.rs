@@ -338,7 +338,7 @@ impl Window {
     }
 
     #[inline]
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub fn focus_window(&self) {
         let Some(window) = self.backend.winit() else { return };
 

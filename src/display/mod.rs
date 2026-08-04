@@ -62,10 +62,10 @@ mod rects;
 mod renderer;
 mod text;
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[cfg(test)]
 pub(crate) use media::CaptureRedaction;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) use renderer::{ScreenshotError, ScreenshotPixels, ScreenshotReadback};
 
 /// Label for the forward terminal search bar.
@@ -321,17 +321,17 @@ impl Display {
     }
 
     /// Whether the renderer holds a frame a screenshot could read.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub fn has_rendered_frame(&self) -> bool {
         self.scene_renderer.has_rendered_frame()
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub fn begin_screenshot(&self) -> Result<ScreenshotReadback, ScreenshotError> {
         self.scene_renderer.begin_screenshot()
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub fn poll_screenshot(
         &self,
         readback: &ScreenshotReadback,
@@ -339,7 +339,7 @@ impl Display {
         self.scene_renderer.poll_screenshot(readback)
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub fn supports_render_size(&self, width: u32, height: u32) -> bool {
         self.scene_renderer.clamp_render_size(PhysicalSize::new(width, height))
             == PhysicalSize::new(width, height)

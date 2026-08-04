@@ -1,6 +1,6 @@
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use std::sync::mpsc::{self, Receiver, TryRecvError};
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use std::time::Instant;
 
 use pollster::block_on;
@@ -12,7 +12,7 @@ use winit::dpi::PhysicalSize;
 use crate::terminal::graphics::GraphicsCommand;
 
 use crate::display::SizeInfo;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use crate::display::media::CaptureRedaction;
 use crate::display::media::VividMediaRenderer;
 use crate::display::window::RenderSource;
@@ -27,45 +27,45 @@ pub enum Error {
 }
 
 /// Maximum raw screenshot readback allocation.
-#[cfg(any(unix, test))]
+#[cfg(any(unix, windows, test))]
 const MAX_SCREENSHOT_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Number of bytes in one captured RGBA pixel.
-#[cfg(any(unix, test))]
+#[cfg(any(unix, windows, test))]
 const SCREENSHOT_PIXEL_BYTES: u32 = 4;
 
-#[cfg(any(unix, test))]
+#[cfg(any(unix, windows, test))]
 #[derive(Debug)]
 pub enum ScreenshotError {
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     NoPresentedFrame,
     TooLarge,
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     Device(String),
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     Readback(String),
 }
 
-#[cfg(any(unix, test))]
+#[cfg(any(unix, windows, test))]
 impl std::fmt::Display for ScreenshotError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             Self::NoPresentedFrame => formatter.write_str("no displayed frame is available"),
             Self::TooLarge => formatter.write_str("screenshot exceeds the 256 MiB readback limit"),
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             Self::Device(err) => write!(formatter, "screenshot device polling failed: {err}"),
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             Self::Readback(err) => write!(formatter, "screenshot readback failed: {err}"),
         }
     }
 }
 
-#[cfg(any(unix, test))]
+#[cfg(any(unix, windows, test))]
 impl std::error::Error for ScreenshotError {}
 
 /// Asynchronous GPU screenshot readback.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub struct ScreenshotReadback {
     receiver: Receiver<Result<Vec<u8>, String>>,
     pub width: u32,
@@ -76,7 +76,7 @@ pub struct ScreenshotReadback {
 }
 
 /// Completed screenshot pixels with WebGPU row padding still present.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub struct ScreenshotPixels {
     pub bytes: Vec<u8>,
     pub width: u32,
@@ -300,13 +300,13 @@ impl SceneRenderer {
     }
 
     /// Whether the render target holds a frame a screenshot could read.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub fn has_rendered_frame(&self) -> bool {
         self.has_rendered_frame
     }
 
     /// Start asynchronously reading the last rendered frame.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub fn begin_screenshot(&self) -> Result<ScreenshotReadback, ScreenshotError> {
         if !self.has_rendered_frame {
             return Err(ScreenshotError::NoPresentedFrame);
@@ -360,7 +360,7 @@ impl SceneRenderer {
     }
 
     /// Poll an asynchronous screenshot without blocking the renderer thread.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub fn poll_screenshot(
         &self,
         readback: &ScreenshotReadback,
@@ -468,7 +468,7 @@ fn create_render_target(
     (texture, view)
 }
 
-#[cfg(any(unix, test))]
+#[cfg(any(unix, windows, test))]
 fn screenshot_layout(width: u32, height: u32) -> Result<(u32, u64), ScreenshotError> {
     let unpadded_bytes_per_row =
         width.checked_mul(SCREENSHOT_PIXEL_BYTES).ok_or(ScreenshotError::TooLarge)?;
@@ -520,7 +520,7 @@ mod tests {
     ///
     /// This is the whole basis of headless `msg screenshot`: the offscreen target *is* the
     /// finished image, so a frame is readable without any surface ever being presented.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn offscreen_renderer_produces_a_readable_frame() {
         let _gpu = gpu_lock();
@@ -567,7 +567,7 @@ mod tests {
     }
 
     /// Resizing an offscreen renderer must retarget without a surface to reconfigure.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn offscreen_renderer_resizes() {
         let _gpu = gpu_lock();

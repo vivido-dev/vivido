@@ -28,9 +28,9 @@ struct Session {
 
 impl Session {
     /// Start a detached headless session running `program`.
-    fn start(name: &str, program: &[&str]) -> Session {
+    fn start(name: &str, program: &[String]) -> Session {
         // Unix sockets cap the whole path at ~108 bytes, so the runtime root must stay short.
-        let runtime = PathBuf::from(format!("/tmp/vivido-it-{}-{name}", std::process::id()));
+        let runtime = env::temp_dir().join(format!("vivido-it-{}-{name}", std::process::id()));
         let _ = fs::remove_dir_all(&runtime);
         fs::create_dir_all(&runtime).expect("runtime directory");
         set_private(&runtime);
@@ -81,10 +81,12 @@ impl Session {
 
     /// Run `vivido msg` and return its stdout, failing the test on a protocol error.
     fn msg<S: AsRef<OsStr>>(&self, args: &[S]) -> String {
+        let printable_args: Vec<_> =
+            args.iter().map(|arg| arg.as_ref().to_string_lossy()).collect();
         let output = self.try_msg(args);
         assert!(
             output.status.success(),
-            "vivido msg failed: {}",
+            "vivido msg {printable_args:?} failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
         String::from_utf8_lossy(&output.stdout).into_owned()
@@ -111,8 +113,11 @@ impl Drop for Session {
 /// A `vivido` invocation with no windowing system reachable.
 fn base_command(runtime: &Path) -> Command {
     let mut command = Command::new(binary());
+    #[cfg(unix)]
+    command.env("XDG_RUNTIME_DIR", runtime);
+    #[cfg(windows)]
+    command.env("VIVIDO_RUNTIME_DIR", runtime);
     command
-        .env("XDG_RUNTIME_DIR", runtime)
         .env_remove("WAYLAND_DISPLAY")
         .env_remove("DISPLAY")
         .env_remove("VIVIDO_SOCKET")
@@ -127,7 +132,7 @@ fn binary() -> PathBuf {
     if path.ends_with("deps") {
         path.pop();
     }
-    path.join("vivido")
+    path.join(format!("vivido{}", env::consts::EXE_SUFFIX))
 }
 
 #[cfg(unix)]
@@ -136,73 +141,64 @@ fn set_private(path: &Path) {
     fs::set_permissions(path, fs::Permissions::from_mode(0o700)).expect("private runtime dir");
 }
 
+#[cfg(windows)]
+fn set_private(_path: &Path) {}
+
 /// Decode a PNG into `(width, height, distinct_colors, non_black_pixels)`.
 fn inspect_png(path: &Path) -> (u32, u32, usize, usize) {
     use std::collections::HashSet;
 
-    let bytes = fs::read(path).expect("read screenshot");
-    assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n", "not a PNG");
-
-    let mut offset = 8;
-    let mut idat = Vec::new();
-    let (mut width, mut height) = (0u32, 0u32);
-    while offset + 8 <= bytes.len() {
-        let length = u32::from_be_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
-        let kind = &bytes[offset + 4..offset + 8];
-        let data = &bytes[offset + 8..offset + 8 + length];
-        match kind {
-            b"IHDR" => {
-                width = u32::from_be_bytes(data[0..4].try_into().unwrap());
-                height = u32::from_be_bytes(data[4..8].try_into().unwrap());
-            },
-            b"IDAT" => idat.extend_from_slice(data),
-            _ => (),
-        }
-        offset += 12 + length;
-    }
-
-    let raw = inflate(&idat);
-    let stride = width as usize * 4;
+    let image = image::open(path).expect("decode screenshot PNG").into_rgba8();
+    let (width, height) = image.dimensions();
     let mut colors = HashSet::new();
     let mut lit = 0;
-    for row in 0..height as usize {
-        // Each row is prefixed with its filter byte; vello emits unfiltered rows here.
-        let start = row * (stride + 1) + 1;
-        for pixel in raw[start..start + stride].chunks_exact(4) {
-            colors.insert([pixel[0], pixel[1], pixel[2]]);
-            if pixel[..3] != [0, 0, 0] {
-                lit += 1;
-            }
+    for pixel in image.pixels() {
+        colors.insert([pixel[0], pixel[1], pixel[2]]);
+        if pixel.0[..3] != [0, 0, 0] {
+            lit += 1;
         }
     }
     (width, height, colors.len(), lit)
 }
 
-/// Minimal zlib inflate, so the test suite does not gain a dependency to read one image.
-fn inflate(bytes: &[u8]) -> Vec<u8> {
-    let output = Command::new("python3")
-        .args([
-            "-c",
-            "import sys,zlib; sys.stdout.buffer.write(zlib.decompress(sys.stdin.buffer.read()))",
-        ])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .spawn()
-        .and_then(|mut child| {
-            use std::io::Write;
-            child.stdin.take().expect("stdin").write_all(bytes)?;
-            child.wait_with_output()
-        })
-        .expect("inflate with python3");
-    assert!(output.status.success(), "inflate failed");
-    output.stdout
+#[cfg(unix)]
+fn shell_program() -> Vec<String> {
+    vec![String::from("sh")]
+}
+
+#[cfg(windows)]
+fn shell_program() -> Vec<String> {
+    ["powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive"]
+        .into_iter()
+        .map(String::from)
+        .collect()
+}
+
+fn marker_program(marker: &str) -> Vec<String> {
+    #[cfg(unix)]
+    return ["sh", "-c", &format!("echo {marker}; exec sh")]
+        .into_iter()
+        .map(String::from)
+        .collect();
+    #[cfg(windows)]
+    return [
+        String::from("powershell.exe"),
+        String::from("-NoLogo"),
+        String::from("-NoProfile"),
+        String::from("-NonInteractive"),
+        String::from("-NoExit"),
+        String::from("-Command"),
+        format!("Write-Output '{marker}'"),
+    ]
+    .into_iter()
+    .collect();
 }
 
 /// The whole point: a session with no compositor still answers text and pixel queries.
 #[test]
 #[ignore = "spawns processes and needs a wgpu adapter"]
 fn a_headless_session_serves_text_and_screenshots_without_a_compositor() {
-    let session = Session::start("basic", &["sh", "-c", "echo MARKER-ALPHA; sleep 300"]);
+    let session = Session::start("basic", &marker_program("MARKER-ALPHA"));
 
     // `hello` must say so, rather than leaving a client to infer it from a failed `focus`.
     let capabilities = session.msg(&["capabilities"]);
@@ -232,9 +228,12 @@ fn a_headless_session_serves_text_and_screenshots_without_a_compositor() {
 #[test]
 #[ignore = "spawns processes and needs a wgpu adapter"]
 fn typing_drives_the_shell_in_a_headless_session() {
-    let session = Session::start("typing", &["sh"]);
+    let session = Session::start("typing", &shell_program());
 
+    #[cfg(unix)]
     session.msg(&["typing", "echo RESULT-$((6*7))\n"]);
+    #[cfg(windows)]
+    session.msg(&["typing", "Write-Output (\"RESULT-\" + (6*7))\r"]);
     session.msg(&["wait", "text", "RESULT-42"]);
 
     let text = session.msg(&["get-text"]);
@@ -245,7 +244,7 @@ fn typing_drives_the_shell_in_a_headless_session() {
 #[test]
 #[ignore = "spawns processes and needs a wgpu adapter"]
 fn resizing_a_headless_session_changes_the_rendered_size() {
-    let session = Session::start("resize", &["sh"]);
+    let session = Session::start("resize", &shell_program());
 
     let before = PathBuf::from(session.msg(&["screenshot"]).trim());
     let (before_width, before_height, ..) = inspect_png(&before);
@@ -268,13 +267,15 @@ fn resizing_a_headless_session_changes_the_rendered_size() {
 #[test]
 #[ignore = "spawns processes and needs a wgpu adapter"]
 fn a_headless_session_persists_and_is_listed_until_it_is_told_to_quit() {
-    let session = Session::start("lifecycle", &["sh"]);
+    let session = Session::start("lifecycle", &shell_program());
 
     let listed = session.list();
     assert!(listed.contains("lifecycle"), "the session is not listed: {listed:?}");
 
     // A second window makes the instance multi-window, which is what nesting relies on.
-    let second = session.msg(&["create-window", "-e", "sh"]);
+    let mut create_window = vec![String::from("create-window"), String::from("-e")];
+    create_window.extend(shell_program());
+    let second = session.msg(&create_window);
     let second: u64 = second.trim().parse().expect("create-window returns a window id");
     let windows = session.msg(&["list-windows"]);
     assert_eq!(windows.matches(r#""window_id""#).count(), 2, "two windows: {windows}");
@@ -293,6 +294,7 @@ fn a_headless_session_persists_and_is_listed_until_it_is_told_to_quit() {
 
     // Shutting down clears the rendezvous, so a stale entry cannot outlive the daemon.
     assert!(!session.list().contains("lifecycle"), "the registry survived shutdown");
+    #[cfg(unix)]
     assert!(!Path::new(&session.socket).exists(), "the socket survived shutdown");
 }
 
@@ -303,8 +305,8 @@ fn a_headless_session_persists_and_is_listed_until_it_is_told_to_quit() {
 #[test]
 #[ignore = "spawns processes and needs a wgpu adapter"]
 fn tearing_down_one_session_leaves_the_other_untouched() {
-    let first = Session::start("iso-one", &["sh", "-c", "echo OWNER-ONE; sleep 300"]);
-    let second = Session::start("iso-two", &["sh", "-c", "echo OWNER-TWO; sleep 300"]);
+    let first = Session::start("iso-one", &marker_program("OWNER-ONE"));
+    let second = Session::start("iso-two", &marker_program("OWNER-TWO"));
 
     first.msg(&["wait", "text", "OWNER-ONE"]);
     second.msg(&["wait", "text", "OWNER-TWO"]);
@@ -329,7 +331,10 @@ fn tearing_down_one_session_leaves_the_other_untouched() {
         1,
         "the survivor lost its window"
     );
+    #[cfg(unix)]
     second.msg(&["typing", "echo STILL-ALIVE\n"]);
+    #[cfg(windows)]
+    second.msg(&["typing", "Write-Output 'STILL-ALIVE'\r"]);
     second.msg(&["wait", "text", "STILL-ALIVE"]);
 
     let path = PathBuf::from(second.msg(&["screenshot"]).trim());
@@ -346,7 +351,7 @@ fn tearing_down_one_session_leaves_the_other_untouched() {
 /// A session name must never escape the runtime directory.
 #[test]
 fn session_names_that_escape_the_runtime_directory_are_refused() {
-    let runtime = PathBuf::from(format!("/tmp/vivido-it-names-{}", std::process::id()));
+    let runtime = env::temp_dir().join(format!("vivido-it-names-{}", std::process::id()));
     let _ = fs::remove_dir_all(&runtime);
     fs::create_dir_all(&runtime).expect("runtime directory");
     set_private(&runtime);

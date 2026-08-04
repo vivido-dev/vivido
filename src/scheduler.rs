@@ -29,9 +29,9 @@ pub enum Topic {
     BlinkTimeout,
     Frame,
     VividResizeSettled,
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     ScreenshotReadback,
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     Automation,
 }
 

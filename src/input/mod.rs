@@ -306,7 +306,7 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
     }
 
     /// Temporarily use a neutral automation modifier state without changing physical key state.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub fn set_modifier_override(&mut self, modifiers: ModifiersState) {
         self.modifier_override = Some(modifiers);
     }

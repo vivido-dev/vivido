@@ -109,7 +109,7 @@ pub struct UiConfig {
     live_config_reload: Option<bool>,
 
     /// Offer IPC through a unix socket.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[config(deprecated = "use general.ipc_socket instead")]
     pub ipc_socket: Option<bool>,
 }
@@ -160,7 +160,7 @@ impl UiConfig {
         self.live_config_reload.unwrap_or(self.general.live_config_reload)
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[inline]
     pub fn ipc_socket(&self) -> bool {
         self.ipc_socket.unwrap_or(self.general.ipc_socket)

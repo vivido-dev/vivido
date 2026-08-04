@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 use clap::{ArgAction, Args, Parser, ValueHint};
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use clap::{Subcommand, ValueEnum};
 use log::{LevelFilter, error};
 use serde::{Deserialize, Serialize};
@@ -42,30 +42,30 @@ pub struct Options {
     #[clap(long, value_hint = ValueHint::FilePath)]
     pub config_file: Option<PathBuf>,
 
-    /// Path for IPC socket creation.
-    #[cfg(unix)]
+    /// Local IPC endpoint (a filesystem path on Unix, a named-pipe path on Windows).
+    #[cfg(any(unix, windows))]
     #[clap(short = 's', long, value_hint = ValueHint::FilePath)]
     pub socket: Option<PathBuf>,
 
     /// Run with no window and no compositor, serving IPC in the background.
     ///
     /// Detaches and prints the socket unless `--foreground` is given.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[clap(long)]
     pub headless: bool,
 
     /// Name of the headless session, for `--target` on `msg` [default: derived from the PID].
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[clap(long, value_name = "NAME", requires = "headless")]
     pub session: Option<String>,
 
     /// Keep a headless instance attached to this terminal instead of detaching.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[clap(long, requires = "headless")]
     pub foreground: bool,
 
     /// Size of the headless window, as COLUMNSxLINES or WIDTHxHEIGHTpx.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[clap(long, value_name = "SIZE", requires = "headless")]
     pub headless_size: Option<HeadlessSize>,
 
@@ -90,9 +90,19 @@ pub struct Options {
     pub window_options: WindowOptions,
 
     /// Subcommand passed to the CLI.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[clap(subcommand)]
     pub subcommands: Option<Subcommands>,
+
+    /// Internal inherited readiness handle for the Windows headless server.
+    #[cfg(windows)]
+    #[clap(long = "__headless-server-handle", hide = true)]
+    pub headless_server_handle: Option<usize>,
+
+    /// Parent-resolved session name for the Windows headless server.
+    #[cfg(windows)]
+    #[clap(long = "__resolved-session", hide = true)]
+    pub resolved_session: Option<String>,
 }
 
 impl Options {
@@ -107,7 +117,7 @@ impl Options {
 
     /// Override configuration file with options from the CLI.
     pub fn override_config(&mut self, config: &mut UiConfig) {
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         if self.socket.is_some() {
             config.ipc_socket = Some(true);
         }
@@ -149,14 +159,14 @@ impl Options {
 ///
 /// Accepts cells (`120x40`) or physical pixels (`1280x720px`). Cells are the natural unit for a
 /// terminal, but a caller driving screenshots usually wants exact pixels.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum HeadlessSize {
     Cells { columns: u16, lines: u16 },
     Pixels { width: u32, height: u32 },
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 impl std::str::FromStr for HeadlessSize {
     type Err = String;
 
@@ -296,7 +306,7 @@ impl WindowIdentity {
 }
 
 /// Available CLI subcommands.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[derive(Subcommand, Debug)]
 // `Msg` carries the whole message payload while the session verbs carry at most a name. Boxing it
 // would only move the same bytes behind a pointer on a path that runs once per process.
@@ -315,11 +325,43 @@ pub enum Subcommands {
     },
 }
 
+/// Insert internal re-exec flags before `-e`, whose variadic values must remain last.
+#[cfg(windows)]
+pub fn headless_reexec_args(
+    mut arguments: Vec<std::ffi::OsString>,
+    readiness_handle: usize,
+    session: &str,
+) -> Vec<std::ffi::OsString> {
+    use std::ffi::{OsStr, OsString};
+
+    let insertion = arguments
+        .iter()
+        .position(|argument| {
+            if argument == OsStr::new("-e") || argument == OsStr::new("--command") {
+                return true;
+            }
+            let argument = argument.to_string_lossy();
+            argument.starts_with("--command=")
+                || argument.strip_prefix("-e").is_some_and(|value| !value.is_empty())
+        })
+        .unwrap_or(arguments.len());
+    arguments.splice(
+        insertion..insertion,
+        [
+            OsString::from("--__headless-server-handle"),
+            OsString::from(readiness_handle.to_string()),
+            OsString::from("--__resolved-session"),
+            OsString::from(session),
+        ],
+    );
+    arguments
+}
+
 /// Send a message to the Vivido socket.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[derive(Args, Debug)]
 pub struct MessageOptions {
-    /// IPC socket connection path override.
+    /// IPC endpoint override (a filesystem path on Unix, a named-pipe path on Windows).
     #[clap(short, long, value_hint = ValueHint::FilePath)]
     pub socket: Option<PathBuf>,
 
@@ -333,7 +375,7 @@ pub struct MessageOptions {
 }
 
 /// Available socket messages.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[derive(Subcommand, Debug, Clone, PartialEq)]
 pub enum SocketMessage {
     /// Create a new window in the same Vivido process.
@@ -412,7 +454,7 @@ pub struct WindowOptions {
     /// Stable IPC ID assigned to this window.
     ///
     /// When omitted, Vivido uses the platform window ID.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[clap(short = 'w', long = "window-id", value_name = "WINDOW_ID")]
     pub ipc_window_id: Option<u64>,
 
@@ -446,14 +488,14 @@ impl WindowOptions {
     }
 
     /// Add a config override, as if it had been passed with `-o`.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub fn push_override(&mut self, option: impl Into<String>) {
         self.option.push(option.into());
     }
 }
 
 /// Parameters to the `config` IPC subcommand.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[derive(Args, Serialize, Deserialize, Default, Debug, Clone, PartialEq, Eq)]
 pub struct IpcConfig {
     /// Configuration file options [example: 'cursor.style="Beam"'].
@@ -472,7 +514,7 @@ pub struct IpcConfig {
 }
 
 /// Parameters to the `get-config` IPC subcommand.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[derive(Args, Serialize, Deserialize, Default, Debug, Clone, PartialEq, Eq)]
 pub struct IpcGetConfig {
     /// Window ID for the config request.
@@ -483,7 +525,7 @@ pub struct IpcGetConfig {
 }
 
 /// Parameters to the `typing` IPC subcommand.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[derive(Args, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct IpcTyping {
     /// Literal UTF-8 text to write to the terminal PTY.
@@ -497,7 +539,7 @@ pub struct IpcTyping {
     pub window_id: Option<u64>,
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 impl std::fmt::Debug for IpcTyping {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -509,7 +551,7 @@ impl std::fmt::Debug for IpcTyping {
 }
 
 /// Parameters to the `get-text` IPC subcommand.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[derive(Args, Serialize, Deserialize, Default, Debug, Clone, PartialEq, Eq)]
 pub struct IpcGetText {
     /// Number of latest physical terminal rows to return.
@@ -526,7 +568,7 @@ pub struct IpcGetText {
 }
 
 /// Parameters to the `screenshot` IPC subcommand.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[derive(Args, Serialize, Deserialize, Default, Debug, Clone, PartialEq, Eq)]
 pub struct IpcScreenshot {
     /// Window ID for the screenshot.
@@ -537,7 +579,7 @@ pub struct IpcScreenshot {
 }
 
 /// Common target selection for IPC commands.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[derive(Args, Serialize, Deserialize, Default, Debug, Clone, PartialEq, Eq)]
 pub struct IpcTarget {
     /// Window ID. The focused window is used when this is omitted.
@@ -546,7 +588,7 @@ pub struct IpcTarget {
 }
 
 /// Route for injected input.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[derive(ValueEnum, Serialize, Deserialize, Default, Debug, Copy, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum IpcInputRoute {
@@ -558,7 +600,7 @@ pub enum IpcInputRoute {
 }
 
 /// Parameters to the `key` IPC subcommand.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[derive(Args, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct IpcKey {
     /// Unicode scalar or named key (Enter, Escape, ArrowUp, F1, and so on).
@@ -582,7 +624,7 @@ pub struct IpcKey {
 }
 
 /// Parameters to the `paste` IPC subcommand.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[derive(Args, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct IpcPaste {
     /// Literal UTF-8 text to paste.
@@ -597,7 +639,7 @@ pub struct IpcPaste {
     pub target: IpcTarget,
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 impl std::fmt::Debug for IpcPaste {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -610,7 +652,7 @@ impl std::fmt::Debug for IpcPaste {
 }
 
 /// Mouse coordinate and modifier arguments.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[derive(Args, Serialize, Deserialize, Default, Debug, Clone, PartialEq)]
 pub struct IpcMousePosition {
     /// Zero-based terminal cell column.
@@ -642,7 +684,7 @@ pub struct IpcMousePosition {
 }
 
 /// Mouse button accepted by IPC.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[derive(ValueEnum, Serialize, Deserialize, Default, Debug, Copy, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum IpcMouseButton {
@@ -653,7 +695,7 @@ pub enum IpcMouseButton {
 }
 
 /// Mouse arguments requiring a button.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[derive(Args, Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct IpcMouseButtonAction {
     /// Mouse button.
@@ -665,7 +707,7 @@ pub struct IpcMouseButtonAction {
 }
 
 /// Mouse scrolling arguments.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[derive(Args, Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct IpcMouseScroll {
     /// Vertical scroll amount; positive values scroll up.
@@ -681,7 +723,7 @@ pub struct IpcMouseScroll {
 }
 
 /// Available mouse actions.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[derive(Subcommand, Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum IpcMouseAction {
@@ -695,7 +737,7 @@ pub enum IpcMouseAction {
 }
 
 /// Parameters to the `mouse` IPC subcommand.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[derive(Args, Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct IpcMouse {
     #[clap(subcommand)]
@@ -703,7 +745,7 @@ pub struct IpcMouse {
 }
 
 /// Parameters to the `resize` IPC subcommand.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[derive(Args, Serialize, Deserialize, Default, Debug, Clone, PartialEq, Eq)]
 pub struct IpcResize {
     /// Exact terminal grid column count.
@@ -727,7 +769,7 @@ pub struct IpcResize {
 }
 
 /// Explicit Unix signals accepted by IPC.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[derive(ValueEnum, Serialize, Deserialize, Debug, Copy, Clone, PartialEq, Eq)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum IpcSignalName {
@@ -743,7 +785,7 @@ pub enum IpcSignalName {
 }
 
 /// Parameters to the `signal` IPC subcommand.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[derive(Args, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct IpcSignal {
     /// Signal name without a SIG prefix.
@@ -755,7 +797,7 @@ pub struct IpcSignal {
 }
 
 /// Parameters to the `get-grid` IPC subcommand.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[derive(Args, Serialize, Deserialize, Default, Debug, Clone, PartialEq, Eq)]
 pub struct IpcGetGrid {
     /// First signed physical grid line in retained scrollback/live-screen coordinates.
@@ -779,7 +821,7 @@ pub struct IpcGetGrid {
     pub target: IpcTarget,
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn parse_ipc_duration(value: &str) -> Result<u64, String> {
     let value = value.trim();
     let (number, multiplier) = if let Some(number) = value.strip_suffix("ms") {
@@ -804,7 +846,7 @@ fn parse_ipc_duration(value: &str) -> Result<u64, String> {
 }
 
 /// Common timeout for wait commands, represented as milliseconds on the wire.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[derive(Args, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct IpcWaitCommon {
     /// Maximum wait (for example 500ms, 30s, 2m, or 1h).
@@ -816,7 +858,7 @@ pub struct IpcWaitCommon {
 }
 
 /// Text wait parameters.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[derive(Args, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct IpcWaitText {
     pub text: String,
@@ -829,7 +871,7 @@ pub struct IpcWaitText {
 }
 
 /// Output wait parameters.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[derive(Args, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct IpcWaitOutput {
     pub pattern: String,
@@ -844,7 +886,7 @@ pub struct IpcWaitOutput {
 }
 
 /// Screen/frame sequence wait parameters.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[derive(Args, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct IpcWaitSequence {
     #[clap(long)]
@@ -854,7 +896,7 @@ pub struct IpcWaitSequence {
 }
 
 /// Screen stability wait parameters.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[derive(Args, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct IpcWaitStable {
     /// Required period without semantic screen changes.
@@ -867,7 +909,7 @@ pub struct IpcWaitStable {
 }
 
 /// Frame wait parameters.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[derive(Args, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct IpcWaitFrame {
     #[clap(long)]
@@ -877,7 +919,7 @@ pub struct IpcWaitFrame {
 }
 
 /// Available wait conditions.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[derive(Subcommand, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum IpcWaitCondition {
@@ -890,7 +932,7 @@ pub enum IpcWaitCondition {
 }
 
 /// Parameters to the `wait` IPC subcommand.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[derive(Args, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct IpcWait {
     #[clap(subcommand)]
@@ -898,7 +940,7 @@ pub struct IpcWait {
 }
 
 /// Parameters to the `transcript` IPC subcommand.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[derive(Args, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct IpcTranscript {
     /// First retained byte offset. Omit to request the newest bytes.
@@ -918,7 +960,7 @@ pub struct IpcTranscript {
 }
 
 /// Parameters to the `subscribe` IPC subcommand.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[derive(Args, Serialize, Deserialize, Default, Debug, Clone, PartialEq, Eq)]
 pub struct IpcSubscribe {
     /// Window ID. The focused window is used when omitted.
@@ -1102,7 +1144,61 @@ mod tests {
         assert!(class.is_err());
     }
 
-    #[cfg(unix)]
+    #[cfg(windows)]
+    #[test]
+    fn windows_headless_reexec_preserves_fully_populated_options() {
+        let original = [
+            "--headless",
+            "--session",
+            "build",
+            "--headless-size",
+            "1024x768px",
+            "--print-events",
+            "--hold",
+            "--title",
+            "agent",
+            "-o",
+            "window.padding.x=7",
+            "-e",
+            "powershell.exe",
+            "-NoLogo",
+        ];
+        let mut arguments = vec![std::ffi::OsString::from("vivido")];
+        arguments.extend(headless_reexec_args(
+            original.into_iter().map(Into::into).collect(),
+            1234,
+            "build",
+        ));
+        let options = Options::try_parse_from(arguments).unwrap();
+
+        assert!(options.headless);
+        assert_eq!(options.session.as_deref(), Some("build"));
+        assert_eq!(options.headless_size, Some(HeadlessSize::Pixels { width: 1024, height: 768 }));
+        assert!(options.print_events);
+        assert!(options.window_options.terminal_options.hold);
+        assert_eq!(options.window_options.window_identity.title.as_deref(), Some("agent"));
+        assert_eq!(options.window_options.option, ["window.padding.x=7"]);
+        assert_eq!(options.window_options.terminal_options.command, ["powershell.exe", "-NoLogo"]);
+        assert_eq!(options.headless_server_handle, Some(1234));
+        assert_eq!(options.resolved_session.as_deref(), Some("build"));
+        assert!(options.subcommands.is_none());
+
+        let arguments = headless_reexec_args(
+            ["--headless", "--command=powershell.exe", "-NoLogo"]
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+            5678,
+            "attached-command",
+        );
+        let handle_index =
+            arguments.iter().position(|argument| argument == "--__headless-server-handle").unwrap();
+        let command_index =
+            arguments.iter().position(|argument| argument == "--command=powershell.exe").unwrap();
+        assert!(handle_index < command_index, "internal flags must precede an attached command");
+    }
+
+    #[cfg(any(unix, windows))]
     #[test]
     fn parse_typing_message() {
         let options =
@@ -1121,7 +1217,7 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn parse_assigned_window_ids() {
         let options = Options::try_parse_from(["vivido", "--window-id", "1234"]).unwrap();
@@ -1139,7 +1235,7 @@ mod tests {
         assert_eq!(window_options.ipc_window_id, Some(5678));
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn typing_debug_redacts_input() {
         let typing = IpcTyping { text: String::from("secret"), window_id: Some(42) };
@@ -1149,7 +1245,7 @@ mod tests {
         assert!(debug.contains("6 bytes"));
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn parse_capture_messages() {
         let options = Options::try_parse_from([
@@ -1181,14 +1277,14 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn capture_rows_are_bounded() {
         assert!(Options::try_parse_from(["vivido", "msg", "get-text", "--rows", "0"]).is_err());
         assert!(Options::try_parse_from(["vivido", "msg", "get-text", "--rows", "1001"]).is_err());
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn parse_agent_control_and_wait_commands() {
         let options = Options::try_parse_from([
@@ -1241,7 +1337,7 @@ mod tests {
         assert_eq!(wait.common.timeout, 120_000);
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn agent_cli_limits_are_rejected() {
         assert!(
@@ -1257,9 +1353,9 @@ mod tests {
         );
     }
 
-    // The checked-in completion files describe the Unix-only socket and `msg`
-    // surface, so generating them from the reduced Windows CLI is not a valid
-    // snapshot comparison.
+    // clap_complete emits even hidden Windows re-exec options, so the checked-in public shell
+    // completions are generated from Unix where those internal implementation details do not
+    // exist.
     #[cfg(unix)]
     #[test]
     fn completions() {

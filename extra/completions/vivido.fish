@@ -25,7 +25,7 @@ function __fish_vivido_using_subcommand
 end
 
 complete -c vivido -n "__fish_vivido_needs_command" -l config-file -d 'Specify alternative configuration file [default: $XDG_CONFIG_HOME/vivido/vivido.toml]' -r -F
-complete -c vivido -n "__fish_vivido_needs_command" -s s -l socket -d 'Path for IPC socket creation' -r -F
+complete -c vivido -n "__fish_vivido_needs_command" -s s -l socket -d 'Local IPC endpoint (a filesystem path on Unix, a named-pipe path on Windows)' -r -F
 complete -c vivido -n "__fish_vivido_needs_command" -l session -d 'Name of the headless session, for `--target` on `msg` [default: derived from the PID]' -r
 complete -c vivido -n "__fish_vivido_needs_command" -l headless-size -d 'Size of the headless window, as COLUMNSxLINES or WIDTHxHEIGHTpx' -r
 complete -c vivido -n "__fish_vivido_needs_command" -l vivid-target -d 'Present a `desktop-surface-v1` Vivid target instead of the terminal target' -r -f -a "terminal\t'`terminal-surface-v1`: a grid of cells with a text plane and anchors'
@@ -50,7 +50,7 @@ complete -c vivido -n "__fish_vivido_needs_command" -f -a "msg" -d 'Send a messa
 complete -c vivido -n "__fish_vivido_needs_command" -f -a "list" -d 'List running headless sessions'
 complete -c vivido -n "__fish_vivido_needs_command" -f -a "kill-session" -d 'Shut down a headless session'
 complete -c vivido -n "__fish_vivido_needs_command" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
-complete -c vivido -n "__fish_vivido_using_subcommand msg; and not __fish_seen_subcommand_from create-window quit config get-config typing get-text screenshot capabilities key paste mouse resize focus signal list-windows inspect get-grid wait transcript subscribe help" -s s -l socket -d 'IPC socket connection path override' -r -F
+complete -c vivido -n "__fish_vivido_using_subcommand msg; and not __fish_seen_subcommand_from create-window quit config get-config typing get-text screenshot capabilities key paste mouse resize focus signal list-windows inspect get-grid wait transcript subscribe help" -s s -l socket -d 'IPC endpoint override (a filesystem path on Unix, a named-pipe path on Windows)' -r -F
 complete -c vivido -n "__fish_vivido_using_subcommand msg; and not __fish_seen_subcommand_from create-window quit config get-config typing get-text screenshot capabilities key paste mouse resize focus signal list-windows inspect get-grid wait transcript subscribe help" -s t -l target -d 'Name of the headless session to talk to [default: $VIVIDO_SESSION, else the only session]' -r
 complete -c vivido -n "__fish_vivido_using_subcommand msg; and not __fish_seen_subcommand_from create-window quit config get-config typing get-text screenshot capabilities key paste mouse resize focus signal list-windows inspect get-grid wait transcript subscribe help" -s h -l help -d 'Print help'
 complete -c vivido -n "__fish_vivido_using_subcommand msg; and not __fish_seen_subcommand_from create-window quit config get-config typing get-text screenshot capabilities key paste mouse resize focus signal list-windows inspect get-grid wait transcript subscribe help" -f -a "create-window" -d 'Create a new window in the same Vivido process'

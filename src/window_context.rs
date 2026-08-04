@@ -1,14 +1,14 @@
 //! Terminal window context.
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use std::borrow::Cow;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use std::cell::RefCell;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use std::collections::hash_map::DefaultHasher;
 use std::error::Error;
 use std::fs::File;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use std::hash::{Hash, Hasher};
 use std::io::Write;
 use std::mem;
@@ -16,19 +16,19 @@ use std::mem;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::rc::Rc;
 use std::sync::Arc;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use base64::Engine;
 use log::info;
 use serde_json as json;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use serde_json::{Value, json as json_value};
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use winit::dpi::PhysicalPosition;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, TouchPhase};
 use winit::event::{Event as WinitEvent, Modifiers, WindowEvent};
 #[cfg(target_os = "macos")]
@@ -36,29 +36,29 @@ use winit::event_loop::ActiveEventLoop;
 use winit::window::WindowId;
 
 use crate::terminal::event::Event as TerminalEvent;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use crate::terminal::event::Notify;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use crate::terminal::event_loop::EventLoopSendError;
 use crate::terminal::event_loop::{EventLoop as PtyEventLoop, Msg, Notifier};
 use crate::terminal::grid::{Dimensions, Scroll};
 use crate::terminal::index::Direction;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use crate::terminal::index::{Column, Line};
 use crate::terminal::sync::FairMutex;
 use crate::terminal::term::Term;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use crate::terminal::term::TermMode;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use crate::terminal::term::cell::Flags;
 use crate::terminal::term::test::TermSize;
 use crate::terminal::tty;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use crate::terminal::vte::ansi::{Color, NamedColor};
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use crate::automation::{AutomationWindowState, Transcript};
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use crate::cli::{
     IpcKey, IpcMouse, IpcMouseAction, IpcMouseButton, IpcMousePosition, IpcSignalName,
 };
@@ -66,46 +66,46 @@ use crate::cli::{ParsedOptions, VividTarget, WindowOptions};
 use crate::clipboard::Clipboard;
 use crate::config::UiConfig;
 use crate::display::Display;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use crate::display::ScreenshotReadback;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use crate::display::color::{DIM_FACTOR, Rgb};
 use crate::event::{
     ActionContext, Event, EventProxy, EventSink, EventType, LoopHandle, Mouse, SearchState,
     TouchPurpose,
 };
 use crate::input;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use crate::logging::LOG_TARGET_IPC_CONFIG;
 use crate::message_bar::MessageBuffer;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use crate::polling::ipc::{IpcConnection, IpcError};
 use crate::scheduler::{Scheduler, TimerId, Topic};
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use crate::screenshot;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use crate::terminal::thread;
 use crate::vivid::VividService;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use crate::vivid::scene::TrackWaitEvaluation;
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 type AutomationResize = (u32, u32, Option<(u16, u16)>);
 
 const VIVID_RESIZE_SETTLE_DELAY: Duration = Duration::from_millis(120);
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[derive(Default)]
 struct AutomationNotifier(RefCell<Vec<u8>>);
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 impl AutomationNotifier {
     fn into_bytes(self) -> Vec<u8> {
         self.0.into_inner()
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 impl Notify for AutomationNotifier {
     fn notify<B: Into<Cow<'static, [u8]>>>(&self, bytes: B) {
         self.0.borrow_mut().extend_from_slice(bytes.into().as_ref());
@@ -130,33 +130,32 @@ pub struct WindowContext {
     preserve_title: bool,
     #[cfg(not(windows))]
     master_fd: RawFd,
-    #[cfg(not(windows))]
     shell_pid: u32,
     window_config: ParsedOptions,
     config: Rc<UiConfig>,
     vivid_service: VividService,
     vivid_resize_settled: Option<u64>,
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     ipc_window_id: u64,
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     screenshot: Option<PendingScreenshot>,
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     screenshot_busy: bool,
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub automation: AutomationWindowState,
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 struct PendingScreenshot {
     readback: ScreenshotReadback,
     connection: IpcConnection,
     request_id: u64,
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 const SCREENSHOT_POLL_INTERVAL: Duration = Duration::from_millis(5);
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 const SCREENSHOT_READBACK_TIMEOUT: Duration = Duration::from_secs(5);
 
 impl WindowContext {
@@ -218,7 +217,7 @@ impl WindowContext {
         options.terminal_options.override_pty_config(&mut pty_config);
 
         let preserve_title = options.window_identity.title.is_some();
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         let ipc_window_id = options.ipc_window_id.unwrap_or_else(|| display.window.id().into());
 
         info!(
@@ -260,9 +259,9 @@ impl WindowContext {
         // The PTY forks a process to run the shell on the slave side of the
         // pseudoterminal. A file descriptor for the master side is retained for
         // reading/writing to the shell.
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         let terminal_window_id = ipc_window_id;
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         let terminal_window_id = display.window.id().into();
         let pty = tty::new(&pty_config, display.size_info.into(), terminal_window_id)?;
 
@@ -270,6 +269,8 @@ impl WindowContext {
         let master_fd = pty.file().as_raw_fd();
         #[cfg(not(windows))]
         let shell_pid = pty.child().id();
+        #[cfg(windows)]
+        let shell_pid = pty.child_watcher().pid().map_or(0, std::num::NonZeroU32::get);
 
         // Create the pseudoterminal I/O loop.
         //
@@ -277,7 +278,7 @@ impl WindowContext {
         // renderer and input processing. Note that access to the terminal state is
         // synchronized since the I/O loop updates the state, and the display
         // consumes it periodically.
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         let transcript = Arc::new(Mutex::new(Transcript::default()));
         let event_loop = PtyEventLoop::new(
             Arc::clone(&terminal),
@@ -285,7 +286,7 @@ impl WindowContext {
             pty,
             pty_config.drain_on_exit,
             config.debug.ref_test,
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             transcript.clone(),
         )?;
 
@@ -308,7 +309,6 @@ impl WindowContext {
             display,
             #[cfg(not(windows))]
             master_fd,
-            #[cfg(not(windows))]
             shell_pid,
             config,
             notifier: Notifier(loop_tx),
@@ -325,13 +325,13 @@ impl WindowContext {
             dirty: Default::default(),
             vivid_service,
             vivid_resize_settled: None,
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             ipc_window_id,
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             screenshot: None,
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             screenshot_busy: false,
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             automation: AutomationWindowState::new(0, transcript),
         })
     }
@@ -412,13 +412,13 @@ impl WindowContext {
     }
 
     /// Get reference to the window's configuration.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub fn config(&self) -> &UiConfig {
         &self.config
     }
 
     /// Clear the window config overrides.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub fn reset_window_config(&mut self, config: Rc<UiConfig>) {
         // Clear previous window errors.
         self.message_buffer.remove_target(LOG_TARGET_IPC_CONFIG);
@@ -430,7 +430,7 @@ impl WindowContext {
     }
 
     /// Add new window config overrides.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub fn add_window_config(&mut self, config: Rc<UiConfig>, options: &ParsedOptions) {
         // Clear previous window errors.
         self.message_buffer.remove_target(LOG_TARGET_IPC_CONFIG);
@@ -620,19 +620,19 @@ impl WindowContext {
     }
 
     /// Stable external ID used to target this window through IPC.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub fn ipc_window_id(&self) -> u64 {
         self.ipc_window_id
     }
 
     /// Whether this terminal currently has keyboard focus.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub fn is_focused(&self) -> bool {
         self.terminal.lock().is_focused
     }
 
     /// Write bytes and notify the main event loop after the PTY master accepted all of them.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub fn write_to_pty_with_completion(
         &self,
         bytes: Vec<u8>,
@@ -645,7 +645,7 @@ impl WindowContext {
     }
 
     /// Apply the current terminal dimensions to the PTY and report completion.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub fn write_pty_resize_with_completion(
         &self,
         completion: u64,
@@ -657,7 +657,7 @@ impl WindowContext {
     }
 
     /// Capture terminal grid text without styling or display overlays.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub fn text(&self, rows: Option<u16>) -> String {
         let terminal = self.terminal.lock();
         match rows {
@@ -667,7 +667,7 @@ impl WindowContext {
     }
 
     /// Build application-directed paste bytes with the same safety filtering as local paste.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub fn application_paste(&self, text: &str) -> Vec<u8> {
         let bracketed = self.terminal.lock().mode().contains(TermMode::BRACKETED_PASTE);
         if bracketed {
@@ -683,7 +683,7 @@ impl WindowContext {
     }
 
     /// Process paste through search/UI state, returning tagged PTY bytes when it reaches the app.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub fn ui_paste(
         &mut self,
         text: &str,
@@ -712,7 +712,9 @@ impl WindowContext {
                 dirty: &mut self.dirty,
                 occluded: &mut self.occluded,
                 terminal: &mut terminal,
+                #[cfg(not(windows))]
                 master_fd: self.master_fd,
+                #[cfg(not(windows))]
                 shell_pid: self.shell_pid,
                 preserve_title: self.preserve_title,
                 vivid_service: &self.vivid_service,
@@ -730,13 +732,13 @@ impl WindowContext {
     }
 
     /// Active terminal modes used by application key encoding.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub fn terminal_mode(&self) -> TermMode {
         *self.terminal.lock().mode()
     }
 
     /// Process a neutral key through Vivido's normal UI input processor.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub fn ui_key(
         &mut self,
         key: &IpcKey,
@@ -761,7 +763,9 @@ impl WindowContext {
             dirty: &mut self.dirty,
             occluded: &mut self.occluded,
             terminal: &mut terminal,
+            #[cfg(not(windows))]
             master_fd: self.master_fd,
+            #[cfg(not(windows))]
             shell_pid: self.shell_pid,
             preserve_title: self.preserve_title,
             vivid_service: &self.vivid_service,
@@ -783,7 +787,7 @@ impl WindowContext {
     }
 
     /// Process mouse actions through Vivido's normal UI mouse processor.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub fn ui_mouse(
         &mut self,
         mouse: &IpcMouse,
@@ -825,7 +829,9 @@ impl WindowContext {
                 dirty: &mut self.dirty,
                 occluded: &mut self.occluded,
                 terminal: &mut terminal,
+                #[cfg(not(windows))]
                 master_fd: self.master_fd,
+                #[cfg(not(windows))]
                 shell_pid: self.shell_pid,
                 preserve_title: self.preserve_title,
                 vivid_service: &self.vivid_service,
@@ -880,7 +886,7 @@ impl WindowContext {
     }
 
     /// Encode one application mouse action without entering Vivido's UI input path.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub fn application_mouse(&self, mouse: &IpcMouse) -> Result<Vec<u8>, IpcError> {
         let terminal = self.terminal.lock();
         let mode = *terminal.mode();
@@ -1018,7 +1024,7 @@ impl WindowContext {
         Ok(output)
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn mouse_cell(&self, position: &IpcMousePosition) -> Result<(usize, usize), IpcError> {
         let size = self.display.size_info;
         let (column, row) = match (position.cell_column, position.cell_row, position.x, position.y)
@@ -1082,8 +1088,43 @@ impl WindowContext {
         Ok(process_group)
     }
 
+    /// Windows has no POSIX process group. Forceful termination is supported for the ConPTY
+    /// child; console-signal delivery is unavailable because the child is attached to a
+    /// pseudoconsole rather than the caller's console.
+    #[cfg(windows)]
+    pub fn signal_process_group(&self, signal: IpcSignalName) -> Result<i32, IpcError> {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, PROCESS_TERMINATE, TerminateProcess,
+        };
+
+        if !matches!(signal, IpcSignalName::Term | IpcSignalName::Kill) {
+            return Err(IpcError::new(
+                "unsupported",
+                "this signal cannot be delivered through a Windows pseudoconsole",
+            ));
+        }
+        let process = unsafe { OpenProcess(PROCESS_TERMINATE, 0, self.shell_pid) };
+        if process.is_null() {
+            return Err(IpcError::new(
+                "unsupported",
+                format!("failed to open child process: {}", std::io::Error::last_os_error()),
+            ));
+        }
+        let result = unsafe { TerminateProcess(process, 1) };
+        unsafe { CloseHandle(process) };
+        if result == 0 {
+            return Err(IpcError::new(
+                "unsupported",
+                format!("failed to terminate child process: {}", std::io::Error::last_os_error()),
+            ));
+        }
+        i32::try_from(self.shell_pid)
+            .map_err(|_| IpcError::new("invalid_state", "child process ID is out of range"))
+    }
+
     /// Request an exact client-area size.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub fn request_automation_resize(
         &self,
         columns: Option<u16>,
@@ -1138,7 +1179,7 @@ impl WindowContext {
         Ok((width, height, grid))
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub fn automation_size_matches(
         &self,
         columns: Option<u16>,
@@ -1156,13 +1197,13 @@ impl WindowContext {
     }
 
     /// Ask the window system to activate this window.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub fn request_automation_focus(&self) {
         self.display.window.focus_window();
     }
 
     /// Coalesce terminal-model mutations into one semantic screen sequence change.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub fn sync_automation_screen(&mut self) -> Option<(u64, Option<Vec<u16>>)> {
         let terminal = self.terminal.lock();
         let grid = terminal.grid();
@@ -1227,13 +1268,13 @@ impl WindowContext {
     }
 
     /// Summary used by deterministic window discovery.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub fn automation_summary(&self) -> Value {
         let terminal = self.terminal.lock();
         self.automation_summary_with_terminal(&terminal)
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn automation_summary_with_terminal(&self, terminal: &Term<EventProxy>) -> Value {
         let size = self.display.size_info;
         let pixels = self.display.window.inner_size();
@@ -1256,7 +1297,7 @@ impl WindowContext {
     }
 
     /// Detailed, secret-free terminal/window inspection.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub fn automation_inspect(&self, event_sequence: u64) -> Value {
         let terminal = self.terminal.lock();
         let grid = terminal.grid();
@@ -1264,18 +1305,32 @@ impl WindowContext {
         let cursor = grid.cursor.point;
         let selection =
             terminal.selection.as_ref().and_then(|selection| selection.to_range(&terminal));
+        #[cfg(unix)]
         let foreground_pgid = unsafe { libc::tcgetpgrp(self.master_fd) };
+        #[cfg(unix)]
         let foreground_pgid = (foreground_pgid > 0).then_some(foreground_pgid);
+        #[cfg(windows)]
+        let foreground_pgid = None::<i32>;
+        #[cfg(unix)]
         let executable = foreground_pgid.and_then(foreground_executable_basename);
+        #[cfg(windows)]
+        let executable = None::<String>;
+        #[cfg(unix)]
         let current_directory =
             crate::daemon::foreground_process_path(self.master_fd, self.shell_pid)
                 .ok()
                 .map(|path| path.to_string_lossy().into_owned());
+        #[cfg(windows)]
+        let current_directory = None::<String>;
+        #[cfg(unix)]
         let mut attributes = std::mem::MaybeUninit::<libc::termios>::uninit();
+        #[cfg(unix)]
         let echo = unsafe {
             (libc::tcgetattr(self.master_fd, attributes.as_mut_ptr()) == 0)
                 .then(|| attributes.assume_init().c_lflag & libc::ECHO != 0)
         };
+        #[cfg(windows)]
+        let echo = None::<bool>;
 
         json_value!({
             "window": self.automation_summary_with_terminal(&terminal),
@@ -1303,7 +1358,7 @@ impl WindowContext {
         })
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub fn automation_vivid_sessions(&self) -> Value {
         let sessions = self
             .vivid_service
@@ -1319,7 +1374,7 @@ impl WindowContext {
         json_value!({"window_id": self.ipc_window_id, "sessions": sessions})
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub fn automation_vivid_surfaces(&self) -> Value {
         let surfaces = self
             .vivid_service
@@ -1334,7 +1389,7 @@ impl WindowContext {
         json_value!({"window_id": self.ipc_window_id, "surfaces": surfaces})
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub fn automation_vivid_surface(
         &self,
         session_id: u64,
@@ -1354,7 +1409,7 @@ impl WindowContext {
             .ok_or_else(|| IpcError::new("surface_not_found", "Vivid surface does not exist"))
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub fn automation_vivid_tracks(&self) -> Value {
         let tracks = self
             .vivid_service
@@ -1369,7 +1424,7 @@ impl WindowContext {
         json_value!({"window_id": self.ipc_window_id, "tracks": tracks})
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub fn automation_vivid_track(
         &self,
         session_id: u64,
@@ -1391,7 +1446,7 @@ impl WindowContext {
             .ok_or_else(|| IpcError::new("track_not_found", "Vivid track does not exist"))
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub fn automation_vivid_scene(
         &self,
         session_id: u64,
@@ -1437,7 +1492,7 @@ impl WindowContext {
         }))
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[allow(clippy::too_many_arguments)]
     pub fn automation_vivid_wait(
         &self,
@@ -1467,7 +1522,7 @@ impl WindowContext {
     }
 
     /// Structured physical-cell grid snapshot or current-state delta.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub fn automation_grid(
         &self,
         start_line: Option<i32>,
@@ -1641,7 +1696,7 @@ impl WindowContext {
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn cell_style(&self, cell: &crate::terminal::term::cell::Cell) -> Value {
         let mut foreground =
             resolve_color(&self.display.colors, cell.fg, cell.flags, true, &self.config);
@@ -1668,7 +1723,7 @@ impl WindowContext {
     }
 
     /// Start reading back the last successfully presented frame.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub fn request_screenshot(
         &mut self,
         connection: IpcConnection,
@@ -1698,7 +1753,7 @@ impl WindowContext {
     }
 
     /// Poll screenshot readback and move PNG encoding off the event-loop thread.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub fn poll_screenshot(&mut self, scheduler: &mut Scheduler, event_proxy: &EventSink) {
         let Some(pending) = self.screenshot.as_ref() else {
             return;
@@ -1763,13 +1818,13 @@ impl WindowContext {
     }
 
     /// Allow another screenshot after background PNG persistence completes.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub fn complete_screenshot(&mut self) {
         self.screenshot_busy = false;
     }
 
     /// Forget asynchronous work owned by a disconnected IPC client.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub fn cancel_automation_connection(&mut self, connection_id: u64) -> bool {
         self.automation.pending_writes.retain(|pending| pending.connection.id() != connection_id);
         self.automation.waiters.retain(|waiter| waiter.connection.id() != connection_id);
@@ -1784,7 +1839,7 @@ impl WindowContext {
     }
 
     /// Complete every outstanding IPC operation before the window disappears.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub fn fail_automation_requests(&mut self, code: &str, message: &str) {
         for pending in self.automation.pending_writes.drain(..) {
             pending.connection.error(pending.request_id, IpcError::new(code, message));
@@ -1848,7 +1903,7 @@ impl Drop for WindowContext {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn selection_json(selection: crate::terminal::selection::SelectionRange) -> Value {
     json_value!({
         "start": {"line": selection.start.line.0, "column": selection.start.column.0},
@@ -1857,22 +1912,42 @@ fn selection_json(selection: crate::terminal::selection::SelectionRange) -> Valu
     })
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn exit_status_json(status: Option<&std::process::ExitStatus>) -> Value {
-    use std::os::unix::process::ExitStatusExt;
-
     match status {
         Some(status) => json_value!({
             "state": "exited",
             "code": status.code(),
-            "signal": status.signal(),
-            "core_dumped": status.core_dumped(),
+            "signal": exit_signal(status),
+            "core_dumped": exit_core_dumped(status),
         }),
         None => json_value!({"state": "running"}),
     }
 }
 
 #[cfg(unix)]
+fn exit_signal(status: &std::process::ExitStatus) -> Option<i32> {
+    use std::os::unix::process::ExitStatusExt;
+    status.signal()
+}
+
+#[cfg(windows)]
+fn exit_signal(_status: &std::process::ExitStatus) -> Option<i32> {
+    None
+}
+
+#[cfg(unix)]
+fn exit_core_dumped(status: &std::process::ExitStatus) -> bool {
+    use std::os::unix::process::ExitStatusExt;
+    status.core_dumped()
+}
+
+#[cfg(windows)]
+fn exit_core_dumped(_status: &std::process::ExitStatus) -> bool {
+    false
+}
+
+#[cfg(any(unix, windows))]
 fn vivid_surface_status_json(window_id: u64, status: &crate::vivid::scene::SurfaceStatus) -> Value {
     let descriptor = &status.definition.descriptor;
     json_value!({
@@ -1903,7 +1978,7 @@ fn vivid_surface_status_json(window_id: u64, status: &crate::vivid::scene::Surfa
     })
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn vivid_track_status_json(window_id: u64, status: &crate::vivid::scene::TrackStatus) -> Value {
     json_value!({
         "window_id": window_id,
@@ -1937,12 +2012,12 @@ fn vivid_track_status_json(window_id: u64, status: &crate::vivid::scene::TrackSt
     })
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn cbor_map_json(map: &[(u64, vivid_protocol::cbor::Value)]) -> Value {
     Value::Object(map.iter().map(|(key, value)| (key.to_string(), cbor_json(value))).collect())
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn cbor_json(value: &vivid_protocol::cbor::Value) -> Value {
     use vivid_protocol::cbor::Value as Cbor;
     match value {
@@ -1957,7 +2032,7 @@ fn cbor_json(value: &vivid_protocol::cbor::Value) -> Value {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn hex_bytes(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
@@ -1992,7 +2067,7 @@ fn foreground_executable_basename(_pid: libc::pid_t) -> Option<String> {
     None
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn terminal_mode_names(mode: TermMode) -> Vec<&'static str> {
     let modes = [
         (TermMode::SHOW_CURSOR, "show_cursor"),
@@ -2020,7 +2095,7 @@ fn terminal_mode_names(mode: TermMode) -> Vec<&'static str> {
     modes.into_iter().filter_map(|(flag, name)| mode.contains(flag).then_some(name)).collect()
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn resolve_color(
     colors: &crate::display::color::List,
     color: Color,
@@ -2060,7 +2135,7 @@ fn resolve_color(
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn style_attribute_names(flags: Flags) -> Vec<&'static str> {
     let attributes = [
         (Flags::BOLD, "bold"),
@@ -2078,7 +2153,7 @@ fn style_attribute_names(flags: Flags) -> Vec<&'static str> {
     attributes.into_iter().filter_map(|(flag, name)| flags.contains(flag).then_some(name)).collect()
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[derive(Copy, Clone)]
 enum MouseEncodingAction {
     Move,
@@ -2089,7 +2164,7 @@ enum MouseEncodingAction {
     Scroll(f64, f64),
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn mouse_modifier_code(modifiers: &[String]) -> Result<u8, IpcError> {
     let mut code = 0;
     for modifier in modifiers {
@@ -2114,7 +2189,7 @@ fn mouse_modifier_code(modifiers: &[String]) -> Result<u8, IpcError> {
     Ok(code)
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn append_mouse_report(
     output: &mut Vec<u8>,
     mode: TermMode,
@@ -2146,7 +2221,7 @@ fn append_mouse_report(
     Ok(())
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn append_legacy_mouse_coordinate(output: &mut Vec<u8>, coordinate: usize, utf8: bool) {
     let encoded = coordinate + 33;
     if utf8 && coordinate >= 95 {

@@ -7,7 +7,7 @@ use std::fs::File;
 use std::io::{self, ErrorKind, Read, Write};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use std::sync::Mutex;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread::JoinHandle;
@@ -16,7 +16,7 @@ use std::time::Instant;
 use log::error;
 use polling::{Event as PollingEvent, Events, PollMode, Poller};
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use crate::automation::Transcript;
 use crate::terminal::event::{self, Event, EventListener, WindowSize};
 use crate::terminal::sync::FairMutex;
@@ -36,7 +36,7 @@ pub enum Msg {
     /// Data that should be written to the PTY.
     Input {
         bytes: Cow<'static, [u8]>,
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         completion: Option<u64>,
     },
 
@@ -46,7 +46,7 @@ pub enum Msg {
     /// Instruction to resize the PTY.
     Resize {
         window_size: WindowSize,
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         completion: Option<u64>,
     },
 }
@@ -64,7 +64,7 @@ pub struct EventLoop<T: tty::EventedPty, U: EventListener> {
     event_proxy: U,
     drain_on_exit: bool,
     ref_test: bool,
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     transcript: Arc<Mutex<Transcript>>,
 }
 
@@ -80,7 +80,7 @@ where
         pty: T,
         drain_on_exit: bool,
         ref_test: bool,
-        #[cfg(unix)] transcript: Arc<Mutex<Transcript>>,
+        #[cfg(any(unix, windows))] transcript: Arc<Mutex<Transcript>>,
     ) -> io::Result<EventLoop<T, U>> {
         let (tx, rx) = mpsc::channel();
         let poll = Poller::new()?.into();
@@ -93,7 +93,7 @@ where
             event_proxy,
             drain_on_exit,
             ref_test,
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             transcript,
         })
     }
@@ -110,22 +110,22 @@ where
             match msg {
                 Msg::Input {
                     bytes,
-                    #[cfg(unix)]
+                    #[cfg(any(unix, windows))]
                     completion,
                 } => {
                     state.write_list.push_back(PendingInput {
                         bytes,
-                        #[cfg(unix)]
+                        #[cfg(any(unix, windows))]
                         completion,
                     });
                 },
                 Msg::Resize {
                     window_size,
-                    #[cfg(unix)]
+                    #[cfg(any(unix, windows))]
                     completion,
                 } => {
                     self.pty.on_resize(window_size);
-                    #[cfg(unix)]
+                    #[cfg(any(unix, windows))]
                     if let Some(token) = completion {
                         self.event_proxy.send_event(Event::PtyResizeComplete(token));
                     }
@@ -192,10 +192,10 @@ where
             processed += state.advance(
                 &mut **terminal,
                 &buf[..unprocessed],
-                #[cfg(unix)]
+                #[cfg(any(unix, windows))]
                 &self.transcript,
             );
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             if let Some((start, end)) = state.take_output_range() {
                 self.event_proxy.send_event(Event::PtyOutput { start, end });
             }
@@ -229,7 +229,7 @@ where
                     Ok(n) => {
                         current.advance(n);
                         if current.finished() {
-                            #[cfg(unix)]
+                            #[cfg(any(unix, windows))]
                             if let Some(token) = current.completion {
                                 self.event_proxy.send_event(Event::PtyWriteComplete(token));
                             }
@@ -376,13 +376,13 @@ where
 struct Writing {
     source: Cow<'static, [u8]>,
     written: usize,
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     completion: Option<u64>,
 }
 
 struct PendingInput {
     bytes: Cow<'static, [u8]>,
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     completion: Option<u64>,
 }
 
@@ -401,7 +401,7 @@ impl event::Notify for Notifier {
 
         let _ = self.0.send(Msg::Input {
             bytes,
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             completion: None,
         });
     }
@@ -411,7 +411,7 @@ impl event::OnResize for Notifier {
     fn on_resize(&mut self, window_size: WindowSize) {
         let _ = self.0.send(Msg::Resize {
             window_size,
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             completion: None,
         });
     }
@@ -467,7 +467,7 @@ pub struct State {
     writing: Option<Writing>,
     parser: ansi::Processor,
     vivid_markers: VividMarkerScanner,
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     output_range: Option<(u64, u64)>,
 }
 
@@ -476,14 +476,14 @@ impl State {
         &mut self,
         terminal: &mut Term<T>,
         bytes: &[u8],
-        #[cfg(unix)] transcript: &Arc<Mutex<Transcript>>,
+        #[cfg(any(unix, windows))] transcript: &Arc<Mutex<Transcript>>,
     ) -> usize {
         let mut processed = 0;
         for chunk in self.vivid_markers.push(bytes) {
             match chunk {
                 VividChunk::Bytes(bytes) => {
                     processed += bytes.len();
-                    #[cfg(unix)]
+                    #[cfg(any(unix, windows))]
                     {
                         let (start, end) = transcript.lock().unwrap().append(&bytes);
                         self.output_range = Some(match self.output_range {
@@ -504,7 +504,7 @@ impl State {
         processed
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn take_output_range(&mut self) -> Option<(u64, u64)> {
         self.output_range.take()
     }
@@ -645,7 +645,7 @@ impl Writing {
         Writing {
             source: input.bytes,
             written: 0,
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             completion: input.completion,
         }
     }

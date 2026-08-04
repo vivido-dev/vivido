@@ -1,13 +1,13 @@
-//! Versioned, owner-only Unix socket automation protocol.
+//! Versioned, owner-only local automation protocol.
 
 use std::collections::HashSet;
 use std::env;
+#[cfg(unix)]
 use std::ffi::OsStr;
 use std::fmt;
+#[cfg(unix)]
 use std::fs;
 use std::io::{self, BufRead, BufReader, Error as IoError, ErrorKind, Write};
-use std::os::unix::fs::PermissionsExt;
-use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, SyncSender, TrySendError};
@@ -21,6 +21,7 @@ use serde_json::{Value, json};
 
 use crate::cli::{IpcMouseAction, IpcWaitCondition, MessageOptions, Options, SocketMessage};
 use crate::event::{Event, EventSink, EventType};
+use crate::polling::transport::{LocalListener, LocalStream};
 use crate::terminal::thread;
 
 /// Formal Vivido automation protocol version.
@@ -222,7 +223,7 @@ struct ConnectionInner {
     output: SyncSender<OutputFrame>,
     in_flight: Mutex<HashSet<u64>>,
     alive: AtomicBool,
-    shutdown: Mutex<Option<UnixStream>>,
+    shutdown: Mutex<Option<LocalStream>>,
 }
 
 impl fmt::Debug for IpcConnection {
@@ -243,7 +244,7 @@ impl IpcConnection {
     fn close(&self) {
         self.inner.alive.store(false, Ordering::Release);
         if let Some(stream) = self.inner.shutdown.lock().unwrap().take() {
-            let _ = stream.shutdown(std::net::Shutdown::Both);
+            let _ = stream.shutdown();
         }
     }
 
@@ -379,7 +380,7 @@ impl Drop for ConnectionGuard {
 
 /// IPC socket listener.
 pub struct IpcListener {
-    pub socket: UnixListener,
+    pub socket: LocalListener,
     event_proxy: EventSink,
     connection_count: Arc<AtomicUsize>,
     next_connection_id: AtomicU64,
@@ -405,15 +406,8 @@ impl IpcListener {
 
     /// Accept and start one persistent full-duplex IPC session.
     pub fn process_message(&mut self) -> Result<(), IoError> {
-        let (stream, _) = self.socket.accept()?;
-
-        // The 0600 socket mode is the first gate, but it is a property of a path that may have
-        // been created before a hostile umask or replaced under us. The peer's own credentials
-        // are not forgeable, so check them too: this connection can drive a terminal.
-        if let Err(err) = require_peer_owner(&stream) {
-            warn!("Rejected IPC connection: {err}");
-            return Ok(());
-        }
+        // `accept` verifies the peer's process owner in addition to the endpoint ACL/mode.
+        let stream = self.socket.accept()?;
 
         let previous = self.connection_count.fetch_add(1, Ordering::AcqRel);
         if previous >= MAX_CONNECTIONS {
@@ -438,7 +432,7 @@ impl IpcListener {
 }
 
 fn spawn_connection(
-    stream: UnixStream,
+    stream: LocalStream,
     connection_id: u64,
     event_proxy: EventSink,
     guard: ConnectionGuard,
@@ -478,7 +472,7 @@ fn spawn_connection(
         let _ = writer.set_write_timeout(Some(IPC_WRITE_TIMEOUT));
         while let Ok(frame) = output_rx.recv() {
             if writer.write_all(&frame.bytes).and_then(|()| writer.flush()).is_err() {
-                let _ = writer.shutdown(std::net::Shutdown::Both);
+                let _ = writer.shutdown();
                 break;
             }
         }
@@ -496,11 +490,11 @@ fn spawn_connection(
     });
 }
 
-fn configure_connection(stream: &UnixStream) -> io::Result<()> {
+fn configure_connection(stream: &LocalStream) -> io::Result<()> {
     stream.set_nonblocking(false)
 }
 
-fn run_connection(stream: UnixStream, connection: IpcConnection, event_proxy: &EventSink) {
+fn run_connection(stream: LocalStream, connection: IpcConnection, event_proxy: &EventSink) {
     let mut reader = BufReader::new(stream);
     let Some(first) = read_request_frame(&mut reader, &connection) else {
         return;
@@ -662,7 +656,7 @@ fn hello_result() -> Value {
     })
 }
 
-fn send_direct_error(mut stream: UnixStream, id: u64, error: IpcError) {
+fn send_direct_error(mut stream: LocalStream, id: u64, error: IpcError) {
     let response = ResponseEnvelope::error(id, error);
     if let Ok(mut frame) = serde_json::to_vec(&response) {
         frame.push(b'\n');
@@ -671,68 +665,9 @@ fn send_direct_error(mut stream: UnixStream, id: u64, error: IpcError) {
 }
 
 /// Bind and secure the Vivido IPC socket.
-/// Refuse a peer that is not the user running this process.
-///
-/// Checked on both ends: the server will not take orders from another user, and the client will
-/// not hand a command to a socket another user planted where it expected to find ours.
-fn require_peer_owner(stream: &UnixStream) -> io::Result<()> {
-    let peer = peer_uid(stream)?;
-    // SAFETY: geteuid has no preconditions.
-    let owner = unsafe { libc::geteuid() };
-    if peer != owner {
-        return Err(IoError::new(
-            ErrorKind::PermissionDenied,
-            format!("IPC socket peer uid {peer} is not owner uid {owner}"),
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(target_os = "linux")]
-fn peer_uid(stream: &UnixStream) -> io::Result<libc::uid_t> {
-    use std::os::fd::AsRawFd;
-
-    let mut credential = libc::ucred { pid: 0, uid: 0, gid: 0 };
-    let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
-    // SAFETY: `credential` and `length` are valid writable buffers of the size getsockopt is told.
-    let result = unsafe {
-        libc::getsockopt(
-            stream.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_PEERCRED,
-            (&raw mut credential).cast(),
-            &raw mut length,
-        )
-    };
-    if result != 0 {
-        return Err(IoError::last_os_error());
-    }
-    Ok(credential.uid)
-}
-
-#[cfg(not(target_os = "linux"))]
-fn peer_uid(stream: &UnixStream) -> io::Result<libc::uid_t> {
-    use std::os::fd::AsRawFd;
-
-    let mut uid: libc::uid_t = 0;
-    let mut gid: libc::gid_t = 0;
-    // SAFETY: both out-parameters are valid writable locations for getpeereid.
-    let result = unsafe { libc::getpeereid(stream.as_raw_fd(), &raw mut uid, &raw mut gid) };
-    if result != 0 {
-        return Err(IoError::last_os_error());
-    }
-    Ok(uid)
-}
-
-fn bind_socket(path: &Path) -> io::Result<UnixListener> {
-    let socket = UnixListener::bind(path)?;
-    let result = fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-        .and_then(|()| socket.set_nonblocking(true));
-    if let Err(err) = result {
-        drop(socket);
-        let _ = fs::remove_file(path);
-        return Err(err);
-    }
+fn bind_socket(path: &Path) -> io::Result<LocalListener> {
+    let socket = LocalListener::bind(path)?;
+    socket.set_nonblocking(true)?;
     Ok(socket)
 }
 
@@ -772,7 +707,7 @@ pub fn send_message(options: MessageOptions) -> io::Result<()> {
 }
 
 fn send_client_request(
-    stream: &mut UnixStream,
+    stream: &mut LocalStream,
     id: u64,
     method: &str,
     params: Value,
@@ -979,7 +914,7 @@ fn write_json_to<W: Write>(output: &mut W, value: &Value) -> io::Result<()> {
 }
 
 /// Directory for the IPC socket file.
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(unix, not(target_os = "macos")))]
 pub fn socket_dir() -> PathBuf {
     xdg::BaseDirectories::with_prefix("vivido")
         .get_runtime_directory()
@@ -995,15 +930,27 @@ pub fn socket_dir() -> PathBuf {
     env::temp_dir()
 }
 
-/// Find a socket using an override, inherited endpoint, or current display discovery.
-/// Connect, refusing a socket that belongs to another user.
-fn connect_checked(path: &Path) -> io::Result<UnixStream> {
-    let stream = UnixStream::connect(path)?;
-    require_peer_owner(&stream)?;
-    Ok(stream)
+/// Default endpoint for a windowed instance.
+#[cfg(unix)]
+pub fn default_endpoint() -> PathBuf {
+    let mut path = socket_dir();
+    path.push(format!("{}-{}.sock", socket_prefix(), std::process::id()));
+    path
 }
 
-fn find_socket(socket_path: Option<PathBuf>, target: Option<&str>) -> io::Result<UnixStream> {
+/// Default endpoint for a windowed Windows instance.
+#[cfg(windows)]
+pub fn default_endpoint() -> PathBuf {
+    PathBuf::from(format!(r"\\.\pipe\Vivido-{}", std::process::id()))
+}
+
+/// Find a socket using an override, inherited endpoint, or current display discovery.
+/// Connect, refusing a socket that belongs to another user.
+fn connect_checked(path: &Path) -> io::Result<LocalStream> {
+    LocalStream::connect(path)
+}
+
+fn find_socket(socket_path: Option<PathBuf>, target: Option<&str>) -> io::Result<LocalStream> {
     if let Some(socket_path) = socket_path {
         return connect_checked(&socket_path).map_err(|err| {
             IoError::new(err.kind(), format!("invalid socket path {socket_path:?}"))
@@ -1032,7 +979,9 @@ fn find_socket(socket_path: Option<PathBuf>, target: Option<&str>) -> io::Result
         return Ok(socket);
     }
 
+    #[cfg(unix)]
     let mut candidates = Vec::new();
+    #[cfg(unix)]
     for entry in fs::read_dir(socket_dir())?.filter_map(Result::ok) {
         let path = entry.path();
         let prefix = socket_prefix();
@@ -1044,8 +993,11 @@ fn find_socket(socket_path: Option<PathBuf>, target: Option<&str>) -> io::Result
             candidates.push(path);
         }
     }
+    #[cfg(unix)]
     candidates.sort();
+    #[cfg(unix)]
     candidates.reverse();
+    #[cfg(unix)]
     for path in candidates {
         match connect_checked(&path) {
             Ok(socket) => return Ok(socket),
@@ -1060,7 +1012,7 @@ fn find_socket(socket_path: Option<PathBuf>, target: Option<&str>) -> io::Result
 }
 
 /// File prefix matching sockets on the current display server.
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(unix, not(target_os = "macos")))]
 pub fn socket_prefix() -> String {
     let display = env::var("WAYLAND_DISPLAY").or_else(|_| env::var("DISPLAY")).unwrap_or_default();
     format!("Vivido-{}", display.replace('/', "-"))
@@ -1074,10 +1026,13 @@ pub fn socket_prefix() -> String {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    use std::io::Read;
     use std::io::{BufReader, Write};
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+    #[cfg(unix)]
     use std::os::unix::io::AsRawFd;
-    use std::os::unix::net::UnixStream;
 
     use serde_json::json;
 
@@ -1186,7 +1141,7 @@ mod tests {
 
     #[test]
     fn partial_frame_is_read_until_newline() {
-        let (mut client, server) = UnixStream::pair().unwrap();
+        let (mut client, server) = LocalStream::pair().unwrap();
         let writer = std::thread::spawn(move || {
             client.write_all(br#"{"version":1,"id":1,"method":"hello","params":{}"#).unwrap();
             client.write_all(b"}\n").unwrap();
@@ -1208,7 +1163,7 @@ mod tests {
 
     #[test]
     fn rejects_oversized_frame() {
-        let (mut client, server) = UnixStream::pair().unwrap();
+        let (mut client, server) = LocalStream::pair().unwrap();
         let writer = std::thread::spawn(move || {
             client.write_all(&vec![b'x'; MAX_REQUEST_FRAME_BYTES + 1]).unwrap();
         });
@@ -1227,6 +1182,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn socket_is_owner_only() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("vivido.sock");
@@ -1235,8 +1191,9 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn accepted_connections_are_restored_to_blocking_mode() {
-        let (_client, server) = UnixStream::pair().unwrap();
+        let (_client, server) = LocalStream::pair().unwrap();
         server.set_nonblocking(true).unwrap();
         configure_connection(&server).unwrap();
 
@@ -1271,11 +1228,62 @@ mod tests {
 
     /// A connection from this very process is by definition the owner, so it must be accepted.
     #[test]
+    #[cfg(unix)]
     fn the_owner_is_accepted_on_both_ends_of_a_socket() {
-        let (client, server) = UnixStream::pair().expect("socketpair");
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("owner.sock");
+        let listener = LocalListener::bind(&path).expect("bind");
+        let client = std::thread::spawn({
+            let path = path.clone();
+            move || LocalStream::connect(&path).expect("client accepts server owner")
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        let _server = loop {
+            match listener.accept() {
+                Ok(server) => break server,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "owner connection was not accepted"
+                    );
+                    std::thread::yield_now();
+                },
+                Err(error) => panic!("server accepts client owner: {error}"),
+            }
+        };
+        let _client = client.join().unwrap();
+    }
 
-        require_peer_owner(&server).expect("the server must accept its owner");
-        require_peer_owner(&client).expect("the client must accept its owner");
+    /// Owner authentication runs on both pipe ends, and a blocked reader must not stall writes.
+    #[test]
+    #[cfg(windows)]
+    fn the_owner_is_accepted_by_a_full_duplex_named_pipe() {
+        let path = PathBuf::from(format!(r"\\.\pipe\vivido-owner-test-{}", std::process::id()));
+        let listener = LocalListener::bind(&path).expect("bind");
+        let client = std::thread::spawn({
+            let path = path.clone();
+            move || LocalStream::connect(&path).expect("client accepts server owner")
+        });
+        let mut server = listener.accept().expect("server accepts client owner");
+        let mut client = client.join().unwrap();
+
+        let mut server_reader = server.try_clone().unwrap();
+        let mut client_reader = client.try_clone().unwrap();
+        let server_read = std::thread::spawn(move || {
+            let mut bytes = [0; 6];
+            server_reader.read_exact(&mut bytes).unwrap();
+            bytes
+        });
+        let client_read = std::thread::spawn(move || {
+            let mut bytes = [0; 6];
+            client_reader.read_exact(&mut bytes).unwrap();
+            bytes
+        });
+        std::thread::sleep(Duration::from_millis(10));
+        server.write_all(b"server").unwrap();
+        client.write_all(b"client").unwrap();
+        assert_eq!(&server_read.join().unwrap(), b"client");
+        assert_eq!(&client_read.join().unwrap(), b"server");
     }
 
     /// The capability document tells a client whether it reached a windowless instance.
