@@ -56,7 +56,7 @@ use vivid_protocol::revision::{
 use vivid_protocol::scene::SceneNode;
 use vivid_protocol::surface::{DesktopSurfaceParameters, SurfaceDefinition, SurfaceDescriptor};
 use vivid_protocol::track::{
-    ChannelOpenDecision, ChannelOpenState, KindConfiguration, TrackConfiguration,
+    ChannelOpenDecision, ChannelOpenState, KindConfiguration, TrackConfiguration, TrackMode,
 };
 use vivid_protocol::wire::{ConnectionKind, RECORD_OPTIONAL, Record};
 
@@ -91,8 +91,6 @@ const MAX_SESSIONS: usize = 16;
 const MAX_CONNECTIONS: usize = 64;
 const MAX_ACTIVE_ANCHORS: usize = 4096;
 const MAX_SEEN_ANCHORS: usize = 8192;
-const CHANNEL_FLOW_BYTES: u64 = 8 * 1024 * 1024;
-const CHANNEL_FLOW_RECORDS: u64 = 128;
 const CHANNEL_OPEN_DEADLINE_US: u64 = 30_000_000;
 const MAX_SCENE_NODES: usize = 256;
 const MAX_LEASES: usize = 32;
@@ -461,6 +459,34 @@ impl VividService {
     #[cfg(any(unix, windows))]
     pub(crate) fn automation_track_status(&self, identity: TrackIdentity) -> Option<TrackStatus> {
         self.scene.track_status(identity)
+    }
+
+    #[cfg(any(unix, windows))]
+    pub(crate) fn automation_streaming_metrics(&self) -> serde_json::Value {
+        let metrics = self
+            .scene
+            .track_keys()
+            .into_iter()
+            .filter_map(|identity| self.scene.track_status(identity))
+            .fold(scene::TrackMetrics::default(), |mut total, status| {
+                total.decoded_frames =
+                    total.decoded_frames.saturating_add(status.metrics.decoded_frames);
+                total.discarded_late_frames = total
+                    .discarded_late_frames
+                    .saturating_add(status.metrics.discarded_late_frames);
+                total.latency_keyframe_requests = total
+                    .latency_keyframe_requests
+                    .saturating_add(status.metrics.latency_keyframe_requests);
+                total.audio_rebases =
+                    total.audio_rebases.saturating_add(status.metrics.audio_rebases);
+                total
+            });
+        serde_json::json!({
+            "decoded_frames": metrics.decoded_frames,
+            "discarded_late_frames": metrics.discarded_late_frames,
+            "latency_keyframe_requests": metrics.latency_keyframe_requests,
+            "audio_rebases": metrics.audio_rebases,
+        })
     }
 
     #[cfg(any(unix, windows))]
@@ -2300,14 +2326,14 @@ fn handle_track_channel(reader: &mut Reader, shared: &Arc<ServiceShared>) -> io:
         return Err(io::Error::new(ErrorKind::PermissionDenied, "channel authentication failed"));
     }
     let generation = ChannelGeneration::new(open.channel_generation);
-    let maximum_bytes = CHANNEL_FLOW_BYTES.max(u64::from(status.configuration.maximum_record_body));
+    let (maximum_bytes, maximum_records) = live_channel_flow(&status.configuration);
     let acceptance = vec![
         (0, Value::Unsigned(open.context_id)),
         (1, Value::Unsigned(open.surface_id)),
         (2, Value::Unsigned(open.track_id)),
         (3, Value::Unsigned(open.channel_generation)),
         (4, Value::Unsigned(maximum_bytes)),
-        (5, Value::Unsigned(CHANNEL_FLOW_RECORDS)),
+        (5, Value::Unsigned(maximum_records)),
         (6, Value::Unsigned(u64::from(status.configuration.maximum_record_body))),
         (7, Value::Unsigned(status.state.revision.get().saturating_add(1))),
     ];
@@ -2346,7 +2372,7 @@ fn handle_track_channel(reader: &mut Reader, shared: &Arc<ServiceShared>) -> io:
     } else {
         shared
             .scene
-            .accept_channel(identity, generation, maximum_bytes, CHANNEL_FLOW_RECORDS)
+            .accept_channel(identity, generation, maximum_bytes, maximum_records)
             .map_err(io::Error::other)?
     };
     writer.write_record(
@@ -2398,6 +2424,27 @@ fn handle_track_channel(reader: &mut Reader, shared: &Arc<ServiceShared>) -> io:
         let _ = session.writer.write_record(messages::TRACK_LOST, identity.track_id, &body);
     }
     result
+}
+
+/// Keep only one maximum-sized record plus the declared live-latency horizon in the initial
+/// channel allowance. Capacity is returned after each record is processed, so a multi-second
+/// static window only turns transport congestion into stale media that cannot be recalled.
+fn live_channel_flow(configuration: &TrackConfiguration) -> (u64, u64) {
+    let latency_us = configuration.maximum_latency_us.max(1);
+    let latency_bytes = configuration
+        .maximum_encoded_bits_per_second
+        .saturating_mul(latency_us)
+        .div_ceil(8_000_000);
+    let maximum_bytes = u64::from(configuration.maximum_record_body)
+        .saturating_add(latency_bytes)
+        .min(configuration.maximum_inflight_body_bytes)
+        .max(u64::from(configuration.maximum_record_body));
+    let maximum_records = configuration
+        .maximum_records_per_second
+        .saturating_mul(latency_us)
+        .div_ceil(1_000_000)
+        .max(2);
+    (maximum_bytes, maximum_records)
 }
 
 /// Ask the producer for a random-access unit on this channel, media §13.
@@ -2476,6 +2523,8 @@ fn channel_loop(
     let mut byte_bucket = TokenBucket::new(byte_rate, maximum_record_charge);
     let mut record_bucket = TokenBucket::new(configuration.maximum_records_per_second, 1);
     let mut last_rate_update = Instant::now();
+    let mut latency_recovery_epoch = None;
+    let mut expected_audio_pts_us = None;
     loop {
         let record = match reader.read_record(ConnectionKind::Track) {
             Ok(record) => record,
@@ -2673,6 +2722,29 @@ fn channel_loop(
                         record.sequence,
                     )
                     .map_err(io::Error::other)?;
+                let discard_before = if priming_record {
+                    None
+                } else {
+                    shared
+                        .scene
+                        .active_track(identity.surface, scene::SLOT_AUDIO)
+                        .and_then(|audio_identity| {
+                            lock(&shared.audio_outputs).get(&audio_identity).cloned()
+                        })
+                        .and_then(|audio| {
+                            audio.discard_video_before(configuration.maximum_latency_us)
+                        })
+                };
+                let late = discard_before.is_some_and(|deadline| packet.pts_us < deadline);
+                let requested_keyframe = late && latency_recovery_epoch != Some(packet.epoch);
+                if requested_keyframe {
+                    request_keyframe(writer, identity, generation, NEED_KEYFRAME_DECODER_RESET);
+                    latency_recovery_epoch = Some(packet.epoch);
+                } else if random_access
+                    && latency_recovery_epoch.is_some_and(|epoch| packet.epoch > epoch)
+                {
+                    latency_recovery_epoch = None;
+                }
                 let frames = video_decoder
                     .as_mut()
                     .ok_or_else(|| {
@@ -2681,8 +2753,8 @@ fn channel_loop(
                             "VIDEO_PACKET used a non-video track",
                         )
                     })?
-                    .push(packet);
-                let frames = match frames {
+                    .push_discarding_before(packet, discard_before);
+                let (frames, discarded) = match frames {
                     Ok(frames) => frames,
                     Err(error) => {
                         // Media §13 reason 2: the decoder reset, so a key unit in a greater epoch
@@ -2692,6 +2764,12 @@ fn channel_loop(
                         continue;
                     },
                 };
+                if discarded != 0 || requested_keyframe {
+                    shared
+                        .scene
+                        .record_late_video_discard(identity, discarded, requested_keyframe)
+                        .map_err(io::Error::other)?;
+                }
                 for decoded in frames {
                     let (sar_num, sar_den) = match &configuration.kind {
                         KindConfiguration::Video(configuration) => (
@@ -2742,7 +2820,19 @@ fn channel_loop(
                     io::Error::new(ErrorKind::InvalidData, "AUDIO_PACKET used a non-audio track")
                 })?;
                 let mut samples = decoder.push(packet)?;
-                output.observe_audio_pts(packet.pts_us);
+                let discontinuity = expected_audio_pts_us
+                    .is_some_and(|expected: i64| packet.pts_us.abs_diff(expected) > 2_000);
+                if discontinuity && configuration.mode == TrackMode::Live {
+                    output.rebase_live(packet.pts_us);
+                    shared.scene.record_audio_rebase(identity).map_err(io::Error::other)?;
+                } else {
+                    output.observe_audio_pts(packet.pts_us);
+                }
+                expected_audio_pts_us = Some(
+                    packet
+                        .pts_us
+                        .saturating_add(i64::try_from(packet.duration_us).unwrap_or(i64::MAX)),
+                );
                 output.trim_before_start(packet.pts_us, packet.duration_us, &mut samples);
                 output.push(&samples)?;
                 shared.scene.mark_output_ready(identity, generation).map_err(io::Error::other)?;
@@ -3726,6 +3816,38 @@ mod tests {
             descriptor[3].1.as_u64().unwrap(),
             descriptor[6].1.as_bool().unwrap(),
         )
+    }
+
+    #[test]
+    fn live_channel_allowance_matches_the_declared_latency_horizon() {
+        let configuration = TrackConfiguration {
+            context_id: 1,
+            surface_id: 1,
+            track_id: 1,
+            slot: 1,
+            mode: TrackMode::Live,
+            lane: LaneClass::Bulk,
+            maximum_record_body: 4 * 1024 * 1024,
+            maximum_rate_millihertz: 30_000,
+            maximum_encoded_bits_per_second: 8_000_000,
+            maximum_records_per_second: 34,
+            maximum_inflight_body_bytes: 64 * 1024 * 1024,
+            kind: KindConfiguration::Raster(RasterConfiguration {
+                width: 1,
+                height: 1,
+                alpha_mode: scene::ALPHA_STRAIGHT,
+                delta_enabled: false,
+                maximum_delta_operations: 1,
+                zstd_enabled: false,
+            }),
+            target_latency_us: 33_000,
+            maximum_latency_us: 100_000,
+            retained_pixel_charge: 1,
+        };
+
+        let (bytes, records) = live_channel_flow(&configuration);
+        assert_eq!(bytes, 4 * 1024 * 1024 + 100_000);
+        assert_eq!(records, 4);
     }
 
     fn next_target_change(session: &vivid_sdk::Session) -> messages::PayloadMap {

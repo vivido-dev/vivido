@@ -13,7 +13,8 @@ const HELP: &str = r#"Forward the current Vivido window's Vivid endpoint over SS
 Usage: vvssh [SSH_OPTIONS] DESTINATION
 
 vvssh option:
-  --separate-media-transport  Use a second, lifecycle-bound SSH TCP connection for media.
+  --shared-media-transport    Carry media on the interactive SSH TCP connection (legacy mode).
+  --separate-media-transport  Explicitly select the default independent media connection.
 
 All arguments are passed to ssh and DESTINATION must be the final argument. Connection options can
 also be placed in ~/.ssh/config. vvssh opens an interactive remote login shell; remote commands and
@@ -45,7 +46,7 @@ fn run() -> Result<u8, String> {
         println!("vvssh {}", env!("VERSION"));
         return Ok(0);
     }
-    let separate_media = take_separate_media_flag(&mut arguments);
+    let separate_media = take_media_transport_flags(&mut arguments)?;
     validate_arguments(&arguments)?;
 
     let endpoint = env::var("VIVID_ENDPOINT_CONTROL")
@@ -149,17 +150,24 @@ fn run() -> Result<u8, String> {
     Ok(status.code().and_then(|code| u8::try_from(code).ok()).unwrap_or(1))
 }
 
-fn take_separate_media_flag(arguments: &mut Vec<OsString>) -> bool {
-    let mut found = false;
+fn take_media_transport_flags(arguments: &mut Vec<OsString>) -> Result<bool, String> {
+    let mut separate = false;
+    let mut shared = false;
     arguments.retain(|argument| {
         if argument == OsStr::new("--separate-media-transport") {
-            found = true;
+            separate = true;
+            false
+        } else if argument == OsStr::new("--shared-media-transport") {
+            shared = true;
             false
         } else {
             true
         }
     });
-    found
+    if separate && shared {
+        return Err("--separate-media-transport conflicts with --shared-media-transport".into());
+    }
+    Ok(!shared)
 }
 
 fn validate_arguments(arguments: &[OsString]) -> Result<(), String> {
@@ -196,12 +204,15 @@ fn build_ssh_arguments(
     let anchor_transport = " VIVID_ANCHOR_TRANSPORT=conpty";
     #[cfg(not(windows))]
     let anchor_transport = "";
-    let bulk_environment = bulk_socket
+    let media_environment = bulk_socket
         .as_ref()
-        .map(|socket| format!(" VIVID_ENDPOINT_BULK={}", shell_quote(&format!("unix:{socket}"))))
+        .map(|socket| {
+            let endpoint = shell_quote(&format!("unix:{socket}"));
+            format!(" VIVID_ENDPOINT_REALTIME={endpoint} VIVID_ENDPOINT_BULK={endpoint}")
+        })
         .unwrap_or_default();
     let remote_command = format!(
-        "VIVID_ROOT_SECRET=$(cat {}) && rm -f {} && export VIVID_ROOT_SECRET && env VIVID_REMOTE=1{anchor_transport} VIVID_ENDPOINT_CONTROL={}{bulk_environment} \"$SHELL\" -l",
+        "VIVID_ROOT_SECRET=$(cat {}) && rm -f {} && export VIVID_ROOT_SECRET && env VIVID_REMOTE=1{anchor_transport} VIVID_ENDPOINT_CONTROL={}{media_environment} \"$SHELL\" -l",
         shell_quote(&secret_file),
         shell_quote(&secret_file),
         shell_quote(&remote_endpoint),
@@ -395,11 +406,30 @@ mod tests {
         let interactive =
             interactive.iter().map(|argument| argument.to_string_lossy()).collect::<Vec<_>>();
         assert!(interactive.last().unwrap().contains("VIVID_ENDPOINT_BULK="));
+        assert!(interactive.last().unwrap().contains("VIVID_ENDPOINT_REALTIME="));
         let bulk = bulk.unwrap();
         assert!(bulk.iter().any(|argument| argument == "ControlMaster=no"));
         assert!(bulk.iter().any(|argument| argument == "ControlPath=none"));
         assert!(bulk.iter().any(|argument| {
             argument.to_string_lossy().contains(bulk_socket.as_deref().unwrap())
         }));
+    }
+
+    #[test]
+    fn separate_media_is_default_and_shared_transport_is_an_explicit_opt_out() {
+        let mut default = vec![OsString::from("host")];
+        assert!(take_media_transport_flags(&mut default).unwrap());
+        assert_eq!(default, [OsString::from("host")]);
+
+        let mut shared = vec![OsString::from("--shared-media-transport"), OsString::from("host")];
+        assert!(!take_media_transport_flags(&mut shared).unwrap());
+        assert_eq!(shared, [OsString::from("host")]);
+
+        let mut conflicting = vec![
+            OsString::from("--shared-media-transport"),
+            OsString::from("--separate-media-transport"),
+            OsString::from("host"),
+        ];
+        assert!(take_media_transport_flags(&mut conflicting).is_err());
     }
 }

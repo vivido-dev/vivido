@@ -221,9 +221,16 @@ impl Decoder {
         })
     }
 
-    pub fn push(&mut self, packet: ParsedVideoPacket<'_>) -> io::Result<Vec<DecodedFrame>> {
+    /// Decode every access unit needed to preserve reference state, but avoid the expensive
+    /// YUV-to-RGBA conversion and allocation for output that is already outside the live latency
+    /// window.
+    pub fn push_discarding_before(
+        &mut self,
+        packet: ParsedVideoPacket<'_>,
+        discard_before_pts_us: Option<i64>,
+    ) -> io::Result<(Vec<DecodedFrame>, u64)> {
         if packet.data.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), 0));
         }
         let size = c_int::try_from(packet.data.len())
             .map_err(|_| invalid("encoded packet exceeds FFmpeg i32 size"))?;
@@ -247,7 +254,7 @@ impl Decoder {
         let send_result = unsafe { avcodec_send_packet(self.context, self.packet) };
         unsafe { av_packet_unref(self.packet) };
         check_ffmpeg("decoder rejected encoded packet", send_result)?;
-        self.receive_frames(false)
+        self.receive_frames(false, discard_before_pts_us)
     }
 
     pub fn finish(&mut self) -> io::Result<Vec<DecodedFrame>> {
@@ -255,24 +262,34 @@ impl Decoder {
         if result < 0 && result != AVERROR_EOF {
             return Err(ffmpeg_error("could not drain decoder", result));
         }
-        self.receive_frames(true)
+        self.receive_frames(true, None).map(|(frames, _)| frames)
     }
 
-    fn receive_frames(&mut self, draining: bool) -> io::Result<Vec<DecodedFrame>> {
+    fn receive_frames(
+        &mut self,
+        draining: bool,
+        discard_before_pts_us: Option<i64>,
+    ) -> io::Result<(Vec<DecodedFrame>, u64)> {
         let mut output = Vec::new();
+        let mut discarded = 0_u64;
         loop {
             let result = unsafe { avcodec_receive_frame(self.context, self.frame) };
             if result == -libc::EAGAIN || result == AVERROR_EOF {
                 break;
             }
             check_ffmpeg("could not receive decoded frame", result)?;
-            output.push(self.convert_frame()?);
+            let pts_us = unsafe { (*(self.frame as *const AVFramePrefix)).pts };
+            if decoded_frame_is_late(pts_us, discard_before_pts_us) {
+                discarded = discarded.saturating_add(1);
+            } else {
+                output.push(self.convert_frame()?);
+            }
             unsafe { av_frame_unref(self.frame) };
         }
         if draining && output.is_empty() {
             log::debug!("Vivid decoder drained without an additional frame");
         }
-        Ok(output)
+        Ok((output, discarded))
     }
 
     fn convert_frame(&mut self) -> io::Result<DecodedFrame> {
@@ -362,6 +379,10 @@ impl Decoder {
         })?;
         Ok(time_base)
     }
+}
+
+fn decoded_frame_is_late(pts_us: i64, discard_before_pts_us: Option<i64>) -> bool {
+    discard_before_pts_us.is_some_and(|deadline| pts_us < deadline)
 }
 
 impl Drop for Decoder {
@@ -514,6 +535,13 @@ mod tests {
     }
 
     #[test]
+    fn live_discard_deadline_keeps_the_boundary_and_drops_only_older_frames() {
+        assert!(decoded_frame_is_late(99_999, Some(100_000)));
+        assert!(!decoded_frame_is_late(100_000, Some(100_000)));
+        assert!(!decoded_frame_is_late(0, None));
+    }
+
+    #[test]
     #[cfg(windows)]
     fn windows_decodes_av1_with_software_decoder() {
         // Canonical sequence-header OBU and first temporal unit from medias/under_attack.webm.
@@ -529,18 +557,22 @@ mod tests {
             0x87, 0x13, 0x6f, 0xca, 0xa7, 0x25, 0x3f, 0x80,
         ];
         let mut decoder = Decoder::new(&video_config("av1", extradata.to_vec())).unwrap();
-        let frames = decoder
-            .push(ParsedVideoPacket {
-                epoch: 1,
-                flags: vivid_protocol::media::VIDEO_PACKET_KEY,
-                packet_id: 1,
-                pts_us: 0,
-                dts_us: 0,
-                duration_us: 40_000,
-                side_data: &[],
-                data: &access_unit,
-            })
+        let (frames, discarded) = decoder
+            .push_discarding_before(
+                ParsedVideoPacket {
+                    epoch: 1,
+                    flags: vivid_protocol::media::VIDEO_PACKET_KEY,
+                    packet_id: 1,
+                    pts_us: 0,
+                    dts_us: 0,
+                    duration_us: 40_000,
+                    side_data: &[],
+                    data: &access_unit,
+                },
+                None,
+            )
             .unwrap();
+        assert_eq!(discarded, 0);
         assert_eq!(frames.len(), 1);
         assert_eq!((frames[0].width, frames[0].height), (640, 480));
     }

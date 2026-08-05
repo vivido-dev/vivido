@@ -1349,6 +1349,7 @@ impl WindowContext {
             "echo": echo,
             "exit_status": exit_status_json(self.automation.exit_status.as_ref()),
             "event_sequence": event_sequence,
+            "vivid_streaming": self.vivid_service.automation_streaming_metrics(),
             "limits": {
                 "transcript_bytes": crate::automation::TRANSCRIPT_CAPACITY,
                 "screen_history": crate::automation::SCREEN_HISTORY_COUNT,
@@ -2004,6 +2005,12 @@ fn vivid_track_status_json(window_id: u64, status: &crate::vivid::scene::TrackSt
             "cumulative_media_records": status.state.flow.sent_media_records,
             "maximum_body_bytes": status.maximum_channel_bytes,
             "maximum_media_records": status.maximum_channel_records,
+        },
+        "streaming": {
+            "decoded_frames": status.metrics.decoded_frames,
+            "discarded_late_frames": status.metrics.discarded_late_frames,
+            "latency_keyframe_requests": status.metrics.latency_keyframe_requests,
+            "audio_rebases": status.metrics.audio_rebases,
         },
         "playback": {
             "state": if status.configuration.mode as u64 == 2 { "timed" } else { "live" },

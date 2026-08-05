@@ -94,6 +94,15 @@ pub struct TrackStatus {
     pub last_media_record_sequence: u64,
     pub maximum_channel_bytes: u64,
     pub maximum_channel_records: u64,
+    pub metrics: TrackMetrics,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TrackMetrics {
+    pub decoded_frames: u64,
+    pub discarded_late_frames: u64,
+    pub latency_keyframe_requests: u64,
+    pub audio_rebases: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -188,6 +197,7 @@ struct Track {
     maximum_channel_bytes: u64,
     maximum_channel_records: u64,
     playback: Option<PlaybackClock>,
+    metrics: TrackMetrics,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -775,6 +785,7 @@ impl SharedScene {
             maximum_channel_bytes: 0,
             maximum_channel_records: 0,
             playback: None,
+            metrics: TrackMetrics::default(),
         };
         let status = track_status(identity, &track);
         state.tracks.insert(identity, track);
@@ -1044,11 +1055,36 @@ impl SharedScene {
             return Err("stale channel generation");
         }
         track.last_decoded_pts_us = Some(frame.pts_us);
+        track.metrics.decoded_frames = track.metrics.decoded_frames.saturating_add(1);
         track.frame = Some(Arc::new(frame));
         track.state.milestones |= MILESTONE_OUTPUT_READY;
         track.state.revision =
             track.state.revision.advance().map_err(|_| "track revision exhausted")?;
         self.0.changed.notify_all();
+        Ok(())
+    }
+
+    pub fn record_late_video_discard(
+        &self,
+        identity: TrackIdentity,
+        frames: u64,
+        requested_keyframe: bool,
+    ) -> Result<(), &'static str> {
+        let mut state = self.lock();
+        let track = state.tracks.get_mut(&identity).ok_or("track does not exist")?;
+        track.metrics.discarded_late_frames =
+            track.metrics.discarded_late_frames.saturating_add(frames);
+        if requested_keyframe {
+            track.metrics.latency_keyframe_requests =
+                track.metrics.latency_keyframe_requests.saturating_add(1);
+        }
+        Ok(())
+    }
+
+    pub fn record_audio_rebase(&self, identity: TrackIdentity) -> Result<(), &'static str> {
+        let mut state = self.lock();
+        let track = state.tracks.get_mut(&identity).ok_or("track does not exist")?;
+        track.metrics.audio_rebases = track.metrics.audio_rebases.saturating_add(1);
         Ok(())
     }
 
@@ -1899,6 +1935,7 @@ fn track_status(identity: TrackIdentity, track: &Track) -> TrackStatus {
         last_media_record_sequence: track.last_media_record_sequence,
         maximum_channel_bytes: track.maximum_channel_bytes,
         maximum_channel_records: track.maximum_channel_records,
+        metrics: track.metrics,
     }
 }
 
@@ -1961,6 +1998,61 @@ mod tests {
         scene.destroy_surface(first_surface).unwrap();
         assert!(scene.surface_status(first_surface).is_none());
         assert!(scene.surface_status(second_surface).is_some());
+    }
+
+    #[test]
+    fn latency_recovery_metrics_are_isolated_for_reused_track_ids() {
+        let scene = SharedScene::for_test();
+        let first = session(2, 1);
+        let second = session(2, 2);
+        scene.register_session(first, TargetGeneration::ONE).unwrap();
+        scene.register_session(second, TargetGeneration::ONE).unwrap();
+        let first_surface = first.context(1).unwrap().surface(1).unwrap();
+        let second_surface = second.context(1).unwrap().surface(1).unwrap();
+        scene.create_surface(first_surface, definition(1, 1)).unwrap();
+        scene.create_surface(second_surface, definition(1, 1)).unwrap();
+        let configuration = |track_id| TrackConfiguration {
+            context_id: 1,
+            surface_id: 1,
+            track_id,
+            slot: SLOT_RASTER,
+            mode: TrackMode::Live,
+            lane: LaneClass::Bulk,
+            maximum_record_body: 128,
+            maximum_rate_millihertz: 1_000,
+            maximum_encoded_bits_per_second: 8_192,
+            maximum_records_per_second: 1,
+            maximum_inflight_body_bytes: 1_024,
+            kind: KindConfiguration::Raster(RasterConfiguration {
+                width: 1,
+                height: 1,
+                alpha_mode: ALPHA_STRAIGHT,
+                delta_enabled: false,
+                maximum_delta_operations: 1,
+                zstd_enabled: false,
+            }),
+            target_latency_us: 0,
+            maximum_latency_us: 100_000,
+            retained_pixel_charge: 1,
+        };
+        let first_track = first_surface.track(7).unwrap();
+        let second_track = second_surface.track(7).unwrap();
+        scene.create_track(first_track, configuration(7)).unwrap();
+        scene.create_track(second_track, configuration(7)).unwrap();
+
+        scene.record_late_video_discard(first_track, 3, true).unwrap();
+        scene.record_audio_rebase(first_track).unwrap();
+
+        assert_eq!(
+            scene.track_status(first_track).unwrap().metrics,
+            TrackMetrics {
+                discarded_late_frames: 3,
+                latency_keyframe_requests: 1,
+                audio_rebases: 1,
+                ..TrackMetrics::default()
+            }
+        );
+        assert_eq!(scene.track_status(second_track).unwrap().metrics, TrackMetrics::default());
     }
 
     #[test]

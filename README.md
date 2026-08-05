@@ -90,17 +90,18 @@ Plain SSH does not forward the per-window Vivid media endpoint. Use the bundled 
 display remote images or video with Vivi; see
 [Running Vivi over SSH from Vivido](../docs/vivi-over-ssh.md).
 
-By default, `vvssh user@host` carries control and media over one private SSH transport. For an
-independent media path, use:
+By default, `vvssh user@host` keeps media on an independent lifecycle-bound SSH transport so video
+backpressure cannot stall the terminal and control connection. To restore the legacy shared path
+for diagnosis, use:
 
 ```sh
-vvssh --separate-media-transport user@host
+vvssh --shared-media-transport user@host
 ```
 
-The opt-in helper creates a distinct lifecycle-bound SSH TCP connection and private remote socket,
-exports it as `VIVID_ENDPOINT_BULK`, avoids OpenSSH control-master reuse for that helper, and cleans
-up the process and socket with the main session. `VIVID_ROOT_SECRET` travels only through the
-protected temporary-file setup channel, never in command arguments or logs.
+The media helper exports its private socket as both `VIVID_ENDPOINT_REALTIME` and
+`VIVID_ENDPOINT_BULK`, avoids OpenSSH control-master reuse, and is cleaned up with the main
+session. `VIVID_ROOT_SECRET` travels only through the protected temporary-file setup channel,
+never in command arguments or logs.
 
 The 1.1 wire protocol and the version-1 automation interface are intentionally not supported. See
 the [Vivido 1.1 to 1.5 migration guide](../docs/vivido-protocol-1.1-to-1.5-migration.md).

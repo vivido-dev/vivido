@@ -477,8 +477,9 @@ What you interact with instead is the environment Vivido sets for programs it la
   pass as a command argument, or commit it. Treat it like a password.
 - `VIVID_ENDPOINT_REALTIME` — optional realtime-track discovery. If absent, producers use the
   bulk endpoint and then the control endpoint according to the 1.5 fallback order.
-- `VIVID_ENDPOINT_BULK` — an optional separate media transport advertised by `vvssh` for remote
-  sessions. It is transport discovery only; control always stays on `VIVID_ENDPOINT_CONTROL`.
+- `VIVID_ENDPOINT_BULK` — the separate media transport advertised by default by `vvssh` for remote
+  sessions. The same private media socket is also exported as `VIVID_ENDPOINT_REALTIME`; control
+  always stays on `VIVID_ENDPOINT_CONTROL`. `vvssh --shared-media-transport` is the legacy opt-out.
 
 For remote display, use the bundled `vvssh` wrapper rather than plain `ssh`, which does not forward
 the media endpoint. See `docs/vivi-over-ssh.md`.

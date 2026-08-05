@@ -18,7 +18,7 @@ const AV_INPUT_BUFFER_PADDING_SIZE: usize = 64;
 const AV_SAMPLE_FMT_FLT: c_int = 3;
 const AVERROR_EOF: c_int = -541_478_725;
 const PACKET_TIME_BASE: AVRational = AVRational { num: 1, den: 1_000_000 };
-const RING_BUFFER_SECONDS: usize = 2;
+const RING_BUFFER_MILLISECONDS: usize = 250;
 const PREBUFFER_MILLISECONDS: u64 = 100;
 const LINKED_AUDIO_STALL_FALLBACK: Duration = Duration::from_secs(2);
 const UNSET_PTS: i64 = i64::MIN;
@@ -184,7 +184,9 @@ impl AudioOutput {
             error: Mutex::new(None),
         });
         let ring = HeapRb::<f32>::new(
-            (config.sample_rate as usize * config.channels as usize * RING_BUFFER_SECONDS).max(1),
+            (config.sample_rate as usize * config.channels as usize * RING_BUFFER_MILLISECONDS
+                / 1_000)
+                .max(1),
         );
         let (producer, consumer) = ring.split();
         let stream = match format {
@@ -394,6 +396,35 @@ impl AudioOutput {
                     self.sample_rate,
                     self.channels,
                 )
+    }
+
+    /// Oldest video PTS worth converting for a linked live stream. Frames before this threshold
+    /// are still decoded as references, but their pixels need not be allocated or uploaded.
+    pub fn discard_video_before(&self, maximum_latency_us: u64) -> Option<i64> {
+        if !self.shared.enabled.load(Ordering::SeqCst)
+            || !self.shared.prebuffered.load(Ordering::SeqCst)
+        {
+            return None;
+        }
+        let origin = self.shared.timeline_origin_us.load(Ordering::SeqCst);
+        (origin != UNSET_PTS).then(|| {
+            rendered_pts_us(
+                origin,
+                self.shared.rendered_samples.load(Ordering::SeqCst),
+                self.sample_rate,
+                self.channels,
+            )
+            .saturating_sub(i64::try_from(maximum_latency_us).unwrap_or(i64::MAX))
+        })
+    }
+
+    /// Drop queued device samples and restart a live timeline at the next packet after an encoded
+    /// packet gap. Continuing the old clock would make freshly received audio sound late while
+    /// video follows the packet PTS and moves ahead.
+    pub fn rebase_live(&self, pts_us: i64) {
+        self.flush();
+        self.observe_audio_pts(pts_us);
+        self.start();
     }
 
     pub fn video_gate_stalled(&self) -> bool {
@@ -1076,6 +1107,33 @@ mod tests {
         assert_eq!(rendered_pts_us(20_000, 48_000 * 2, 48_000, 2), 1_020_000);
         assert_eq!(leading_silence_sample_count(0, 100_000, 48_000, 2), 9_600);
         assert_eq!(leading_silence_sample_count(100_000, 0, 48_000, 2), 0);
+    }
+
+    #[test]
+    fn live_video_discard_threshold_tracks_rendered_audio() {
+        let output = AudioOutput::test_output();
+        output.observe_audio_pts(1_000_000);
+        output.start();
+        output.shared.prebuffered.store(true, Ordering::SeqCst);
+        output.shared.rendered_samples.store(48_000 * 2, Ordering::SeqCst);
+
+        assert_eq!(output.discard_video_before(100_000), Some(1_900_000));
+    }
+
+    #[test]
+    fn live_rebase_discards_old_samples_and_restarts_the_clock() {
+        let output = AudioOutput::test_output();
+        output.observe_audio_pts(1_000_000);
+        output.start();
+        output.shared.queued_samples.store(960, Ordering::SeqCst);
+        output.shared.played_samples.store(480, Ordering::SeqCst);
+
+        output.rebase_live(2_000_000);
+
+        assert!(output.shared.enabled.load(Ordering::SeqCst));
+        assert_eq!(output.shared.timeline_origin_us.load(Ordering::SeqCst), 2_000_000);
+        assert_eq!(output.shared.discard_samples.load(Ordering::SeqCst), 480);
+        assert!(!output.shared.prebuffered.load(Ordering::SeqCst));
     }
 
     #[test]
