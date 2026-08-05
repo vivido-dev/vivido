@@ -18,7 +18,9 @@ const AV_INPUT_BUFFER_PADDING_SIZE: usize = 64;
 const AV_SAMPLE_FMT_FLT: c_int = 3;
 const AVERROR_EOF: c_int = -541_478_725;
 const PACKET_TIME_BASE: AVRational = AVRational { num: 1, den: 1_000_000 };
-const RING_BUFFER_MILLISECONDS: usize = 250;
+// Remote audio commonly arrives in bursts after SSH scheduling or network jitter. Keep a bounded
+// reserve large enough to bridge those stalls; linked video is discarded when it falls behind.
+const RING_BUFFER_SECONDS: usize = 2;
 const PREBUFFER_MILLISECONDS: u64 = 100;
 const LINKED_AUDIO_STALL_FALLBACK: Duration = Duration::from_secs(2);
 const UNSET_PTS: i64 = i64::MIN;
@@ -184,9 +186,7 @@ impl AudioOutput {
             error: Mutex::new(None),
         });
         let ring = HeapRb::<f32>::new(
-            (config.sample_rate as usize * config.channels as usize * RING_BUFFER_MILLISECONDS
-                / 1_000)
-                .max(1),
+            (config.sample_rate as usize * config.channels as usize * RING_BUFFER_SECONDS).max(1),
         );
         let (producer, consumer) = ring.split();
         let stream = match format {

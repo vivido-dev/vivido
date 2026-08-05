@@ -91,6 +91,9 @@ const MAX_SESSIONS: usize = 16;
 const MAX_CONNECTIONS: usize = 64;
 const MAX_ACTIVE_ANCHORS: usize = 4096;
 const MAX_SEEN_ANCHORS: usize = 8192;
+// Audio continuity takes precedence over live video freshness. This remains finite while covering
+// ordinary SSH scheduling stalls; the producer drops video when its audio reserve begins filling.
+const LIVE_AUDIO_FLOW_RESERVE_US: u64 = 2_000_000;
 const CHANNEL_OPEN_DEADLINE_US: u64 = 30_000_000;
 const MAX_SCENE_NODES: usize = 256;
 const MAX_LEASES: usize = 32;
@@ -2426,11 +2429,17 @@ fn handle_track_channel(reader: &mut Reader, shared: &Arc<ServiceShared>) -> io:
     result
 }
 
-/// Keep only one maximum-sized record plus the declared live-latency horizon in the initial
-/// channel allowance. Capacity is returned after each record is processed, so a multi-second
-/// static window only turns transport congestion into stale media that cannot be recalled.
+/// Keep video flow within its declared live-latency horizon, but reserve two seconds for live
+/// audio. Audio is low bandwidth and cannot be reconstructed after a producer-side drop, while
+/// stale video can be discarded and recovered at a fresh keyframe.
 fn live_channel_flow(configuration: &TrackConfiguration) -> (u64, u64) {
-    let latency_us = configuration.maximum_latency_us.max(1);
+    let latency_us = if configuration.mode == TrackMode::Live
+        && matches!(&configuration.kind, KindConfiguration::Audio(_))
+    {
+        LIVE_AUDIO_FLOW_RESERVE_US
+    } else {
+        configuration.maximum_latency_us.max(1)
+    };
     let latency_bytes = configuration
         .maximum_encoded_bits_per_second
         .saturating_mul(latency_us)
@@ -3848,6 +3857,36 @@ mod tests {
         let (bytes, records) = live_channel_flow(&configuration);
         assert_eq!(bytes, 4 * 1024 * 1024 + 100_000);
         assert_eq!(records, 4);
+
+        let audio = TrackConfiguration {
+            context_id: 1,
+            surface_id: 1,
+            track_id: 2,
+            slot: scene::SLOT_AUDIO,
+            mode: TrackMode::Live,
+            lane: LaneClass::Realtime,
+            maximum_record_body: 4_096,
+            maximum_rate_millihertz: 50_000,
+            maximum_encoded_bits_per_second: 128_000,
+            maximum_records_per_second: 100,
+            maximum_inflight_body_bytes: 1 << 20,
+            kind: KindConfiguration::Audio(vivid_protocol::track::AudioConfiguration {
+                codec: "opus".into(),
+                packetization: "opus-packet-v1".into(),
+                extradata: vec![],
+                sample_rate: 48_000,
+                channels: 2,
+                channel_mask: 3,
+                maximum_access_unit_bytes: 4_048,
+                codec_string: Some("opus".into()),
+            }),
+            target_latency_us: 33_000,
+            maximum_latency_us: 100_000,
+            retained_pixel_charge: 0,
+        };
+        let (bytes, records) = live_channel_flow(&audio);
+        assert_eq!(bytes, 36_096);
+        assert_eq!(records, 200);
     }
 
     fn next_target_change(session: &vivid_sdk::Session) -> messages::PayloadMap {
