@@ -6,11 +6,22 @@ Linux uses Wayland exclusively.
 
 ## Vivid Protocol
 
-Vivido accepts Vivid Protocol 1.5 only. It is a `terminal-surface-v1` presentation target and
-implements core control, generic and terminal content surfaces, immutable live/timed media tracks,
-observability, authenticated track channels, absolute flow limits, and marker-v3 anchors. Desktop,
-canvas, input, web-carrier, multiplexed-carrier, and auxiliary-slot profiles are rejected.
-Transcript-bound root authentication is verified before session resources are created.
+Vivido accepts Vivid Protocol 1.5 only. A window presents exactly one presentation target for its
+lifetime, chosen with `--vivid-target`:
+
+- `terminal` (default) is `terminal-surface-v1`: a grid of cells with a text plane and anchors. It
+  negotiates `vivid-core-control-v1`, `live-media-v1`, `timed-media-v1`, `observability-v1`, and
+  `web-carrier-v1`.
+- `desktop` is `desktop-surface-v1`: a virtual desktop in logical pixels, with no grid, no anchors,
+  and no shell. It negotiates the same set plus `desktop-input-v1`, and rejects
+  `terminal-content-v1` surfaces.
+
+Across both targets Vivido implements core control, generic/terminal/desktop content surfaces,
+immutable live and timed media tracks, observability, authenticated track channels, absolute flow
+limits, marker-v3 anchors, session leases with activation-retry and suspend/resume, and the
+authenticated interactive lane that carries desktop input independently of bulk media flow.
+Canvas, multiplexed-carrier, and auxiliary-slot profiles are rejected. Transcript-bound root
+authentication is verified before session resources are created.
 
 Portable video includes H.264/HEVC Annex B, VP9 frames, and AV1 low-overhead temporal units.
 Portable audio includes MP3, AAC, ALAC, PCM, Opus, Vorbis, and FLAC. Opus, Vorbis, and FLAC require
@@ -46,11 +57,28 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 ## Agent automation
 
-On Unix, `vivido msg` exposes the version-2 owner-only IPC service for terminal input, window and
-process control, deterministic discovery, structured grid snapshots, state waits, screenshots,
-sanitized PTY transcripts, and replayable event subscriptions. Start with
-`vivido msg capabilities` and `vivido msg list-windows`. The complete CLI and JSON wire contract is
-documented in [Agent automation IPC](docs/ipc.md).
+`vivido msg` exposes the version-2 owner-only IPC service on Linux, macOS, and Windows: terminal
+input, window and process control, deterministic discovery, structured grid snapshots, state waits,
+screenshots, sanitized PTY transcripts, Vivid 1.5 session/surface/track inspection, and replayable
+event subscriptions. Start with `vivido msg capabilities` and `vivido msg list-windows`. The
+complete CLI and JSON wire contract is documented in [Agent automation IPC](docs/ipc.md).
+
+## Headless sessions
+
+`vivido --headless` runs the whole runtime — terminal, Vivid presenter, and GPU renderer — with no
+window and no compositor, serving IPC in the background:
+
+```sh
+eval "$(vivido --headless --session build)"
+vivido msg get-text
+vivido msg screenshot
+vivido kill-session --target build
+```
+
+Sessions are named (`--session`), discoverable (`vivido list`), addressable (`vivido msg --target`),
+and safe against PID recycling. `--foreground` keeps the instance attached to the calling terminal,
+and `--headless-size` fixes the geometry in cells or pixels. See
+[Headless Vivido and named sessions](docs/headless.md).
 
 ## Compatibility
 
@@ -74,8 +102,8 @@ exports it as `VIVID_ENDPOINT_BULK`, avoids OpenSSH control-master reuse for tha
 up the process and socket with the main session. `VIVID_ROOT_SECRET` travels only through the
 protected temporary-file setup channel, never in command arguments or logs.
 
-The 1.1 wire protocol and automation interface are intentionally not supported. See the
-[Vivido 1.1 to 1.5 migration guide](docs/vivid-1.1-to-1.5-migration.md).
+The 1.1 wire protocol and the version-1 automation interface are intentionally not supported. See
+the [Vivido 1.1 to 1.5 migration guide](../docs/vivido-protocol-1.1-to-1.5-migration.md).
 
 ## Deliberate differences from Alacritty
 

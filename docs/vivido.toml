@@ -24,7 +24,9 @@ import = []
 # Reapply the config automatically when the file changes.
 live_config_reload = true
 
-# Offer IPC over a Unix socket (`vivido msg …`). Unix only; ignored on Windows.
+# Offer the automation IPC endpoint (`vivido msg …`): an owner-only Unix socket on Linux/macOS,
+# an owner-only named pipe on Windows. `--socket` and `--headless` turn it on regardless, since a
+# headless session exists to serve it.
 ipc_socket = true
 
 # ─────────────────────────────────────────────────────────────────────────────

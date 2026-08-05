@@ -77,7 +77,7 @@ key ordering pitfalls.
 | `import` | array of strings | `[]` | Additional config files to merge in. See [Imports](#imports). |
 | `working_directory` | string | *inherit* | Directory the shell starts in. Unset inherits Vivido's working directory. |
 | `live_config_reload` | bool | `true` | Reapply the config automatically when the file changes. |
-| `ipc_socket` | bool | `true` | Offer IPC over a Unix socket (`vivido msg …`). Unix only; ignored on Windows. |
+| `ipc_socket` | bool | `true` | Offer the automation IPC endpoint (`vivido msg …`). An owner-only Unix socket on Linux/macOS, an owner-only named pipe on Windows. `--socket` and `--headless` enable it regardless of this setting. |
 
 ```toml
 [general]
@@ -136,6 +136,12 @@ instance = "Vivido"
 
 > On Linux, Vivido is Wayland-only. `option_as_alt` applies to macOS; window class maps to the
 > Wayland `app_id`.
+
+> In [headless mode](headless.md) there is no window manager and no monitor. `dimensions` still
+> applies and still derives its pixel size from font metrics, and `padding` still affects the grid;
+> `position`, `decorations`, `opacity`, `blur`, `startup_mode`, `level`, and
+> `decorations_theme_variant` have nothing to act on. `--headless-size WIDTHxHEIGHTpx` bypasses
+> `dimensions` and sets the render surface directly; the scale factor is fixed at 1.0.
 
 ## `scrolling`
 
@@ -458,7 +464,8 @@ render_timer = false
 
 Vivido is a **Vivid Protocol 1.5** terminal presenter: it decodes and composites images, video,
 and audio delivered over an authenticated per-window side channel (see the project `README.md` and
-`docs/vivid_protocol_spec.md`). This pathway is **not** configured through `vivido.toml`. There are
+`../vivid_protocol/vivid-protocol-1.5-spec.md`). This pathway is **not** configured through
+`vivido.toml`. There are
 no TOML knobs for codecs, buffering, flow limits, or endpoints — the presenter negotiates that at
 runtime and keeps media bytes off the PTY.
 

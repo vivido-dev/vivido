@@ -510,7 +510,7 @@ fn run_connection(stream: LocalStream, connection: IpcConnection, event_proxy: &
     if first.version != PROTOCOL_VERSION {
         connection.error(
             first.id,
-            IpcError::new("unsupported_version", "Vivido IPC requires protocol version 1")
+            IpcError::new("unsupported_version", "Vivido IPC requires protocol version 2")
                 .with_data(json!({"supported_versions": [PROTOCOL_VERSION]})),
         );
         return;
@@ -541,7 +541,7 @@ fn run_connection(stream: LocalStream, connection: IpcConnection, event_proxy: &
         if request.version != PROTOCOL_VERSION {
             connection.error(
                 request.id,
-                IpcError::new("unsupported_version", "Vivido IPC requires protocol version 1"),
+                IpcError::new("unsupported_version", "Vivido IPC requires protocol version 2"),
             );
             continue;
         }

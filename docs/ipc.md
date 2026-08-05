@@ -1,8 +1,9 @@
 # Vivido agent automation IPC
 
-Vivido exposes an owner-only automation service on Unix. It is intended for agents, test runners,
-and local programs which need to control and observe both Vivido and terminal applications running
-inside it. Windows IPC is not part of protocol version 1.
+Vivido exposes an owner-only automation service on Linux, macOS, and Windows. It is intended for
+agents, test runners, and local programs which need to control and observe both Vivido and terminal
+applications running inside it. The service is available from windowed instances and from
+[headless sessions](headless.md) alike; a headless session is the deterministic target for CI.
 
 The CLI is the stable shell interface:
 
@@ -16,12 +17,23 @@ vivido msg key Enter --window-id 42
 
 ## Endpoint discovery and targeting
 
-`vivido msg --socket PATH ...` uses an explicit socket. Without `--socket`, the client first tries
-`VIVIDO_SOCKET`; if it is unset or stale, it scans Vivido's runtime directory for the newest live
-socket on the current display. Socket files have mode `0600`. Vivido limits the server to 32 active
-connections.
+The endpoint is an owner-only Unix socket with mode `0600` on Unix, and a named pipe with an
+owner-and-SYSTEM-only DACL on Windows. Both ends verify the peer's process owner in addition to the
+endpoint's mode or ACL, and the Windows pipe rejects remote clients. `--socket PATH` therefore takes
+a filesystem path on Unix and a pipe path on Windows. Vivido limits the server to 32 active
+connections. The service is offered when `general.ipc_socket` is enabled, which is the default;
+`--socket` and `--headless` enable it regardless of configuration.
 
-Window-targeted CLI commands resolve their target in this order:
+`vivido msg` resolves its endpoint in this order:
+
+1. `--socket PATH`;
+2. `--target NAME`, else inherited `VIVIDO_SESSION` — an explicitly named headless session never
+   silently falls through to a different instance, so a name that is not running is an error;
+3. inherited `VIVIDO_SOCKET`, if it still connects;
+4. the only live headless session, when there is exactly one;
+5. on Unix, the newest live windowed instance on the current display.
+
+Window-targeted CLI commands then resolve their window in this order:
 
 1. `--window-id ID`;
 2. inherited `VIVIDO_WINDOW_ID`;
@@ -29,41 +41,45 @@ Window-targeted CLI commands resolve their target in this order:
 
 Use `list-windows` when a caller did not inherit the per-window environment. An explicit missing ID
 returns `window_not_found`; a command requiring the focused fallback returns `no_focused_window`
-when no Vivido window is focused. `subscribe --all` intentionally bypasses target resolution.
+when no Vivido window is focused. A headless session has no operating-system focus, so pass an
+explicit `--window-id` there whenever more than one window exists. `subscribe --all` intentionally
+bypasses target resolution.
 
-## Version 1 wire protocol
+## Version 2 wire protocol
 
-The socket carries newline-delimited UTF-8 JSON. Each frame is one JSON value followed by `\n`.
+The endpoint carries newline-delimited UTF-8 JSON. Each frame is one JSON value followed by `\n`.
 Request frames are limited to 1 MiB and reply/event frames to 16 MiB.
 
 Every connection must begin with `hello`:
 
 ```json
-{"version":1,"id":1,"method":"hello","params":{}}
+{"version":2,"id":1,"method":"hello","params":{}}
 ```
 
-The response advertises the server version, protocol version, methods, event kinds, stable error
-codes, and effective limits:
+The response advertises the server version, protocol version, whether this instance is headless and
+which session it serves, methods, event kinds, stable error codes, and effective limits:
 
 ```json
-{"version":1,"id":1,"ok":true,"result":{"protocol_version":1,"methods":[],"event_kinds":[],"limits":{}}}
+{"version":2,"id":1,"ok":true,"result":{"server_version":"0.0.0","protocol_version":2,"headless":true,"session":"build","methods":[],"event_kinds":[],"limits":{}}}
 ```
+
+`headless` is `false` and `session` is `null` for a windowed instance. Both are fixed at startup.
 
 A legacy raw enum frame, malformed first frame, non-`hello` first request, or unsupported version
 gets a structured error and the connection closes. There is no compatibility mode for the former
-unversioned protocol.
+unversioned protocol and no version-1 compatibility mode.
 
 Subsequent requests use the same envelope:
 
 ```json
-{"version":1,"id":17,"method":"inspect","params":{"window_id":42}}
+{"version":2,"id":17,"method":"inspect","params":{"window_id":42}}
 ```
 
 Correlated success and failure envelopes are:
 
 ```json
-{"version":1,"id":17,"ok":true,"result":{}}
-{"version":1,"id":17,"ok":false,"error":{"code":"window_not_found","message":"..."}}
+{"version":2,"id":17,"ok":true,"result":{}}
+{"version":2,"id":17,"ok":false,"error":{"code":"window_not_found","message":"..."}}
 ```
 
 Request IDs are scoped to a connection. Up to 64 may be active at once. Reusing an active ID
@@ -96,10 +112,17 @@ physical modifiers pressed.
 
 - `hello {}`: required handshake. `vivido msg capabilities` prints its `result` as JSON.
 - `ping {}`: wire-only liveness request; returns `{"pong":true}`.
+- `quit {}`: shuts the whole instance down, closing every window. For a headless session this is
+  the graceful stop, and it lets the daemon remove its own endpoint and registry; `vivido
+  kill-session` is the forceful alternative.
+- `unsubscribe {"subscription_id":ID}`: wire-only cancellation for a subscription on the same
+  connection.
 - `create_window`: synchronously constructs a complete window and returns `{"window_id":ID}`.
   The CLI is `vivido msg create-window` with its existing window, command, directory, hold, title,
   class, and config options. `ipc_window_id` is optional and must be unique. The response does not
-  wait for the first rendered frame.
+  wait for the first rendered frame. `--vivid-target desktop` creates a `desktop-surface-v1` window
+  instead of the default `terminal-surface-v1` one; a desktop window has no grid, no anchors, and no
+  shell, so terminal-shaped methods do not apply to it.
 - `config` and `get_config`: back the existing `config` and `get-config` commands. Configuration
   updates now always receive a correlated response. The special config ID `-1` means all/global.
 - `typing {"text":"...","window_id":ID}`: writes literal UTF-8 bytes without paste handling or an
@@ -113,7 +136,9 @@ physical modifiers pressed.
   the path plus a newline. The PNG is the last successfully presented client-area frame at physical
   resolution and includes terminal rendering, cursor, selection, Vivido overlays, and Vivid media.
   It excludes OS decorations and desktop content. Straight alpha is preserved. The persistent temp
-  file has mode `0600`; its caller owns cleanup. A resize invalidates the stored frame until another
+  file has mode `0600` on Unix and lives in the per-user temporary directory on Windows; its caller
+  owns cleanup. Headless sessions render offscreen and support this identically. A resize
+  invalidates the stored frame until another
   frame is presented. Only one readback per window may run at once and raw allocation is capped at
   256 MiB.
 
@@ -143,7 +168,8 @@ physical modifiers pressed.
 - `focus {"window_id":ID}` requests real operating-system activation. It succeeds only after an
   actual focused event and otherwise returns `focus_denied` after two seconds. Vivido never
   synthesizes terminal focus state. On Wayland, the request uses `xdg_activation_v1` to obtain and
-  apply a compositor-approved client activation token when that protocol is available.
+  apply a compositor-approved client activation token when that protocol is available. A headless
+  session has no compositor, so `focus` cannot succeed there.
 - `signal {"signal":"INT","target":{...}}` accepts `INT`, `TERM`, `HUP`, `QUIT`, `TSTP`, `CONT`,
   `WINCH`, `KILL`, and `STOP`. It sends only the explicitly named signal to the current foreground
   process group, falling back to the PTY child group. KILL and STOP have no implicit aliases.
