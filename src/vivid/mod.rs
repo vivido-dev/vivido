@@ -94,6 +94,18 @@ const MAX_SEEN_ANCHORS: usize = 8192;
 // Audio continuity takes precedence over live video freshness. This remains finite while covering
 // ordinary SSH scheduling stalls; the producer drops video when its audio reserve begins filling.
 const LIVE_AUDIO_FLOW_RESERVE_US: u64 = 2_000_000;
+/// A recovery key frame is the largest unit a producer can send. Asking for one because media is
+/// late, on a link that is late *because* it is saturated, is how a slow session becomes a stopped
+/// one, so latency-driven requests are spaced at least this far apart.
+const LATENCY_KEYFRAME_INTERVAL: Duration = Duration::from_secs(2);
+/// How often the live audio/video delay is allowed to shrink back toward zero.
+const LIVE_DELAY_REVIEW: Duration = Duration::from_secs(5);
+/// Video arrival margin kept when shrinking the delay, so a shrink cannot cause the next frame to
+/// be late.
+const LIVE_DELAY_HEADROOM_US: i64 = 100_000;
+/// A live audio timeline step at least this large is a real gap, not capture or transport jitter.
+/// Three Opus packets: smaller steps are bridged by the decoder's own continuity.
+const AUDIO_GAP_US: i64 = 60_000;
 const CHANNEL_OPEN_DEADLINE_US: u64 = 30_000_000;
 const MAX_SCENE_NODES: usize = 256;
 const MAX_LEASES: usize = 32;
@@ -2456,6 +2468,50 @@ fn live_channel_flow(configuration: &TrackConfiguration) -> (u64, u64) {
     (maximum_bytes, maximum_records)
 }
 
+/// The live audio delay after video arrived `headroom_us` *behind* the audio clock.
+///
+/// The clock is already retarded by the delay in force, so the shortfall is exactly what still has
+/// to be added for sound and picture to be presented together.
+fn grown_live_delay_us(current_us: u64, headroom_us: i64) -> u64 {
+    let behind_us = u64::try_from(headroom_us.saturating_neg().max(0)).unwrap_or(0);
+    current_us.saturating_add(behind_us)
+}
+
+/// The live audio delay after a review window in which video was never late.
+///
+/// Only the margin above [`LIVE_DELAY_HEADROOM_US`] is given back: shrinking to the exact observed
+/// minimum would leave the next frame with nothing to absorb ordinary jitter.
+fn shrunk_live_delay_us(current_us: u64, least_headroom_us: i64) -> u64 {
+    let spare_us = least_headroom_us.saturating_sub(LIVE_DELAY_HEADROOM_US).max(0);
+    current_us.saturating_sub(u64::try_from(spare_us).unwrap_or(0))
+}
+
+/// What a step in the live audio timeline means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AudioTimelineStep {
+    /// Within jitter of where the previous packet ended: play it.
+    Continuous,
+    /// The producer dropped this much timeline. Bridging it with silence keeps the media clock
+    /// aligned without discarding a single buffered sample.
+    Gap(u64),
+    /// The producer's clock went backwards, which a continuous timeline cannot express.
+    Restart,
+}
+
+fn classify_audio_step(expected_pts_us: Option<i64>, pts_us: i64, live: bool) -> AudioTimelineStep {
+    let Some(expected) = expected_pts_us.filter(|_| live) else {
+        return AudioTimelineStep::Continuous;
+    };
+    let step_us = pts_us.saturating_sub(expected);
+    if step_us >= AUDIO_GAP_US {
+        AudioTimelineStep::Gap(u64::try_from(step_us).unwrap_or(0))
+    } else if step_us <= -AUDIO_GAP_US {
+        AudioTimelineStep::Restart
+    } else {
+        AudioTimelineStep::Continuous
+    }
+}
+
 /// Ask the producer for a random-access unit on this channel, media §13.
 fn request_keyframe(
     writer: &Writer,
@@ -2534,6 +2590,9 @@ fn channel_loop(
     let mut last_rate_update = Instant::now();
     let mut latency_recovery_epoch = None;
     let mut expected_audio_pts_us = None;
+    let mut last_latency_keyframe: Option<Instant> = None;
+    let mut delay_review_started = Instant::now();
+    let mut delay_window_headroom_us: Option<i64> = None;
     loop {
         let record = match reader.read_record(ConnectionKind::Track) {
             Ok(record) => record,
@@ -2731,24 +2790,62 @@ fn channel_loop(
                         record.sequence,
                     )
                     .map_err(io::Error::other)?;
+                let linked_audio =
+                    shared.scene.active_track(identity.surface, scene::SLOT_AUDIO).and_then(
+                        |audio_identity| lock(&shared.audio_outputs).get(&audio_identity).cloned(),
+                    );
+                // Keep sound and picture together by delaying the sound.
+                //
+                // Both are stamped on one capture clock but they do not arrive together: video is
+                // roughly two orders of magnitude larger and queues behind itself in the transport,
+                // so audio played on arrival runs ahead of the picture it belongs with by exactly
+                // that difference. Measuring the residual skew here and holding audio back by it is
+                // what makes a live pair presentable; the previous design instead declared the
+                // video late and discarded it, which on any link whose video delay exceeded the
+                // 100 ms budget discarded every frame there was.
+                if configuration.mode == TrackMode::Live
+                    && let Some(audio) = &linked_audio
+                    && let Some(rendered_pts_us) = audio.rendered_pts()
+                {
+                    let headroom_us = packet.pts_us.saturating_sub(rendered_pts_us);
+                    let least_headroom_us = delay_window_headroom_us
+                        .map_or(headroom_us, |least| least.min(headroom_us));
+                    delay_window_headroom_us = Some(least_headroom_us);
+                    if headroom_us < 0 {
+                        audio.request_live_delay(grown_live_delay_us(
+                            audio.live_delay_us(),
+                            headroom_us,
+                        ));
+                    } else if delay_review_started.elapsed() >= LIVE_DELAY_REVIEW {
+                        // Video has been arriving early for a whole review window, so the delay is
+                        // larger than the link now needs and can give some of it back.
+                        audio.request_live_delay(shrunk_live_delay_us(
+                            audio.live_delay_us(),
+                            least_headroom_us,
+                        ));
+                        delay_review_started = Instant::now();
+                        delay_window_headroom_us = None;
+                    }
+                }
                 let discard_before = if priming_record {
                     None
                 } else {
-                    shared
-                        .scene
-                        .active_track(identity.surface, scene::SLOT_AUDIO)
-                        .and_then(|audio_identity| {
-                            lock(&shared.audio_outputs).get(&audio_identity).cloned()
-                        })
-                        .and_then(|audio| {
-                            audio.discard_video_before(configuration.maximum_latency_us)
-                        })
+                    linked_audio.as_ref().and_then(|audio| {
+                        audio.discard_video_before(configuration.maximum_latency_us)
+                    })
                 };
                 let late = discard_before.is_some_and(|deadline| packet.pts_us < deadline);
-                let requested_keyframe = late && latency_recovery_epoch != Some(packet.epoch);
+                // A key frame recovers a *broken* stream. Late media is not broken, and on a
+                // saturated link the recovery unit is the largest thing that could be added to the
+                // queue that made it late, so the request is spaced as well as deduplicated.
+                let requested_keyframe = late
+                    && latency_recovery_epoch != Some(packet.epoch)
+                    && last_latency_keyframe
+                        .is_none_or(|at| at.elapsed() >= LATENCY_KEYFRAME_INTERVAL);
                 if requested_keyframe {
                     request_keyframe(writer, identity, generation, NEED_KEYFRAME_DECODER_RESET);
                     latency_recovery_epoch = Some(packet.epoch);
+                    last_latency_keyframe = Some(Instant::now());
                 } else if random_access
                     && latency_recovery_epoch.is_some_and(|epoch| packet.epoch > epoch)
                 {
@@ -2787,7 +2884,13 @@ fn channel_loop(
                         ),
                         _ => unreachable!(),
                     };
-                    wait_until_video_due(shared, identity, decoded.pts_us, priming_record)?;
+                    wait_until_video_due(
+                        shared,
+                        identity,
+                        decoded.pts_us,
+                        priming_record,
+                        configuration.mode == TrackMode::Live,
+                    )?;
                     shared
                         .scene
                         .publish_decoded_frame(
@@ -2829,13 +2932,26 @@ fn channel_loop(
                     io::Error::new(ErrorKind::InvalidData, "AUDIO_PACKET used a non-audio track")
                 })?;
                 let mut samples = decoder.push(packet)?;
-                let discontinuity = expected_audio_pts_us
-                    .is_some_and(|expected: i64| packet.pts_us.abs_diff(expected) > 2_000);
-                if discontinuity && configuration.mode == TrackMode::Live {
-                    output.rebase_live(packet.pts_us);
-                    shared.scene.record_audio_rebase(identity).map_err(io::Error::other)?;
-                } else {
-                    output.observe_audio_pts(packet.pts_us);
+                // Classify the timeline step before reacting to it. A forward gap is a producer
+                // that dropped packets: the timeline is intact and silence of the gap's length
+                // keeps the clock honest. Only a backward jump is a restarted clock, and only that
+                // justifies discarding every buffered sample. The previous 2 ms tolerance treated
+                // ordinary capture jitter as a restart and was audible each time.
+                match classify_audio_step(
+                    expected_audio_pts_us,
+                    packet.pts_us,
+                    configuration.mode == TrackMode::Live,
+                ) {
+                    AudioTimelineStep::Continuous => output.observe_audio_pts(packet.pts_us),
+                    AudioTimelineStep::Gap(gap_us) => {
+                        output.bridge_live_gap(gap_us);
+                        output.observe_audio_pts(packet.pts_us);
+                        shared.scene.record_audio_rebase(identity).map_err(io::Error::other)?;
+                    },
+                    AudioTimelineStep::Restart => {
+                        output.rebase_live(packet.pts_us);
+                        shared.scene.record_audio_rebase(identity).map_err(io::Error::other)?;
+                    },
                 }
                 expected_audio_pts_us = Some(
                     packet
@@ -2895,7 +3011,13 @@ fn channel_loop(
                             ),
                             _ => unreachable!(),
                         };
-                        wait_until_video_due(shared, identity, decoded.pts_us, priming_record)?;
+                        wait_until_video_due(
+                            shared,
+                            identity,
+                            decoded.pts_us,
+                            priming_record,
+                            configuration.mode == TrackMode::Live,
+                        )?;
                         shared
                             .scene
                             .publish_decoded_frame(
@@ -3004,9 +3126,18 @@ fn wait_until_video_due(
     identity: TrackIdentity,
     pts_us: i64,
     priming_record: bool,
+    live: bool,
 ) -> io::Result<()> {
     if priming_record {
         return shared.scene.wait_until_due(identity, pts_us, true).map_err(io::Error::other);
+    }
+    // Live video is already paced by the capture that produced it, so there is nothing to wait
+    // for — and this runs on the thread that reads the channel. Sleeping here stops the socket
+    // from being drained and stops channel capacity from being returned, which backs the producer
+    // up until *its* queue overflows: the pacing wait manufactures the congestion it is reacting
+    // to. Timed media, which can be delivered far faster than real time, still needs the clock.
+    if live {
+        return Ok(());
     }
     loop {
         let audio = shared
@@ -3825,6 +3956,77 @@ mod tests {
             descriptor[3].1.as_u64().unwrap(),
             descriptor[6].1.as_bool().unwrap(),
         )
+    }
+
+    #[test]
+    fn live_delay_is_scoped_to_its_owner_when_two_sessions_reuse_a_track_id() {
+        // Two surfaces streaming at once will normally both allocate track 7. The delay one
+        // session needs for its link must not become the delay the other plays with, so the
+        // outputs are keyed by complete identity and never by the numeric track ID.
+        let identity = |presenter: u8| {
+            SessionIdentity::new(PresenterInstanceId([presenter; 16]), 1)
+                .unwrap()
+                .context(1)
+                .unwrap()
+                .surface(1)
+                .unwrap()
+                .track(7)
+                .unwrap()
+        };
+        let (first, second) = (identity(1), identity(2));
+        assert_ne!(first, second, "identity must distinguish the two owners");
+
+        let outputs = HashMap::from([
+            (first, AudioOutput::test_output()),
+            (second, AudioOutput::test_output()),
+        ]);
+
+        outputs[&first].observe_audio_pts(1_000_000);
+        outputs[&second].observe_audio_pts(1_000_000);
+        outputs[&first].request_live_delay(400_000);
+
+        assert_eq!(outputs[&first].live_delay_us(), 400_000);
+        assert_eq!(outputs[&second].live_delay_us(), 0);
+    }
+
+    #[test]
+    fn a_live_delay_grows_by_exactly_what_video_arrived_behind_the_audio_clock() {
+        // The audio clock is already retarded by the delay in force, so the shortfall measured
+        // against it is exactly what still has to be added. Video that is early adds nothing.
+        assert_eq!(grown_live_delay_us(0, -180_000), 180_000);
+        assert_eq!(grown_live_delay_us(180_000, -40_000), 220_000);
+        assert_eq!(grown_live_delay_us(220_000, 90_000), 220_000);
+        assert_eq!(grown_live_delay_us(u64::MAX, -1), u64::MAX);
+    }
+
+    #[test]
+    fn a_live_delay_only_gives_back_the_margin_above_its_headroom() {
+        // A review window in which the closest frame still arrived 400 ms early can return 300 ms
+        // and keep 100 ms to absorb jitter. One that arrived just in time returns nothing.
+        assert_eq!(shrunk_live_delay_us(500_000, 400_000), 200_000);
+        assert_eq!(shrunk_live_delay_us(500_000, LIVE_DELAY_HEADROOM_US), 500_000);
+        assert_eq!(shrunk_live_delay_us(500_000, -50_000), 500_000);
+        assert_eq!(shrunk_live_delay_us(10_000, 900_000), 0);
+    }
+
+    #[test]
+    fn a_forward_audio_step_is_a_gap_and_only_a_backward_one_restarts_the_timeline() {
+        // Regression: a 2 ms tolerance classified ordinary capture jitter as a restart, and every
+        // restart discarded the whole device buffer. Only a clock that went backwards is a restart.
+        use AudioTimelineStep::{Continuous, Gap, Restart};
+        assert_eq!(classify_audio_step(Some(1_000_000), 1_000_020, true), Continuous);
+        assert_eq!(
+            classify_audio_step(Some(1_000_000), 1_000_000 - AUDIO_GAP_US + 1, true),
+            Continuous
+        );
+        assert_eq!(
+            classify_audio_step(Some(1_000_000), 1_000_000 + AUDIO_GAP_US, true),
+            Gap(u64::try_from(AUDIO_GAP_US).unwrap())
+        );
+        assert_eq!(classify_audio_step(Some(1_000_000), 1_000_000 - AUDIO_GAP_US, true), Restart);
+        // The first packet has nothing to compare against, and timed media keeps exact PTS.
+        assert_eq!(classify_audio_step(None, 5_000_000, true), Continuous);
+        assert_eq!(classify_audio_step(Some(1_000_000), 9_000_000, false), Continuous);
     }
 
     #[test]

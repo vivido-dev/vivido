@@ -22,6 +22,15 @@ const PACKET_TIME_BASE: AVRational = AVRational { num: 1, den: 1_000_000 };
 // reserve large enough to bridge those stalls; linked video is discarded when it falls behind.
 const RING_BUFFER_SECONDS: usize = 2;
 const PREBUFFER_MILLISECONDS: u64 = 100;
+/// The most a live stream will be delayed to line sound up with picture. Past this the session is
+/// no longer interactive, and the honest answer is a lower encoder target, not more buffering.
+///
+/// Held audio accumulates in the device ring, so this must stay comfortably under
+/// [`RING_BUFFER_SECONDS`]: steady-state ring occupancy is the delay itself, and a delay that
+/// could reach the ring's capacity would block the decoder thread pushing into it.
+const MAXIMUM_LIVE_DELAY_US: u64 = 1_000_000;
+/// Delay changes smaller than this are transport jitter, not skew worth re-buffering for.
+const LIVE_DELAY_STEP_US: u64 = 20_000;
 const LINKED_AUDIO_STALL_FALLBACK: Duration = Duration::from_secs(2);
 const UNSET_PTS: i64 = i64::MIN;
 
@@ -114,6 +123,17 @@ struct Shared {
     timeline_origin_us: AtomicI64,
     first_audio_pts_us: AtomicI64,
     leading_silence_samples: AtomicU64,
+    /// Silence the device emits *without* advancing the media clock or consuming the ring.
+    ///
+    /// This is the live audio/video presentation delay. Leading silence is the opposite tool: it
+    /// covers timeline that has already elapsed and therefore does advance the clock.
+    hold_silence_samples: AtomicU64,
+    /// Silence covering timeline the producer dropped. It advances the media clock, like leading
+    /// silence, but has its own counter because `observe_timeline_pts` recomputes and *stores*
+    /// leading silence on every packet and would otherwise erase a bridge before it played out.
+    gap_silence_samples: AtomicU64,
+    /// The delay the hold is currently implementing, so it can be measured and adjusted.
+    live_delay_us: AtomicU64,
     prebuffer_samples: AtomicU64,
     requested_start_pts_us: AtomicI64,
     play_configured_at: Mutex<Option<Instant>>,
@@ -171,6 +191,9 @@ impl AudioOutput {
             timeline_origin_us: AtomicI64::new(UNSET_PTS),
             first_audio_pts_us: AtomicI64::new(UNSET_PTS),
             leading_silence_samples: AtomicU64::new(0),
+            hold_silence_samples: AtomicU64::new(0),
+            gap_silence_samples: AtomicU64::new(0),
+            live_delay_us: AtomicU64::new(0),
             prebuffer_samples: AtomicU64::new(
                 u64::from(config.sample_rate)
                     .saturating_mul(u64::from(config.channels))
@@ -234,6 +257,9 @@ impl AudioOutput {
             timeline_origin_us: AtomicI64::new(UNSET_PTS),
             first_audio_pts_us: AtomicI64::new(UNSET_PTS),
             leading_silence_samples: AtomicU64::new(0),
+            hold_silence_samples: AtomicU64::new(0),
+            gap_silence_samples: AtomicU64::new(0),
+            live_delay_us: AtomicU64::new(0),
             prebuffer_samples: AtomicU64::new(0),
             requested_start_pts_us: AtomicI64::new(UNSET_PTS),
             play_configured_at: Mutex::new(None),
@@ -305,6 +331,9 @@ impl AudioOutput {
             .load(Ordering::SeqCst)
             .saturating_sub(self.shared.played_samples.load(Ordering::SeqCst));
         self.shared.discard_samples.store(outstanding, Ordering::SeqCst);
+        self.shared.hold_silence_samples.store(0, Ordering::SeqCst);
+        self.shared.gap_silence_samples.store(0, Ordering::SeqCst);
+        self.shared.live_delay_us.store(0, Ordering::SeqCst);
         self.shared.prebuffered.store(false, Ordering::SeqCst);
         self.shared.decode_done.store(false, Ordering::SeqCst);
         self.shared.eos_observed.store(false, Ordering::SeqCst);
@@ -398,9 +427,8 @@ impl AudioOutput {
                 )
     }
 
-    /// Oldest video PTS worth converting for a linked live stream. Frames before this threshold
-    /// are still decoded as references, but their pixels need not be allocated or uploaded.
-    pub fn discard_video_before(&self, maximum_latency_us: u64) -> Option<i64> {
+    /// The media PTS currently leaving the device, or `None` before playback is running.
+    pub fn rendered_pts(&self) -> Option<i64> {
         if !self.shared.enabled.load(Ordering::SeqCst)
             || !self.shared.prebuffered.load(Ordering::SeqCst)
         {
@@ -414,13 +442,72 @@ impl AudioOutput {
                 self.sample_rate,
                 self.channels,
             )
-            .saturating_sub(i64::try_from(maximum_latency_us).unwrap_or(i64::MAX))
         })
     }
 
-    /// Drop queued device samples and restart a live timeline at the next packet after an encoded
-    /// packet gap. Continuing the old clock would make freshly received audio sound late while
-    /// video follows the packet PTS and moves ahead.
+    /// Oldest video PTS worth converting for a linked live stream. Frames before this threshold
+    /// are still decoded as references, but their pixels need not be allocated or uploaded.
+    ///
+    /// The threshold is measured against the clock *after* the live presentation delay, so it means
+    /// "older than the picture that belongs with the sound coming out of the speaker" rather than
+    /// "slower to arrive than audio". Those are the same thing only on a link with no video
+    /// queueing delay, and treating them as the same discarded every frame of a congested session.
+    pub fn discard_video_before(&self, maximum_latency_us: u64) -> Option<i64> {
+        self.rendered_pts()
+            .map(|pts| pts.saturating_sub(i64::try_from(maximum_latency_us).unwrap_or(i64::MAX)))
+    }
+
+    /// How far behind capture this output is deliberately playing, in microseconds.
+    pub fn live_delay_us(&self) -> u64 {
+        self.shared.live_delay_us.load(Ordering::SeqCst)
+    }
+
+    /// Hold audio back so it reaches the speaker when the picture it belongs with reaches the
+    /// screen.
+    ///
+    /// Audio and video are captured on one clock but do not arrive on one: video is two orders of
+    /// magnitude larger and queues behind itself in the transport. Playing audio the moment it
+    /// arrives therefore runs sound ahead of picture by exactly that difference. The device holds
+    /// the difference as silence that does not advance the media clock, which is the only way the
+    /// two can be presented together. Returns the delay now in force.
+    pub fn request_live_delay(&self, target_us: u64) -> u64 {
+        let target_us = target_us.min(MAXIMUM_LIVE_DELAY_US);
+        let current = self.shared.live_delay_us.load(Ordering::SeqCst);
+        if target_us.abs_diff(current) < LIVE_DELAY_STEP_US {
+            return current;
+        }
+        if target_us > current {
+            let added = target_us - current;
+            self.shared.hold_silence_samples.fetch_add(self.samples_for(added), Ordering::SeqCst);
+            self.shared.live_delay_us.store(target_us, Ordering::SeqCst);
+            return target_us;
+        }
+        // Shrinking the delay means throwing away audio that has already been buffered, so it is
+        // only worth doing when the saving is audible-scale and the excess is durable.
+        let removed = current - target_us;
+        self.shared.discard_samples.fetch_add(self.samples_for(removed), Ordering::SeqCst);
+        self.shared.live_delay_us.store(target_us, Ordering::SeqCst);
+        target_us
+    }
+
+    fn samples_for(&self, duration_us: u64) -> u64 {
+        u64::from(self.sample_rate)
+            .saturating_mul(u64::from(self.channels))
+            .saturating_mul(duration_us)
+            / 1_000_000
+    }
+
+    /// Cover a gap in the encoded audio timeline without interrupting playback.
+    ///
+    /// A producer that dropped packets leaves a hole. Silence of exactly the hole's length keeps
+    /// the media clock honest — the alternative, restarting the timeline, discards every buffered
+    /// sample and is audible every time transport jitter is mistaken for a discontinuity.
+    pub fn bridge_live_gap(&self, gap_us: u64) {
+        self.shared.gap_silence_samples.fetch_add(self.samples_for(gap_us), Ordering::SeqCst);
+    }
+
+    /// Drop queued device samples and restart a live timeline. Reserved for a producer that
+    /// genuinely restarted its clock, which is the only case a continuous timeline cannot express.
     pub fn rebase_live(&self, pts_us: i64) {
         self.flush();
         self.observe_audio_pts(pts_us);
@@ -568,20 +655,43 @@ where
                     }
                     shared.prebuffered.store(true, Ordering::SeqCst);
                 }
-                let rendered = output.len() as u64;
                 let mut played = 0_u64;
+                // Media time only advances for samples that actually carried the timeline: real
+                // audio, and the leading silence that stands in for timeline before the first
+                // packet. An underrun renders silence the producer never sent, and a hold is delay
+                // that has not happened yet — counting either would run the clock ahead of the
+                // media and make every linked video frame look late for the rest of the session.
+                let mut rendered = 0_u64;
                 for sample in output {
-                    let emit_silence = shared
-                        .leading_silence_samples
+                    if shared
+                        .hold_silence_samples
                         .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
                             remaining.checked_sub(1)
                         })
-                        .is_ok();
+                        .is_ok()
+                    {
+                        *sample = T::from_sample(0.0);
+                        continue;
+                    }
+                    let emit_silence = shared
+                        .gap_silence_samples
+                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                            remaining.checked_sub(1)
+                        })
+                        .is_ok()
+                        || shared
+                            .leading_silence_samples
+                            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                                remaining.checked_sub(1)
+                            })
+                            .is_ok();
                     if emit_silence {
                         *sample = T::from_sample(0.0);
+                        rendered += 1;
                     } else if let Some(value) = consumer.try_pop() {
                         *sample = T::from_sample(value);
                         played += 1;
+                        rendered += 1;
                     } else {
                         *sample = T::from_sample(0.0);
                     }
@@ -1118,6 +1228,70 @@ mod tests {
         output.shared.rendered_samples.store(48_000 * 2, Ordering::SeqCst);
 
         assert_eq!(output.discard_video_before(100_000), Some(1_900_000));
+    }
+
+    #[test]
+    fn a_live_delay_holds_audio_back_without_moving_the_media_clock() {
+        // Regression: audio played on arrival runs ahead of the picture it belongs with by the
+        // transport's video delay. The hold is what puts them back together, and it must not be
+        // mistaken for elapsed media time — a delay that advanced the clock would leave the video
+        // exactly as late as it was before, and be discarded for it.
+        let output = AudioOutput::test_output();
+        output.observe_audio_pts(1_000_000);
+        output.start();
+        output.shared.prebuffered.store(true, Ordering::SeqCst);
+        let before = output.rendered_pts();
+
+        assert_eq!(output.request_live_delay(300_000), 300_000);
+        assert_eq!(output.live_delay_us(), 300_000);
+        assert_eq!(output.shared.hold_silence_samples.load(Ordering::SeqCst), 48_000 * 2 * 3 / 10);
+        assert_eq!(output.rendered_pts(), before, "a hold is not elapsed media time");
+
+        // Jitter-sized changes are ignored, and the hold is bounded.
+        assert_eq!(output.request_live_delay(310_000), 300_000);
+        assert_eq!(output.request_live_delay(u64::MAX), MAXIMUM_LIVE_DELAY_US);
+    }
+
+    #[test]
+    fn shrinking_a_live_delay_discards_the_samples_it_no_longer_holds() {
+        let output = AudioOutput::test_output();
+        output.request_live_delay(500_000);
+
+        assert_eq!(output.request_live_delay(200_000), 200_000);
+        assert_eq!(output.live_delay_us(), 200_000);
+        assert_eq!(output.shared.discard_samples.load(Ordering::SeqCst), 48_000 * 2 * 3 / 10);
+    }
+
+    #[test]
+    fn bridging_a_gap_advances_the_clock_and_keeps_every_buffered_sample() {
+        // The producer dropped 120 ms. The timeline is intact, so the clock must move over the
+        // hole while the audio already buffered behind it survives; restarting the timeline for
+        // this is audible and used to happen for any step over 2 ms.
+        let output = AudioOutput::test_output();
+        output.observe_audio_pts(1_000_000);
+        output.start();
+        output.shared.prebuffered.store(true, Ordering::SeqCst);
+        output.shared.queued_samples.store(9_600, Ordering::SeqCst);
+
+        output.bridge_live_gap(120_000);
+        // The packet that follows the gap is observed like any other. Leading silence is
+        // recomputed and *stored* on every observation, so a bridge kept there would be erased
+        // before a single sample of it reached the device.
+        output.observe_audio_pts(1_200_000);
+
+        assert_eq!(output.shared.gap_silence_samples.load(Ordering::SeqCst), 48_000 * 2 * 12 / 100);
+        assert_eq!(
+            output.shared.leading_silence_samples.load(Ordering::SeqCst),
+            0,
+            "the observation really does clear leading silence, which is why the bridge is separate"
+        );
+        assert_eq!(output.shared.discard_samples.load(Ordering::SeqCst), 0);
+        assert_eq!(output.shared.queued_samples.load(Ordering::SeqCst), 9_600);
+        assert_eq!(
+            output.shared.timeline_origin_us.load(Ordering::SeqCst),
+            1_000_000,
+            "a gap does not restart the timeline"
+        );
     }
 
     #[test]
