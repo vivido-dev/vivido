@@ -26,7 +26,7 @@ use winit::event_loop::ActiveEventLoop;
 use winit::monitor::MonitorHandle;
 #[cfg(windows)]
 use winit::platform::windows::{IconExtWindows, WindowAttributesExtWindows};
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::{
     CursorIcon, Fullscreen, ImePurpose, Theme, UserAttentionType, Window as WinitWindow,
@@ -245,7 +245,12 @@ impl Window {
             .with_fullscreen(config.window.fullscreen())
             .with_window_level(config.window.level.into());
 
-        #[cfg(target_os = "macos")]
+        #[cfg(windows)]
+        if options.no_activate {
+            window_attributes = window_attributes.with_active(false);
+        }
+
+        #[cfg(any(target_os = "macos", windows))]
         if let Some(parent) = options.parent_window {
             // SAFETY: `ParentWindowHandle::new` requires the caller to keep the parent alive until
             // after its children. Window creation and all subsequent access happen on this active
@@ -318,7 +323,7 @@ impl Window {
         matches!(self.backend, Backend::Headless(_))
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     #[inline]
     pub fn raw_window_handle(&self) -> Option<RawWindowHandle> {
         Some(self.backend.winit()?.window_handle().unwrap().as_raw())

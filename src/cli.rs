@@ -11,7 +11,7 @@ use log::{LevelFilter, error};
 use serde::{Deserialize, Serialize};
 use toml::Value;
 use vivido_config::SerdeReplace;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 use winit::raw_window_handle::RawWindowHandle;
 
 use crate::terminal::tty::Options as PtyOptions;
@@ -461,11 +461,11 @@ pub enum SocketMessage {
 ///
 /// Winit uses the same wrapper internally for child-window attributes. The handle is only
 /// dereferenced by the windowing system on the main event-loop thread.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ParentWindowHandle(RawWindowHandle);
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 impl ParentWindowHandle {
     /// Wrap a raw handle for use as a child window's parent.
     ///
@@ -484,9 +484,9 @@ impl ParentWindowHandle {
 
 // SAFETY: The constructor requires the owner to keep the parent alive, and Vivido only uses the
 // handle to create the child on the main event-loop thread.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 unsafe impl Send for ParentWindowHandle {}
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 unsafe impl Sync for ParentWindowHandle {}
 
 /// Subset of options that we pass to 'create-window' IPC subcommand.
@@ -530,7 +530,7 @@ pub struct WindowOptions {
 
     #[clap(skip)]
     #[serde(skip)]
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     /// Parent window for an in-process embedded pane.
     pub parent_window: Option<ParentWindowHandle>,
 

@@ -36,7 +36,7 @@ pub mod terminal;
 mod vivid;
 pub mod window_context;
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 pub use crate::cli::ParentWindowHandle;
 pub use crate::cli::WindowOptions;
 pub use crate::display::window::Window;

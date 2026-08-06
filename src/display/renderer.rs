@@ -106,7 +106,7 @@ pub struct SceneRenderer {
     context: Option<SharedRenderContext>,
     /// Absent when rendering offscreen: there is no windowing-system surface to present to.
     surface: Option<Box<RenderSurface<'static>>>,
-    renderer: Renderer,
+    renderer: Rc<RefCell<Renderer>>,
     device: wgpu::Device,
     queue: wgpu::Queue,
     /// Whether the render target has a drawable (non-zero) size.
@@ -125,14 +125,42 @@ pub struct SceneRenderer {
 /// Main-thread render context shared by every window surface.
 ///
 /// Vello keeps adapters/devices in the context, so reusing it prevents each terminal pane and
-/// host chrome surface from allocating another wgpu device. Renderers remain surface-local and
-/// are driven serially by the application's event loop.
+/// host chrome surface from allocating another wgpu device. A renderer is cached per compatible
+/// device and driven serially by the application's event loop; surfaces and render targets remain
+/// window-local.
 #[derive(Clone)]
-pub struct SharedRenderContext(Rc<RefCell<RenderContext>>);
+pub struct SharedRenderContext(Rc<RefCell<SharedRenderState>>);
+
+struct SharedRenderState {
+    context: RenderContext,
+    renderers: Vec<Option<Rc<RefCell<Renderer>>>>,
+}
+
+impl SharedRenderState {
+    fn renderer_for(
+        &mut self,
+        device_id: usize,
+        device: &wgpu::Device,
+    ) -> Result<Rc<RefCell<Renderer>>, vello::Error> {
+        if self.renderers.len() <= device_id {
+            self.renderers.resize_with(device_id + 1, || None);
+        }
+        if let Some(renderer) = &self.renderers[device_id] {
+            return Ok(Rc::clone(renderer));
+        }
+
+        let renderer = Rc::new(RefCell::new(create_renderer(device)?));
+        self.renderers[device_id] = Some(Rc::clone(&renderer));
+        Ok(renderer)
+    }
+}
 
 impl SharedRenderContext {
     pub fn new() -> Self {
-        Self(Rc::new(RefCell::new(RenderContext::new())))
+        Self(Rc::new(RefCell::new(SharedRenderState {
+            context: RenderContext::new(),
+            renderers: Vec::new(),
+        })))
     }
 }
 
@@ -167,11 +195,11 @@ impl SceneRenderer {
         let size = clamp_render_size(size, wgpu::Limits::default().max_texture_dimension_2d);
         let valid_target = size.width != 0 && size.height != 0;
 
-        let (context, surface, device, queue, target_size) = match source {
+        let (context, surface, device, queue, target_size, renderer) = match source {
             RenderSource::Surface(window) => {
                 let context = window_render_context();
                 let mut context_ref = context.0.borrow_mut();
-                let mut surface = block_on(context_ref.create_surface(
+                let mut surface = block_on(context_ref.context.create_surface(
                     window,
                     size.width.max(1),
                     size.height.max(1),
@@ -181,10 +209,10 @@ impl SceneRenderer {
 
                 let alpha_modes = &surface
                     .surface
-                    .get_capabilities(context_ref.devices[surface.dev_id].adapter())
+                    .get_capabilities(context_ref.context.devices[surface.dev_id].adapter())
                     .alpha_modes;
                 surface.config.alpha_mode = surface_alpha_mode(alpha_modes);
-                context_ref.configure_surface(&surface);
+                context_ref.context.configure_surface(&surface);
 
                 if surface.config.alpha_mode == wgpu::CompositeAlphaMode::PostMultiplied {
                     log::info!("Surface alpha mode: {:?}", surface.config.alpha_mode);
@@ -195,18 +223,23 @@ impl SceneRenderer {
                     );
                 }
 
-                let handle = &context_ref.devices[surface.dev_id];
+                let handle = &context_ref.context.devices[surface.dev_id];
                 let (device, queue) = (handle.device.clone(), handle.queue.clone());
+                let renderer = context_ref
+                    .renderer_for(surface.dev_id, &device)
+                    .map_err(Error::CreateRenderer)?;
                 let target_size = PhysicalSize::new(surface.config.width, surface.config.height);
                 drop(context_ref);
-                (Some(context), Some(Box::new(surface)), device, queue, target_size)
+                (Some(context), Some(Box::new(surface)), device, queue, target_size, renderer)
             },
             RenderSource::Offscreen => {
                 let (device, queue) = offscreen_device()?;
                 // Nothing can refuse an offscreen size, but keep the same minimum-1 clamp so the
                 // texture is always creatable.
                 let target_size = PhysicalSize::new(size.width.max(1), size.height.max(1));
-                (None, None, device, queue, target_size)
+                let renderer =
+                    Rc::new(RefCell::new(create_renderer(&device).map_err(Error::CreateRenderer)?));
+                (None, None, device, queue, target_size, renderer)
             },
         };
 
@@ -214,15 +247,6 @@ impl SceneRenderer {
         let media = VividMediaRenderer::new(&device);
         let (render_target, render_target_view) =
             create_render_target(&device, target_size.width, target_size.height);
-
-        let renderer = Renderer::new(
-            &device,
-            RendererOptions {
-                antialiasing_support: [AaConfig::Msaa8].into_iter().collect::<AaSupport>(),
-                ..RendererOptions::default()
-            },
-        )
-        .map_err(Error::CreateRenderer)?;
 
         Ok(Self {
             context,
@@ -249,7 +273,7 @@ impl SceneRenderer {
         }
 
         if let (Some(context), Some(surface)) = (&self.context, &mut self.surface) {
-            context.0.borrow().resize_surface(surface, size.width, size.height);
+            context.0.borrow().context.resize_surface(surface, size.width, size.height);
         }
         (self.render_target, self.render_target_view) =
             create_render_target(&self.device, size.width, size.height);
@@ -275,8 +299,8 @@ impl SceneRenderer {
         size: &SizeInfo,
         display_offset: usize,
     ) -> Option<vello::peniko::ImageData> {
-        let Self { media, device, queue, renderer, .. } = self;
-        media.draw(device, queue, renderer, size, display_offset)
+        let mut renderer = self.renderer.borrow_mut();
+        self.media.draw(&self.device, &self.queue, &mut renderer, size, display_offset)
     }
 
     pub fn render(&mut self, scene: &Scene, base_color: Color) -> Result<bool, Error> {
@@ -297,7 +321,11 @@ impl SceneRenderer {
                 },
                 wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Outdated => {
                     if let (Some(context), Some(surface)) = (&self.context, &mut self.surface) {
-                        context.0.borrow().resize_surface(surface, width.max(1), height.max(1));
+                        context.0.borrow().context.resize_surface(
+                            surface,
+                            width.max(1),
+                            height.max(1),
+                        );
                     }
                     return Ok(false);
                 },
@@ -307,6 +335,7 @@ impl SceneRenderer {
         };
 
         self.renderer
+            .borrow_mut()
             .render_to_texture(
                 &self.device,
                 &self.queue,
@@ -428,8 +457,18 @@ impl SceneRenderer {
 
 impl Drop for SceneRenderer {
     fn drop(&mut self) {
-        self.media.clear_target(&mut self.renderer);
+        self.media.clear_target(&mut self.renderer.borrow_mut());
     }
+}
+
+fn create_renderer(device: &wgpu::Device) -> Result<Renderer, vello::Error> {
+    Renderer::new(
+        device,
+        RendererOptions {
+            antialiasing_support: [AaConfig::Msaa8].into_iter().collect::<AaSupport>(),
+            ..RendererOptions::default()
+        },
+    )
 }
 
 /// Create a wgpu device with no surface behind it.
@@ -536,8 +575,9 @@ fn surface_alpha_mode(alpha_modes: &[wgpu::CompositeAlphaMode]) -> wgpu::Composi
 #[cfg(test)]
 mod tests {
     use super::{
-        RenderSource, SceneRenderer, clamp_render_size, offscreen_device, screenshot_layout,
-        surface_alpha_mode, window_render_context,
+        RenderSource, SceneRenderer, SharedRenderContext, clamp_render_size, offscreen_device,
+        screenshot_layout, shutdown_window_render_context, surface_alpha_mode,
+        window_render_context,
     };
     use std::rc::Rc;
     use std::sync::{Mutex, MutexGuard};
@@ -560,8 +600,30 @@ mod tests {
         assert!(Rc::ptr_eq(&first.0, &second.0));
     }
 
+    #[test]
+    fn shutting_down_window_render_context_allows_clean_recreation() {
+        let first = window_render_context();
+        shutdown_window_render_context();
+        let second = window_render_context();
+        assert!(!Rc::ptr_eq(&first.0, &second.0));
+        shutdown_window_render_context();
+    }
+
     fn gpu_lock() -> MutexGuard<'static, ()> {
         GPU.lock().unwrap_or_else(|err| err.into_inner())
+    }
+
+    #[test]
+    fn shared_context_reuses_one_renderer_per_device() {
+        let _gpu = gpu_lock();
+        let Ok((device, _)) = offscreen_device() else {
+            eprintln!("Skipping shared renderer test: no wgpu adapter");
+            return;
+        };
+        let context = SharedRenderContext::new();
+        let first = context.0.borrow_mut().renderer_for(0, &device).expect("first renderer");
+        let second = context.0.borrow_mut().renderer_for(0, &device).expect("shared renderer");
+        assert!(Rc::ptr_eq(&first, &second));
     }
 
     /// Render a solid frame with no windowing system and read the pixels back.
