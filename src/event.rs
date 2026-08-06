@@ -290,6 +290,16 @@ impl Processor {
         Ok(ipc_window_id)
     }
 
+    /// Look up one terminal window without exposing the processor's window map.
+    pub fn window(&self, window_id: WindowId) -> Option<&WindowContext> {
+        self.windows.get(&window_id)
+    }
+
+    /// Mutably look up one terminal window without exposing the processor's window map.
+    pub fn window_mut(&mut self, window_id: WindowId) -> Option<&mut WindowContext> {
+        self.windows.get_mut(&window_id)
+    }
+
     /// Run the event loop.
     ///
     /// The result is exit code generate from the loop.
