@@ -81,6 +81,13 @@ pub struct Options {
     #[clap(long)]
     pub daemon: bool,
 
+    /// Run without a Dock icon or menu bar, and never activate over the frontmost application.
+    ///
+    /// This is the shape for an instance whose windows are panes of another application.
+    #[cfg(target_os = "macos")]
+    #[clap(long)]
+    pub accessory: bool,
+
     /// CLI options for config overrides.
     #[clap(skip)]
     pub config_options: ParsedOptions,
@@ -414,6 +421,15 @@ pub enum SocketMessage {
     /// Resize a terminal window.
     Resize(IpcResize),
 
+    /// Move and optionally resize a window's outer frame.
+    SetGeometry(IpcSetGeometry),
+
+    /// Map or unmap a window without destroying it.
+    SetVisible(IpcSetVisible),
+
+    /// Set a window's stacking level.
+    SetLevel(IpcSetLevel),
+
     /// Request real operating-system focus for a window.
     Focus(IpcTarget),
 
@@ -457,6 +473,13 @@ pub struct WindowOptions {
     #[cfg(any(unix, windows))]
     #[clap(short = 'w', long = "window-id", value_name = "WINDOW_ID")]
     pub ipc_window_id: Option<u64>,
+
+    /// Map the window without taking keyboard focus from the active application.
+    ///
+    /// A window created as another application's pane must not steal the keyboard from the host
+    /// that is about to position it.
+    #[clap(long)]
+    pub no_activate: bool,
 
     /// Terminal options which can be passed via IPC.
     #[clap(flatten)]
@@ -763,6 +786,79 @@ pub struct IpcResize {
     /// Exact physical client height in pixels.
     #[clap(long, requires = "width", conflicts_with_all = ["columns", "rows"], value_parser = clap::value_parser!(u32).range(1..))]
     pub height: Option<u32>,
+
+    #[clap(flatten)]
+    pub target: IpcTarget,
+}
+
+/// Parameters to the `set-geometry` IPC subcommand.
+#[cfg(any(unix, windows))]
+#[derive(Args, Serialize, Deserialize, Default, Debug, Clone, PartialEq, Eq)]
+pub struct IpcSetGeometry {
+    /// Physical-pixel X coordinate of the outer frame's top-left corner.
+    #[clap(long, requires = "y", allow_hyphen_values = true)]
+    pub x: Option<i32>,
+
+    /// Physical-pixel Y coordinate of the outer frame's top-left corner.
+    #[clap(long, requires = "x", allow_hyphen_values = true)]
+    pub y: Option<i32>,
+
+    /// Exact physical client width in pixels.
+    #[clap(long, requires = "height", value_parser = clap::value_parser!(u32).range(1..))]
+    pub width: Option<u32>,
+
+    /// Exact physical client height in pixels.
+    #[clap(long, requires = "width", value_parser = clap::value_parser!(u32).range(1..))]
+    pub height: Option<u32>,
+
+    #[clap(flatten)]
+    pub target: IpcTarget,
+}
+
+/// Parameters to the `set-visible` IPC subcommand.
+#[cfg(any(unix, windows))]
+#[derive(Args, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct IpcSetVisible {
+    /// Map the window when true, unmap it when false.
+    #[clap(long, action = ArgAction::Set, value_name = "BOOL")]
+    pub visible: bool,
+
+    #[clap(flatten)]
+    pub target: IpcTarget,
+}
+
+/// Window stacking level accepted by IPC.
+#[cfg(any(unix, windows))]
+#[derive(ValueEnum, Serialize, Deserialize, Default, Debug, Copy, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum IpcWindowLevel {
+    /// Ordered with ordinary windows by activation.
+    #[default]
+    Normal,
+    /// Ordered above ordinary windows, including other applications'.
+    AlwaysOnTop,
+    /// Ordered below ordinary windows.
+    AlwaysOnBottom,
+}
+
+#[cfg(any(unix, windows))]
+impl From<IpcWindowLevel> for winit::window::WindowLevel {
+    fn from(level: IpcWindowLevel) -> Self {
+        match level {
+            IpcWindowLevel::Normal => Self::Normal,
+            IpcWindowLevel::AlwaysOnTop => Self::AlwaysOnTop,
+            IpcWindowLevel::AlwaysOnBottom => Self::AlwaysOnBottom,
+        }
+    }
+}
+
+/// Parameters to the `set-level` IPC subcommand.
+#[cfg(any(unix, windows))]
+#[derive(Args, Serialize, Deserialize, Default, Debug, Clone, PartialEq, Eq)]
+pub struct IpcSetLevel {
+    /// Stacking level.
+    #[clap(value_enum)]
+    pub level: IpcWindowLevel,
 
     #[clap(flatten)]
     pub target: IpcTarget,
@@ -1243,6 +1339,84 @@ mod tests {
 
         assert!(!debug.contains("secret"));
         assert!(debug.contains("6 bytes"));
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn parse_window_layout_messages() {
+        let options = Options::try_parse_from([
+            "vivido",
+            "msg",
+            "set-geometry",
+            "--x",
+            "-100",
+            "--y",
+            "24",
+            "--width",
+            "800",
+            "--height",
+            "600",
+            "--window-id",
+            "42",
+        ])
+        .unwrap();
+        let Some(Subcommands::Msg(message)) = options.subcommands else {
+            panic!("expected msg subcommand");
+        };
+        assert_eq!(
+            message.message,
+            SocketMessage::SetGeometry(IpcSetGeometry {
+                x: Some(-100),
+                y: Some(24),
+                width: Some(800),
+                height: Some(600),
+                target: IpcTarget { window_id: Some(42) },
+            })
+        );
+
+        let options = Options::try_parse_from([
+            "vivido",
+            "msg",
+            "set-visible",
+            "--visible",
+            "false",
+            "--window-id",
+            "42",
+        ])
+        .unwrap();
+        let Some(Subcommands::Msg(message)) = options.subcommands else {
+            panic!("expected msg subcommand");
+        };
+        assert_eq!(
+            message.message,
+            SocketMessage::SetVisible(IpcSetVisible {
+                visible: false,
+                target: IpcTarget { window_id: Some(42) },
+            })
+        );
+
+        let options = Options::try_parse_from([
+            "vivido",
+            "msg",
+            "set-level",
+            "always-on-top",
+            "--window-id",
+            "42",
+        ])
+        .unwrap();
+        let Some(Subcommands::Msg(message)) = options.subcommands else {
+            panic!("expected msg subcommand");
+        };
+        assert_eq!(
+            message.message,
+            SocketMessage::SetLevel(IpcSetLevel {
+                level: IpcWindowLevel::AlwaysOnTop,
+                target: IpcTarget { window_id: Some(42) },
+            })
+        );
+
+        // A lone coordinate is not a position.
+        assert!(Options::try_parse_from(["vivido", "msg", "set-geometry", "--x", "10"]).is_err());
     }
 
     #[cfg(any(unix, windows))]

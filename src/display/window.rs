@@ -30,7 +30,7 @@ use winit::platform::windows::{IconExtWindows, WindowAttributesExtWindows};
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::{
     CursorIcon, Fullscreen, ImePurpose, Theme, UserAttentionType, Window as WinitWindow,
-    WindowAttributes, WindowId,
+    WindowAttributes, WindowId, WindowLevel,
 };
 
 use crate::terminal::index::Point;
@@ -98,6 +98,8 @@ static NEXT_HEADLESS_ID: AtomicU64 = AtomicU64::new(1 << 63);
 struct HeadlessWindow {
     id: WindowId,
     size: Cell<PhysicalSize<u32>>,
+    position: Cell<PhysicalPosition<i32>>,
+    visible: Cell<bool>,
     maximized: Cell<bool>,
     fullscreen: Cell<bool>,
     theme: Cell<Option<Theme>>,
@@ -109,6 +111,8 @@ impl HeadlessWindow {
         Self {
             id,
             size: Cell::new(size),
+            position: Cell::new(PhysicalPosition::new(0, 0)),
+            visible: Cell::new(true),
             maximized: Cell::new(false),
             fullscreen: Cell::new(false),
             theme: Cell::new(theme),
@@ -134,6 +138,13 @@ impl Backend {
         match self {
             Self::Winit(window) => window.inner_size(),
             Self::Headless(headless) => headless.size.get(),
+        }
+    }
+
+    fn outer_position(&self) -> Option<PhysicalPosition<i32>> {
+        match self {
+            Self::Winit(window) => window.outer_position().ok(),
+            Self::Headless(headless) => Some(headless.position.get()),
         }
     }
 
@@ -330,11 +341,69 @@ impl Window {
         self.backend.inner_size()
     }
 
+    /// Move the window's outer frame to a physical screen position.
+    #[inline]
+    pub fn set_outer_position(&self, position: PhysicalPosition<i32>) {
+        match &self.backend {
+            Backend::Winit(window) => window.set_outer_position(position),
+            // Nothing can refuse the request, so it takes effect immediately.
+            Backend::Headless(headless) => headless.position.set(position),
+        }
+    }
+
+    /// Physical screen position of the window's outer frame.
+    ///
+    /// [`None`] when the windowing system refuses to report one.
+    #[inline]
+    pub fn outer_position(&self) -> Option<PhysicalPosition<i32>> {
+        self.backend.outer_position()
+    }
+
     #[inline]
     pub fn set_visible(&self, visibility: bool) {
-        if let Some(window) = self.backend.winit() {
-            window.set_visible(visibility);
+        match &self.backend {
+            Backend::Winit(window) => window.set_visible(visibility),
+            Backend::Headless(headless) => headless.visible.set(visibility),
         }
+    }
+
+    /// Whether the window is currently mapped.
+    ///
+    /// [`None`] when the windowing system cannot answer.
+    #[inline]
+    pub fn is_visible(&self) -> Option<bool> {
+        match &self.backend {
+            Backend::Winit(window) => window.is_visible(),
+            Backend::Headless(headless) => Some(headless.visible.get()),
+        }
+    }
+
+    /// Set the window's stacking level relative to other windows.
+    #[inline]
+    pub fn set_window_level(&self, level: WindowLevel) {
+        if let Some(window) = self.backend.winit() {
+            window.set_window_level(level);
+        }
+    }
+
+    /// Map the window without making it key.
+    ///
+    /// Winit's `set_visible(true)` is `makeKeyAndOrderFront:`, which steals focus from whichever
+    /// application is active. A window used as another application's pane must appear without
+    /// taking the keyboard away from the host it is being attached to.
+    #[cfg(target_os = "macos")]
+    pub fn order_front_without_focus(&self) {
+        let view = match self.raw_window_handle() {
+            Some(RawWindowHandle::AppKit(handle)) => {
+                assert!(MainThreadMarker::new().is_some());
+                unsafe { handle.ns_view.cast::<NSView>().as_ref() }
+            },
+            _ => return,
+        };
+
+        // `orderFrontRegardless` also works across applications, which `orderFront:` does not do
+        // while another application is active — exactly the case a pane is created in.
+        view.window().unwrap().orderFrontRegardless();
     }
 
     #[inline]

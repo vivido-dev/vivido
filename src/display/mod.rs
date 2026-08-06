@@ -345,7 +345,16 @@ impl Display {
             == PhysicalSize::new(width, height)
     }
 
-    pub fn new(window: Window, config: &UiConfig, _tabbed: bool) -> Result<Display, Error> {
+    /// Build the renderer for `window` and map it.
+    ///
+    /// `no_activate` maps the window without taking the keyboard, which is what a window created
+    /// to serve as another application's pane needs.
+    pub fn new(
+        window: Window,
+        config: &UiConfig,
+        _tabbed: bool,
+        no_activate: bool,
+    ) -> Result<Display, Error> {
         let scale_factor = window.scale_factor as f32;
         let font_size = config.font.size().scale(scale_factor);
         let font = config.font.clone().with_size(font_size);
@@ -393,10 +402,21 @@ impl Display {
                 .set_resize_increments(PhysicalSize::new(metrics.cell_width, metrics.cell_height));
         }
 
-        window.set_visible(true);
-
         #[cfg(target_os = "macos")]
-        window.focus_window();
+        if no_activate {
+            window.order_front_without_focus();
+        } else {
+            window.set_visible(true);
+            window.focus_window();
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            // Mapping a window does not hand it the keyboard here, so the hint has nothing to
+            // suppress.
+            let _ = no_activate;
+            window.set_visible(true);
+        }
 
         #[allow(clippy::single_match)]
         #[cfg(not(windows))]

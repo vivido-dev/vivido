@@ -165,6 +165,19 @@ physical modifiers pressed.
   size is at least 2 by 1 and must fit renderer and PTY limits. Only one resize per window is active.
   Success waits for both the OS size and terminal/PTY size; failure after five seconds is
   `resize_mismatch` with requested/actual details where available.
+- `set_geometry {"x":X,"y":Y,"width":W,"height":H,"target":{...}}` moves the outer frame to a
+  physical screen position, resizes the client area to exact physical pixels, or both. Each pair is
+  all-or-nothing and at least one must be present. Unlike `resize`, it returns as soon as the
+  requests are issued rather than waiting for the windowing system, because a caller driving a
+  layout sends these continuously while dragging; subscribe to `moved` and `resized` for
+  confirmation. The result reports the resulting `x`, `y`, `width`, and `height`, with a null
+  position when the windowing system refuses to report one. Positioning a headless window returns
+  `unsupported`, since it is on no screen.
+- `set_visible {"visible":BOOL,"target":{...}}` maps or unmaps a window without destroying it.
+  Mapping deliberately does not take the keyboard, so an external layout owner can reveal a window
+  while its own stays focused.
+- `set_level {"level":"normal"|"always_on_top"|"always_on_bottom","target":{...}}` sets stacking
+  relative to other windows, including other applications'.
 - `focus {"window_id":ID}` requests real operating-system activation. It succeeds only after an
   actual focused event and otherwise returns `focus_denied` after two seconds. Vivido never
   synthesizes terminal focus state. On Wayland, the request uses `xdg_activation_v1` to obtain and
@@ -177,8 +190,8 @@ physical modifiers pressed.
 ### Discovery and inspection
 
 - `list_windows {}` returns `{"windows":[...]}` sorted by monotonic `creation_index`. Each entry
-  contains window ID, title, focus/occlusion/hold state, grid/pixel dimensions, process state, and
-  current screen/frame/output sequences.
+  contains window ID, title, focus/occlusion/visibility/hold state, grid/pixel dimensions, outer
+  frame position, process state, and current screen/frame/output sequences.
 - `inspect {"window_id":ID}` returns the list entry plus cell dimensions, scale, scrollback,
   display offset, primary/alternate screen, terminal mode names, cursor, selection, shell PID,
   foreground process group, optional executable basename/current directory, echo state, exit
@@ -283,7 +296,7 @@ Event frames have this shape:
 ```
 
 Kinds are `screen_changed`, `output`, `frame_presented`, `title_changed`, `focus_changed`, `resized`,
-`bell`, `child_exit`, `window_created`, `window_closed`, and `overflow`. Output data is split into
+`moved`, `bell`, `child_exit`, `window_created`, `window_closed`, and `overflow`. Output data is split into
 at most 64 KiB chunks with start/end offsets and base64 bytes. Screen-change data contains current
 row replacements. The process replay ring is bounded by both 4 MiB and 4,096 events.
 

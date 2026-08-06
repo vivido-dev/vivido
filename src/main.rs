@@ -147,7 +147,23 @@ impl Drop for TemporaryFiles {
 /// config change monitor, and runs the main display loop.
 fn vivido(mut options: Options) -> Result<(), Box<dyn Error>> {
     // Setup winit event loop.
+    #[cfg(not(target_os = "macos"))]
     let window_event_loop = EventLoop::<Event>::with_user_event().build()?;
+
+    // An accessory instance exists to serve another application's windows, so it takes neither a
+    // Dock icon nor the activation the frontmost application currently holds.
+    #[cfg(target_os = "macos")]
+    let window_event_loop = {
+        use winit::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS};
+
+        let mut builder = EventLoop::<Event>::with_user_event();
+        if options.accessory {
+            builder
+                .with_activation_policy(ActivationPolicy::Accessory)
+                .with_activate_ignoring_other_apps(false);
+        }
+        builder.build()?
+    };
 
     // Initialize the logger as soon as possible as to capture output from other subsystems.
     let log_file =

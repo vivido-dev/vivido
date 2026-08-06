@@ -39,6 +39,8 @@ desktop\:"\`desktop-surface-v1\`\: a virtual desktop in logical pixels, with no 
 '(-v)*-q[Reduces the level of verbosity (the min level is -qq)]' \
 '(-q)*-v[Increases the level of verbosity (the max level is -vvv)]' \
 '--daemon[Do not spawn an initial window]' \
+'--accessory[Run without a Dock icon or menu bar, and never activate over the frontmost application]' \
+'--no-activate[Map the window without taking keyboard focus from the active application]' \
 '--hold[Remain open after child process exit]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
@@ -85,6 +87,7 @@ desktop\:"\`desktop-surface-v1\`\: a virtual desktop in logical pixels, with no 
 '--class=[Defines the Wayland app_id \[default\: Vivido\]]:general> | <general>,<instance:_default' \
 '*-o+[Override configuration file options \[example\: '\''cursor.style="Beam"'\''\]]:OPTION:_default' \
 '*--option=[Override configuration file options \[example\: '\''cursor.style="Beam"'\''\]]:OPTION:_default' \
+'--no-activate[Map the window without taking keyboard focus from the active application]' \
 '--hold[Remain open after child process exit]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
@@ -359,6 +362,38 @@ _arguments "${_arguments_options[@]}" : \
 '--window-id=[Window ID. The focused window is used when this is omitted]:WINDOW_ID:_default' \
 '-h[Print help]' \
 '--help[Print help]' \
+&& ret=0
+;;
+(set-geometry)
+_arguments "${_arguments_options[@]}" : \
+'--x=[Physical-pixel X coordinate of the outer frame'\''s top-left corner]:X:_default' \
+'--y=[Physical-pixel Y coordinate of the outer frame'\''s top-left corner]:Y:_default' \
+'--width=[Exact physical client width in pixels]:WIDTH:_default' \
+'--height=[Exact physical client height in pixels]:HEIGHT:_default' \
+'-w+[Window ID. The focused window is used when this is omitted]:WINDOW_ID:_default' \
+'--window-id=[Window ID. The focused window is used when this is omitted]:WINDOW_ID:_default' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(set-visible)
+_arguments "${_arguments_options[@]}" : \
+'--visible=[Map the window when true, unmap it when false]:BOOL:(true false)' \
+'-w+[Window ID. The focused window is used when this is omitted]:WINDOW_ID:_default' \
+'--window-id=[Window ID. The focused window is used when this is omitted]:WINDOW_ID:_default' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(set-level)
+_arguments "${_arguments_options[@]}" : \
+'-w+[Window ID. The focused window is used when this is omitted]:WINDOW_ID:_default' \
+'--window-id=[Window ID. The focused window is used when this is omitted]:WINDOW_ID:_default' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+':level -- Stacking level:((normal\:"Ordered with ordinary windows by activation"
+always-on-top\:"Ordered above ordinary windows, including other applications'\''"
+always-on-bottom\:"Ordered below ordinary windows"))' \
 && ret=0
 ;;
 (focus)
@@ -652,6 +687,18 @@ esac
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
+(set-geometry)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(set-visible)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(set-level)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
 (focus)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
@@ -858,6 +905,18 @@ esac
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
+(set-geometry)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(set-visible)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(set-level)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
 (focus)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
@@ -1001,6 +1060,9 @@ _vivido__help__msg_commands() {
 'paste:Paste literal text into a terminal' \
 'mouse:Send a mouse action to a terminal or Vivido UI' \
 'resize:Resize a terminal window' \
+'set-geometry:Move and optionally resize a window'\''s outer frame' \
+'set-visible:Map or unmap a window without destroying it' \
+'set-level:Set a window'\''s stacking level' \
 'focus:Request real operating-system focus for a window' \
 'signal:Send an explicit signal to the foreground process group' \
 'list-windows:List all windows in deterministic creation order' \
@@ -1130,6 +1192,21 @@ _vivido__help__msg__screenshot_commands() {
     local commands; commands=()
     _describe -t commands 'vivido help msg screenshot commands' commands "$@"
 }
+(( $+functions[_vivido__help__msg__set-geometry_commands] )) ||
+_vivido__help__msg__set-geometry_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido help msg set-geometry commands' commands "$@"
+}
+(( $+functions[_vivido__help__msg__set-level_commands] )) ||
+_vivido__help__msg__set-level_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido help msg set-level commands' commands "$@"
+}
+(( $+functions[_vivido__help__msg__set-visible_commands] )) ||
+_vivido__help__msg__set-visible_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido help msg set-visible commands' commands "$@"
+}
 (( $+functions[_vivido__help__msg__signal_commands] )) ||
 _vivido__help__msg__signal_commands() {
     local commands; commands=()
@@ -1217,6 +1294,9 @@ _vivido__msg_commands() {
 'paste:Paste literal text into a terminal' \
 'mouse:Send a mouse action to a terminal or Vivido UI' \
 'resize:Resize a terminal window' \
+'set-geometry:Move and optionally resize a window'\''s outer frame' \
+'set-visible:Map or unmap a window without destroying it' \
+'set-level:Set a window'\''s stacking level' \
 'focus:Request real operating-system focus for a window' \
 'signal:Send an explicit signal to the foreground process group' \
 'list-windows:List all windows in deterministic creation order' \
@@ -1279,6 +1359,9 @@ _vivido__msg__help_commands() {
 'paste:Paste literal text into a terminal' \
 'mouse:Send a mouse action to a terminal or Vivido UI' \
 'resize:Resize a terminal window' \
+'set-geometry:Move and optionally resize a window'\''s outer frame' \
+'set-visible:Map or unmap a window without destroying it' \
+'set-level:Set a window'\''s stacking level' \
 'focus:Request real operating-system focus for a window' \
 'signal:Send an explicit signal to the foreground process group' \
 'list-windows:List all windows in deterministic creation order' \
@@ -1413,6 +1496,21 @@ _vivido__msg__help__resize_commands() {
 _vivido__msg__help__screenshot_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg help screenshot commands' commands "$@"
+}
+(( $+functions[_vivido__msg__help__set-geometry_commands] )) ||
+_vivido__msg__help__set-geometry_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg help set-geometry commands' commands "$@"
+}
+(( $+functions[_vivido__msg__help__set-level_commands] )) ||
+_vivido__msg__help__set-level_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg help set-level commands' commands "$@"
+}
+(( $+functions[_vivido__msg__help__set-visible_commands] )) ||
+_vivido__msg__help__set-visible_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg help set-visible commands' commands "$@"
 }
 (( $+functions[_vivido__msg__help__signal_commands] )) ||
 _vivido__msg__help__signal_commands() {
@@ -1613,6 +1711,21 @@ _vivido__msg__resize_commands() {
 _vivido__msg__screenshot_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg screenshot commands' commands "$@"
+}
+(( $+functions[_vivido__msg__set-geometry_commands] )) ||
+_vivido__msg__set-geometry_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg set-geometry commands' commands "$@"
+}
+(( $+functions[_vivido__msg__set-level_commands] )) ||
+_vivido__msg__set-level_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg set-level commands' commands "$@"
+}
+(( $+functions[_vivido__msg__set-visible_commands] )) ||
+_vivido__msg__set-visible_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg set-visible commands' commands "$@"
 }
 (( $+functions[_vivido__msg__signal_commands] )) ||
 _vivido__msg__signal_commands() {

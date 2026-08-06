@@ -435,7 +435,6 @@ impl Processor {
                 | WindowEvent::Destroyed
                 | WindowEvent::ThemeChanged(_)
                 | WindowEvent::HoveredFile(_)
-                | WindowEvent::Moved(_)
         )
     }
 
@@ -484,9 +483,10 @@ impl Processor {
     fn handle_ipc_request(&mut self, event_loop: LoopHandle<'_>, request: IpcRequest) {
         use crate::cli::{
             IpcConfig, IpcGetConfig, IpcGetGrid, IpcGetText, IpcInputRoute, IpcKey, IpcMouse,
-            IpcPaste, IpcResize, IpcScreenshot, IpcSignal, IpcSubscribe, IpcTarget, IpcTranscript,
-            IpcTyping, IpcWaitCommon, IpcWaitFrame, IpcWaitOutput, IpcWaitSequence, IpcWaitStable,
-            IpcWaitText, WindowOptions,
+            IpcPaste, IpcResize, IpcScreenshot, IpcSetGeometry, IpcSetLevel, IpcSetVisible,
+            IpcSignal, IpcSubscribe, IpcTarget, IpcTranscript, IpcTyping, IpcWaitCommon,
+            IpcWaitFrame, IpcWaitOutput, IpcWaitSequence, IpcWaitStable, IpcWaitText,
+            WindowOptions,
         };
 
         let result = match request.method.as_str() {
@@ -877,6 +877,68 @@ impl Processor {
                         Err(error) => Err(error),
                     }
                 }
+            },
+            "set_geometry" => {
+                let params: IpcSetGeometry = match decode_ipc_params(&request) {
+                    Ok(params) => params,
+                    Err(error) => {
+                        request.connection.error(request.id, error);
+                        return;
+                    },
+                };
+                match self.resolve_ipc_target(params.target.window_id) {
+                    Ok(target) => {
+                        let result = self.windows[&target].request_automation_geometry(
+                            params.x,
+                            params.y,
+                            params.width,
+                            params.height,
+                        );
+
+                        // A compositor answers a size request with `Resized`, which is what
+                        // reflows the grid and the PTY. Nothing will do that for a headless
+                        // window, whose size already changed, so deliver the same event here.
+                        if result.is_ok()
+                            && self.windows[&target].display.window.is_headless()
+                            && let (Some(width), Some(height)) = (params.width, params.height)
+                        {
+                            self.on_window_event(
+                                event_loop,
+                                target,
+                                WindowEvent::Resized(PhysicalSize::new(width, height)),
+                            );
+                        }
+
+                        result
+                    },
+                    Err(error) => Err(error),
+                }
+            },
+            "set_visible" => {
+                let params: IpcSetVisible = match decode_ipc_params(&request) {
+                    Ok(params) => params,
+                    Err(error) => {
+                        request.connection.error(request.id, error);
+                        return;
+                    },
+                };
+                self.resolve_ipc_target(params.target.window_id).map(|target| {
+                    self.windows[&target].set_automation_visible(params.visible);
+                    serde_json::json!({"visible": params.visible})
+                })
+            },
+            "set_level" => {
+                let params: IpcSetLevel = match decode_ipc_params(&request) {
+                    Ok(params) => params,
+                    Err(error) => {
+                        request.connection.error(request.id, error);
+                        return;
+                    },
+                };
+                self.resolve_ipc_target(params.target.window_id).map(|target| {
+                    self.windows[&target].set_automation_level(params.level);
+                    serde_json::json!({"level": params.level})
+                })
             },
             "signal" => {
                 let params: IpcSignal = match decode_ipc_params(&request) {
@@ -1985,6 +2047,9 @@ impl Processor {
             },
             WindowEvent::Resized(size) => {
                 Some(("resized", serde_json::json!({"width": size.width, "height": size.height})))
+            },
+            WindowEvent::Moved(position) => {
+                Some(("moved", serde_json::json!({"x": position.x, "y": position.y})))
             },
             _ => None,
         };

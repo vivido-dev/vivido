@@ -90,6 +90,9 @@ pub const METHODS: &[&str] = &[
     "paste",
     "mouse",
     "resize",
+    "set_geometry",
+    "set_visible",
+    "set_level",
     "focus",
     "signal",
     "list_windows",
@@ -121,6 +124,7 @@ pub const EVENT_KINDS: &[&str] = &[
     "title_changed",
     "focus_changed",
     "resized",
+    "moved",
     "bell",
     "child_exit",
     "window_created",
@@ -777,6 +781,9 @@ fn message_request(message: &SocketMessage) -> io::Result<(&'static str, Value)>
         SocketMessage::Paste(params) => Ok(("paste", serialize_params(params)?)),
         SocketMessage::Mouse(params) => Ok(("mouse", serialize_params(params)?)),
         SocketMessage::Resize(params) => Ok(("resize", serialize_params(params)?)),
+        SocketMessage::SetGeometry(params) => Ok(("set_geometry", serialize_params(params)?)),
+        SocketMessage::SetVisible(params) => Ok(("set_visible", serialize_params(params)?)),
+        SocketMessage::SetLevel(params) => Ok(("set_level", serialize_params(params)?)),
         SocketMessage::Focus(params) => Ok(("focus", serialize_params(params)?)),
         SocketMessage::Signal(params) => Ok(("signal", serialize_params(params)?)),
         SocketMessage::ListWindows => Ok(("list_windows", json!({}))),
@@ -830,6 +837,22 @@ fn validate_message(message: &SocketMessage) -> io::Result<()> {
             ErrorKind::InvalidInput,
             "resize requires either --columns/--rows or --width/--height",
         ));
+    }
+    if let SocketMessage::SetGeometry(params) = message {
+        if params.x.is_none() && params.width.is_none() {
+            return Err(IoError::new(
+                ErrorKind::InvalidInput,
+                "set-geometry requires --x/--y, --width/--height, or both",
+            ));
+        }
+        if params.x.is_some() != params.y.is_some()
+            || params.width.is_some() != params.height.is_some()
+        {
+            return Err(IoError::new(
+                ErrorKind::InvalidInput,
+                "set-geometry coordinate and size pairs must be complete",
+            ));
+        }
     }
     if let SocketMessage::Mouse(params) = message {
         let position = match &params.action {
@@ -899,6 +922,9 @@ fn write_cli_result(message: &SocketMessage, result: &Value) -> io::Result<()> {
         | SocketMessage::Paste(_)
         | SocketMessage::Mouse(_)
         | SocketMessage::Resize(_)
+        | SocketMessage::SetGeometry(_)
+        | SocketMessage::SetVisible(_)
+        | SocketMessage::SetLevel(_)
         | SocketMessage::Focus(_)
         | SocketMessage::Signal(_) => Ok(()),
     }
@@ -1216,9 +1242,13 @@ mod tests {
             "vivid_track_status",
             "vivid_scene_status",
             "wait_vivid_track",
+            "set_geometry",
+            "set_visible",
+            "set_level",
         ] {
             assert!(hello["methods"].as_array().unwrap().iter().any(|value| value == method));
         }
+        assert!(hello["event_kinds"].as_array().unwrap().iter().any(|value| value == "moved"));
         for retired in
             ["vivid_sources", "vivid_source_status", "vivid_milestones", "wait_vivid_source"]
         {

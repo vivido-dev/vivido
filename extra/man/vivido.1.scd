@@ -25,6 +25,16 @@ set of features with high performance.
 
 	Do not spawn an initial window.
 
+*--accessory*
+
+	macOS only. Run without a Dock icon or menu bar, and never activate over the
+	frontmost application. This is the shape for an instance whose windows are
+	panes of another application.
+
+*--no-activate*
+
+	Map the window without taking keyboard focus from the active application.
+
 *--print-events*
 
 	Print all events to STDOUT.

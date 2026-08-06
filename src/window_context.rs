@@ -170,7 +170,7 @@ impl WindowContext {
         options.window_identity.override_identity_config(&mut identity);
 
         let window = event_loop.create_window(&config, &identity, &mut options)?;
-        let display = Display::new(window, &config, false)?;
+        let display = Display::new(window, &config, false, options.no_activate)?;
 
         Self::new(display, config, options, proxy)
     }
@@ -194,7 +194,7 @@ impl WindowContext {
         let tabbed = false;
 
         let window = event_loop.create_window(&config, &identity, &mut options)?;
-        let display = Display::new(window, &config, tabbed)?;
+        let display = Display::new(window, &config, tabbed, options.no_activate)?;
 
         let mut window_context = Self::new(display, config, options, proxy)?;
 
@@ -1202,6 +1202,91 @@ impl WindowContext {
         self.display.window.focus_window();
     }
 
+    /// Move and optionally resize the window's outer frame.
+    ///
+    /// Position and size are applied without waiting for the windowing system to acknowledge
+    /// either one: a caller driving a layout issues these continuously while dragging, and a
+    /// per-request handshake would serialize the drag against the compositor. Callers that need
+    /// confirmation subscribe to `moved` and `resized`.
+    #[cfg(any(unix, windows))]
+    pub fn request_automation_geometry(
+        &self,
+        x: Option<i32>,
+        y: Option<i32>,
+        width: Option<u32>,
+        height: Option<u32>,
+    ) -> Result<Value, IpcError> {
+        if self.display.window.is_headless() && (x.is_some() || y.is_some()) {
+            return Err(IpcError::new(
+                "unsupported",
+                "a headless window has no screen to be positioned on",
+            ));
+        }
+
+        match (width, height) {
+            (Some(width), Some(height)) => {
+                self.request_automation_resize(None, None, Some(width), Some(height))?;
+            },
+            (None, None) => (),
+            _ => {
+                return Err(IpcError::new(
+                    "invalid_params",
+                    "set_geometry requires both width and height, or neither",
+                ));
+            },
+        }
+
+        match (x, y) {
+            (Some(x), Some(y)) => {
+                self.display.window.set_outer_position(winit::dpi::PhysicalPosition::new(x, y));
+            },
+            (None, None) => (),
+            _ => {
+                return Err(IpcError::new(
+                    "invalid_params",
+                    "set_geometry requires both x and y, or neither",
+                ));
+            },
+        }
+
+        if x.is_none() && width.is_none() {
+            return Err(IpcError::new(
+                "invalid_params",
+                "set_geometry requires a position, a size, or both",
+            ));
+        }
+
+        let pixels = self.display.window.inner_size();
+        let position = self.display.window.outer_position();
+        Ok(json_value!({
+            "x": position.map(|position| position.x),
+            "y": position.map(|position| position.y),
+            "width": pixels.width,
+            "height": pixels.height,
+        }))
+    }
+
+    /// Map or unmap the window.
+    ///
+    /// Mapping deliberately does not take the keyboard: an external layout owner reveals a pane
+    /// while its own window stays key.
+    #[cfg(any(unix, windows))]
+    pub fn set_automation_visible(&self, visible: bool) {
+        #[cfg(target_os = "macos")]
+        if visible && !self.display.window.is_headless() {
+            self.display.window.order_front_without_focus();
+            return;
+        }
+
+        self.display.window.set_visible(visible);
+    }
+
+    /// Set the window's stacking level.
+    #[cfg(any(unix, windows))]
+    pub fn set_automation_level(&self, level: crate::cli::IpcWindowLevel) {
+        self.display.window.set_window_level(level.into());
+    }
+
     /// Coalesce terminal-model mutations into one semantic screen sequence change.
     #[cfg(any(unix, windows))]
     pub fn sync_automation_screen(&mut self) -> Option<(u64, Option<Vec<u16>>)> {
@@ -1278,15 +1363,18 @@ impl WindowContext {
     fn automation_summary_with_terminal(&self, terminal: &Term<EventProxy>) -> Value {
         let size = self.display.size_info;
         let pixels = self.display.window.inner_size();
+        let position = self.display.window.outer_position();
         json_value!({
             "window_id": self.ipc_window_id,
             "creation_index": self.automation.creation_index,
             "title": self.display.window.title(),
             "focused": terminal.is_focused,
             "occluded": self.occluded,
+            "visible": self.display.window.is_visible(),
             "hold": self.display.window.hold,
             "grid": {"columns": size.columns(), "rows": size.screen_lines()},
             "pixels": {"width": pixels.width, "height": pixels.height},
+            "position": position.map(|position| json_value!({"x": position.x, "y": position.y})),
             "process": exit_status_json(self.automation.exit_status.as_ref()),
             "sequences": {
                 "screen": self.automation.screen_sequence,

@@ -180,6 +180,25 @@ variables were not inherited. Missing and unfocused targets return errors.
 	client pixels with _--width/--height_. Success waits for the OS and PTY resize;
 	the operation fails after five seconds if the actual size does not match.
 
+*set-geometry*
+
+	Move the outer frame with _--x/--y_, resize the client area with
+	_--width/--height_, or both. Each pair is all-or-nothing and at least one is
+	required. Coordinates and sizes are physical pixels. The request returns as
+	soon as it is issued rather than waiting for the windowing system; subscribe
+	to *moved* and *resized* to confirm. Positioning a headless window is
+	unsupported.
+
+*set-visible* _--visible BOOL_
+
+	Map or unmap a window without destroying it. Mapping does not take the
+	keyboard from the active application.
+
+*set-level* _normal|always-on-top|always-on-bottom_
+
+	Set window stacking relative to other windows, including other
+	applications'.
+
 *focus*
 
 	Request real operating-system focus. Success requires a real focused event
@@ -193,7 +212,8 @@ variables were not inherited. Missing and unfocused targets return errors.
 *list-windows*
 
 	Print deterministic JSON window discovery data including titles, focus/hold/
-	occlusion state, dimensions, process state, and automation sequences.
+	occlusion/visibility state, dimensions, outer frame position, process state,
+	and automation sequences.
 
 *inspect*
 
