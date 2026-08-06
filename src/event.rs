@@ -2563,6 +2563,7 @@ impl Processor {
             window.fail_automation_requests("pty_closed", "Vivido event loop is shutting down");
         }
         self.windows.clear();
+        crate::display::renderer::shutdown_window_render_context();
 
         // SAFETY: The clipboard must be dropped before the event loop, so use the nop clipboard
         // as a safe placeholder.

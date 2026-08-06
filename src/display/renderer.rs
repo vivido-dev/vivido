@@ -143,7 +143,19 @@ impl Default for SharedRenderContext {
 }
 
 thread_local! {
-    static WINDOW_RENDER_CONTEXT: SharedRenderContext = SharedRenderContext::new();
+    static WINDOW_RENDER_CONTEXT: RefCell<Option<SharedRenderContext>> = const { RefCell::new(None) };
+}
+
+fn window_render_context() -> SharedRenderContext {
+    WINDOW_RENDER_CONTEXT
+        .with(|slot| slot.borrow_mut().get_or_insert_with(SharedRenderContext::new).clone())
+}
+
+/// Drop the main-thread window render context before platform thread-local teardown begins.
+pub fn shutdown_window_render_context() {
+    WINDOW_RENDER_CONTEXT.with(|slot| {
+        slot.borrow_mut().take();
+    });
 }
 
 impl SceneRenderer {
@@ -157,7 +169,7 @@ impl SceneRenderer {
 
         let (context, surface, device, queue, target_size) = match source {
             RenderSource::Surface(window) => {
-                let context = WINDOW_RENDER_CONTEXT.with(Clone::clone);
+                let context = window_render_context();
                 let mut context_ref = context.0.borrow_mut();
                 let mut surface = block_on(context_ref.create_surface(
                     window,
@@ -524,8 +536,8 @@ fn surface_alpha_mode(alpha_modes: &[wgpu::CompositeAlphaMode]) -> wgpu::Composi
 #[cfg(test)]
 mod tests {
     use super::{
-        RenderSource, SceneRenderer, WINDOW_RENDER_CONTEXT, clamp_render_size, offscreen_device,
-        screenshot_layout, surface_alpha_mode,
+        RenderSource, SceneRenderer, clamp_render_size, offscreen_device, screenshot_layout,
+        surface_alpha_mode, window_render_context,
     };
     use std::rc::Rc;
     use std::sync::{Mutex, MutexGuard};
@@ -543,8 +555,8 @@ mod tests {
 
     #[test]
     fn window_renderers_reuse_the_thread_render_context() {
-        let first = WINDOW_RENDER_CONTEXT.with(Clone::clone);
-        let second = WINDOW_RENDER_CONTEXT.with(Clone::clone);
+        let first = window_render_context();
+        let second = window_render_context();
         assert!(Rc::ptr_eq(&first.0, &second.0));
     }
 
