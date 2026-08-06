@@ -91,6 +91,7 @@ pub const METHODS: &[&str] = &[
     "mouse",
     "resize",
     "set_geometry",
+    "set_geometry_batch",
     "set_visible",
     "set_level",
     "focus",

@@ -815,6 +815,18 @@ pub struct IpcSetGeometry {
     pub target: IpcTarget,
 }
 
+/// Parameters to the `set_geometry_batch` IPC method.
+///
+/// Several geometry updates applied in one request, so a layout owner moving a whole window full
+/// of panes commits them in a single pass instead of one window at a time. This method has no CLI
+/// subcommand: it exists for the automation protocol.
+#[cfg(any(unix, windows))]
+#[derive(Serialize, Deserialize, Default, Debug, Clone, PartialEq, Eq)]
+pub struct IpcSetGeometryBatch {
+    /// The per-window geometry updates to apply together, in order.
+    pub items: Vec<IpcSetGeometry>,
+}
+
 /// Parameters to the `set-visible` IPC subcommand.
 #[cfg(any(unix, windows))]
 #[derive(Args, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]

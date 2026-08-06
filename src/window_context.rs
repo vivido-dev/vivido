@@ -1271,14 +1271,29 @@ impl WindowContext {
     /// Mapping deliberately does not take the keyboard: an external layout owner reveals a pane
     /// while its own window stays key.
     #[cfg(any(unix, windows))]
-    pub fn set_automation_visible(&self, visible: bool) {
+    pub fn set_automation_visible(&mut self, visible: bool) {
         #[cfg(target_os = "macos")]
-        if visible && !self.display.window.is_headless() {
+        let mapped_without_focus = visible && !self.display.window.is_headless();
+        #[cfg(not(target_os = "macos"))]
+        let mapped_without_focus = false;
+
+        if mapped_without_focus {
+            #[cfg(target_os = "macos")]
             self.display.window.order_front_without_focus();
-            return;
+        } else {
+            self.display.window.set_visible(visible);
         }
 
-        self.display.window.set_visible(visible);
+        // A window an external layout owner just revealed is on screen now, but an automation show
+        // carries no focus, resize, or occlusion event to mark it dirty — and `draw` suppresses a
+        // frame entirely while the window is still flagged occluded (it was created behind the
+        // host). Clear that flag and ask for the one frame, so a revealed pane paints on show
+        // rather than only on the first click into it.
+        if visible && !self.display.window.is_headless() {
+            self.occluded = false;
+            self.dirty = true;
+            self.display.window.request_redraw();
+        }
     }
 
     /// Set the window's stacking level.

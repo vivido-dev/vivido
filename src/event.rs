@@ -483,10 +483,10 @@ impl Processor {
     fn handle_ipc_request(&mut self, event_loop: LoopHandle<'_>, request: IpcRequest) {
         use crate::cli::{
             IpcConfig, IpcGetConfig, IpcGetGrid, IpcGetText, IpcInputRoute, IpcKey, IpcMouse,
-            IpcPaste, IpcResize, IpcScreenshot, IpcSetGeometry, IpcSetLevel, IpcSetVisible,
-            IpcSignal, IpcSubscribe, IpcTarget, IpcTranscript, IpcTyping, IpcWaitCommon,
-            IpcWaitFrame, IpcWaitOutput, IpcWaitSequence, IpcWaitStable, IpcWaitText,
-            WindowOptions,
+            IpcPaste, IpcResize, IpcScreenshot, IpcSetGeometry, IpcSetGeometryBatch, IpcSetLevel,
+            IpcSetVisible, IpcSignal, IpcSubscribe, IpcTarget, IpcTranscript, IpcTyping,
+            IpcWaitCommon, IpcWaitFrame, IpcWaitOutput, IpcWaitSequence, IpcWaitStable,
+            IpcWaitText, WindowOptions,
         };
 
         let result = match request.method.as_str() {
@@ -914,6 +914,59 @@ impl Processor {
                     Err(error) => Err(error),
                 }
             },
+            "set_geometry_batch" => {
+                let params: IpcSetGeometryBatch = match decode_ipc_params(&request) {
+                    Ok(params) => params,
+                    Err(error) => {
+                        request.connection.error(request.id, error);
+                        return;
+                    },
+                };
+
+                // Apply every window's geometry within this one request so the moves land in a
+                // single pass and the window server presents them together, instead of one window
+                // trailing the next as a per-window round trip would. A window that closed mid-drag
+                // is skipped rather than aborting its neighbours: the next sync no longer names it.
+                let mut applied = Vec::with_capacity(params.items.len());
+                let mut headless_resizes = Vec::new();
+                for item in &params.items {
+                    let Ok(target) = self.resolve_ipc_target(item.target.window_id) else {
+                        continue;
+                    };
+                    let Ok(mut value) = self.windows[&target].request_automation_geometry(
+                        item.x,
+                        item.y,
+                        item.width,
+                        item.height,
+                    ) else {
+                        continue;
+                    };
+                    if let Some(map) = value.as_object_mut() {
+                        map.insert(
+                            "window_id".to_string(),
+                            serde_json::json!(self.windows[&target].ipc_window_id()),
+                        );
+                    }
+                    applied.push(value);
+                    if self.windows[&target].display.window.is_headless()
+                        && let (Some(width), Some(height)) = (item.width, item.height)
+                    {
+                        headless_resizes.push((target, width, height));
+                    }
+                }
+
+                // A compositor answers each size request with `Resized`; nothing does for a
+                // headless window, so deliver those here as the single-window path does.
+                for (target, width, height) in headless_resizes {
+                    self.on_window_event(
+                        event_loop,
+                        target,
+                        WindowEvent::Resized(PhysicalSize::new(width, height)),
+                    );
+                }
+
+                Ok(serde_json::json!({ "items": applied }))
+            },
             "set_visible" => {
                 let params: IpcSetVisible = match decode_ipc_params(&request) {
                     Ok(params) => params,
@@ -923,7 +976,9 @@ impl Processor {
                     },
                 };
                 self.resolve_ipc_target(params.target.window_id).map(|target| {
-                    self.windows[&target].set_automation_visible(params.visible);
+                    if let Some(window) = self.windows.get_mut(&target) {
+                        window.set_automation_visible(params.visible);
+                    }
                     serde_json::json!({"visible": params.visible})
                 })
             },
