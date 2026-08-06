@@ -9,13 +9,6 @@
 // See https://msdn.microsoft.com/en-us/library/4cc7ya5b.aspx for more details.
 #![windows_subsystem = "windows"]
 
-// The internal derive library generates paths through `vivido_config`. Expose this binary crate
-// under that name so generated implementations use the local runtime trait.
-extern crate self as vivido_config;
-
-#[cfg(all(not(feature = "wayland"), not(any(target_os = "macos", windows))))]
-compile_error!(r#"the "wayland" feature must be enabled on Linux and other Unix desktops"#);
-
 use std::error::Error;
 use std::fmt::Write as _;
 use std::io::{self, Write};
@@ -27,46 +20,21 @@ use log::info;
 use windows_sys::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole, FreeConsole};
 use winit::event_loop::EventLoop;
 
-use crate::terminal::tty;
-
-mod automation;
-mod cli;
-mod clipboard;
-mod config;
-mod daemon;
-mod display;
-mod event;
-mod headless;
-mod input;
-mod logging;
 #[cfg(target_os = "macos")]
-mod macos;
-mod message_bar;
+use vivido::binary::macos::{self, locale};
 #[cfg(windows)]
-mod panic;
-mod polling;
-mod scheduler;
-mod screenshot;
-mod serde_replace;
-mod session;
-mod string;
-pub mod terminal;
-mod vivid;
-mod window_context;
-
-pub use crate::serde_replace::SerdeReplace;
-
-use crate::cli::MessageOptions;
-use crate::cli::Options;
+use vivido::binary::panic;
+use vivido::binary::polling::{IoListener, ipc};
+use vivido::binary::{headless, logging, session};
+use vivido::cli::MessageOptions;
+use vivido::cli::Options;
 #[cfg(not(any(target_os = "macos", windows)))]
-use crate::cli::SocketMessage;
-use crate::cli::Subcommands;
-use crate::config::UiConfig;
-use crate::config::monitor::ConfigMonitor;
-use crate::event::{Event, EventSink, Processor};
-#[cfg(target_os = "macos")]
-use crate::macos::locale;
-use crate::polling::{IoListener, ipc};
+use vivido::cli::SocketMessage;
+use vivido::cli::Subcommands;
+use vivido::config;
+use vivido::config::UiConfig;
+use vivido::event::{Event, EventSink, Processor};
+use vivido::terminal::tty;
 
 fn main() -> Result<(), Box<dyn Error>> {
     #[cfg(windows)]

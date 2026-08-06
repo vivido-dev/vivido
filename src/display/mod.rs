@@ -1310,6 +1310,12 @@ pub struct FrameTimer {
     refresh_interval: Duration,
 }
 
+impl Default for FrameTimer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl FrameTimer {
     pub fn new() -> Self {
         let now = Instant::now();

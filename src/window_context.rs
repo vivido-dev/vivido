@@ -14,6 +14,7 @@ use std::io::Write;
 use std::mem;
 #[cfg(not(windows))]
 use std::os::unix::io::{AsRawFd, RawFd};
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 #[cfg(any(unix, windows))]
@@ -617,6 +618,24 @@ impl WindowContext {
     /// ID of this terminal context.
     pub fn id(&self) -> WindowId {
         self.display.window.id()
+    }
+
+    /// Current terminal window title.
+    pub fn title(&self) -> &str {
+        self.display.window.title()
+    }
+
+    /// Working directory of the foreground process, when the platform can report it.
+    pub fn current_directory(&self) -> Option<PathBuf> {
+        #[cfg(not(windows))]
+        {
+            crate::daemon::foreground_process_path(self.master_fd, self.shell_pid).ok()
+        }
+
+        #[cfg(windows)]
+        {
+            None
+        }
     }
 
     /// Stable external ID used to target this window through IPC.
@@ -1418,13 +1437,8 @@ impl WindowContext {
         let executable = foreground_pgid.and_then(foreground_executable_basename);
         #[cfg(windows)]
         let executable = None::<String>;
-        #[cfg(unix)]
         let current_directory =
-            crate::daemon::foreground_process_path(self.master_fd, self.shell_pid)
-                .ok()
-                .map(|path| path.to_string_lossy().into_owned());
-        #[cfg(windows)]
-        let current_directory = None::<String>;
+            self.current_directory().map(|path| path.to_string_lossy().into_owned());
         #[cfg(unix)]
         let mut attributes = std::mem::MaybeUninit::<libc::termios>::uninit();
         #[cfg(unix)]

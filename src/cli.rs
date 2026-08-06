@@ -11,6 +11,8 @@ use log::{LevelFilter, error};
 use serde::{Deserialize, Serialize};
 use toml::Value;
 use vivido_config::SerdeReplace;
+#[cfg(target_os = "macos")]
+use winit::raw_window_handle::RawWindowHandle;
 
 use crate::terminal::tty::Options as PtyOptions;
 
@@ -455,6 +457,38 @@ pub enum SocketMessage {
     Subscribe(IpcSubscribe),
 }
 
+/// A raw parent handle that can cross the event-loop proxy boundary.
+///
+/// Winit uses the same wrapper internally for child-window attributes. The handle is only
+/// dereferenced by the windowing system on the main event-loop thread.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ParentWindowHandle(RawWindowHandle);
+
+#[cfg(target_os = "macos")]
+impl ParentWindowHandle {
+    /// Wrap a raw handle for use as a child window's parent.
+    ///
+    /// # Safety
+    ///
+    /// The parent window must remain valid until after every child created with this handle has
+    /// been destroyed.
+    pub unsafe fn new(handle: RawWindowHandle) -> Self {
+        Self(handle)
+    }
+
+    pub(crate) fn raw(self) -> RawWindowHandle {
+        self.0
+    }
+}
+
+// SAFETY: The constructor requires the owner to keep the parent alive, and Vivido only uses the
+// handle to create the child on the main event-loop thread.
+#[cfg(target_os = "macos")]
+unsafe impl Send for ParentWindowHandle {}
+#[cfg(target_os = "macos")]
+unsafe impl Sync for ParentWindowHandle {}
+
 /// Subset of options that we pass to 'create-window' IPC subcommand.
 #[derive(Serialize, Deserialize, Args, Default, Clone, Debug, PartialEq, Eq)]
 pub struct WindowOptions {
@@ -493,6 +527,12 @@ pub struct WindowOptions {
     #[cfg(target_os = "macos")]
     /// The window tabbing identifier to use when building a window.
     pub window_tabbing_id: Option<String>,
+
+    #[clap(skip)]
+    #[serde(skip)]
+    #[cfg(target_os = "macos")]
+    /// Parent window for an in-process embedded pane.
+    pub parent_window: Option<ParentWindowHandle>,
 
     #[clap(skip)]
     #[cfg(not(any(target_os = "macos", windows)))]

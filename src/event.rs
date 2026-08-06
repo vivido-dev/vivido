@@ -2032,6 +2032,24 @@ impl Processor {
 
         info!("Initialisation complete");
     }
+
+    /// Route one winit event through Vivido's embedded event processor.
+    ///
+    /// An in-process host can use this instead of exposing the processor's window map, clipboard,
+    /// scheduler, or individual lifecycle handlers.
+    pub fn handle_winit_event(&mut self, event_loop: &ActiveEventLoop, event: WinitEvent<Event>) {
+        let event_loop = LoopHandle::Winit(event_loop);
+        match event {
+            WinitEvent::NewEvents(StartCause::Init) => self.on_init(event_loop),
+            WinitEvent::WindowEvent { window_id, event } => {
+                self.on_window_event(event_loop, window_id, event);
+            },
+            WinitEvent::UserEvent(event) => self.on_user_event(event_loop, event),
+            WinitEvent::AboutToWait => self.on_about_to_wait(event_loop),
+            WinitEvent::LoopExiting => self.on_exiting(),
+            _ => (),
+        }
+    }
 }
 
 impl ApplicationHandler<Event> for Processor {

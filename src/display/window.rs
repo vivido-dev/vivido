@@ -245,6 +245,14 @@ impl Window {
             .with_fullscreen(config.window.fullscreen())
             .with_window_level(config.window.level.into());
 
+        #[cfg(target_os = "macos")]
+        if let Some(parent) = options.parent_window {
+            // SAFETY: `ParentWindowHandle::new` requires the caller to keep the parent alive until
+            // after its children. Window creation and all subsequent access happen on this active
+            // event-loop thread.
+            window_attributes = unsafe { window_attributes.with_parent_window(Some(parent.raw())) };
+        }
+
         let window = Arc::new(event_loop.create_window(window_attributes)?);
 
         // Text cursor.
@@ -339,6 +347,12 @@ impl Window {
     #[inline]
     pub fn inner_size(&self) -> PhysicalSize<u32> {
         self.backend.inner_size()
+    }
+
+    /// Current window scale factor.
+    #[inline]
+    pub fn scale_factor(&self) -> f64 {
+        self.scale_factor
     }
 
     /// Move the window's outer frame to a physical screen position.
