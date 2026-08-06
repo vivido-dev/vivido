@@ -1,3 +1,5 @@
+use std::cell::RefCell;
+use std::rc::Rc;
 #[cfg(any(unix, windows))]
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 #[cfg(any(unix, windows))]
@@ -101,7 +103,7 @@ impl std::error::Error for Error {}
 
 pub struct SceneRenderer {
     /// Owns the wgpu instance and the surface's device. Absent when rendering offscreen.
-    context: Option<RenderContext>,
+    context: Option<SharedRenderContext>,
     /// Absent when rendering offscreen: there is no windowing-system surface to present to.
     surface: Option<Box<RenderSurface<'static>>>,
     renderer: Renderer,
@@ -120,6 +122,30 @@ pub struct SceneRenderer {
     has_rendered_frame: bool,
 }
 
+/// Main-thread render context shared by every window surface.
+///
+/// Vello keeps adapters/devices in the context, so reusing it prevents each terminal pane and
+/// host chrome surface from allocating another wgpu device. Renderers remain surface-local and
+/// are driven serially by the application's event loop.
+#[derive(Clone)]
+pub struct SharedRenderContext(Rc<RefCell<RenderContext>>);
+
+impl SharedRenderContext {
+    pub fn new() -> Self {
+        Self(Rc::new(RefCell::new(RenderContext::new())))
+    }
+}
+
+impl Default for SharedRenderContext {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+thread_local! {
+    static WINDOW_RENDER_CONTEXT: SharedRenderContext = SharedRenderContext::new();
+}
+
 impl SceneRenderer {
     pub fn new(
         source: RenderSource,
@@ -131,8 +157,9 @@ impl SceneRenderer {
 
         let (context, surface, device, queue, target_size) = match source {
             RenderSource::Surface(window) => {
-                let mut context = RenderContext::new();
-                let mut surface = block_on(context.create_surface(
+                let context = WINDOW_RENDER_CONTEXT.with(Clone::clone);
+                let mut context_ref = context.0.borrow_mut();
+                let mut surface = block_on(context_ref.create_surface(
                     window,
                     size.width.max(1),
                     size.height.max(1),
@@ -142,10 +169,10 @@ impl SceneRenderer {
 
                 let alpha_modes = &surface
                     .surface
-                    .get_capabilities(context.devices[surface.dev_id].adapter())
+                    .get_capabilities(context_ref.devices[surface.dev_id].adapter())
                     .alpha_modes;
                 surface.config.alpha_mode = surface_alpha_mode(alpha_modes);
-                context.configure_surface(&surface);
+                context_ref.configure_surface(&surface);
 
                 if surface.config.alpha_mode == wgpu::CompositeAlphaMode::PostMultiplied {
                     log::info!("Surface alpha mode: {:?}", surface.config.alpha_mode);
@@ -156,9 +183,10 @@ impl SceneRenderer {
                     );
                 }
 
-                let handle = &context.devices[surface.dev_id];
+                let handle = &context_ref.devices[surface.dev_id];
                 let (device, queue) = (handle.device.clone(), handle.queue.clone());
                 let target_size = PhysicalSize::new(surface.config.width, surface.config.height);
+                drop(context_ref);
                 (Some(context), Some(Box::new(surface)), device, queue, target_size)
             },
             RenderSource::Offscreen => {
@@ -209,7 +237,7 @@ impl SceneRenderer {
         }
 
         if let (Some(context), Some(surface)) = (&self.context, &mut self.surface) {
-            context.resize_surface(surface, size.width, size.height);
+            context.0.borrow().resize_surface(surface, size.width, size.height);
         }
         (self.render_target, self.render_target_view) =
             create_render_target(&self.device, size.width, size.height);
@@ -257,7 +285,7 @@ impl SceneRenderer {
                 },
                 wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Outdated => {
                     if let (Some(context), Some(surface)) = (&self.context, &mut self.surface) {
-                        context.resize_surface(surface, width.max(1), height.max(1));
+                        context.0.borrow().resize_surface(surface, width.max(1), height.max(1));
                     }
                     return Ok(false);
                 },
@@ -496,9 +524,10 @@ fn surface_alpha_mode(alpha_modes: &[wgpu::CompositeAlphaMode]) -> wgpu::Composi
 #[cfg(test)]
 mod tests {
     use super::{
-        RenderSource, SceneRenderer, clamp_render_size, offscreen_device, screenshot_layout,
-        surface_alpha_mode,
+        RenderSource, SceneRenderer, WINDOW_RENDER_CONTEXT, clamp_render_size, offscreen_device,
+        screenshot_layout, surface_alpha_mode,
     };
+    use std::rc::Rc;
     use std::sync::{Mutex, MutexGuard};
 
     use vello::peniko::Color;
@@ -511,6 +540,13 @@ mod tests {
     /// Several drivers fault when two devices are created concurrently in one process, and the
     /// test harness runs tests on parallel threads by default.
     static GPU: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn window_renderers_reuse_the_thread_render_context() {
+        let first = WINDOW_RENDER_CONTEXT.with(Clone::clone);
+        let second = WINDOW_RENDER_CONTEXT.with(Clone::clone);
+        assert!(Rc::ptr_eq(&first.0, &second.0));
+    }
 
     fn gpu_lock() -> MutexGuard<'static, ()> {
         GPU.lock().unwrap_or_else(|err| err.into_inner())
