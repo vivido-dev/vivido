@@ -11,7 +11,9 @@ use parley::{
     StyleProperty,
 };
 use unicode_script::UnicodeScript as _;
-use vello::peniko::Color;
+use vello::kurbo::Affine;
+use vello::peniko::{Brush, Color, Fill};
+use vello::{Glyph, Scene};
 
 use crate::terminal::term::cell::Flags;
 
@@ -149,6 +151,60 @@ impl TextSystem {
         italic: bool,
     ) -> Arc<Layout<()>> {
         self.shape_char(character, font_variant_from_style(bold, italic))
+    }
+
+    /// Shape and paint one UI text run at a physical-pixel origin.
+    ///
+    /// This uses the same font fallback, named-style, and glyph positioning path as terminal text,
+    /// allowing an embedding shell to draw chrome without maintaining a second text stack.
+    pub fn paint_text(
+        &mut self,
+        scene: &mut Scene,
+        text: &str,
+        origin: (f32, f32),
+        color: Rgb,
+        bold: bool,
+    ) -> f32 {
+        if text.is_empty() {
+            return 0.0;
+        }
+
+        let layout = self.shape_text(text.to_owned(), font_variant_from_style(bold, false));
+        let transform = Affine::translate((f64::from(origin.0), f64::from(origin.1)));
+        let brush = Brush::Solid(color_from_rgb(color));
+
+        for line in layout.lines() {
+            for item in line.items() {
+                let PositionedLayoutItem::GlyphRun(glyph_run) = item else {
+                    continue;
+                };
+
+                let run = glyph_run.run();
+                let mut cursor_x = glyph_run.offset();
+                let baseline = glyph_run.baseline();
+                scene
+                    .draw_glyphs(run.font())
+                    .brush(&brush)
+                    .hint(false)
+                    .transform(transform)
+                    .font_size(run.font_size())
+                    .normalized_coords(run.normalized_coords())
+                    .draw(
+                        Fill::NonZero,
+                        glyph_run.glyphs().map(|glyph| {
+                            let positioned = Glyph {
+                                id: glyph.id,
+                                x: cursor_x + glyph.x,
+                                y: baseline - glyph.y,
+                            };
+                            cursor_x += glyph.advance;
+                            positioned
+                        }),
+                    );
+            }
+        }
+
+        layout.full_width()
     }
 
     fn shape_char(&mut self, character: char, variant: FontVariant) -> Arc<Layout<()>> {

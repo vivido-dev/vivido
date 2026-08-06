@@ -52,15 +52,15 @@ pub mod color;
 pub mod content;
 pub mod cursor;
 pub mod hint;
+pub mod rects;
+pub mod renderer;
+pub mod text;
 pub mod window;
 
 mod bell;
 mod damage;
 mod media;
 mod meter;
-mod rects;
-mod renderer;
-mod text;
 
 #[cfg(any(unix, windows))]
 #[cfg(test)]
