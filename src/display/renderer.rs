@@ -9,7 +9,7 @@ use pollster::block_on;
 use vello::peniko::Color;
 use vello::util::{RenderContext, RenderSurface};
 use vello::{AaConfig, AaSupport, RenderParams, Renderer, RendererOptions, Scene, wgpu};
-use winit::dpi::PhysicalSize;
+use winit::dpi::{PhysicalPosition, PhysicalSize};
 
 use crate::terminal::graphics::GraphicsCommand;
 
@@ -26,6 +26,7 @@ pub enum Error {
     Render(vello::Error),
     SurfaceValidation,
     NoOffscreenAdapter(String),
+    NoWindowDevice,
 }
 
 /// Maximum raw screenshot readback allocation.
@@ -95,6 +96,9 @@ impl std::fmt::Display for Error {
             Self::Render(err) => write!(f, "failed to render scene: {err}"),
             Self::SurfaceValidation => write!(f, "surface texture validation failed"),
             Self::NoOffscreenAdapter(err) => write!(f, "{err}"),
+            Self::NoWindowDevice => {
+                f.write_str("an embedded renderer requires an initialized window renderer")
+            },
         }
     }
 }
@@ -120,6 +124,18 @@ pub struct SceneRenderer {
     /// Whether `render_target` holds a frame. Screenshots read that texture, not the swapchain,
     /// so this is set by both the windowed and the offscreen path.
     has_rendered_frame: bool,
+}
+
+/// Latest GPU frame retained by an embedded Vivido window.
+pub struct EmbeddedFrame<'a> {
+    texture: &'a wgpu::Texture,
+    pub size: PhysicalSize<u32>,
+}
+
+/// Placement of an embedded frame in a window render target.
+pub struct EmbeddedFramePlacement<'a> {
+    pub frame: EmbeddedFrame<'a>,
+    pub origin: PhysicalPosition<u32>,
 }
 
 /// Main-thread render context shared by every window surface.
@@ -241,6 +257,19 @@ impl SceneRenderer {
                     Rc::new(RefCell::new(create_renderer(&device).map_err(Error::CreateRenderer)?));
                 (None, None, device, queue, target_size, renderer)
             },
+            RenderSource::Embedded => {
+                let context = window_render_context();
+                let mut context_ref = context.0.borrow_mut();
+                let Some(handle) = context_ref.context.devices.first() else {
+                    return Err(Error::NoWindowDevice);
+                };
+                let (device, queue) = (handle.device.clone(), handle.queue.clone());
+                let renderer =
+                    context_ref.renderer_for(0, &device).map_err(Error::CreateRenderer)?;
+                let target_size = PhysicalSize::new(size.width.max(1), size.height.max(1));
+                drop(context_ref);
+                (Some(context), None, device, queue, target_size, renderer)
+            },
         };
 
         let max_surface_dimension = device.limits().max_texture_dimension_2d.min(8192);
@@ -304,6 +333,15 @@ impl SceneRenderer {
     }
 
     pub fn render(&mut self, scene: &Scene, base_color: Color) -> Result<bool, Error> {
+        self.render_composited(scene, base_color, &[])
+    }
+
+    pub fn render_composited(
+        &mut self,
+        scene: &Scene,
+        base_color: Color,
+        frames: &[EmbeddedFramePlacement<'_>],
+    ) -> Result<bool, Error> {
         if !self.valid_target {
             return Ok(false);
         }
@@ -345,6 +383,39 @@ impl SceneRenderer {
             )
             .map_err(Error::Render)?;
 
+        if !frames.is_empty() {
+            let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Vivido.vello.embedded_composite"),
+            });
+            for placement in frames {
+                let PhysicalSize { width, height } =
+                    embedded_copy_extent(placement.frame.size, placement.origin, self.target_size);
+                if width == 0 || height == 0 {
+                    continue;
+                }
+                encoder.copy_texture_to_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: placement.frame.texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &self.render_target,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d {
+                            x: placement.origin.x,
+                            y: placement.origin.y,
+                            z: 0,
+                        },
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+                );
+            }
+            self.queue.submit([encoder.finish()]);
+        }
+
         // The offscreen target is the finished image; only a windowed renderer blits and presents.
         if let (Some(surface), Some(surface_texture)) = (&self.surface, surface_texture) {
             let surface_view =
@@ -366,6 +437,11 @@ impl SceneRenderer {
         let _ = self.device.poll(wgpu::PollType::Poll);
 
         Ok(true)
+    }
+
+    pub fn embedded_frame(&self) -> Option<EmbeddedFrame<'_>> {
+        self.has_rendered_frame
+            .then_some(EmbeddedFrame { texture: &self.render_target, size: self.target_size })
     }
 
     /// Whether the render target holds a frame a screenshot could read.
@@ -455,6 +531,17 @@ impl SceneRenderer {
     }
 }
 
+fn embedded_copy_extent(
+    source: PhysicalSize<u32>,
+    origin: PhysicalPosition<u32>,
+    target: PhysicalSize<u32>,
+) -> PhysicalSize<u32> {
+    PhysicalSize::new(
+        source.width.min(target.width.saturating_sub(origin.x)),
+        source.height.min(target.height.saturating_sub(origin.y)),
+    )
+}
+
 impl Drop for SceneRenderer {
     fn drop(&mut self) {
         self.media.clear_target(&mut self.renderer.borrow_mut());
@@ -540,7 +627,8 @@ fn create_render_target(
         format: wgpu::TextureFormat::Rgba8Unorm,
         usage: wgpu::TextureUsages::STORAGE_BINDING
             | wgpu::TextureUsages::TEXTURE_BINDING
-            | wgpu::TextureUsages::COPY_SRC,
+            | wgpu::TextureUsages::COPY_SRC
+            | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     });
     let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -575,8 +663,8 @@ fn surface_alpha_mode(alpha_modes: &[wgpu::CompositeAlphaMode]) -> wgpu::Composi
 #[cfg(test)]
 mod tests {
     use super::{
-        RenderSource, SceneRenderer, SharedRenderContext, clamp_render_size, offscreen_device,
-        screenshot_layout, shutdown_window_render_context, surface_alpha_mode,
+        RenderSource, SceneRenderer, SharedRenderContext, clamp_render_size, embedded_copy_extent,
+        offscreen_device, screenshot_layout, shutdown_window_render_context, surface_alpha_mode,
         window_render_context,
     };
     use std::rc::Rc;
@@ -585,7 +673,7 @@ mod tests {
     use vello::peniko::Color;
     use vello::wgpu::CompositeAlphaMode;
     use vello::{Scene, kurbo};
-    use winit::dpi::PhysicalSize;
+    use winit::dpi::{PhysicalPosition, PhysicalSize};
 
     /// Serializes tests that create a wgpu device.
     ///
@@ -710,6 +798,26 @@ mod tests {
         assert_eq!(
             clamp_render_size(PhysicalSize::new(640, 480), 8192),
             PhysicalSize::new(640, 480)
+        );
+    }
+
+    #[test]
+    fn embedded_copy_extent_clips_at_target_edges() {
+        assert_eq!(
+            embedded_copy_extent(
+                PhysicalSize::new(320, 200),
+                PhysicalPosition::new(900, 550),
+                PhysicalSize::new(1000, 600),
+            ),
+            PhysicalSize::new(100, 50),
+        );
+        assert_eq!(
+            embedded_copy_extent(
+                PhysicalSize::new(10, 10),
+                PhysicalPosition::new(1001, 601),
+                PhysicalSize::new(1000, 600),
+            ),
+            PhysicalSize::new(0, 0),
         );
     }
 

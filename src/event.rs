@@ -2060,6 +2060,96 @@ impl Processor {
             _ => (),
         }
     }
+
+    /// Create a terminal whose GPU frame is retained for composition by an in-process host.
+    pub fn create_embedded_window(
+        &mut self,
+        size: PhysicalSize<u32>,
+        scale_factor: f64,
+        options: WindowOptions,
+    ) -> Result<u64, Box<dyn Error>> {
+        self.create_window(LoopHandle::Embedded { size, scale_factor }, options)
+    }
+
+    /// Deliver one host-translated event to an embedded terminal.
+    pub fn handle_embedded_window_event(&mut self, window_id: WindowId, event: WindowEvent) {
+        self.on_window_event(
+            LoopHandle::Embedded { size: PhysicalSize::new(1, 1), scale_factor: 1.0 },
+            window_id,
+            event,
+        );
+    }
+
+    /// Resize an embedded terminal and immediately update its grid and render target.
+    pub fn resize_embedded_window(&mut self, window_id: WindowId, size: PhysicalSize<u32>) {
+        let Some(window) = self.windows.get_mut(&window_id) else {
+            return;
+        };
+        if !window.display.window.is_embedded() || window.display.window.inner_size() == size {
+            return;
+        }
+        window.display.window.request_inner_size(size);
+        self.handle_embedded_window_event(window_id, WindowEvent::Resized(size));
+    }
+
+    /// Show or hide an embedded terminal without changing any other window's lifecycle state.
+    pub fn set_embedded_window_visible(&mut self, window_id: WindowId, visible: bool) {
+        let Some(window) = self.windows.get_mut(&window_id) else {
+            return;
+        };
+        if !window.display.window.is_embedded() {
+            return;
+        }
+        window.set_automation_visible(visible);
+        if visible {
+            window.display.window.request_redraw();
+        }
+    }
+
+    /// Update the focus state observed by one embedded terminal.
+    pub fn set_embedded_window_focused(&mut self, window_id: WindowId, focused: bool) {
+        if self.windows.get(&window_id).is_some_and(|window| window.display.window.is_embedded()) {
+            self.handle_embedded_window_event(window_id, WindowEvent::Focused(focused));
+        }
+    }
+
+    /// Draw embedded terminals which requested a frame.
+    pub fn draw_pending_embedded_windows(&mut self) -> bool {
+        let pending = self
+            .windows
+            .iter()
+            .filter(|(_, window)| {
+                window.display.window.is_embedded()
+                    && window.display.window.requested_redraw
+                    && window.display.window.is_visible() != Some(false)
+            })
+            .map(|(window_id, _)| *window_id)
+            .collect::<Vec<_>>();
+        for window_id in &pending {
+            self.handle_embedded_window_event(*window_id, WindowEvent::RedrawRequested);
+        }
+        !pending.is_empty()
+    }
+
+    pub fn has_pending_embedded_redraw(&self) -> bool {
+        self.windows.values().any(|window| {
+            window.display.window.is_embedded() && window.display.window.requested_redraw
+        })
+    }
+
+    pub fn embedded_frame(
+        &self,
+        window_id: WindowId,
+    ) -> Option<crate::display::renderer::EmbeddedFrame<'_>> {
+        self.windows.get(&window_id)?.display.embedded_frame()
+    }
+
+    pub fn embedded_input_state(
+        &self,
+        window_id: WindowId,
+    ) -> Option<crate::display::window::EmbeddedInputState> {
+        self.windows.get(&window_id)?.display.window.embedded_input_state()
+    }
 }
 
 impl ApplicationHandler<Event> for Processor {
@@ -2623,6 +2713,7 @@ impl HeadlessLoop {
 pub enum LoopHandle<'a> {
     Winit(&'a ActiveEventLoop),
     Headless(&'a HeadlessLoop),
+    Embedded { size: PhysicalSize<u32>, scale_factor: f64 },
 }
 
 impl<'a> LoopHandle<'a> {
@@ -2631,6 +2722,7 @@ impl<'a> LoopHandle<'a> {
         match self {
             Self::Winit(event_loop) => event_loop.exit(),
             Self::Headless(headless) => headless.exiting.set(true),
+            Self::Embedded { .. } => (),
         }
     }
 
@@ -2652,7 +2744,7 @@ impl<'a> LoopHandle<'a> {
     pub fn winit(&self) -> Option<&'a ActiveEventLoop> {
         match self {
             Self::Winit(event_loop) => Some(event_loop),
-            Self::Headless(_) => None,
+            Self::Headless(_) | Self::Embedded { .. } => None,
         }
     }
 
@@ -2672,6 +2764,9 @@ impl<'a> LoopHandle<'a> {
                 headless.size,
                 headless.scale_factor,
             )),
+            Self::Embedded { size, scale_factor } => {
+                Ok(Window::embedded(config, identity, options, *size, *scale_factor))
+            },
         }
     }
 }

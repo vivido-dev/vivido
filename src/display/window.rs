@@ -83,6 +83,15 @@ impl From<winit::error::OsError> for Error {
 pub enum RenderSource {
     Surface(Arc<WinitWindow>),
     Offscreen,
+    Embedded,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct EmbeddedInputState {
+    pub cursor: CursorIcon,
+    pub cursor_visible: bool,
+    pub ime_allowed: bool,
+    pub ime_cursor_area: Option<(PhysicalPosition<f64>, PhysicalSize<f64>)>,
 }
 
 /// Next identifier handed to a headless window.
@@ -103,10 +112,11 @@ struct HeadlessWindow {
     maximized: Cell<bool>,
     fullscreen: Cell<bool>,
     theme: Cell<Option<Theme>>,
+    embedded: bool,
 }
 
 impl HeadlessWindow {
-    fn new(size: PhysicalSize<u32>, theme: Option<Theme>) -> Self {
+    fn new(size: PhysicalSize<u32>, theme: Option<Theme>, embedded: bool) -> Self {
         let id = WindowId::from(NEXT_HEADLESS_ID.fetch_add(1, Ordering::Relaxed));
         Self {
             id,
@@ -116,6 +126,7 @@ impl HeadlessWindow {
             maximized: Cell::new(false),
             fullscreen: Cell::new(false),
             theme: Cell::new(theme),
+            embedded,
         }
     }
 }
@@ -196,6 +207,7 @@ pub struct Window {
     current_mouse_cursor: CursorIcon,
     mouse_visible: bool,
     ime_inhibitor: ImeInhibitor,
+    ime_cursor_area: Cell<Option<(PhysicalPosition<f64>, PhysicalSize<f64>)>>,
 }
 
 impl Window {
@@ -286,6 +298,7 @@ impl Window {
             scale_factor,
             backend: Backend::Winit(window),
             ime_inhibitor: Default::default(),
+            ime_cursor_area: Cell::new(None),
         })
     }
 
@@ -301,7 +314,7 @@ impl Window {
         scale_factor: f64,
     ) -> Window {
         let identity = identity.clone();
-        let headless = HeadlessWindow::new(size, config.window.theme());
+        let headless = HeadlessWindow::new(size, config.window.theme(), false);
         log::info!("Headless window {:?} at {}x{}", headless.id, size.width, size.height);
 
         Self {
@@ -314,13 +327,53 @@ impl Window {
             scale_factor,
             backend: Backend::Headless(headless),
             ime_inhibitor: Default::default(),
+            ime_cursor_area: Cell::new(None),
+        }
+    }
+
+    /// Create a window whose frames are composited into an in-process host surface.
+    pub fn embedded(
+        config: &UiConfig,
+        identity: &Identity,
+        options: &WindowOptions,
+        size: PhysicalSize<u32>,
+        scale_factor: f64,
+    ) -> Window {
+        let identity = identity.clone();
+        let embedded = HeadlessWindow::new(size, config.window.theme(), true);
+        log::info!("Embedded window {:?} at {}x{}", embedded.id, size.width, size.height);
+        Self {
+            hold: options.terminal_options.hold,
+            requested_redraw: false,
+            title: identity.title,
+            current_mouse_cursor: CursorIcon::Text,
+            mouse_visible: true,
+            has_frame: true,
+            scale_factor,
+            backend: Backend::Headless(embedded),
+            ime_inhibitor: Default::default(),
+            ime_cursor_area: Cell::new(None),
         }
     }
 
     /// Whether this window has no windowing system behind it.
     #[inline]
     pub fn is_headless(&self) -> bool {
-        matches!(self.backend, Backend::Headless(_))
+        matches!(&self.backend, Backend::Headless(window) if !window.embedded)
+    }
+
+    #[inline]
+    pub fn is_embedded(&self) -> bool {
+        matches!(&self.backend, Backend::Headless(window) if window.embedded)
+    }
+
+    pub fn embedded_input_state(&self) -> Option<EmbeddedInputState> {
+        self.is_embedded().then_some(EmbeddedInputState {
+            cursor: self.current_mouse_cursor,
+            cursor_visible: self.mouse_visible,
+            ime_allowed: self.ime_inhibitor.is_empty(),
+            ime_cursor_area: self.ime_cursor_area.get(),
+        })
     }
 
     #[cfg(any(target_os = "macos", windows))]
@@ -334,6 +387,7 @@ impl Window {
     pub fn render_source(&self) -> RenderSource {
         match &self.backend {
             Backend::Winit(window) => RenderSource::Surface(Arc::clone(window)),
+            Backend::Headless(window) if window.embedded => RenderSource::Embedded,
             Backend::Headless(_) => RenderSource::Offscreen,
         }
     }
@@ -654,7 +708,6 @@ impl Window {
 
     /// Adjust the IME editor position according to the new location of the cursor.
     pub fn update_ime_position(&self, point: Point<usize>, size: &SizeInfo) {
-        let Some(window) = self.backend.winit() else { return };
         let nspot_x = f64::from(size.padding_x() + point.column.0 as f32 * size.cell_width());
         let nspot_y = f64::from(size.padding_y() + point.line as f32 * size.cell_height());
 
@@ -664,10 +717,13 @@ impl Window {
         let width = size.cell_width() as f64 * 2.;
         let height = size.cell_height as f64;
 
-        window.set_ime_cursor_area(
-            PhysicalPosition::new(nspot_x, nspot_y),
-            PhysicalSize::new(width, height),
-        );
+        let position = PhysicalPosition::new(nspot_x, nspot_y);
+        let size = PhysicalSize::new(width, height);
+        self.ime_cursor_area.set(Some((position, size)));
+
+        if let Some(window) = self.backend.winit() {
+            window.set_ime_cursor_area(position, size);
+        }
     }
 
     /// Disable macOS window shadows.
@@ -745,4 +801,36 @@ fn use_srgb_color_space(window: &WinitWindow) {
     };
 
     view.window().unwrap().setColorSpace(Some(&NSColorSpace::sRGBColorSpace()));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn embedded_window_retains_host_managed_state() {
+        let config = UiConfig::default();
+        let mut window = Window::embedded(
+            &config,
+            &Identity::default(),
+            &WindowOptions::default(),
+            PhysicalSize::new(640, 480),
+            2.0,
+        );
+        assert!(window.is_embedded());
+        assert!(!window.is_headless());
+        assert!(matches!(window.render_source(), RenderSource::Embedded));
+
+        window.request_inner_size(PhysicalSize::new(320, 200));
+        window.set_outer_position(PhysicalPosition::new(10, 20));
+        window.set_visible(false);
+        window.set_mouse_cursor(CursorIcon::Pointer);
+        assert_eq!(window.inner_size(), PhysicalSize::new(320, 200));
+        assert_eq!(window.outer_position(), Some(PhysicalPosition::new(10, 20)));
+        assert_eq!(window.is_visible(), Some(false));
+        let input = window.embedded_input_state().unwrap();
+        assert_eq!(input.cursor, CursorIcon::Pointer);
+        assert!(input.cursor_visible);
+        assert!(input.ime_allowed);
+    }
 }

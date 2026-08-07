@@ -39,7 +39,7 @@ use crate::display::damage::{DamageTracker, damage_y_to_viewport_y};
 use crate::display::hint::{HintMatch, HintState};
 use crate::display::meter::Meter;
 use crate::display::rects::{RenderLine, RenderLines, RenderRect, paint_rect, paint_rects};
-use crate::display::renderer::SceneRenderer;
+use crate::display::renderer::{EmbeddedFrame, SceneRenderer};
 use crate::display::text::{TextMetrics, TextSystem, color_from_rgb};
 use crate::display::window::Window;
 use crate::event::{Event, EventType, Mouse, SearchState};
@@ -318,6 +318,14 @@ impl Display {
     pub fn submit_graphics(&mut self, command: GraphicsCommand) {
         self.scene_renderer.submit_graphics(command);
         self.damage_tracker.frame().mark_fully_damaged();
+    }
+
+    pub fn embedded_frame(&self) -> Option<EmbeddedFrame<'_>> {
+        self.display_window_is_embedded().then(|| self.scene_renderer.embedded_frame()).flatten()
+    }
+
+    fn display_window_is_embedded(&self) -> bool {
+        self.window.is_embedded()
     }
 
     /// Whether the renderer holds a frame a screenshot could read.
