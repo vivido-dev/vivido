@@ -52,7 +52,7 @@ pub use config::monitor::ConfigMonitor;
 pub mod binary {
     pub mod headless {
         pub use crate::headless::run;
-        #[cfg(windows)]
+        #[cfg(any(target_os = "macos", windows))]
         pub use crate::headless::run_reexec;
     }
 

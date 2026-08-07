@@ -51,7 +51,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     // Load command line options.
     let mut options = Options::new();
 
-    #[cfg(windows)]
+    #[cfg(any(target_os = "macos", windows))]
     if let Some(readiness_handle) = options.headless_server_handle {
         let resolved_session = options
             .resolved_session

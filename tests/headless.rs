@@ -30,7 +30,7 @@ impl Session {
     /// Start a detached headless session running `program`.
     fn start(name: &str, program: &[String]) -> Session {
         // Unix sockets cap the whole path at ~108 bytes, so the runtime root must stay short.
-        let runtime = env::temp_dir().join(format!("vivido-it-{}-{name}", std::process::id()));
+        let runtime = test_runtime(name);
         let _ = fs::remove_dir_all(&runtime);
         fs::create_dir_all(&runtime).expect("runtime directory");
         set_private(&runtime);
@@ -99,6 +99,15 @@ impl Session {
         let output = command.output().expect("run vivido list");
         String::from_utf8_lossy(&output.stdout).into_owned()
     }
+}
+
+/// Keep Unix socket paths below `sockaddr_un.sun_path`, which is only 104 bytes on macOS.
+fn test_runtime(name: &str) -> PathBuf {
+    #[cfg(unix)]
+    let root = PathBuf::from("/tmp");
+    #[cfg(windows)]
+    let root = env::temp_dir();
+    root.join(format!("vivido-it-{}-{name}", std::process::id()))
 }
 
 impl Drop for Session {
@@ -351,7 +360,7 @@ fn tearing_down_one_session_leaves_the_other_untouched() {
 /// A session name must never escape the runtime directory.
 #[test]
 fn session_names_that_escape_the_runtime_directory_are_refused() {
-    let runtime = env::temp_dir().join(format!("vivido-it-names-{}", std::process::id()));
+    let runtime = test_runtime("names");
     let _ = fs::remove_dir_all(&runtime);
     fs::create_dir_all(&runtime).expect("runtime directory");
     set_private(&runtime);

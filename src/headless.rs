@@ -4,9 +4,10 @@
 //! either reports readiness or reports why it failed, so `vivido --headless` never exits 0 leaving
 //! a session that was never usable.
 //!
-//! Unix forks before any thread is started so the daemon keeps the already-parsed options. Windows
-//! re-execs with an inherited readiness handle because it has no equivalent fork operation. Those
-//! platform launch mechanisms live in separate modules below this shared orchestration layer.
+//! Linux forks before any thread is started so the daemon keeps the already-parsed options. macOS
+//! and Windows re-exec with an inherited readiness handle: Windows has no fork, while macOS must
+//! initialize Metal in a fresh process. Those platform launch mechanisms live in separate modules
+//! below this shared orchestration layer.
 
 use std::error::Error;
 use std::fs::File;
@@ -23,14 +24,17 @@ use crate::polling::IoListener;
 use crate::session::{RegistryGuard, SessionPaths, validate_session_name};
 use crate::{config, logging, tty};
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 #[path = "headless/unix.rs"]
+mod platform;
+#[cfg(target_os = "macos")]
+#[path = "headless/macos.rs"]
 mod platform;
 #[cfg(windows)]
 #[path = "headless/windows.rs"]
 mod platform;
 
-#[cfg(windows)]
+#[cfg(any(target_os = "macos", windows))]
 pub use platform::run_reexec;
 
 /// How long the parent waits for the daemon to report readiness.

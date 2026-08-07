@@ -103,13 +103,13 @@ pub struct Options {
     #[clap(subcommand)]
     pub subcommands: Option<Subcommands>,
 
-    /// Internal inherited readiness handle for the Windows headless server.
-    #[cfg(windows)]
+    /// Internal inherited readiness handle for a re-executed headless server.
+    #[cfg(any(target_os = "macos", windows))]
     #[clap(long = "__headless-server-handle", hide = true)]
     pub headless_server_handle: Option<usize>,
 
-    /// Parent-resolved session name for the Windows headless server.
-    #[cfg(windows)]
+    /// Parent-resolved session name for a re-executed headless server.
+    #[cfg(any(target_os = "macos", windows))]
     #[clap(long = "__resolved-session", hide = true)]
     pub resolved_session: Option<String>,
 }
@@ -335,7 +335,7 @@ pub enum Subcommands {
 }
 
 /// Insert internal re-exec flags before `-e`, whose variadic values must remain last.
-#[cfg(windows)]
+#[cfg(any(target_os = "macos", windows))]
 pub fn headless_reexec_args(
     mut arguments: Vec<std::ffi::OsString>,
     readiness_handle: usize,
@@ -1204,14 +1204,14 @@ impl DerefMut for ParsedOptions {
 mod tests {
     use super::*;
 
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "macos")))]
     use std::fs::File;
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "macos")))]
     use std::io::{Read, Write};
 
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "macos")))]
     use clap::CommandFactory;
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "macos")))]
     use clap_complete::Shell;
     use toml::Table;
 
@@ -1292,9 +1292,9 @@ mod tests {
         assert!(class.is_err());
     }
 
-    #[cfg(windows)]
+    #[cfg(any(target_os = "macos", windows))]
     #[test]
-    fn windows_headless_reexec_preserves_fully_populated_options() {
+    fn headless_reexec_preserves_fully_populated_options() {
         let original = [
             "--headless",
             "--session",
@@ -1579,10 +1579,10 @@ mod tests {
         );
     }
 
-    // clap_complete emits even hidden Windows re-exec options, so the checked-in public shell
-    // completions are generated from Unix where those internal implementation details do not
+    // clap_complete emits even hidden macOS/Windows re-exec options, so the checked-in public shell
+    // completions are generated from Linux where those internal implementation details do not
     // exist.
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     fn completions() {
         let mut clap = Options::command();

@@ -143,10 +143,11 @@ service accounts. It does not weaken the pipe DACL.
 
 ## Platform notes
 
-Unix forks before any thread starts, so the daemon keeps the options the parent already parsed.
-Windows has no `fork` and instead re-executes with an inherited readiness handle and detached-process
-creation flags; the internal `--__headless-server-handle` and `--__resolved-session` flags exist only
-for that re-exec and are not part of the public CLI.
+Linux forks before any thread starts, so the daemon keeps the options the parent already parsed.
+macOS and Windows instead re-execute with an inherited readiness handle: macOS must initialize Metal
+in a fresh process, while Windows has no `fork` and also uses detached-process creation flags. The
+internal `--__headless-server-handle` and `--__resolved-session` flags exist only for that re-exec
+and are not part of the public CLI.
 
 The implementation record and security checklist for the Windows port is
 [headless-windows-plan.md](headless-windows-plan.md).
