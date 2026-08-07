@@ -2466,7 +2466,7 @@ pub mod test {
     /// # Examples
     ///
     /// ```rust
-    /// use crate::terminal::term::test::mock_term;
+    /// use vivido::terminal::term::test::mock_term;
     ///
     /// // Create a terminal with the following cells:
     /// //

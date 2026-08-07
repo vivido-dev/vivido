@@ -1213,7 +1213,9 @@ mod tests {
     fn socket_is_owner_only() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("vivido.sock");
-        let _socket = bind_socket(&path).unwrap();
+        let Some(_socket) = bound_socket_or_skip(bind_socket(&path)) else {
+            return;
+        };
         assert_eq!(path.metadata().unwrap().permissions().mode() & 0o777, 0o600);
     }
 
@@ -1263,7 +1265,9 @@ mod tests {
     fn the_owner_is_accepted_on_both_ends_of_a_socket() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("owner.sock");
-        let listener = LocalListener::bind(&path).expect("bind");
+        let Some(listener) = bound_socket_or_skip(LocalListener::bind(&path)) else {
+            return;
+        };
         let client = std::thread::spawn({
             let path = path.clone();
             move || LocalStream::connect(&path).expect("client accepts server owner")
@@ -1283,6 +1287,18 @@ mod tests {
             }
         };
         let _client = client.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    fn bound_socket_or_skip<T>(result: io::Result<T>) -> Option<T> {
+        match result {
+            Ok(socket) => Some(socket),
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                eprintln!("skipping socket test: this runner forbids local socket binds");
+                None
+            },
+            Err(error) => panic!("could not bind test socket: {error}"),
+        }
     }
 
     /// Owner authentication runs on both pipe ends, and a blocked reader must not stall writes.
