@@ -177,13 +177,78 @@ struct SessionRuntime {
     grant: Mutex<InputGrant>,
     /// The bounded, coalescing observation queue, `observability-v1`.
     observations: Mutex<ObservationQueue>,
+    /// Bounds what an anchor-marker flood can cost the PTY parser thread.
+    markers: Mutex<MarkerAdmission>,
+}
+
+/// Anchor markers admitted for verification per second, per session.
+///
+/// Verifying a marker is an HMAC-SHA256, it runs on the PTY parser thread, and it runs before the
+/// `seen_anchors` dedup can help: a marker whose tag names a live session but whose authenticator
+/// is wrong is verified in full every single time. Any program that has ever seen one marker knows
+/// the tag it carries, so a loop printing marker-shaped APCs could spend the terminal's output
+/// thread on hashing. Admitting `MAX_ACTIVE_ANCHORS` a second costs a few milliseconds of work
+/// where an unbounded flood cost a core, and no producer can notice the limit: the bucket starts
+/// full at that same figure, so a complete anchor set still registers in one burst.
+const MARKER_ADMISSION_RATE: u64 = MAX_ACTIVE_ANCHORS as u64;
+
+/// A session's bounded budget for marker verification.
+struct MarkerAdmission {
+    bucket: TokenBucket,
+    replenished: Instant,
+    /// Markers this session has let through to verification — the work the budget bounds.
+    admitted: u64,
+}
+
+impl MarkerAdmission {
+    fn new(now: Instant) -> Self {
+        Self { bucket: TokenBucket::new(MARKER_ADMISSION_RATE, 1), replenished: now, admitted: 0 }
+    }
+
+    /// Admit one marker for verification, or refuse to do the work.
+    fn admit(&mut self, now: Instant) -> bool {
+        let elapsed = now.saturating_duration_since(self.replenished);
+        self.replenished = now;
+        if self.bucket.replenish(elapsed).is_err() || self.bucket.charge(1).is_err() {
+            return false;
+        }
+        self.admitted = self.admitted.saturating_add(1);
+        true
+    }
 }
 
 #[derive(Default)]
 struct Registry {
     sessions: HashMap<u64, Arc<SessionRuntime>>,
+    /// Session tags to the sessions that own them, so an anchor marker off the PTY finds its
+    /// session by lookup rather than by scanning every live one.
+    by_tag: HashMap<[u8; 16], u64>,
     channel_opens: HashMap<TrackIdentity, ChannelOpenState>,
     leases: LeaseTable,
+}
+
+impl Registry {
+    /// Publish a session under both the ID its producer uses and the tag its markers carry.
+    fn insert_session(&mut self, runtime: Arc<SessionRuntime>) {
+        self.by_tag.insert(runtime.session_tag, runtime.identity.session_id);
+        self.sessions.insert(runtime.identity.session_id, runtime);
+    }
+
+    /// Retire one session from both indexes, leaving every other session's entries alone.
+    fn remove_session(&mut self, session_id: u64) -> Option<Arc<SessionRuntime>> {
+        let runtime = self.sessions.remove(&session_id)?;
+        // A resume keeps the session ID but derives fresh key material, so by the time the old
+        // runtime is retired its tag may already name the new one. Only unpublish a tag that
+        // still points here.
+        if self.by_tag.get(&runtime.session_tag) == Some(&session_id) {
+            self.by_tag.remove(&runtime.session_tag);
+        }
+        Some(runtime)
+    }
+
+    fn session_by_tag(&self, tag: &[u8; 16]) -> Option<&Arc<SessionRuntime>> {
+        self.sessions.get(self.by_tag.get(tag)?)
+    }
 }
 
 struct ServiceShared {
@@ -424,14 +489,16 @@ impl VividService {
         let Ok(marker) = anchor::parse_marker(marker) else {
             return;
         };
-        let session = lock(&self.shared.registry)
-            .sessions
-            .values()
-            .find(|session| session.session_tag == marker.session_tag)
-            .cloned();
+        // A tag naming no live session is refused by lookup, before anything is hashed.
+        let session = lock(&self.shared.registry).session_by_tag(&marker.session_tag).cloned();
         let Some(session) = session else {
             return;
         };
+        // Then the session's own budget, still before hashing: whoever is printing these markers
+        // is not necessarily the producer whose tag they carry.
+        if !lock(&session.markers).admit(Instant::now()) {
+            return;
+        }
         if !anchor::verify_marker(&session.anchor_key, &marker)
             || lock(&session.contexts)
                 .get(&marker.context_id)
@@ -1099,7 +1166,7 @@ fn revoke_lease(
     let _ = lease.machine.revoke();
     let child = lease.child.take();
     let payload = lease.changed_payload(key.1, key.2, reason, Instant::now());
-    let child_runtime = child.and_then(|child| registry.sessions.remove(&child.session_id));
+    let child_runtime = child.and_then(|child| registry.remove_session(child.session_id));
     drop(registry);
 
     // Release the capacity the lease held back from its owning context.
@@ -1132,7 +1199,7 @@ fn finish_session(shared: &Arc<ServiceShared>, session: &Arc<SessionRuntime>, cl
         let issuer = lock(&shared.registry).sessions.get(&key.0.session_id).cloned();
         if let Some(issuer) = issuer {
             if !clean && suspend_lease(shared, session, key) {
-                lock(&shared.registry).sessions.remove(&session.identity.session_id);
+                lock(&shared.registry).remove_session(session.identity.session_id);
                 (shared.wake)();
                 return;
             }
@@ -1140,7 +1207,7 @@ fn finish_session(shared: &Arc<ServiceShared>, session: &Arc<SessionRuntime>, cl
             revoke_lease(shared, &issuer, key, reason);
         }
     }
-    lock(&shared.registry).sessions.remove(&session.identity.session_id);
+    lock(&shared.registry).remove_session(session.identity.session_id);
     let removed_audio = {
         let mut outputs = lock(&shared.audio_outputs);
         let keys = outputs
@@ -1563,6 +1630,7 @@ fn establish_root_session(
         lane_egress: Mutex::new(None),
         grant: Mutex::new(InputGrant::new()),
         observations: Mutex::new(ObservationQueue::new(observation_capacity)),
+        markers: Mutex::new(MarkerAdmission::new(Instant::now())),
     });
     // Suspension retained this session's surfaces, tracks, and nodes, so a resume re-attaches to
     // them rather than registering a second time (security §7.1).
@@ -1572,7 +1640,7 @@ fn establish_root_session(
             .register_session(identity, TargetGeneration::new(target.generation()))
             .map_err(io::Error::other)?;
     }
-    registry.sessions.insert(session_id, runtime.clone());
+    registry.insert_session(runtime.clone());
     for (issuer_session, lease_id, payload) in resumed_announcements {
         if let Some(issuer) = registry.sessions.get(&issuer_session)
             && let Ok(body) = Envelope::new(0, payload).encode()
@@ -5672,6 +5740,153 @@ mod tests {
                 Err(error) => !matches!(error.kind(), ErrorKind::WouldBlock),
             }
         })
+    }
+
+    /// The body of an anchor marker, as the PTY parser hands it over.
+    fn marker_body(key: &AnchorKey, tag: &[u8; 16], context_id: u64, anchor_id: u64) -> String {
+        let marker = anchor::encode_marker(key, tag, context_id, anchor_id).unwrap();
+        marker[2..marker.len() - 2].to_owned()
+    }
+
+    fn live_sessions(service: &VividService) -> Vec<Arc<SessionRuntime>> {
+        lock(&service.shared.registry).sessions.values().cloned().collect()
+    }
+
+    fn anchors_owned_by(service: &VividService, session: &Arc<SessionRuntime>) -> usize {
+        service
+            .scene
+            .anchor_positions()
+            .iter()
+            .filter(|(identity, ..)| identity.context.session == session.identity)
+            .count()
+    }
+
+    /// A program printing marker-shaped APCs in a loop must not be able to spend the terminal's
+    /// output thread on HMAC verification — its own session's or anybody else's.
+    ///
+    /// Verification happens before the `seen_anchors` dedup can help, and the tag a marker carries
+    /// is visible to any program that has seen one, so a replayed marker with a wrong
+    /// authenticator is the cheapest possible attack and the most expensive record to serve.
+    #[test]
+    fn an_anchor_marker_flood_is_bounded_and_costs_no_other_session_anything() {
+        let service =
+            socket_service!(VividService::start_with_wake(test_geometry(), Arc::new(|| {})));
+        let flooded = connect(&service);
+        let flooded_context = flooded.info().root_context_id;
+        let [flooded_session] = live_sessions(&service).try_into().ok().expect("one session");
+        let quiet = connect(&service);
+        let quiet_context = quiet.info().root_context_id;
+        let quiet_session = live_sessions(&service)
+            .into_iter()
+            .find(|session| session.identity != flooded_session.identity)
+            .expect("the second session");
+
+        // The flooded session's own tag, with an authenticator derived from somebody else's key:
+        // the lookup succeeds, so every one of these reaches verification and fails it.
+        let forged = marker_body(
+            &AnchorKey::new([0x5a; 32]),
+            &flooded_session.session_tag,
+            flooded_context,
+            1,
+        );
+        let attempts = 16 * MARKER_ADMISSION_RATE;
+        for _ in 0..attempts {
+            service.handle_terminal_marker(&forged, 0, 0, false);
+        }
+
+        let admitted = lock(&flooded_session.markers).admitted;
+        assert!(
+            admitted <= 4 * MARKER_ADMISSION_RATE,
+            "{admitted} of {attempts} forged markers were verified"
+        );
+        assert_eq!(anchors_owned_by(&service, &flooded_session), 0, "no forgery became an anchor");
+
+        // The other session's budget is its own, and its markers still work.
+        assert_eq!(lock(&quiet_session.markers).admitted, 0, "a flood spends no other budget");
+        let genuine =
+            marker_body(&quiet_session.anchor_key, &quiet_session.session_tag, quiet_context, 7);
+        service.handle_terminal_marker(&genuine, 3, 5, false);
+        assert_eq!(
+            anchors_owned_by(&service, &quiet_session),
+            1,
+            "the untouched session registers its anchor as usual"
+        );
+    }
+
+    /// A session that leaves takes its marker tag with it and nothing else.
+    #[test]
+    fn a_departing_session_unpublishes_only_its_own_marker_tag() {
+        let service =
+            socket_service!(VividService::start_with_wake(test_geometry(), Arc::new(|| {})));
+        let leaving = connect(&service);
+        let [leaving_session] = live_sessions(&service).try_into().ok().expect("one session");
+        let staying = connect(&service);
+        let staying_context = staying.info().root_context_id;
+        let staying_session = live_sessions(&service)
+            .into_iter()
+            .find(|session| session.identity != leaving_session.identity)
+            .expect("the second session");
+
+        {
+            let registry = lock(&service.shared.registry);
+            for session in [&leaving_session, &staying_session] {
+                assert_eq!(
+                    registry.session_by_tag(&session.session_tag).map(|found| found.identity),
+                    Some(session.identity),
+                    "a live session is reachable by the tag its markers carry"
+                );
+            }
+        }
+
+        leaving.close().expect("GOODBYE is answered");
+        assert!(
+            wait_until(Duration::from_secs(2), || {
+                lock(&service.shared.registry).sessions.len() == 1
+            }),
+            "the departed session leaves the registry"
+        );
+
+        let registry = lock(&service.shared.registry);
+        assert!(
+            registry.session_by_tag(&leaving_session.session_tag).is_none(),
+            "the departed tag resolves to nothing"
+        );
+        assert_eq!(
+            registry.session_by_tag(&staying_session.session_tag).map(|found| found.identity),
+            Some(staying_session.identity),
+            "the surviving session's tag is untouched"
+        );
+        drop(registry);
+
+        let genuine = marker_body(
+            &staying_session.anchor_key,
+            &staying_session.session_tag,
+            staying_context,
+            9,
+        );
+        service.handle_terminal_marker(&genuine, 1, 2, false);
+        assert_eq!(anchors_owned_by(&service, &staying_session), 1);
+    }
+
+    /// The marker budget is generous to producers and finite to floods.
+    #[test]
+    fn marker_admission_allows_a_whole_anchor_set_at_once_and_then_bounds_the_rate() {
+        let start = Instant::now();
+        let mut admission = MarkerAdmission::new(start);
+
+        // A producer registering its complete anchor set in one burst is never made to wait.
+        for index in 0..MAX_ACTIVE_ANCHORS {
+            assert!(admission.admit(start), "marker {index} of a full anchor set was refused");
+        }
+        assert!(!admission.admit(start), "the burst is the whole budget, not the start of it");
+        assert_eq!(admission.admitted, MAX_ACTIVE_ANCHORS as u64);
+
+        // And the budget returns at the stated rate rather than all at once.
+        let quarter = start + Duration::from_millis(250);
+        for _ in 0..MARKER_ADMISSION_RATE / 4 {
+            assert!(admission.admit(quarter));
+        }
+        assert!(!admission.admit(quarter), "a quarter second buys a quarter of the rate");
     }
 
     /// A local process that opens connections and says nothing must not close the endpoint.
