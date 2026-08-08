@@ -53,6 +53,7 @@ Useful verification commands:
 cargo check --workspace --all-targets
 cargo test --workspace --all-targets
 cargo clippy --workspace --all-targets -- -D warnings
+cargo test --test headless -- --ignored --test-threads=1  # test ignored
 ```
 
 ## Agent automation
