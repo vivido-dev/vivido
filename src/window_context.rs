@@ -2246,6 +2246,7 @@ fn terminal_mode_names(mode: TermMode) -> Vec<&'static str> {
         (TermMode::MOUSE_REPORT_CLICK, "mouse_click"),
         (TermMode::BRACKETED_PASTE, "bracketed_paste"),
         (TermMode::SGR_MOUSE, "sgr_mouse"),
+        (TermMode::SGR_PIXEL_MOUSE, "sgr_pixel_mouse"),
         (TermMode::MOUSE_MOTION, "mouse_motion"),
         (TermMode::LINE_WRAP, "line_wrap"),
         (TermMode::LINE_FEED_NEW_LINE, "line_feed_new_line"),

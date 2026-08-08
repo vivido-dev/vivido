@@ -88,6 +88,23 @@ fn selection_clipboards(button: MouseButton) -> &'static [ClipboardType] {
     }
 }
 
+fn sgr_mouse_sequence(
+    point: Point,
+    pixel: Option<(usize, usize)>,
+    button: u8,
+    state: ElementState,
+) -> Vec<u8> {
+    let terminator = match state {
+        ElementState::Pressed => 'M',
+        ElementState::Released => 'm',
+    };
+    let (x, y) = pixel.map_or_else(
+        || (point.column.0.saturating_add(1), point.line.0.max(0) as usize + 1),
+        |(x, y)| (x.saturating_add(1), y.saturating_add(1)),
+    );
+    format!("\x1b[<{};{};{}{}", button, x, y, terminator).into_bytes()
+}
+
 fn report_mouse_to_application(mouse_mode: bool, shift: bool) -> bool {
     mouse_mode && !shift
 }
@@ -320,6 +337,7 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
         let size_info = self.ctx.size_info();
 
         let (x, y) = position.into();
+        let old_pixel = (self.ctx.mouse().x, self.ctx.mouse().y);
 
         let lmb_pressed = self.ctx.mouse().left_button_state == ElementState::Pressed;
         let rmb_pressed = self.ctx.mouse().right_button_state == ElementState::Pressed;
@@ -340,9 +358,12 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
 
         let point = self.ctx.mouse().point(&size_info, display_offset);
         let cell_changed = old_point != point;
+        let pixel_mouse =
+            self.ctx.terminal().mode().contains(TermMode::SGR_MOUSE | TermMode::SGR_PIXEL_MOUSE);
+        let pixel_changed = old_pixel != (x, y);
 
         // If the mouse hasn't changed cells, do nothing.
-        if !cell_changed
+        if !(cell_changed || pixel_mouse && pixel_changed)
             && self.ctx.mouse().cell_side == cell_side
             && self.ctx.mouse().inside_text_area == inside_text_area
         {
@@ -366,7 +387,7 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
             && (self.modifiers_state().shift_key() || !self.ctx.mouse_mode())
         {
             self.ctx.update_selection(point, cell_side);
-        } else if cell_changed
+        } else if (cell_changed || pixel_mouse)
             && self.ctx.terminal().mode().intersects(TermMode::MOUSE_MOTION | TermMode::MOUSE_DRAG)
         {
             if lmb_pressed {
@@ -470,13 +491,13 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
     }
 
     fn sgr_mouse_report(&mut self, point: Point, button: u8, state: ElementState) {
-        let c = match state {
-            ElementState::Pressed => 'M',
-            ElementState::Released => 'm',
+        let mode = self.ctx.terminal().mode();
+        let pixel = if mode.contains(TermMode::SGR_PIXEL_MOUSE) {
+            Some((self.ctx.mouse().x, self.ctx.mouse().y))
+        } else {
+            None
         };
-
-        let msg = format!("\x1b[<{};{};{}{}", button, point.column + 1, point.line + 1, c);
-        self.ctx.write_to_pty(msg.into_bytes());
+        self.ctx.write_to_pty(sgr_mouse_sequence(point, pixel, button, state));
     }
 
     fn on_mouse_press(&mut self, button: MouseButton) {
@@ -1128,6 +1149,25 @@ mod tests {
         assert!(report_mouse_to_application(true, false));
         assert!(!report_mouse_to_application(true, true));
         assert!(!report_mouse_to_application(false, false));
+    }
+
+    #[test]
+    fn sgr_pixels_reports_one_based_physical_coordinates() {
+        let point = Point::new(Line(2), Column(3));
+        assert_eq!(
+            sgr_mouse_sequence(point, Some((319, 199)), 32, ElementState::Pressed),
+            b"\x1b[<32;320;200M"
+        );
+        assert_eq!(
+            sgr_mouse_sequence(point, Some((0, 0)), 0, ElementState::Released),
+            b"\x1b[<0;1;1m"
+        );
+    }
+
+    #[test]
+    fn legacy_sgr_mouse_keeps_cell_coordinates() {
+        let point = Point::new(Line(2), Column(3));
+        assert_eq!(sgr_mouse_sequence(point, None, 64, ElementState::Pressed), b"\x1b[<64;4;3M");
     }
 
     macro_rules! test_process_binding {

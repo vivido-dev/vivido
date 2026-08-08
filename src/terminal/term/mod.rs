@@ -70,6 +70,8 @@ bitflags! {
         const MOUSE_DRAG              = 1 << 13;
         const UTF8_MOUSE              = 1 << 14;
         const ALTERNATE_SCROLL        = 1 << 15;
+        /// DECSET 1016: report SGR mouse coordinates in physical pixels.
+        const SGR_PIXEL_MOUSE         = 1 << 16;
         const URGENCY_HINTS           = 1 << 17;
         const DISAMBIGUATE_ESC_CODES  = 1 << 18;
         const REPORT_EVENT_TYPES      = 1 << 19;
@@ -1947,6 +1949,10 @@ impl<T: EventListener> Handler for Term<T> {
     fn set_private_mode(&mut self, mode: PrivateMode) {
         let mode = match mode {
             PrivateMode::Named(mode) => mode,
+            PrivateMode::Unknown(1016) => {
+                self.mode.insert(TermMode::SGR_PIXEL_MOUSE);
+                return;
+            },
             PrivateMode::Unknown(mode) => {
                 debug!("Ignoring unknown mode {mode} in set_private_mode");
                 return;
@@ -2010,6 +2016,10 @@ impl<T: EventListener> Handler for Term<T> {
     fn unset_private_mode(&mut self, mode: PrivateMode) {
         let mode = match mode {
             PrivateMode::Named(mode) => mode,
+            PrivateMode::Unknown(1016) => {
+                self.mode.remove(TermMode::SGR_PIXEL_MOUSE);
+                return;
+            },
             PrivateMode::Unknown(mode) => {
                 debug!("Ignoring unknown mode {mode} in unset_private_mode");
                 return;
@@ -2097,6 +2107,7 @@ impl<T: EventListener> Handler for Term<T> {
                 NamedPrivateMode::SyncUpdate => ModeState::Reset,
                 NamedPrivateMode::ColumnMode => ModeState::NotSupported,
             },
+            PrivateMode::Unknown(1016) => self.mode.contains(TermMode::SGR_PIXEL_MOUSE).into(),
             PrivateMode::Unknown(_) => ModeState::NotSupported,
         };
 
@@ -2963,6 +2974,18 @@ mod tests {
 
         assert_eq!(term.history_size(), 0);
         assert_eq!(term.grid.cursor.point, Point::new(Line(19), Column(0)));
+    }
+
+    #[test]
+    fn decset_1016_toggles_sgr_pixel_mouse_mode() {
+        let size = TermSize::new(80, 24);
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+
+        term.set_private_mode(PrivateMode::Unknown(1016));
+        assert!(term.mode().contains(TermMode::SGR_PIXEL_MOUSE));
+
+        term.unset_private_mode(PrivateMode::Unknown(1016));
+        assert!(!term.mode().contains(TermMode::SGR_PIXEL_MOUSE));
     }
 
     #[test]
