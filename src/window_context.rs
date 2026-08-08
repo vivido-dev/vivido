@@ -2011,7 +2011,53 @@ fn configure_vivid_pty_environment(
     // must therefore emit the bounded printable marker form that the Windows PTY scanner removes
     // and authenticates before ordinary terminal parsing.
     #[cfg(windows)]
-    environment.insert("VIVID_ANCHOR_TRANSPORT".into(), "conpty".into());
+    {
+        environment.insert("VIVID_ANCHOR_TRANSPORT".into(), "conpty".into());
+
+        // WSL only imports arbitrary Windows environment variables named by WSLENV. Use `/u` so
+        // these per-window discovery values flow from Win32 into WSL, but are not exported back to
+        // every Windows process subsequently launched from Linux. The latter matters especially
+        // for the root secret. Preserve unrelated user entries while taking ownership of the
+        // exact uppercase names Vivido supplies.
+        let inherited = environment
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("WSLENV"))
+            .map(|(_, value)| value.clone())
+            .or_else(|| std::env::var("WSLENV").ok())
+            .unwrap_or_default();
+        environment.retain(|name, _| !name.eq_ignore_ascii_case("WSLENV"));
+        environment.insert("WSLENV".into(), vivid_wslenv(&inherited));
+    }
+}
+
+#[cfg(windows)]
+fn vivid_wslenv(inherited: &str) -> String {
+    // Remove every endpoint name Vivido owns. In particular, retaining an old optional lane in
+    // WSLENV makes WSL create that variable with an empty value when this window does not offer
+    // the lane. Producers correctly reject a present-but-empty endpoint as malformed instead of
+    // applying the missing-lane fallback.
+    const MANAGED: [&str; 6] = [
+        "VIVID_ENDPOINT_CONTROL",
+        "VIVID_ENDPOINT_INTERACTIVE",
+        "VIVID_ENDPOINT_REALTIME",
+        "VIVID_ENDPOINT_BULK",
+        "VIVID_ROOT_SECRET",
+        "VIVID_ANCHOR_TRANSPORT",
+    ];
+    const EXPORTED: [&str; 3] =
+        ["VIVID_ENDPOINT_CONTROL", "VIVID_ROOT_SECRET", "VIVID_ANCHOR_TRANSPORT"];
+
+    let mut entries = inherited
+        .split(':')
+        .filter(|entry| !entry.is_empty())
+        .filter(|entry| {
+            let name = entry.split_once('/').map_or(*entry, |(name, _)| name);
+            !MANAGED.contains(&name)
+        })
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    entries.extend(EXPORTED.map(|name| format!("{name}/u")));
+    entries.join(":")
 }
 
 impl Drop for WindowContext {
@@ -2359,6 +2405,8 @@ fn append_legacy_mouse_coordinate(output: &mut Vec<u8>, coordinate: usize, utf8:
 #[cfg(test)]
 mod vivid_environment_tests {
     use super::configure_vivid_pty_environment;
+    #[cfg(windows)]
+    use super::vivid_wslenv;
     use std::collections::HashMap;
 
     #[test]
@@ -2375,5 +2423,18 @@ mod vivid_environment_tests {
         assert_eq!(environment.get("VIVID_ANCHOR_TRANSPORT").map(String::as_str), Some("conpty"));
         #[cfg(not(windows))]
         assert!(!environment.contains_key("VIVID_ANCHOR_TRANSPORT"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn wsl_receives_vivid_discovery_without_overwriting_user_entries() {
+        assert_eq!(
+            vivid_wslenv(
+                "GOPATH/p:VIVID_ROOT_SECRET/w:VIVID_ENDPOINT_BULK/u::CARGO_HOME/p:\
+                 VIVID_ENDPOINT_CONTROL/l"
+            ),
+            "GOPATH/p:CARGO_HOME/p:VIVID_ENDPOINT_CONTROL/u:VIVID_ROOT_SECRET/u:\
+             VIVID_ANCHOR_TRANSPORT/u"
+        );
     }
 }

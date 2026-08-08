@@ -296,7 +296,10 @@ and `-e wsl.exe`, and the working directory must be `%USERPROFILE%`.
 
 Launch **Vivido PowerShell** from the Start Menu and confirm Vivido opens with PowerShell 7. Launch
 **Vivido WSL** and confirm the default WSL distribution opens. On Ubuntu's first launch, complete
-the required Linux username and password prompt.
+the required Linux username and password prompt. From that shell, confirm
+`VIVID_ENDPOINT_CONTROL`, `VIVID_ROOT_SECRET`, and `VIVID_ANCHOR_TRANSPORT` are set, then run a
+Linux build of `vivi` against a known image. This verifies that the shortcut's `wsl.exe` boundary
+preserves Vivid discovery rather than testing only that WSL starts.
 
 For a functional suite smoke test:
 
