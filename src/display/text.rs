@@ -56,6 +56,28 @@ struct LayoutKey {
     font_size_bits: u32,
 }
 
+/// Shaped layouts kept alive at once.
+///
+/// The cache is keyed partly by the cluster's text, so a program emitting many distinct
+/// multi-character clusters — emoji sequences, combining marks, a fuzzer — grew it without bound;
+/// only a font change ever cleared it. A terminal's real working set is a few hundred distinct
+/// clusters, so four thousand keeps every ordinary session entirely cached and still bounds the
+/// pathological one.
+const MAX_CACHED_LAYOUTS: usize = 4096;
+
+/// How much of the cache one eviction reclaims.
+///
+/// Reclaiming a batch rather than a single entry is what keeps the scan amortized: one pass over
+/// the cache buys the next thousand insertions, so a flood of distinct clusters pays a constant
+/// amount each instead of a full scan apiece.
+const LAYOUT_EVICTION_BATCH: usize = MAX_CACHED_LAYOUTS / 4;
+
+struct CachedLayout {
+    layout: Arc<Layout<()>>,
+    /// The value of `cache_clock` when this layout was last handed out.
+    used: u64,
+}
+
 pub struct TextSystem {
     font: Font,
     font_cx: FontContext,
@@ -66,7 +88,8 @@ pub struct TextSystem {
     checked_fallbacks: AHashSet<(FallbackKey, char)>,
     family_stacks: [FontFamily<'static>; 4],
     variant_styles: [(ParleyFontStyle, FontWeight); 4],
-    cache: AHashMap<LayoutKey, Arc<Layout<()>>>,
+    cache: AHashMap<LayoutKey, CachedLayout>,
+    cache_clock: u64,
 }
 
 impl TextSystem {
@@ -84,6 +107,7 @@ impl TextSystem {
             fallback_search_families,
             checked_fallbacks: AHashSet::default(),
             cache: AHashMap::new(),
+            cache_clock: 0,
         };
         text_system.metrics = text_system.measure_metrics();
         text_system
@@ -217,8 +241,8 @@ impl TextSystem {
             variant,
             font_size_bits: self.font.size().as_px().to_bits(),
         };
-        if let Some(layout) = self.cache.get(&key) {
-            return Arc::clone(layout);
+        if let Some(layout) = self.cached_layout(&key) {
+            return layout;
         }
 
         self.build_and_cache_layout(key, text, variant)
@@ -232,11 +256,36 @@ impl TextSystem {
             variant,
             font_size_bits: self.font.size().as_px().to_bits(),
         };
-        if let Some(layout) = self.cache.get(&key) {
-            return Arc::clone(layout);
+        if let Some(layout) = self.cached_layout(&key) {
+            return layout;
         }
 
         self.build_and_cache_layout(key, &text, variant)
+    }
+
+    /// Take a layout out of the cache, recording that it is the most recently wanted one.
+    fn cached_layout(&mut self, key: &LayoutKey) -> Option<Arc<Layout<()>>> {
+        let clock = self.cache_clock.saturating_add(1);
+        let entry = self.cache.get_mut(key)?;
+        entry.used = clock;
+        self.cache_clock = clock;
+        Some(Arc::clone(&entry.layout))
+    }
+
+    /// Drop the least recently used part of the cache once it reaches its bound.
+    ///
+    /// The eviction is by recency rather than by insertion order, so the handful of clusters a
+    /// session actually repeats survives any flood of one-off ones passing through around it.
+    fn evict_cached_layouts(&mut self) {
+        if self.cache.len() < MAX_CACHED_LAYOUTS {
+            return;
+        }
+        let mut used = self.cache.values().map(|entry| entry.used).collect::<Vec<_>>();
+        // Every entry's clock value is distinct, so this is the exact recency of the
+        // `LAYOUT_EVICTION_BATCH`th oldest, and everything at or below it goes.
+        let (_, threshold, _) = used.select_nth_unstable(LAYOUT_EVICTION_BATCH);
+        let threshold = *threshold;
+        self.cache.retain(|_, entry| entry.used > threshold);
     }
 
     fn build_and_cache_layout(
@@ -261,7 +310,10 @@ impl TextSystem {
         layout.align(Alignment::Start, AlignmentOptions::default());
 
         let layout = Arc::new(layout);
-        self.cache.insert(key, Arc::clone(&layout));
+        self.evict_cached_layouts();
+        self.cache_clock = self.cache_clock.saturating_add(1);
+        self.cache
+            .insert(key, CachedLayout { layout: Arc::clone(&layout), used: self.cache_clock });
         layout
     }
 
@@ -664,8 +716,9 @@ mod tests {
     use parley::{FontFamilyName, GenericFamily};
 
     use super::{
-        FontVariant, TextSystem, family_name_sort_key, font_family_stack, fontique_script_for_char,
-        normalize_locale, parse_named_style, push_configured_family_names,
+        FontVariant, LAYOUT_EVICTION_BATCH, MAX_CACHED_LAYOUTS, TextSystem, family_name_sort_key,
+        font_family_stack, fontique_script_for_char, normalize_locale, parse_named_style,
+        push_configured_family_names,
     };
     use crate::config::font::Font;
     use crate::display::color::Rgb;
@@ -757,6 +810,32 @@ mod tests {
 
         assert!(text.shape_cell(&tab_cell).is_none());
         assert_eq!(text.cache_len(), 0);
+    }
+
+    /// The cache was cleared only on a font change, so a program printing distinct clusters — an
+    /// emoji or combining-mark flood — grew it for as long as the session lived.
+    #[test]
+    fn the_shape_cache_stays_bounded_under_a_cluster_flood() {
+        let mut text = TextSystem::new(Font::default());
+        let hot = "hot";
+        text.shape_string(hot, false, false).unwrap();
+
+        for index in 0..MAX_CACHED_LAYOUTS * 2 {
+            text.shape_string(format!("flood-{index}"), false, false).unwrap();
+            // Kept in use throughout, so recency — not insertion order — decides what survives.
+            text.shape_string(hot, false, false).unwrap();
+            assert!(
+                text.cache_len() <= MAX_CACHED_LAYOUTS,
+                "cache grew to {} entries",
+                text.cache_len()
+            );
+        }
+
+        assert!(text.cache_len() >= LAYOUT_EVICTION_BATCH, "eviction must not empty the cache");
+        let before = text.cache_len();
+        let cached = text.shape_string(hot, false, false).unwrap();
+        assert_eq!(text.cache_len(), before, "the cluster in constant use survived the flood");
+        assert!(Arc::ptr_eq(&cached, &text.shape_string(hot, false, false).unwrap()));
     }
 
     #[test]

@@ -1,6 +1,7 @@
 //! WebGPU compositor for Vivid media and compatibility graphics commands.
 
 use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
 
 use bytemuck::{Pod, Zeroable};
 use vello::peniko::{ImageAlphaType, ImageData};
@@ -18,6 +19,25 @@ use crate::vivid::scene::{
 /// [`MAX_RENDER_ITEMS`]; this is only the size that avoids reallocating for ordinary scenes.
 const INITIAL_QUADS: usize = 256;
 const VERTICES_PER_QUAD: usize = 6;
+
+/// How long a track's texture outlives the last frame it was rendered in.
+///
+/// A node stops rendering for reasons that are usually momentary: a `vvmux` tab switch, a scrolled
+/// out anchor, a surface hidden while its producer redraws. Dropping the texture the instant that
+/// happens forces a full re-upload of every pixel when it comes back, which is the most expensive
+/// thing the compositor does. A few seconds covers a switch away and back without keeping memory
+/// alive for a track that has genuinely gone.
+const TEXTURE_GRACE: Duration = Duration::from_secs(5);
+
+/// Pixels the retained — that is, not currently rendered — textures may occupy in total.
+///
+/// This is the presenter's own ceiling on GPU memory, not the `Resource::RetainedPixels` figure the
+/// resource contract grants each session: that one bounds what a producer may ask the presenter to
+/// keep, per session, in ordinary memory, and honouring it here for sixteen sessions at once would
+/// mean holding gigabytes of VRAM for things nobody can see. Thirty-two million pixels is 128 MiB
+/// of RGBA8 — several 4K desktops, or every tab of a large `vvmux` layout — which is as much as a
+/// switch-away-and-back can plausibly need.
+const MAX_RETAINED_PIXELS: u64 = 32 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CaptureRedaction {
@@ -88,6 +108,13 @@ struct SourceTexture {
     rgba_ptr: usize,
     rgba_len: usize,
     alpha_mode: u64,
+    last_rendered: Instant,
+}
+
+impl SourceTexture {
+    fn pixels(&self) -> u64 {
+        u64::from(self.width) * u64::from(self.height)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -278,7 +305,10 @@ impl VividMediaRenderer {
         // desktop. The renderer only needs the conversion.
         let placement_scale = scene.target().placement_scale(size);
         if items.is_empty() {
-            self.tracks.clear();
+            // An empty scene is usually a momentary one — everything hidden while a producer
+            // redraws — so the textures are retained on the same terms as any other frame in which
+            // a track does not render.
+            self.retain_tracks(&HashSet::new(), Instant::now());
             self.capture_redactions.clear();
             return None;
         }
@@ -313,7 +343,7 @@ impl VividMediaRenderer {
             .map(|(_, vertices)| redaction_from_vertices(vertices, size))
             .collect();
         let active = rendered.iter().map(|(item, _)| item.track_key).collect::<HashSet<_>>();
-        self.tracks.retain(|key, _| active.contains(key));
+        self.retain_tracks(&active, Instant::now());
         for (item, _) in &rendered {
             debug_assert_eq!(item.track_key.surface, item.surface_key);
             self.upload_track(device, queue, item.track_key, item);
@@ -384,6 +414,31 @@ impl VividMediaRenderer {
     #[cfg(any(unix, windows))]
     pub fn capture_redactions(&self) -> &[CaptureRedaction] {
         &self.capture_redactions
+    }
+
+    /// Keep the textures of tracks that are not rendering this frame, within bounds.
+    ///
+    /// A track that stops rendering used to lose its texture on that very frame, so coming back
+    /// re-uploaded every pixel. Instead its texture survives [`TEXTURE_GRACE`], and the retained
+    /// set as a whole survives only while it fits [`MAX_RETAINED_PIXELS`] — past that the tracks
+    /// that have gone unrendered longest are dropped first, since they are the least likely to be
+    /// wanted next.
+    fn retain_tracks(&mut self, active: &HashSet<TrackKey>, now: Instant) {
+        let mut retained = Vec::new();
+        for (key, track) in &mut self.tracks {
+            if active.contains(key) {
+                track.last_rendered = now;
+            } else {
+                retained.push((
+                    *key,
+                    now.saturating_duration_since(track.last_rendered),
+                    track.pixels(),
+                ));
+            }
+        }
+        for key in evictions(&mut retained) {
+            self.tracks.remove(&key);
+        }
     }
 
     fn upload_track(
@@ -536,6 +591,7 @@ impl VividMediaRenderer {
                 rgba_ptr: frame.rgba.as_ptr() as usize,
                 rgba_len: frame.rgba.len(),
                 alpha_mode: frame.alpha_mode,
+                last_rendered: Instant::now(),
             },
         );
         self.source_upload_metrics.frames = self.source_upload_metrics.frames.saturating_add(1);
@@ -589,6 +645,36 @@ impl VividMediaRenderer {
         image.alpha_type = ImageAlphaType::AlphaPremultiplied;
         self.target = Some(MediaTarget { _texture: texture, view, image, width, height });
     }
+}
+
+/// Which retained textures to drop, given how long each has gone unrendered and how big it is.
+///
+/// Everything past the grace period goes first, then — only if what is left still exceeds the
+/// budget — the longest unrendered of the survivors, until it fits. Taking the oldest first keeps
+/// the tab a user just switched away from, which is the one they are most likely to switch back to.
+fn evictions<K: Copy>(retained: &mut Vec<(K, Duration, u64)>) -> Vec<K> {
+    let mut evicted = Vec::new();
+    retained.retain(|(key, age, _)| {
+        let expired = *age >= TEXTURE_GRACE;
+        if expired {
+            evicted.push(*key);
+        }
+        !expired
+    });
+    let mut total =
+        retained.iter().fold(0_u64, |total, (_, _, pixels)| total.saturating_add(*pixels));
+    if total <= MAX_RETAINED_PIXELS {
+        return evicted;
+    }
+    retained.sort_by_key(|(_, age, _)| std::cmp::Reverse(*age));
+    for (key, _, pixels) in retained.iter() {
+        if total <= MAX_RETAINED_PIXELS {
+            break;
+        }
+        evicted.push(*key);
+        total = total.saturating_sub(*pixels);
+    }
+    evicted
 }
 
 /// The capacity the geometry buffer must grow to in order to hold `quads`, or `None` when
@@ -697,7 +783,12 @@ fn fixed_to_f32(value: i64) -> f32 {
 
 #[cfg(test)]
 mod protocol_renderer_tests {
-    use super::{INITIAL_QUADS, MAX_RENDER_ITEMS, fixed_to_f32, grown_vertex_capacity};
+    use std::time::Duration;
+
+    use super::{
+        INITIAL_QUADS, MAX_RENDER_ITEMS, MAX_RETAINED_PIXELS, TEXTURE_GRACE, evictions,
+        fixed_to_f32, grown_vertex_capacity,
+    };
 
     #[test]
     fn fixed_point_cell_coordinates_remain_fractional() {
@@ -723,6 +814,52 @@ mod protocol_renderer_tests {
             "capacity {capacity} must hold {MAX_RENDER_ITEMS} quads"
         );
         assert_eq!(grown_vertex_capacity(MAX_RENDER_ITEMS, capacity), None);
+    }
+
+    /// A track that stops rendering used to lose its texture on that very frame, so a `vvmux` tab
+    /// switch or a scrolled-out anchor paid a full re-upload to come back. It now survives a brief
+    /// absence, and only a brief one.
+    #[test]
+    fn a_texture_survives_a_brief_absence_and_no_longer() {
+        let mut retained = vec![
+            ('a', Duration::from_millis(16), 1920 * 1080),
+            ('b', TEXTURE_GRACE - Duration::from_millis(1), 1920 * 1080),
+            ('c', TEXTURE_GRACE, 1920 * 1080),
+            ('d', TEXTURE_GRACE + Duration::from_secs(60), 1920 * 1080),
+        ];
+        assert_eq!(evictions(&mut retained), vec!['c', 'd'], "only what is past the grace period");
+        assert_eq!(retained.len(), 2, "the recent two are kept");
+    }
+
+    /// Retention is bounded by pixels, not by count, and gives up the longest-absent first.
+    #[test]
+    fn the_retained_set_stays_within_its_pixel_budget_oldest_first() {
+        let each = MAX_RETAINED_PIXELS / 4;
+        let mut retained = vec![
+            ('a', Duration::from_millis(10), each),
+            ('b', Duration::from_millis(40), each),
+            ('c', Duration::from_millis(20), each),
+            ('d', Duration::from_millis(30), each),
+        ];
+        assert!(evictions(&mut retained).is_empty(), "exactly the budget is not over it");
+
+        let mut retained = vec![
+            ('a', Duration::from_millis(10), each),
+            ('b', Duration::from_millis(40), each),
+            ('c', Duration::from_millis(20), each),
+            ('d', Duration::from_millis(30), each),
+            ('e', Duration::from_millis(50), each),
+            ('f', Duration::from_millis(60), each),
+        ];
+        assert_eq!(
+            evictions(&mut retained),
+            vec!['f', 'e'],
+            "the longest unrendered go, and only until the rest fits"
+        );
+
+        // One texture larger than the whole budget is not kept at any age.
+        let mut huge = vec![('a', Duration::ZERO, MAX_RETAINED_PIXELS + 1)];
+        assert_eq!(evictions(&mut huge), vec!['a']);
     }
 }
 
