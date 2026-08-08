@@ -26,6 +26,11 @@ use vivid_protocol::{CONTROL_MAX_RECORD_BODY, HARD_MAX_RECORD_BODY};
 /// never timed out for being idle.
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Windows does not reliably wake a blocking `recv` when another cloned `TcpStream` handle calls
+/// `shutdown`. Polling keeps both explicit reader cancellation and pre-handshake eviction bounded.
+#[cfg(windows)]
+const WINDOWS_READ_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
 /// How much of a record body is made room for at a time.
 ///
 /// Small enough that a declared length nobody intends to send costs almost nothing, large enough
@@ -46,9 +51,22 @@ pub struct Reader {
 impl Reader {
     pub fn new(mut stream: LocalStream) -> io::Result<(Self, Preface, [u8; PREFACE_SIZE])> {
         let handshake_deadline = Instant::now() + HANDSHAKE_TIMEOUT;
+        #[cfg(unix)]
         stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
+        #[cfg(windows)]
+        stream.set_read_timeout(Some(WINDOWS_READ_POLL_INTERVAL))?;
+        #[cfg(windows)]
+        let cancelled = Arc::new(AtomicBool::new(false));
         let mut bytes = [0_u8; PREFACE_SIZE];
+        #[cfg(unix)]
         stream.read_exact(&mut bytes)?;
+        #[cfg(windows)]
+        read_exact_interruptibly(
+            &stream,
+            cancelled.as_ref(),
+            Some(handshake_deadline),
+            &mut bytes,
+        )?;
         let preface = match Preface::classify(bytes)? {
             PrefaceClassification::Accepted(preface) => preface,
             PrefaceClassification::UnsupportedVersion(_) => {
@@ -61,13 +79,11 @@ impl Reader {
             },
         };
         let maximum = preface.initiator_tx_body_limit.min(HARD_MAX_RECORD_BODY);
-        #[cfg(windows)]
-        stream.set_read_timeout(Some(Duration::from_millis(100)))?;
         Ok((
             Self {
                 stream: Arc::new(stream),
                 #[cfg(windows)]
-                cancelled: Arc::new(AtomicBool::new(false)),
+                cancelled,
                 negotiated_maximum: maximum,
                 maximum: if preface.kind == ConnectionKind::Control {
                     maximum.min(CONTROL_MAX_RECORD_BODY)
