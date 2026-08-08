@@ -8,14 +8,23 @@ use std::os::unix::net::UnixStream as LocalStream;
 #[cfg(windows)]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-#[cfg(windows)]
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use vivid_protocol::wire::{
     ConnectionKind, HEADER_SIZE, PREFACE_SIZE, Preface, PrefaceClassification, RECORD_KNOWN_FLAGS,
     Record, RecordHeader,
 };
 use vivid_protocol::{CONTROL_MAX_RECORD_BODY, HARD_MAX_RECORD_BODY};
+
+/// How long an accepted connection has to get from its preface to an authenticated session.
+///
+/// Every connection holds a slot and an OS thread from the moment it is accepted, so the phase
+/// before the peer has proved anything is deadlined. Ten seconds is orders of magnitude above any
+/// real `HELLO`, `CHANNEL_OPEN` or `LANE_OPEN` round trip — a producer that is merely slow cannot
+/// reach it, and one that says nothing at all no longer holds its slot forever. The deadline is
+/// lifted by [`Reader::finish_handshake`] once the peer is authenticated, so a live session is
+/// never timed out for being idle.
+pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct Reader {
     stream: Arc<LocalStream>,
@@ -25,10 +34,13 @@ pub struct Reader {
     maximum: u32,
     sequence: u64,
     first_record: bool,
+    handshake_deadline: Option<Instant>,
 }
 
 impl Reader {
     pub fn new(mut stream: LocalStream) -> io::Result<(Self, Preface, [u8; PREFACE_SIZE])> {
+        let handshake_deadline = Instant::now() + HANDSHAKE_TIMEOUT;
+        stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
         let mut bytes = [0_u8; PREFACE_SIZE];
         stream.read_exact(&mut bytes)?;
         let preface = match Preface::classify(bytes)? {
@@ -58,10 +70,30 @@ impl Reader {
                 },
                 sequence: 0,
                 first_record: true,
+                handshake_deadline: Some(handshake_deadline),
             },
             preface,
             bytes,
         ))
+    }
+
+    /// Lift the handshake deadline once this connection's peer has been authenticated.
+    ///
+    /// An established session may legitimately stay silent for hours, so the deadline covers only
+    /// the records before `HELLO`/`CHANNEL_OPEN`/`LANE_OPEN` has been accepted. On Windows the
+    /// short polling timeout stays in place: it is what makes [`ReadShutdown`] able to wake a
+    /// parked reader, not a deadline.
+    pub fn finish_handshake(&mut self) -> io::Result<()> {
+        self.handshake_deadline = None;
+        #[cfg(unix)]
+        self.stream.set_read_timeout(None)?;
+        Ok(())
+    }
+
+    /// Shorten the handshake deadline so a test does not have to wait the production ten seconds.
+    #[cfg(test)]
+    pub fn set_handshake_deadline(&mut self, within: Duration) {
+        self.handshake_deadline = Some(Instant::now() + within);
     }
 
     /// A handle that can unblock a reader parked in [`Self::read_record`].
@@ -96,9 +128,14 @@ impl Reader {
     ) -> io::Result<RecordHeader> {
         let mut bytes = [0_u8; HEADER_SIZE];
         #[cfg(unix)]
-        read_exact_interruptibly(self.stream.as_ref(), &mut bytes)?;
+        read_exact_interruptibly(self.stream.as_ref(), self.handshake_deadline, &mut bytes)?;
         #[cfg(windows)]
-        read_exact_interruptibly(self.stream.as_ref(), &self.cancelled, &mut bytes)?;
+        read_exact_interruptibly(
+            self.stream.as_ref(),
+            &self.cancelled,
+            self.handshake_deadline,
+            &mut bytes,
+        )?;
         let header = RecordHeader::decode(bytes);
         if header.flags & !RECORD_KNOWN_FLAGS != 0 {
             return Err(io::Error::new(
@@ -128,9 +165,14 @@ impl Reader {
         self.sequence = header.sequence;
         body.resize(header.body_length as usize, 0);
         #[cfg(unix)]
-        read_exact_interruptibly(self.stream.as_ref(), body)?;
+        read_exact_interruptibly(self.stream.as_ref(), self.handshake_deadline, body)?;
         #[cfg(windows)]
-        read_exact_interruptibly(self.stream.as_ref(), &self.cancelled, body)?;
+        read_exact_interruptibly(
+            self.stream.as_ref(),
+            &self.cancelled,
+            self.handshake_deadline,
+            body,
+        )?;
         Ok(header)
     }
 
@@ -179,6 +221,7 @@ impl ReadShutdown {
 fn read_exact_interruptibly(
     stream: &LocalStream,
     cancelled: &AtomicBool,
+    deadline: Option<Instant>,
     mut bytes: &mut [u8],
 ) -> io::Result<()> {
     while !bytes.is_empty() {
@@ -192,6 +235,9 @@ fn read_exact_interruptibly(
                 if cancelled.load(Ordering::Acquire) {
                     return Err(io::Error::new(io::ErrorKind::Interrupted, "reader stopped"));
                 }
+                if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                    return Err(handshake_expired());
+                }
             },
             Err(error) => return Err(error),
         }
@@ -200,9 +246,45 @@ fn read_exact_interruptibly(
 }
 
 #[cfg(unix)]
-fn read_exact_interruptibly(stream: &LocalStream, bytes: &mut [u8]) -> io::Result<()> {
+fn read_exact_interruptibly(
+    stream: &LocalStream,
+    deadline: Option<Instant>,
+    mut bytes: &mut [u8],
+) -> io::Result<()> {
     let mut stream = stream;
-    stream.read_exact(bytes)
+    let Some(deadline) = deadline else {
+        return stream.read_exact(bytes);
+    };
+    // Before the handshake completes the socket carries a receive timeout, and it is refreshed to
+    // what is left of the deadline so a peer that dribbles one byte at a time cannot extend it.
+    while !bytes.is_empty() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(handshake_expired());
+        }
+        // A peer that has already closed makes this fail on macOS; the timeout installed before
+        // the preface read still bounds the wait, so the read below decides the outcome.
+        let _ = stream.set_read_timeout(Some(remaining));
+        match stream.read(bytes) {
+            Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
+            Ok(read) => bytes = &mut bytes[read..],
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {},
+            Err(error)
+                if matches!(error.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock) =>
+            {
+                return Err(handshake_expired());
+            },
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+fn handshake_expired() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::TimedOut,
+        "Vivid connection did not complete its handshake before the deadline",
+    )
 }
 
 pub struct Writer {
@@ -338,6 +420,60 @@ mod tests {
             .unwrap();
         let (mut reader, preface, _) = Reader::new(server).unwrap();
         assert!(reader.read_record(preface.kind).is_err());
+    }
+
+    /// A peer that sends a preface and then goes silent must not park the reader forever.
+    #[test]
+    fn a_silent_peer_is_dropped_when_the_handshake_deadline_expires() {
+        let (mut client, server) = stream_pair();
+        client.write_all(&encode_preface(ConnectionKind::Control, 1024)).unwrap();
+        let (mut reader, preface, _) = Reader::new(server).unwrap();
+        reader.set_handshake_deadline(Duration::from_millis(50));
+
+        let started = Instant::now();
+        let Err(error) = reader.read_record(preface.kind) else {
+            panic!("a silent peer must not be served past the handshake deadline");
+        };
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < HANDSHAKE_TIMEOUT, "the deadline, not the socket, ended it");
+        drop(client);
+    }
+
+    /// The deadline covers the handshake only: an established session may idle indefinitely.
+    #[test]
+    fn finishing_the_handshake_lifts_the_deadline() {
+        let (mut client, server) = stream_pair();
+        client.write_all(&encode_preface(ConnectionKind::Control, 1024)).unwrap();
+        let (mut reader, preface, _) = Reader::new(server).unwrap();
+        reader.set_handshake_deadline(Duration::from_millis(50));
+        reader.finish_handshake().unwrap();
+
+        // Nothing arrives for longer than the deadline would have allowed; the record that then
+        // does arrive is still served.
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            write_hello(&mut client);
+            client
+        });
+        let record = reader.read_record(preface.kind).expect("an idle session stays open");
+        assert_eq!(record.record_type, vivid_protocol::messages::HELLO);
+        drop(writer.join().unwrap());
+    }
+
+    fn write_hello(stream: &mut LocalStream) {
+        stream
+            .write_all(
+                &RecordHeader {
+                    body_length: 0,
+                    record_type: vivid_protocol::messages::HELLO,
+                    flags: 0,
+                    object_id: 0,
+                    sequence: 1,
+                }
+                .encode(),
+            )
+            .unwrap();
+        stream.flush().unwrap();
     }
 
     #[test]

@@ -947,8 +947,43 @@ pub fn socket_dir() -> PathBuf {
         .get_runtime_directory()
         .map(ToOwned::to_owned)
         .ok()
-        .and_then(|path| fs::create_dir_all(&path).map(|_| path).ok())
+        .and_then(private_socket_dir)
         .unwrap_or_else(env::temp_dir)
+}
+
+/// Hold the socket directory to the same standard `crate::session` holds a runtime root to.
+///
+/// The socket inside it injects input and reads screen content, so the 0600 mode `bind_socket`
+/// sets is not the whole defence: a directory another user can write to lets the socket be
+/// replaced wholesale rather than read. A directory Vivido has to create is therefore created
+/// owner-only rather than at the umask's discretion, and one that already exists is used only if
+/// it is this user's and closed to everyone else — otherwise discovery falls back to the temporary
+/// directory, where the socket mode and the peer check still stand. A path Vivido does not own is
+/// never modified, only declined.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn private_socket_dir(path: PathBuf) -> Option<PathBuf> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    if !path.exists() {
+        fs::create_dir_all(&path).ok()?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).ok()?;
+    }
+    let metadata = fs::symlink_metadata(&path).ok()?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_dir()
+        || metadata.uid() != effective_uid()
+        || metadata.mode() & 0o077 != 0
+    {
+        warn!("declining IPC socket directory {}: it is not owner-only", path.display());
+        return None;
+    }
+    Some(path)
+}
+
+#[cfg(unix)]
+fn effective_uid() -> u32 {
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    unsafe { libc::geteuid() }
 }
 
 /// Directory for the IPC socket file.
@@ -971,12 +1006,34 @@ pub fn default_endpoint() -> PathBuf {
     PathBuf::from(format!(r"\\.\pipe\Vivido-{}", std::process::id()))
 }
 
-/// Find a socket using an override, inherited endpoint, or current display discovery.
 /// Connect, refusing a socket that belongs to another user.
+///
+/// The transport authenticates the peer's uid from both ends once a connection exists, so this is
+/// the check that runs *before* one does: a socket another user planted where Vivido looks — macOS
+/// still discovers them in the shared `env::temp_dir()` — is declined without a byte being written
+/// to it, and reported as what it is rather than as a protocol failure.
 fn connect_checked(path: &Path) -> io::Result<LocalStream> {
+    #[cfg(unix)]
+    require_socket_owner(path)?;
     LocalStream::connect(path)
 }
 
+#[cfg(unix)]
+fn require_socket_owner(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = fs::symlink_metadata(path)?;
+    let owner = effective_uid();
+    if metadata.file_type().is_symlink() || metadata.uid() != owner {
+        return Err(IoError::new(
+            ErrorKind::PermissionDenied,
+            format!("IPC socket {} is not owned by uid {owner}", path.display()),
+        ));
+    }
+    Ok(())
+}
+
+/// Find a socket using an override, inherited endpoint, or current display discovery.
 fn find_socket(socket_path: Option<PathBuf>, target: Option<&str>) -> io::Result<LocalStream> {
     if let Some(socket_path) = socket_path {
         return connect_checked(&socket_path).map_err(|err| {
@@ -1208,15 +1265,86 @@ mod tests {
         writer.join().unwrap();
     }
 
+    /// The IPC surface injects input and reads screen content, so its socket is owner-only —
+    /// stated outright rather than inherited from whatever umask the shell happened to have.
     #[test]
     #[cfg(unix)]
-    fn socket_is_owner_only() {
+    fn socket_is_owner_only_regardless_of_umask() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("vivido.sock");
-        let Some(_socket) = bound_socket_or_skip(bind_socket(&path)) else {
+
+        // SAFETY: umask has no preconditions. It is process-wide, so it is restored immediately
+        // and held for no longer than the bind.
+        let previous = unsafe { libc::umask(0) };
+        let bound = bind_socket(&path);
+        unsafe { libc::umask(previous) };
+
+        let Some(_socket) = bound_socket_or_skip(bound) else {
             return;
         };
         assert_eq!(path.metadata().unwrap().permissions().mode() & 0o777, 0o600);
+    }
+
+    /// A socket belonging to somebody else is declined before a byte is written to it.
+    ///
+    /// On macOS the sockets are discovered in a shared `env::temp_dir()`, so a path where Vivido
+    /// looks is not proof of who put it there.
+    #[test]
+    #[cfg(unix)]
+    fn a_socket_owned_by_another_user_is_refused_before_connecting() {
+        use std::os::unix::fs::MetadataExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let ours = directory.path().join("ours.sock");
+        std::fs::File::create(&ours).unwrap();
+        require_socket_owner(&ours).expect("a path this user owns is accepted");
+
+        // Faking a peer uid needs privileges this runner may not have; an existing path owned by
+        // another user proves the same predicate without them.
+        let Some(theirs) =
+            ["/etc/hosts", "/bin/sh", "/usr/bin/env"].into_iter().map(Path::new).find(|path| {
+                fs::symlink_metadata(path).is_ok_and(|metadata| metadata.uid() != effective_uid())
+            })
+        else {
+            eprintln!("skipping foreign-owner test: this runner owns every candidate path");
+            return;
+        };
+        let error =
+            require_socket_owner(theirs).expect_err("a socket owned by another user is refused");
+        assert_eq!(error.kind(), ErrorKind::PermissionDenied);
+    }
+
+    /// A directory Vivido has to create for its sockets is owner-only whatever the umask says.
+    #[test]
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn the_socket_directory_vivido_creates_is_owner_only() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("runtime");
+
+        // SAFETY: umask has no preconditions. It is process-wide, so it is restored at once.
+        let previous = unsafe { libc::umask(0) };
+        let created = private_socket_dir(path.clone());
+        unsafe { libc::umask(previous) };
+
+        assert_eq!(created, Some(path.clone()));
+        assert_eq!(path.metadata().unwrap().permissions().mode() & 0o777, 0o700);
+    }
+
+    /// One that anybody else can write to is declined rather than trusted or rewritten.
+    #[test]
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn a_socket_directory_open_to_others_is_declined() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("shared");
+        fs::create_dir(&path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o777)).unwrap();
+
+        assert_eq!(private_socket_dir(path.clone()), None);
+        assert_eq!(
+            path.metadata().unwrap().permissions().mode() & 0o777,
+            0o777,
+            "a directory Vivido does not own is left exactly as it was found"
+        );
     }
 
     #[test]

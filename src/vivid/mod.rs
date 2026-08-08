@@ -90,6 +90,16 @@ type LocalStream = UnixStream;
 
 pub(crate) const MAX_SESSIONS: usize = 16;
 const MAX_CONNECTIONS: usize = 64;
+/// How many accepted connections may sit in their handshake at once.
+///
+/// A connection is unauthenticated until `HELLO`, `CHANNEL_OPEN` or `LANE_OPEN` proves who is on
+/// the other end, and until then anything that can reach the endpoint can hold a slot. Giving that
+/// phase its own, much smaller budget means a peer that opens sockets and says nothing can never
+/// consume the connection budget legitimate producers draw from — it can only fill this fraction
+/// of it, and only for [`transport::HANDSHAKE_TIMEOUT`]. Sixteen is well above the handful of
+/// control, track and lane connections a producer opens back to back at startup, and a quarter of
+/// `MAX_CONNECTIONS`.
+const MAX_PENDING_CONNECTIONS: usize = 16;
 const MAX_ACTIVE_ANCHORS: usize = 4096;
 const MAX_SEEN_ANCHORS: usize = 8192;
 // Audio continuity takes precedence over live video freshness. This remains finite while covering
@@ -184,7 +194,69 @@ struct ServiceShared {
     audio_outputs: Mutex<HashMap<TrackIdentity, Arc<AudioOutput>>>,
     next_session: AtomicU64,
     active_connections: AtomicUsize,
+    pending_handshakes: Mutex<PendingHandshakes>,
     wake: Arc<dyn Fn() + Send + Sync>,
+}
+
+/// The accepted connections that have not authenticated yet, oldest first.
+#[derive(Default)]
+struct PendingHandshakes {
+    next_id: u64,
+    open: Vec<(u64, LocalStream)>,
+}
+
+/// One accepted connection's claim on the pre-handshake budget.
+///
+/// Held from accept until the peer authenticates, then released by
+/// [`PendingConnection::authenticated`], which is also where the connection's handshake deadline is
+/// lifted — the two are the same fact, so they are established in one place. A connection that
+/// fails, is evicted, or is dropped before that releases its claim through `Drop`.
+struct PendingConnection {
+    shared: Arc<ServiceShared>,
+    id: u64,
+}
+
+impl PendingConnection {
+    /// Admit a freshly accepted connection to the pre-handshake budget.
+    ///
+    /// The budget is enforced by evicting the oldest unauthenticated connection rather than by
+    /// refusing the newest arrival. Refusing would hand an attacker the outcome it wants: sixteen
+    /// silent sockets would bar every real producer from the endpoint until their deadlines
+    /// expired. Evicting inverts that — a producer authenticates in the time it takes to write one
+    /// record, so the oldest pending connection is all but always a peer that has said nothing,
+    /// and a flood only evicts itself.
+    fn admit(shared: &Arc<ServiceShared>, stream: &LocalStream) -> io::Result<Self> {
+        let handle = stream.try_clone()?;
+        let mut pending = lock(&shared.pending_handshakes);
+        let id = pending.next_id;
+        pending.next_id = pending.next_id.wrapping_add(1);
+        pending.open.push((id, handle));
+        while pending.open.len() > MAX_PENDING_CONNECTIONS {
+            let (_, evicted) = pending.open.remove(0);
+            // The evicted reader is parked in a blocking read; the shutdown ends it, and its own
+            // `PendingConnection` is already gone from this list.
+            let _ = evicted.shutdown(std::net::Shutdown::Both);
+        }
+        drop(pending);
+        Ok(Self { shared: shared.clone(), id })
+    }
+
+    /// Record that this connection's peer is authenticated.
+    fn authenticated(&self, reader: &mut Reader) -> io::Result<()> {
+        reader.finish_handshake()?;
+        self.release();
+        Ok(())
+    }
+
+    fn release(&self) {
+        lock(&self.shared.pending_handshakes).open.retain(|(id, _)| *id != self.id);
+    }
+}
+
+impl Drop for PendingConnection {
+    fn drop(&mut self) {
+        self.release();
+    }
 }
 
 pub struct VividService {
@@ -248,6 +320,7 @@ impl VividService {
             audio_outputs: Mutex::new(HashMap::new()),
             next_session: AtomicU64::new(1),
             active_connections: AtomicUsize::new(0),
+            pending_handshakes: Mutex::new(PendingHandshakes::default()),
             wake,
         });
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -632,26 +705,45 @@ fn listener_loop(listener: LocalListener, shared: Arc<ServiceShared>, shutdown: 
                 continue;
             },
         };
+        // Charge the pre-handshake budget before the connection budget, so unauthenticated peers
+        // are bounded among themselves before they are counted against producers.
+        let pending = match PendingConnection::admit(&shared, &stream) {
+            Ok(pending) => pending,
+            Err(error) => {
+                log::debug!("Vivid connection refused before its handshake: {error}");
+                continue;
+            },
+        };
         if shared.active_connections.fetch_add(1, Ordering::AcqRel) >= MAX_CONNECTIONS {
             shared.active_connections.fetch_sub(1, Ordering::AcqRel);
             continue;
         }
-        let shared = shared.clone();
-        let _ = thread::Builder::new().name("vivid-1.5-connection".into()).spawn(move || {
-            if let Err(error) = handle_connection(stream, &shared) {
+        let connection = shared.clone();
+        let served = thread::Builder::new().name("vivid-1.5-connection".into()).spawn(move || {
+            if let Err(error) = handle_connection(stream, &connection, &pending) {
                 log::debug!("Vivid connection closed: {error}");
             }
-            shared.active_connections.fetch_sub(1, Ordering::AcqRel);
+            connection.active_connections.fetch_sub(1, Ordering::AcqRel);
         });
+        if let Err(error) = served {
+            // Nothing will run the closure that gives the slot back, so give it back here; a
+            // failed spawn must not retire one of the sixty-four permanently.
+            log::debug!("could not serve a Vivid connection: {error}");
+            shared.active_connections.fetch_sub(1, Ordering::AcqRel);
+        }
     }
 }
 
-fn handle_connection(stream: LocalStream, shared: &Arc<ServiceShared>) -> io::Result<()> {
+fn handle_connection(
+    stream: LocalStream,
+    shared: &Arc<ServiceShared>,
+    pending: &PendingConnection,
+) -> io::Result<()> {
     let (mut reader, preface, preface_bytes) = Reader::new(stream)?;
     match preface.kind {
-        ConnectionKind::Control => handle_control(&mut reader, &preface_bytes, shared),
-        ConnectionKind::Track => handle_track_channel(&mut reader, shared),
-        ConnectionKind::Lane => handle_lane(&mut reader, shared),
+        ConnectionKind::Control => handle_control(&mut reader, &preface_bytes, shared, pending),
+        ConnectionKind::Track => handle_track_channel(&mut reader, shared, pending),
+        ConnectionKind::Lane => handle_lane(&mut reader, shared, pending),
     }
 }
 
@@ -659,6 +751,7 @@ fn handle_control(
     reader: &mut Reader,
     preface: &[u8; 16],
     shared: &Arc<ServiceShared>,
+    pending: &PendingConnection,
 ) -> io::Result<()> {
     let writer = Arc::new(reader.writer(ConnectionKind::Control)?);
     let first = reader.read_record(ConnectionKind::Control)?;
@@ -682,8 +775,20 @@ fn handle_control(
             return Err(error);
         },
     };
-    reader.set_maximum(hello.maximum_control_body)?;
-    writer.set_maximum(hello.maximum_control_body)?;
+    // `HELLO` has been proved and answered: this is a session now, free to idle as long as it
+    // likes, and no longer charged against the pre-handshake budget. `WELCOME` has already been
+    // written by the time these can fail, so the session exists and has to be retired rather than
+    // abandoned — a peer that closed between `WELCOME` and here is exactly how they fail.
+    let established = reader
+        .set_maximum(hello.maximum_control_body)
+        .and_then(|()| writer.set_maximum(hello.maximum_control_body))
+        .and_then(|()| pending.authenticated(reader));
+    if let Err(error) = established {
+        egress.close();
+        egress.join();
+        finish_session(shared, &session, false);
+        return Err(error);
+    }
 
     // A session is a reader, an actor, and an egress. This thread is the reader: it parses and
     // enqueues, and never writes, so a peer that stops draining its replies cannot stall parsing.
@@ -2350,7 +2455,11 @@ fn dispatch_control(
     Ok(Some((reply.0, reply.1, body)))
 }
 
-fn handle_track_channel(reader: &mut Reader, shared: &Arc<ServiceShared>) -> io::Result<()> {
+fn handle_track_channel(
+    reader: &mut Reader,
+    shared: &Arc<ServiceShared>,
+    pending: &PendingConnection,
+) -> io::Result<()> {
     let writer = Arc::new(reader.writer(ConnectionKind::Track)?);
     let first = reader.read_record(ConnectionKind::Track)?;
     let envelope = messages::decode_control(&first.body)?;
@@ -2407,6 +2516,9 @@ fn handle_track_channel(reader: &mut Reader, shared: &Arc<ServiceShared>) -> io:
         )?;
         return Err(io::Error::new(ErrorKind::PermissionDenied, "channel authentication failed"));
     }
+    // The channel tag is proved, so this connection is a media channel that may then wait on its
+    // producer for as long as the track lives.
+    pending.authenticated(reader)?;
     let generation = ChannelGeneration::new(open.channel_generation);
     let (maximum_bytes, maximum_records) = live_channel_flow(&status.configuration);
     let acceptance = vec![
@@ -3245,7 +3357,11 @@ fn wait_until_video_due(
 /// Core §7: the lane is authenticated with a tag over the session channel key, carries only
 /// input and liveness records, and its loss revokes input without disturbing the control session,
 /// surfaces, or tracks.
-fn handle_lane(reader: &mut Reader, shared: &Arc<ServiceShared>) -> io::Result<()> {
+fn handle_lane(
+    reader: &mut Reader,
+    shared: &Arc<ServiceShared>,
+    pending: &PendingConnection,
+) -> io::Result<()> {
     let writer = Arc::new(reader.writer(ConnectionKind::Lane)?);
     reader.set_maximum(LANE_MAX_RECORD_BODY)?;
     writer.set_maximum(LANE_MAX_RECORD_BODY)?;
@@ -3293,6 +3409,9 @@ fn handle_lane(reader: &mut Reader, shared: &Arc<ServiceShared>) -> io::Result<(
             "lane authentication failed",
         ));
     }
+    // The lane tag is proved. An interactive lane is quiet by nature — it carries input the
+    // presenter sends when the user acts — so it must not be deadlined from here.
+    pending.authenticated(reader)?;
 
     let admission = {
         let mut slot = lock(&session.lane);
@@ -5539,6 +5658,72 @@ mod tests {
             sequence: header.sequence,
             body,
         })
+    }
+
+    /// Has this end of the connection been closed by the presenter?
+    fn is_closed(stream: &LocalStream) -> bool {
+        stream.set_nonblocking(true).unwrap();
+        wait_until(Duration::from_millis(500), || {
+            let mut stream = stream;
+            match stream.read(&mut [0_u8; 1]) {
+                Ok(0) => true,
+                Ok(_) => false,
+                Err(error) => !matches!(error.kind(), ErrorKind::WouldBlock),
+            }
+        })
+    }
+
+    /// A local process that opens connections and says nothing must not close the endpoint.
+    ///
+    /// Every accepted connection costs a slot and a thread from the moment it arrives — before its
+    /// peer has proved anything at all, and on Windows the endpoint is a loopback listener any
+    /// process can reach. Unauthenticated connections are therefore bounded among themselves, and
+    /// the bound is enforced by evicting the oldest silent peer rather than by turning the newest
+    /// arrival away, so the flood displaces itself and not a producer.
+    #[test]
+    fn silent_connections_cannot_lock_a_producer_out_of_the_endpoint() {
+        let service =
+            socket_service!(VividService::start_with_wake(test_geometry(), Arc::new(|| {})));
+        let endpoint = service.control_endpoint().to_owned();
+
+        // The entire connection budget, and not one of them sends even a preface.
+        let mut silent = Vec::new();
+        for _ in 0..MAX_CONNECTIONS {
+            match connect_endpoint(&endpoint) {
+                Ok(stream) => silent.push(stream),
+                Err(error) => panic!("the endpoint stopped accepting connections: {error}"),
+            }
+        }
+
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                let pending = lock(&service.shared.pending_handshakes);
+                pending.next_id >= MAX_CONNECTIONS as u64
+                    && pending.open.len() <= MAX_PENDING_CONNECTIONS
+            }),
+            "unauthenticated connections stay bounded among themselves"
+        );
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                service.shared.active_connections.load(Ordering::Acquire) <= MAX_PENDING_CONNECTIONS
+            }),
+            "a peer that has not spoken cannot hold a producer's connection slot or its thread"
+        );
+
+        let evicted = MAX_CONNECTIONS - MAX_PENDING_CONNECTIONS;
+        assert_eq!(
+            silent[..evicted].iter().filter(|stream| is_closed(stream)).count(),
+            evicted,
+            "the oldest silent connections are shut down, not merely uncounted"
+        );
+
+        // The point of the bound: a real producer is served while the flood is still live.
+        let session = connect(&service);
+        assert!(
+            session.query_session().is_ok(),
+            "a legitimate producer connects and is served during a flood of silent sockets"
+        );
+        drop(silent);
     }
 
     fn wait_until(deadline: Duration, mut condition: impl FnMut() -> bool) -> bool {
