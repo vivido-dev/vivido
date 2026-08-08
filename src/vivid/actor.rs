@@ -82,7 +82,12 @@ impl Egress {
         egress
     }
 
-    /// Have this egress unblock `shutdown`'s reader when it stops serving the peer.
+    /// Have this egress unblock `shutdown`'s reader when it *gives up* on the peer — an overflow
+    /// or a failed write, never an orderly close.
+    ///
+    /// Without this a session whose queue overflowed from an outside thread would stop accepting
+    /// records but stay registered, holding its connection slot and its scene state, until its
+    /// peer happened to close. Overflow is meant to end the session, so it has to be able to.
     pub(crate) fn set_shutdown(&self, shutdown: ReadShutdown) {
         let closed = self.queue.lock().expect("egress queue").closed;
         if closed {
@@ -168,7 +173,9 @@ impl Egress {
                 }
             };
             let Some((record_type, object_id, body)) = next else {
-                self.stop_reader();
+                // A normal close, so the reader is left alone: the control session's actor stops
+                // it itself once the final reply — notably `GOODBYE`'s `OK` — has drained, and
+                // pre-empting that would cut the connection before the peer saw it.
                 return;
             };
             if writer.write_record(record_type, object_id, &body).is_err() {

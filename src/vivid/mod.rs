@@ -670,6 +670,10 @@ fn handle_control(
     // A session is a reader, an actor, and an egress. This thread is the reader: it parses and
     // enqueues, and never writes, so a peer that stops draining its replies cannot stall parsing.
     let egress = Egress::start(writer, "vivid-control-egress");
+    // An overflow here is caused by whichever thread posted the record that did not fit, which is
+    // often not this session's own. Let the egress wake this reader so the session is reclaimed
+    // rather than lingering until its peer decides to close.
+    egress.set_shutdown(reader.shutdown_handle()?);
     // Publish it before the actor starts, so no record this session owes can be dispatched while
     // another thread would still find no egress and drop what it wanted to say.
     *lock(&session.egress) = Some(egress.clone());
@@ -5955,11 +5959,6 @@ mod tests {
     fn a_producer_that_stops_draining_control_cannot_stall_the_terminal_or_the_window() {
         let service =
             socket_service!(VividService::start_with_wake(test_geometry(), Arc::new(|| {})));
-        // A healthy producer, so the isolation claim has a second owner to be checked against.
-        let mut healthy = connect(&service);
-        let healthy_context = healthy.info().root_context_id;
-        let healthy_surface = grid_surface(&mut healthy, 1);
-
         // A producer that completes HELLO and then never reads another byte.
         let stalled = RawClient::root(&service).expect("root session");
         assert!(
@@ -5969,27 +5968,72 @@ mod tests {
             "the stalled producer is registered"
         );
 
-        // Far more announcements than either the egress queue or the socket buffer can hold. Each
-        // of these is what the PTY parser and the draw path call. The draw-path call is made every
-        // so often rather than every iteration: it clones the session table under a lock, and the
-        // claim here is about blocking, not throughput.
+        // Far more announcements than either the egress queue or the socket buffer can hold.
+        //
+        // The geometry has to actually change on every iteration: `offer_geometry` returns `None`
+        // for a repeat, so re-offering the same size would queue nothing and this would pass
+        // whether or not the write blocks. `flush_display_change` is what the thread that draws
+        // the window calls on every frame.
         let started = Instant::now();
-        for line in 0..(actor::EGRESS_CAPACITY as i32 * 4) {
+        for step in 0..(actor::EGRESS_CAPACITY as u32 * 4) {
+            let mut geometry = test_geometry();
+            geometry.viewport_width = 400 + step % 400;
+            geometry.columns = geometry.viewport_width / geometry.cell_width;
+            assert!(
+                service.update_metrics(geometry).is_some(),
+                "each step must be a real target change, or this proves nothing"
+            );
+            service.flush_display_change(None);
             service.handle_grid_scroll(0, 24, 1, 0);
-            service.handle_screen_swap(line % 2 == 1);
-            if line % 32 == 0 {
-                service.update_metrics(test_geometry());
-                service.flush_display_change(None);
-            }
+            service.handle_screen_swap(step % 2 == 1);
         }
         let elapsed = started.elapsed();
         assert!(
             elapsed < Duration::from_secs(5),
             "the terminal and draw paths must never block on a producer; took {elapsed:?}"
         );
+    }
 
-        // The healthy producer is untouched: same surface, still serving requests, still able to
-        // commit. Overflowing one session's egress closes that session and nothing else.
+    /// Overflowing one producer's egress closes that producer and touches nothing else.
+    ///
+    /// Paced deliberately: a presenter that generates announcements faster than *any* producer can
+    /// consume them will close that producer too, which is the designed bound rather than a
+    /// failure. The claim here is about a peer that will not read at all, so the rate stays one a
+    /// healthy peer keeps up with while the stalled one's queue still fills.
+    #[test]
+    fn a_stalled_producer_is_closed_without_disturbing_a_healthy_one() {
+        let service =
+            socket_service!(VividService::start_with_wake(test_geometry(), Arc::new(|| {})));
+        let mut healthy = connect(&service);
+        let healthy_context = healthy.info().root_context_id;
+        let healthy_surface = grid_surface(&mut healthy, 1);
+        let stalled = RawClient::root(&service).expect("root session");
+        assert!(
+            wait_until(Duration::from_secs(2), || {
+                lock(&service.shared.registry).sessions.contains_key(&stalled.session_id)
+            }),
+            "the stalled producer is registered"
+        );
+
+        for step in 0..(actor::EGRESS_CAPACITY as u32 * 2) {
+            let mut geometry = test_geometry();
+            geometry.viewport_width = 400 + step % 400;
+            geometry.columns = geometry.viewport_width / geometry.cell_width;
+            service.update_metrics(geometry);
+            service.flush_display_change(None);
+            if step % 16 == 0 {
+                thread::sleep(Duration::from_micros(200));
+            }
+        }
+
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                !lock(&service.shared.registry).sessions.contains_key(&stalled.session_id)
+            }),
+            "a producer that will not read its replies is closed"
+        );
+
+        // The healthy producer still answers, and keeps every piece of state it owns.
         assert!(healthy.query_session().is_ok(), "the healthy session still answers");
         let healthy_identity =
             SessionIdentity::new(service.shared.presenter, healthy.info().session_id).unwrap();
