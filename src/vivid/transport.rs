@@ -5,7 +5,11 @@ use std::io::{self, IoSlice, Read, Write};
 use std::net::TcpStream as LocalStream;
 #[cfg(unix)]
 use std::os::unix::net::UnixStream as LocalStream;
+#[cfg(windows)]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+#[cfg(windows)]
+use std::time::Duration;
 
 use vivid_protocol::wire::{
     ConnectionKind, HEADER_SIZE, PREFACE_SIZE, Preface, PrefaceClassification, RECORD_KNOWN_FLAGS,
@@ -15,6 +19,8 @@ use vivid_protocol::{CONTROL_MAX_RECORD_BODY, HARD_MAX_RECORD_BODY};
 
 pub struct Reader {
     stream: Arc<LocalStream>,
+    #[cfg(windows)]
+    cancelled: Arc<AtomicBool>,
     negotiated_maximum: u32,
     maximum: u32,
     sequence: u64,
@@ -37,9 +43,13 @@ impl Reader {
             },
         };
         let maximum = preface.initiator_tx_body_limit.min(HARD_MAX_RECORD_BODY);
+        #[cfg(windows)]
+        stream.set_read_timeout(Some(Duration::from_millis(100)))?;
         Ok((
             Self {
                 stream: Arc::new(stream),
+                #[cfg(windows)]
+                cancelled: Arc::new(AtomicBool::new(false)),
                 negotiated_maximum: maximum,
                 maximum: if preface.kind == ConnectionKind::Control {
                     maximum.min(CONTROL_MAX_RECORD_BODY)
@@ -60,7 +70,11 @@ impl Reader {
     /// and close the logical session, so the reader must stop rather than wait for a peer EOF that
     /// a producer is not obliged to send promptly.
     pub fn shutdown_handle(&self) -> io::Result<ReadShutdown> {
-        Ok(ReadShutdown { stream: self.stream.clone() })
+        Ok(ReadShutdown {
+            stream: self.stream.clone(),
+            #[cfg(windows)]
+            cancelled: self.cancelled.clone(),
+        })
     }
 
     pub fn read_record(&mut self, kind: ConnectionKind) -> io::Result<Record> {
@@ -81,8 +95,10 @@ impl Reader {
         body: &mut Vec<u8>,
     ) -> io::Result<RecordHeader> {
         let mut bytes = [0_u8; HEADER_SIZE];
-        let mut stream = self.stream.as_ref();
-        stream.read_exact(&mut bytes)?;
+        #[cfg(unix)]
+        read_exact_interruptibly(self.stream.as_ref(), &mut bytes)?;
+        #[cfg(windows)]
+        read_exact_interruptibly(self.stream.as_ref(), &self.cancelled, &mut bytes)?;
         let header = RecordHeader::decode(bytes);
         if header.flags & !RECORD_KNOWN_FLAGS != 0 {
             return Err(io::Error::new(
@@ -111,7 +127,10 @@ impl Reader {
         }
         self.sequence = header.sequence;
         body.resize(header.body_length as usize, 0);
-        stream.read_exact(body)?;
+        #[cfg(unix)]
+        read_exact_interruptibly(self.stream.as_ref(), body)?;
+        #[cfg(windows)]
+        read_exact_interruptibly(self.stream.as_ref(), &self.cancelled, body)?;
         Ok(header)
     }
 
@@ -144,12 +163,46 @@ impl Reader {
 /// Unblocks a parked reader after the connection's egress has drained.
 pub struct ReadShutdown {
     stream: Arc<LocalStream>,
+    #[cfg(windows)]
+    cancelled: Arc<AtomicBool>,
 }
 
 impl ReadShutdown {
     pub fn stop(&self) {
+        #[cfg(windows)]
+        self.cancelled.store(true, Ordering::Release);
         let _ = self.stream.shutdown(std::net::Shutdown::Both);
     }
+}
+
+#[cfg(windows)]
+fn read_exact_interruptibly(
+    stream: &LocalStream,
+    cancelled: &AtomicBool,
+    mut bytes: &mut [u8],
+) -> io::Result<()> {
+    while !bytes.is_empty() {
+        let mut stream = stream;
+        match stream.read(bytes) {
+            Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
+            Ok(read) => bytes = &mut bytes[read..],
+            Err(error)
+                if matches!(error.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock) =>
+            {
+                if cancelled.load(Ordering::Acquire) {
+                    return Err(io::Error::new(io::ErrorKind::Interrupted, "reader stopped"));
+                }
+            },
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn read_exact_interruptibly(stream: &LocalStream, bytes: &mut [u8]) -> io::Result<()> {
+    let mut stream = stream;
+    stream.read_exact(bytes)
 }
 
 pub struct Writer {

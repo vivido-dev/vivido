@@ -45,6 +45,8 @@ pub(crate) const INGRESS_CAPACITY: usize = 64;
 struct EgressQueue {
     records: VecDeque<(u16, u64, Vec<u8>)>,
     closed: bool,
+    #[cfg(test)]
+    worker_paused: bool,
 }
 
 /// Owns a connection's writer so no thread that must stay responsive blocks on a peer.
@@ -68,7 +70,12 @@ pub(crate) struct Egress {
 impl Egress {
     pub(crate) fn start(writer: Arc<Writer>, name: &'static str) -> Arc<Self> {
         let egress = Arc::new(Self {
-            queue: Mutex::new(EgressQueue { records: VecDeque::new(), closed: false }),
+            queue: Mutex::new(EgressQueue {
+                records: VecDeque::new(),
+                closed: false,
+                #[cfg(test)]
+                worker_paused: false,
+            }),
             ready: Condvar::new(),
             overflowed: AtomicBool::new(false),
             worker: Mutex::new(None),
@@ -103,7 +110,11 @@ impl Egress {
     #[cfg(test)]
     fn detached() -> Arc<Self> {
         Arc::new(Self {
-            queue: Mutex::new(EgressQueue { records: VecDeque::new(), closed: false }),
+            queue: Mutex::new(EgressQueue {
+                records: VecDeque::new(),
+                closed: false,
+                worker_paused: false,
+            }),
             ready: Condvar::new(),
             overflowed: AtomicBool::new(false),
             worker: Mutex::new(None),
@@ -136,6 +147,14 @@ impl Egress {
         self.overflowed.load(Ordering::Acquire)
     }
 
+    /// Stop the worker at its queue boundary so overflow tests do not depend on kernel socket
+    /// buffer sizes. In particular, Windows loopback TCP buffers substantially more than the Unix
+    /// domain sockets used by the same tests on macOS and Linux.
+    #[cfg(test)]
+    pub(crate) fn pause_worker_for_test(&self) {
+        self.queue.lock().expect("egress queue").worker_paused = true;
+    }
+
     /// Stop accepting records and let the worker drain what is already queued.
     pub(crate) fn close(&self) {
         let mut queue = self.queue.lock().expect("egress queue");
@@ -163,6 +182,11 @@ impl Egress {
             let next = {
                 let mut queue = self.queue.lock().expect("egress queue");
                 loop {
+                    #[cfg(test)]
+                    if queue.worker_paused && !queue.closed {
+                        queue = self.ready.wait(queue).expect("egress queue");
+                        continue;
+                    }
                     if let Some(record) = queue.records.pop_front() {
                         break Some(record);
                     }

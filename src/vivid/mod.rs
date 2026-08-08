@@ -663,20 +663,34 @@ fn handle_control(
     let writer = Arc::new(reader.writer(ConnectionKind::Control)?);
     let first = reader.read_record(ConnectionKind::Control)?;
     let (hello_request, hello) = Hello::decode(&first.body)?;
-    let session = establish_root_session(shared, writer.clone(), preface, &hello, hello_request)?;
+    // Install the bounded egress before publishing the session. The registry lock held during
+    // establishment keeps outside announcements behind WELCOME, and once it is released every
+    // visible session is already able to queue them.
+    let egress = Egress::start(writer.clone(), "vivid-control-egress");
+    let session = match establish_root_session(
+        shared,
+        writer.clone(),
+        egress.clone(),
+        preface,
+        &hello,
+        hello_request,
+    ) {
+        Ok(session) => session,
+        Err(error) => {
+            egress.close();
+            egress.join();
+            return Err(error);
+        },
+    };
     reader.set_maximum(hello.maximum_control_body)?;
     writer.set_maximum(hello.maximum_control_body)?;
 
     // A session is a reader, an actor, and an egress. This thread is the reader: it parses and
     // enqueues, and never writes, so a peer that stops draining its replies cannot stall parsing.
-    let egress = Egress::start(writer, "vivid-control-egress");
     // An overflow here is caused by whichever thread posted the record that did not fit, which is
     // often not this session's own. Let the egress wake this reader so the session is reclaimed
     // rather than lingering until its peer decides to close.
     egress.set_shutdown(reader.shutdown_handle()?);
-    // Publish it before the actor starts, so no record this session owes can be dispatched while
-    // another thread would still find no egress and drop what it wanted to say.
-    *lock(&session.egress) = Some(egress.clone());
     let (records, incoming) = mpsc::sync_channel::<Record>(actor::INGRESS_CAPACITY);
     let clean_goodbye = Arc::new(AtomicBool::new(false));
     let shutdown = reader.shutdown_handle()?;
@@ -1078,6 +1092,7 @@ fn fail_authentication(writer: &Arc<Writer>, request_id: u64, diagnostic: &str) 
 fn establish_root_session(
     shared: &Arc<ServiceShared>,
     writer: Arc<Writer>,
+    egress: Arc<Egress>,
     preface: &[u8; 16],
     hello: &Hello,
     request_id: u64,
@@ -1426,7 +1441,7 @@ fn establish_root_session(
         session_tag,
         channel_key: Secret32::new(*keys.channel_key()),
         anchor_key,
-        egress: Mutex::new(None),
+        egress: Mutex::new(Some(egress)),
         contexts: Mutex::new(HashMap::from([(
             root_context.context_id,
             ContextState::root(identity, root_context.context_id, classes, contract)
@@ -6015,6 +6030,27 @@ mod tests {
             "the stalled producer is registered"
         );
 
+        // Make the stalled write deterministic. Kernel receive-buffer capacity differs greatly:
+        // Windows loopback TCP can absorb this entire burst, while the Unix-domain socket used on
+        // macOS fills. Pausing only this session's worker models the same blocked socket boundary
+        // and leaves the production queue/overflow/reader-shutdown path under test.
+        assert!(
+            wait_until(Duration::from_secs(2), || {
+                let registry = lock(&service.shared.registry);
+                registry
+                    .sessions
+                    .get(&stalled.session_id)
+                    .is_some_and(|session| lock(&session.egress).is_some())
+            }),
+            "the stalled producer egress is installed"
+        );
+        let stalled_egress = {
+            let registry = lock(&service.shared.registry);
+            let session = registry.sessions.get(&stalled.session_id).expect("stalled session");
+            lock(&session.egress).clone().expect("stalled session egress")
+        };
+        stalled_egress.pause_worker_for_test();
+
         for step in 0..(actor::EGRESS_CAPACITY as u32 * 2) {
             let mut geometry = test_geometry();
             geometry.viewport_width = 400 + step % 400;
@@ -6025,6 +6061,8 @@ mod tests {
                 thread::sleep(Duration::from_micros(200));
             }
         }
+
+        assert!(stalled_egress.overflowed(), "the stalled egress queue must overflow");
 
         assert!(
             wait_until(Duration::from_secs(5), || {
