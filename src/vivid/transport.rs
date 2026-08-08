@@ -26,6 +26,12 @@ use vivid_protocol::{CONTROL_MAX_RECORD_BODY, HARD_MAX_RECORD_BODY};
 /// never timed out for being idle.
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How much of a record body is made room for at a time.
+///
+/// Small enough that a declared length nobody intends to send costs almost nothing, large enough
+/// that a real 16 MiB key frame is a handful of amortized growths rather than a per-byte concern.
+const BODY_READ_CHUNK: usize = 64 * 1024;
+
 pub struct Reader {
     stream: Arc<LocalStream>,
     #[cfg(windows)]
@@ -111,7 +117,7 @@ impl Reader {
 
     pub fn read_record(&mut self, kind: ConnectionKind) -> io::Result<Record> {
         let mut body = Vec::new();
-        let header = self.read_record_body_into(kind, &mut body)?;
+        let header = self.read_record_into(kind, &mut body)?;
         Ok(Record {
             record_type: header.record_type,
             flags: header.flags,
@@ -121,7 +127,12 @@ impl Reader {
         })
     }
 
-    fn read_record_body_into(
+    /// Read one record, reusing `body` for its payload.
+    ///
+    /// A caller that parses and drops a record within one iteration — the media channel loop — can
+    /// hand the same buffer back every time and stop allocating per record entirely. `body` is
+    /// replaced, not appended to, and holds the record's payload when this returns.
+    pub fn read_record_into(
         &mut self,
         kind: ConnectionKind,
         body: &mut Vec<u8>,
@@ -163,17 +174,40 @@ impl Reader {
             self.first_record = false;
         }
         self.sequence = header.sequence;
-        body.resize(header.body_length as usize, 0);
-        #[cfg(unix)]
-        read_exact_interruptibly(self.stream.as_ref(), self.handshake_deadline, body)?;
-        #[cfg(windows)]
-        read_exact_interruptibly(
-            self.stream.as_ref(),
-            &self.cancelled,
-            self.handshake_deadline,
-            body,
-        )?;
+        self.read_body_into(header.body_length as usize, body)?;
         Ok(header)
+    }
+
+    /// Read `length` bytes of body, growing `body` as they arrive rather than up front.
+    ///
+    /// The declared length is a peer's claim, not a delivery. Sizing the buffer to it before
+    /// reading let anything that could reach the endpoint charge the presenter
+    /// `HARD_MAX_RECORD_BODY` — 64 MiB — per connection for the price of an eight-byte header, on
+    /// as many connections as it could open. Reading in bounded pieces means the memory a
+    /// connection holds tracks the bytes it has actually sent, so the claim costs nothing until it
+    /// is honoured. A peer that sends what it declared reaches the same buffer by the same total
+    /// amount of copying, since the growth stays amortized.
+    fn read_body_into(&mut self, length: usize, body: &mut Vec<u8>) -> io::Result<()> {
+        body.clear();
+        while body.len() < length {
+            let filled = body.len();
+            let next = length.min(filled.saturating_add(BODY_READ_CHUNK));
+            body.resize(next, 0);
+            #[cfg(unix)]
+            read_exact_interruptibly(
+                self.stream.as_ref(),
+                self.handshake_deadline,
+                &mut body[filled..],
+            )?;
+            #[cfg(windows)]
+            read_exact_interruptibly(
+                self.stream.as_ref(),
+                &self.cancelled,
+                self.handshake_deadline,
+                &mut body[filled..],
+            )?;
+        }
+        Ok(())
     }
 
     pub fn writer(&self, kind: ConnectionKind) -> io::Result<Writer> {
@@ -457,6 +491,88 @@ mod tests {
         });
         let record = reader.read_record(preface.kind).expect("an idle session stays open");
         assert_eq!(record.record_type, vivid_protocol::messages::HELLO);
+        drop(writer.join().unwrap());
+    }
+
+    /// A body length is a claim until the bytes arrive, and must not be charged for before then.
+    ///
+    /// Sizing the buffer to the declared length let anything that could reach the endpoint charge
+    /// the presenter 64 MiB per connection for the price of an eight-byte header.
+    #[test]
+    fn a_declared_body_is_not_allocated_until_it_arrives() {
+        let (mut client, server) = stream_pair();
+        client.write_all(&encode_preface(ConnectionKind::Track, HARD_MAX_RECORD_BODY)).unwrap();
+        let (mut reader, preface, _) = Reader::new(server).unwrap();
+        reader.finish_handshake().unwrap();
+
+        // The largest body the protocol allows, of which a token amount is actually sent.
+        client
+            .write_all(
+                &RecordHeader {
+                    body_length: HARD_MAX_RECORD_BODY,
+                    record_type: vivid_protocol::messages::CHANNEL_OPEN,
+                    flags: 0,
+                    object_id: 0,
+                    sequence: 1,
+                }
+                .encode(),
+            )
+            .unwrap();
+        client.write_all(&[0_u8; 1024]).unwrap();
+        client.shutdown(std::net::Shutdown::Write).unwrap();
+
+        let mut body = Vec::new();
+        let Err(error) = reader.read_record_into(preface.kind, &mut body) else {
+            panic!("a body that was never sent must not be served");
+        };
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+        assert!(
+            body.capacity() <= 2 * BODY_READ_CHUNK,
+            "held {} bytes for a body of which 1 KiB arrived",
+            body.capacity()
+        );
+    }
+
+    /// The media path parses and drops each record within one iteration, so it reads into one
+    /// buffer for the life of the connection rather than allocating per record.
+    #[test]
+    fn a_reused_body_buffer_stops_reallocating_after_the_first_record() {
+        let length = 4 * BODY_READ_CHUNK;
+        let (mut client, server) = stream_pair();
+        client.write_all(&encode_preface(ConnectionKind::Track, HARD_MAX_RECORD_BODY)).unwrap();
+        // The pair's socket buffer is smaller than the records, so the writer cannot be this thread.
+        let writer = std::thread::spawn(move || {
+            for sequence in 1..=2 {
+                client
+                    .write_all(
+                        &RecordHeader {
+                            body_length: length as u32,
+                            record_type: vivid_protocol::messages::CHANNEL_OPEN,
+                            flags: 0,
+                            object_id: 0,
+                            sequence,
+                        }
+                        .encode(),
+                    )
+                    .unwrap();
+                client.write_all(&vec![sequence as u8; length]).unwrap();
+            }
+            client.flush().unwrap();
+            client
+        });
+        let (mut reader, preface, _) = Reader::new(server).unwrap();
+        reader.finish_handshake().unwrap();
+
+        let mut body = Vec::new();
+        reader.read_record_into(preface.kind, &mut body).unwrap();
+        assert_eq!(body.len(), length);
+        let (address, capacity) = (body.as_ptr(), body.capacity());
+
+        reader.read_record_into(preface.kind, &mut body).unwrap();
+        assert_eq!(body.len(), length);
+        assert_eq!(body[0], 2, "the second record replaces the first, it does not append");
+        assert_eq!(body.as_ptr(), address, "the second record reused the same allocation");
+        assert_eq!(body.capacity(), capacity);
         drop(writer.join().unwrap());
     }
 

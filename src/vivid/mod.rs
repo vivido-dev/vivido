@@ -2774,20 +2774,24 @@ fn channel_loop(
     let mut last_latency_keyframe: Option<Instant> = None;
     let mut delay_review_started = Instant::now();
     let mut delay_window_headroom_us: Option<i64> = None;
+    // Every record here is parsed and finished with before the next one is read, so the channel
+    // reads into one buffer for the life of the connection instead of allocating per record — on
+    // the path that carries every video packet, every raster frame and every audio packet.
+    let mut body = Vec::new();
     loop {
-        let record = match reader.read_record(ConnectionKind::Track) {
-            Ok(record) => record,
+        let header = match reader.read_record_into(ConnectionKind::Track, &mut body) {
+            Ok(header) => header,
             Err(error) if error.kind() == ErrorKind::UnexpectedEof => return Ok(()),
             Err(error) => return Err(error),
         };
-        if record.object_id != identity.track_id {
+        if header.object_id != identity.track_id {
             return Err(io::Error::new(
                 ErrorKind::InvalidData,
                 "media record object ID does not match the track",
             ));
         }
         if matches!(
-            record.record_type,
+            header.record_type,
             messages::VIDEO_PACKET
                 | messages::AUDIO_PACKET
                 | messages::RASTER_FRAME
@@ -2797,7 +2801,7 @@ fn channel_loop(
                 &mut byte_bucket,
                 &mut record_bucket,
                 &mut last_rate_update,
-                u64::try_from(record.body.len()).unwrap_or(u64::MAX),
+                u64::try_from(body.len()).unwrap_or(u64::MAX),
             )?;
             lock(&shared.registry)
                 .channel_opens
@@ -2806,7 +2810,7 @@ fn channel_loop(
                 .admit_media(generation)
                 .map_err(io::Error::other)?;
         }
-        match record.record_type {
+        match header.record_type {
             messages::RASTER_FRAME => {
                 let KindConfiguration::Raster(raster) = &configuration.kind else {
                     return Err(io::Error::new(
@@ -2814,7 +2818,7 @@ fn channel_loop(
                         "RASTER_FRAME used a non-raster track",
                     ));
                 };
-                let frame = if let Ok(parsed) = media::parse_full_raster_frame(&record.body) {
+                let frame = if let Ok(parsed) = media::parse_full_raster_frame(&body) {
                     if parsed.width != raster.width
                         || parsed.height != raster.height
                         || (parsed.compressed && !raster.zstd_enabled)
@@ -2843,7 +2847,7 @@ fn channel_loop(
                         ));
                     }
                     let delta = media::parse_delta_raster_frame(
-                        &record.body,
+                        &body,
                         raster.width,
                         raster.height,
                         u32::from(raster.maximum_delta_operations),
@@ -2860,17 +2864,14 @@ fn channel_loop(
                     .publish_frame(
                         identity,
                         generation,
-                        u32::try_from(record.body.len()).map_err(|_| {
+                        u32::try_from(body.len()).map_err(|_| {
                             io::Error::new(ErrorKind::InvalidData, "raster record exceeds u32")
                         })?,
                         frame.damage.as_ref().map_or_else(
-                            || {
-                                media::parse_full_raster_frame(&record.body)
-                                    .map(|value| value.epoch)
-                            },
+                            || media::parse_full_raster_frame(&body).map(|value| value.epoch),
                             |_| {
                                 media::parse_delta_raster_frame(
-                                    &record.body,
+                                    &body,
                                     raster.width,
                                     raster.height,
                                     u32::from(raster.maximum_delta_operations),
@@ -2880,7 +2881,7 @@ fn channel_loop(
                         )?,
                         frame.frame_id,
                         frame.damage.is_none(),
-                        record.sequence,
+                        header.sequence,
                         frame,
                     )
                     .map_err(io::Error::other)?;
@@ -2898,9 +2899,9 @@ fn channel_loop(
                         "IMAGE_DATA used a non-image track",
                     ));
                 };
-                if record.body.len() != configuration.encoded_length as usize
+                if body.len() != configuration.encoded_length as usize
                     || configuration.sha256.is_some_and(|expected| {
-                        let actual: [u8; 32] = Sha256::digest(&record.body).into();
+                        let actual: [u8; 32] = Sha256::digest(&body).into();
                         actual != expected
                     })
                 {
@@ -2910,7 +2911,7 @@ fn channel_loop(
                     ));
                 }
                 let image = image::load_from_memory_with_format(
-                    &record.body,
+                    &body,
                     image_format(configuration.encoding)?,
                 )
                 .map_err(io::Error::other)?
@@ -2927,13 +2928,13 @@ fn channel_loop(
                     .publish_frame(
                         identity,
                         generation,
-                        u32::try_from(record.body.len()).map_err(|_| {
+                        u32::try_from(body.len()).map_err(|_| {
                             io::Error::new(ErrorKind::InvalidData, "image record exceeds u32")
                         })?,
                         0,
                         1,
                         true,
-                        record.sequence,
+                        header.sequence,
                         Frame {
                             frame_id: 1,
                             pts_us: 0,
@@ -2950,7 +2951,7 @@ fn channel_loop(
                 (shared.wake)();
             },
             messages::VIDEO_PACKET => {
-                let packet = media::parse_video_packet(&record.body)?;
+                let packet = media::parse_video_packet(&body)?;
                 let random_access = packet.flags & media::VIDEO_PACKET_KEY != 0;
                 // A decoder may release multiple reordered frames for one encoded record. Treat
                 // every output from the first output-bearing record as part of the same priming
@@ -2962,13 +2963,13 @@ fn channel_loop(
                     .admit_media(
                         identity,
                         generation,
-                        u32::try_from(record.body.len()).map_err(|_| {
+                        u32::try_from(body.len()).map_err(|_| {
                             io::Error::new(ErrorKind::InvalidData, "video record exceeds u32")
                         })?,
                         packet.epoch,
                         packet.packet_id,
                         random_access,
-                        record.sequence,
+                        header.sequence,
                     )
                     .map_err(io::Error::other)?;
                 let linked_audio =
@@ -3094,19 +3095,19 @@ fn channel_loop(
                 }
             },
             messages::AUDIO_PACKET => {
-                let packet = media::parse_audio_packet(&record.body)?;
+                let packet = media::parse_audio_packet(&body)?;
                 shared
                     .scene
                     .admit_media(
                         identity,
                         generation,
-                        u32::try_from(record.body.len()).map_err(|_| {
+                        u32::try_from(body.len()).map_err(|_| {
                             io::Error::new(ErrorKind::InvalidData, "audio record exceeds u32")
                         })?,
                         packet.epoch,
                         packet.packet_id,
                         true,
-                        record.sequence,
+                        header.sequence,
                     )
                     .map_err(io::Error::other)?;
                 let (output, decoder) = audio.as_mut().ok_or_else(|| {
@@ -3144,7 +3145,7 @@ fn channel_loop(
                 shared.scene.mark_output_ready(identity, generation).map_err(io::Error::other)?;
             },
             messages::CHANNEL_EOS => {
-                let envelope = messages::decode_control(&record.body)?;
+                let envelope = messages::decode_control(&body)?;
                 if envelope.request_id != 0 {
                     return Err(io::Error::new(
                         ErrorKind::InvalidData,
@@ -3235,7 +3236,7 @@ fn channel_loop(
                 }
                 return Ok(());
             },
-            _ if record.flags & RECORD_OPTIONAL != 0 => {},
+            _ if header.flags & RECORD_OPTIONAL != 0 => {},
             _ => {
                 return Err(io::Error::new(
                     ErrorKind::InvalidData,
@@ -3244,7 +3245,7 @@ fn channel_loop(
             },
         }
         if matches!(
-            record.record_type,
+            header.record_type,
             messages::VIDEO_PACKET
                 | messages::AUDIO_PACKET
                 | messages::RASTER_FRAME
@@ -3252,7 +3253,7 @@ fn channel_loop(
         ) {
             let (maximum_bytes, maximum_records) = shared
                 .scene
-                .return_channel_capacity(identity, generation, record.body.len() as u64, 1)
+                .return_channel_capacity(identity, generation, body.len() as u64, 1)
                 .map_err(io::Error::other)?;
             writer.write_record(
                 messages::MAX_CHANNEL_DATA,
