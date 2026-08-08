@@ -32,6 +32,25 @@ pub const SLOT_RASTER: u64 = 3;
 pub const SLOT_POSTER: u64 = 4;
 pub const ALPHA_STRAIGHT: u64 = 1;
 const MAX_RETAINED_POSTER_PIXELS: u64 = 64 * 1024 * 1024;
+/// Retained posters are also bounded by count, not only by pixels: a detached session holding many
+/// tiny frames would otherwise stay within the pixel budget while growing the render list without
+/// limit.
+const MAX_RETAINED_POSTERS: usize = 256;
+
+/// The most render items one [`SharedScene::snapshot`] can produce.
+///
+/// Every live session's visible nodes plus the retained posters of detached ones. The compositor
+/// sizes its geometry against this, so it has to be the true ceiling rather than a guess.
+pub const MAX_RENDER_ITEMS: usize =
+    crate::vivid::MAX_SESSIONS * crate::vivid::MAX_SCENE_NODES + MAX_RETAINED_POSTERS;
+
+// Every session may fill its node contract at once, and every retained poster is another item.
+// Raising a contract without raising this would let the compositor be handed more geometry than it
+// sized itself for, which is the overflow this constant exists to prevent.
+const _: () = assert!(
+    MAX_RENDER_ITEMS
+        >= crate::vivid::MAX_SESSIONS * crate::vivid::MAX_SCENE_NODES + MAX_RETAINED_POSTERS
+);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RasterDamageRect {
@@ -450,9 +469,17 @@ impl SharedScene {
         };
         let mut posters = Vec::new();
         let mut retained_pixels = 0_u64;
+        // This session's own earlier posters are replaced below, so only other sessions' posters
+        // count against the ceiling.
+        let posters_kept = state
+            .retained_posters
+            .iter()
+            .filter(|poster| poster.anchor.context.session != session)
+            .count();
         for node in scene.nodes.values() {
             if let Some((poster, pixels)) = retained_poster(&*self.0.target, &state, session, node)
                 && retained_pixels.saturating_add(pixels) <= MAX_RETAINED_POSTER_PIXELS
+                && posters_kept + posters.len() < MAX_RETAINED_POSTERS
             {
                 retained_pixels = retained_pixels.saturating_add(pixels);
                 posters.push(poster);

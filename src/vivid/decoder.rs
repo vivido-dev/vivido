@@ -7,78 +7,14 @@ use std::ptr;
 use vivid_protocol::media::ParsedVideoPacket;
 use vivid_protocol::track::VideoConfiguration;
 
+use crate::vivid::ffmpeg::{self, AVPacket, AVRational, ParameterValues};
+
 const AVMEDIA_TYPE_VIDEO: c_int = 0;
 const AV_INPUT_BUFFER_PADDING_SIZE: usize = 64;
 const AV_PKT_FLAG_KEY: c_int = 1;
 const AVERROR_EOF: c_int = -541_478_725;
 const SWS_BILINEAR: c_int = 2;
 const PACKET_TIME_BASE: AVRational = AVRational { num: 1, den: 1_000_000 };
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct AVRational {
-    num: c_int,
-    den: c_int,
-}
-
-#[repr(C)]
-struct AVCodecPrefix {
-    name: *const c_char,
-    long_name: *const c_char,
-    media_type: c_int,
-    id: c_int,
-}
-
-#[repr(C)]
-struct AVCodecParametersPrefix {
-    codec_type: c_int,
-    codec_id: c_int,
-    codec_tag: u32,
-    extradata: *mut u8,
-    extradata_size: c_int,
-    coded_side_data: *mut c_void,
-    nb_coded_side_data: c_int,
-    format: c_int,
-    bit_rate: i64,
-    bits_per_coded_sample: c_int,
-    bits_per_raw_sample: c_int,
-    profile: c_int,
-    level: c_int,
-    width: c_int,
-    height: c_int,
-}
-
-#[repr(C)]
-struct AVPacketPrefix {
-    buf: *mut c_void,
-    pts: i64,
-    dts: i64,
-    data: *mut u8,
-    size: c_int,
-    stream_index: c_int,
-    flags: c_int,
-    side_data: *mut c_void,
-    side_data_elems: c_int,
-    duration: i64,
-    pos: i64,
-    opaque: *mut c_void,
-    opaque_ref: *mut c_void,
-    time_base: AVRational,
-}
-
-#[repr(C)]
-struct AVFramePrefix {
-    data: [*mut u8; 8],
-    linesize: [c_int; 8],
-    extended_data: *mut *mut u8,
-    width: c_int,
-    height: c_int,
-    nb_samples: c_int,
-    format: c_int,
-    pict_type: c_int,
-    sample_aspect_ratio: AVRational,
-    pts: i64,
-}
 
 #[derive(Debug)]
 pub struct DecodedFrame {
@@ -89,6 +25,8 @@ pub struct DecodedFrame {
 }
 
 pub struct Decoder {
+    /// The verified layout of the FFmpeg this decoder reads structures from.
+    abi: &'static ffmpeg::Abi,
     context: *mut c_void,
     packet: *mut c_void,
     frame: *mut c_void,
@@ -108,6 +46,8 @@ impl Decoder {
         let decoder_name = if config.codec == "av1" { "libdav1d" } else { config.codec.as_str() };
         let codec_name =
             CString::new(decoder_name).map_err(|_| invalid("video codec contains NUL"))?;
+        // Verify the linked FFmpeg's structure layout before touching any of it.
+        let abi = ffmpeg::abi()?;
         let codec = unsafe { avcodec_find_decoder_by_name(codec_name.as_ptr()) };
         if codec.is_null() {
             return Err(invalid_owned(format!("FFmpeg decoder {decoder_name:?} is unavailable")));
@@ -117,26 +57,18 @@ impl Decoder {
             return Err(io::Error::other("FFmpeg could not allocate a decoder context"));
         }
 
-        let mut parameters = unsafe { avcodec_parameters_alloc() };
-        if parameters.is_null() {
-            unsafe { avcodec_free_context(&mut context) };
-            return Err(io::Error::other("FFmpeg could not allocate codec parameters"));
-        }
+        let mut parameters = match ffmpeg::allocate_parameters() {
+            Ok(parameters) => parameters,
+            Err(error) => {
+                unsafe { avcodec_free_context(&mut context) };
+                return Err(error);
+            },
+        };
 
         let result = (|| {
-            let codec_prefix = unsafe { &*(codec as *const AVCodecPrefix) };
-            let parameters_prefix = unsafe { &mut *(parameters as *mut AVCodecParametersPrefix) };
-            parameters_prefix.codec_type = AVMEDIA_TYPE_VIDEO;
-            parameters_prefix.codec_id = codec_prefix.id;
-            parameters_prefix.profile = config.profile;
-            parameters_prefix.level = config.level;
-            parameters_prefix.width = c_int::try_from(config.coded_width)
-                .map_err(|_| invalid("video width exceeds FFmpeg limits"))?;
-            parameters_prefix.height = c_int::try_from(config.coded_height)
-                .map_err(|_| invalid("video height exceeds FFmpeg limits"))?;
-            parameters_prefix.bit_rate = 0;
-
-            if !config.extradata.is_empty() {
+            let extradata = if config.extradata.is_empty() {
+                None
+            } else {
                 let allocation = config
                     .extradata
                     .len()
@@ -153,9 +85,29 @@ impl Decoder {
                         config.extradata.len(),
                     );
                 }
-                parameters_prefix.extradata = extradata;
-                parameters_prefix.extradata_size = c_int::try_from(config.extradata.len())
+                let length = c_int::try_from(config.extradata.len())
                     .map_err(|_| invalid("codec extradata exceeds i32"))?;
+                Some((extradata, length))
+            };
+            let dimensions = (
+                c_int::try_from(config.coded_width)
+                    .map_err(|_| invalid("video width exceeds FFmpeg limits"))?,
+                c_int::try_from(config.coded_height)
+                    .map_err(|_| invalid("video height exceeds FFmpeg limits"))?,
+            );
+            unsafe {
+                abi.set_parameters(
+                    parameters,
+                    AVMEDIA_TYPE_VIDEO,
+                    ffmpeg::codec_id(codec),
+                    ParameterValues {
+                        extradata,
+                        profile: Some(config.profile),
+                        level: Some(config.level),
+                        dimensions: Some(dimensions),
+                        format: None,
+                    },
+                );
             }
 
             check_ffmpeg("could not configure decoder", unsafe {
@@ -169,7 +121,7 @@ impl Decoder {
             })?;
             Ok(())
         })();
-        unsafe { avcodec_parameters_free(&mut parameters) };
+        ffmpeg::free_parameters(&mut parameters);
         if let Err(error) = result {
             let mut context = context;
             unsafe { avcodec_free_context(&mut context) };
@@ -204,6 +156,7 @@ impl Decoder {
         }
 
         Ok(Self {
+            abi,
             context,
             packet,
             frame,
@@ -237,7 +190,7 @@ impl Decoder {
         check_ffmpeg("could not allocate encoded packet", unsafe {
             av_new_packet(self.packet, size)
         })?;
-        let av_packet = unsafe { &mut *(self.packet as *mut AVPacketPrefix) };
+        let av_packet = unsafe { &mut *(self.packet as *mut AVPacket) };
         unsafe {
             ptr::copy_nonoverlapping(packet.data.as_ptr(), av_packet.data, packet.data.len())
         };
@@ -278,7 +231,7 @@ impl Decoder {
                 break;
             }
             check_ffmpeg("could not receive decoded frame", result)?;
-            let pts_us = unsafe { (*(self.frame as *const AVFramePrefix)).pts };
+            let pts_us = unsafe { self.abi.frame_pts(self.frame) };
             if decoded_frame_is_late(pts_us, discard_before_pts_us) {
                 discarded = discarded.saturating_add(1);
             } else {
@@ -293,7 +246,8 @@ impl Decoder {
     }
 
     fn convert_frame(&mut self) -> io::Result<DecodedFrame> {
-        let frame = unsafe { &*(self.frame as *const AVFramePrefix) };
+        let pts_us = unsafe { self.abi.frame_pts(self.frame) };
+        let frame = unsafe { self.abi.frame(self.frame) };
         if frame.width <= 0 || frame.height <= 0 || frame.width > 8192 || frame.height > 8192 {
             return Err(invalid("decoder produced invalid frame dimensions"));
         }
@@ -368,7 +322,7 @@ impl Decoder {
         if converted != frame.height {
             return Err(io::Error::other("FFmpeg returned a partial RGBA frame"));
         }
-        Ok(DecodedFrame { pts_us: frame.pts, width, height, rgba })
+        Ok(DecodedFrame { pts_us, width, height, rgba })
     }
 
     #[cfg(test)]
@@ -433,8 +387,6 @@ unsafe extern "C" {
     fn avcodec_find_decoder_by_name(name: *const c_char) -> *const c_void;
     fn avcodec_alloc_context3(codec: *const c_void) -> *mut c_void;
     fn avcodec_free_context(context: *mut *mut c_void);
-    fn avcodec_parameters_alloc() -> *mut c_void;
-    fn avcodec_parameters_free(parameters: *mut *mut c_void);
     fn avcodec_parameters_to_context(context: *mut c_void, parameters: *const c_void) -> c_int;
     fn avcodec_open2(
         context: *mut c_void,

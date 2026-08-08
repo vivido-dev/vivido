@@ -28,7 +28,7 @@ use vivid_protocol::revision::ChannelGeneration;
 
 use crate::vivid::audio::AudioOutput;
 use crate::vivid::scene::{SharedScene, TrackWaitEvaluation};
-use crate::vivid::transport::Writer;
+use crate::vivid::transport::{ReadShutdown, Writer};
 
 /// How often the actor re-evaluates outstanding operations when no record arrives.
 pub(crate) const TICK: Duration = Duration::from_millis(2);
@@ -47,31 +47,51 @@ struct EgressQueue {
     closed: bool,
 }
 
-/// Owns the control connection's writer so neither the reader nor the actor blocks on a peer.
+/// Owns a connection's writer so no thread that must stay responsive blocks on a peer.
+///
+/// Every write a presenter originates goes through one of these. The control egress is owned by
+/// the session actor; the lane egress is owned by the lane's reader thread. Threads that may never
+/// block on a socket — the PTY parser, the winit UI thread, a track channel, another session's
+/// actor — only ever queue here.
 pub(crate) struct Egress {
     queue: Mutex<EgressQueue>,
     ready: Condvar,
     overflowed: AtomicBool,
     worker: Mutex<Option<JoinHandle<()>>>,
+    /// Unblocks the reader sharing this connection once the egress has given up on the peer.
+    ///
+    /// Only the lane sets one. The control session's actor already owns its reader's shutdown and
+    /// stops it after the final reply has drained, which an egress-side close would pre-empt.
+    shutdown: Mutex<Option<ReadShutdown>>,
 }
 
 impl Egress {
-    pub(crate) fn start(writer: Arc<Writer>) -> Arc<Self> {
+    pub(crate) fn start(writer: Arc<Writer>, name: &'static str) -> Arc<Self> {
         let egress = Arc::new(Self {
             queue: Mutex::new(EgressQueue { records: VecDeque::new(), closed: false }),
             ready: Condvar::new(),
             overflowed: AtomicBool::new(false),
             worker: Mutex::new(None),
+            shutdown: Mutex::new(None),
         });
         let worker = {
             let egress = egress.clone();
-            thread::Builder::new()
-                .name("vivid-control-egress".into())
-                .spawn(move || egress.run(writer))
-                .ok()
+            thread::Builder::new().name(name.into()).spawn(move || egress.run(writer)).ok()
         };
         *egress.worker.lock().expect("egress worker") = worker;
         egress
+    }
+
+    /// Have this egress unblock `shutdown`'s reader when it stops serving the peer.
+    pub(crate) fn set_shutdown(&self, shutdown: ReadShutdown) {
+        let closed = self.queue.lock().expect("egress queue").closed;
+        if closed {
+            // The egress already gave up; honour the handle immediately rather than storing it
+            // somewhere nothing will read it again.
+            shutdown.stop();
+            return;
+        }
+        *self.shutdown.lock().expect("egress shutdown") = Some(shutdown);
     }
 
     /// An egress with no worker, so queue admission can be tested without racing a drain.
@@ -82,6 +102,7 @@ impl Egress {
             ready: Condvar::new(),
             overflowed: AtomicBool::new(false),
             worker: Mutex::new(None),
+            shutdown: Mutex::new(None),
         })
     }
 
@@ -96,6 +117,8 @@ impl Egress {
             queue.closed = true;
             self.overflowed.store(true, Ordering::Release);
             self.ready.notify_all();
+            drop(queue);
+            self.stop_reader();
             return false;
         }
         queue.records.push_back((record_type, object_id, body));
@@ -122,6 +145,14 @@ impl Egress {
         }
     }
 
+    /// Wake whatever reader shares this connection, so it stops waiting for a peer we have
+    /// stopped answering. A no-op for the control egress, which has no handle.
+    fn stop_reader(&self) {
+        if let Some(shutdown) = self.shutdown.lock().expect("egress shutdown").take() {
+            shutdown.stop();
+        }
+    }
+
     fn run(self: Arc<Self>, writer: Arc<Writer>) {
         loop {
             let next = {
@@ -137,10 +168,12 @@ impl Egress {
                 }
             };
             let Some((record_type, object_id, body)) = next else {
+                self.stop_reader();
                 return;
             };
             if writer.write_record(record_type, object_id, &body).is_err() {
                 self.close();
+                self.stop_reader();
                 return;
             }
         }

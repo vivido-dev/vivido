@@ -306,12 +306,21 @@ pub struct Display {
 
     hint_mouse_point: Option<Point>,
     scene_renderer: SceneRenderer,
+    /// Kept so a renderer rebuilt after GPU device loss can be re-attached to the same scene.
+    vivid_scene: Option<crate::vivid::scene::SharedScene>,
+    /// Consecutive rebuilds without a frame in between. A GPU that cannot be brought back is not
+    /// something to retry forever.
+    renderer_rebuilds: u32,
     text_system: TextSystem,
     meter: Meter,
 }
 
+/// Rebuild attempts allowed before a GPU error is treated as unrecoverable.
+const MAX_RENDERER_REBUILDS: u32 = 2;
+
 impl Display {
     pub fn set_vivid_scene(&mut self, scene: crate::vivid::scene::SharedScene) {
+        self.vivid_scene = Some(scene.clone());
         self.scene_renderer.set_vivid_scene(scene);
     }
 
@@ -458,6 +467,8 @@ impl Display {
             font_size,
             hint_mouse_point: Default::default(),
             scene_renderer,
+            vivid_scene: None,
+            renderer_rebuilds: 0,
             text_system,
             meter: Default::default(),
         })
@@ -753,10 +764,19 @@ impl Display {
             background_color.b,
             (config.window_opacity() * 255.) as u8,
         );
-        let presented = self
-            .scene_renderer
-            .render(&scene, base_color)
-            .unwrap_or_else(|err| panic!("renderer stopped after a fatal GPU error: {err}"));
+        let presented = match self.scene_renderer.render(&scene, base_color) {
+            Ok(presented) => {
+                self.renderer_rebuilds = 0;
+                presented
+            },
+            Err(error) => {
+                // The GPU went away. Rebuild and let the next frame paint rather than taking the
+                // terminal down: the grid, the PTY, and every Vivid session are all still intact,
+                // and track textures re-upload from the scene's retained frames.
+                self.recover_from_render_error(&error, config);
+                false
+            },
+        };
 
         self.request_frame(scheduler);
         self.damage_tracker.swap_damage();
@@ -1187,6 +1207,33 @@ impl Display {
                 *hint = None;
             }
         }
+    }
+
+    /// Rebuild the GPU renderer after a fatal render error, or give up if it will not come back.
+    fn recover_from_render_error(&mut self, error: &renderer::Error, config: &UiConfig) {
+        self.renderer_rebuilds += 1;
+        if self.renderer_rebuilds > MAX_RENDERER_REBUILDS {
+            panic!("renderer stopped after a fatal GPU error: {error}");
+        }
+        log::warn!(
+            "GPU render failed ({error}); rebuilding the renderer (attempt {} of \
+             {MAX_RENDERER_REBUILDS})",
+            self.renderer_rebuilds
+        );
+        if let Err(rebuild) = self.scene_renderer.rebuild(
+            self.window.render_source(),
+            self.window.inner_size(),
+            config.window_opacity() < 1.0,
+        ) {
+            panic!("renderer stopped after a fatal GPU error: {error}; rebuild failed: {rebuild}");
+        }
+        if let Some(scene) = self.vivid_scene.clone() {
+            self.scene_renderer.set_vivid_scene(scene);
+        }
+        // Nothing on the new device has been painted, so the next frame must draw everything.
+        self.damage_tracker.frame().mark_fully_damaged();
+        self.damage_tracker.next_frame().mark_fully_damaged();
+        self.window.request_redraw();
     }
 
     fn request_frame(&mut self, scheduler: &mut Scheduler) {

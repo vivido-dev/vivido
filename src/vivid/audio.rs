@@ -13,6 +13,8 @@ use ringbuf::{HeapProd, HeapRb};
 use vivid_protocol::media::ParsedAudioPacket;
 use vivid_protocol::track::AudioConfiguration;
 
+use crate::vivid::ffmpeg::{self, AVPacket, AVRational, ParameterValues};
+
 const AVMEDIA_TYPE_AUDIO: c_int = 1;
 const AV_INPUT_BUFFER_PADDING_SIZE: usize = 64;
 const AV_SAMPLE_FMT_FLT: c_int = 3;
@@ -32,73 +34,16 @@ const MAXIMUM_LIVE_DELAY_US: u64 = 1_000_000;
 /// Delay changes smaller than this are transport jitter, not skew worth re-buffering for.
 const LIVE_DELAY_STEP_US: u64 = 20_000;
 const LINKED_AUDIO_STALL_FALLBACK: Duration = Duration::from_secs(2);
+/// How much of a full ring buffer to wait for the device to drain before retrying a push.
+const RING_WAIT_SAMPLES: u64 = 512;
+/// A floor on that wait, so a very high sample rate cannot turn it back into a spin.
+const MINIMUM_RING_WAIT: Duration = Duration::from_micros(500);
+/// How often to re-check an output that is not draining, so `stop` and errors are still noticed.
+const STOPPED_OUTPUT_RECHECK: Duration = Duration::from_millis(5);
 const UNSET_PTS: i64 = i64::MIN;
 
 pub fn supports(config: &AudioConfiguration) -> bool {
     AudioDecoder::new(config, config.sample_rate, u16::from(config.channels)).is_ok()
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct AVRational {
-    num: c_int,
-    den: c_int,
-}
-
-#[repr(C)]
-struct AVCodecPrefix {
-    name: *const c_char,
-    long_name: *const c_char,
-    media_type: c_int,
-    id: c_int,
-}
-
-#[repr(C)]
-struct AVCodecParametersPrefix {
-    codec_type: c_int,
-    codec_id: c_int,
-    codec_tag: u32,
-    extradata: *mut u8,
-    extradata_size: c_int,
-    coded_side_data: *mut c_void,
-    nb_coded_side_data: c_int,
-    format: c_int,
-    bit_rate: i64,
-    bits_per_coded_sample: c_int,
-    bits_per_raw_sample: c_int,
-    profile: c_int,
-    level: c_int,
-    width: c_int,
-    height: c_int,
-}
-
-#[repr(C)]
-struct AVPacketPrefix {
-    buf: *mut c_void,
-    pts: i64,
-    dts: i64,
-    data: *mut u8,
-    size: c_int,
-    stream_index: c_int,
-    flags: c_int,
-    side_data: *mut c_void,
-    side_data_elems: c_int,
-    duration: i64,
-    pos: i64,
-    opaque: *mut c_void,
-    opaque_ref: *mut c_void,
-    time_base: AVRational,
-}
-
-#[repr(C)]
-struct AVFramePrefix {
-    data: [*mut u8; 8],
-    linesize: [c_int; 8],
-    extended_data: *mut *mut u8,
-    width: c_int,
-    height: c_int,
-    nb_samples: c_int,
-    format: c_int,
 }
 
 #[repr(C)]
@@ -490,6 +435,31 @@ impl AudioOutput {
         target_us
     }
 
+    /// How long until the media clock reaches `pts_us`, or `None` when it already has.
+    ///
+    /// The device renders at a fixed rate, so the remaining time is arithmetic rather than
+    /// something to poll for. `None` is also returned when the clock is not running: the caller
+    /// has its own fallback for that and must not wait on a clock that is not advancing.
+    pub fn time_until_pts(&self, pts_us: i64) -> Option<Duration> {
+        let rendered = self.rendered_pts()?;
+        let remaining = pts_us.checked_sub(rendered).filter(|remaining| *remaining > 0)?;
+        Some(Duration::from_micros(u64::try_from(remaining).unwrap_or(u64::MAX)))
+    }
+
+    /// How long until the device has consumed `samples` from the ring.
+    ///
+    /// Used to wait out a full ring buffer without polling it. The device only drains while it is
+    /// enabled, so a stopped or paused output reports nothing and the caller re-checks its own
+    /// exit conditions instead.
+    fn time_to_drain(&self, samples: u64) -> Option<Duration> {
+        if !self.shared.enabled.load(Ordering::SeqCst) {
+            return None;
+        }
+        let rate = u64::from(self.sample_rate).saturating_mul(u64::from(self.channels));
+        (rate > 0)
+            .then(|| Duration::from_micros(samples.saturating_mul(1_000_000).div_ceil(rate.max(1))))
+    }
+
     fn samples_for(&self, duration_us: u64) -> u64 {
         u64::from(self.sample_rate)
             .saturating_mul(u64::from(self.channels))
@@ -559,7 +529,14 @@ impl AudioOutput {
                     },
                     Err(value) => {
                         sample = value;
-                        thread::sleep(Duration::from_micros(500));
+                        // The ring is full. It drains at the device's fixed rate, so wait for the
+                        // device to consume a chunk rather than polling it. Signalling from the
+                        // audio callback instead would put a lock on the realtime thread.
+                        let wait = self
+                            .time_to_drain(RING_WAIT_SAMPLES)
+                            .unwrap_or(STOPPED_OUTPUT_RECHECK)
+                            .clamp(MINIMUM_RING_WAIT, STOPPED_OUTPUT_RECHECK);
+                        thread::sleep(wait);
                     },
                 }
             }
@@ -706,6 +683,8 @@ where
 }
 
 pub struct AudioDecoder {
+    /// The verified layout of the FFmpeg this decoder reads structures from.
+    abi: &'static ffmpeg::Abi,
     context: *mut c_void,
     packet: *mut c_void,
     frame: *mut c_void,
@@ -724,6 +703,8 @@ impl AudioDecoder {
         output_rate: u32,
         output_channels: u16,
     ) -> io::Result<Self> {
+        // Verify the linked FFmpeg's structure layout before touching any of it.
+        let abi = ffmpeg::abi()?;
         let name =
             CString::new(config.codec.as_str()).map_err(|_| invalid("audio codec has NUL"))?;
         let codec = unsafe { avcodec_find_decoder_by_name(name.as_ptr()) };
@@ -734,42 +715,51 @@ impl AudioDecoder {
             ));
         }
         let mut context = unsafe { avcodec_alloc_context3(codec) };
-        let mut parameters = unsafe { avcodec_parameters_alloc() };
-        if context.is_null() || parameters.is_null() {
-            unsafe {
-                avcodec_parameters_free(&mut parameters);
-                avcodec_free_context(&mut context);
-            }
+        let mut parameters = match ffmpeg::allocate_parameters() {
+            Ok(parameters) => parameters,
+            Err(error) => {
+                unsafe { avcodec_free_context(&mut context) };
+                return Err(error);
+            },
+        };
+        if context.is_null() {
+            ffmpeg::free_parameters(&mut parameters);
             return Err(io::Error::other("FFmpeg could not allocate audio decoder state"));
         }
         let result = (|| {
-            let codec = unsafe { &*(codec as *const AVCodecPrefix) };
-            let parameters = unsafe { &mut *(parameters as *mut AVCodecParametersPrefix) };
-            parameters.codec_type = AVMEDIA_TYPE_AUDIO;
-            parameters.codec_id = codec.id;
-            parameters.bit_rate = 0;
-            if !config.extradata.is_empty() {
+            let extradata = if config.extradata.is_empty() {
+                None
+            } else {
                 let size = config
                     .extradata
                     .len()
                     .checked_add(AV_INPUT_BUFFER_PADDING_SIZE)
                     .ok_or_else(|| invalid("audio extradata size overflows"))?;
-                parameters.extradata = unsafe { av_mallocz(size) }.cast();
-                if parameters.extradata.is_null() {
+                let extradata: *mut u8 = unsafe { av_mallocz(size) }.cast();
+                if extradata.is_null() {
                     return Err(io::Error::other("FFmpeg could not allocate audio extradata"));
                 }
                 unsafe {
                     ptr::copy_nonoverlapping(
                         config.extradata.as_ptr(),
-                        parameters.extradata,
+                        extradata,
                         config.extradata.len(),
                     )
                 };
-                parameters.extradata_size = c_int::try_from(config.extradata.len())
+                let length = c_int::try_from(config.extradata.len())
                     .map_err(|_| invalid("audio extradata exceeds i32"))?;
+                Some((extradata, length))
+            };
+            unsafe {
+                abi.set_parameters(
+                    parameters,
+                    AVMEDIA_TYPE_AUDIO,
+                    ffmpeg::codec_id(codec),
+                    ParameterValues { extradata, ..Default::default() },
+                );
             }
             check_ffmpeg("could not configure audio decoder", unsafe {
-                avcodec_parameters_to_context(context, parameters as *const _ as *const c_void)
+                avcodec_parameters_to_context(context, parameters)
             })?;
             check_ffmpeg("could not set audio packet time base", unsafe {
                 av_opt_set_q(context, c"pkt_timebase".as_ptr(), PACKET_TIME_BASE, 0)
@@ -791,10 +781,10 @@ impl AudioDecoder {
             unsafe { av_channel_layout_uninit(&mut layout) };
             check_ffmpeg("could not set audio channel layout", layout_result)?;
             check_ffmpeg("could not open audio decoder", unsafe {
-                avcodec_open2(context, codec as *const _ as *const c_void, ptr::null_mut())
+                avcodec_open2(context, codec, ptr::null_mut())
             })
         })();
-        unsafe { avcodec_parameters_free(&mut parameters) };
+        ffmpeg::free_parameters(&mut parameters);
         if let Err(error) = result {
             unsafe { avcodec_free_context(&mut context) };
             return Err(error);
@@ -812,6 +802,7 @@ impl AudioDecoder {
             return Err(io::Error::other("FFmpeg could not allocate audio decode buffers"));
         }
         Ok(Self {
+            abi,
             context,
             packet,
             frame,
@@ -834,7 +825,7 @@ impl AudioDecoder {
         check_ffmpeg("could not allocate audio packet", unsafe {
             av_new_packet(self.packet, size)
         })?;
-        let av_packet = unsafe { &mut *(self.packet as *mut AVPacketPrefix) };
+        let av_packet = unsafe { &mut *(self.packet as *mut AVPacket) };
         unsafe {
             ptr::copy_nonoverlapping(packet.data.as_ptr(), av_packet.data, packet.data.len())
         };
@@ -903,7 +894,7 @@ impl AudioDecoder {
                 break;
             }
             check_ffmpeg("could not receive decoded audio", result)?;
-            let frame = unsafe { &*(self.frame as *const AVFramePrefix) };
+            let frame = unsafe { self.abi.frame(self.frame) };
             if frame.nb_samples <= 0 {
                 unsafe { av_frame_unref(self.frame) };
                 continue;
@@ -1084,8 +1075,6 @@ unsafe extern "C" {
     fn avcodec_find_decoder_by_name(name: *const c_char) -> *const c_void;
     fn avcodec_alloc_context3(codec: *const c_void) -> *mut c_void;
     fn avcodec_free_context(context: *mut *mut c_void);
-    fn avcodec_parameters_alloc() -> *mut c_void;
-    fn avcodec_parameters_free(parameters: *mut *mut c_void);
     fn avcodec_parameters_to_context(context: *mut c_void, parameters: *const c_void) -> c_int;
     fn avcodec_open2(
         context: *mut c_void,

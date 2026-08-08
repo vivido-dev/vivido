@@ -4,6 +4,7 @@ mod actor;
 mod audio;
 mod clock;
 mod decoder;
+mod ffmpeg;
 pub(crate) mod hid;
 mod lane;
 mod lease;
@@ -87,7 +88,7 @@ type LocalListener = UnixListener;
 #[cfg(unix)]
 type LocalStream = UnixStream;
 
-const MAX_SESSIONS: usize = 16;
+pub(crate) const MAX_SESSIONS: usize = 16;
 const MAX_CONNECTIONS: usize = 64;
 const MAX_ACTIVE_ANCHORS: usize = 4096;
 const MAX_SEEN_ANCHORS: usize = 8192;
@@ -107,7 +108,14 @@ const LIVE_DELAY_HEADROOM_US: i64 = 100_000;
 /// Three Opus packets: smaller steps are bridged by the decoder's own continuity.
 const AUDIO_GAP_US: i64 = 60_000;
 const CHANNEL_OPEN_DEADLINE_US: u64 = 30_000_000;
-const MAX_SCENE_NODES: usize = 256;
+/// The longest a single ingress-pacing sleep may last before the shortfall is recomputed.
+const MAXIMUM_PACING_SLEEP: Duration = Duration::from_millis(50);
+/// How long a video frame waiting on the linked audio clock may sleep before re-checking whether
+/// that clock is still advancing and still the one to follow.
+const LINKED_AUDIO_RECHECK: Duration = Duration::from_millis(20);
+/// A floor on that wait, so a frame due imminently does not turn the sleep into a spin.
+const MINIMUM_LINKED_AUDIO_WAIT: Duration = Duration::from_millis(1);
+pub(crate) const MAX_SCENE_NODES: usize = 256;
 const MAX_LEASES: usize = 32;
 const MAX_STATUS_ENTRIES: usize = 64;
 /// Core §4.3 caps a lane control body at 64 KiB.
@@ -132,7 +140,13 @@ struct SessionRuntime {
     session_tag: [u8; 16],
     channel_key: Secret32,
     anchor_key: AnchorKey,
-    writer: Arc<Writer>,
+    /// The control connection's egress, installed as soon as the session begins serving records.
+    ///
+    /// There is deliberately no writer here. The handshake is written by the connection's own
+    /// thread before this exists; everything afterwards queues, because a blocking write from the
+    /// PTY parser, the winit UI thread, a track channel, or another session's actor freezes
+    /// whatever that thread was for.
+    egress: Mutex<Option<Arc<Egress>>>,
     contexts: Mutex<HashMap<u64, ContextState>>,
     seen_anchors: Mutex<HashSet<(u64, u64)>>,
     /// The lease this session was activated from, if it is a leased child rather than a root.
@@ -142,8 +156,13 @@ struct SessionRuntime {
     /// The one interactive transport this session may have, core §7.
     lane: Mutex<Option<lane::LaneState>>,
     /// Its writer, independent of the control writer and of every track writer, so a saturated
-    /// bulk track cannot delay input revocation.
+    /// bulk track cannot delay input revocation. Held only so the lane's own reader thread can
+    /// answer `PING` and `SET_INPUT_BINDING` inline; presenter-originated input goes through
+    /// `lane_egress`.
     lane_writer: Mutex<Option<Arc<Writer>>>,
+    /// The lane's egress. Input events and revocations are queued here because they originate on
+    /// the winit UI thread and on the session actor, neither of which may block on a producer.
+    lane_egress: Mutex<Option<Arc<Egress>>>,
     /// The desktop input grant, `desktop-input-v1`.
     grant: Mutex<InputGrant>,
     /// The bounded, coalescing observation queue, `observability-v1`.
@@ -283,14 +302,16 @@ impl VividService {
         self.scene.advance_target_generation(TargetGeneration::new(change.generation));
 
         let body = target_change_body(&change);
-        let writers = lock(&self.shared.registry)
-            .sessions
-            .values()
-            .map(|session| session.writer.clone())
-            .collect::<Vec<_>>();
-        for writer in writers {
-            if let Err(error) = writer.write_record(messages::TARGET_CHANGED, 0, &body) {
-                log::debug!("could not send TARGET_CHANGED: {error}");
+        // This runs on the thread that draws the window. Queue the announcement rather than
+        // writing it: one producer that has stopped reading its control replies would otherwise
+        // block the redraw of every window.
+        let sessions = lock(&self.shared.registry).sessions.values().cloned().collect::<Vec<_>>();
+        for session in sessions {
+            if !session.post_control(messages::TARGET_CHANGED, 0, body.clone()) {
+                log::debug!(
+                    "could not queue TARGET_CHANGED for Vivid session {}",
+                    session.identity.session_id
+                );
             }
         }
     }
@@ -377,7 +398,9 @@ impl VividService {
         )
         .encode()
         .expect("anchor event is valid");
-        let _ = session.writer.write_record(messages::ANCHOR_READY, marker.anchor_id, &body);
+        // The PTY parser thread is here. Writing the socket directly would stop terminal output
+        // for as long as the producer declines to read it.
+        session.post_control(messages::ANCHOR_READY, marker.anchor_id, body);
         (self.shared.wake)();
     }
 
@@ -418,9 +441,6 @@ impl VividService {
             let Some(payload) = tagged else {
                 continue;
             };
-            let Some(writer) = lock(&session.lane_writer).clone() else {
-                continue;
-            };
             let surface_id = payload
                 .iter()
                 .find(|entry| entry.0 == 3)
@@ -429,7 +449,10 @@ impl VividService {
             let Ok(body) = Envelope::new(0, payload).encode() else {
                 continue;
             };
-            if writer.write_record(event.record_type(), surface_id, &body).is_ok() {
+            // The winit event loop calls this for every keystroke and pointer motion. Admission is
+            // the queue: core §7 makes a generation unrepeatable once an event is admitted, and a
+            // producer that stops draining its lane must lose input, not freeze the window.
+            if session.post_lane(event.record_type(), surface_id, body) {
                 // Core §7: once an event is admitted, this lane generation cannot be reopened.
                 if let Some(state) = lock(&session.lane).as_mut() {
                     state.note_input();
@@ -546,9 +569,28 @@ impl VividService {
             )
             .encode();
             if let Ok(body) = body {
-                let _ = session.writer.write_record(record_type, identity.anchor_id, &body);
+                // Reached from the PTY parser on every scroll, clear, and screen swap.
+                session.post_control(record_type, identity.anchor_id, body);
             }
         }
+    }
+}
+
+impl SessionRuntime {
+    /// Queue one record on the session's control connection.
+    ///
+    /// This never blocks and never fails the caller's own work. `false` means the record was not
+    /// admitted — the session has not begun serving yet, or its peer stopped draining and the
+    /// egress overflowed, which closes the session on its own thread.
+    fn post_control(&self, record_type: u16, object_id: u64, body: Vec<u8>) -> bool {
+        let egress = lock(&self.egress).clone();
+        egress.is_some_and(|egress| egress.send(record_type, object_id, body))
+    }
+
+    /// Queue one record on the session's interactive lane, with the same guarantees.
+    fn post_lane(&self, record_type: u16, object_id: u64, body: Vec<u8>) -> bool {
+        let egress = lock(&self.lane_egress).clone();
+        egress.is_some_and(|egress| egress.send(record_type, object_id, body))
     }
 }
 
@@ -627,7 +669,10 @@ fn handle_control(
 
     // A session is a reader, an actor, and an egress. This thread is the reader: it parses and
     // enqueues, and never writes, so a peer that stops draining its replies cannot stall parsing.
-    let egress = Egress::start(writer);
+    let egress = Egress::start(writer, "vivid-control-egress");
+    // Publish it before the actor starts, so no record this session owes can be dispatched while
+    // another thread would still find no egress and drop what it wanted to say.
+    *lock(&session.egress) = Some(egress.clone());
     let (records, incoming) = mpsc::sync_channel::<Record>(actor::INGRESS_CAPACITY);
     let clean_goodbye = Arc::new(AtomicBool::new(false));
     let shutdown = reader.shutdown_handle()?;
@@ -871,7 +916,9 @@ fn suspend_lease(
     if let Some(issuer) = issuer
         && let Ok(body) = Envelope::new(0, payload).encode()
     {
-        let _ = issuer.writer.write_record(messages::SESSION_LEASE_CHANGED, key.2, &body);
+        // The issuer is a different session with a different reader. Writing its socket from this
+        // one's thread makes one producer's backlog another producer's stall.
+        issuer.post_control(messages::SESSION_LEASE_CHANGED, key.2, body);
     }
     true
 }
@@ -944,7 +991,7 @@ fn revoke_lease(
     drop(child_runtime);
 
     if let Ok(body) = Envelope::new(0, payload).encode() {
-        let _ = issuer.writer.write_record(messages::SESSION_LEASE_CHANGED, key.2, &body);
+        issuer.post_control(messages::SESSION_LEASE_CHANGED, key.2, body);
     }
     (shared.wake)();
     Some(())
@@ -1375,7 +1422,7 @@ fn establish_root_session(
         session_tag,
         channel_key: Secret32::new(*keys.channel_key()),
         anchor_key,
-        writer,
+        egress: Mutex::new(None),
         contexts: Mutex::new(HashMap::from([(
             root_context.context_id,
             ContextState::root(identity, root_context.context_id, classes, contract)
@@ -1389,6 +1436,7 @@ fn establish_root_session(
         resume_key: Secret32::new(*keys.resume_key()),
         lane: Mutex::new(None),
         lane_writer: Mutex::new(None),
+        lane_egress: Mutex::new(None),
         grant: Mutex::new(InputGrant::new()),
         observations: Mutex::new(ObservationQueue::new(observation_capacity)),
     });
@@ -1405,7 +1453,7 @@ fn establish_root_session(
         if let Some(issuer) = registry.sessions.get(&issuer_session)
             && let Ok(body) = Envelope::new(0, payload).encode()
         {
-            let _ = issuer.writer.write_record(messages::SESSION_LEASE_CHANGED, lease_id, &body);
+            issuer.post_control(messages::SESSION_LEASE_CHANGED, lease_id, body);
         }
     }
     Ok(runtime)
@@ -2012,12 +2060,12 @@ fn dispatch_control(
                         generation: target.generation(),
                         reason: 0,
                     };
-                    if let Err(error) = session.writer.write_record(
+                    if !session.post_control(
                         messages::TARGET_CHANGED,
                         0,
-                        &target_change_body(&current),
+                        target_change_body(&current),
                     ) {
-                        log::debug!("could not re-announce the target for a stale commit: {error}");
+                        log::debug!("could not re-announce the target for a stale commit");
                     }
                     return Err(ControlError::stale_target());
                 },
@@ -2436,7 +2484,9 @@ fn handle_track_channel(reader: &mut Reader, shared: &Arc<ServiceShared>) -> io:
             ],
         )
         .encode()?;
-        let _ = session.writer.write_record(messages::TRACK_LOST, identity.track_id, &body);
+        // This is the track channel's thread, not the session's. Queue so a stalled control peer
+        // cannot hold a media connection open past its own failure.
+        session.post_control(messages::TRACK_LOST, identity.track_id, body);
     }
     result
 }
@@ -3105,19 +3155,24 @@ fn pace_ingress(
         *last_update = now;
         byte_bucket.replenish(elapsed).map_err(io::Error::other)?;
         record_bucket.replenish(elapsed).map_err(io::Error::other)?;
-        let mut next_bytes = byte_bucket.clone();
-        let mut next_records = record_bucket.clone();
-        if next_bytes.charge(body_bytes).is_ok() && next_records.charge(1).is_ok() {
-            *byte_bucket = next_bytes;
-            *record_bucket = next_records;
-            return Ok(());
-        }
 
         // Transport scheduling can turn a correctly paced producer stream into an arrival burst
         // after SSH, WebTransport, or WebSocket buffering. Shape admission here instead of
         // destroying the track for that transport artifact. Absolute channel flow remains the
         // finite bound and no capacity is returned until this record is reusable.
-        thread::sleep(Duration::from_millis(1));
+        //
+        // A record larger than a bucket can ever hold is an error rather than something to wait
+        // for: sleeping on it would park this track's reader for good.
+        let bytes_wait = byte_bucket.time_until(body_bytes).map_err(io::Error::other)?;
+        let records_wait = record_bucket.time_until(1).map_err(io::Error::other)?;
+        let Some(wait) = bytes_wait.into_iter().chain(records_wait).max() else {
+            byte_bucket.charge(body_bytes).map_err(io::Error::other)?;
+            record_bucket.charge(1).map_err(io::Error::other)?;
+            return Ok(());
+        };
+        // Sleep the shortfall exactly rather than polling for it. The cap only bounds how long a
+        // single sleep can be, so a track being torn down is not waited out in one go.
+        thread::sleep(wait.min(MAXIMUM_PACING_SLEEP));
     }
 }
 
@@ -3153,7 +3208,16 @@ fn wait_until_video_due(
         if audio.video_gate_stalled() {
             return shared.scene.wait_until_due(identity, pts_us, false).map_err(io::Error::other);
         }
-        thread::sleep(Duration::from_millis(2));
+        // The audio device renders at a fixed rate, so how long this frame is early by is
+        // arithmetic. Sleep that instead of polling: the alternative, waking this track's reader
+        // every two milliseconds for the length of the wait, costs the same whether the frame is
+        // due in one millisecond or one second. The cap keeps the stall check and a disappearing
+        // audio track responsive.
+        let wait = audio
+            .time_until_pts(pts_us)
+            .unwrap_or(LINKED_AUDIO_RECHECK)
+            .clamp(MINIMUM_LINKED_AUDIO_WAIT, LINKED_AUDIO_RECHECK);
+        thread::sleep(wait);
     }
 }
 
@@ -3247,7 +3311,14 @@ fn handle_lane(reader: &mut Reader, shared: &Arc<ServiceShared>) -> io::Result<(
     .encode()
     .map_err(io::Error::other)?;
     writer.write_record(messages::LANE_ACCEPTED, 0, &accepted)?;
+
+    // From here the lane is reader plus egress, exactly as the control connection is. Nothing that
+    // originates outside this thread — an input event from the window, a revocation, a renewal —
+    // touches the socket, and this thread's own replies do not queue behind them either.
+    let egress = Egress::start(writer.clone(), "vivid-lane-egress");
+    egress.set_shutdown(reader.shutdown_handle()?);
     *lock(&session.lane_writer) = Some(writer.clone());
+    *lock(&session.lane_egress) = Some(egress.clone());
 
     let outcome = serve_lane(reader, &writer, &session, &shared.scene);
 
@@ -3255,6 +3326,9 @@ fn handle_lane(reader: &mut Reader, shared: &Arc<ServiceShared>) -> io::Result<(
     lane::confirm_lost(&mut lock(&session.lane), open.lane_generation);
     revoke_input(&session, grant_reason::LANE_LOSS);
     *lock(&session.lane_writer) = None;
+    *lock(&session.lane_egress) = None;
+    egress.close();
+    egress.join();
     outcome
 }
 
@@ -3334,11 +3408,11 @@ fn revoke_input(session: &Arc<SessionRuntime>, reason: u64) {
     };
     let surface_id =
         payload.iter().find(|entry| entry.0 == 3).and_then(|entry| entry.1.as_u64()).unwrap_or(0);
-    let writer = lock(&session.lane_writer).clone();
-    if let Some(writer) = writer
-        && let Ok(body) = Envelope::new(0, payload).encode()
-    {
-        let _ = writer.write_record(messages::INPUT_REVOKED, surface_id, &body);
+    // Focus loss revokes from the winit UI thread; lane loss revokes from the session actor.
+    // Neither may block, and the grant above is already revoked locally either way, so a producer
+    // that is not reading cannot keep a stale grant alive.
+    if let Ok(body) = Envelope::new(0, payload).encode() {
+        session.post_lane(messages::INPUT_REVOKED, surface_id, body);
     }
 }
 
@@ -3353,11 +3427,9 @@ fn service_input_renewal(session: &Arc<SessionRuntime>) {
     };
     let surface_id =
         payload.iter().find(|entry| entry.0 == 3).and_then(|entry| entry.1.as_u64()).unwrap_or(0);
-    let writer = lock(&session.lane_writer).clone();
-    if let Some(writer) = writer
-        && let Ok(body) = Envelope::new(0, payload).encode()
-    {
-        let _ = writer.write_record(messages::INPUT_LEASE_RENEW, surface_id, &body);
+    // Runs on the session actor's tick; a blocking write here would stall control dispatch.
+    if let Ok(body) = Envelope::new(0, payload).encode() {
+        session.post_lane(messages::INPUT_LEASE_RENEW, surface_id, body);
     }
 }
 
@@ -3387,7 +3459,9 @@ fn serve_lane(
                 let body = Envelope::new(envelope.request_id, envelope.payload)
                     .encode()
                     .map_err(io::Error::other)?;
-                writer.write_record(messages::PONG, 0, &body)?;
+                // Core §7 wants liveness answered promptly. Queue it so a producer that has
+                // stopped reading cannot stall the thread that would answer the next one.
+                session.post_lane(messages::PONG, 0, body);
             },
             messages::PONG | messages::ERROR => {},
             messages::SET_INPUT_BINDING => {
@@ -3403,7 +3477,7 @@ fn serve_lane(
                     ));
                 };
                 let body = apply_input_binding(scene, session, &binding)?;
-                writer.write_record(messages::INPUT_BOUND, binding.surface_id, &body)?;
+                session.post_lane(messages::INPUT_BOUND, binding.surface_id, body);
             },
             _ => {
                 // Ordinary input events travel presenter-to-producer, so a producer sending one is
@@ -5364,6 +5438,32 @@ mod tests {
             })
         }
 
+        /// A root session that never reads its control replies.
+        ///
+        /// The point of the freeze regressions below: a producer is free to stop draining, and
+        /// nothing about the presenter's terminal or window may depend on it not doing so.
+        fn root(service: &VividService) -> io::Result<Self> {
+            let secret = Secret32::new(
+                <[u8; 32]>::try_from(
+                    (0..32)
+                        .map(|index| {
+                            u8::from_str_radix(&service.root_secret()[index * 2..index * 2 + 2], 16)
+                                .expect("root secret is hex")
+                        })
+                        .collect::<Vec<_>>()
+                        .as_slice(),
+                )
+                .expect("root secret is 32 bytes"),
+            );
+            Self::open(
+                service,
+                HelloAuthentication::Root { proof: [0; 32] },
+                move |hello: &mut Hello, preface: &[u8; 16]| {
+                    hello.authenticate_root(&secret, preface).map_err(io::Error::other)
+                },
+            )
+        }
+
         /// Send one correlated request, which closes the activation-retry window.
         fn query_session(&mut self) -> io::Result<messages::PayloadMap> {
             self.sequence += 1;
@@ -5843,6 +5943,115 @@ mod tests {
             "lane loss revokes the grant"
         );
         assert!(session.query_session().is_ok(), "the control session survives lane loss");
+    }
+
+    /// A producer that stops reading its control replies must not stop the terminal.
+    ///
+    /// `ANCHOR_READY` and `ANCHOR_GONE` are emitted from the PTY parser thread on every marker,
+    /// scroll, clear, and screen swap, and `TARGET_CHANGED` from the thread that draws the window.
+    /// All three used to be blocking socket writes, so one producer declining to read froze
+    /// terminal output and redraw for every window.
+    #[test]
+    fn a_producer_that_stops_draining_control_cannot_stall_the_terminal_or_the_window() {
+        let service =
+            socket_service!(VividService::start_with_wake(test_geometry(), Arc::new(|| {})));
+        // A healthy producer, so the isolation claim has a second owner to be checked against.
+        let mut healthy = connect(&service);
+        let healthy_context = healthy.info().root_context_id;
+        let healthy_surface = grid_surface(&mut healthy, 1);
+
+        // A producer that completes HELLO and then never reads another byte.
+        let stalled = RawClient::root(&service).expect("root session");
+        assert!(
+            wait_until(Duration::from_secs(2), || {
+                lock(&service.shared.registry).sessions.contains_key(&stalled.session_id)
+            }),
+            "the stalled producer is registered"
+        );
+
+        // Far more announcements than either the egress queue or the socket buffer can hold. Each
+        // of these is what the PTY parser and the draw path call. The draw-path call is made every
+        // so often rather than every iteration: it clones the session table under a lock, and the
+        // claim here is about blocking, not throughput.
+        let started = Instant::now();
+        for line in 0..(actor::EGRESS_CAPACITY as i32 * 4) {
+            service.handle_grid_scroll(0, 24, 1, 0);
+            service.handle_screen_swap(line % 2 == 1);
+            if line % 32 == 0 {
+                service.update_metrics(test_geometry());
+                service.flush_display_change(None);
+            }
+        }
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "the terminal and draw paths must never block on a producer; took {elapsed:?}"
+        );
+
+        // The healthy producer is untouched: same surface, still serving requests, still able to
+        // commit. Overflowing one session's egress closes that session and nothing else.
+        assert!(healthy.query_session().is_ok(), "the healthy session still answers");
+        let healthy_identity =
+            SessionIdentity::new(service.shared.presenter, healthy.info().session_id).unwrap();
+        let status = service
+            .scene
+            .surface_status(SurfaceIdentity {
+                context: healthy_identity.context(healthy_context).unwrap(),
+                surface_id: healthy_surface.id(),
+            })
+            .expect("the healthy producer keeps its surface");
+        assert_eq!(status.lifecycle, 1);
+    }
+
+    /// The same claim for the interactive lane, which is driven from the winit UI thread.
+    ///
+    /// `send_input` runs on the event loop for every keystroke and pointer motion, and
+    /// `revoke_all_input` runs on focus loss. A blocking lane write there froze the whole window.
+    #[test]
+    fn a_producer_that_stops_draining_its_lane_cannot_stall_the_ui_thread() {
+        let service = socket_service!(desktop_service());
+        let mut session = connect_desktop(&service);
+        let context_id = session.info().root_context_id;
+        let mut definition = desktop_surface(context_id, 1920);
+        definition.profile_parameters = vivid_protocol::surface::DesktopSurfaceParameters {
+            captured_origin_x: 0,
+            captured_origin_y: 0,
+            topology: vec![],
+            semantic_generation: 1,
+            input_capabilities: vivid_protocol::input::INPUT_CLASS_KEYBOARD,
+        }
+        .encode();
+        let surface = session.create_surface(definition, &RequestMetadata::default()).unwrap();
+        present_desktop_video(&service, &mut session, &surface, context_id);
+
+        // Open a lane, take the grant, then never read from it again.
+        let mut lane = RawLane::open(&service, &session, 1).unwrap();
+        let granted = lane.bind(context_id, surface.id(), 2, 1).unwrap();
+        assert_eq!(
+            granted.iter().find(|entry| entry.0 == 6).and_then(|entry| entry.1.as_u64()),
+            Some(vivid_protocol::grant::STATE_ENABLED),
+        );
+
+        // Many more events than the lane egress or the socket can hold, from the thread the winit
+        // event loop would be on.
+        let started = Instant::now();
+        for usage in 0..(actor::EGRESS_CAPACITY as u32 * 4) {
+            service.send_input(vivid_protocol::input::InputEvent::Key {
+                binding: zero_tuple(),
+                usage: 0x04 + (usage % 8) as u16,
+                pressed: usage % 2 == 0,
+            });
+        }
+        service.revoke_all_input(vivid_protocol::grant::reason::FOCUS_LOSS);
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "input delivery and revocation must never block on a producer; took {elapsed:?}"
+        );
+
+        // Losing input is the correct outcome for a producer that will not read it. The control
+        // session, which is a different connection, is untouched.
+        assert!(session.query_session().is_ok(), "the control session survives a stalled lane");
     }
 
     #[test]

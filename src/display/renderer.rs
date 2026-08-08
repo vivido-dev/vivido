@@ -293,6 +293,31 @@ impl SceneRenderer {
         })
     }
 
+    /// Rebuild this renderer from scratch after a fatal GPU error.
+    ///
+    /// Device loss is ordinary: a DirectX 12 timeout detection and recovery reset, a GPU switch or
+    /// display sleep on macOS, `VK_ERROR_DEVICE_LOST` across a Linux suspend. None of them are a
+    /// reason to lose the terminal, so the whole GPU side is discarded and built again. The caller
+    /// re-attaches the Vivid scene and marks the window fully damaged; track textures re-upload
+    /// from the scene's retained frames on the next draw.
+    pub fn rebuild(
+        &mut self,
+        source: RenderSource,
+        size: PhysicalSize<u32>,
+        transparent: bool,
+    ) -> Result<(), Error> {
+        // Release the surface before asking for another one: a window may only have a single live
+        // surface, and the shared context has to be droppable so the replacement is built on a
+        // fresh device rather than the lost one.
+        self.surface = None;
+        self.context = None;
+        self.media.clear_sources();
+        self.has_rendered_frame = false;
+        shutdown_window_render_context();
+        *self = Self::new(source, size, transparent)?;
+        Ok(())
+    }
+
     pub fn resize(&mut self, size: PhysicalSize<u32>) {
         let size = self.clamp_render_size(size);
         if size.width == 0 || size.height == 0 {

@@ -10,9 +10,14 @@ use vello::{Renderer, wgpu};
 use crate::terminal::graphics::{DeleteTarget, GraphicsCommand, GraphicsProtocol};
 
 use crate::display::SizeInfo;
-use crate::vivid::scene::{PresentationRejection, RenderItem, SharedScene, TrackKey};
+use crate::vivid::scene::{
+    MAX_RENDER_ITEMS, PresentationRejection, RenderItem, SharedScene, TrackKey,
+};
 
-const MAX_NODES: usize = 256;
+/// Quads the geometry buffer starts out able to hold. It grows on demand up to
+/// [`MAX_RENDER_ITEMS`]; this is only the size that avoids reallocating for ordinary scenes.
+const INITIAL_QUADS: usize = 256;
+const VERTICES_PER_QUAD: usize = 6;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CaptureRedaction {
@@ -107,6 +112,8 @@ pub struct VividMediaRenderer {
     pipeline: wgpu::RenderPipeline,
     sampler: wgpu::Sampler,
     vertex_buffer: wgpu::Buffer,
+    vertex_capacity_quads: usize,
+    reported_item_overflow: bool,
     tracks: HashMap<TrackKey, SourceTexture>,
     target: Option<MediaTarget>,
     scene: Option<SharedScene>,
@@ -202,18 +209,15 @@ impl VividMediaRenderer {
             min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
-        let vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("vivido.vivid.vertices"),
-            size: (MAX_NODES * 6 * std::mem::size_of::<Vertex>()) as u64,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        let vertex_buffer = create_vertex_buffer(device, INITIAL_QUADS);
         Self {
             reported_protocols: HashSet::new(),
             bind_group_layout,
             pipeline,
             sampler,
             vertex_buffer,
+            vertex_capacity_quads: INITIAL_QUADS,
+            reported_item_overflow: false,
             tracks: HashMap::new(),
             target: None,
             scene: None,
@@ -280,13 +284,27 @@ impl VividMediaRenderer {
         }
         self.ensure_target(device, renderer, size.width() as u32, size.height() as u32);
 
-        let rendered = items
+        let mut rendered = items
             .iter()
             .filter_map(|item| {
                 vertices(item, size, display_offset, placement_scale)
                     .map(|vertices| (item, vertices))
             })
             .collect::<Vec<_>>();
+        // `MAX_RENDER_ITEMS` is the scene's own ceiling, so this should be unreachable. Clamp
+        // anyway: writing geometry past the end of the buffer is a wgpu validation error, and the
+        // default handler turns that into a panic that takes the window with it.
+        if rendered.len() > MAX_RENDER_ITEMS {
+            if !self.reported_item_overflow {
+                self.reported_item_overflow = true;
+                log::warn!(
+                    "Vivid scene produced {} render items; drawing the first {MAX_RENDER_ITEMS}",
+                    rendered.len()
+                );
+            }
+            rendered.truncate(MAX_RENDER_ITEMS);
+        }
+        self.ensure_vertex_capacity(device, rendered.len());
         self.capture_redactions = rendered
             .iter()
             .filter(|(item, _)| {
@@ -527,6 +545,18 @@ impl VividMediaRenderer {
             self.source_upload_metrics.full_frame_pixels.saturating_add(full_frame_pixels);
     }
 
+    /// Make sure the geometry buffer can hold `quads`, growing it if not.
+    ///
+    /// The buffer only ever grows, and never past [`MAX_RENDER_ITEMS`], so a scene that briefly
+    /// gets large does not reallocate on every subsequent frame.
+    fn ensure_vertex_capacity(&mut self, device: &wgpu::Device, quads: usize) {
+        let Some(capacity) = grown_vertex_capacity(quads, self.vertex_capacity_quads) else {
+            return;
+        };
+        self.vertex_buffer = create_vertex_buffer(device, capacity);
+        self.vertex_capacity_quads = capacity;
+    }
+
     fn ensure_target(
         &mut self,
         device: &wgpu::Device,
@@ -559,6 +589,28 @@ impl VividMediaRenderer {
         image.alpha_type = ImageAlphaType::AlphaPremultiplied;
         self.target = Some(MediaTarget { _texture: texture, view, image, width, height });
     }
+}
+
+/// The capacity the geometry buffer must grow to in order to hold `quads`, or `None` when
+/// `current` is already enough.
+///
+/// Doubling keeps a scene that grows steadily from reallocating every frame, and the clamp is what
+/// keeps the result a capacity the caller can actually write into: `quads` is never allowed past
+/// [`MAX_RENDER_ITEMS`], so clamping there can never return less than was asked for.
+fn grown_vertex_capacity(quads: usize, current: usize) -> Option<usize> {
+    if quads <= current {
+        return None;
+    }
+    Some(quads.next_power_of_two().min(MAX_RENDER_ITEMS).max(quads))
+}
+
+fn create_vertex_buffer(device: &wgpu::Device, quads: usize) -> wgpu::Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("vivido.vivid.vertices"),
+        size: (quads * VERTICES_PER_QUAD * std::mem::size_of::<Vertex>()) as u64,
+        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    })
 }
 
 fn vertices(
@@ -645,12 +697,32 @@ fn fixed_to_f32(value: i64) -> f32 {
 
 #[cfg(test)]
 mod protocol_renderer_tests {
-    use super::fixed_to_f32;
+    use super::{INITIAL_QUADS, MAX_RENDER_ITEMS, fixed_to_f32, grown_vertex_capacity};
 
     #[test]
     fn fixed_point_cell_coordinates_remain_fractional() {
         assert_eq!(fixed_to_f32(2_i64 << 32), 2.0);
         assert_eq!(fixed_to_f32(1_i64 << 31), 0.5);
+    }
+
+    /// The geometry buffer used to be fixed at 256 quads while the presenter admits 256 nodes per
+    /// session across sixteen sessions, plus retained posters. Writing past the end of a wgpu
+    /// buffer is a validation error, and the default handler turns that into a panic — so a
+    /// nested `vvmux` layout with enough visible nodes took the window down.
+    #[test]
+    fn the_geometry_buffer_grows_to_every_scene_the_presenter_can_produce() {
+        assert_eq!(grown_vertex_capacity(INITIAL_QUADS, INITIAL_QUADS), None, "no needless growth");
+        assert_eq!(grown_vertex_capacity(INITIAL_QUADS + 1, INITIAL_QUADS), Some(512));
+
+        // The ceiling has to be reachable, not merely near: the largest scene the scene module can
+        // hand over must still get a capacity that holds all of it.
+        let capacity = grown_vertex_capacity(MAX_RENDER_ITEMS, INITIAL_QUADS)
+            .expect("the largest possible scene needs more than the initial capacity");
+        assert!(
+            capacity >= MAX_RENDER_ITEMS,
+            "capacity {capacity} must hold {MAX_RENDER_ITEMS} quads"
+        );
+        assert_eq!(grown_vertex_capacity(MAX_RENDER_ITEMS, capacity), None);
     }
 }
 
