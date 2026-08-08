@@ -242,6 +242,7 @@ impl WindowContext {
                 &mut pty_config.env,
                 service.control_endpoint(),
                 service.root_secret(),
+                ipc_window_id,
             );
             display.set_vivid_scene(service.scene());
             service
@@ -2004,9 +2005,11 @@ fn configure_vivid_pty_environment(
     environment: &mut std::collections::HashMap<String, String>,
     control_endpoint: &str,
     root_secret: &str,
+    window_id: u64,
 ) {
     environment.insert("VIVID_ENDPOINT_CONTROL".into(), control_endpoint.into());
     environment.insert("VIVID_ROOT_SECRET".into(), root_secret.into());
+    environment.insert("VIVIDO_WINDOW_ID".into(), window_id.to_string());
     // ConPTY strips APC control strings before they reach Vivido's terminal parser. Producers
     // must therefore emit the bounded printable marker form that the Windows PTY scanner removes
     // and authenticates before ordinary terminal parsing.
@@ -2036,16 +2039,21 @@ fn vivid_wslenv(inherited: &str) -> String {
     // WSLENV makes WSL create that variable with an empty value when this window does not offer
     // the lane. Producers correctly reject a present-but-empty endpoint as malformed instead of
     // applying the missing-lane fallback.
-    const MANAGED: [&str; 6] = [
+    const MANAGED: [&str; 7] = [
         "VIVID_ENDPOINT_CONTROL",
         "VIVID_ENDPOINT_INTERACTIVE",
         "VIVID_ENDPOINT_REALTIME",
         "VIVID_ENDPOINT_BULK",
         "VIVID_ROOT_SECRET",
         "VIVID_ANCHOR_TRANSPORT",
+        "VIVIDO_WINDOW_ID",
     ];
-    const EXPORTED: [&str; 3] =
-        ["VIVID_ENDPOINT_CONTROL", "VIVID_ROOT_SECRET", "VIVID_ANCHOR_TRANSPORT"];
+    const EXPORTED: [&str; 4] = [
+        "VIVID_ENDPOINT_CONTROL",
+        "VIVID_ROOT_SECRET",
+        "VIVID_ANCHOR_TRANSPORT",
+        "VIVIDO_WINDOW_ID",
+    ];
 
     let mut entries = inherited
         .split(':')
@@ -2413,13 +2421,14 @@ mod vivid_environment_tests {
     #[test]
     fn child_receives_the_platform_marker_transport() {
         let mut environment = HashMap::new();
-        configure_vivid_pty_environment(&mut environment, "tcp:127.0.0.1:1", "secret");
+        configure_vivid_pty_environment(&mut environment, "tcp:127.0.0.1:1", "secret", 42);
 
         assert_eq!(
             environment.get("VIVID_ENDPOINT_CONTROL").map(String::as_str),
             Some("tcp:127.0.0.1:1")
         );
         assert_eq!(environment.get("VIVID_ROOT_SECRET").map(String::as_str), Some("secret"));
+        assert_eq!(environment.get("VIVIDO_WINDOW_ID").map(String::as_str), Some("42"));
         #[cfg(windows)]
         assert_eq!(environment.get("VIVID_ANCHOR_TRANSPORT").map(String::as_str), Some("conpty"));
         #[cfg(not(windows))]
@@ -2432,10 +2441,10 @@ mod vivid_environment_tests {
         assert_eq!(
             vivid_wslenv(
                 "GOPATH/p:VIVID_ROOT_SECRET/w:VIVID_ENDPOINT_BULK/u::CARGO_HOME/p:\
-                 VIVID_ENDPOINT_CONTROL/l"
+                 VIVID_ENDPOINT_CONTROL/l:VIVIDO_WINDOW_ID/w"
             ),
             "GOPATH/p:CARGO_HOME/p:VIVID_ENDPOINT_CONTROL/u:VIVID_ROOT_SECRET/u:\
-             VIVID_ANCHOR_TRANSPORT/u"
+             VIVID_ANCHOR_TRANSPORT/u:VIVIDO_WINDOW_ID/u"
         );
     }
 }
