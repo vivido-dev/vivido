@@ -139,6 +139,7 @@ const SURFACE_CHANGED_SLOTS: u64 = 1 << 4;
 const TRACK_CHANGED_LIFECYCLE: u64 = 1 << 0;
 const TRACK_CHANGED_CHANNEL: u64 = 1 << 1;
 const TRACK_CHANGED_ACTIVATION: u64 = 1 << 3;
+const TRACK_CHANGED_AUDIO_GAIN: u64 = 1 << 4;
 /// `SCENE_CHANGED` reason bits, core §10.
 const SCENE_CHANGED_PRODUCER_COMMIT: u64 = 1 << 0;
 /// `NEED_KEYFRAME` and `NEED_FULL_FRAME` reasons, media §13.
@@ -151,6 +152,7 @@ struct SessionRuntime {
     session_tag: [u8; 16],
     channel_key: Secret32,
     anchor_key: AnchorKey,
+    accepted_profiles: Vec<String>,
     /// The control connection's egress, installed as soon as the session begins serving records.
     ///
     /// There is deliberately no writer here. The handshake is written by the connection's own
@@ -838,6 +840,10 @@ impl VividService {
 }
 
 impl SessionRuntime {
+    fn supports(&self, profile: &str) -> bool {
+        self.accepted_profiles.binary_search_by(|value| value.as_str().cmp(profile)).is_ok()
+    }
+
     /// Queue one record on the session's control connection.
     ///
     /// This never blocks and never fails the caller's own work. `false` means the record was not
@@ -1824,6 +1830,7 @@ fn establish_root_session(
         session_tag,
         channel_key: Secret32::new(*keys.channel_key()),
         anchor_key,
+        accepted_profiles: welcome.accepted_profiles.clone(),
         egress: Mutex::new(Some(egress)),
         actor_ingress: Mutex::new(None),
         contexts: Mutex::new(HashMap::from([(
@@ -2253,7 +2260,11 @@ fn dispatch_control(
             (
                 messages::TRACK_STATUS,
                 record.object_id,
-                Envelope::new(request_id, track_status_payload(&status)).encode(),
+                Envelope::new(
+                    request_id,
+                    track_status_payload(&status, session.supports(registry::AUDIO_GAIN)),
+                )
+                .encode(),
             )
         },
         messages::ADVANCE_CHANNEL => {
@@ -2273,6 +2284,9 @@ fn dispatch_control(
             {
                 return Err(ControlError::state("channel advance is not exact"));
             }
+            if let Some(output) = lock(&shared.audio_outputs).remove(&identity) {
+                output.stop();
+            }
             let status = shared.scene.advance_channel(identity).map_err(ControlError::state)?;
             observe_track(session, &status, TRACK_CHANGED_CHANNEL);
             (
@@ -2291,6 +2305,24 @@ fn dispatch_control(
                 )
                 .encode(),
             )
+        },
+        messages::SET_AUDIO_GAIN => {
+            if !session.supports(registry::AUDIO_GAIN) {
+                return Err(ControlError::unsupported_profile("audio-gain-v1 was not negotiated"));
+            }
+            let identity = payload_track_identity(session, &value)?;
+            let map = StrictMap::new("SET_AUDIO_GAIN", &value, &[0, 1, 2, 3])
+                .map_err(|_| ControlError::bad_message("invalid audio gain"))?;
+            let raw = map.required_u64(3).map_err(|_| ControlError::bad_message("audio gain"))?;
+            let gain = vivid_protocol::track::AudioGain::new(raw)
+                .ok_or_else(|| ControlError::bad_message("audio gain exceeds 200 percent"))?;
+            let status =
+                shared.scene.set_audio_gain(identity, gain).map_err(ControlError::state)?;
+            if let Some(output) = lock(&shared.audio_outputs).get(&identity) {
+                output.set_gain(gain);
+            }
+            observe_track(session, &status, TRACK_CHANGED_AUDIO_GAIN);
+            (messages::OK, record.object_id, Ok(messages::ok(request_id)))
         },
         messages::ACTIVATE_TRACK => {
             let map = StrictMap::new("ACTIVATE_TRACK", &value, &[0, 1, 2, 3])
@@ -2860,10 +2892,14 @@ fn handle_track_channel(
     let result = channel_loop(reader, &writer, shared, identity, generation);
     attachment.detach();
     if let Err(error) = &result {
+        let status = shared.scene.lose_track(identity, generation).ok().flatten();
+        let Some(status) = status else {
+            // The failed transport was superseded or its owner already removed the track. Its
+            // error belongs to that retired generation and must not poison the current one.
+            return result;
+        };
         stop_failed_audio_output(&shared.audio_outputs, identity);
-        let _ = shared.scene.lose_track(identity);
         shared.request_frame_wake();
-        let status = shared.scene.track_status(identity);
         let diagnostic = error.to_string().chars().take(4_096).collect::<String>();
         let error_code = if diagnostic.contains("rate exceeded") {
             messages::ERROR_RATE_LIMITED
@@ -2884,12 +2920,7 @@ fn handle_track_channel(
                 (1, Value::Unsigned(identity.surface.surface_id)),
                 (2, Value::Unsigned(identity.track_id)),
                 (3, Value::Unsigned(error_code)),
-                (
-                    4,
-                    Value::Unsigned(
-                        status.as_ref().map_or(1, |status| status.state.revision.get()),
-                    ),
-                ),
+                (4, Value::Unsigned(status.state.revision.get())),
                 (5, Value::Map(vec![])),
                 (6, Value::Text(diagnostic)),
             ],
@@ -3019,11 +3050,11 @@ fn channel_loop(
     identity: TrackIdentity,
     generation: ChannelGeneration,
 ) -> io::Result<()> {
-    let configuration = shared
+    let status = shared
         .scene
         .track_status(identity)
-        .ok_or_else(|| io::Error::new(ErrorKind::NotFound, "track disappeared"))?
-        .configuration;
+        .ok_or_else(|| io::Error::new(ErrorKind::NotFound, "track disappeared"))?;
+    let configuration = status.configuration;
     let mut video_decoder = match &configuration.kind {
         KindConfiguration::Video(video) => Some(Decoder::new(video, configuration.mode)?),
         _ => None,
@@ -3031,6 +3062,7 @@ fn channel_loop(
     let mut audio = match &configuration.kind {
         KindConfiguration::Audio(audio_configuration) => {
             let output = AudioOutput::open()?;
+            output.set_gain(status.audio_gain);
             let decoder = output.decoder(audio_configuration)?;
             if configuration.mode == vivid_protocol::track::TrackMode::Live {
                 output.start();
@@ -3950,8 +3982,8 @@ fn surface_status_payload(status: &SurfaceStatus) -> Vec<(u64, Value)> {
     ]
 }
 
-fn track_status_payload(status: &TrackStatus) -> Vec<(u64, Value)> {
-    vec![
+fn track_status_payload(status: &TrackStatus, include_audio_gain: bool) -> Vec<(u64, Value)> {
+    let mut payload = vec![
         (0, Value::Unsigned(status.identity.surface.context.context_id)),
         (1, Value::Unsigned(status.identity.surface.surface_id)),
         (2, Value::Unsigned(status.identity.track_id)),
@@ -3990,7 +4022,11 @@ fn track_status_payload(status: &TrackStatus) -> Vec<(u64, Value)> {
         (18, Value::Unsigned(status.maximum_channel_bytes)),
         (19, Value::Unsigned(status.maximum_channel_records)),
         (20, Value::Unsigned(0)),
-    ]
+    ];
+    if include_audio_gain && matches!(status.configuration.kind, KindConfiguration::Audio(_)) {
+        payload.push((23, Value::Unsigned(status.audio_gain.raw())));
+    }
+    payload
 }
 
 fn scene_status_payload(status: &SceneStatus) -> Vec<(u64, Value)> {
@@ -4169,6 +4205,10 @@ impl ControlError {
 
     const fn unsupported(message: &'static str) -> Self {
         Self { code: messages::ERROR_UNSUPPORTED_CONFIG, message }
+    }
+
+    const fn unsupported_profile(message: &'static str) -> Self {
+        Self { code: messages::ERROR_UNSUPPORTED_PROFILE, message }
     }
 
     const fn duplicate(message: &'static str) -> Self {
@@ -4818,6 +4858,153 @@ mod tests {
             opacity: u16::MAX,
             clip: None,
         }
+    }
+
+    /// A seek replaces linked audio while retaining its video surface. Clearing the old slot is
+    /// the producer-visible mutation that advances both copies of the surface revision; destroying
+    /// the now-unbound track must then leave that revision alone so the replacement can activate.
+    #[test]
+    fn clear_then_destroy_keeps_repeated_track_replacements_revision_synchronized() {
+        let service =
+            socket_service!(VividService::start_with_wake(test_geometry(), Arc::new(|| {})));
+        let mut seeking = connect(&service);
+        let mut neighbor = connect(&service);
+        let seeking_context = seeking.info().root_context_id;
+        let neighbor_context = neighbor.info().root_context_id;
+        // Both producers deliberately reuse every numeric object ID.
+        let seeking_surface = grid_surface(&mut seeking, 90);
+        let neighbor_surface = grid_surface(&mut neighbor, 90);
+        seeking
+            .create_node(
+                &grid_node(seeking_context, 94, &seeking_surface, 2),
+                &RequestMetadata::default(),
+            )
+            .unwrap();
+        neighbor
+            .create_node(
+                &grid_node(neighbor_context, 94, &neighbor_surface, 2),
+                &RequestMetadata::default(),
+            )
+            .unwrap();
+
+        let track_configuration =
+            |context_id: u64, surface_id: u64, track_id: u64| TrackConfiguration {
+                context_id,
+                surface_id,
+                track_id,
+                slot: scene::SLOT_RASTER,
+                mode: TrackMode::Live,
+                lane: LaneClass::Bulk,
+                maximum_record_body: 88,
+                maximum_rate_millihertz: 60_000,
+                maximum_encoded_bits_per_second: 1_000_000,
+                maximum_records_per_second: 60,
+                maximum_inflight_body_bytes: 4_096,
+                kind: KindConfiguration::Raster(RasterConfiguration {
+                    width: 2,
+                    height: 2,
+                    alpha_mode: scene::ALPHA_STRAIGHT,
+                    delta_enabled: false,
+                    maximum_delta_operations: 1,
+                    zstd_enabled: false,
+                }),
+                target_latency_us: 0,
+                maximum_latency_us: 1_000_000,
+                retained_pixel_charge: 0,
+            };
+        let ready_track = |session: &mut vivid_sdk::Session,
+                           surface: &vivid_sdk::Surface,
+                           track_id: u64| {
+            let track = session
+                .create_track(
+                    track_configuration(surface.context_id(), surface.id(), track_id),
+                    &RequestMetadata::default(),
+                )
+                .unwrap();
+            let channel = session.open_track_channel(&track).unwrap();
+            channel.send_raster(0, track_id, &[0x44, 0x88, 0xcc, 0xff].repeat(4), false).unwrap();
+            session
+                .wait_track(
+                    &track,
+                    TrackWaitCondition::MilestoneSet,
+                    Some(MILESTONE_OUTPUT_READY),
+                    1_000_000,
+                )
+                .unwrap();
+            (track, channel)
+        };
+        let activate = |session: &mut vivid_sdk::Session,
+                        surface: &vivid_sdk::Surface,
+                        track: &vivid_sdk::Track| {
+            session
+                .activate_tracks(
+                    surface,
+                    &[SlotBinding {
+                        slot: scene::SLOT_RASTER,
+                        track_id: track.id(),
+                        expected_channel_generation: track.channel_generation(),
+                        required_milestone: MILESTONE_OUTPUT_READY,
+                    }],
+                    &RequestMetadata::default(),
+                )
+                .unwrap();
+        };
+        let clear = |session: &mut vivid_sdk::Session, surface: &vivid_sdk::Surface| {
+            session
+                .activate_tracks(
+                    surface,
+                    &[SlotBinding {
+                        slot: scene::SLOT_RASTER,
+                        track_id: 0,
+                        expected_channel_generation: ChannelGeneration::ZERO,
+                        required_milestone: 0,
+                    }],
+                    &RequestMetadata::default(),
+                )
+                .unwrap();
+        };
+
+        let (neighbor_track, neighbor_channel) = ready_track(&mut neighbor, &neighbor_surface, 91);
+        activate(&mut neighbor, &neighbor_surface, &neighbor_track);
+        let neighbor_identity =
+            SessionIdentity::new(service.shared.presenter, neighbor.info().session_id).unwrap();
+        let neighbor_surface_identity = neighbor_identity
+            .context(neighbor_context)
+            .unwrap()
+            .surface(neighbor_surface.id())
+            .unwrap();
+        let neighbor_revision =
+            service.scene.surface_status(neighbor_surface_identity).unwrap().revision;
+
+        for track_id in [91, 92, 93] {
+            let (track, channel) = ready_track(&mut seeking, &seeking_surface, track_id);
+            activate(&mut seeking, &seeking_surface, &track);
+            clear(&mut seeking, &seeking_surface);
+            channel.close().unwrap();
+            seeking.destroy_track(&track, &RequestMetadata::default()).unwrap();
+        }
+
+        let neighbor_status = service.scene.surface_status(neighbor_surface_identity).unwrap();
+        assert_eq!(neighbor_status.revision, neighbor_revision);
+        assert_eq!(neighbor_status.active_slots.get(&scene::SLOT_RASTER), Some(&91));
+        neighbor_channel.send_raster(0, 95, &[0x11, 0x22, 0x33, 0xff].repeat(4), false).unwrap();
+        let neighbor_track_status = neighbor.query_track(&neighbor_track).unwrap();
+        assert_eq!(neighbor_track_status.lifecycle, 1);
+        assert_eq!(neighbor_track_status.last_media_id, 95);
+
+        // Both the next surface mutation and the next scene mutation remain valid for the owner
+        // that did not seek.
+        activate(&mut neighbor, &neighbor_surface, &neighbor_track);
+        neighbor
+            .update_node(
+                &grid_node(neighbor_context, 94, &neighbor_surface, 3),
+                &RequestMetadata::default(),
+            )
+            .unwrap();
+        let neighbor_scene = service.scene.scene_status(neighbor_identity, 8);
+        assert_eq!(neighbor_scene.nodes.len(), 1);
+        assert!(neighbor_scene.nodes[0].node.visible);
+        assert_eq!(neighbor_scene.nodes[0].node.geometry[3].1, Value::Unsigned(3_u64 << 32));
     }
 
     /// A scene commit names the target generation it was planned against, so an announced resize

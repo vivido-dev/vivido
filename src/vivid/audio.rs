@@ -1,7 +1,7 @@
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::io;
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -11,7 +11,7 @@ use cpal::{FromSample, I24, SampleFormat, SizedSample, Stream, StreamConfig, U24
 use ringbuf::traits::{Consumer, Producer, Split};
 use ringbuf::{HeapProd, HeapRb};
 use vivid_protocol::media::ParsedAudioPacket;
-use vivid_protocol::track::AudioConfiguration;
+use vivid_protocol::track::{AudioConfiguration, AudioGain};
 
 use crate::vivid::ffmpeg::{self, AVPacket, AVRational, ParameterValues};
 
@@ -81,6 +81,7 @@ struct Shared {
     live_delay_us: AtomicU64,
     prebuffer_samples: AtomicU64,
     requested_start_pts_us: AtomicI64,
+    gain_bits: AtomicU32,
     play_configured_at: Mutex<Option<Instant>>,
     clock_progress: Mutex<ClockProgress>,
     error: Mutex<Option<String>>,
@@ -146,6 +147,7 @@ impl AudioOutput {
                     / 1_000,
             ),
             requested_start_pts_us: AtomicI64::new(UNSET_PTS),
+            gain_bits: AtomicU32::new(1.0_f32.to_bits()),
             play_configured_at: Mutex::new(None),
             clock_progress: Mutex::new(ClockProgress {
                 rendered_samples: 0,
@@ -207,6 +209,7 @@ impl AudioOutput {
             live_delay_us: AtomicU64::new(0),
             prebuffer_samples: AtomicU64::new(0),
             requested_start_pts_us: AtomicI64::new(UNSET_PTS),
+            gain_bits: AtomicU32::new(1.0_f32.to_bits()),
             play_configured_at: Mutex::new(None),
             clock_progress: Mutex::new(ClockProgress {
                 rendered_samples: 0,
@@ -242,6 +245,10 @@ impl AudioOutput {
 
     pub fn start(&self) {
         self.shared.enabled.store(true, Ordering::SeqCst);
+    }
+
+    pub fn set_gain(&self, gain: AudioGain) {
+        self.shared.gain_bits.store(gain.as_f32().to_bits(), Ordering::SeqCst);
     }
 
     pub fn configure_play(&self, start_pts_us: i64, minimum_buffer_us: u64) {
@@ -634,6 +641,7 @@ where
                 // that has not happened yet — counting either would run the clock ahead of the
                 // media and make every linked video frame look late for the rest of the session.
                 let mut rendered = 0_u64;
+                let gain = f32::from_bits(shared.gain_bits.load(Ordering::SeqCst));
                 for sample in output {
                     if shared
                         .hold_silence_samples
@@ -661,7 +669,7 @@ where
                         *sample = T::from_sample(0.0);
                         rendered += 1;
                     } else if let Some(value) = consumer.try_pop() {
-                        *sample = T::from_sample(value);
+                        *sample = T::from_sample((value * gain).clamp(-1.0, 1.0));
                         played += 1;
                         rendered += 1;
                     } else {
@@ -1333,5 +1341,14 @@ mod tests {
         samples.extend(decoder.finish().unwrap());
         assert_eq!(samples.len(), 480 * 2);
         assert!(samples.iter().all(|sample| *sample == 0.0));
+    }
+
+    #[test]
+    fn gain_updates_without_changing_audio_clock_state() {
+        let output = AudioOutput::test_output();
+        output.shared.rendered_samples.store(42, Ordering::SeqCst);
+        output.set_gain(AudioGain::from_percent(175).unwrap());
+        assert_eq!(f32::from_bits(output.shared.gain_bits.load(Ordering::SeqCst)), 1.75);
+        assert_eq!(output.shared.rendered_samples.load(Ordering::SeqCst), 42);
     }
 }

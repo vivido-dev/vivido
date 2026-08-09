@@ -160,6 +160,7 @@ pub struct TerminalTarget {
 
 impl TerminalTarget {
     const PROFILES: &'static [&'static str] = &[
+        registry::AUDIO_GAIN,
         registry::CORE_CONTROL,
         registry::LIVE_MEDIA,
         registry::OBSERVABILITY,
@@ -349,6 +350,7 @@ pub struct DesktopTarget {
 
 impl DesktopTarget {
     const PROFILES: &'static [&'static str] = &[
+        registry::AUDIO_GAIN,
         registry::CORE_CONTROL,
         registry::DESKTOP_SURFACE,
         registry::DESKTOP_INPUT,

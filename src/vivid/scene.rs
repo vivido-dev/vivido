@@ -19,7 +19,7 @@ use vivid_protocol::scene::SceneNode;
 use crate::vivid::target::{ClipRect, NodePlacement, PresentationTarget};
 use vivid_protocol::surface::SurfaceDefinition;
 use vivid_protocol::track::{
-    KindConfiguration, MILESTONE_BUFFERED_ENDED, MILESTONE_CHANNEL_ACCEPTED,
+    AudioGain, KindConfiguration, MILESTONE_BUFFERED_ENDED, MILESTONE_CHANNEL_ACCEPTED,
     MILESTONE_CHANNEL_DETACHED, MILESTONE_CLOCK_STARTED, MILESTONE_EOS_ACCEPTED,
     MILESTONE_OUTPUT_READY, MILESTONE_PRESENTED, MILESTONE_TRACK_LOST, TrackConfiguration,
     TrackMode, TrackState,
@@ -175,6 +175,7 @@ pub struct TrackStatus {
     pub maximum_channel_bytes: u64,
     pub maximum_channel_records: u64,
     pub metrics: TrackMetrics,
+    pub audio_gain: AudioGain,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -278,6 +279,7 @@ struct Track {
     maximum_channel_records: u64,
     playback: Option<PlaybackClock>,
     metrics: TrackMetrics,
+    audio_gain: AudioGain,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -923,6 +925,7 @@ impl SharedScene {
             maximum_channel_records: 0,
             playback: None,
             metrics: TrackMetrics::default(),
+            audio_gain: AudioGain::UNITY,
         };
         let status = track_status(identity, &track);
         state.tracks.insert(identity, track);
@@ -1086,6 +1089,24 @@ impl SharedScene {
         Ok(result)
     }
 
+    pub fn set_audio_gain(
+        &self,
+        identity: TrackIdentity,
+        gain: AudioGain,
+    ) -> Result<TrackStatus, &'static str> {
+        let mut state = self.lock();
+        let track = state.tracks.get_mut(&identity).ok_or("track does not exist")?;
+        if !matches!(track.configuration.kind, KindConfiguration::Audio(_)) {
+            return Err("audio gain requires an audio track");
+        }
+        track.audio_gain = gain;
+        track.state.revision =
+            track.state.revision.advance().map_err(|_| "track revision exhausted")?;
+        let result = track_status(identity, track);
+        self.0.changed.notify_all();
+        Ok(result)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn publish_frame(
         &self,
@@ -1240,15 +1261,28 @@ impl SharedScene {
         Ok(())
     }
 
-    pub fn lose_track(&self, identity: TrackIdentity) -> Result<(), &'static str> {
+    /// Lose only the channel generation that actually failed.
+    ///
+    /// An older channel can observe EOF after `ADVANCE_CHANNEL` has already installed and opened
+    /// its replacement. Treating that late EOF as track-wide loss destroys the replacement and
+    /// sends the producer a stale `TRACK_LOST` event.
+    pub fn lose_track(
+        &self,
+        identity: TrackIdentity,
+        generation: ChannelGeneration,
+    ) -> Result<Option<TrackStatus>, &'static str> {
         let mut state = self.lock();
         state.invalidate_topology();
         let track = state.tracks.get_mut(&identity).ok_or("track does not exist")?;
+        if track.state.channel_generation != generation || track.lifecycle != 1 {
+            return Ok(None);
+        }
         track.lifecycle = 6;
         track.state.milestones = 0;
         track.state.lose().map_err(|_| "track revision exhausted")?;
+        let status = track_status(identity, track);
         self.0.changed.notify_all();
-        Ok(())
+        Ok(Some(status))
     }
 
     pub fn mark_output_ready(
@@ -2103,6 +2137,7 @@ fn track_status(identity: TrackIdentity, track: &Track) -> TrackStatus {
         maximum_channel_bytes: track.maximum_channel_bytes,
         maximum_channel_records: track.maximum_channel_records,
         metrics: track.metrics,
+        audio_gain: track.audio_gain,
     }
 }
 
@@ -2122,7 +2157,9 @@ mod tests {
     use vivid_protocol::identity::PresenterInstanceId;
     use vivid_protocol::messages::LaneClass;
     use vivid_protocol::surface::{CoordinateModel, SurfaceDescriptor, SurfaceRole};
-    use vivid_protocol::track::{KindConfiguration, RasterConfiguration, VideoConfiguration};
+    use vivid_protocol::track::{
+        AudioConfiguration, KindConfiguration, RasterConfiguration, VideoConfiguration,
+    };
 
     fn session(presenter: u8, id: u64) -> SessionIdentity {
         SessionIdentity::new(PresenterInstanceId([presenter; 16]), id).unwrap()
@@ -2246,6 +2283,123 @@ mod tests {
             }
         );
         assert_eq!(scene.track_status(second_track).unwrap().metrics, TrackMetrics::default());
+    }
+
+    #[test]
+    fn audio_gain_is_isolated_for_reused_track_ids() {
+        let scene = SharedScene::for_test();
+        let first = session(7, 1);
+        let second = session(7, 2);
+        scene.register_session(first, TargetGeneration::ONE).unwrap();
+        scene.register_session(second, TargetGeneration::ONE).unwrap();
+        let first_surface = first.context(1).unwrap().surface(1).unwrap();
+        let second_surface = second.context(1).unwrap().surface(1).unwrap();
+        scene.create_surface(first_surface, definition(1, 1)).unwrap();
+        scene.create_surface(second_surface, definition(1, 1)).unwrap();
+        let configuration = |track_id| TrackConfiguration {
+            context_id: 1,
+            surface_id: 1,
+            track_id,
+            slot: SLOT_AUDIO,
+            mode: TrackMode::Timed,
+            lane: LaneClass::Realtime,
+            maximum_record_body: 4_096,
+            maximum_rate_millihertz: 50_000,
+            maximum_encoded_bits_per_second: 128_000,
+            maximum_records_per_second: 100,
+            maximum_inflight_body_bytes: 1 << 20,
+            kind: KindConfiguration::Audio(AudioConfiguration {
+                codec: "pcm_s16le".into(),
+                packetization: "pcm-packet-v1".into(),
+                extradata: Vec::new(),
+                sample_rate: 48_000,
+                channels: 2,
+                channel_mask: 3,
+                maximum_access_unit_bytes: 4_048,
+                codec_string: None,
+            }),
+            target_latency_us: 0,
+            maximum_latency_us: 100_000,
+            retained_pixel_charge: 0,
+        };
+        let first_track = first_surface.track(9).unwrap();
+        let second_track = second_surface.track(9).unwrap();
+        scene.create_track(first_track, configuration(9)).unwrap();
+        scene.create_track(second_track, configuration(9)).unwrap();
+
+        scene.set_audio_gain(first_track, AudioGain::from_percent(35).unwrap()).unwrap();
+
+        assert_eq!(
+            scene.track_status(first_track).unwrap().audio_gain,
+            AudioGain::from_percent(35).unwrap()
+        );
+        assert_eq!(scene.track_status(second_track).unwrap().audio_gain, AudioGain::UNITY);
+    }
+
+    #[test]
+    fn loss_from_a_retired_generation_cannot_destroy_its_replacement_or_another_owner() {
+        let scene = SharedScene::for_test();
+        let first = session(8, 1);
+        let second = session(8, 2);
+        scene.register_session(first, TargetGeneration::ONE).unwrap();
+        scene.register_session(second, TargetGeneration::ONE).unwrap();
+        let first_surface = first.context(1).unwrap().surface(1).unwrap();
+        let second_surface = second.context(1).unwrap().surface(1).unwrap();
+        scene.create_surface(first_surface, definition(1, 1)).unwrap();
+        scene.create_surface(second_surface, definition(1, 1)).unwrap();
+        let configuration = |track_id| TrackConfiguration {
+            context_id: 1,
+            surface_id: 1,
+            track_id,
+            slot: SLOT_RASTER,
+            mode: TrackMode::Live,
+            lane: LaneClass::Bulk,
+            maximum_record_body: 128,
+            maximum_rate_millihertz: 1_000,
+            maximum_encoded_bits_per_second: 8_192,
+            maximum_records_per_second: 1,
+            maximum_inflight_body_bytes: 1_024,
+            kind: KindConfiguration::Raster(RasterConfiguration {
+                width: 1,
+                height: 1,
+                alpha_mode: ALPHA_STRAIGHT,
+                delta_enabled: false,
+                maximum_delta_operations: 1,
+                zstd_enabled: false,
+            }),
+            target_latency_us: 0,
+            maximum_latency_us: 100_000,
+            retained_pixel_charge: 1,
+        };
+        // Both owners deliberately reuse the same context, surface, and track IDs.
+        let first_track = first_surface.track(9).unwrap();
+        let second_track = second_surface.track(9).unwrap();
+        scene.create_track(first_track, configuration(9)).unwrap();
+        scene.create_track(second_track, configuration(9)).unwrap();
+        scene.accept_channel(first_track, ChannelGeneration::ONE, 1_024, 8).unwrap();
+        scene.accept_channel(second_track, ChannelGeneration::ONE, 1_024, 8).unwrap();
+        let second_before = scene.track_status(second_track).unwrap();
+
+        scene.advance_channel(first_track).unwrap();
+        assert!(
+            scene.lose_track(first_track, ChannelGeneration::ONE).unwrap().is_none(),
+            "late loss from generation one destroyed generation two"
+        );
+        let first_status = scene.track_status(first_track).unwrap();
+        assert_eq!(first_status.lifecycle, 1);
+        assert_eq!(first_status.state.channel_generation, ChannelGeneration::new(2));
+
+        let second_after = scene.track_status(second_track).unwrap();
+        assert_eq!(second_after.lifecycle, second_before.lifecycle);
+        assert_eq!(second_after.state.revision, second_before.state.revision);
+        assert_eq!(second_after.state.channel_generation, second_before.state.channel_generation);
+        assert_eq!(second_after.state.milestones, second_before.state.milestones);
+        scene.mark_output_ready(second_track, ChannelGeneration::ONE).unwrap();
+        assert_ne!(
+            scene.track_status(second_track).unwrap().state.milestones & MILESTONE_OUTPUT_READY,
+            0,
+            "the unrelated owner could not make its next valid update"
+        );
     }
 
     #[test]
@@ -2699,7 +2853,7 @@ mod tests {
             scene.evaluate_track_wait(track_identity, ChannelGeneration::ONE, 6, None),
             TrackWaitEvaluation::Satisfied(_)
         ));
-        scene.lose_track(track_identity).unwrap();
+        assert!(scene.lose_track(track_identity, ChannelGeneration::ONE).unwrap().is_some());
         assert!(matches!(
             scene.evaluate_track_wait(
                 track_identity,
