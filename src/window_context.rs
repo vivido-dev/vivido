@@ -160,6 +160,20 @@ const SCREENSHOT_POLL_INTERVAL: Duration = Duration::from_millis(5);
 const SCREENSHOT_READBACK_TIMEOUT: Duration = Duration::from_secs(5);
 
 impl WindowContext {
+    pub(crate) fn acknowledge_vivid_frame(&mut self) {
+        self.vivid_service.acknowledge_frame_wake();
+        self.display.mark_vivid_frame();
+    }
+
+    pub(crate) fn retry_renderer(&mut self, scheduler: &mut Scheduler) {
+        if self.display.retry_renderer(&self.config, scheduler) {
+            self.dirty = true;
+            if self.display.window.has_frame {
+                self.display.window.request_redraw();
+            }
+        }
+    }
+
     /// Create initial window context.
     pub fn initial(
         event_loop: LoopHandle<'_>,
@@ -1449,6 +1463,8 @@ impl WindowContext {
         };
         #[cfg(windows)]
         let echo = None::<bool>;
+        let (text_scene_builds, cached_scene_frames, media_metrics) =
+            self.display.optimization_metrics();
 
         json_value!({
             "window": self.automation_summary_with_terminal(&terminal),
@@ -1468,6 +1484,15 @@ impl WindowContext {
             "exit_status": exit_status_json(self.automation.exit_status.as_ref()),
             "event_sequence": event_sequence,
             "vivid_streaming": self.vivid_service.automation_streaming_metrics(),
+            "render_optimization": {
+                "text_scene_builds": text_scene_builds,
+                "cached_scene_frames": cached_scene_frames,
+                "media_passes": media_metrics.media_passes,
+                "media_skipped_passes": media_metrics.skipped_passes,
+                "uploaded_frames": media_metrics.frames,
+                "uploaded_pixels": media_metrics.uploaded_pixels,
+                "full_frame_pixels": media_metrics.full_frame_pixels,
+            },
             "limits": {
                 "transcript_bytes": crate::automation::TRANSCRIPT_CAPACITY,
                 "screen_history": crate::automation::SCREEN_HISTORY_COUNT,

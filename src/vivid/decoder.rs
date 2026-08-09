@@ -3,11 +3,13 @@
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::io;
 use std::ptr;
+use std::sync::{Arc, Mutex};
 
 use vivid_protocol::media::ParsedVideoPacket;
-use vivid_protocol::track::VideoConfiguration;
+use vivid_protocol::track::{TrackMode, VideoConfiguration};
 
 use crate::vivid::ffmpeg::{self, AVPacket, AVRational, ParameterValues};
+use crate::vivid::scene::RgbaBuffer;
 
 const AVMEDIA_TYPE_VIDEO: c_int = 0;
 const AV_INPUT_BUFFER_PADDING_SIZE: usize = 64;
@@ -21,7 +23,7 @@ pub struct DecodedFrame {
     pub pts_us: i64,
     pub width: u32,
     pub height: u32,
-    pub rgba: Vec<u8>,
+    pub rgba: RgbaBuffer,
 }
 
 pub struct Decoder {
@@ -36,10 +38,11 @@ pub struct Decoder {
     rgba_format: c_int,
     sws_colorspace: c_int,
     source_full_range: c_int,
+    free_rgba: Arc<Mutex<Vec<Vec<u8>>>>,
 }
 
 impl Decoder {
-    pub fn new(config: &VideoConfiguration) -> io::Result<Self> {
+    pub fn new(config: &VideoConfiguration, mode: TrackMode) -> io::Result<Self> {
         // FFmpeg's native `av1` decoder can open when only a hardware path is available, then fail
         // on the first packet on systems without supported AV1 hardware. Require the bounded
         // software implementation for predictable decoding on every supported platform.
@@ -116,6 +119,21 @@ impl Decoder {
             check_ffmpeg("could not set decoder packet time base", unsafe {
                 av_opt_set_q(context, c"pkt_timebase".as_ptr(), PACKET_TIME_BASE, 0)
             })?;
+            check_ffmpeg("could not configure automatic decoder threading", unsafe {
+                av_opt_set_int(context, c"threads".as_ptr(), 0, 0)
+            })?;
+            if decoder_name == "libdav1d" {
+                if mode == TrackMode::Live {
+                    check_ffmpeg("could not bound live AV1 frame delay", unsafe {
+                        av_opt_set_int(context, c"max_frame_delay".as_ptr(), 1, 1)
+                    })?;
+                }
+            } else {
+                let thread_type = if mode == TrackMode::Live { 2 } else { 2 | 1 };
+                check_ffmpeg("could not configure decoder thread type", unsafe {
+                    av_opt_set_int(context, c"thread_type".as_ptr(), thread_type, 0)
+                })?;
+            }
             check_ffmpeg("could not open decoder", unsafe {
                 avcodec_open2(context, codec, ptr::null_mut())
             })?;
@@ -171,6 +189,7 @@ impl Decoder {
                 _ => 1, // RGB/identity input; coefficients are unused by RGB paths
             },
             source_full_range: c_int::from(config.signal_range == 2),
+            free_rgba: Arc::new(Mutex::new(Vec::with_capacity(2))),
         })
     }
 
@@ -304,7 +323,13 @@ impl Decoder {
             .checked_mul(height as usize)
             .and_then(|pixels| pixels.checked_mul(4))
             .ok_or_else(|| invalid("decoded frame allocation overflows"))?;
-        let mut rgba = vec![0_u8; length];
+        let mut rgba = self
+            .free_rgba
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .pop()
+            .filter(|buffer| buffer.len() == length)
+            .unwrap_or_else(|| vec![0_u8; length]);
         let mut destination = [ptr::null_mut(); 4];
         destination[0] = rgba.as_mut_ptr();
         let destination_lines = [frame.width * 4, 0, 0, 0];
@@ -322,7 +347,12 @@ impl Decoder {
         if converted != frame.height {
             return Err(io::Error::other("FFmpeg returned a partial RGBA frame"));
         }
-        Ok(DecodedFrame { pts_us, width, height, rgba })
+        Ok(DecodedFrame {
+            pts_us,
+            width,
+            height,
+            rgba: RgbaBuffer::pooled(rgba, Arc::downgrade(&self.free_rgba)),
+        })
     }
 
     #[cfg(test)]
@@ -332,6 +362,15 @@ impl Decoder {
             av_opt_get_q(self.context, c"pkt_timebase".as_ptr(), 0, &mut time_base)
         })?;
         Ok(time_base)
+    }
+
+    #[cfg(test)]
+    fn integer_option(&self, name: &CStr, flags: c_int) -> io::Result<i64> {
+        let mut value = 0;
+        check_ffmpeg("could not read decoder option", unsafe {
+            av_opt_get_int(self.context, name.as_ptr(), flags, &mut value)
+        })?;
+        Ok(value)
     }
 }
 
@@ -409,12 +448,20 @@ unsafe extern "C" {
         value: AVRational,
         flags: c_int,
     ) -> c_int;
+    fn av_opt_set_int(object: *mut c_void, name: *const c_char, value: i64, flags: c_int) -> c_int;
     #[cfg(test)]
     fn av_opt_get_q(
         object: *mut c_void,
         name: *const c_char,
         flags: c_int,
         output: *mut AVRational,
+    ) -> c_int;
+    #[cfg(test)]
+    fn av_opt_get_int(
+        object: *mut c_void,
+        name: *const c_char,
+        flags: c_int,
+        output: *mut i64,
     ) -> c_int;
     fn av_get_pix_fmt(name: *const c_char) -> c_int;
     fn av_strerror(error: c_int, buffer: *mut c_char, buffer_size: usize) -> c_int;
@@ -481,9 +528,21 @@ mod tests {
 
     #[test]
     fn decoder_context_uses_protocol_packet_time_base() {
-        let decoder = Decoder::new(&video_config("h264", Vec::new())).unwrap();
+        let decoder = Decoder::new(&video_config("h264", Vec::new()), TrackMode::Live).unwrap();
 
         assert_eq!(decoder.packet_time_base().unwrap(), PACKET_TIME_BASE);
+    }
+
+    #[test]
+    fn decoder_threading_is_mode_aware() {
+        let config = video_config("h264", Vec::new());
+        let live = Decoder::new(&config, TrackMode::Live).unwrap();
+        let timed = Decoder::new(&config, TrackMode::Timed).unwrap();
+
+        assert!(live.integer_option(c"threads", 0).unwrap() > 1);
+        assert!(timed.integer_option(c"threads", 0).unwrap() > 1);
+        assert_eq!(live.integer_option(c"thread_type", 0).unwrap(), 2);
+        assert_eq!(timed.integer_option(c"thread_type", 0).unwrap(), 3);
     }
 
     #[test]
@@ -508,7 +567,8 @@ mod tests {
             0xe5, 0x32, 0xe7, 0xc7, 0x11, 0xa7, 0x0f, 0x82, 0x7f, 0x25, 0x17, 0x49, 0x75, 0x9e,
             0x87, 0x13, 0x6f, 0xca, 0xa7, 0x25, 0x3f, 0x80,
         ];
-        let mut decoder = Decoder::new(&video_config("av1", extradata.to_vec())).unwrap();
+        let mut decoder =
+            Decoder::new(&video_config("av1", extradata.to_vec()), TrackMode::Live).unwrap();
         let (frames, discarded) = decoder
             .push_discarding_before(
                 ParsedVideoPacket {

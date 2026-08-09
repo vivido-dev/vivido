@@ -130,6 +130,15 @@ impl Lease {
         }
     }
 
+    /// The deadline which next requires service, when this lease is waiting on time.
+    fn deadline(&self) -> Option<Instant> {
+        match self.machine.state() {
+            LeaseState::Issued => Some(self.activation_deadline),
+            LeaseState::Suspended => self.grace_deadline,
+            _ => None,
+        }
+    }
+
     /// Payload for `SESSION_LEASE_READY`. Security §6.2: no secret appears here.
     pub(crate) fn ready_payload(&self, context_id: u64, lease_id: u64) -> PayloadMap {
         vec![
@@ -256,6 +265,15 @@ impl LeaseTable {
     /// Leases whose activation or grace deadline has passed.
     pub(crate) fn expired(&self, now: Instant) -> Vec<LeaseKey> {
         self.leases.iter().filter(|(_, lease)| lease.expired(now)).map(|(key, _)| *key).collect()
+    }
+
+    /// Earliest activation or grace deadline owned by one issuer.
+    pub(crate) fn next_deadline(&self, issuer: SessionIdentity) -> Option<Instant> {
+        self.leases
+            .iter()
+            .filter(|(key, _)| key.0 == issuer)
+            .filter_map(|(_, lease)| lease.deadline())
+            .min()
     }
 
     pub(crate) fn len(&self) -> usize {

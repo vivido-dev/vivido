@@ -2481,8 +2481,8 @@ impl Processor {
             },
             (EventType::VividFrame, Some(window_id)) => {
                 if let Some(window_context) = self.windows.get_mut(window_id) {
+                    window_context.acknowledge_vivid_frame();
                     window_context.dirty = true;
-                    window_context.display.damage_tracker.frame().mark_fully_damaged();
                     if window_context.display.window.has_frame {
                         window_context.display.window.request_redraw();
                     }
@@ -2555,6 +2555,11 @@ impl Processor {
                     if window_context.dirty {
                         window_context.display.window.request_redraw();
                     }
+                }
+            },
+            (EventType::RendererRecovery, Some(window_id)) => {
+                if let Some(window_context) = self.windows.get_mut(window_id) {
+                    window_context.retry_renderer(&mut self.scheduler);
                 }
             },
             (EventType::VividResizeSettled(generation), Some(window_id)) => {
@@ -2824,6 +2829,7 @@ pub enum EventType {
     #[cfg(any(unix, windows))]
     Shutdown,
     Frame,
+    RendererRecovery,
     VividResizeSettled(u64),
 }
 
@@ -3888,6 +3894,7 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                 | EventType::ConfigReload(_)
                 | EventType::CreateWindow(_)
                 | EventType::Frame
+                | EventType::RendererRecovery
                 | EventType::VividResizeSettled(_) => (),
                 EventType::VividFrame => (),
             },

@@ -1,7 +1,9 @@
 //! Owner-scoped Vivid 1.5 surface, track, and retained-scene state.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::{Arc, Condvar, Mutex};
+use std::ops::Deref;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use vivid_protocol::cbor::Value;
@@ -60,6 +62,52 @@ pub struct RasterDamageRect {
     pub height: u32,
 }
 
+/// Retained RGBA pixels with optional bounded return to their decoder's free-buffer pool.
+#[derive(Debug)]
+pub struct RgbaBuffer {
+    bytes: Option<Vec<u8>>,
+    decoder_pool: Option<Weak<Mutex<Vec<Vec<u8>>>>>,
+}
+
+impl RgbaBuffer {
+    pub fn new(bytes: Vec<u8>) -> Self {
+        Self { bytes: Some(bytes), decoder_pool: None }
+    }
+
+    pub(crate) fn pooled(bytes: Vec<u8>, decoder_pool: Weak<Mutex<Vec<Vec<u8>>>>) -> Self {
+        Self { bytes: Some(bytes), decoder_pool: Some(decoder_pool) }
+    }
+}
+
+impl Deref for RgbaBuffer {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        self.bytes.as_deref().unwrap_or_default()
+    }
+}
+
+impl AsRef<[u8]> for RgbaBuffer {
+    fn as_ref(&self) -> &[u8] {
+        self
+    }
+}
+
+impl Drop for RgbaBuffer {
+    fn drop(&mut self) {
+        let Some(pool) = self.decoder_pool.as_ref().and_then(Weak::upgrade) else {
+            return;
+        };
+        let Some(bytes) = self.bytes.take() else {
+            return;
+        };
+        let mut free = pool.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if free.len() < 2 {
+            free.push(bytes);
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Frame {
     pub frame_id: u64,
@@ -69,7 +117,7 @@ pub struct Frame {
     pub sar_num: u32,
     pub sar_den: u32,
     pub alpha_mode: u64,
-    pub rgba: Arc<[u8]>,
+    pub rgba: Arc<RgbaBuffer>,
     pub damage: Option<Arc<[RasterDamageRect]>>,
 }
 
@@ -89,6 +137,19 @@ pub struct RenderItem {
     pub clip: Option<ClipRect>,
     pub frame: Arc<Frame>,
     pub capture_policy: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct RenderSnapshot {
+    pub topology_revision: u64,
+    pub content_revision: u64,
+    pub capture_revision: u64,
+    pub items: Arc<Vec<RenderItem>>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SceneOptimizationMetrics {
+    pub snapshot_rebuilds: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -297,12 +358,39 @@ struct State {
     detached_sessions: HashSet<SessionIdentity>,
     retained_posters: Vec<RetainedPoster>,
     alternate_screen: bool,
+    topology_revision: u64,
+    content_revision: u64,
+    capture_revision: u64,
+    render_cache: Option<Arc<Vec<RenderItem>>>,
+}
+
+impl State {
+    fn invalidate_topology(&mut self) {
+        self.topology_revision = self.topology_revision.wrapping_add(1);
+        self.render_cache = None;
+    }
+
+    fn invalidate_capture(&mut self) {
+        self.capture_revision = self.capture_revision.wrapping_add(1);
+        self.invalidate_topology();
+    }
+
+    fn replace_cached_frame(&mut self, identity: TrackIdentity, frame: Arc<Frame>) {
+        self.content_revision = self.content_revision.wrapping_add(1);
+        let Some(items) = self.render_cache.as_mut() else {
+            return;
+        };
+        for item in Arc::make_mut(items).iter_mut().filter(|item| item.track_key == identity) {
+            item.frame = frame.clone();
+        }
+    }
 }
 
 struct Inner {
     state: Mutex<State>,
     changed: Condvar,
     target: Arc<dyn PresentationTarget>,
+    snapshot_rebuilds: AtomicU64,
 }
 
 #[derive(Clone)]
@@ -316,11 +404,18 @@ impl SharedScene {
             state: Mutex::new(State::default()),
             changed: Condvar::new(),
             target,
+            snapshot_rebuilds: AtomicU64::new(0),
         }))
     }
 
     pub fn target(&self) -> &Arc<dyn PresentationTarget> {
         &self.0.target
+    }
+
+    pub fn optimization_metrics(&self) -> SceneOptimizationMetrics {
+        SceneOptimizationMetrics {
+            snapshot_rebuilds: self.0.snapshot_rebuilds.load(Ordering::Relaxed),
+        }
     }
 
     /// A scene on a default terminal target, for tests that do not care about placement.
@@ -348,6 +443,7 @@ impl SharedScene {
     ) -> Result<(), &'static str> {
         target_generation.require_nonzero().map_err(|_| "target generation must be nonzero")?;
         let mut state = self.lock();
+        state.invalidate_topology();
         if state.scenes.contains_key(&session) {
             return Err("session already exists");
         }
@@ -379,6 +475,7 @@ impl SharedScene {
     /// an announcement can only carry the scene forward.
     pub fn advance_target_generation(&self, target_generation: TargetGeneration) {
         let mut state = self.lock();
+        state.invalidate_topology();
         if state.target_generation < target_generation {
             state.target_generation = target_generation;
         }
@@ -392,6 +489,7 @@ impl SharedScene {
 
     pub fn remove_session(&self, session: SessionIdentity) {
         let mut state = self.lock();
+        state.invalidate_topology();
         state.surfaces.retain(|identity, _| identity.context.session != session);
         state.tracks.retain(|identity, _| identity.surface.context.session != session);
         state.scenes.remove(&session);
@@ -414,6 +512,7 @@ impl SharedScene {
     /// lease's reservation until resume or grace expiry, which is why nothing is released here.
     pub fn suspend_session(&self, session: SessionIdentity) {
         let mut state = self.lock();
+        state.invalidate_topology();
         if !state.scenes.contains_key(&session) {
             return;
         }
@@ -464,6 +563,7 @@ impl SharedScene {
 
     pub fn detach_session(&self, session: SessionIdentity) {
         let mut state = self.lock();
+        state.invalidate_topology();
         let Some(scene) = state.scenes.get(&session) else {
             return;
         };
@@ -507,6 +607,7 @@ impl SharedScene {
 
     pub fn remove_contexts(&self, session: SessionIdentity, contexts: &HashSet<u64>) {
         let mut state = self.lock();
+        state.invalidate_topology();
         state.surfaces.retain(|identity, _| {
             identity.context.session != session || !contexts.contains(&identity.context.context_id)
         });
@@ -558,6 +659,7 @@ impl SharedScene {
         alternate: bool,
     ) -> Result<(), &'static str> {
         let mut state = self.lock();
+        state.invalidate_topology();
         if state.anchors.contains_key(&identity) || state.gone_anchors.contains(&identity) {
             return Err("anchor identity was already used");
         }
@@ -582,6 +684,7 @@ impl SharedScene {
         positions: impl IntoIterator<Item = (AnchorIdentity, Option<(usize, i32, bool)>)>,
     ) -> Vec<AnchorIdentity> {
         let mut state = self.lock();
+        state.invalidate_topology();
         let mut removed = Vec::new();
         for (identity, position) in positions {
             match (state.anchors.get_mut(&identity), position) {
@@ -610,6 +713,7 @@ impl SharedScene {
         }
         let minimum_line = -(history_size.min(i32::MAX as usize) as i32);
         let mut state = self.lock();
+        state.invalidate_topology();
         let mut removed = Vec::new();
         for (&identity, anchor) in &mut state.anchors {
             let old = anchor.line;
@@ -639,6 +743,7 @@ impl SharedScene {
 
     pub fn clear_terminal(&self) -> Vec<AnchorIdentity> {
         let mut state = self.lock();
+        state.invalidate_topology();
         let removed = state.anchors.keys().copied().collect::<Vec<_>>();
         remove_anchors(&mut state, &removed);
         self.0.changed.notify_all();
@@ -650,6 +755,7 @@ impl SharedScene {
         if state.alternate_screen == alternate {
             return Vec::new();
         }
+        state.invalidate_topology();
         state.alternate_screen = alternate;
         let removed = if alternate {
             Vec::new()
@@ -678,6 +784,7 @@ impl SharedScene {
             return Err("surface owner does not match complete identity");
         }
         let mut state = self.lock();
+        state.invalidate_topology();
         if !state.scenes.contains_key(&identity.context.session) {
             return Err("owning session does not exist");
         }
@@ -707,6 +814,7 @@ impl SharedScene {
         replacement.validate().map_err(|_| "invalid surface replacement")?;
         self.0.target.validate_surface(&replacement)?;
         let mut state = self.lock();
+        state.invalidate_capture();
         let surface = state.surfaces.get_mut(&identity).ok_or("surface does not exist")?;
         if surface.revision != expected_revision || surface.generation != expected_generation {
             return Err("stale surface revision or generation");
@@ -740,6 +848,7 @@ impl SharedScene {
 
     pub fn destroy_surface(&self, identity: SurfaceIdentity) -> Result<(), &'static str> {
         let mut state = self.lock();
+        state.invalidate_topology();
         if state.surfaces.remove(&identity).is_none() {
             return Err("surface does not exist");
         }
@@ -794,6 +903,7 @@ impl SharedScene {
             return Err("auxiliary slots are unsupported by the terminal target");
         }
         let mut state = self.lock();
+        state.invalidate_topology();
         if !state.surfaces.contains_key(&identity.surface) {
             return Err("owning surface does not exist");
         }
@@ -822,6 +932,7 @@ impl SharedScene {
 
     pub fn destroy_track(&self, identity: TrackIdentity) -> Result<(), &'static str> {
         let mut state = self.lock();
+        state.invalidate_topology();
         if state.tracks.remove(&identity).is_none() {
             return Err("track does not exist");
         }
@@ -848,6 +959,7 @@ impl SharedScene {
         bindings: &[(u64, u64, ChannelGeneration, u64)],
     ) -> Result<SurfaceStatus, &'static str> {
         let mut state = self.lock();
+        state.invalidate_topology();
         let surface = state.surfaces.get(&surface_identity).ok_or("surface does not exist")?;
         if surface.revision != expected_revision {
             return Err("stale surface revision");
@@ -957,6 +1069,7 @@ impl SharedScene {
 
     pub fn advance_channel(&self, identity: TrackIdentity) -> Result<TrackStatus, &'static str> {
         let mut state = self.lock();
+        state.invalidate_topology();
         let track = state.tracks.get_mut(&identity).ok_or("track does not exist")?;
         let current = track.state.channel_generation;
         let next = current.advance().map_err(|_| "channel generation exhausted")?;
@@ -1018,6 +1131,7 @@ impl SharedScene {
         generation: ChannelGeneration,
     ) -> Result<(), &'static str> {
         let mut state = self.lock();
+        state.invalidate_topology();
         let track = state.tracks.get_mut(&identity).ok_or("track does not exist")?;
         if track.state.channel_generation != generation || track.lifecycle != 1 {
             return Err("stale channel generation");
@@ -1077,16 +1191,27 @@ impl SharedScene {
             return Err("invalid decoded frame");
         }
         let mut state = self.lock();
-        let track = state.tracks.get_mut(&identity).ok_or("track does not exist")?;
-        if track.state.channel_generation != generation || track.lifecycle != 1 {
-            return Err("stale channel generation");
+        let frame = Arc::new(frame);
+        let replacing = {
+            let track = state.tracks.get_mut(&identity).ok_or("track does not exist")?;
+            if track.state.channel_generation != generation || track.lifecycle != 1 {
+                return Err("stale channel generation");
+            }
+            track.last_decoded_pts_us = Some(frame.pts_us);
+            track.metrics.decoded_frames = track.metrics.decoded_frames.saturating_add(1);
+            let replacing = track.frame.is_some();
+            track.frame = Some(frame.clone());
+            track.state.milestones |= MILESTONE_OUTPUT_READY;
+            track.state.revision =
+                track.state.revision.advance().map_err(|_| "track revision exhausted")?;
+            replacing
+        };
+        if replacing {
+            state.replace_cached_frame(identity, frame);
+        } else {
+            state.content_revision = state.content_revision.wrapping_add(1);
+            state.invalidate_topology();
         }
-        track.last_decoded_pts_us = Some(frame.pts_us);
-        track.metrics.decoded_frames = track.metrics.decoded_frames.saturating_add(1);
-        track.frame = Some(Arc::new(frame));
-        track.state.milestones |= MILESTONE_OUTPUT_READY;
-        track.state.revision =
-            track.state.revision.advance().map_err(|_| "track revision exhausted")?;
         self.0.changed.notify_all();
         Ok(())
     }
@@ -1117,6 +1242,7 @@ impl SharedScene {
 
     pub fn lose_track(&self, identity: TrackIdentity) -> Result<(), &'static str> {
         let mut state = self.lock();
+        state.invalidate_topology();
         let track = state.tracks.get_mut(&identity).ok_or("track does not exist")?;
         track.lifecycle = 6;
         track.state.milestones = 0;
@@ -1214,6 +1340,7 @@ impl SharedScene {
         new_epoch: u32,
     ) -> Result<(), &'static str> {
         let mut state = self.lock();
+        state.invalidate_topology();
         let track = state.tracks.get_mut(&identity).ok_or("track does not exist")?;
         if track.configuration.mode != TrackMode::Timed || new_epoch <= track.state.media_epoch {
             return Err("FLUSH requires a greater epoch on a timed track");
@@ -1420,6 +1547,7 @@ impl SharedScene {
         expected_revision: Option<SceneRevision>,
     ) -> Result<SceneRevision, CommitRejection> {
         let mut state = self.lock();
+        state.invalidate_topology();
         let session = context.session;
         let mutations = state
             .scenes
@@ -1575,12 +1703,17 @@ impl SharedScene {
         }
     }
 
-    pub fn snapshot(&self) -> (u64, Vec<RenderItem>) {
-        let state = self.lock();
-        let revision = state
-            .scenes
-            .values()
-            .fold(0_u64, |value, scene| value.wrapping_add(scene.revision.get()));
+    pub fn snapshot(&self) -> RenderSnapshot {
+        let mut state = self.lock();
+        if let Some(items) = state.render_cache.clone() {
+            return RenderSnapshot {
+                topology_revision: state.topology_revision,
+                content_revision: state.content_revision,
+                capture_revision: state.capture_revision,
+                items,
+            };
+        }
+        self.0.snapshot_rebuilds.fetch_add(1, Ordering::Relaxed);
         let mut items = Vec::new();
         for (session_identity, scene) in &state.scenes {
             for node in scene.nodes.values().filter(|node| node.visible) {
@@ -1713,7 +1846,14 @@ impl SharedScene {
             });
         }
         items.sort_by_key(|item| (item.text_layer, item.z_index));
-        (revision, items)
+        let items = Arc::new(items);
+        state.render_cache = Some(items.clone());
+        RenderSnapshot {
+            topology_revision: state.topology_revision,
+            content_revision: state.content_revision,
+            capture_revision: state.capture_revision,
+            items,
+        }
     }
 
     pub fn mark_presented(
@@ -2012,6 +2152,32 @@ mod tests {
     }
 
     #[test]
+    fn rgba_buffers_return_to_a_bounded_decoder_pool() {
+        let pool = Arc::new(Mutex::new(Vec::new()));
+        for value in 0..3 {
+            drop(RgbaBuffer::pooled(vec![value; 16], Arc::downgrade(&pool)));
+        }
+        let free = pool.lock().unwrap();
+        assert_eq!(free.len(), 2, "a decoder retains at most two free frames");
+        assert!(free.iter().all(|buffer| buffer.len() == 16));
+    }
+
+    #[test]
+    fn unchanged_snapshots_share_the_cached_render_list() {
+        let scene = SharedScene::for_test();
+        let first = scene.snapshot();
+        let second = scene.snapshot();
+        assert!(Arc::ptr_eq(&first.items, &second.items));
+        assert_eq!(scene.optimization_metrics().snapshot_rebuilds, 1);
+
+        scene.register_session(session(9, 1), TargetGeneration::ONE).unwrap();
+        let changed = scene.snapshot();
+        assert!(!Arc::ptr_eq(&second.items, &changed.items));
+        assert!(changed.topology_revision > second.topology_revision);
+        assert_eq!(scene.optimization_metrics().snapshot_rebuilds, 2);
+    }
+
+    #[test]
     fn reused_local_ids_are_isolated_by_complete_owner() {
         let scene = SharedScene::for_test();
         let first = session(1, 1);
@@ -2271,7 +2437,7 @@ mod tests {
             sar_num: 1,
             sar_den: 1,
             alpha_mode: ALPHA_STRAIGHT,
-            rgba: Arc::from([0_u8, 0, 0, 255].as_slice()),
+            rgba: Arc::new(RgbaBuffer::new(vec![0_u8, 0, 0, 255])),
             damage: None,
         };
         scene.publish_decoded_frame(track_identity, ChannelGeneration::ONE, frame).unwrap();
@@ -2360,7 +2526,7 @@ mod tests {
                     sar_num: 1,
                     sar_den: 1,
                     alpha_mode: ALPHA_STRAIGHT,
-                    rgba: Arc::from([255, 0, 0, 255]),
+                    rgba: Arc::new(RgbaBuffer::new(vec![255, 0, 0, 255])),
                     damage: None,
                 },
             )
@@ -2408,15 +2574,15 @@ mod tests {
         scene
             .commit_transaction(context, 1, TargetGeneration::ONE, Some(SceneRevision::ZERO))
             .unwrap();
-        let item = scene.snapshot().1.pop().unwrap();
+        let item = scene.snapshot().items[0].clone();
         assert_eq!((item.x, item.y), (3_i64 << 32, 5_i64 << 32));
 
         scene.detach_session(session);
-        assert_eq!(scene.snapshot().1.len(), 1);
+        assert_eq!(scene.snapshot().items.len(), 1);
         assert!(scene.scroll_anchors(0, 24, 2, 0).is_empty());
-        assert_eq!(scene.snapshot().1[0].y, 3_i64 << 32);
+        assert_eq!(scene.snapshot().items[0].y, 3_i64 << 32);
         assert_eq!(scene.clear_terminal(), vec![anchor_identity]);
-        assert!(scene.snapshot().1.is_empty());
+        assert!(scene.snapshot().items.is_empty());
     }
 
     #[test]
@@ -2482,7 +2648,7 @@ mod tests {
                     sar_num: 1,
                     sar_den: 1,
                     alpha_mode: ALPHA_STRAIGHT,
-                    rgba: Arc::from([0, 0, 0, 255]),
+                    rgba: Arc::new(RgbaBuffer::new(vec![0, 0, 0, 255])),
                     damage: None,
                 },
             )

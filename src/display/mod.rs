@@ -308,29 +308,51 @@ pub struct Display {
     scene_renderer: SceneRenderer,
     /// Kept so a renderer rebuilt after GPU device loss can be re-attached to the same scene.
     vivid_scene: Option<crate::vivid::scene::SharedScene>,
-    /// Consecutive rebuilds without a frame in between. A GPU that cannot be brought back is not
-    /// something to retry forever.
-    renderer_rebuilds: u32,
+    renderer_unavailable: bool,
+    renderer_retry_delay: Duration,
+    cached_scene: Option<Scene>,
+    cached_media_generation: u64,
+    cached_base_color: Color,
+    vivid_frame_requested: bool,
+    text_scene_builds: u64,
+    cached_scene_frames: u64,
     text_system: TextSystem,
     meter: Meter,
 }
 
-/// Rebuild attempts allowed before a GPU error is treated as unrecoverable.
-const MAX_RENDERER_REBUILDS: u32 = 2;
+const INITIAL_RENDERER_RETRY: Duration = Duration::from_millis(100);
+const MAX_RENDERER_RETRY: Duration = Duration::from_secs(5);
 
 impl Display {
+    pub(crate) fn mark_vivid_frame(&mut self) {
+        self.vivid_frame_requested = true;
+    }
+
+    pub(crate) fn optimization_metrics(&self) -> (u64, u64, media::SourceUploadMetrics) {
+        (self.text_scene_builds, self.cached_scene_frames, self.scene_renderer.media_metrics())
+    }
+
+    fn invalidate_cached_scene(&mut self) {
+        self.cached_scene = None;
+        self.vivid_frame_requested = false;
+    }
+
     pub fn set_vivid_scene(&mut self, scene: crate::vivid::scene::SharedScene) {
+        self.invalidate_cached_scene();
         self.vivid_scene = Some(scene.clone());
         self.scene_renderer.set_vivid_scene(scene);
     }
 
     pub fn submit_graphics(&mut self, command: GraphicsCommand) {
+        self.invalidate_cached_scene();
         self.scene_renderer.submit_graphics(command);
         self.damage_tracker.frame().mark_fully_damaged();
     }
 
     pub fn embedded_frame(&self) -> Option<EmbeddedFrame<'_>> {
-        self.display_window_is_embedded().then(|| self.scene_renderer.embedded_frame()).flatten()
+        (!self.renderer_unavailable && self.display_window_is_embedded())
+            .then(|| self.scene_renderer.embedded_frame())
+            .flatten()
     }
 
     fn display_window_is_embedded(&self) -> bool {
@@ -340,11 +362,14 @@ impl Display {
     /// Whether the renderer holds a frame a screenshot could read.
     #[cfg(any(unix, windows))]
     pub fn has_rendered_frame(&self) -> bool {
-        self.scene_renderer.has_rendered_frame()
+        !self.renderer_unavailable && self.scene_renderer.has_rendered_frame()
     }
 
     #[cfg(any(unix, windows))]
     pub fn begin_screenshot(&self) -> Result<ScreenshotReadback, ScreenshotError> {
+        if self.renderer_unavailable {
+            return Err(ScreenshotError::NoPresentedFrame);
+        }
         self.scene_renderer.begin_screenshot()
     }
 
@@ -468,7 +493,14 @@ impl Display {
             hint_mouse_point: Default::default(),
             scene_renderer,
             vivid_scene: None,
-            renderer_rebuilds: 0,
+            renderer_unavailable: false,
+            renderer_retry_delay: INITIAL_RENDERER_RETRY,
+            cached_scene: None,
+            cached_media_generation: 0,
+            cached_base_color: Color::BLACK,
+            vivid_frame_requested: false,
+            text_scene_builds: 0,
+            cached_scene_frames: 0,
             text_system,
             meter: Default::default(),
         })
@@ -489,6 +521,7 @@ impl Display {
         let mut metrics = self.text_system.metrics();
 
         if let Some(font) = pending_update.font().cloned() {
+            self.invalidate_cached_scene();
             self.text_system.update_font(font);
             metrics = self.text_system.metrics();
             self.damage_tracker.frame().mark_fully_damaged();
@@ -531,6 +564,7 @@ impl Display {
         }
 
         if new_size != self.size_info {
+            self.invalidate_cached_scene();
             let renderer_update = self.pending_renderer_update.get_or_insert(Default::default());
             renderer_update.resize = true;
             search_state.clear_focused_match();
@@ -546,6 +580,7 @@ impl Display {
         };
 
         if renderer_update.resize {
+            self.invalidate_cached_scene();
             self.scene_renderer.resize(PhysicalSize::new(
                 self.size_info.width() as u32,
                 self.size_info.height() as u32,
@@ -564,6 +599,56 @@ impl Display {
         config: &UiConfig,
         search_state: &mut SearchState,
     ) -> bool {
+        if self.renderer_unavailable {
+            return false;
+        }
+        match terminal.damage() {
+            TermDamage::Full => self.damage_tracker.frame().mark_fully_damaged(),
+            TermDamage::Partial(damaged_lines) => {
+                for damage in damaged_lines {
+                    self.damage_tracker.frame().damage_line(damage);
+                }
+            },
+        }
+        terminal.reset_damage();
+
+        let size_info = self.size_info;
+        let early_display_offset = terminal.grid().display_offset();
+        let prepared_media = self.scene_renderer.prepare_media(&size_info, early_display_offset);
+        let media_generation = prepared_media.as_ref().map_or(0, |media| media.image_generation);
+        let _media_changed = prepared_media.as_ref().is_some_and(|media| media.changed);
+        let can_reuse_scene = self.vivid_frame_requested
+            && self.cached_scene.is_some()
+            && self.cached_media_generation == media_generation
+            && self.damage_tracker.frame().is_empty()
+            && self.visual_bell.intensity() == 0.
+            && !self.hint_state.active()
+            && search_state.regex().is_none()
+            && !self.damage_tracker.debug;
+        if can_reuse_scene {
+            self.cached_scene_frames = self.cached_scene_frames.saturating_add(1);
+            drop(terminal);
+            self.window.pre_present_notify();
+            let result = {
+                let scene = self.cached_scene.as_ref().expect("cached scene checked above");
+                self.scene_renderer.render(scene, self.cached_base_color)
+            };
+            let presented = match result {
+                Ok(presented) => {
+                    self.renderer_retry_delay = INITIAL_RENDERER_RETRY;
+                    presented
+                },
+                Err(error) => {
+                    self.recover_from_render_error(&error, config, scheduler);
+                    false
+                },
+            };
+            self.vivid_frame_requested = false;
+            self.request_frame(scheduler);
+            self.damage_tracker.swap_damage();
+            return presented;
+        }
+
         let mut content = RenderableContent::new(config, self, &terminal, search_state);
         let mut grid_cells = Vec::new();
         for cell in &mut content {
@@ -578,18 +663,7 @@ impl Display {
 
         let cursor_point = terminal.grid().cursor.point;
         let total_lines = terminal.grid().total_lines();
-        let size_info = self.size_info;
         let metrics = self.text_system.metrics();
-
-        match terminal.damage() {
-            TermDamage::Full => self.damage_tracker.frame().mark_fully_damaged(),
-            TermDamage::Partial(damaged_lines) => {
-                for damage in damaged_lines {
-                    self.damage_tracker.frame().damage_line(damage);
-                }
-            },
-        }
-        terminal.reset_damage();
 
         drop(terminal);
 
@@ -628,6 +702,7 @@ impl Display {
         }
 
         let mut scene = Scene::new();
+        self.text_scene_builds = self.text_scene_builds.saturating_add(1);
 
         let render_start = Instant::now();
         {
@@ -637,8 +712,8 @@ impl Display {
                 Self::paint_cell_background(&mut scene, cell, size_info);
             }
 
-            if let Some(image) = self.scene_renderer.prepare_media(&size_info, display_offset) {
-                scene.draw_image(&image, Affine::IDENTITY);
+            if let Some(media) = &prepared_media {
+                scene.draw_image(&media.image, Affine::IDENTITY);
             }
 
             for cell in &prepared_cells {
@@ -764,19 +839,26 @@ impl Display {
             background_color.b,
             (config.window_opacity() * 255.) as u8,
         );
-        let presented = match self.scene_renderer.render(&scene, base_color) {
+        let (presented, cacheable) = match self.scene_renderer.render(&scene, base_color) {
             Ok(presented) => {
-                self.renderer_rebuilds = 0;
-                presented
+                self.renderer_retry_delay = INITIAL_RENDERER_RETRY;
+                (presented, true)
             },
             Err(error) => {
                 // The GPU went away. Rebuild and let the next frame paint rather than taking the
                 // terminal down: the grid, the PTY, and every Vivid session are all still intact,
                 // and track textures re-upload from the scene's retained frames.
-                self.recover_from_render_error(&error, config);
-                false
+                self.recover_from_render_error(&error, config, scheduler);
+                (false, false)
             },
         };
+
+        if cacheable {
+            self.cached_scene = Some(scene);
+            self.cached_media_generation = media_generation;
+            self.cached_base_color = base_color;
+        }
+        self.vivid_frame_requested = false;
 
         self.request_frame(scheduler);
         self.damage_tracker.swap_damage();
@@ -784,6 +866,7 @@ impl Display {
     }
 
     pub fn update_config(&mut self, config: &UiConfig) {
+        self.invalidate_cached_scene();
         self.damage_tracker.debug = config.debug.highlight_damage;
         self.visual_bell.update_config(&config.bell);
         self.colors = List::from(&config.colors);
@@ -1209,24 +1292,49 @@ impl Display {
         }
     }
 
-    /// Rebuild the GPU renderer after a fatal render error, or give up if it will not come back.
-    fn recover_from_render_error(&mut self, error: &renderer::Error, config: &UiConfig) {
-        self.renderer_rebuilds += 1;
-        if self.renderer_rebuilds > MAX_RENDERER_REBUILDS {
-            panic!("renderer stopped after a fatal GPU error: {error}");
+    fn recover_from_render_error(
+        &mut self,
+        error: &renderer::Error,
+        config: &UiConfig,
+        scheduler: &mut Scheduler,
+    ) {
+        self.invalidate_cached_scene();
+        log::warn!("GPU render failed ({error}); rebuilding the renderer");
+        if let Err(rebuild) = self.rebuild_renderer(config) {
+            log::warn!(
+                "GPU renderer remains unavailable ({rebuild}); retrying in {:?}",
+                self.renderer_retry_delay
+            );
+            self.renderer_unavailable = true;
+            self.schedule_renderer_retry(scheduler);
         }
-        log::warn!(
-            "GPU render failed ({error}); rebuilding the renderer (attempt {} of \
-             {MAX_RENDERER_REBUILDS})",
-            self.renderer_rebuilds
-        );
-        if let Err(rebuild) = self.scene_renderer.rebuild(
+    }
+
+    pub(crate) fn retry_renderer(&mut self, config: &UiConfig, scheduler: &mut Scheduler) -> bool {
+        if !self.renderer_unavailable {
+            return true;
+        }
+        match self.rebuild_renderer(config) {
+            Ok(()) => true,
+            Err(error) => {
+                log::warn!(
+                    "GPU renderer recovery failed ({error}); retrying in {:?}",
+                    self.renderer_retry_delay
+                );
+                self.schedule_renderer_retry(scheduler);
+                false
+            },
+        }
+    }
+
+    fn rebuild_renderer(&mut self, config: &UiConfig) -> Result<(), renderer::Error> {
+        self.scene_renderer.rebuild(
             self.window.render_source(),
             self.window.inner_size(),
             config.window_opacity() < 1.0,
-        ) {
-            panic!("renderer stopped after a fatal GPU error: {error}; rebuild failed: {rebuild}");
-        }
+        )?;
+        self.renderer_unavailable = false;
+        self.invalidate_cached_scene();
         if let Some(scene) = self.vivid_scene.clone() {
             self.scene_renderer.set_vivid_scene(scene);
         }
@@ -1234,6 +1342,20 @@ impl Display {
         self.damage_tracker.frame().mark_fully_damaged();
         self.damage_tracker.next_frame().mark_fully_damaged();
         self.window.request_redraw();
+        Ok(())
+    }
+
+    fn schedule_renderer_retry(&mut self, scheduler: &mut Scheduler) {
+        let window_id = self.window.id();
+        let timer_id = TimerId::new(Topic::RendererRecovery, window_id);
+        scheduler.unschedule(timer_id);
+        scheduler.schedule(
+            Event::new(EventType::RendererRecovery, window_id),
+            self.renderer_retry_delay,
+            false,
+            timer_id,
+        );
+        self.renderer_retry_delay = next_renderer_retry_delay(self.renderer_retry_delay);
     }
 
     fn request_frame(&mut self, scheduler: &mut Scheduler) {
@@ -1256,6 +1378,10 @@ impl Display {
     }
 }
 
+fn next_renderer_retry_delay(current: Duration) -> Duration {
+    current.saturating_mul(2).min(MAX_RENDERER_RETRY)
+}
+
 fn scene_glyph_from_layout(
     cursor_x: &mut f32,
     baseline: f32,
@@ -1276,7 +1402,10 @@ fn text_cell_width(text: &str) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{scene_glyph_from_layout, text_cell_width};
+    use super::{
+        INITIAL_RENDERER_RETRY, MAX_RENDERER_RETRY, next_renderer_retry_delay,
+        scene_glyph_from_layout, text_cell_width,
+    };
 
     #[test]
     fn scene_glyphs_use_baseline_relative_y_coordinates() {
@@ -1296,6 +1425,16 @@ mod tests {
         assert_eq!(text_cell_width("abc"), 3);
         assert_eq!(text_cell_width("今a"), 3);
         assert_eq!(text_cell_width(""), 0);
+    }
+
+    #[test]
+    fn renderer_recovery_backoff_is_bounded() {
+        let mut delay = INITIAL_RENDERER_RETRY;
+        for _ in 0..16 {
+            delay = next_renderer_retry_delay(delay);
+        }
+        assert_eq!(delay, MAX_RENDERER_RETRY);
+        assert_eq!(next_renderer_retry_delay(delay), MAX_RENDERER_RETRY);
     }
 }
 

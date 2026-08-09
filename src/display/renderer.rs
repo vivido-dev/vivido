@@ -348,11 +348,15 @@ impl SceneRenderer {
         self.media.submit(command);
     }
 
+    pub fn media_metrics(&self) -> super::media::SourceUploadMetrics {
+        self.media.source_upload_metrics()
+    }
+
     pub fn prepare_media(
         &mut self,
         size: &SizeInfo,
         display_offset: usize,
-    ) -> Option<vello::peniko::ImageData> {
+    ) -> Option<super::media::PreparedMedia> {
         let mut renderer = self.renderer.borrow_mut();
         self.media.draw(&self.device, &self.queue, &mut renderer, size, display_offset)
     }
@@ -459,8 +463,6 @@ impl SceneRenderer {
         }
 
         self.has_rendered_frame = true;
-        let _ = self.device.poll(wgpu::PollType::Poll);
-
         Ok(true)
     }
 

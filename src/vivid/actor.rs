@@ -68,7 +68,7 @@ pub(crate) struct Egress {
 }
 
 impl Egress {
-    pub(crate) fn start(writer: Arc<Writer>, name: &'static str) -> Arc<Self> {
+    pub(crate) fn start(writer: Arc<Writer>, name: &'static str) -> io::Result<Arc<Self>> {
         let egress = Arc::new(Self {
             queue: Mutex::new(EgressQueue {
                 records: VecDeque::new(),
@@ -83,10 +83,10 @@ impl Egress {
         });
         let worker = {
             let egress = egress.clone();
-            thread::Builder::new().name(name.into()).spawn(move || egress.run(writer)).ok()
+            thread::Builder::new().name(name.into()).spawn(move || egress.run(writer))?
         };
-        *egress.worker.lock().expect("egress worker") = worker;
-        egress
+        *egress.worker.lock().expect("egress worker") = Some(worker);
+        Ok(egress)
     }
 
     /// Have this egress unblock `shutdown`'s reader when it *gives up* on the peer — an overflow
@@ -285,6 +285,24 @@ impl PendingSet {
 
     pub(crate) fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    /// Observation cadence for pending work, capped by the earliest track-wait deadline.
+    pub(crate) fn observation_timeout(&self, now: Instant) -> Option<Duration> {
+        if self.entries.is_empty() {
+            return None;
+        }
+        Some(
+            self.entries
+                .iter()
+                .filter_map(|entry| match entry {
+                    Pending::TrackWait { deadline, .. } => {
+                        Some(deadline.saturating_duration_since(now))
+                    },
+                    Pending::AudioDrain { .. } => None,
+                })
+                .fold(TICK, Duration::min),
+        )
     }
 
     /// Resolve whatever is ready, writing replies through the egress.
@@ -498,6 +516,25 @@ mod tests {
     fn an_empty_set_needs_no_servicing() {
         let pending = PendingSet::new(4, 4);
         assert!(pending.is_empty());
+        assert_eq!(pending.observation_timeout(Instant::now()), None);
+    }
+
+    #[test]
+    fn pending_observation_is_capped_by_the_wait_deadline() {
+        let now = Instant::now();
+        let mut pending = PendingSet::new(4, 4);
+        pending
+            .register(Pending::TrackWait {
+                request_id: 1,
+                object_id: 1,
+                identity: track(),
+                generation: ChannelGeneration::ONE,
+                condition: 2,
+                value: Some(1),
+                deadline: now + Duration::from_micros(250),
+            })
+            .unwrap();
+        assert_eq!(pending.observation_timeout(now), Some(Duration::from_micros(250)));
     }
 
     #[test]

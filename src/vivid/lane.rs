@@ -55,6 +55,10 @@ impl LaneState {
         self.live
     }
 
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
+
     /// Note that an ordinary input event was admitted, which makes this generation unrepeatable.
     pub(crate) fn note_input(&mut self) {
         self.admitted_input = true;

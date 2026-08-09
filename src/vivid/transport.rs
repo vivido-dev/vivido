@@ -253,6 +253,7 @@ impl Reader {
 }
 
 /// Unblocks a parked reader after the connection's egress has drained.
+#[derive(Clone)]
 pub struct ReadShutdown {
     stream: Arc<LocalStream>,
     #[cfg(windows)]

@@ -139,6 +139,10 @@ pub struct FrameDamage {
 }
 
 impl FrameDamage {
+    pub fn is_empty(&self) -> bool {
+        !self.full && self.rects.is_empty() && self.lines.iter().all(|line| !line.is_damaged())
+    }
+
     /// Damage line for the given frame.
     #[inline]
     pub fn damage_line(&mut self, damage: LineDamageBounds) {

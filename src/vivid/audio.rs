@@ -513,33 +513,28 @@ impl AudioOutput {
 
     pub fn push(&self, samples: &[f32]) -> io::Result<()> {
         let mut producer = self.producer.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        for &sample in samples {
-            let mut sample = sample;
-            loop {
-                if self.shared.stopped.load(Ordering::SeqCst) {
-                    return Ok(());
-                }
-                if let Some(error) = self.shared.error() {
-                    return Err(io::Error::new(io::ErrorKind::NotConnected, error));
-                }
-                match producer.try_push(sample) {
-                    Ok(()) => {
-                        self.shared.queued_samples.fetch_add(1, Ordering::SeqCst);
-                        break;
-                    },
-                    Err(value) => {
-                        sample = value;
-                        // The ring is full. It drains at the device's fixed rate, so wait for the
-                        // device to consume a chunk rather than polling it. Signalling from the
-                        // audio callback instead would put a lock on the realtime thread.
-                        let wait = self
-                            .time_to_drain(RING_WAIT_SAMPLES)
-                            .unwrap_or(STOPPED_OUTPUT_RECHECK)
-                            .clamp(MINIMUM_RING_WAIT, STOPPED_OUTPUT_RECHECK);
-                        thread::sleep(wait);
-                    },
-                }
+        let mut offset = 0;
+        while offset < samples.len() {
+            if self.shared.stopped.load(Ordering::SeqCst) {
+                return Ok(());
             }
+            if let Some(error) = self.shared.error() {
+                return Err(io::Error::new(io::ErrorKind::NotConnected, error));
+            }
+            let accepted = producer.push_slice(&samples[offset..]);
+            if accepted != 0 {
+                self.shared.queued_samples.fetch_add(accepted as u64, Ordering::SeqCst);
+                offset += accepted;
+                continue;
+            }
+            // The ring is full. It drains at the device's fixed rate, so wait for the device to
+            // consume a chunk rather than polling it. Signalling from the audio callback instead
+            // would put a lock on the realtime thread.
+            let wait = self
+                .time_to_drain(RING_WAIT_SAMPLES)
+                .unwrap_or(STOPPED_OUTPUT_RECHECK)
+                .clamp(MINIMUM_RING_WAIT, STOPPED_OUTPUT_RECHECK);
+            thread::sleep(wait);
         }
         Ok(())
     }
@@ -1167,6 +1162,14 @@ mod tests {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .is_none()
         );
+    }
+
+    #[test]
+    fn producer_push_accounts_an_accepted_slice_once() {
+        let output = AudioOutput::test_output();
+        let samples = [0.0, 0.25, -0.5, 1.0, -1.0, 0.75];
+        output.push(&samples).unwrap();
+        assert_eq!(output.shared.queued_samples.load(Ordering::SeqCst), samples.len() as u64);
     }
 
     #[test]

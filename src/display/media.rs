@@ -122,6 +122,15 @@ pub struct SourceUploadMetrics {
     pub frames: u64,
     pub uploaded_pixels: u64,
     pub full_frame_pixels: u64,
+    pub media_passes: u64,
+    pub skipped_passes: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct PreparedMedia {
+    pub image: ImageData,
+    pub image_generation: u64,
+    pub changed: bool,
 }
 
 struct MediaTarget {
@@ -146,6 +155,12 @@ pub struct VividMediaRenderer {
     scene: Option<SharedScene>,
     capture_redactions: Vec<CaptureRedaction>,
     source_upload_metrics: SourceUploadMetrics,
+    last_snapshot: Option<(u64, u64, u64, u32, u32, usize)>,
+    image_generation: u64,
+    rendered: Vec<(usize, [Vertex; 6])>,
+    active_tracks: HashSet<TrackKey>,
+    upload_tracks: HashSet<TrackKey>,
+    vertex_data: Vec<Vertex>,
 }
 
 impl VividMediaRenderer {
@@ -250,6 +265,12 @@ impl VividMediaRenderer {
             scene: None,
             capture_redactions: Vec::new(),
             source_upload_metrics: SourceUploadMetrics::default(),
+            last_snapshot: None,
+            image_generation: 0,
+            rendered: Vec::with_capacity(INITIAL_QUADS),
+            active_tracks: HashSet::new(),
+            upload_tracks: HashSet::new(),
+            vertex_data: Vec::with_capacity(INITIAL_QUADS * 6),
         }
     }
 
@@ -277,7 +298,6 @@ impl VividMediaRenderer {
     }
 
     /// Cumulative track-texture traffic for targeted-performance diagnostics.
-    #[allow(dead_code)]
     pub fn source_upload_metrics(&self) -> SourceUploadMetrics {
         self.source_upload_metrics
     }
@@ -286,6 +306,7 @@ impl VividMediaRenderer {
         if let Some(target) = self.target.take() {
             renderer.unregister_texture(target.image);
         }
+        self.last_snapshot = None;
     }
 
     pub fn draw(
@@ -295,63 +316,97 @@ impl VividMediaRenderer {
         renderer: &mut Renderer,
         size: &SizeInfo,
         display_offset: usize,
-    ) -> Option<ImageData> {
+    ) -> Option<PreparedMedia> {
         let Some(scene) = self.scene.as_ref().cloned() else {
             self.capture_redactions.clear();
             return None;
         };
-        let (_, items) = scene.snapshot();
+        let snapshot = scene.snapshot();
+        let items = &snapshot.items;
+        let width = size.width() as u32;
+        let height = size.height() as u32;
+        let snapshot_key = (
+            snapshot.topology_revision,
+            snapshot.content_revision,
+            snapshot.capture_revision,
+            width,
+            height,
+            display_offset,
+        );
+        if self.last_snapshot == Some(snapshot_key) {
+            self.source_upload_metrics.skipped_passes =
+                self.source_upload_metrics.skipped_passes.saturating_add(1);
+            return self.target.as_ref().map(|target| PreparedMedia {
+                image: target.image.clone(),
+                image_generation: self.image_generation,
+                changed: false,
+            });
+        }
         // The target owns what a placement unit means: cells for a terminal, logical pixels for a
         // desktop. The renderer only needs the conversion.
         let placement_scale = scene.target().placement_scale(size);
-        if items.is_empty() {
+        if items.is_empty() && self.target.is_none() {
             // An empty scene is usually a momentary one — everything hidden while a producer
             // redraws — so the textures are retained on the same terms as any other frame in which
             // a track does not render.
             self.retain_tracks(&HashSet::new(), Instant::now());
             self.capture_redactions.clear();
+            self.last_snapshot = Some(snapshot_key);
+            self.source_upload_metrics.skipped_passes =
+                self.source_upload_metrics.skipped_passes.saturating_add(1);
             return None;
         }
-        self.ensure_target(device, renderer, size.width() as u32, size.height() as u32);
+        self.ensure_target(device, renderer, width, height);
 
-        let mut rendered = items
-            .iter()
-            .filter_map(|item| {
-                vertices(item, size, display_offset, placement_scale)
-                    .map(|vertices| (item, vertices))
-            })
-            .collect::<Vec<_>>();
+        self.rendered.clear();
+        self.rendered.extend(items.iter().enumerate().filter_map(|(index, item)| {
+            vertices(item, size, display_offset, placement_scale).map(|vertices| (index, vertices))
+        }));
         // `MAX_RENDER_ITEMS` is the scene's own ceiling, so this should be unreachable. Clamp
         // anyway: writing geometry past the end of the buffer is a wgpu validation error, and the
         // default handler turns that into a panic that takes the window with it.
-        if rendered.len() > MAX_RENDER_ITEMS {
+        if self.rendered.len() > MAX_RENDER_ITEMS {
             if !self.reported_item_overflow {
                 self.reported_item_overflow = true;
                 log::warn!(
                     "Vivid scene produced {} render items; drawing the first {MAX_RENDER_ITEMS}",
-                    rendered.len()
+                    self.rendered.len()
                 );
             }
-            rendered.truncate(MAX_RENDER_ITEMS);
+            self.rendered.truncate(MAX_RENDER_ITEMS);
         }
-        self.ensure_vertex_capacity(device, rendered.len());
-        self.capture_redactions = rendered
-            .iter()
-            .filter(|(item, _)| {
-                item.capture_policy & vivid_protocol::surface::POLICY_DENY_CAPTURE != 0
-            })
-            .map(|(_, vertices)| redaction_from_vertices(vertices, size))
-            .collect();
-        let active = rendered.iter().map(|(item, _)| item.track_key).collect::<HashSet<_>>();
+        self.ensure_vertex_capacity(device, self.rendered.len());
+        self.capture_redactions.clear();
+        self.capture_redactions.extend(
+            self.rendered
+                .iter()
+                .filter(|(index, _)| {
+                    let item = &items[*index];
+                    item.capture_policy & vivid_protocol::surface::POLICY_DENY_CAPTURE != 0
+                })
+                .map(|(_, vertices)| redaction_from_vertices(vertices, size)),
+        );
+        self.active_tracks.clear();
+        self.active_tracks.extend(self.rendered.iter().map(|(index, _)| items[*index].track_key));
+        let active = std::mem::take(&mut self.active_tracks);
         self.retain_tracks(&active, Instant::now());
-        for (item, _) in &rendered {
+        self.active_tracks = active;
+        self.upload_tracks.clear();
+        self.upload_tracks.extend(self.rendered.iter().map(|(index, _)| items[*index].track_key));
+        let upload_tracks = std::mem::take(&mut self.upload_tracks);
+        for key in &upload_tracks {
+            let Some(item) = items.iter().find(|item| item.track_key == *key) else {
+                continue;
+            };
             debug_assert_eq!(item.track_key.surface, item.surface_key);
             self.upload_track(device, queue, item.track_key, item);
         }
+        self.upload_tracks = upload_tracks;
 
-        let vertex_data = rendered.iter().flat_map(|(_, vertices)| *vertices).collect::<Vec<_>>();
-        if !vertex_data.is_empty() {
-            queue.write_buffer(&self.vertex_buffer, 0, bytemuck::cast_slice(&vertex_data));
+        self.vertex_data.clear();
+        self.vertex_data.extend(self.rendered.iter().flat_map(|(_, vertices)| *vertices));
+        if !self.vertex_data.is_empty() {
+            queue.write_buffer(&self.vertex_buffer, 0, bytemuck::cast_slice(&self.vertex_data));
         }
 
         let target = self.target.as_ref().expect("media target initialized");
@@ -377,7 +432,8 @@ impl VividMediaRenderer {
             });
             pass.set_pipeline(&self.pipeline);
             pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-            for (index, (item, _)) in rendered.iter().enumerate() {
+            for (index, (item_index, _)) in self.rendered.iter().enumerate() {
+                let item = &items[*item_index];
                 if let Some(track) = self.tracks.get(&item.track_key) {
                     pass.set_bind_group(0, &track.bind_group, &[]);
                     let start = (index * 6) as u32;
@@ -386,7 +442,10 @@ impl VividMediaRenderer {
             }
         }
         queue.submit([encoder.finish()]);
-        for (item, _) in &rendered {
+        self.source_upload_metrics.media_passes =
+            self.source_upload_metrics.media_passes.saturating_add(1);
+        for (item_index, _) in &self.rendered {
+            let item = &items[*item_index];
             match scene.mark_presented(
                 item.track_key,
                 item.channel_generation,
@@ -408,7 +467,12 @@ impl VividMediaRenderer {
             }
         }
         renderer.mark_override_image_dirty(&target.image);
-        Some(target.image.clone())
+        self.last_snapshot = Some(snapshot_key);
+        Some(PreparedMedia {
+            image: target.image.clone(),
+            image_generation: self.image_generation,
+            changed: true,
+        })
     }
 
     #[cfg(any(unix, windows))]
@@ -644,6 +708,7 @@ impl VividMediaRenderer {
         let mut image = renderer.register_texture(texture.clone());
         image.alpha_type = ImageAlphaType::AlphaPremultiplied;
         self.target = Some(MediaTarget { _texture: texture, view, image, width, height });
+        self.image_generation = self.image_generation.wrapping_add(1);
     }
 }
 
@@ -1193,7 +1258,13 @@ mod tests {
         device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
         assert_eq!(
             media.source_upload_metrics(),
-            super::SourceUploadMetrics { frames: 2, uploaded_pixels: 17, full_frame_pixels: 32 }
+            super::SourceUploadMetrics {
+                frames: 2,
+                uploaded_pixels: 17,
+                full_frame_pixels: 32,
+                media_passes: 0,
+                skipped_passes: 0,
+            }
         );
     }
 
