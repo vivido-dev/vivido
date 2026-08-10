@@ -34,7 +34,24 @@ pub struct Pty {
 }
 
 pub fn new(config: &Options, window_size: WindowSize, _window_id: u64) -> Result<Pty> {
-    conpty::new(config, window_size)
+    let config = with_shell_environment(config);
+    conpty::new(&config, window_size)
+}
+
+/// Advertise the program Vivido launched as the interactive shell.
+///
+/// Windows keeps `COMSPEC` pointed at `cmd.exe` even when a terminal launches PowerShell (or
+/// another shell). Programs such as vvmux therefore need the conventional `SHELL` value to carry
+/// the user's terminal choice across their own PTY boundary.
+fn with_shell_environment(config: &Options) -> Options {
+    let mut config = config.clone();
+    let shell = config
+        .shell
+        .as_ref()
+        .map_or_else(|| "powershell".to_owned(), |shell| shell.program.clone());
+    config.env.retain(|name, _| !name.eq_ignore_ascii_case("SHELL"));
+    config.env.insert("SHELL".into(), shell);
+    config
 }
 
 impl Pty {
@@ -181,7 +198,7 @@ pub fn win32_string<S: AsRef<OsStr> + ?Sized>(value: &S) -> Vec<u16> {
 
 #[cfg(test)]
 mod test {
-    use crate::terminal::tty::windows::{cmdline, push_escaped_arg};
+    use crate::terminal::tty::windows::{cmdline, push_escaped_arg, with_shell_environment};
     use crate::terminal::tty::{Options, Shell};
 
     #[test]
@@ -235,5 +252,31 @@ mod test {
 
         options.escape_args = true;
         assert_eq!(cmdline(&options), "echo \"hello world\"");
+    }
+
+    #[test]
+    fn shell_environment_tracks_the_program_vivido_launches() {
+        let mut options = Options {
+            shell: Some(Shell {
+                program: "pwsh.exe".to_string(),
+                args: vec!["-NoLogo".to_string()],
+            }),
+            working_directory: None,
+            drain_on_exit: false,
+            env: [("Shell".to_string(), "stale.exe".to_string())].into_iter().collect(),
+            escape_args: false,
+        };
+
+        options = with_shell_environment(&options);
+
+        assert_eq!(options.env.get("SHELL").map(String::as_str), Some("pwsh.exe"));
+        assert_eq!(options.env.keys().filter(|name| name.eq_ignore_ascii_case("SHELL")).count(), 1);
+        assert_eq!(options.shell.unwrap().args, ["-NoLogo"]);
+    }
+
+    #[test]
+    fn default_windows_shell_is_advertised_too() {
+        let options = with_shell_environment(&Options::default());
+        assert_eq!(options.env.get("SHELL").map(String::as_str), Some("powershell"));
     }
 }

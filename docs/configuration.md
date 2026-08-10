@@ -471,6 +471,9 @@ runtime and keeps media bytes off the PTY.
 
 What you interact with instead is the environment Vivido sets for programs it launches:
 
+- `SHELL` (Windows) — the shell program Vivido actually launched, including a `-e` override. This
+  lets nested terminal tools such as `vvmux` preserve the shell choice instead of falling back to
+  `%COMSPEC%` (`cmd.exe`).
 - `VIVID_ENDPOINT_CONTROL` — the private per-window control endpoint. Vivido exports this to its
   child shell automatically; 1.5 producers read it.
 - `VIVID_ROOT_SECRET` — the per-window root authentication secret. **Never** print, log, copy into shell history,
