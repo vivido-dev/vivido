@@ -1,10 +1,8 @@
 use log::LevelFilter;
 use serde::Serialize;
 
-use vivido_config_derive::ConfigDeserialize;
-
 /// Debugging options.
-#[derive(ConfigDeserialize, Serialize, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Serialize, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Debug {
     pub log_level: LevelFilter,
 
@@ -20,17 +18,14 @@ pub struct Debug {
     pub highlight_damage: bool,
 
     /// Removed renderer selection compatibility key.
-    #[config(alias = "renderer", removed = "Vivido now uses Vello/wgpu exclusively")]
     #[serde(skip_serializing)]
     renderer_removed: Option<String>,
 
     /// Removed EGL preference compatibility key.
-    #[config(alias = "prefer_egl", removed = "Vivido no longer creates EGL contexts")]
     #[serde(skip_serializing)]
     prefer_egl_removed: bool,
 
     /// Record ref test.
-    #[config(skip)]
     #[serde(skip_serializing)]
     pub ref_test: bool,
 }
@@ -49,3 +44,14 @@ impl Default for Debug {
         }
     }
 }
+
+impl_config_deserialize!(Debug {
+    log_level,
+    print_events,
+    persistent_logging,
+    render_timer,
+    highlight_damage,
+    renderer_removed: option_alias_removed("renderer", "Vivido now uses Vello/wgpu exclusively"),
+    prefer_egl_removed: alias_removed("prefer_egl", "Vivido no longer creates EGL contexts"),
+    ref_test: skip,
+});

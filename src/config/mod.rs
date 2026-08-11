@@ -383,6 +383,38 @@ mod tests {
     }
 
     #[test]
+    fn in_crate_config_impls_preserve_tolerant_deserialization() {
+        let config = toml::from_str::<UiConfig>(
+            r##"
+            [scrolling]
+            multiplier = "invalid"
+            history = 42
+
+            [window]
+            title = "Flattened title"
+            startup_mode = "FULLSCREEN"
+            position = "none"
+
+            [colors.cursor]
+            text = "#010203"
+            cursor = "CellForeground"
+            "##,
+        )
+        .unwrap();
+
+        assert_eq!(config.scrolling.multiplier, 3);
+        assert_eq!(config.scrolling.history(), 42);
+        assert_eq!(config.window.identity.title, "Flattened title");
+        assert_eq!(config.window.startup_mode, crate::config::window::StartupMode::Fullscreen);
+        assert!(config.window.position.is_none());
+        assert_eq!(
+            config.colors.cursor.foreground,
+            crate::display::color::CellRgb::Rgb(crate::display::color::Rgb::new(1, 2, 3))
+        );
+        assert_eq!(config.colors.cursor.background, crate::display::color::CellRgb::CellForeground);
+    }
+
+    #[test]
     fn explicit_config_has_precedence_without_discovery() {
         let discovery_called = Cell::new(false);
         let explicit = PathBuf::from("explicit.toml");

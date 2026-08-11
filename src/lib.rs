@@ -4,16 +4,14 @@
 #![deny(clippy::all, clippy::if_not_else, clippy::enum_glob_use)]
 #![cfg_attr(clippy, deny(warnings))]
 
-// The configuration derives generate paths through `vivido_config`. Expose this library crate
-// under that name so generated implementations use the local runtime trait.
-extern crate self as vivido_config;
-
 #[cfg(all(not(feature = "wayland"), not(any(target_os = "macos", windows))))]
 compile_error!(r#"the "wayland" feature must be enabled on Linux and other Unix desktops"#);
 
 mod automation;
 pub mod cli;
 mod clipboard;
+#[macro_use]
+mod config_derive;
 pub mod config;
 mod daemon;
 pub mod display;

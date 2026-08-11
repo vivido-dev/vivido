@@ -1,11 +1,9 @@
 use serde::de::Error as SerdeError;
 use serde::{Deserialize, Deserializer, Serialize};
 
-use vivido_config_derive::ConfigDeserialize;
-
 use crate::display::color::{CellRgb, Rgb};
 
-#[derive(ConfigDeserialize, Serialize, Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Serialize, Clone, Debug, Default, PartialEq, Eq)]
 pub struct Colors {
     pub primary: PrimaryColors,
     pub cursor: InvertedCellColors,
@@ -32,19 +30,19 @@ impl Colors {
     }
 }
 
-#[derive(ConfigDeserialize, Serialize, Copy, Clone, Default, Debug, PartialEq, Eq)]
+#[derive(Serialize, Copy, Clone, Default, Debug, PartialEq, Eq)]
 pub struct LineIndicatorColors {
     pub foreground: Option<Rgb>,
     pub background: Option<Rgb>,
 }
 
-#[derive(ConfigDeserialize, Serialize, Default, Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Default, Copy, Clone, Debug, PartialEq, Eq)]
 pub struct HintColors {
     pub start: HintStartColors,
     pub end: HintEndColors,
 }
 
-#[derive(ConfigDeserialize, Serialize, Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Copy, Clone, Debug, PartialEq, Eq)]
 pub struct HintStartColors {
     pub foreground: CellRgb,
     pub background: CellRgb,
@@ -59,7 +57,7 @@ impl Default for HintStartColors {
     }
 }
 
-#[derive(ConfigDeserialize, Serialize, Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Copy, Clone, Debug, PartialEq, Eq)]
 pub struct HintEndColors {
     pub foreground: CellRgb,
     pub background: CellRgb,
@@ -110,11 +108,9 @@ impl<'de> Deserialize<'de> for ColorIndex {
     }
 }
 
-#[derive(ConfigDeserialize, Serialize, Debug, Copy, Clone, PartialEq, Eq)]
+#[derive(Serialize, Debug, Copy, Clone, PartialEq, Eq)]
 pub struct InvertedCellColors {
-    #[config(alias = "text")]
     pub foreground: CellRgb,
-    #[config(alias = "cursor")]
     pub background: CellRgb,
 }
 
@@ -124,13 +120,13 @@ impl Default for InvertedCellColors {
     }
 }
 
-#[derive(ConfigDeserialize, Serialize, Debug, Copy, Clone, Default, PartialEq, Eq)]
+#[derive(Serialize, Debug, Copy, Clone, Default, PartialEq, Eq)]
 pub struct SearchColors {
     pub focused_match: FocusedMatchColors,
     pub matches: MatchColors,
 }
 
-#[derive(ConfigDeserialize, Serialize, Debug, Copy, Clone, PartialEq, Eq)]
+#[derive(Serialize, Debug, Copy, Clone, PartialEq, Eq)]
 pub struct FocusedMatchColors {
     pub foreground: CellRgb,
     pub background: CellRgb,
@@ -145,7 +141,7 @@ impl Default for FocusedMatchColors {
     }
 }
 
-#[derive(ConfigDeserialize, Serialize, Debug, Copy, Clone, PartialEq, Eq)]
+#[derive(Serialize, Debug, Copy, Clone, PartialEq, Eq)]
 pub struct MatchColors {
     pub foreground: CellRgb,
     pub background: CellRgb,
@@ -160,13 +156,13 @@ impl Default for MatchColors {
     }
 }
 
-#[derive(ConfigDeserialize, Serialize, Debug, Copy, Clone, Default, PartialEq, Eq)]
+#[derive(Serialize, Debug, Copy, Clone, Default, PartialEq, Eq)]
 pub struct BarColors {
     foreground: Option<Rgb>,
     background: Option<Rgb>,
 }
 
-#[derive(ConfigDeserialize, Serialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
 pub struct PrimaryColors {
     pub foreground: Rgb,
     pub background: Rgb,
@@ -185,7 +181,7 @@ impl Default for PrimaryColors {
     }
 }
 
-#[derive(ConfigDeserialize, Serialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
 pub struct NormalColors {
     pub black: Rgb,
     pub red: Rgb,
@@ -212,7 +208,7 @@ impl Default for NormalColors {
     }
 }
 
-#[derive(ConfigDeserialize, Serialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
 pub struct BrightColors {
     pub black: Rgb,
     pub red: Rgb,
@@ -242,7 +238,7 @@ impl Default for BrightColors {
     }
 }
 
-#[derive(ConfigDeserialize, Serialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
 pub struct DimColors {
     pub black: Rgb,
     pub red: Rgb,
@@ -269,3 +265,40 @@ impl Default for DimColors {
         }
     }
 }
+
+impl_config_deserialize!(Colors {
+    primary,
+    cursor,
+    selection,
+    normal,
+    bright,
+    dim: option,
+    indexed_colors,
+    search,
+    line_indicator,
+    hints,
+    transparent_background_colors,
+    draw_bold_text_with_bright_colors,
+    footer_bar,
+});
+impl_config_deserialize!(LineIndicatorColors { foreground: option, background: option });
+impl_config_deserialize!(HintColors { start, end });
+impl_config_deserialize!(HintStartColors { foreground, background });
+impl_config_deserialize!(HintEndColors { foreground, background });
+impl_config_deserialize!(InvertedCellColors {
+    foreground: alias("text"),
+    background: alias("cursor"),
+});
+impl_config_deserialize!(SearchColors { focused_match, matches });
+impl_config_deserialize!(FocusedMatchColors { foreground, background });
+impl_config_deserialize!(MatchColors { foreground, background });
+impl_config_deserialize!(BarColors { foreground: option, background: option });
+impl_config_deserialize!(PrimaryColors {
+    foreground,
+    background,
+    bright_foreground: option,
+    dim_foreground: option,
+});
+impl_config_deserialize!(NormalColors { black, red, green, yellow, blue, magenta, cyan, white });
+impl_config_deserialize!(BrightColors { black, red, green, yellow, blue, magenta, cyan, white });
+impl_config_deserialize!(DimColors { black, red, green, yellow, blue, magenta, cyan, white });

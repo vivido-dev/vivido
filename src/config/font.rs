@@ -3,8 +3,6 @@ use std::fmt;
 use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use vivido_config_derive::{ConfigDeserialize, SerdeReplace};
-
 use crate::config::ui_config::Delta;
 
 /// Font config.
@@ -13,7 +11,7 @@ use crate::config::ui_config::Delta;
 /// field in this struct. It might be nice in the future to have defaults for
 /// each value independently. Alternatively, maybe erroring when the user
 /// doesn't provide complete config is Ok.
-#[derive(ConfigDeserialize, Serialize, Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Serialize, Debug, Clone, Default, PartialEq, Eq)]
 pub struct Font {
     /// Extra spacing per character.
     pub offset: Delta<i8>,
@@ -21,7 +19,6 @@ pub struct Font {
     /// Glyph offset within character cell.
     pub glyph_offset: Delta<i8>,
 
-    #[config(removed = "set the AppleFontSmoothing user default instead")]
     pub use_thin_strokes: bool,
 
     /// Normal font face.
@@ -40,7 +37,6 @@ pub struct Font {
     size: Size,
 
     /// Removed built-in box drawing compatibility key.
-    #[config(alias = "builtin_box_drawing", removed = "use a font with box-drawing glyphs")]
     #[serde(skip_serializing)]
     builtin_box_drawing_removed: bool,
 }
@@ -78,7 +74,7 @@ impl Font {
 }
 
 /// Description of the normal font.
-#[derive(ConfigDeserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Debug, Clone, PartialEq, Eq)]
 pub struct FontDescription {
     pub family: String,
     pub style: Option<String>,
@@ -105,7 +101,7 @@ impl Default for FontDescription {
 }
 
 /// Description of the italic and bold font.
-#[derive(ConfigDeserialize, Serialize, Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Serialize, Debug, Default, Clone, PartialEq, Eq)]
 pub struct SecondaryFontDescription {
     family: Option<String>,
     style: Option<String>,
@@ -120,7 +116,7 @@ impl SecondaryFontDescription {
     }
 }
 
-#[derive(SerdeReplace, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct Size(FontSize);
 
 /// Font size stored in configuration points.
@@ -189,6 +185,24 @@ impl<'de> Deserialize<'de> for Size {
         deserializer.deserialize_any(NumVisitor)
     }
 }
+
+impl_config_deserialize!(Font {
+    offset,
+    glyph_offset,
+    use_thin_strokes: removed("set the AppleFontSmoothing user default instead"),
+    normal,
+    bold,
+    italic,
+    bold_italic,
+    size,
+    builtin_box_drawing_removed: alias_removed(
+        "builtin_box_drawing",
+        "use a font with box-drawing glyphs"
+    ),
+});
+impl_config_deserialize!(FontDescription { family, style: option });
+impl_config_deserialize!(SecondaryFontDescription { family: option, style: option });
+impl_serde_replace!(Size);
 
 impl Serialize for Size {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>

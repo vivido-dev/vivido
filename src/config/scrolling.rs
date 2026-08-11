@@ -1,13 +1,11 @@
 use serde::de::Error as SerdeError;
 use serde::{Deserialize, Deserializer, Serialize};
 
-use vivido_config_derive::{ConfigDeserialize, SerdeReplace};
-
 /// Maximum scrollback amount configurable.
 pub const MAX_SCROLLBACK_LINES: u32 = 100_000;
 
 /// Struct for scrolling related settings.
-#[derive(ConfigDeserialize, Serialize, Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Copy, Clone, Debug, PartialEq, Eq)]
 pub struct Scrolling {
     pub multiplier: u8,
 
@@ -26,7 +24,7 @@ impl Scrolling {
     }
 }
 
-#[derive(SerdeReplace, Serialize, Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Copy, Clone, Debug, PartialEq, Eq)]
 struct ScrollingHistory(u32);
 
 impl Default for ScrollingHistory {
@@ -51,3 +49,6 @@ impl<'de> Deserialize<'de> for ScrollingHistory {
         }
     }
 }
+
+impl_config_deserialize!(Scrolling { multiplier, history });
+impl_serde_replace!(ScrollingHistory);

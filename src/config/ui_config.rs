@@ -12,11 +12,10 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use unicode_width::UnicodeWidthChar;
 use winit::keyboard::{Key, ModifiersState};
 
+use crate::SerdeReplace;
 use crate::terminal::term::Config as TermConfig;
 use crate::terminal::term::search::RegexSearch;
 use crate::terminal::tty::{Options as PtyOptions, Shell};
-use vivido_config::SerdeReplace;
-use vivido_config_derive::{ConfigDeserialize, SerdeReplace};
 
 use crate::config::LOG_TARGET_CONFIG;
 use crate::config::bell::BellConfig;
@@ -40,7 +39,7 @@ use crate::config::window::WindowConfig;
 const URL_REGEX: &str = "(ipfs:|ipns:|magnet:|mailto:|gemini://|gopher://|https://|http://|news:|file:|git://|ssh:|ftp://)\
                          [^\u{0000}-\u{001F}\u{007F}-\u{009F}<>\"\\s{-}\\^⟨⟩`\\\\]+";
 
-#[derive(ConfigDeserialize, Serialize, Default, Clone, Debug, PartialEq)]
+#[derive(Serialize, Default, Clone, Debug, PartialEq)]
 pub struct UiConfig {
     /// Miscellaneous configuration options.
     pub general: General,
@@ -76,7 +75,6 @@ pub struct UiConfig {
     pub colors: Colors,
 
     /// Path where config was loaded from.
-    #[config(skip)]
     #[serde(skip_serializing)]
     pub config_paths: Vec<PathBuf>,
 
@@ -90,27 +88,22 @@ pub struct UiConfig {
     keyboard: Keyboard,
 
     /// Path to a shell program to run on startup.
-    #[config(deprecated = "use terminal.shell instead")]
     shell: Option<Program>,
 
     /// Configuration file imports.
     ///
     /// This is never read since the field is directly accessed through the config's
     /// [`toml::Value`], but still present to prevent unused field warnings.
-    #[config(deprecated = "use general.import instead")]
     import: Option<Vec<String>>,
 
     /// Shell startup directory.
-    #[config(deprecated = "use general.working_directory instead")]
     working_directory: Option<PathBuf>,
 
     /// Live config reload.
-    #[config(deprecated = "use general.live_config_reload instead")]
     live_config_reload: Option<bool>,
 
     /// Offer IPC through a unix socket.
     #[cfg(any(unix, windows))]
-    #[config(deprecated = "use general.ipc_socket instead")]
     pub ipc_socket: Option<bool>,
 }
 
@@ -168,14 +161,14 @@ impl UiConfig {
 }
 
 /// Keyboard configuration.
-#[derive(ConfigDeserialize, Serialize, Default, Clone, Debug, PartialEq)]
+#[derive(Serialize, Default, Clone, Debug, PartialEq)]
 struct Keyboard {
     /// Keybindings.
     #[serde(skip_serializing)]
     bindings: KeyBindings,
 }
 
-#[derive(SerdeReplace, Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct KeyBindings(Vec<KeyBinding>);
 
 impl Default for KeyBindings {
@@ -226,7 +219,7 @@ where
 }
 
 /// A delta for a point in a 2 dimensional plane.
-#[derive(ConfigDeserialize, Serialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Serialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Delta<T: Default> {
     /// Horizontal change.
     pub x: T,
@@ -235,7 +228,7 @@ pub struct Delta<T: Default> {
 }
 
 /// Regex terminal hints.
-#[derive(ConfigDeserialize, Serialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
 pub struct Hints {
     /// Characters for the hint labels.
     alphabet: HintsAlphabet,
@@ -290,7 +283,7 @@ impl Hints {
     }
 }
 
-#[derive(SerdeReplace, Serialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
 struct HintsAlphabet(String);
 
 impl Default for HintsAlphabet {
@@ -323,7 +316,7 @@ impl<'de> Deserialize<'de> for HintsAlphabet {
 }
 
 /// Built-in actions for hint mode.
-#[derive(ConfigDeserialize, Serialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
 pub enum HintInternalAction {
     /// Copy the text to the clipboard.
     Copy,
@@ -486,7 +479,7 @@ impl fmt::Debug for HintBinding {
 }
 
 /// Hint mouse highlighting.
-#[derive(ConfigDeserialize, Serialize, Default, Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Default, Copy, Clone, Debug, PartialEq, Eq)]
 pub struct HintMouse {
     /// Hint mouse highlighting availability.
     pub enabled: bool,
@@ -586,7 +579,7 @@ impl PartialEq for LazyRegexVariant {
 impl Eq for LazyRegexVariant {}
 
 /// Wrapper around f32 that represents a percentage value between 0.0 and 1.0.
-#[derive(SerdeReplace, Serialize, Clone, Copy, Debug, PartialEq)]
+#[derive(Serialize, Clone, Copy, Debug, PartialEq)]
 pub struct Percentage(f32);
 
 impl Default for Percentage {
@@ -657,6 +650,38 @@ impl SerdeReplace for Program {
         Ok(())
     }
 }
+
+impl_config_deserialize!(UiConfig {
+    general,
+    env,
+    scrolling,
+    cursor,
+    selection,
+    font,
+    window,
+    mouse,
+    debug,
+    bell,
+    colors,
+    config_paths: skip,
+    hints,
+    terminal,
+    keyboard,
+    shell: option_deprecated("use terminal.shell instead"),
+    import: option_deprecated("use general.import instead"),
+    working_directory: option_deprecated("use general.working_directory instead"),
+    live_config_reload: option_deprecated("use general.live_config_reload instead"),
+    #[cfg(any(unix, windows))]
+    ipc_socket: option_deprecated("use general.ipc_socket instead"),
+});
+impl_config_deserialize!(Keyboard { bindings });
+impl_serde_replace!(KeyBindings);
+impl_config_deserialize_generic!(Delta<T> { x, y });
+impl_config_deserialize!(Hints { alphabet, enabled });
+impl_serde_replace!(HintsAlphabet);
+impl_config_deserialize_enum!(HintInternalAction { Copy, Paste, Select });
+impl_config_deserialize!(HintMouse { enabled, mods });
+impl_serde_replace!(Percentage);
 
 pub(crate) struct StringVisitor;
 impl serde::de::Visitor<'_> for StringVisitor {

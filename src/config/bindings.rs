@@ -13,8 +13,6 @@ use winit::keyboard::{
 };
 use winit::platform::scancode::PhysicalKeyExtScancode;
 
-use vivido_config_derive::{ConfigDeserialize, SerdeReplace};
-
 use crate::config::ui_config::{Hint, Program};
 use crate::terminal::term::TermMode;
 
@@ -83,22 +81,18 @@ impl<T: Eq> Binding<T> {
     }
 }
 
-#[derive(ConfigDeserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     /// Write an escape sequence.
-    #[config(skip)]
     Esc(String),
 
     /// Run given command.
-    #[config(skip)]
     Command(Program),
 
     /// Regex keyboard hints.
-    #[config(skip)]
     Hint(Rc<Hint>),
 
     /// Perform search mode action.
-    #[config(skip)]
     Search(SearchAction),
 
     /// Paste contents of system clipboard.
@@ -255,7 +249,7 @@ impl Display for Action {
 
 /// Search mode specific actions.
 #[allow(clippy::enum_variant_names)]
-#[derive(ConfigDeserialize, Debug, Copy, Clone, PartialEq, Eq)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum SearchAction {
     /// Move the focus to the next search match.
     SearchFocusNext,
@@ -1021,7 +1015,7 @@ impl<'a> Deserialize<'a> for KeyBinding {
 ///
 /// Our deserialize impl wouldn't be covered by a derive(Deserialize); see the
 /// impl below.
-#[derive(SerdeReplace, Debug, Copy, Clone, Hash, Default, Eq, PartialEq)]
+#[derive(Debug, Copy, Clone, Hash, Default, Eq, PartialEq)]
 pub struct ModsWrapper(pub ModifiersState);
 
 impl ModsWrapper {
@@ -1067,6 +1061,64 @@ impl<'a> de::Deserialize<'a> for ModsWrapper {
         deserializer.deserialize_str(ModsVisitor)
     }
 }
+
+impl_config_deserialize_enum!(Action {
+    Paste,
+    Copy,
+    CopySelection,
+    PasteSelection,
+    IncreaseFontSize,
+    DecreaseFontSize,
+    ResetFontSize,
+    ScrollPageUp,
+    ScrollPageDown,
+    ScrollHalfPageUp,
+    ScrollHalfPageDown,
+    ScrollLineUp,
+    ScrollLineDown,
+    ScrollToTop,
+    ScrollToBottom,
+    ClearHistory,
+    Hide,
+    HideOtherApplications,
+    Minimize,
+    Quit,
+    ClearLogNotice,
+    SpawnNewInstance,
+    SelectNextTab,
+    SelectPreviousTab,
+    SelectTab1,
+    SelectTab2,
+    SelectTab3,
+    SelectTab4,
+    SelectTab5,
+    SelectTab6,
+    SelectTab7,
+    SelectTab8,
+    SelectTab9,
+    SelectLastTab,
+    CreateNewWindow,
+    CreateNewTab,
+    ToggleFullscreen,
+    ToggleMaximized,
+    ToggleSimpleFullscreen,
+    ClearSelection,
+    ReceiveChar,
+    SearchForward,
+    SearchBackward,
+    None,
+});
+impl_config_deserialize_enum!(SearchAction {
+    SearchFocusNext,
+    SearchFocusPrevious,
+    SearchConfirm,
+    SearchCancel,
+    SearchClear,
+    SearchDeleteWord,
+    SearchHistoryPrevious,
+    SearchHistoryNext,
+});
+impl_serde_replace!(ModsWrapper);
 
 #[cfg(test)]
 mod tests {

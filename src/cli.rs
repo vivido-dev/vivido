@@ -4,13 +4,13 @@ use std::ops::{Deref, DerefMut};
 use std::path::PathBuf;
 use std::rc::Rc;
 
+use crate::SerdeReplace;
 use clap::{ArgAction, Args, Parser, ValueHint};
 #[cfg(any(unix, windows))]
 use clap::{Subcommand, ValueEnum};
 use log::{LevelFilter, error};
 use serde::{Deserialize, Serialize};
 use toml::Value;
-use vivido_config::SerdeReplace;
 #[cfg(any(target_os = "macos", windows))]
 use winit::raw_window_handle::RawWindowHandle;
 

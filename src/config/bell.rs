@@ -2,12 +2,10 @@ use std::time::Duration;
 
 use serde::Serialize;
 
-use vivido_config_derive::ConfigDeserialize;
-
 use crate::config::ui_config::Program;
 use crate::display::color::Rgb;
 
-#[derive(ConfigDeserialize, Serialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
 pub struct BellConfig {
     /// Visual bell animation function.
     pub animation: BellAnimation,
@@ -41,7 +39,7 @@ impl BellConfig {
 
 /// `VisualBellAnimations` are modeled after a subset of CSS transitions and Robert
 /// Penner's Easing Functions.
-#[derive(ConfigDeserialize, Serialize, Default, Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Serialize, Default, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BellAnimation {
     // CSS animation.
     Ease,
@@ -65,3 +63,17 @@ pub enum BellAnimation {
     #[default]
     Linear,
 }
+
+impl_config_deserialize!(BellConfig { animation, command: option, color, duration });
+impl_config_deserialize_enum!(BellAnimation {
+    Ease,
+    EaseOut,
+    EaseOutSine,
+    EaseOutQuad,
+    EaseOutCubic,
+    EaseOutQuart,
+    EaseOutQuint,
+    EaseOutExpo,
+    EaseOutCirc,
+    Linear,
+});
