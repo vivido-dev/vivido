@@ -428,7 +428,7 @@ _vivido() {
 
     case "${cmd}" in
         vivido)
-            opts="-s -q -v -w -e -T -o -h -V --print-events --ref-test --config-file --socket --headless --session --foreground --headless-size --daemon --accessory --vivid-target --window-id --no-activate --working-directory --hold --command --title --class --option --help --version msg list kill-session help"
+            opts="-s -q -v -w -e -T -o -h -V --print-events --ref-test --config-file --socket --headless --session --foreground --headless-size --daemon --vivid-target --window-id --no-activate --working-directory --hold --command --title --class --option --help --version msg list kill-session help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 1 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0

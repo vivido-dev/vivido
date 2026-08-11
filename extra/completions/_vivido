@@ -39,7 +39,6 @@ desktop\:"\`desktop-surface-v1\`\: a virtual desktop in logical pixels, with no 
 '(-v)*-q[Reduces the level of verbosity (the min level is -qq)]' \
 '(-q)*-v[Increases the level of verbosity (the max level is -vvv)]' \
 '--daemon[Do not spawn an initial window]' \
-'--accessory[Run without a Dock icon or menu bar, and never activate over the frontmost application]' \
 '--no-activate[Map the window without taking keyboard focus from the active application]' \
 '--hold[Remain open after child process exit]' \
 '-h[Print help (see more with '\''--help'\'')]' \
