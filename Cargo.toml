@@ -54,7 +54,7 @@ toml_edit = "0.25"
 unicode-width = "0.2.0"
 unicode-script = "0.5"
 vivid_protocol = { version = "1.5", path = "../vivid_protocol" }
-vivido_config_derive = { path = "config_derive" }
+vivido_config_derive = { version = "0.4.0", path = "config_derive" }
 vte = { version = "0.15.0", default-features = false, features = [
   "std",
   "ansi",
