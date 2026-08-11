@@ -4,6 +4,8 @@ version = "0.4.0"
 authors = ["Wensheng Wang <wenshengwang@gmail.com>"]
 license = "Apache-2.0 OR MIT"
 description = "Configuration derives for Vivido"
+homepage = "https://vivido.dev"
+repository = "https://github.com/vivido-dev/vivido"
 edition = "2024"
 rust-version = "1.88.0"
 

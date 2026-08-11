@@ -1,6 +1,6 @@
 # Print an optspec for argparse to handle cmd's options that are independent of any subcommand.
 function __fish_vivido_global_optspecs
-	string join \n print-events ref-test config-file= s/socket= headless session= foreground headless-size= q v daemon accessory vivid-target= w/window-id= no-activate working-directory= hold e/command= T/title= class= o/option= h/help V/version
+	string join \n print-events ref-test config-file= s/socket= headless session= foreground headless-size= q v daemon vivid-target= w/window-id= no-activate working-directory= hold e/command= T/title= class= o/option= h/help V/version
 end
 
 function __fish_vivido_needs_command
@@ -43,7 +43,6 @@ complete -c vivido -n "__fish_vivido_needs_command" -l foreground -d 'Keep a hea
 complete -c vivido -n "__fish_vivido_needs_command" -s q -d 'Reduces the level of verbosity (the min level is -qq)'
 complete -c vivido -n "__fish_vivido_needs_command" -s v -d 'Increases the level of verbosity (the max level is -vvv)'
 complete -c vivido -n "__fish_vivido_needs_command" -l daemon -d 'Do not spawn an initial window'
-complete -c vivido -n "__fish_vivido_needs_command" -l accessory -d 'Run without a Dock icon or menu bar, and never activate over the frontmost application'
 complete -c vivido -n "__fish_vivido_needs_command" -l no-activate -d 'Map the window without taking keyboard focus from the active application'
 complete -c vivido -n "__fish_vivido_needs_command" -l hold -d 'Remain open after child process exit'
 complete -c vivido -n "__fish_vivido_needs_command" -s h -l help -d 'Print help (see more with \'--help\')'
