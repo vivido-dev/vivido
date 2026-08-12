@@ -1637,6 +1637,62 @@ impl WindowContext {
     }
 
     #[cfg(any(unix, windows))]
+    pub fn automation_vivid_trace(
+        &self,
+        after_sequence: Option<u64>,
+        limit: u16,
+        filter: crate::vivid::trace::TraceFilter,
+    ) -> Value {
+        serde_json::to_value(self.vivid_service.automation_trace(after_sequence, limit, filter))
+            .unwrap_or_else(|_| json_value!({"schema_version": 1, "events": []}))
+    }
+
+    #[cfg(any(unix, windows))]
+    pub fn automation_diagnose(&self, event_sequence: u64, trace_limit: u16) -> Value {
+        let sessions = self.automation_vivid_sessions();
+        let surfaces = self.automation_vivid_surfaces();
+        let tracks = self.automation_vivid_tracks();
+        let scenes = self
+            .vivid_service
+            .automation_sessions()
+            .into_iter()
+            .filter_map(|identity| {
+                self.automation_vivid_scene(
+                    identity.session_id,
+                    crate::vivid::MAX_SCENE_NODES as u64,
+                )
+                .ok()
+            })
+            .collect::<Vec<_>>();
+        json_value!({
+            "schema_version": 1,
+            "capture": {
+                "event_sequence": event_sequence,
+                "screen_sequence": self.automation.screen_sequence,
+                "frame_sequence": self.automation.frame_sequence,
+            },
+            "window": self.automation_inspect(event_sequence),
+            "renderer": {
+                "frame_sequence": self.automation.frame_sequence,
+                "has_presented_frame": self.automation.frame_sequence != 0,
+                "headless": self.display.window.is_headless(),
+            },
+            "presenter": {
+                "sessions": sessions.get("sessions").cloned().unwrap_or_else(|| json_value!([])),
+                "surfaces": surfaces.get("surfaces").cloned().unwrap_or_else(|| json_value!([])),
+                "tracks": tracks.get("tracks").cloned().unwrap_or_else(|| json_value!([])),
+                "scenes": scenes,
+                "streaming": self.vivid_service.automation_streaming_metrics(),
+                "trace": self.automation_vivid_trace(
+                    None,
+                    trace_limit,
+                    crate::vivid::trace::TraceFilter::default(),
+                ),
+            },
+        })
+    }
+
+    #[cfg(any(unix, windows))]
     #[allow(clippy::too_many_arguments)]
     pub fn automation_vivid_wait(
         &self,

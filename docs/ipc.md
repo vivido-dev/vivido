@@ -15,6 +15,17 @@ vivido msg wait text 'ready>' --window-id 42
 vivido msg key Enter --window-id 42
 ```
 
+The canonical agent loop is discover → inspect → capture a sequence → act with an explicit wait →
+follow trace → diagnose or bundle:
+
+```sh
+vivido list --all --json
+vivido doctor --target vivido-1234 --json
+vivido msg --target vivido-1234 diagnose --trace-limit 128
+vivido msg --target vivido-1234 vivid trace --after 40 --follow --recovery-only
+vivido debug-bundle --target vivido-1234 --output vivido-debug.zip
+```
+
 ## Endpoint discovery and targeting
 
 The endpoint is an owner-only Unix socket with mode `0600` on Unix, and a named pipe with an
@@ -22,12 +33,15 @@ owner-and-SYSTEM-only DACL on Windows. Both ends verify the peer's process owner
 endpoint's mode or ACL, and the Windows pipe rejects remote clients. `--socket PATH` therefore takes
 a filesystem path on Unix and a pipe path on Windows. Vivido limits the server to 32 active
 connections. The service is offered when `general.ipc_socket` is enabled, which is the default;
-`--socket` and `--headless` enable it regardless of configuration.
+`--socket` and `--headless` enable it regardless of configuration. Every headed process also
+enables and registers this endpoint: `--automation-name NAME` chooses its name, otherwise it is
+`vivido-PID`. `vivido list` retains its legacy headless-only text output; `vivido list --all
+--json` discovers both headed and headless instances on every platform.
 
 `vivido msg` resolves its endpoint in this order:
 
 1. `--socket PATH`;
-2. `--target NAME`, else inherited `VIVIDO_SESSION` — an explicitly named headless session never
+2. `--target NAME`, else inherited `VIVIDO_SESSION` — an explicitly named registered instance never
    silently falls through to a different instance, so a name that is not running is an error;
 3. inherited `VIVIDO_SOCKET`, if it still connects;
 4. the only live headless session, when there is exactly one;
@@ -56,14 +70,15 @@ Every connection must begin with `hello`:
 {"version":2,"id":1,"method":"hello","params":{}}
 ```
 
-The response advertises the server version, protocol version, whether this instance is headless and
-which session it serves, methods, event kinds, stable error codes, and effective limits:
+The response advertises the server version, protocol version, whether this instance is headless,
+its optional session and `automation_name`, methods, event kinds, stable error codes, and limits:
 
 ```json
 {"version":2,"id":1,"ok":true,"result":{"server_version":"0.0.0","protocol_version":2,"headless":true,"session":"build","methods":[],"event_kinds":[],"limits":{}}}
 ```
 
-`headless` is `false` and `session` is `null` for a windowed instance. Both are fixed at startup.
+`headless` is `false` and `session` is `null` for a windowed instance. `automation_name` addresses
+either form uniformly. All are fixed at startup.
 
 A legacy raw enum frame, malformed first frame, non-`hello` first request, or unsupported version
 gets a structured error and the connection closes. There is no compatibility mode for the former
@@ -111,7 +126,7 @@ physical modifiers pressed.
 ### Basic and existing commands
 
 - `hello {}`: required handshake. `vivido msg capabilities` prints its `result` as JSON.
-- `ping {}`: wire-only liveness request; returns `{"pong":true}`.
+- `ping {}` / `vivido msg ping`: liveness request; returns `{"pong":true}`.
 - `quit {}`: shuts the whole instance down, closing every window. For a headless session this is
   the graceful stop, and it lets the daemon remove its own endpoint and registry; `vivido
   kill-session` is the forceful alternative.
@@ -128,6 +143,9 @@ physical modifiers pressed.
 - `typing {"text":"...","window_id":ID}`: writes literal UTF-8 bytes without paste handling or an
   appended Enter. Text is limited to 1 MiB. Success is sent only after every byte is written to the
   PTY master, with a five-second write timeout.
+  `typing`, `key`, and `paste` accept CLI `--report`, which prints the resolved window, encoded byte
+  count, input sequence, and successful PTY-write completion. It explicitly reports that
+  application consumption was not observed.
 - `get_text {"rows":N,"window_id":ID}`: returns `{"text":"..."}`. With no `rows`, text is the
   visible viewport at its current scroll position. `rows` accepts 1 through 1000 and reads newest
   physical rows at the live bottom, including scrollback. The CLI writes text exactly, without an
@@ -198,6 +216,13 @@ physical modifiers pressed.
   status, global event sequence, and effective automation limits. It never returns process
   arguments, environment values, Vivid root/resume secrets, channel authenticators, or derived
   capabilities.
+- `diagnose` captures window, renderer, presenter, track, flow, connection-health, and bounded
+  recent-trace metadata in one event-loop turn. It does not wait for rendering or transport;
+  asynchronous metrics carry an age.
+- `vivido doctor --target NAME --json` combines registry identity, IPC responsiveness, renderer
+  progress, and presenter health. `vivido debug-bundle` creates an owner-only, atomic versioned ZIP.
+  Its default is metadata only; screenshot, grid, transcript, and bounded log content each require
+  their corresponding explicit `--include-*` flag.
 
 ### Structured grid
 
@@ -271,6 +296,12 @@ IPC v2 exposes the presenter without projecting 1.5 objects back into the remove
   scene revision and target generation.
 - `wait_vivid_track` requires the complete track identity, current `channel_generation`, condition,
   optional value, and millisecond `timeout`.
+
+The CLI names those conditions `revision-after`, `milestones`, `presentation-after`, `pts-after`,
+`clock-started`, `buffered-ended`, `channel-accepted`, `channel-detached`, and `track-lost`.
+`vivid trace` reads or follows the bounded metadata journal (4,096 events or 2 MiB), with complete
+owner filters, monotonic sequences, eviction gaps, recovery filtering, process/start anchors, and
+no credentials, media bytes, or frame hashes.
 
 There are no IPC v1 aliases for `vivid_sources`, `vivid_source_status`, `vivid_milestones`, or
 `wait_vivid_source`. The wire service never returns root secrets, channel keys, authenticators, or

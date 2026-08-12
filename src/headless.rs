@@ -124,7 +124,7 @@ fn serve(
 
     let mut nonce = [0u8; 32];
     getrandom::fill(&mut nonce).map_err(io::Error::other)?;
-    let registry = paths.write_registry(&session, &nonce, (columns, lines))?;
+    let registry = paths.write_registry(&session, &nonce, (columns, lines), true)?;
     let _registry_guard = RegistryGuard::new(paths.clone(), registry);
 
     // The socket is bound, the window exists, and the registry is published: a client that

@@ -42,7 +42,7 @@ pub enum ProcessBirth {
     Windows { creation_time: u64 },
 }
 
-/// Published rendezvous for a running headless daemon.
+/// Published same-user rendezvous for a running headed or headless instance.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SessionRegistry {
@@ -55,13 +55,24 @@ pub struct SessionRegistry {
     pub endpoint_id: String,
     pub process_birth: ProcessBirth,
     pub socket: PathBuf,
+    #[serde(default = "default_headless_registry")]
+    pub headless: bool,
     pub columns: u16,
     pub lines: u16,
+}
+
+fn default_headless_registry() -> bool {
+    true
 }
 
 impl SessionPaths {
     pub fn for_session(name: &str) -> io::Result<Self> {
         Self::for_session_in_root(name, &runtime_root()?)
+    }
+
+    /// Build registry paths for a process whose IPC endpoint was explicitly selected.
+    pub fn for_endpoint(name: &str, socket: PathBuf) -> io::Result<Self> {
+        Self::for_endpoint_in_root(name, &runtime_root()?, socket)
     }
 
     fn for_session_in_root(name: &str, root: &Path) -> io::Result<Self> {
@@ -76,6 +87,17 @@ impl SessionPaths {
         let socket = root.join(format!("session-{hash}.sock"));
         #[cfg(windows)]
         let socket = PathBuf::from(format!(r"\\.\pipe\vivido-session-{hash}"));
+        Self::for_endpoint_in_root(name, root, socket)
+    }
+
+    fn for_endpoint_in_root(name: &str, root: &Path, socket: PathBuf) -> io::Result<Self> {
+        validate_session_name(name)?;
+        #[cfg(unix)]
+        let uid = effective_uid();
+        #[cfg(windows)]
+        let uid = 0;
+        ensure_private_directory(root, uid)?;
+        let hash = hex(&Sha256::digest(name.as_bytes())[..16]);
         let registry = root.join(format!("session-{hash}.json"));
         let endpoint_id =
             hex(&domain_hash(b"vivido endpoint identity v1\0", &endpoint_identity_bytes(&socket)));
@@ -88,6 +110,7 @@ impl SessionPaths {
         name: &str,
         nonce: &[u8; 32],
         dimensions: (u16, u16),
+        headless: bool,
     ) -> io::Result<SessionRegistry> {
         let registry = SessionRegistry {
             schema: REGISTRY_SCHEMA,
@@ -99,6 +122,7 @@ impl SessionPaths {
             endpoint_id: self.endpoint_id.clone(),
             process_birth: process_birth(std::process::id())?,
             socket: self.socket.clone(),
+            headless,
             columns: dimensions.0,
             lines: dimensions.1,
         };
@@ -267,7 +291,9 @@ fn list_registries_in_root(root: &Path) -> io::Result<Vec<SessionRegistry>> {
         let Ok(registry) = read_registry_file(&entry.path()) else {
             continue;
         };
-        let Ok(paths) = SessionPaths::for_session_in_root(&registry.name, root) else {
+        let Ok(paths) =
+            SessionPaths::for_endpoint_in_root(&registry.name, root, registry.socket.clone())
+        else {
             continue;
         };
         if paths.registry != entry.path() || paths.validate_identity(&registry).is_err() {
@@ -283,8 +309,31 @@ fn list_registries_in_root(root: &Path) -> io::Result<Vec<SessionRegistry>> {
     Ok(sessions)
 }
 
+/// Resolve one registered headed or headless instance by exact name.
+pub fn registered_instance(name: &str) -> io::Result<SessionRegistry> {
+    validate_session_name(name)?;
+    let root = runtime_root()?;
+    let derived = SessionPaths::for_session_in_root(name, &root)?;
+    let registry = read_registry_file(&derived.registry)?;
+    let paths = SessionPaths::for_endpoint_in_root(name, &root, registry.socket.clone())?;
+    if paths.registry != derived.registry || paths.validate_identity(&registry).is_err() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Vivido registry endpoint identity is invalid",
+        ));
+    }
+    if !registry_process_matches(&registry) {
+        let _ = paths.remove_instance(&registry);
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("Vivido instance {name:?} is no longer running"),
+        ));
+    }
+    Ok(registry)
+}
+
 pub fn print_sessions() -> io::Result<()> {
-    for session in list_registries()? {
+    for session in list_registries()?.into_iter().filter(|session| session.headless) {
         println!(
             "{}\tpid {}\t{}x{}\t{}",
             session.name,
@@ -299,8 +348,7 @@ pub fn print_sessions() -> io::Result<()> {
 
 /// Ask a session's daemon to shut down, refusing to signal a recycled PID.
 pub fn terminate_session(name: &str) -> io::Result<()> {
-    let paths = SessionPaths::for_session(name)?;
-    let registry = paths.read_registry().map_err(|error| {
+    let registry = registered_instance(name).map_err(|error| {
         if error.kind() == io::ErrorKind::NotFound {
             io::Error::new(
                 io::ErrorKind::NotFound,
@@ -310,13 +358,13 @@ pub fn terminate_session(name: &str) -> io::Result<()> {
             error
         }
     })?;
-    if !registry_process_matches(&registry) {
-        let _ = paths.remove_instance(&registry);
+    if !registry.headless {
         return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("vivido session {name:?} is no longer running"),
+            io::ErrorKind::InvalidInput,
+            format!("Vivido instance {name:?} is headed; use `vivido msg --target {name} quit`"),
         ));
     }
+    let paths = SessionPaths::for_endpoint(name, registry.socket.clone())?;
 
     signal_session(&paths, &registry)
 }
@@ -759,6 +807,7 @@ mod tests {
             endpoint_id: paths.endpoint_id.clone(),
             process_birth: process_birth(std::process::id()).unwrap(),
             socket: paths.socket.clone(),
+            headless: true,
             columns: 80,
             lines: 24,
         }
@@ -799,7 +848,7 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         let paths = SessionPaths::for_session_in_root("live", &root).unwrap();
 
-        let written = paths.write_registry("live", &[3; 32], (100, 40)).unwrap();
+        let written = paths.write_registry("live", &[3; 32], (100, 40), true).unwrap();
         assert_eq!(paths.read_registry().unwrap(), written);
         assert!(registry_process_matches(&written), "our own process must match its birth time");
         assert_eq!(list_registries_in_root(&root).unwrap(), vec![written.clone()]);
@@ -816,7 +865,7 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         let paths = SessionPaths::for_session_in_root("scoped", &root).unwrap();
 
-        let live = paths.write_registry("scoped", &[1; 32], (80, 24)).unwrap();
+        let live = paths.write_registry("scoped", &[1; 32], (80, 24), true).unwrap();
         #[cfg(unix)]
         fs::write(&paths.socket, b"").unwrap();
 

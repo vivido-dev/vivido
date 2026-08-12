@@ -76,11 +76,13 @@ pub mod binary {
         pub use crate::polling::IoListener;
 
         pub mod ipc {
-            pub use crate::polling::ipc::send_message;
+            pub use crate::polling::ipc::{request_once, send_message};
         }
     }
 
     pub mod session {
-        pub use crate::session::{print_sessions, terminate_session};
+        pub use crate::session::{
+            RegistryGuard, SessionPaths, list_registries, print_sessions, terminate_session,
+        };
     }
 }

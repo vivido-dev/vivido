@@ -61,6 +61,11 @@ pub struct Options {
     #[clap(long, value_name = "NAME", requires = "headless")]
     pub session: Option<String>,
 
+    /// Stable same-user automation name for a headed instance [default: vivido-<pid>].
+    #[cfg(any(unix, windows))]
+    #[clap(long, value_name = "NAME", conflicts_with_all = ["session", "headless"])]
+    pub automation_name: Option<String>,
+
     /// Keep a headless instance attached to this terminal instead of detaching.
     #[cfg(any(unix, windows))]
     #[clap(long, requires = "headless")]
@@ -324,7 +329,13 @@ pub enum Subcommands {
     Msg(MessageOptions),
 
     /// List running headless sessions.
-    List,
+    List(ListOptions),
+
+    /// Check discovery, IPC, rendering, and presenter health.
+    Doctor(DoctorOptions),
+
+    /// Write a bounded, versioned diagnostic ZIP bundle.
+    DebugBundle(DebugBundleOptions),
 
     /// Shut down a headless session.
     KillSession {
@@ -332,6 +343,61 @@ pub enum Subcommands {
         #[clap(short = 't', long = "target", value_name = "NAME")]
         target: String,
     },
+}
+
+/// Options for listing discoverable Vivido instances.
+#[cfg(any(unix, windows))]
+#[derive(Args, Debug, Default)]
+pub struct ListOptions {
+    /// Include headed instances in addition to headless sessions.
+    #[clap(long)]
+    pub all: bool,
+
+    /// Emit one bounded JSON document instead of the legacy text format.
+    #[clap(long)]
+    pub json: bool,
+}
+
+/// Options for the non-mutating health check.
+#[cfg(any(unix, windows))]
+#[derive(Args, Debug)]
+pub struct DoctorOptions {
+    /// Exact registered automation/session name.
+    #[clap(short = 't', long = "target", value_name = "NAME")]
+    pub target: String,
+
+    /// Emit structured JSON. Reserved for a future human renderer when omitted.
+    #[clap(long, default_value_t = true)]
+    pub json: bool,
+}
+
+/// Options for creating a local diagnostic bundle.
+#[cfg(any(unix, windows))]
+#[derive(Args, Debug)]
+pub struct DebugBundleOptions {
+    /// Exact registered automation/session name.
+    #[clap(short = 't', long = "target", value_name = "NAME")]
+    pub target: String,
+
+    /// Destination ZIP path. The file is created atomically and never written to stdout.
+    #[clap(long, value_hint = ValueHint::FilePath)]
+    pub output: PathBuf,
+
+    /// Include a rendered screenshot; potentially sensitive.
+    #[clap(long)]
+    pub include_screenshot: bool,
+
+    /// Include the structured terminal grid; potentially sensitive.
+    #[clap(long)]
+    pub include_grid: bool,
+
+    /// Include the retained terminal transcript; potentially sensitive.
+    #[clap(long)]
+    pub include_transcript: bool,
+
+    /// Include a bounded tail of Vivido's own log; potentially sensitive.
+    #[clap(long)]
+    pub include_log: bool,
 }
 
 /// Insert internal re-exec flags before `-e`, whose variadic values must remain last.
@@ -393,6 +459,9 @@ pub enum SocketMessage {
     /// Shut down the Vivido instance, closing every window.
     Quit,
 
+    /// Check IPC liveness.
+    Ping,
+
     /// Update the Vivido configuration.
     Config(IpcConfig),
 
@@ -443,6 +512,15 @@ pub enum SocketMessage {
 
     /// Inspect one terminal window.
     Inspect(IpcTarget),
+
+    /// Capture one correlated, metadata-only diagnostic snapshot.
+    Diagnose(IpcDiagnose),
+
+    /// Inspect or trace the Vivid presenter.
+    Vivid {
+        #[clap(subcommand)]
+        command: IpcVividCommand,
+    },
 
     /// Read a structured terminal grid snapshot or delta.
     GetGrid(IpcGetGrid),
@@ -600,6 +678,11 @@ pub struct IpcTyping {
     /// The focused window is used when no ID is specified.
     #[clap(short, long, env = "VIVIDO_WINDOW_ID")]
     pub window_id: Option<u64>,
+
+    /// Print the tagged PTY-write completion as JSON.
+    #[clap(long)]
+    #[serde(default, skip_serializing)]
+    pub report: bool,
 }
 
 #[cfg(any(unix, windows))]
@@ -650,6 +733,116 @@ pub struct IpcTarget {
     pub window_id: Option<u64>,
 }
 
+/// Parameters for a correlated diagnostic snapshot.
+#[cfg(any(unix, windows))]
+#[derive(Args, Serialize, Deserialize, Default, Debug, Clone, PartialEq, Eq)]
+pub struct IpcDiagnose {
+    /// Window ID. The focused window is used when this is omitted.
+    #[clap(short, long, env = "VIVIDO_WINDOW_ID")]
+    pub window_id: Option<u64>,
+
+    /// Maximum recent Vivid trace events to include.
+    #[clap(long, default_value_t = 128, value_parser = clap::value_parser!(u16).range(1..=512))]
+    pub trace_limit: u16,
+}
+
+/// Complete Vivid track identity used by inspection and waits.
+#[cfg(any(unix, windows))]
+#[derive(Args, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct IpcVividTrackIdentity {
+    #[clap(long)]
+    pub session_id: u64,
+    #[clap(long)]
+    pub context_id: u64,
+    #[clap(long)]
+    pub surface_id: u64,
+    #[clap(long)]
+    pub track_id: u64,
+}
+
+/// Complete Vivid surface identity.
+#[cfg(any(unix, windows))]
+#[derive(Args, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct IpcVividSurfaceIdentity {
+    #[clap(long)]
+    pub session_id: u64,
+    #[clap(long)]
+    pub context_id: u64,
+    #[clap(long)]
+    pub surface_id: u64,
+}
+
+/// Vivid presenter automation commands.
+#[cfg(any(unix, windows))]
+#[derive(Subcommand, Debug, Clone, PartialEq)]
+pub enum IpcVividCommand {
+    Sessions(IpcTarget),
+    Surfaces(IpcTarget),
+    SurfaceStatus {
+        #[clap(flatten)]
+        identity: IpcVividSurfaceIdentity,
+        #[clap(flatten)]
+        target: IpcTarget,
+    },
+    Tracks(IpcTarget),
+    TrackStatus {
+        #[clap(flatten)]
+        identity: IpcVividTrackIdentity,
+        #[clap(flatten)]
+        target: IpcTarget,
+    },
+    SceneStatus {
+        #[clap(long)]
+        session_id: u64,
+        #[clap(flatten)]
+        target: IpcTarget,
+    },
+    Trace(IpcVividTrace),
+}
+
+/// Vivid trace categories exposed to automation.
+#[cfg(any(unix, windows))]
+#[derive(ValueEnum, Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum IpcVividTraceCategory {
+    Connection,
+    Lifecycle,
+    Flow,
+    Playback,
+    Recovery,
+    Decode,
+    Render,
+}
+
+/// Parameters for a bounded Vivid trace query or follow loop.
+#[cfg(any(unix, windows))]
+#[derive(Args, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct IpcVividTrace {
+    #[clap(flatten)]
+    #[serde(flatten)]
+    pub target: IpcTarget,
+    #[clap(long)]
+    pub after: Option<u64>,
+    #[clap(long, default_value_t = 128, value_parser = clap::value_parser!(u16).range(1..=512))]
+    pub limit: u16,
+    #[clap(long, default_value = "30s", value_parser = parse_ipc_duration)]
+    pub timeout: u64,
+    #[clap(long)]
+    pub follow: bool,
+    #[clap(long)]
+    pub session_id: Option<u64>,
+    #[clap(long, requires = "session_id")]
+    pub context_id: Option<u64>,
+    #[clap(long, requires = "context_id")]
+    pub surface_id: Option<u64>,
+    #[clap(long, requires = "surface_id")]
+    pub track_id: Option<u64>,
+    #[clap(long, value_enum)]
+    pub category: Option<IpcVividTraceCategory>,
+    #[clap(long)]
+    pub recovery_only: bool,
+}
+
 /// Route for injected input.
 #[cfg(any(unix, windows))]
 #[derive(ValueEnum, Serialize, Deserialize, Default, Debug, Copy, Clone, PartialEq, Eq)]
@@ -684,6 +877,11 @@ pub struct IpcKey {
 
     #[clap(flatten)]
     pub target: IpcTarget,
+
+    /// Print the tagged PTY-write completion as JSON.
+    #[clap(long)]
+    #[serde(default, skip_serializing)]
+    pub report: bool,
 }
 
 /// Parameters to the `paste` IPC subcommand.
@@ -700,6 +898,11 @@ pub struct IpcPaste {
 
     #[clap(flatten)]
     pub target: IpcTarget,
+
+    /// Print the tagged PTY-write completion as JSON.
+    #[clap(long)]
+    #[serde(default, skip_serializing)]
+    pub report: bool,
 }
 
 #[cfg(any(unix, windows))]
@@ -1076,7 +1279,72 @@ pub enum IpcWaitCondition {
     ScreenChange(IpcWaitSequence),
     ScreenStable(IpcWaitStable),
     Frame(IpcWaitFrame),
+    VividTrack(IpcWaitVividTrack),
     Exit(IpcWaitCommon),
+}
+
+/// Named Vivid track conditions. The IPC v2 wire retains its registered numeric values.
+#[cfg(any(unix, windows))]
+#[derive(ValueEnum, Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum IpcVividWaitCondition {
+    RevisionAfter,
+    Milestones,
+    PresentationAfter,
+    PtsAfter,
+    ClockStarted,
+    BufferedEnded,
+    ChannelAccepted,
+    ChannelDetached,
+    TrackLost,
+}
+
+#[cfg(any(unix, windows))]
+impl IpcVividWaitCondition {
+    pub fn wire_value(self) -> u64 {
+        match self {
+            Self::RevisionAfter => 1,
+            Self::Milestones => 2,
+            Self::PresentationAfter => 3,
+            Self::PtsAfter => 4,
+            Self::ClockStarted => 5,
+            Self::BufferedEnded => 6,
+            Self::ChannelAccepted => 7,
+            Self::ChannelDetached => 8,
+            Self::TrackLost => 9,
+        }
+    }
+
+    pub fn requires_value(self) -> bool {
+        matches!(
+            self,
+            Self::RevisionAfter | Self::Milestones | Self::PresentationAfter | Self::PtsAfter
+        )
+    }
+}
+
+/// Parameters for a generation-scoped Vivid track wait.
+#[cfg(any(unix, windows))]
+#[derive(Args, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct IpcWaitVividTrack {
+    #[clap(value_enum)]
+    pub condition: IpcVividWaitCondition,
+
+    #[clap(flatten)]
+    pub identity: IpcVividTrackIdentity,
+
+    #[clap(long)]
+    pub channel_generation: u64,
+
+    /// Threshold or milestone mask for value-bearing conditions.
+    #[clap(long)]
+    pub value: Option<u64>,
+
+    #[clap(long, default_value = "30s", value_parser = parse_ipc_duration)]
+    pub timeout: u64,
+
+    #[clap(flatten)]
+    pub target: IpcTarget,
 }
 
 /// Parameters to the `wait` IPC subcommand.
@@ -1361,6 +1629,7 @@ mod tests {
             SocketMessage::Typing(IpcTyping {
                 text: String::from("echo hello"),
                 window_id: Some(42),
+                report: false,
             })
         );
     }
@@ -1386,7 +1655,7 @@ mod tests {
     #[cfg(any(unix, windows))]
     #[test]
     fn typing_debug_redacts_input() {
-        let typing = IpcTyping { text: String::from("secret"), window_id: Some(42) };
+        let typing = IpcTyping { text: String::from("secret"), window_id: Some(42), report: false };
         let debug = format!("{typing:?}");
 
         assert!(!debug.contains("secret"));

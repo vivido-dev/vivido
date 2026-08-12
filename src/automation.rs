@@ -248,6 +248,11 @@ pub enum WaitKind {
         condition: u64,
         value: Option<u64>,
     },
+    VividTrace {
+        after_sequence: u64,
+        limit: u16,
+        filter: crate::vivid::trace::TraceFilter,
+    },
     Exit,
     Resize {
         columns: Option<u16>,

@@ -213,6 +213,13 @@ fn a_headless_session_serves_text_and_screenshots_without_a_compositor() {
     let capabilities = session.msg(&["capabilities"]);
     assert!(capabilities.contains(r#""headless":true"#), "capabilities: {capabilities}");
     assert!(capabilities.contains(r#""session":"basic""#), "capabilities: {capabilities}");
+    assert!(capabilities.contains(r#""automation_name":"basic""#));
+    assert!(session.msg(&["ping"]).contains(r#""pong""#));
+
+    let vivid_sessions = session.msg(&["vivid", "sessions"]);
+    assert!(vivid_sessions.contains("sessions"), "Vivid sessions: {vivid_sessions}");
+    let diagnose = session.msg(&["diagnose", "--trace-limit", "16"]);
+    assert!(diagnose.contains(r#""schema_version":1"#), "diagnose: {diagnose}");
 
     // The window is never focused, so this also proves target resolution does not need focus.
     let windows = session.msg(&["list-windows"]);
@@ -231,6 +238,21 @@ fn a_headless_session_serves_text_and_screenshots_without_a_compositor() {
     assert!(colors > 1, "screenshot is a single flat colour, so nothing was rendered");
     assert!(lit > 0, "screenshot has no non-background pixels, so no text was drawn");
     let _ = fs::remove_file(&path);
+
+    let mut list = base_command(&session.runtime);
+    list.args(["list", "--all", "--json"]);
+    let listed = list.output().unwrap();
+    assert!(listed.status.success());
+    assert!(String::from_utf8_lossy(&listed.stdout).contains(r#""name":"basic""#));
+
+    let bundle = session.runtime.join("basic.zip");
+    let mut command = base_command(&session.runtime);
+    command.args(["debug-bundle", "--target", "basic", "--output", bundle.to_str().unwrap()]);
+    let bundled = command.output().unwrap();
+    assert!(bundled.status.success(), "{}", String::from_utf8_lossy(&bundled.stderr));
+    let archive = fs::read(bundle).unwrap();
+    assert!(archive.windows(b"manifest.json".len()).any(|part| part == b"manifest.json"));
+    assert!(!archive.windows(b"content/".len()).any(|part| part == b"content/"));
 }
 
 /// Input reaches the PTY and its output comes back, with no window and no focus.
@@ -240,9 +262,11 @@ fn typing_drives_the_shell_in_a_headless_session() {
     let session = Session::start("typing", &shell_program());
 
     #[cfg(unix)]
-    session.msg(&["typing", "echo RESULT-$((6*7))\n"]);
+    let report = session.msg(&["typing", "echo RESULT-$((6*7))\n", "--report"]);
     #[cfg(windows)]
-    session.msg(&["typing", "Write-Output (\"RESULT-\" + (6*7))\r"]);
+    let report = session.msg(&["typing", "Write-Output (\"RESULT-\" + (6*7))\r", "--report"]);
+    assert!(report.contains(r#""pty_write_completed":true"#), "report: {report}");
+    assert!(report.contains(r#""application_consumption_observed":false"#), "report: {report}");
     session.msg(&["wait", "text", "RESULT-42"]);
 
     let text = session.msg(&["get-text"]);

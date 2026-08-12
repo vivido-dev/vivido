@@ -10,6 +10,7 @@ mod lane;
 mod lease;
 pub mod scene;
 pub mod target;
+pub(crate) mod trace;
 mod transport;
 
 use std::collections::{HashMap, HashSet};
@@ -270,6 +271,7 @@ struct ServiceShared {
     wake_pending: AtomicBool,
     frame_wake_events: AtomicU64,
     actor_timeout_services: AtomicU64,
+    trace: Mutex<trace::TraceJournal>,
 }
 
 enum ActorMessage {
@@ -287,7 +289,13 @@ struct ConnectionSlot {
 
 impl Drop for ConnectionSlot {
     fn drop(&mut self) {
-        self.shared.active_connections.fetch_sub(1, Ordering::AcqRel);
+        let previous = self.shared.active_connections.fetch_sub(1, Ordering::AcqRel);
+        self.shared.trace(
+            trace::TraceCategory::Connection,
+            "connection_closed",
+            None,
+            serde_json::json!({"active_connections": previous.saturating_sub(1)}),
+        );
     }
 }
 
@@ -502,6 +510,7 @@ impl VividService {
             wake_pending: AtomicBool::new(false),
             frame_wake_events: AtomicU64::new(0),
             actor_timeout_services: AtomicU64::new(0),
+            trace: Mutex::new(trace::TraceJournal::default()),
         });
         let shutdown = Arc::new(AtomicBool::new(false));
         let listener_thread = thread::Builder::new().name("vivid-1.5-listener".into()).spawn({
@@ -813,6 +822,16 @@ impl VividService {
         self.scene.evaluate_track_wait(identity, generation, condition, value)
     }
 
+    #[cfg(any(unix, windows))]
+    pub(crate) fn automation_trace(
+        &self,
+        after_sequence: Option<u64>,
+        limit: u16,
+        filter: trace::TraceFilter,
+    ) -> trace::TraceBatch {
+        lock(&self.shared.trace).query(after_sequence, limit, filter)
+    }
+
     fn notify_anchor_events(&self, record_type: u16, anchors: &[AnchorIdentity]) {
         if anchors.is_empty() {
             return;
@@ -868,6 +887,17 @@ impl SessionRuntime {
 }
 
 impl ServiceShared {
+    fn trace(
+        &self,
+        category: trace::TraceCategory,
+        event: &'static str,
+        track: Option<TrackIdentity>,
+        data: serde_json::Value,
+    ) {
+        lock(&self.trace).push(category, event, track, data);
+        self.request_frame_wake();
+    }
+
     fn request_frame_wake(&self) {
         if self
             .wake_pending
@@ -929,6 +959,14 @@ fn listener_loop(listener: LocalListener, shared: Arc<ServiceShared>, shutdown: 
             shared.active_connections.fetch_sub(1, Ordering::AcqRel);
             continue;
         }
+        shared.trace(
+            trace::TraceCategory::Connection,
+            "connection_accepted",
+            None,
+            serde_json::json!({
+                "active_connections": shared.active_connections.load(Ordering::Acquire),
+            }),
+        );
         let slot = ConnectionSlot { shared: shared.clone() };
         let connection = shared.clone();
         let served = thread::Builder::new().name("vivid-1.5-connection".into()).spawn(move || {
@@ -2741,6 +2779,21 @@ fn dispatch_control(
                 },
                 _ => unreachable!(),
             }
+            shared.trace(
+                trace::TraceCategory::Playback,
+                match record.record_type {
+                    messages::PLAY => "play_applied",
+                    messages::PAUSE => "pause_applied",
+                    messages::FLUSH => "flush_applied",
+                    messages::DRAIN => "drain_applied",
+                    _ => unreachable!(),
+                },
+                Some(identity),
+                serde_json::json!({
+                    "channel_generation": status.state.channel_generation.get(),
+                    "track_revision": status.state.revision.get(),
+                }),
+            );
             (messages::OK, record.object_id, Ok(messages::ok(request_id)))
         },
         messages::SET_OBSERVATION => {
@@ -2888,9 +2941,28 @@ fn handle_track_channel(
         open.track_id,
         &Envelope::new(request_id, acceptance).encode()?,
     )?;
+    shared.trace(
+        trace::TraceCategory::Lifecycle,
+        "track_channel_accepted",
+        Some(identity),
+        serde_json::json!({
+            "channel_generation": generation.get(),
+            "maximum_body_bytes": maximum_bytes,
+            "maximum_media_records": maximum_records,
+        }),
+    );
     reader.set_maximum(status.configuration.maximum_record_body)?;
     let result = channel_loop(reader, &writer, shared, identity, generation);
     attachment.detach();
+    shared.trace(
+        trace::TraceCategory::Lifecycle,
+        "track_channel_detached",
+        Some(identity),
+        serde_json::json!({
+            "channel_generation": generation.get(),
+            "clean": result.is_ok(),
+        }),
+    );
     if let Err(error) = &result {
         let status = shared.scene.lose_track(identity, generation).ok().flatten();
         let Some(status) = status else {
@@ -2899,6 +2971,12 @@ fn handle_track_channel(
             return result;
         };
         stop_failed_audio_output(&shared.audio_outputs, identity);
+        shared.trace(
+            trace::TraceCategory::Lifecycle,
+            "track_lost",
+            Some(identity),
+            serde_json::json!({"channel_generation": generation.get()}),
+        );
         shared.request_frame_wake();
         let diagnostic = error.to_string().chars().take(4_096).collect::<String>();
         let error_code = if diagnostic.contains("rate exceeded") {
@@ -3007,6 +3085,7 @@ fn classify_audio_step(expected_pts_us: Option<i64>, pts_us: i64, live: bool) ->
 /// Ask the producer for a random-access unit on this channel, media §13.
 fn request_keyframe(
     writer: &Writer,
+    shared: &ServiceShared,
     identity: TrackIdentity,
     generation: ChannelGeneration,
     reason: u64,
@@ -3020,7 +3099,28 @@ fn request_keyframe(
         (5, Value::Unsigned(reason)),
     ];
     if let Ok(body) = Envelope::new(0, payload).encode() {
-        let _ = writer.write_record(messages::NEED_KEYFRAME, identity.track_id, &body);
+        shared.trace(
+            trace::TraceCategory::Recovery,
+            "need_keyframe_queued",
+            Some(identity),
+            serde_json::json!({
+                "channel_generation": generation.get(),
+                "minimum_epoch": 0,
+                "reason": reason,
+            }),
+        );
+        if writer.write_record(messages::NEED_KEYFRAME, identity.track_id, &body).is_ok() {
+            shared.trace(
+                trace::TraceCategory::Recovery,
+                "need_keyframe_written",
+                Some(identity),
+                serde_json::json!({
+                    "channel_generation": generation.get(),
+                    "minimum_epoch": 0,
+                    "reason": reason,
+                }),
+            );
+        }
     }
 }
 
@@ -3086,11 +3186,13 @@ fn channel_loop(
     let mut last_latency_keyframe: Option<Instant> = None;
     let mut delay_review_started = Instant::now();
     let mut delay_window_headroom_us: Option<i64> = None;
+    let mut last_flow_trace = Instant::now();
     // Every record here is parsed and finished with before the next one is read, so the channel
     // reads into one buffer for the life of the connection instead of allocating per record — on
     // the path that carries every video packet, every raster frame and every audio packet.
     let mut body = Vec::new();
     loop {
+        let mut recovery_unit = false;
         let header = match reader.read_record_into(ConnectionKind::Track, &mut body) {
             Ok(header) => header,
             Err(error) if error.kind() == ErrorKind::UnexpectedEof => return Ok(()),
@@ -3258,6 +3360,25 @@ fn channel_loop(
             messages::VIDEO_PACKET => {
                 let packet = media::parse_video_packet(&body)?;
                 let random_access = packet.flags & media::VIDEO_PACKET_KEY != 0;
+                recovery_unit = random_access;
+                let packet_epoch = packet.epoch;
+                let packet_id = packet.packet_id;
+                let packet_pts_us = packet.pts_us;
+                if random_access {
+                    shared.trace(
+                        trace::TraceCategory::Recovery,
+                        "keyframe_ingress",
+                        Some(identity),
+                        serde_json::json!({
+                            "channel_generation": generation.get(),
+                            "record_sequence": header.sequence,
+                            "media_epoch": packet_epoch,
+                            "media_id": packet_id,
+                            "pts_us": packet_pts_us,
+                            "body_bytes": body.len(),
+                        }),
+                    );
+                }
                 // A decoder may release multiple reordered frames for one encoded record. Treat
                 // every output from the first output-bearing record as part of the same priming
                 // unit: the producer cannot observe OUTPUT_READY or issue PLAY until its record
@@ -3330,7 +3451,13 @@ fn channel_loop(
                     && last_latency_keyframe
                         .is_none_or(|at| at.elapsed() >= LATENCY_KEYFRAME_INTERVAL);
                 if requested_keyframe {
-                    request_keyframe(writer, identity, generation, NEED_KEYFRAME_DECODER_RESET);
+                    request_keyframe(
+                        writer,
+                        shared,
+                        identity,
+                        generation,
+                        NEED_KEYFRAME_DECODER_RESET,
+                    );
                     latency_recovery_epoch = Some(packet.epoch);
                     last_latency_keyframe = Some(Instant::now());
                 } else if random_access
@@ -3352,11 +3479,32 @@ fn channel_loop(
                     Err(error) => {
                         // Media §13 reason 2: the decoder reset, so a key unit in a greater epoch
                         // recovers the channel rather than losing the track.
-                        request_keyframe(writer, identity, generation, NEED_KEYFRAME_DECODER_RESET);
+                        request_keyframe(
+                            writer,
+                            shared,
+                            identity,
+                            generation,
+                            NEED_KEYFRAME_DECODER_RESET,
+                        );
                         log::debug!("video decode failed, asked for a key unit: {error}");
                         continue;
                     },
                 };
+                if random_access {
+                    shared.trace(
+                        trace::TraceCategory::Decode,
+                        "keyframe_decoded",
+                        Some(identity),
+                        serde_json::json!({
+                            "channel_generation": generation.get(),
+                            "media_epoch": packet_epoch,
+                            "media_id": packet_id,
+                            "pts_us": packet_pts_us,
+                            "decoded_frames": frames.len(),
+                            "discarded_frames": discarded,
+                        }),
+                    );
+                }
                 if discarded != 0 || requested_keyframe {
                     shared
                         .scene
@@ -3576,6 +3724,21 @@ fn channel_loop(
                 )
                 .encode()?,
             )?;
+            if recovery_unit || last_flow_trace.elapsed() >= Duration::from_millis(250) {
+                shared.trace(
+                    trace::TraceCategory::Flow,
+                    "flow_grant_written",
+                    Some(identity),
+                    serde_json::json!({
+                        "channel_generation": generation.get(),
+                        "record_sequence": header.sequence,
+                        "maximum_body_bytes": maximum_bytes,
+                        "maximum_media_records": maximum_records,
+                        "recovery_unit": recovery_unit,
+                    }),
+                );
+                last_flow_trace = Instant::now();
+            }
         }
     }
 }

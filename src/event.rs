@@ -1082,6 +1082,33 @@ impl Processor {
                     self.windows[&target].automation_inspect(self.automation.event_sequence())
                 })
             },
+            "diagnose" => {
+                #[derive(serde::Deserialize)]
+                struct Params {
+                    window_id: Option<u64>,
+                    #[serde(default = "default_vivid_trace_limit")]
+                    trace_limit: u16,
+                }
+                let params: Params = match decode_ipc_params(&request) {
+                    Ok(params) => params,
+                    Err(error) => {
+                        request.connection.error(request.id, error);
+                        return;
+                    },
+                };
+                if params.trace_limit == 0
+                    || params.trace_limit > crate::vivid::trace::MAX_QUERY_EVENTS
+                {
+                    Err(IpcError::new("invalid_params", "trace_limit must be 1 through 512"))
+                } else {
+                    self.resolve_ipc_target(params.window_id).map(|target| {
+                        self.windows[&target].automation_diagnose(
+                            self.automation.event_sequence(),
+                            params.trace_limit,
+                        )
+                    })
+                }
+            },
             "vivid_sessions" => {
                 let params: IpcTarget = match decode_ipc_params(&request) {
                     Ok(params) => params,
@@ -1182,6 +1209,82 @@ impl Processor {
                     self.windows[&target]
                         .automation_vivid_scene(params.session_id, params.maximum_nodes)
                 })
+            },
+            "vivid_trace" => {
+                #[derive(serde::Deserialize)]
+                struct Params {
+                    window_id: Option<u64>,
+                    after: Option<u64>,
+                    #[serde(default = "default_vivid_trace_limit")]
+                    limit: u16,
+                    #[serde(default)]
+                    timeout: u64,
+                    #[serde(default)]
+                    follow: bool,
+                    session_id: Option<u64>,
+                    context_id: Option<u64>,
+                    surface_id: Option<u64>,
+                    track_id: Option<u64>,
+                    category: Option<crate::vivid::trace::TraceCategory>,
+                    #[serde(default)]
+                    recovery_only: bool,
+                }
+                let params: Params = match decode_ipc_params(&request) {
+                    Ok(params) => params,
+                    Err(error) => {
+                        request.connection.error(request.id, error);
+                        return;
+                    },
+                };
+                let identity_valid = params.context_id.is_none() || params.session_id.is_some();
+                let identity_valid = identity_valid
+                    && (params.surface_id.is_none() || params.context_id.is_some())
+                    && (params.track_id.is_none() || params.surface_id.is_some());
+                if params.limit == 0
+                    || params.limit > crate::vivid::trace::MAX_QUERY_EVENTS
+                    || !identity_valid
+                    || (params.follow && !(1..=24 * 60 * 60 * 1000).contains(&params.timeout))
+                {
+                    Err(IpcError::new(
+                        "invalid_params",
+                        "invalid Vivid trace limit, timeout, or identity filter",
+                    ))
+                } else {
+                    let target = match self.resolve_ipc_target(params.window_id) {
+                        Ok(target) => target,
+                        Err(error) => {
+                            request.connection.error(request.id, error);
+                            return;
+                        },
+                    };
+                    let filter = crate::vivid::trace::TraceFilter {
+                        session_id: params.session_id,
+                        context_id: params.context_id,
+                        surface_id: params.surface_id,
+                        track_id: params.track_id,
+                        category: params.category,
+                        recovery_only: params.recovery_only,
+                    };
+                    let batch = self.windows[&target].automation_vivid_trace(
+                        params.after,
+                        params.limit,
+                        filter,
+                    );
+                    let has_events =
+                        batch["events"].as_array().is_some_and(|events| !events.is_empty());
+                    if !params.follow || has_events || batch.get("gap").is_some() {
+                        Ok(batch)
+                    } else {
+                        let after_sequence = batch["current_sequence"].as_u64().unwrap_or(0);
+                        self.register_wait_for_target(
+                            target,
+                            params.timeout,
+                            WaitKind::VividTrace { after_sequence, limit: params.limit, filter },
+                            &request,
+                        );
+                        return;
+                    }
+                }
             },
             "get_grid" => {
                 let params: IpcGetGrid = match decode_ipc_params(&request) {
@@ -1930,6 +2033,14 @@ impl Processor {
                         )))
                     },
                 },
+                WaitKind::VividTrace { after_sequence, limit, filter } => {
+                    let batch =
+                        window.automation_vivid_trace(Some(*after_sequence), *limit, *filter);
+                    batch["events"]
+                        .as_array()
+                        .is_some_and(|events| !events.is_empty())
+                        .then_some(Ok(batch))
+                },
                 WaitKind::Exit => exit_status.map(|status| {
                     Ok(serde_json::json!({
                         "exited": true,
@@ -1992,6 +2103,11 @@ fn decode_ipc_params<T: DeserializeOwned>(request: &IpcRequest) -> Result<T, Ipc
 #[cfg(any(unix, windows))]
 fn default_vivid_scene_nodes() -> u64 {
     64
+}
+
+#[cfg(any(unix, windows))]
+fn default_vivid_trace_limit() -> u16 {
+    128
 }
 
 #[cfg(any(unix, windows))]
@@ -2458,7 +2574,13 @@ impl Processor {
                     let pending = window.automation.pending_writes.swap_remove(index);
                     pending.connection.reply(
                         pending.request_id,
-                        serde_json::json!({"written_bytes": pending.bytes}),
+                        serde_json::json!({
+                            "window_id": window.ipc_window_id(),
+                            "input_sequence": pending.token,
+                            "written_bytes": pending.bytes,
+                            "pty_write_completed": true,
+                            "application_consumption_observed": false,
+                        }),
                     );
                 }
                 self.schedule_automation_timer(*window_id);

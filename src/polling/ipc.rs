@@ -19,7 +19,10 @@ use log::{error, warn};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::cli::{IpcMouseAction, IpcWaitCondition, MessageOptions, Options, SocketMessage};
+use crate::cli::{
+    IpcMouseAction, IpcVividCommand, IpcWait, IpcWaitCondition, MessageOptions, Options,
+    SocketMessage,
+};
 use crate::event::{Event, EventSink, EventType};
 use crate::polling::transport::{LocalListener, LocalStream};
 use crate::terminal::thread;
@@ -67,6 +70,7 @@ static INSTANCE: std::sync::OnceLock<Instance> = std::sync::OnceLock::new();
 struct Instance {
     headless: bool,
     session: Option<String>,
+    automation_name: Option<String>,
 }
 
 /// Number of serialized frames buffered for one connection.
@@ -98,12 +102,14 @@ pub const METHODS: &[&str] = &[
     "signal",
     "list_windows",
     "inspect",
+    "diagnose",
     "vivid_sessions",
     "vivid_surfaces",
     "vivid_surface_status",
     "vivid_tracks",
     "vivid_track_status",
     "vivid_scene_status",
+    "vivid_trace",
     "get_grid",
     "wait_text",
     "wait_output",
@@ -395,8 +401,11 @@ impl IpcListener {
     pub fn new(options: &Options, event_proxy: EventSink, path: &Path) -> Result<Self, IoError> {
         let socket = bind_socket(path)?;
         unsafe { env::set_var(VIVIDO_SOCKET_ENV, path.as_os_str()) };
-        let _ =
-            INSTANCE.set(Instance { headless: options.headless, session: options.session.clone() });
+        let _ = INSTANCE.set(Instance {
+            headless: options.headless,
+            session: options.session.clone(),
+            automation_name: options.automation_name.clone().or_else(|| options.session.clone()),
+        });
         if options.daemon {
             println!("VIVIDO_SOCKET={}; export VIVIDO_SOCKET", path.display());
         }
@@ -638,6 +647,7 @@ fn hello_result() -> Value {
         // inferring it from a failed `focus`.
         "headless": instance.is_some_and(|instance| instance.headless),
         "session": instance.and_then(|instance| instance.session.clone()),
+        "automation_name": instance.and_then(|instance| instance.automation_name.clone()),
         "methods": METHODS,
         "event_kinds": EVENT_KINDS,
         "error_codes": [
@@ -689,6 +699,12 @@ pub fn send_message(options: MessageOptions) -> io::Result<()> {
         return write_json(&hello);
     }
 
+    if let SocketMessage::Vivid { command: IpcVividCommand::Trace(params) } = &options.message
+        && params.follow
+    {
+        return run_vivid_trace_follow(&mut stream, &mut reader, params.clone());
+    }
+
     let (method, params) = message_request(&options.message)?;
     send_client_request(&mut stream, 2, method, params)?;
     let result = read_client_response(&mut reader, 2)?;
@@ -709,6 +725,53 @@ pub fn send_message(options: MessageOptions) -> io::Result<()> {
     }
 
     Ok(())
+}
+
+/// Issue one bounded automation request without rendering CLI output.
+pub fn request_once(
+    socket: Option<PathBuf>,
+    target: Option<&str>,
+    message: &SocketMessage,
+) -> io::Result<(Value, Value)> {
+    validate_message(message)?;
+    let mut stream = find_socket(socket, target)?;
+    stream.set_nonblocking(false)?;
+    let mut reader = BufReader::new(stream.try_clone()?);
+    send_client_request(&mut stream, 1, "hello", json!({}))?;
+    let hello = read_client_response(&mut reader, 1)?;
+    if matches!(message, SocketMessage::Capabilities) {
+        return Ok((hello.clone(), hello));
+    }
+    let (method, params) = message_request(message)?;
+    send_client_request(&mut stream, 2, method, params)?;
+    let result = read_client_response(&mut reader, 2)?;
+    Ok((hello, result))
+}
+
+fn run_vivid_trace_follow(
+    stream: &mut LocalStream,
+    reader: &mut BufReader<LocalStream>,
+    mut params: crate::cli::IpcVividTrace,
+) -> io::Result<()> {
+    let mut request_id = 2_u64;
+    let mut stdout = io::stdout().lock();
+    loop {
+        send_client_request(stream, request_id, "vivid_trace", serialize_params(&params)?)?;
+        let batch = read_client_response(reader, request_id)?;
+        if let Some(gap) = batch.get("gap") {
+            write_json_to(&mut stdout, &json!({"type": "gap", "gap": gap}))?;
+        }
+        if let Some(events) = batch.get("events").and_then(Value::as_array) {
+            for event in events {
+                write_json_to(&mut stdout, event)?;
+            }
+        }
+        stdout.flush()?;
+        params.after = batch.get("current_sequence").and_then(Value::as_u64);
+        request_id = request_id
+            .checked_add(1)
+            .ok_or_else(|| IoError::other("Vivid trace request ID exhausted"))?;
+    }
 }
 
 fn send_client_request(
@@ -772,6 +835,7 @@ fn message_request(message: &SocketMessage) -> io::Result<(&'static str, Value)>
     match message {
         SocketMessage::CreateWindow(params) => Ok(("create_window", serialize_params(params)?)),
         SocketMessage::Quit => Ok(("quit", Value::Object(Default::default()))),
+        SocketMessage::Ping => Ok(("ping", json!({}))),
         SocketMessage::Config(params) => Ok(("config", serialize_params(params)?)),
         SocketMessage::GetConfig(params) => Ok(("get_config", serialize_params(params)?)),
         SocketMessage::Typing(params) => Ok(("typing", serialize_params(params)?)),
@@ -789,6 +853,36 @@ fn message_request(message: &SocketMessage) -> io::Result<(&'static str, Value)>
         SocketMessage::Signal(params) => Ok(("signal", serialize_params(params)?)),
         SocketMessage::ListWindows => Ok(("list_windows", json!({}))),
         SocketMessage::Inspect(params) => Ok(("inspect", serialize_params(params)?)),
+        SocketMessage::Diagnose(params) => Ok(("diagnose", serialize_params(params)?)),
+        SocketMessage::Vivid { command } => match command {
+            IpcVividCommand::Sessions(target) => Ok(("vivid_sessions", serialize_params(target)?)),
+            IpcVividCommand::Surfaces(target) => Ok(("vivid_surfaces", serialize_params(target)?)),
+            IpcVividCommand::SurfaceStatus { identity, target } => Ok((
+                "vivid_surface_status",
+                json!({
+                    "window_id": target.window_id,
+                    "session_id": identity.session_id,
+                    "context_id": identity.context_id,
+                    "surface_id": identity.surface_id,
+                }),
+            )),
+            IpcVividCommand::Tracks(target) => Ok(("vivid_tracks", serialize_params(target)?)),
+            IpcVividCommand::TrackStatus { identity, target } => Ok((
+                "vivid_track_status",
+                json!({
+                    "window_id": target.window_id,
+                    "session_id": identity.session_id,
+                    "context_id": identity.context_id,
+                    "surface_id": identity.surface_id,
+                    "track_id": identity.track_id,
+                }),
+            )),
+            IpcVividCommand::SceneStatus { session_id, target } => Ok((
+                "vivid_scene_status",
+                json!({"window_id": target.window_id, "session_id": session_id}),
+            )),
+            IpcVividCommand::Trace(params) => Ok(("vivid_trace", serialize_params(params)?)),
+        },
         SocketMessage::GetGrid(params) => Ok(("get_grid", serialize_params(params)?)),
         SocketMessage::Transcript(params) => Ok(("transcript", serialize_params(params)?)),
         SocketMessage::Subscribe(params) => Ok(("subscribe", serialize_params(params)?)),
@@ -802,6 +896,20 @@ fn message_request(message: &SocketMessage) -> io::Result<(&'static str, Value)>
                 Ok(("wait_screen_stable", serialize_params(params)?))
             },
             IpcWaitCondition::Frame(params) => Ok(("wait_frame", serialize_params(params)?)),
+            IpcWaitCondition::VividTrack(params) => Ok((
+                "wait_vivid_track",
+                json!({
+                    "window_id": params.target.window_id,
+                    "session_id": params.identity.session_id,
+                    "context_id": params.identity.context_id,
+                    "surface_id": params.identity.surface_id,
+                    "track_id": params.identity.track_id,
+                    "channel_generation": params.channel_generation,
+                    "condition": params.condition.wire_value(),
+                    "value": params.value,
+                    "timeout": params.timeout,
+                }),
+            )),
             IpcWaitCondition::Exit(params) => Ok(("wait_exit", serialize_params(params)?)),
         },
     }
@@ -874,6 +982,19 @@ fn validate_message(message: &SocketMessage) -> io::Result<()> {
             ));
         }
     }
+    if let SocketMessage::Wait(IpcWait { condition: IpcWaitCondition::VividTrack(params) }) =
+        message
+        && params.condition.requires_value() != params.value.is_some()
+    {
+        return Err(IoError::new(
+            ErrorKind::InvalidInput,
+            if params.condition.requires_value() {
+                "this Vivid track wait condition requires --value"
+            } else {
+                "this Vivid track wait condition does not accept --value"
+            },
+        ));
+    }
     Ok(())
 }
 
@@ -911,12 +1032,18 @@ fn write_cli_result(message: &SocketMessage, result: &Value) -> io::Result<()> {
             stdout.write_all(&bytes)
         },
         SocketMessage::Capabilities
+        | SocketMessage::Ping
         | SocketMessage::ListWindows
         | SocketMessage::Inspect(_)
+        | SocketMessage::Diagnose(_)
+        | SocketMessage::Vivid { .. }
         | SocketMessage::GetGrid(_)
         | SocketMessage::Wait(_)
         | SocketMessage::Transcript(_)
         | SocketMessage::Subscribe(_) => write_json_to(&mut stdout, result),
+        SocketMessage::Typing(params) if params.report => write_json_to(&mut stdout, result),
+        SocketMessage::Key(params) if params.report => write_json_to(&mut stdout, result),
+        SocketMessage::Paste(params) if params.report => write_json_to(&mut stdout, result),
         SocketMessage::Config(_)
         | SocketMessage::Typing(_)
         | SocketMessage::Key(_)
@@ -1043,9 +1170,9 @@ fn find_socket(socket_path: Option<PathBuf>, target: Option<&str>) -> io::Result
 
     // An explicitly named session must never silently fall through to a different instance.
     if let Some(target) = target.map(str::to_owned).or_else(|| env::var(VIVIDO_SESSION_ENV).ok()) {
-        let paths = crate::session::SessionPaths::for_session(&target)?;
-        return connect_checked(&paths.socket).map_err(|err| {
-            IoError::new(err.kind(), format!("no running Vivido session named {target:?}"))
+        let registry = crate::session::registered_instance(&target)?;
+        return connect_checked(&registry.socket).map_err(|err| {
+            IoError::new(err.kind(), format!("no running Vivido instance named {target:?}"))
         });
     }
 
