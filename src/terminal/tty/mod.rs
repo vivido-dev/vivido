@@ -102,7 +102,8 @@ pub trait EventedPty: EventedReadWrite {
 
 const TERMINFO_NAME: &str = "vivido";
 // Regenerate from `extra/vivido.info` with `term_dir=$(mktemp -d)`, `tic -x -e vivido -o
-// "$term_dir" extra/vivido.info`, and `base64 "$term_dir/v/vivido"`.
+// "$term_dir" extra/vivido.info`, and `base64` on the generated `vivido` entry. Depending on the
+// host ncurses build, `tic` may put the entry below `v/` or hexadecimal `76/`.
 const BUNDLED_TERMINFO: &str = include_str!("../../../extra/vivido.terminfo.b64");
 
 /// Keeps Vivido's private terminfo tree alive until all PTY children have exited.
@@ -145,16 +146,18 @@ pub fn setup_env() -> TerminfoGuard {
     TerminfoGuard { _directory: directory }
 }
 
-/// Materialize the bundled compiled entry in the standard terminfo directory layout.
+/// Materialize the bundled compiled entry in both terminfo directory layouts.
 fn provision_bundled_terminfo() -> io::Result<TempDir> {
     let encoded: String = BUNDLED_TERMINFO.split_whitespace().collect();
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(encoded)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     let directory = tempfile::Builder::new().prefix("vivido-terminfo-").tempdir()?;
-    let entry_directory = directory.path().join(&TERMINFO_NAME[..1]);
-    fs::create_dir(&entry_directory)?;
-    fs::write(entry_directory.join(TERMINFO_NAME), bytes)?;
+    for entry_directory in [&TERMINFO_NAME[..1], "76"] {
+        let entry_directory = directory.path().join(entry_directory);
+        fs::create_dir(&entry_directory)?;
+        fs::write(entry_directory.join(TERMINFO_NAME), &bytes)?;
+    }
     Ok(directory)
 }
 
@@ -217,11 +220,11 @@ mod tests {
     fn bundled_terminfo_is_valid_and_lifecycle_scoped() {
         let directory = provision_bundled_terminfo().unwrap();
         let root = directory.path().to_owned();
-        let entry = root.join("v").join(TERMINFO_NAME);
         let encoded: String = BUNDLED_TERMINFO.split_whitespace().collect();
         let expected = base64::engine::general_purpose::STANDARD.decode(encoded).unwrap();
 
-        assert_eq!(fs::read(&entry).unwrap(), expected);
+        assert_eq!(fs::read(root.join("v").join(TERMINFO_NAME)).unwrap(), expected);
+        assert_eq!(fs::read(root.join("76").join(TERMINFO_NAME)).unwrap(), expected);
         assert!(expected.windows(b"Smulx".len()).any(|window| window == b"Smulx"));
         assert!(expected.windows(b"\x1b[4:%p1%dm".len()).any(|window| window == b"\x1b[4:%p1%dm"));
 
