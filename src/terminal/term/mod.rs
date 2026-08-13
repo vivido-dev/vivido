@@ -904,6 +904,16 @@ impl<T> Term<T> {
         });
     }
 
+    /// Forward a parsed OSC desktop-notification request to the owning window.
+    pub(crate) fn desktop_notification(
+        &self,
+        notification: crate::osc_notification::OscNotification,
+    ) where
+        T: EventListener,
+    {
+        self.event_proxy.send_event(Event::DesktopNotification(notification));
+    }
+
     /// Forward a decoded graphics/media command to the UI renderer.
     ///
     /// Escape-sequence parsers can call this after translating Sixel, Kitty, or custom protocol

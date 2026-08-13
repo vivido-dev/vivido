@@ -2543,6 +2543,19 @@ impl Processor {
                     );
                 }
             },
+            (
+                EventType::Terminal(TerminalEvent::DesktopNotification(notification)),
+                Some(window_id),
+            ) => {
+                if let Some(window_context) = self.windows.get_mut(window_id) {
+                    window_context.handle_desktop_notification(notification);
+                }
+            },
+            (EventType::NotificationActivated, Some(window_id)) => {
+                if let Some(window_context) = self.windows.get(window_id) {
+                    window_context.activate_desktop_notification();
+                }
+            },
             (EventType::Terminal(TerminalEvent::Wakeup), Some(window_id)) => {
                 if let Some(window_context) = self.windows.get_mut(window_id) {
                     window_context.dirty = true;
@@ -2948,6 +2961,7 @@ pub enum EventType {
     BlinkCursor,
     BlinkCursorTimeout,
     SearchNext,
+    NotificationActivated,
     #[cfg(any(unix, windows))]
     Shutdown,
     Frame,
@@ -3946,6 +3960,7 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                             *self.ctx.prev_bell_cmd = Some(Instant::now());
                         }
                     },
+                    TerminalEvent::DesktopNotification(_) => (),
                     TerminalEvent::Graphics(command) => {
                         self.ctx.display.submit_graphics(command);
                         self.ctx.mark_dirty();
@@ -4015,6 +4030,7 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                 EventType::Message(_)
                 | EventType::ConfigReload(_)
                 | EventType::CreateWindow(_)
+                | EventType::NotificationActivated
                 | EventType::Frame
                 | EventType::RendererRecovery
                 | EventType::VividResizeSettled(_) => (),

@@ -18,6 +18,7 @@ use polling::{Event as PollingEvent, Events, PollMode, Poller};
 
 #[cfg(any(unix, windows))]
 use crate::automation::Transcript;
+use crate::osc_notification::OscNotificationParser;
 use crate::terminal::event::{self, Event, EventListener, WindowSize};
 use crate::terminal::sync::FairMutex;
 use crate::terminal::term::Term;
@@ -466,6 +467,7 @@ pub struct State {
     write_list: VecDeque<PendingInput>,
     writing: Option<Writing>,
     parser: ansi::Processor,
+    osc_notifications: OscNotificationParser,
     vivid_markers: VividMarkerScanner,
     #[cfg(any(unix, windows))]
     output_range: Option<(u64, u64)>,
@@ -478,6 +480,10 @@ impl State {
         bytes: &[u8],
         #[cfg(any(unix, windows))] transcript: &Arc<Mutex<Transcript>>,
     ) -> usize {
+        for notification in self.osc_notifications.advance(bytes) {
+            terminal.desktop_notification(notification);
+        }
+
         let mut processed = 0;
         for chunk in self.vivid_markers.push(bytes) {
             match chunk {

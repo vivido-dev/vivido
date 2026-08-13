@@ -3,6 +3,7 @@ use std::fmt::{self, Debug, Formatter};
 use std::process::ExitStatus;
 use std::sync::Arc;
 
+use crate::osc_notification::OscNotification;
 use crate::terminal::graphics::GraphicsCommand;
 use crate::terminal::term::ClipboardType;
 use crate::terminal::vte::ansi::Rgb;
@@ -64,6 +65,9 @@ pub enum Event {
     /// Terminal bell ring.
     Bell,
 
+    /// A bounded OSC 9 or OSC 99 desktop-notification request.
+    DesktopNotification(OscNotification),
+
     /// Protocol-neutral image, animation, or video operation.
     Graphics(GraphicsCommand),
 
@@ -106,6 +110,7 @@ impl Debug for Event {
             #[cfg(any(unix, windows))]
             Event::PtyResizeComplete(token) => write!(f, "PtyResizeComplete({token})"),
             Event::Bell => write!(f, "Bell"),
+            Event::DesktopNotification(_) => write!(f, "DesktopNotification"),
             Event::Graphics(command) => write!(f, "Graphics({command:?})"),
             Event::VividMarker { marker, line, column, alternate } => {
                 write!(f, "VividMarker({marker:?}, {line}, {column}, alternate={alternate})")

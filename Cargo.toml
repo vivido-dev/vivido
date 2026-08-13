@@ -25,11 +25,14 @@ path = "src/bin/vvssh.rs"
 
 [dependencies]
 ahash = { version = "0.8.6", features = ["no-rng"] }
+async-channel = "2.5.0"
 base64 = "0.23.0"
 bitflags = { version = "2.4.1", features = ["serde"] }
 bytemuck = { version = "1.24", features = ["derive"] }
 clap = { version = "4.2.7", features = ["derive", "env"] }
 copypasta = { version = "0.10.1", default-features = false }
+futures-lite = "2.6.1"
+futures-timer = "3.0.4"
 getrandom = "0.4"
 home = "0.5.5"
 image = { version = "0.25", default-features = false, features = [
@@ -39,6 +42,7 @@ image = { version = "0.25", default-features = false, features = [
 libc = "0.2"
 log = { version = "0.4", features = ["std", "serde"] }
 notify = "8.0.0"
+notify-rust = { version = "4.18.0", features = ["preview-macos-un"] }
 parking_lot = "0.12.0"
 parley = "0.11"
 polling = "3.11.0"
@@ -84,6 +88,7 @@ rustix = { version = "1.0.0", default-features = false, features = ["std"] }
 rustix-openpty = "0.2.0"
 
 [target.'cfg(target_os = "macos")'.dependencies]
+mac-usernotifications = { version = "0.3.1", default-features = false }
 objc2 = "0.6.1"
 objc2-foundation = { version = "0.3.1", default-features = false, features = [
   "std",

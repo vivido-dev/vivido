@@ -258,6 +258,9 @@ blinking = "Off"
 # Clipboard access via OSC 52: disabled | onlycopy | onlypaste | copypaste
 osc52 = "onlycopy"
 
+# Allow terminal applications to create desktop notifications through OSC 9 and OSC 99.
+osc_notifications = true
+
 # Shell to launch instead of the login shell.
 # shell = { program = "/usr/bin/fish", args = ["--login"] }
 

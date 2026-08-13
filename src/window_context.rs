@@ -79,6 +79,7 @@ use crate::input;
 #[cfg(any(unix, windows))]
 use crate::logging::LOG_TARGET_IPC_CONFIG;
 use crate::message_bar::MessageBuffer;
+use crate::osc_notification::{NotificationController, OscNotification, WindowNotificationState};
 #[cfg(any(unix, windows))]
 use crate::polling::ipc::{IpcConnection, IpcError};
 use crate::scheduler::{Scheduler, TimerId, Topic};
@@ -122,6 +123,7 @@ pub struct WindowContext {
     terminal: Arc<FairMutex<Term<EventProxy>>>,
     cursor_blink_timed_out: bool,
     prev_bell_cmd: Option<Instant>,
+    notifications: NotificationController,
     modifiers: Modifiers,
     search_state: SearchState,
     notifier: Notifier,
@@ -242,6 +244,11 @@ impl WindowContext {
         );
 
         let event_proxy = EventProxy::new(proxy, display.window.id());
+        let notifications = NotificationController::new(
+            config.terminal.osc_notifications,
+            !display.window.is_headless() && !display.window.is_embedded(),
+            event_proxy.clone(),
+        );
 
         let vivid_service = {
             let service = match options.vivid_target {
@@ -330,6 +337,7 @@ impl WindowContext {
             notifier: Notifier(loop_tx),
             cursor_blink_timed_out: Default::default(),
             prev_bell_cmd: Default::default(),
+            notifications,
             message_buffer: Default::default(),
             window_config: Default::default(),
             search_state: Default::default(),
@@ -361,6 +369,7 @@ impl WindowContext {
 
         self.display.update_config(&self.config);
         self.terminal.lock().set_options(self.config.term_options());
+        self.notifications.set_enabled(self.config.terminal.osc_notifications);
 
         // Reload cursor if its thickness has changed.
         if (old_config.cursor.thickness() - self.config.cursor.thickness()).abs() > f32::EPSILON {
@@ -1234,6 +1243,24 @@ impl WindowContext {
     #[cfg(any(unix, windows))]
     pub fn request_automation_focus(&self) {
         self.display.window.focus_window();
+    }
+
+    /// Apply a bounded OSC notification request using the latest window visibility state.
+    pub(crate) fn handle_desktop_notification(&mut self, notification: OscNotification) {
+        let state = WindowNotificationState {
+            focused: self.terminal.lock().is_focused,
+            visible: self.display.window.is_visible() != Some(false),
+            occluded: self.occluded,
+            headless: self.display.window.is_headless(),
+        };
+        self.notifications.handle(notification, state, &self.notifier);
+    }
+
+    /// Focus the live originating native window after its notification is activated.
+    pub(crate) fn activate_desktop_notification(&self) {
+        if !self.display.window.is_headless() && !self.display.window.is_embedded() {
+            self.display.window.focus_window();
+        }
     }
 
     /// Move and optionally resize the window's outer frame.

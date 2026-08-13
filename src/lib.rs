@@ -22,6 +22,7 @@ mod logging;
 #[cfg(target_os = "macos")]
 mod macos;
 mod message_bar;
+mod osc_notification;
 #[cfg(windows)]
 mod panic;
 mod polling;

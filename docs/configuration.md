@@ -307,12 +307,24 @@ blinking = "Off"
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `osc52` | enum | `onlycopy` | Clipboard access via OSC 52: `disabled`, `onlycopy`, `onlypaste`, `copypaste` (case-insensitive). |
+| `osc_notifications` | bool | `true` | Allow OSC 9 and OSC 99 desktop notifications. |
 | `shell` | string or `{ program, args }` | *system* | Shell to launch instead of the login shell. |
 
 ```toml
 [terminal]
 osc52 = "onlycopy"
+osc_notifications = true
 shell = { program = "/usr/bin/fish", args = ["--login"] }
+```
+
+Vivido accepts legacy iTerm2 notifications (`OSC 9 ; message ST`) and the core Kitty OSC 99
+protocol for bounded title/body chunks, IDs, update/close, visibility policy, urgency, expiry,
+sound, focus-on-click, and capability queries. Platform-specific fields are advertised only when
+the desktop backend supports them. Icons, buttons, and callbacks into the PTY are not supported.
+
+```sh
+printf '\033]9;Build complete\007'
+printf '\033]99;;Build complete\033\\'
 ```
 
 ## `mouse`
