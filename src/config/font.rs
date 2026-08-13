@@ -11,13 +11,16 @@ use crate::config::ui_config::Delta;
 /// field in this struct. It might be nice in the future to have defaults for
 /// each value independently. Alternatively, maybe erroring when the user
 /// doesn't provide complete config is Ok.
-#[derive(Serialize, Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Serialize, Debug, Clone, PartialEq, Eq)]
 pub struct Font {
     /// Extra spacing per character.
     pub offset: Delta<i8>,
 
     /// Glyph offset within character cell.
     pub glyph_offset: Delta<i8>,
+
+    /// Shape compatible neighboring terminal cells as ligature runs.
+    ligatures: bool,
 
     pub use_thin_strokes: bool,
 
@@ -52,6 +55,12 @@ impl Font {
         self.size.0
     }
 
+    /// Whether compatible neighboring terminal cells should be shaped together.
+    #[inline]
+    pub fn ligatures(&self) -> bool {
+        self.ligatures
+    }
+
     /// Get normal font description.
     pub fn normal(&self) -> &FontDescription {
         &self.normal
@@ -70,6 +79,23 @@ impl Font {
     /// Get bold italic font description.
     pub fn bold_italic(&self) -> FontDescription {
         self.bold_italic.desc(&self.normal)
+    }
+}
+
+impl Default for Font {
+    fn default() -> Self {
+        Self {
+            offset: Delta::default(),
+            glyph_offset: Delta::default(),
+            ligatures: true,
+            use_thin_strokes: false,
+            normal: FontDescription::default(),
+            bold: SecondaryFontDescription::default(),
+            italic: SecondaryFontDescription::default(),
+            bold_italic: SecondaryFontDescription::default(),
+            size: Size::default(),
+            builtin_box_drawing_removed: false,
+        }
     }
 }
 
@@ -189,6 +215,7 @@ impl<'de> Deserialize<'de> for Size {
 impl_config_deserialize!(Font {
     offset,
     glyph_offset,
+    ligatures,
     use_thin_strokes: removed("set the AppleFontSmoothing user default instead"),
     normal,
     bold,
@@ -215,7 +242,15 @@ impl Serialize for Size {
 
 #[cfg(test)]
 mod tests {
-    use super::FontSize;
+    use super::{Font, FontSize};
+
+    #[test]
+    fn ligatures_are_enabled_by_default_and_can_be_disabled() {
+        assert!(Font::default().ligatures());
+
+        let font = toml::from_str::<Font>("ligatures = false").unwrap();
+        assert!(!font.ligatures());
+    }
 
     #[test]
     fn point_size_roundtrips_through_platform_pixels() {

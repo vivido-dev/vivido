@@ -168,12 +168,14 @@ family; omit `style` to let the system pick.
 | `italic` | `{ family, style }` | derived from `normal` | Italic face. |
 | `bold_italic` | `{ family, style }` | derived from `normal` | Bold-italic face. |
 | `size` | float | `11.25` | Font size in points. |
+| `ligatures` | boolean | `true` | Shape compatible neighboring terminal cells using ligatures supplied by the selected font. |
 | `offset` | `{ x, y }` | `{ 0, 0 }` | Extra spacing added around each cell. |
 | `glyph_offset` | `{ x, y }` | `{ 0, 0 }` | Shift the glyph within its cell. |
 
 ```toml
 [font]
 size = 12.0
+ligatures = true
 
 [font.normal]
 family = "JetBrains Mono"

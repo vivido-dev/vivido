@@ -2,6 +2,7 @@
 
 use std::cmp;
 use std::fmt::{self, Formatter};
+use std::ops::Range;
 use std::time::{Duration, Instant};
 
 use log::info;
@@ -33,7 +34,7 @@ use crate::config::window::Dimensions;
 use crate::config::window::StartupMode;
 use crate::display::bell::VisualBell;
 use crate::display::color::{List, Rgb};
-use crate::display::content::{RenderableContent, RenderableCursor};
+use crate::display::content::{RenderableCell, RenderableContent, RenderableCursor};
 use crate::display::cursor::IntoRects;
 use crate::display::damage::{DamageTracker, damage_y_to_viewport_y};
 use crate::display::hint::{HintMatch, HintState};
@@ -79,6 +80,14 @@ const SHORTENER: char = '…';
 
 /// Color which is used to highlight damaged rects when debugging.
 const DAMAGE_RECT_COLOR: Rgb = Rgb::new(255, 0, 255);
+
+/// A consecutive slice of prepared terminal cells painted either independently or as one shaped
+/// ligature run.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TerminalTextSpan {
+    cells: Range<usize>,
+    ligature_run: bool,
+}
 
 #[derive(Debug)]
 pub enum Error {
@@ -716,8 +725,24 @@ impl Display {
                 scene.draw_image(&media.image, Affine::IDENTITY);
             }
 
-            for cell in &prepared_cells {
-                Self::paint_cell_text(&mut scene, text_system, size_info, cell);
+            for span in
+                terminal_text_spans(&prepared_cells, cursor.point(), text_system.ligatures())
+            {
+                if span.ligature_run {
+                    Self::paint_ligature_run(
+                        &mut scene,
+                        text_system,
+                        size_info,
+                        &prepared_cells[span.cells],
+                    );
+                } else {
+                    Self::paint_cell_text(
+                        &mut scene,
+                        text_system,
+                        size_info,
+                        &prepared_cells[span.cells.start],
+                    );
+                }
             }
 
             let mut rects = lines.rects(&metrics, &size_info);
@@ -961,6 +986,28 @@ impl Display {
         );
     }
 
+    fn paint_ligature_run(
+        scene: &mut Scene,
+        text_system: &mut TextSystem,
+        size: SizeInfo,
+        cells: &[RenderableCell],
+    ) {
+        let Some(first) = cells.first() else {
+            return;
+        };
+        let text = cells.iter().map(|cell| cell.character).collect::<String>();
+        let layout = text_system.shape_terminal_run(text, first.flags);
+        Self::paint_terminal_run_layout(
+            scene,
+            &layout,
+            text_system.metrics(),
+            size,
+            first.point.line,
+            first.point.column.0,
+            first.fg,
+        );
+    }
+
     fn paint_layout(
         scene: &mut Scene,
         layout: &parley::Layout<()>,
@@ -999,6 +1046,65 @@ impl Display {
                         Fill::NonZero,
                         glyph_run.glyphs().map(|glyph| scene_glyph_from_layout(&mut x, y, glyph)),
                     );
+            }
+        }
+    }
+
+    /// Paint a multi-cell layout while anchoring every shaped cluster to its terminal column.
+    ///
+    /// Parley represents a ligature as one start cluster followed by continuation clusters. The
+    /// start owns the combined glyph, while continuations must not paint it again. Resetting the
+    /// horizontal origin for every other cluster prevents proportional fallback glyphs or rounding
+    /// from shifting later terminal cells off the fixed grid.
+    fn paint_terminal_run_layout(
+        scene: &mut Scene,
+        layout: &parley::Layout<()>,
+        metrics: TextMetrics,
+        size: SizeInfo,
+        line: usize,
+        column: usize,
+        fg: Rgb,
+    ) {
+        let transform = Affine::translate((
+            (size.padding_x() + column as f32 * size.cell_width() + metrics.glyph_offset_x) as f64,
+            (size.padding_y() + line as f32 * size.cell_height() + metrics.glyph_offset_y) as f64,
+        ));
+        let brush = vello::peniko::Brush::Solid(color_from_rgb(fg));
+
+        for line in layout.lines() {
+            for item in line.items() {
+                let parley::layout::PositionedLayoutItem::GlyphRun(glyph_run) = item else {
+                    continue;
+                };
+
+                let run = glyph_run.run();
+                let baseline = glyph_run.baseline();
+                let mut glyphs = Vec::new();
+                for cluster in run.visual_clusters() {
+                    if cluster.is_ligature_continuation() {
+                        continue;
+                    }
+
+                    let mut x = grid_x_for_text_byte(cluster.text_range().start, size.cell_width());
+                    glyphs.extend(
+                        cluster
+                            .glyphs()
+                            .map(|glyph| scene_glyph_from_layout(&mut x, baseline, glyph)),
+                    );
+                }
+
+                if glyphs.is_empty() {
+                    continue;
+                }
+
+                scene
+                    .draw_glyphs(run.font())
+                    .brush(&brush)
+                    .hint(false)
+                    .transform(transform)
+                    .font_size(run.font_size())
+                    .normalized_coords(run.normalized_coords())
+                    .draw(Fill::NonZero, glyphs.into_iter());
             }
         }
     }
@@ -1400,12 +1506,92 @@ fn text_cell_width(text: &str) -> usize {
     text.chars().map(char_cell_width).sum()
 }
 
+/// Split prepared terminal cells into independent cells and compatible multi-cell shaping runs.
+fn terminal_text_spans(
+    cells: &[RenderableCell],
+    cursor: Point<usize>,
+    ligatures: bool,
+) -> Vec<TerminalTextSpan> {
+    let mut spans = Vec::with_capacity(cells.len());
+    let mut start = 0;
+
+    while start < cells.len() {
+        if !ligatures || !ligature_cell_is_eligible(&cells[start], cursor) {
+            spans.push(TerminalTextSpan { cells: start..start + 1, ligature_run: false });
+            start += 1;
+            continue;
+        }
+
+        let mut end = start + 1;
+        while end < cells.len()
+            && ligature_cell_is_eligible(&cells[end], cursor)
+            && ligature_cells_are_compatible(&cells[end - 1], &cells[end])
+        {
+            end += 1;
+        }
+
+        let ligature_run = end - start > 1;
+        spans.push(TerminalTextSpan {
+            cells: start..if ligature_run { end } else { start + 1 },
+            ligature_run,
+        });
+        start = if ligature_run { end } else { start + 1 };
+    }
+
+    spans
+}
+
+fn ligature_cell_is_eligible(cell: &RenderableCell, cursor: Point<usize>) -> bool {
+    cell.point != cursor
+        && cell.character.is_ascii_graphic()
+        && !cell.flags.intersects(Flags::HIDDEN | Flags::WIDE_CHAR | Flags::WIDE_CHAR_SPACER)
+        && cell
+            .extra
+            .as_ref()
+            .is_none_or(|extra| extra.zerowidth.as_ref().is_none_or(|chars| chars.is_empty()))
+}
+
+fn ligature_cells_are_compatible(left: &RenderableCell, right: &RenderableCell) -> bool {
+    left.point.line == right.point.line
+        && left.point.column.0.checked_add(1) == Some(right.point.column.0)
+        && terminal_font_variant(left.flags) == terminal_font_variant(right.flags)
+        && left.fg == right.fg
+        && left.bg == right.bg
+        && left.bg_alpha == right.bg_alpha
+}
+
+fn terminal_font_variant(flags: Flags) -> (bool, bool) {
+    (flags.intersects(Flags::BOLD | Flags::DIM_BOLD), flags.contains(Flags::ITALIC))
+}
+
+/// ASCII run text has one byte per terminal cell, so byte offsets map directly to columns.
+fn grid_x_for_text_byte(byte_index: usize, cell_width: f32) -> f32 {
+    byte_index as f32 * cell_width
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        INITIAL_RENDERER_RETRY, MAX_RENDERER_RETRY, next_renderer_retry_delay,
-        scene_glyph_from_layout, text_cell_width,
+        INITIAL_RENDERER_RETRY, MAX_RENDERER_RETRY, TerminalTextSpan, grid_x_for_text_byte,
+        next_renderer_retry_delay, scene_glyph_from_layout, terminal_text_spans, text_cell_width,
     };
+    use crate::display::color::Rgb;
+    use crate::display::content::RenderableCell;
+    use crate::terminal::index::{Column, Point};
+    use crate::terminal::term::cell::Flags;
+
+    fn renderable_cell(line: usize, column: usize, character: char) -> RenderableCell {
+        RenderableCell {
+            character,
+            point: Point::new(line, Column(column)),
+            fg: Rgb::new(220, 220, 220),
+            bg: Rgb::new(10, 10, 10),
+            bg_alpha: 0.0,
+            underline: Rgb::new(220, 220, 220),
+            flags: Flags::empty(),
+            extra: None,
+        }
+    }
 
     #[test]
     fn scene_glyphs_use_baseline_relative_y_coordinates() {
@@ -1425,6 +1611,97 @@ mod tests {
         assert_eq!(text_cell_width("abc"), 3);
         assert_eq!(text_cell_width("今a"), 3);
         assert_eq!(text_cell_width(""), 0);
+    }
+
+    #[test]
+    fn compatible_ascii_cells_form_a_ligature_run() {
+        let cells = [renderable_cell(0, 3, '='), renderable_cell(0, 4, '>')];
+
+        assert_eq!(
+            terminal_text_spans(&cells, Point::new(0, Column(0)), true),
+            vec![TerminalTextSpan { cells: 0..2, ligature_run: true }]
+        );
+    }
+
+    #[test]
+    fn disabling_ligatures_restores_independent_cells() {
+        let cells = [renderable_cell(0, 3, '='), renderable_cell(0, 4, '>')];
+
+        assert_eq!(
+            terminal_text_spans(&cells, Point::new(0, Column(0)), false),
+            vec![
+                TerminalTextSpan { cells: 0..1, ligature_run: false },
+                TerminalTextSpan { cells: 1..2, ligature_run: false },
+            ]
+        );
+    }
+
+    #[test]
+    fn cursor_and_presentation_boundaries_split_ligature_runs() {
+        let base =
+            [renderable_cell(0, 3, '='), renderable_cell(0, 4, '>'), renderable_cell(0, 5, '>')];
+        let spans = terminal_text_spans(&base, Point::new(0, Column(4)), true);
+        assert!(spans.iter().all(|span| !span.ligature_run));
+
+        let mut cases = Vec::new();
+
+        let mut gap = base.clone();
+        gap[1].point.column = Column(6);
+        cases.push(gap);
+
+        let mut next_line = base.clone();
+        next_line[1].point.line = 1;
+        cases.push(next_line);
+
+        let mut foreground = base.clone();
+        foreground[1].fg = Rgb::new(255, 0, 0);
+        cases.push(foreground);
+
+        let mut background = base.clone();
+        background[1].bg = Rgb::new(0, 0, 255);
+        cases.push(background);
+
+        let mut alpha = base.clone();
+        alpha[1].bg_alpha = 1.0;
+        cases.push(alpha);
+
+        let mut style = base.clone();
+        style[1].flags.insert(Flags::ITALIC);
+        cases.push(style);
+
+        for cells in cases {
+            let spans = terminal_text_spans(&cells, Point::new(9, Column(9)), true);
+            assert!(!spans[0].ligature_run, "unexpected run for {cells:?}");
+        }
+    }
+
+    #[test]
+    fn ineligible_cells_are_never_shaped_into_ligature_runs() {
+        for (character, flags) in [
+            ('\t', Flags::empty()),
+            (' ', Flags::empty()),
+            ('今', Flags::empty()),
+            ('=', Flags::HIDDEN),
+            ('=', Flags::WIDE_CHAR),
+        ] {
+            let cells = [
+                renderable_cell(0, 0, '='),
+                RenderableCell { character, flags, ..renderable_cell(0, 1, character) },
+            ];
+            assert!(
+                terminal_text_spans(&cells, Point::new(9, Column(9)), true)
+                    .iter()
+                    .all(|span| !span.ligature_run),
+                "unexpected run for {character:?} with {flags:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn shaped_ascii_byte_offsets_map_to_fixed_grid_columns() {
+        assert_eq!(grid_x_for_text_byte(0, 9.5), 0.0);
+        assert_eq!(grid_x_for_text_byte(1, 9.5), 9.5);
+        assert_eq!(grid_x_for_text_byte(3, 9.5), 28.5);
     }
 
     #[test]

@@ -117,6 +117,11 @@ impl TextSystem {
         self.metrics
     }
 
+    /// Whether compatible terminal cells should be shaped as ligature runs.
+    pub fn ligatures(&self) -> bool {
+        self.font.ligatures()
+    }
+
     pub fn update_font(&mut self, font: Font) {
         self.font = font;
         self.family_stacks = family_stacks_for_font(&self.font);
@@ -146,6 +151,11 @@ impl TextSystem {
         } else {
             Some(self.shape_char(cell.character, variant))
         }
+    }
+
+    /// Shape a run assembled from compatible neighboring terminal cells.
+    pub fn shape_terminal_run(&mut self, text: String, flags: Flags) -> Arc<Layout<()>> {
+        self.shape_text(text, font_variant(flags))
     }
 
     #[cfg(test)]

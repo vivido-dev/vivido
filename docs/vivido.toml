@@ -105,6 +105,9 @@ multiplier = 3
 # Font size in points.
 size = 11.25
 
+# Shape compatible neighboring terminal cells using ligatures supplied by the selected font.
+ligatures = true
+
 # Extra spacing added around each cell.
 offset = { x = 0, y = 0 }
 
