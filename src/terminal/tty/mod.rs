@@ -1,12 +1,16 @@
 //! TTY related functionality.
 
 use std::collections::HashMap;
+use std::fs;
 use std::path::PathBuf;
 use std::process::ExitStatus;
 use std::sync::Arc;
 use std::{env, io};
 
+use base64::Engine;
+use log::warn;
 use polling::{Event, PollMode, Poller};
+use tempfile::TempDir;
 
 #[cfg(not(windows))]
 mod unix;
@@ -96,16 +100,62 @@ pub trait EventedPty: EventedReadWrite {
     fn next_child_event(&mut self) -> Option<ChildEvent>;
 }
 
+const TERMINFO_NAME: &str = "vivido";
+// Regenerate from `extra/vivido.info` with `term_dir=$(mktemp -d)`, `tic -x -e vivido -o
+// "$term_dir" extra/vivido.info`, and `base64 "$term_dir/v/vivido"`.
+const BUNDLED_TERMINFO: &str = include_str!("../../../extra/vivido.terminfo.b64");
+
+/// Keeps Vivido's private terminfo tree alive until all PTY children have exited.
+#[must_use]
+pub struct TerminfoGuard {
+    _directory: Option<TempDir>,
+}
+
 /// Setup environment variables.
-pub fn setup_env() {
-    // Default to 'vivido' terminfo if it is available, otherwise
-    // default to 'xterm-256color'. May be overridden by user's config
-    // below.
-    let terminfo = if terminfo_exists("vivido") { "vivido" } else { "xterm-256color" };
+pub fn setup_env() -> TerminfoGuard {
+    // Prefer an entry installed by the user or package manager. Source builds and `cargo install`
+    // do not install data files, so materialize the bundled entry when the database has no Vivido
+    // definition. User-configured environment variables are applied after this function and can
+    // still override TERM, TERMINFO, or COLORTERM.
+    let directory = if terminfo_exists(TERMINFO_NAME) {
+        None
+    } else {
+        match provision_bundled_terminfo() {
+            Ok(directory) => {
+                unsafe { env::set_var("TERMINFO", directory.path()) };
+                Some(directory)
+            },
+            Err(error) => {
+                warn!("Could not provision bundled Vivido terminfo: {error}");
+                None
+            },
+        }
+    };
+
+    let terminfo = if directory.is_some() || terminfo_exists(TERMINFO_NAME) {
+        TERMINFO_NAME
+    } else {
+        "xterm-256color"
+    };
     unsafe { env::set_var("TERM", terminfo) };
 
     // Advertise 24-bit color support.
     unsafe { env::set_var("COLORTERM", "truecolor") };
+
+    TerminfoGuard { _directory: directory }
+}
+
+/// Materialize the bundled compiled entry in the standard terminfo directory layout.
+fn provision_bundled_terminfo() -> io::Result<TempDir> {
+    let encoded: String = BUNDLED_TERMINFO.split_whitespace().collect();
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let directory = tempfile::Builder::new().prefix("vivido-terminfo-").tempdir()?;
+    let entry_directory = directory.path().join(&TERMINFO_NAME[..1]);
+    fs::create_dir(&entry_directory)?;
+    fs::write(entry_directory.join(TERMINFO_NAME), bytes)?;
+    Ok(directory)
 }
 
 /// Check if a terminfo entry exists on the system.
@@ -127,7 +177,9 @@ fn terminfo_exists(terminfo: &str) -> bool {
 
     if let Some(dir) = env::var_os("TERMINFO") {
         check_path!(PathBuf::from(&dir));
-    } else if let Some(home) = home::home_dir() {
+    }
+
+    if let Some(home) = home::home_dir() {
         check_path!(home.join(".terminfo"));
     }
 
@@ -151,4 +203,29 @@ fn terminfo_exists(terminfo: &str) -> bool {
 
     // No valid terminfo path has been found.
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BUNDLED_TERMINFO, TERMINFO_NAME, provision_bundled_terminfo};
+
+    use std::fs;
+
+    use base64::Engine;
+
+    #[test]
+    fn bundled_terminfo_is_valid_and_lifecycle_scoped() {
+        let directory = provision_bundled_terminfo().unwrap();
+        let root = directory.path().to_owned();
+        let entry = root.join("v").join(TERMINFO_NAME);
+        let encoded: String = BUNDLED_TERMINFO.split_whitespace().collect();
+        let expected = base64::engine::general_purpose::STANDARD.decode(encoded).unwrap();
+
+        assert_eq!(fs::read(&entry).unwrap(), expected);
+        assert!(expected.windows(b"Smulx".len()).any(|window| window == b"Smulx"));
+        assert!(expected.windows(b"\x1b[4:%p1%dm".len()).any(|window| window == b"\x1b[4:%p1%dm"));
+
+        drop(directory);
+        assert!(!root.exists());
+    }
 }

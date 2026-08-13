@@ -406,7 +406,7 @@ fn vivido(mut options: Options) -> Result<(), Box<dyn Error>> {
     log::set_max_level(config.debug.log_level);
 
     // Set tty environment variables.
-    tty::setup_env();
+    let _terminfo_guard = tty::setup_env();
 
     // Set env vars from config.
     for (key, value) in config.env.iter() {

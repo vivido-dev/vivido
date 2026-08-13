@@ -2605,6 +2605,32 @@ mod tests {
     }
 
     #[test]
+    fn sgr_undercurl_is_distinct_and_cancellable() {
+        let size = TermSize::new(5, 1);
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+        let mut parser: ansi::Processor = ansi::Processor::new();
+
+        parser.advance(
+            &mut term,
+            b"\x1b[4:3;58:2::255:0:0mA\x1b[4mB\x1b[4:3mC\x1b[4:0mD\x1b[4:3m\x1b[24mE",
+        );
+
+        let cells = &term.grid()[Line(0)];
+        assert!(cells[Column(0)].flags.contains(Flags::UNDERCURL));
+        assert!(!cells[Column(0)].flags.contains(Flags::UNDERLINE));
+        assert_eq!(
+            cells[Column(0)].underline_color(),
+            Some(ansi::Color::Spec(ansi::Rgb { r: 255, g: 0, b: 0 }))
+        );
+
+        assert!(cells[Column(1)].flags.contains(Flags::UNDERLINE));
+        assert!(!cells[Column(1)].flags.contains(Flags::UNDERCURL));
+        assert!(cells[Column(2)].flags.contains(Flags::UNDERCURL));
+        assert!(!cells[Column(3)].flags.intersects(Flags::ALL_UNDERLINES));
+        assert!(!cells[Column(4)].flags.intersects(Flags::ALL_UNDERLINES));
+    }
+
+    #[test]
     fn scroll_display_page_up() {
         let size = TermSize::new(5, 10);
         let mut term = Term::new(Config::default(), &size, VoidListener);

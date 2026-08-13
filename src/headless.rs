@@ -104,7 +104,7 @@ fn serve(
     let config = config::load(&mut options);
     log::set_max_level(config.debug.log_level);
 
-    tty::setup_env();
+    let _terminfo_guard = tty::setup_env();
     for (key, value) in config.env.iter() {
         unsafe { env::set_var(key, value) };
     }

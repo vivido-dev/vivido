@@ -22,6 +22,10 @@ cargo install --path .
 This installs both `vivido` and its `vvssh` companion command. Do not select only the `vivido`
 binary with `--bin` if remote Vivid forwarding is needed.
 
+Vivido carries its own terminfo entry and makes it available to child applications automatically
+when no system entry is installed. Extended underline styles such as Neovim undercurls therefore
+work for both source builds and Cargo installs without a separate `tic` step.
+
 ### Linux
 
 Linux builds are Wayland-only. Install the development packages for Wayland, xkbcommon,
