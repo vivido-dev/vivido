@@ -3,7 +3,7 @@
 # Copy this to one of:
 #   Linux/BSD : ~/.config/vivido/vivido.toml
 #   macOS     : ~/.config/vivido/vivido.toml
-#   Windows   : %APPDATA%\vivido\vivido.toml
+#   Windows   : %USERPROFILE%\.config\vivido\vivido.toml
 #
 # Every value shown is the built-in DEFAULT. Uncomment and edit only what you
 # want to change; missing keys keep their defaults. See configuration.md for the

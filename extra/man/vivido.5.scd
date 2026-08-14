@@ -9,7 +9,8 @@ vivido - Vivido configuration file
 Vivido reads TOML configuration from _vivido.toml_. The default locations are
 _$XDG_CONFIG_HOME/vivido/vivido.toml_ on Linux,
 _$HOME/.config/vivido/vivido.toml_ on macOS, and
-_%APPDATA%\vivido\vivido.toml_ on Windows.
+_%USERPROFILE%\.config\vivido\vivido.toml_ on Windows. Windows also falls back to
+_%USERPROFILE%\vivido\vivido.toml_ and _%APPDATA%\vivido\vivido.toml_.
 
 Configuration keys and values are compatible with the corresponding Vivido terminal
 settings except for features deliberately removed by Vivido: X11-only window settings, vi

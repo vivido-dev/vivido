@@ -3223,6 +3223,7 @@ dependencies = [
  "vivid_sdk",
  "vte",
  "wgpu",
+ "windows",
  "windows-sys 0.61.2",
  "winit",
  "xdg",
