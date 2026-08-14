@@ -111,8 +111,9 @@ impl AutomationNotifier {
 
 #[cfg(any(unix, windows))]
 impl Notify for AutomationNotifier {
-    fn notify<B: Into<Cow<'static, [u8]>>>(&self, bytes: B) {
+    fn notify<B: Into<Cow<'static, [u8]>>>(&self, bytes: B) -> Result<(), EventLoopSendError> {
         self.0.borrow_mut().extend_from_slice(bytes.into().as_ref());
+        Ok(())
     }
 }
 

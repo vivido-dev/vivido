@@ -4,6 +4,7 @@ use std::process::ExitStatus;
 use std::sync::Arc;
 
 use crate::osc_notification::OscNotification;
+use crate::terminal::event_loop::EventLoopSendError;
 use crate::terminal::graphics::GraphicsCommand;
 use crate::terminal::term::ClipboardType;
 use crate::terminal::vte::ansi::Rgb;
@@ -132,8 +133,10 @@ impl Debug for Event {
 pub trait Notify {
     /// Notify that an escape sequence should be written to the PTY.
     ///
-    /// TODO this needs to be able to error somehow.
-    fn notify<B: Into<Cow<'static, [u8]>>>(&self, _: B);
+    /// Fails when the response cannot be delivered, e.g. because the PTY event loop has
+    /// already shut down. Callers log and continue; a failed response must not disrupt the
+    /// event processing that triggered it.
+    fn notify<B: Into<Cow<'static, [u8]>>>(&self, _: B) -> Result<(), EventLoopSendError>;
 }
 
 #[derive(Copy, Clone, Debug)]

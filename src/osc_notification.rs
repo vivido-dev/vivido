@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use base64::Engine;
 use base64::engine::general_purpose::{STANDARD as BASE64, STANDARD_NO_PAD as BASE64_NO_PAD};
+use log::warn;
 
 use crate::event::{EventProxy, EventType};
 use crate::terminal::event::Notify;
@@ -584,7 +585,9 @@ impl NotificationController {
     ) {
         match &request.payload {
             Payload::Query => {
-                notifier.notify(self.query_response(request.id.as_deref()));
+                if let Err(error) = notifier.notify(self.query_response(request.id.as_deref())) {
+                    warn!("Failed to send notification query response: {error}");
+                }
                 return;
             },
             Payload::Close => {
@@ -1146,6 +1149,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::*;
+    use crate::terminal::event_loop::EventLoopSendError;
 
     fn parse(bytes: &[u8]) -> Vec<OscNotification> {
         OscNotificationParser::default().advance(bytes)
@@ -1185,8 +1189,9 @@ mod tests {
     struct TestNotifier(RefCell<Vec<u8>>);
 
     impl Notify for TestNotifier {
-        fn notify<B: Into<Cow<'static, [u8]>>>(&self, bytes: B) {
+        fn notify<B: Into<Cow<'static, [u8]>>>(&self, bytes: B) -> Result<(), EventLoopSendError> {
             self.0.borrow_mut().extend_from_slice(bytes.into().as_ref());
+            Ok(())
         }
     }
 

@@ -390,21 +390,21 @@ struct PendingInput {
 pub struct Notifier(pub EventLoopSender);
 
 impl event::Notify for Notifier {
-    fn notify<B>(&self, bytes: B)
+    fn notify<B>(&self, bytes: B) -> Result<(), EventLoopSendError>
     where
         B: Into<Cow<'static, [u8]>>,
     {
         let bytes = bytes.into();
         // Terminal hangs if we send 0 bytes through.
         if bytes.is_empty() {
-            return;
+            return Ok(());
         }
 
-        let _ = self.0.send(Msg::Input {
+        self.0.send(Msg::Input {
             bytes,
             #[cfg(any(unix, windows))]
             completion: None,
-        });
+        })
     }
 }
 

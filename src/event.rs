@@ -3155,7 +3155,9 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
 
     #[inline]
     fn write_to_pty<B: Into<Cow<'static, [u8]>>>(&self, val: B) {
-        self.notifier.notify(val);
+        if let Err(error) = self.notifier.notify(val) {
+            debug!("Failed to queue PTY write: {error}");
+        }
     }
 
     /// Request a redraw.
