@@ -756,7 +756,7 @@ fn run_vivid_trace_follow(
     let mut request_id = 2_u64;
     let mut stdout = io::stdout().lock();
     loop {
-        send_client_request(stream, request_id, "vivid_trace", serialize_params(&params)?)?;
+        send_client_request(stream, request_id, "vivid_trace", vivid_trace_params(&params)?)?;
         let batch = read_client_response(reader, request_id)?;
         if let Some(gap) = batch.get("gap") {
             write_json_to(&mut stdout, &json!({"type": "gap", "gap": gap}))?;
@@ -881,7 +881,7 @@ fn message_request(message: &SocketMessage) -> io::Result<(&'static str, Value)>
                 "vivid_scene_status",
                 json!({"window_id": target.window_id, "session_id": session_id}),
             )),
-            IpcVividCommand::Trace(params) => Ok(("vivid_trace", serialize_params(params)?)),
+            IpcVividCommand::Trace(params) => Ok(("vivid_trace", vivid_trace_params(params)?)),
         },
         SocketMessage::GetGrid(params) => Ok(("get_grid", serialize_params(params)?)),
         SocketMessage::Transcript(params) => Ok(("transcript", serialize_params(params)?)),
@@ -917,6 +917,24 @@ fn message_request(message: &SocketMessage) -> io::Result<(&'static str, Value)>
 
 fn serialize_params<T: Serialize>(params: &T) -> io::Result<Value> {
     serde_json::to_value(params).map_err(IoError::other)
+}
+
+fn vivid_trace_params(params: &crate::cli::IpcVividTrace) -> io::Result<Value> {
+    let mut value = serialize_params(params)?;
+    if let Some(sequence) = params.around {
+        value
+            .as_object_mut()
+            .ok_or_else(|| IoError::new(ErrorKind::InvalidData, "trace params are not an object"))?
+            .insert(
+                "around".into(),
+                json!({
+                    "sequence": sequence,
+                    "preceding": params.preceding,
+                    "following": params.following,
+                }),
+            );
+    }
+    Ok(value)
 }
 
 fn validate_message(message: &SocketMessage) -> io::Result<()> {
@@ -994,6 +1012,24 @@ fn validate_message(message: &SocketMessage) -> io::Result<()> {
                 "this Vivid track wait condition does not accept --value"
             },
         ));
+    }
+    if let SocketMessage::Vivid { command: IpcVividCommand::Trace(params) } = message {
+        let selectors = usize::from(params.after.is_some())
+            + usize::from(params.tail)
+            + usize::from(params.before.is_some())
+            + usize::from(params.around.is_some());
+        let around_count = u32::from(params.preceding) + u32::from(params.following);
+        if selectors > 1
+            || (params.follow
+                && (params.tail || params.before.is_some() || params.around.is_some()))
+            || (params.around.is_some()
+                && !(1..=u32::from(crate::vivid::trace::MAX_QUERY_EVENTS)).contains(&around_count))
+        {
+            return Err(IoError::new(
+                ErrorKind::InvalidInput,
+                "invalid Vivid trace selector, follow mode, or around count",
+            ));
+        }
     }
     Ok(())
 }
@@ -1276,6 +1312,40 @@ mod tests {
         assert_eq!(decoded.version, 1);
         assert_eq!(decoded.id, 17);
         assert_eq!(decoded.method, "inspect");
+    }
+
+    #[test]
+    fn vivid_trace_around_is_structured_and_bounded() {
+        let params = crate::cli::IpcVividTrace {
+            target: crate::cli::IpcTarget::default(),
+            after: None,
+            tail: false,
+            before: None,
+            around: Some(420),
+            preceding: 64,
+            following: 16,
+            limit: 128,
+            timeout: 30_000,
+            follow: false,
+            session_id: None,
+            context_id: None,
+            surface_id: None,
+            track_id: None,
+            category: None,
+            recovery_only: false,
+        };
+        let value = vivid_trace_params(&params).unwrap();
+        assert_eq!(value["around"], json!({"sequence": 420, "preceding": 64, "following": 16}));
+        assert!(value.get("preceding").is_none());
+        assert!(value.get("following").is_none());
+
+        let mut invalid = params.clone();
+        invalid.preceding = 0;
+        invalid.following = 0;
+        assert!(
+            validate_message(&SocketMessage::Vivid { command: IpcVividCommand::Trace(invalid) })
+                .is_err()
+        );
     }
 
     #[test]

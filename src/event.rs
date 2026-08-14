@@ -1212,9 +1212,22 @@ impl Processor {
             },
             "vivid_trace" => {
                 #[derive(serde::Deserialize)]
+                struct Around {
+                    sequence: u64,
+                    #[serde(default = "default_vivid_trace_around_count")]
+                    preceding: u16,
+                    #[serde(default = "default_vivid_trace_around_count")]
+                    following: u16,
+                }
+
+                #[derive(serde::Deserialize)]
                 struct Params {
                     window_id: Option<u64>,
                     after: Option<u64>,
+                    #[serde(default)]
+                    tail: bool,
+                    before: Option<u64>,
+                    around: Option<Around>,
                     #[serde(default = "default_vivid_trace_limit")]
                     limit: u16,
                     #[serde(default)]
@@ -1240,9 +1253,28 @@ impl Processor {
                 let identity_valid = identity_valid
                     && (params.surface_id.is_none() || params.context_id.is_some())
                     && (params.track_id.is_none() || params.surface_id.is_some());
+                let selector_count = [
+                    params.after.is_some(),
+                    params.tail,
+                    params.before.is_some(),
+                    params.around.is_some(),
+                ]
+                .into_iter()
+                .filter(|selected| *selected)
+                .count();
+                let around_count = params
+                    .around
+                    .as_ref()
+                    .map(|around| u32::from(around.preceding) + u32::from(around.following));
+                let non_forward = params.tail || params.before.is_some() || params.around.is_some();
                 if params.limit == 0
                     || params.limit > crate::vivid::trace::MAX_QUERY_EVENTS
                     || !identity_valid
+                    || selector_count > 1
+                    || (params.follow && non_forward)
+                    || around_count.is_some_and(|count| {
+                        !(1..=u32::from(crate::vivid::trace::MAX_QUERY_EVENTS)).contains(&count)
+                    })
                     || (params.follow && !(1..=24 * 60 * 60 * 1000).contains(&params.timeout))
                 {
                     Err(IpcError::new(
@@ -1265,8 +1297,23 @@ impl Processor {
                         category: params.category,
                         recovery_only: params.recovery_only,
                     };
+                    let selection = if let Some(sequence) = params.after {
+                        crate::vivid::trace::TraceSelection::After { sequence }
+                    } else if params.tail {
+                        crate::vivid::trace::TraceSelection::Tail
+                    } else if let Some(sequence) = params.before {
+                        crate::vivid::trace::TraceSelection::Before { sequence }
+                    } else if let Some(around) = params.around {
+                        crate::vivid::trace::TraceSelection::Around {
+                            sequence: around.sequence,
+                            preceding: around.preceding,
+                            following: around.following,
+                        }
+                    } else {
+                        crate::vivid::trace::TraceSelection::FromOldest
+                    };
                     let batch = self.windows[&target].automation_vivid_trace(
-                        params.after,
+                        selection,
                         params.limit,
                         filter,
                     );
@@ -2034,8 +2081,11 @@ impl Processor {
                     },
                 },
                 WaitKind::VividTrace { after_sequence, limit, filter } => {
-                    let batch =
-                        window.automation_vivid_trace(Some(*after_sequence), *limit, *filter);
+                    let batch = window.automation_vivid_trace(
+                        crate::vivid::trace::TraceSelection::After { sequence: *after_sequence },
+                        *limit,
+                        *filter,
+                    );
                     batch["events"]
                         .as_array()
                         .is_some_and(|events| !events.is_empty())
@@ -2108,6 +2158,10 @@ fn default_vivid_scene_nodes() -> u64 {
 #[cfg(any(unix, windows))]
 fn default_vivid_trace_limit() -> u16 {
     128
+}
+
+fn default_vivid_trace_around_count() -> u16 {
+    64
 }
 
 #[cfg(any(unix, windows))]

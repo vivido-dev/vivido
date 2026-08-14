@@ -825,11 +825,11 @@ impl VividService {
     #[cfg(any(unix, windows))]
     pub(crate) fn automation_trace(
         &self,
-        after_sequence: Option<u64>,
+        selection: trace::TraceSelection,
         limit: u16,
         filter: trace::TraceFilter,
     ) -> trace::TraceBatch {
-        lock(&self.shared.trace).query(after_sequence, limit, filter)
+        lock(&self.shared.trace).query(selection, limit, filter)
     }
 
     fn notify_anchor_events(&self, record_type: u16, anchors: &[AnchorIdentity]) {
@@ -1238,6 +1238,25 @@ fn dispatch_and_reply(
                 .map(|envelope| envelope.request_id)
                 .unwrap_or(0);
             let fatal = request_id == 0;
+            if error.trace_rejection
+                && let Some((operation, category)) = traced_track_control(record.record_type)
+            {
+                shared.trace(
+                    category,
+                    "track_control_rejected",
+                    error.track,
+                    serde_json::json!({
+                        "operation": operation,
+                        "request_id": request_id,
+                        "control_record_sequence": record.sequence,
+                        "record_type": record.record_type,
+                        "object_id": record.object_id,
+                        "error_code": error.code,
+                        "diagnostic": error.message,
+                        "fatal": fatal,
+                    }),
+                );
+            }
             let Ok(body) = protocol_error(request_id, error.code, fatal, error.message) else {
                 return false;
             };
@@ -1246,6 +1265,22 @@ fn dispatch_and_reply(
             }
             !fatal
         },
+    }
+}
+
+fn traced_track_control(record_type: u16) -> Option<(&'static str, trace::TraceCategory)> {
+    let lifecycle = trace::TraceCategory::Lifecycle;
+    let playback = trace::TraceCategory::Playback;
+    match record_type {
+        messages::CREATE_TRACK => Some(("create_track", lifecycle)),
+        messages::DESTROY_TRACK => Some(("destroy_track", lifecycle)),
+        messages::ADVANCE_CHANNEL => Some(("advance_channel", lifecycle)),
+        messages::SET_AUDIO_GAIN => Some(("set_audio_gain", playback)),
+        messages::PLAY => Some(("play", playback)),
+        messages::PAUSE => Some(("pause", playback)),
+        messages::FLUSH => Some(("flush", playback)),
+        messages::DRAIN => Some(("drain", playback)),
+        _ => None,
     }
 }
 
@@ -2248,18 +2283,40 @@ fn dispatch_control(
             let configuration = TrackConfiguration::decode(record.object_id, &value, false)
                 .map_err(|_| ControlError::bad_message("invalid track configuration"))?;
             require_context_operation(session, configuration.context_id, OP_SURFACE_TRACK_MEDIA)?;
-            if !supports_track(&configuration) {
-                return Err(ControlError::unsupported("track configuration is unsupported"));
-            }
             let identity = track_identity(
                 session,
                 configuration.context_id,
                 configuration.surface_id,
                 configuration.track_id,
             )?;
-            let status =
-                shared.scene.create_track(identity, configuration).map_err(ControlError::state)?;
+            if !supports_track(&configuration) {
+                return Err(ControlError::unsupported("track configuration is unsupported")
+                    .with_track(identity));
+            }
+            let status = shared
+                .scene
+                .create_track(identity, configuration)
+                .map_err(|message| ControlError::state(message).with_track(identity))?;
             observe_track(session, &status, TRACK_CHANGED_LIFECYCLE);
+            shared.trace(
+                trace::TraceCategory::Lifecycle,
+                "track_created",
+                Some(identity),
+                serde_json::json!({
+                    "operation": "create_track",
+                    "request_id": request_id,
+                    "control_record_sequence": record.sequence,
+                    "record_type": record.record_type,
+                    "object_id": record.object_id,
+                    "track_revision_before": 0,
+                    "track_revision_after": status.state.revision.get(),
+                    "channel_generation": status.state.channel_generation.get(),
+                    "kind": scene::track_kind_name(&status.configuration),
+                    "slot": status.configuration.slot,
+                    "mode": status.configuration.mode as u64,
+                    "lane": status.configuration.lane as u64,
+                }),
+            );
             let mut payload = vec![
                 (0, Value::Unsigned(identity.surface.context.context_id)),
                 (1, Value::Unsigned(identity.surface.surface_id)),
@@ -2283,10 +2340,37 @@ fn dispatch_control(
         },
         messages::DESTROY_TRACK => {
             let identity = payload_track_identity(session, &value)?;
-            shared.scene.destroy_track(identity).map_err(ControlError::state)?;
-            if let Some(output) = lock(&shared.audio_outputs).remove(&identity) {
-                output.stop();
-            }
+            let status = shared.scene.track_status(identity).ok_or_else(|| {
+                ControlError::not_found("track does not exist").with_track(identity)
+            })?;
+            shared
+                .scene
+                .destroy_track(identity)
+                .map_err(|message| ControlError::state(message).with_track(identity))?;
+            let audio_output_stopped =
+                if let Some(output) = lock(&shared.audio_outputs).remove(&identity) {
+                    output.stop();
+                    true
+                } else {
+                    false
+                };
+            shared.trace(
+                trace::TraceCategory::Lifecycle,
+                "track_destroyed",
+                Some(identity),
+                serde_json::json!({
+                    "operation": "destroy_track",
+                    "request_id": request_id,
+                    "control_record_sequence": record.sequence,
+                    "record_type": record.record_type,
+                    "object_id": record.object_id,
+                    "track_revision_before": status.state.revision.get(),
+                    "track_revision_after": null,
+                    "channel_generation": status.state.channel_generation.get(),
+                    "lifecycle": status.lifecycle,
+                    "audio_output_stopped": audio_output_stopped,
+                }),
+            );
             (messages::OK, record.object_id, Ok(messages::ok(request_id)))
         },
         messages::QUERY_TRACK => {
@@ -2307,26 +2391,55 @@ fn dispatch_control(
         },
         messages::ADVANCE_CHANNEL => {
             let identity = payload_track_identity(session, &value)?;
-            let map = StrictMap::new("ADVANCE_CHANNEL", &value, &[0, 1, 2, 3, 4, 5])
-                .map_err(|_| ControlError::bad_message("invalid channel advance"))?;
-            let current =
-                map.required_u64(3).map_err(|_| ControlError::bad_message("current generation"))?;
-            let next =
-                map.required_u64(4).map_err(|_| ControlError::bad_message("next generation"))?;
-            let status = shared
-                .scene
-                .track_status(identity)
-                .ok_or_else(|| ControlError::not_found("track does not exist"))?;
-            if status.state.channel_generation.get() != current
+            let map =
+                StrictMap::new("ADVANCE_CHANNEL", &value, &[0, 1, 2, 3, 4, 5]).map_err(|_| {
+                    ControlError::bad_message("invalid channel advance").with_track(identity)
+                })?;
+            let current = map.required_u64(3).map_err(|_| {
+                ControlError::bad_message("current generation").with_track(identity)
+            })?;
+            let next = map
+                .required_u64(4)
+                .map_err(|_| ControlError::bad_message("next generation").with_track(identity))?;
+            let before = shared.scene.track_status(identity).ok_or_else(|| {
+                ControlError::not_found("track does not exist").with_track(identity)
+            })?;
+            if before.state.channel_generation.get() != current
                 || current.checked_add(1) != Some(next)
             {
-                return Err(ControlError::state("channel advance is not exact"));
+                return Err(
+                    ControlError::state("channel advance is not exact").with_track(identity)
+                );
             }
-            if let Some(output) = lock(&shared.audio_outputs).remove(&identity) {
-                output.stop();
-            }
-            let status = shared.scene.advance_channel(identity).map_err(ControlError::state)?;
+            let status = shared
+                .scene
+                .advance_channel(identity)
+                .map_err(|message| ControlError::state(message).with_track(identity))?;
+            let audio_output_stopped =
+                if let Some(output) = lock(&shared.audio_outputs).remove(&identity) {
+                    output.stop();
+                    true
+                } else {
+                    false
+                };
             observe_track(session, &status, TRACK_CHANGED_CHANNEL);
+            shared.trace(
+                trace::TraceCategory::Lifecycle,
+                "channel_advanced",
+                Some(identity),
+                serde_json::json!({
+                    "operation": "advance_channel",
+                    "request_id": request_id,
+                    "control_record_sequence": record.sequence,
+                    "record_type": record.record_type,
+                    "object_id": record.object_id,
+                    "track_revision_before": before.state.revision.get(),
+                    "track_revision_after": status.state.revision.get(),
+                    "previous_channel_generation": current,
+                    "channel_generation": status.state.channel_generation.get(),
+                    "audio_output_stopped": audio_output_stopped,
+                }),
+            );
             (
                 messages::CHANNEL_ADVANCED,
                 record.object_id,
@@ -2349,17 +2462,47 @@ fn dispatch_control(
                 return Err(ControlError::unsupported_profile("audio-gain-v1 was not negotiated"));
             }
             let identity = payload_track_identity(session, &value)?;
-            let map = StrictMap::new("SET_AUDIO_GAIN", &value, &[0, 1, 2, 3])
-                .map_err(|_| ControlError::bad_message("invalid audio gain"))?;
-            let raw = map.required_u64(3).map_err(|_| ControlError::bad_message("audio gain"))?;
-            let gain = vivid_protocol::track::AudioGain::new(raw)
-                .ok_or_else(|| ControlError::bad_message("audio gain exceeds 200 percent"))?;
-            let status =
-                shared.scene.set_audio_gain(identity, gain).map_err(ControlError::state)?;
-            if let Some(output) = lock(&shared.audio_outputs).get(&identity) {
+            let map = StrictMap::new("SET_AUDIO_GAIN", &value, &[0, 1, 2, 3]).map_err(|_| {
+                ControlError::bad_message("invalid audio gain").with_track(identity)
+            })?;
+            let raw = map
+                .required_u64(3)
+                .map_err(|_| ControlError::bad_message("audio gain").with_track(identity))?;
+            let gain = vivid_protocol::track::AudioGain::new(raw).ok_or_else(|| {
+                ControlError::bad_message("audio gain exceeds 200 percent").with_track(identity)
+            })?;
+            let before = shared.scene.track_status(identity).ok_or_else(|| {
+                ControlError::not_found("track does not exist").with_track(identity)
+            })?;
+            let status = shared
+                .scene
+                .set_audio_gain(identity, gain)
+                .map_err(|message| ControlError::state(message).with_track(identity))?;
+            let output_updated = if let Some(output) = lock(&shared.audio_outputs).get(&identity) {
                 output.set_gain(gain);
-            }
+                true
+            } else {
+                false
+            };
             observe_track(session, &status, TRACK_CHANGED_AUDIO_GAIN);
+            shared.trace(
+                trace::TraceCategory::Playback,
+                "audio_gain_changed",
+                Some(identity),
+                serde_json::json!({
+                    "operation": "set_audio_gain",
+                    "request_id": request_id,
+                    "control_record_sequence": record.sequence,
+                    "record_type": record.record_type,
+                    "object_id": record.object_id,
+                    "track_revision_before": before.state.revision.get(),
+                    "track_revision_after": status.state.revision.get(),
+                    "channel_generation": status.state.channel_generation.get(),
+                    "previous_gain": before.audio_gain.raw(),
+                    "gain": status.audio_gain.raw(),
+                    "output_updated": output_updated,
+                }),
+            );
             (messages::OK, record.object_id, Ok(messages::ok(request_id)))
         },
         messages::ACTIVATE_TRACK => {
@@ -2647,12 +2790,16 @@ fn dispatch_control(
                     return Err(ControlError {
                         code: messages::ERROR_STALE_CHANNEL_GENERATION,
                         message: "track wait names a stale channel generation",
+                        track: Some(identity),
+                        trace_rejection: true,
                     });
                 },
                 TrackWaitEvaluation::NotVisible => {
                     return Err(ControlError {
                         code: messages::ERROR_NOT_VISIBLE,
                         message: "track has no eligible visible placement",
+                        track: Some(identity),
+                        trace_rejection: true,
                     });
                 },
                 TrackWaitEvaluation::Pending => {
@@ -2671,10 +2818,14 @@ fn dispatch_control(
                         AdmissionError::Waits => ControlError {
                             code: messages::ERROR_LIMIT_EXCEEDED,
                             message: "registered wait capacity is exhausted",
+                            track: Some(identity),
+                            trace_rejection: true,
                         },
                         AdmissionError::Requests => ControlError {
                             code: messages::ERROR_LIMIT_EXCEEDED,
                             message: "pending request capacity is exhausted",
+                            track: Some(identity),
+                            trace_rejection: true,
                         },
                     })?;
                     return Ok(None);
@@ -2692,108 +2843,218 @@ fn dispatch_control(
         },
         messages::PLAY | messages::PAUSE | messages::FLUSH | messages::DRAIN => {
             let identity = payload_track_identity(session, &value)?;
-            let status = shared
-                .scene
-                .track_status(identity)
-                .ok_or_else(|| ControlError::not_found("track does not exist"))?;
+            let before = shared.scene.track_status(identity).ok_or_else(|| {
+                ControlError::not_found("track does not exist").with_track(identity)
+            })?;
             let output = lock(&shared.audio_outputs).get(&identity).cloned();
             match record.record_type {
                 messages::PLAY => {
                     let map = StrictMap::new("PLAY", &value, &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
-                        .map_err(|_| ControlError::bad_message("invalid PLAY schema"))?;
+                        .map_err(|_| {
+                        ControlError::bad_message("invalid PLAY schema").with_track(identity)
+                    })?;
                     let start = map
                         .required(3)
-                        .map_err(|_| ControlError::bad_message("PLAY start PTS"))?
+                        .map_err(|_| {
+                            ControlError::bad_message("PLAY start PTS").with_track(identity)
+                        })?
                         .as_i64()
-                        .ok_or_else(|| ControlError::bad_message("PLAY start PTS"))?;
-                    let minimum = map
-                        .required_u64(4)
-                        .map_err(|_| ControlError::bad_message("PLAY minimum buffer"))?;
-                    let maximum = map
-                        .required_u64(5)
-                        .map_err(|_| ControlError::bad_message("PLAY maximum latency"))?;
+                        .ok_or_else(|| {
+                            ControlError::bad_message("PLAY start PTS").with_track(identity)
+                        })?;
+                    let minimum = map.required_u64(4).map_err(|_| {
+                        ControlError::bad_message("PLAY minimum buffer").with_track(identity)
+                    })?;
+                    let maximum = map.required_u64(5).map_err(|_| {
+                        ControlError::bad_message("PLAY maximum latency").with_track(identity)
+                    })?;
                     let rate = map
                         .required(6)
-                        .map_err(|_| ControlError::bad_message("PLAY rate"))?
+                        .map_err(|_| ControlError::bad_message("PLAY rate").with_track(identity))?
                         .as_i64()
-                        .ok_or_else(|| ControlError::bad_message("PLAY rate"))?;
-                    let generation = map
-                        .required_u64(10)
-                        .map_err(|_| ControlError::bad_message("PLAY generation"))?;
+                        .ok_or_else(|| {
+                            ControlError::bad_message("PLAY rate").with_track(identity)
+                        })?;
+                    let generation = map.required_u64(10).map_err(|_| {
+                        ControlError::bad_message("PLAY generation").with_track(identity)
+                    })?;
                     if minimum > maximum
                         || rate != 1_i64 << 32
                         || map.required_u64(7).ok() != Some(1)
                         || map.required_u64(8).ok() != Some(0)
                         || map.required_u64(9).ok() != Some(1)
-                        || generation != status.state.channel_generation.get()
+                        || generation != before.state.channel_generation.get()
                     {
                         return Err(ControlError::bad_state(
                             "PLAY policy, latency, rate, or generation is invalid",
-                        ));
+                        )
+                        .with_track(identity));
                     }
-                    shared.scene.start_playback(identity, start).map_err(ControlError::state)?;
-                    if let Some(output) = output {
+                    shared
+                        .scene
+                        .start_playback(identity, start)
+                        .map_err(|message| ControlError::state(message).with_track(identity))?;
+                    if let Some(output) = &output {
                         output.configure_play(start, minimum);
                         output.start();
                     }
+                    let revision_after = shared
+                        .scene
+                        .track_status(identity)
+                        .map_or(before.state.revision.get(), |status| status.state.revision.get());
+                    shared.trace(
+                        trace::TraceCategory::Playback,
+                        "play_applied",
+                        Some(identity),
+                        serde_json::json!({
+                            "operation": "play",
+                            "request_id": request_id,
+                            "control_record_sequence": record.sequence,
+                            "record_type": record.record_type,
+                            "object_id": record.object_id,
+                            "track_revision_before": before.state.revision.get(),
+                            "track_revision_after": revision_after,
+                            "channel_generation": before.state.channel_generation.get(),
+                            "start_pts_us": start,
+                            "minimum_buffer_us": minimum,
+                            "maximum_latency_us": maximum,
+                            "rate_q32_32": rate,
+                            "audio_output_updated": output.is_some(),
+                        }),
+                    );
                 },
                 messages::PAUSE => {
-                    shared.scene.pause_playback(identity).map_err(ControlError::state)?;
-                    if let Some(output) = output {
+                    shared
+                        .scene
+                        .pause_playback(identity)
+                        .map_err(|message| ControlError::state(message).with_track(identity))?;
+                    if let Some(output) = &output {
                         output.pause();
                     }
+                    let revision_after = shared
+                        .scene
+                        .track_status(identity)
+                        .map_or(before.state.revision.get(), |status| status.state.revision.get());
+                    shared.trace(
+                        trace::TraceCategory::Playback,
+                        "pause_applied",
+                        Some(identity),
+                        serde_json::json!({
+                            "operation": "pause",
+                            "request_id": request_id,
+                            "control_record_sequence": record.sequence,
+                            "record_type": record.record_type,
+                            "object_id": record.object_id,
+                            "track_revision_before": before.state.revision.get(),
+                            "track_revision_after": revision_after,
+                            "channel_generation": before.state.channel_generation.get(),
+                            "audio_output_updated": output.is_some(),
+                        }),
+                    );
                 },
                 messages::FLUSH => {
                     let epoch = StrictMap::new("FLUSH", &value, &[0, 1, 2, 3])
-                        .map_err(|_| ControlError::bad_message("invalid FLUSH schema"))?
+                        .map_err(|_| {
+                            ControlError::bad_message("invalid FLUSH schema").with_track(identity)
+                        })?
                         .required_u64(3)
                         .ok()
                         .and_then(|value| u32::try_from(value).ok())
-                        .ok_or_else(|| ControlError::bad_message("FLUSH epoch"))?;
-                    shared.scene.flush_playback(identity, epoch).map_err(ControlError::state)?;
-                    if let Some(output) = output {
+                        .ok_or_else(|| {
+                            ControlError::bad_message("FLUSH epoch").with_track(identity)
+                        })?;
+                    shared
+                        .scene
+                        .flush_playback(identity, epoch)
+                        .map_err(|message| ControlError::state(message).with_track(identity))?;
+                    if let Some(output) = &output {
                         output.flush();
                     }
+                    let revision_after = shared
+                        .scene
+                        .track_status(identity)
+                        .map_or(before.state.revision.get(), |status| status.state.revision.get());
+                    shared.trace(
+                        trace::TraceCategory::Playback,
+                        "flush_applied",
+                        Some(identity),
+                        serde_json::json!({
+                            "operation": "flush",
+                            "request_id": request_id,
+                            "control_record_sequence": record.sequence,
+                            "record_type": record.record_type,
+                            "object_id": record.object_id,
+                            "track_revision_before": before.state.revision.get(),
+                            "track_revision_after": revision_after,
+                            "channel_generation": before.state.channel_generation.get(),
+                            "previous_media_epoch": before.state.media_epoch,
+                            "media_epoch": epoch,
+                            "audio_output_updated": output.is_some(),
+                        }),
+                    );
                 },
                 messages::DRAIN => {
                     if let Some(output) = output {
-                        output.signal_eos();
                         pending
                             .register(Pending::AudioDrain {
                                 request_id,
                                 object_id: record.object_id,
                                 identity,
-                                generation: status.state.channel_generation,
-                                output,
+                                generation: before.state.channel_generation,
+                                output: output.clone(),
                             })
                             .map_err(|_| ControlError {
                                 code: messages::ERROR_LIMIT_EXCEEDED,
                                 message: "pending request capacity is exhausted",
+                                track: Some(identity),
+                                trace_rejection: true,
                             })?;
+                        output.signal_eos();
+                        shared.trace(
+                            trace::TraceCategory::Playback,
+                            "drain_applied",
+                            Some(identity),
+                            serde_json::json!({
+                                "operation": "drain",
+                                "request_id": request_id,
+                                "control_record_sequence": record.sequence,
+                                "record_type": record.record_type,
+                                "object_id": record.object_id,
+                                "track_revision_before": before.state.revision.get(),
+                                "track_revision_after": before.state.revision.get(),
+                                "channel_generation": before.state.channel_generation.get(),
+                                "completion_pending": true,
+                            }),
+                        );
                         return Ok(None);
                     }
                     shared
                         .scene
-                        .mark_buffered_ended(identity, status.state.channel_generation)
-                        .map_err(ControlError::state)?;
+                        .mark_buffered_ended(identity, before.state.channel_generation)
+                        .map_err(|message| ControlError::state(message).with_track(identity))?;
+                    let revision_after = shared
+                        .scene
+                        .track_status(identity)
+                        .map_or(before.state.revision.get(), |status| status.state.revision.get());
+                    shared.trace(
+                        trace::TraceCategory::Playback,
+                        "drain_applied",
+                        Some(identity),
+                        serde_json::json!({
+                            "operation": "drain",
+                            "request_id": request_id,
+                            "control_record_sequence": record.sequence,
+                            "record_type": record.record_type,
+                            "object_id": record.object_id,
+                            "track_revision_before": before.state.revision.get(),
+                            "track_revision_after": revision_after,
+                            "channel_generation": before.state.channel_generation.get(),
+                            "completion_pending": false,
+                        }),
+                    );
                 },
                 _ => unreachable!(),
             }
-            shared.trace(
-                trace::TraceCategory::Playback,
-                match record.record_type {
-                    messages::PLAY => "play_applied",
-                    messages::PAUSE => "pause_applied",
-                    messages::FLUSH => "flush_applied",
-                    messages::DRAIN => "drain_applied",
-                    _ => unreachable!(),
-                },
-                Some(identity),
-                serde_json::json!({
-                    "channel_generation": status.state.channel_generation.get(),
-                    "track_revision": status.state.revision.get(),
-                }),
-            );
             (messages::OK, record.object_id, Ok(messages::ok(request_id)))
         },
         messages::SET_OBSERVATION => {
@@ -2816,8 +3077,220 @@ fn dispatch_control(
             ));
         },
     };
-    let body = reply.2.map_err(|_| ControlError::bad_message("reply encoding failed"))?;
+    let body = reply.2.map_err(|_| {
+        ControlError::bad_message("reply encoding failed").without_rejection_trace()
+    })?;
     Ok(Some((reply.0, reply.1, body)))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChannelFailureKind {
+    ProtocolFraming,
+    TransportRead,
+    TransportWrite,
+    RateLimit,
+    FlowControl,
+    RecordIdentity,
+    RecordType,
+    MediaParse,
+    MediaAdmission,
+    Decode,
+    AudioOutput,
+    SceneState,
+    InternalState,
+}
+
+impl ChannelFailureKind {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::ProtocolFraming => "protocol_framing",
+            Self::TransportRead => "transport_read",
+            Self::TransportWrite => "transport_write",
+            Self::RateLimit => "rate_limit",
+            Self::FlowControl => "flow_control",
+            Self::RecordIdentity => "record_identity",
+            Self::RecordType => "record_type",
+            Self::MediaParse => "media_parse",
+            Self::MediaAdmission => "media_admission",
+            Self::Decode => "decode",
+            Self::AudioOutput => "audio_output",
+            Self::SceneState => "scene_state",
+            Self::InternalState => "internal_state",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ChannelRecordContext {
+    record_type: Option<u16>,
+    record_sequence: Option<u64>,
+    body_bytes: Option<u64>,
+    media_epoch: Option<u32>,
+    media_id: Option<u64>,
+    pts_us: Option<i64>,
+}
+
+impl ChannelRecordContext {
+    fn begin_record(&mut self, record_type: u16, record_sequence: u64, body_bytes: usize) {
+        *self = Self {
+            record_type: Some(record_type),
+            record_sequence: Some(record_sequence),
+            body_bytes: Some(u64::try_from(body_bytes).unwrap_or(u64::MAX)),
+            ..Self::default()
+        };
+    }
+
+    fn media(&mut self, epoch: u32, media_id: u64, pts_us: i64) {
+        self.media_epoch = Some(epoch);
+        self.media_id = Some(media_id);
+        self.pts_us = Some(pts_us);
+    }
+
+    fn json(self) -> serde_json::Value {
+        serde_json::json!({
+            "record_type": self.record_type,
+            "record_sequence": self.record_sequence,
+            "body_bytes": self.body_bytes,
+            "media_epoch": self.media_epoch,
+            "media_id": self.media_id,
+            "pts_us": self.pts_us,
+        })
+    }
+}
+
+#[derive(Debug)]
+struct ChannelFailure {
+    kind: ChannelFailureKind,
+    error: io::Error,
+    context: ChannelRecordContext,
+}
+
+impl ChannelFailure {
+    fn io(kind: ChannelFailureKind, error: io::Error, context: ChannelRecordContext) -> Self {
+        Self { kind, error, context }
+    }
+
+    fn other(
+        kind: ChannelFailureKind,
+        error: impl std::fmt::Display,
+        context: ChannelRecordContext,
+    ) -> Self {
+        Self::io(kind, io::Error::other(error.to_string()), context)
+    }
+
+    fn message(
+        kind: ChannelFailureKind,
+        error_kind: ErrorKind,
+        message: &'static str,
+        context: ChannelRecordContext,
+    ) -> Self {
+        Self::io(kind, io::Error::new(error_kind, message), context)
+    }
+
+    fn read(error: io::Error, context: ChannelRecordContext) -> Self {
+        let kind = if error.kind() == ErrorKind::InvalidData {
+            ChannelFailureKind::ProtocolFraming
+        } else {
+            ChannelFailureKind::TransportRead
+        };
+        Self::io(kind, error, context)
+    }
+
+    fn protocol_error_code(&self) -> u64 {
+        match self.kind {
+            ChannelFailureKind::RateLimit => messages::ERROR_RATE_LIMITED,
+            ChannelFailureKind::FlowControl | ChannelFailureKind::MediaAdmission => {
+                messages::ERROR_FLOW_CONTROL
+            },
+            ChannelFailureKind::AudioOutput => messages::ERROR_DEVICE_LOST,
+            _ if matches!(
+                self.error.kind(),
+                ErrorKind::NotFound | ErrorKind::NotConnected | ErrorKind::BrokenPipe
+            ) =>
+            {
+                messages::ERROR_DEVICE_LOST
+            },
+            _ => messages::ERROR_DECODER,
+        }
+    }
+
+    fn diagnostic(&self) -> String {
+        sanitize_trace_diagnostic(&self.error.to_string())
+    }
+
+    fn json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "kind": self.kind.name(),
+            "io_kind": io_error_kind_name(self.error.kind()),
+            "error_code": self.protocol_error_code(),
+            "diagnostic": self.diagnostic(),
+        })
+    }
+}
+
+fn sanitize_trace_diagnostic(input: &str) -> String {
+    const MAXIMUM_BYTES: usize = 1_024;
+    let mut output = String::new();
+    for character in input.chars() {
+        let character = if character.is_control() { ' ' } else { character };
+        if output.len().saturating_add(character.len_utf8()) > MAXIMUM_BYTES {
+            break;
+        }
+        output.push(character);
+    }
+    output
+}
+
+fn io_error_kind_name(kind: ErrorKind) -> &'static str {
+    match kind {
+        ErrorKind::NotFound => "not_found",
+        ErrorKind::PermissionDenied => "permission_denied",
+        ErrorKind::ConnectionRefused => "connection_refused",
+        ErrorKind::ConnectionReset => "connection_reset",
+        ErrorKind::ConnectionAborted => "connection_aborted",
+        ErrorKind::NotConnected => "not_connected",
+        ErrorKind::AddrInUse => "address_in_use",
+        ErrorKind::AddrNotAvailable => "address_not_available",
+        ErrorKind::BrokenPipe => "broken_pipe",
+        ErrorKind::AlreadyExists => "already_exists",
+        ErrorKind::WouldBlock => "would_block",
+        ErrorKind::InvalidInput => "invalid_input",
+        ErrorKind::InvalidData => "invalid_data",
+        ErrorKind::TimedOut => "timed_out",
+        ErrorKind::WriteZero => "write_zero",
+        ErrorKind::Interrupted => "interrupted",
+        ErrorKind::Unsupported => "unsupported",
+        ErrorKind::UnexpectedEof => "unexpected_eof",
+        ErrorKind::OutOfMemory => "out_of_memory",
+        ErrorKind::Other => "other",
+        _ => "other",
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn trace_track_channel_rejected(
+    shared: &ServiceShared,
+    track: Option<TrackIdentity>,
+    request_id: u64,
+    record_sequence: u64,
+    channel_generation: Option<u64>,
+    error_code: u64,
+    reason: &'static str,
+    authenticated: bool,
+) {
+    shared.trace(
+        trace::TraceCategory::Lifecycle,
+        "track_channel_rejected",
+        track,
+        serde_json::json!({
+            "request_id": request_id,
+            "record_sequence": record_sequence,
+            "channel_generation": channel_generation,
+            "error_code": error_code,
+            "reason": reason,
+            "authenticated": authenticated,
+        }),
+    );
 }
 
 fn handle_track_channel(
@@ -2827,24 +3300,101 @@ fn handle_track_channel(
 ) -> io::Result<()> {
     let writer = Arc::new(reader.writer(ConnectionKind::Track)?);
     let first = reader.read_record(ConnectionKind::Track)?;
-    let envelope = messages::decode_control(&first.body)?;
+    let envelope = match messages::decode_control(&first.body) {
+        Ok(envelope) => envelope,
+        Err(error) => {
+            trace_track_channel_rejected(
+                shared,
+                None,
+                0,
+                first.sequence,
+                None,
+                messages::ERROR_BAD_MESSAGE,
+                "invalid_channel_open",
+                false,
+            );
+            return Err(io::Error::other(error));
+        },
+    };
     let request_id = envelope.request_id;
-    let open = ChannelOpen::decode(first.object_id, &first.body)?;
-    let session = lock(&shared.registry)
-        .sessions
-        .get(&open.session_id)
-        .cloned()
-        .ok_or_else(|| io::Error::new(ErrorKind::NotFound, "session does not exist"))?;
-    let identity = track_identity(&session, open.context_id, open.surface_id, open.track_id)
-        .map_err(|error| io::Error::new(ErrorKind::InvalidData, error.message))?;
-    let status = shared
-        .scene
-        .track_status(identity)
-        .ok_or_else(|| io::Error::new(ErrorKind::NotFound, "track does not exist"))?;
+    let open = match ChannelOpen::decode(first.object_id, &first.body) {
+        Ok(open) => open,
+        Err(error) => {
+            trace_track_channel_rejected(
+                shared,
+                None,
+                request_id,
+                first.sequence,
+                None,
+                messages::ERROR_BAD_MESSAGE,
+                "invalid_channel_open",
+                false,
+            );
+            return Err(io::Error::other(error));
+        },
+    };
+    let session = match lock(&shared.registry).sessions.get(&open.session_id).cloned() {
+        Some(session) => session,
+        None => {
+            trace_track_channel_rejected(
+                shared,
+                None,
+                request_id,
+                first.sequence,
+                None,
+                messages::ERROR_NOT_FOUND,
+                "session_not_found",
+                false,
+            );
+            return Err(io::Error::new(ErrorKind::NotFound, "session does not exist"));
+        },
+    };
+    let identity = match track_identity(&session, open.context_id, open.surface_id, open.track_id) {
+        Ok(identity) => identity,
+        Err(error) => {
+            trace_track_channel_rejected(
+                shared,
+                None,
+                request_id,
+                first.sequence,
+                None,
+                error.code,
+                "track_identity_rejected",
+                false,
+            );
+            return Err(io::Error::new(ErrorKind::InvalidData, error.message));
+        },
+    };
+    let status = match shared.scene.track_status(identity) {
+        Some(status) => status,
+        None => {
+            trace_track_channel_rejected(
+                shared,
+                None,
+                request_id,
+                first.sequence,
+                None,
+                messages::ERROR_NOT_FOUND,
+                "track_not_found",
+                false,
+            );
+            return Err(io::Error::new(ErrorKind::NotFound, "track does not exist"));
+        },
+    };
     if status.state.channel_generation.get() != open.channel_generation
         || status.configuration.kind.kind() != open.track_kind
         || status.configuration.lane != open.lane
     {
+        trace_track_channel_rejected(
+            shared,
+            None,
+            request_id,
+            first.sequence,
+            None,
+            messages::ERROR_STALE_CHANNEL_GENERATION,
+            "immutable_track_mismatch",
+            false,
+        );
         writer.write_record(
             messages::ERROR,
             open.track_id,
@@ -2869,6 +3419,16 @@ fn handle_track_channel(
         &open.client_nonce,
     );
     if !auth::verify_tag(&expected_tag, &open.authentication_tag) {
+        trace_track_channel_rejected(
+            shared,
+            None,
+            request_id,
+            first.sequence,
+            None,
+            messages::ERROR_AUTH_FAILED,
+            "authentication_failed",
+            false,
+        );
         writer.write_record(
             messages::ERROR,
             open.track_id,
@@ -2883,7 +3443,19 @@ fn handle_track_channel(
     }
     // The channel tag is proved, so this connection is a media channel that may then wait on its
     // producer for as long as the track lives.
-    pending.authenticated(reader)?;
+    if let Err(error) = pending.authenticated(reader) {
+        trace_track_channel_rejected(
+            shared,
+            Some(identity),
+            request_id,
+            first.sequence,
+            Some(open.channel_generation),
+            messages::ERROR_DEVICE_LOST,
+            "connection_setup_failed",
+            true,
+        );
+        return Err(error);
+    }
     let generation = ChannelGeneration::new(open.channel_generation);
     let (maximum_bytes, maximum_records) = live_channel_flow(&status.configuration);
     let acceptance = vec![
@@ -2907,6 +3479,16 @@ fn handle_track_channel(
         ChannelOpenDecision::Fresh(acceptance) => (acceptance, false),
         ChannelOpenDecision::ExactReplay(acceptance) => (acceptance, true),
         ChannelOpenDecision::Busy => {
+            trace_track_channel_rejected(
+                shared,
+                Some(identity),
+                request_id,
+                first.sequence,
+                Some(generation.get()),
+                messages::ERROR_CHANNEL_BUSY,
+                "channel_busy",
+                true,
+            );
             return Err(send_fatal(
                 &writer,
                 request_id,
@@ -2915,6 +3497,16 @@ fn handle_track_channel(
             ));
         },
         ChannelOpenDecision::DifferentBytes | ChannelOpenDecision::StaleGeneration => {
+            trace_track_channel_rejected(
+                shared,
+                Some(identity),
+                request_id,
+                first.sequence,
+                Some(generation.get()),
+                messages::ERROR_STALE_CHANNEL_GENERATION,
+                "stale_or_different_open",
+                true,
+            );
             return Err(send_fatal(
                 &writer,
                 request_id,
@@ -2924,23 +3516,72 @@ fn handle_track_channel(
         },
     };
     let status = if replayed {
-        shared
-            .scene
-            .track_status(identity)
-            .ok_or_else(|| io::Error::new(ErrorKind::NotFound, "track disappeared"))?
+        match shared.scene.track_status(identity) {
+            Some(status) => status,
+            None => {
+                trace_track_channel_rejected(
+                    shared,
+                    Some(identity),
+                    request_id,
+                    first.sequence,
+                    Some(generation.get()),
+                    messages::ERROR_NOT_FOUND,
+                    "track_disappeared",
+                    true,
+                );
+                return Err(io::Error::new(ErrorKind::NotFound, "track disappeared"));
+            },
+        }
     } else {
-        shared
-            .scene
-            .accept_channel(identity, generation, maximum_bytes, maximum_records)
-            .map_err(io::Error::other)?
+        match shared.scene.accept_channel(identity, generation, maximum_bytes, maximum_records) {
+            Ok(status) => status,
+            Err(error) => {
+                trace_track_channel_rejected(
+                    shared,
+                    Some(identity),
+                    request_id,
+                    first.sequence,
+                    Some(generation.get()),
+                    messages::ERROR_BAD_STATE,
+                    "channel_accept_failed",
+                    true,
+                );
+                return Err(io::Error::other(error));
+            },
+        }
     };
     let mut attachment =
         TrackAttachmentCleanup { shared: shared.clone(), identity, generation, armed: true };
-    writer.write_record(
-        messages::CHANNEL_ACCEPTED,
-        open.track_id,
-        &Envelope::new(request_id, acceptance).encode()?,
-    )?;
+    let acceptance = match Envelope::new(request_id, acceptance).encode() {
+        Ok(acceptance) => acceptance,
+        Err(error) => {
+            trace_track_channel_rejected(
+                shared,
+                Some(identity),
+                request_id,
+                first.sequence,
+                Some(generation.get()),
+                messages::ERROR_BAD_MESSAGE,
+                "channel_accept_reply_failed",
+                true,
+            );
+            return Err(io::Error::other(error));
+        },
+    };
+    if let Err(error) = writer.write_record(messages::CHANNEL_ACCEPTED, open.track_id, &acceptance)
+    {
+        trace_track_channel_rejected(
+            shared,
+            Some(identity),
+            request_id,
+            first.sequence,
+            Some(generation.get()),
+            messages::ERROR_DEVICE_LOST,
+            "channel_accept_write_failed",
+            true,
+        );
+        return Err(error);
+    }
     shared.trace(
         trace::TraceCategory::Lifecycle,
         "track_channel_accepted",
@@ -2949,48 +3590,76 @@ fn handle_track_channel(
             "channel_generation": generation.get(),
             "maximum_body_bytes": maximum_bytes,
             "maximum_media_records": maximum_records,
+            "request_id": request_id,
+            "record_sequence": first.sequence,
+            "replayed": replayed,
         }),
     );
-    reader.set_maximum(status.configuration.maximum_record_body)?;
-    let result = channel_loop(reader, &writer, shared, identity, generation);
+    let result = reader
+        .set_maximum(status.configuration.maximum_record_body)
+        .map_err(|error| {
+            ChannelFailure::io(
+                ChannelFailureKind::InternalState,
+                error,
+                ChannelRecordContext::default(),
+            )
+        })
+        .and_then(|()| channel_loop(reader, &writer, shared, identity, generation));
     attachment.detach();
+    let clean = result.is_ok();
+    let context = match &result {
+        Ok(context) => *context,
+        Err(failure) => failure.context,
+    };
+    let lost_status = if result.is_err() {
+        shared.scene.lose_track(identity, generation).ok().flatten()
+    } else {
+        None
+    };
+    let current_status = lost_status.clone().or_else(|| shared.scene.track_status(identity));
+    let disposition = if lost_status.is_some() {
+        "track_lost"
+    } else {
+        match current_status.as_ref() {
+            None => "owner_removed",
+            Some(status) if status.state.channel_generation != generation => "superseded",
+            Some(_) => "detached",
+        }
+    };
+    let current_generation =
+        current_status.as_ref().map(|status| status.state.channel_generation.get());
+    let failure_json = result.as_ref().err().map(ChannelFailure::json);
     shared.trace(
         trace::TraceCategory::Lifecycle,
         "track_channel_detached",
         Some(identity),
         serde_json::json!({
             "channel_generation": generation.get(),
-            "clean": result.is_ok(),
+            "current_channel_generation": current_generation,
+            "clean": clean,
+            "outcome": if clean { "clean" } else { "failed" },
+            "disposition": disposition,
+            "last_record": context.json(),
+            "failure": failure_json,
         }),
     );
-    if let Err(error) = &result {
-        let status = shared.scene.lose_track(identity, generation).ok().flatten();
-        let Some(status) = status else {
-            // The failed transport was superseded or its owner already removed the track. Its
-            // error belongs to that retired generation and must not poison the current one.
-            return result;
-        };
+    if let (Err(failure), Some(status)) = (&result, lost_status) {
         stop_failed_audio_output(&shared.audio_outputs, identity);
+        let error_code = failure.protocol_error_code();
+        let diagnostic = failure.diagnostic();
         shared.trace(
             trace::TraceCategory::Lifecycle,
             "track_lost",
             Some(identity),
-            serde_json::json!({"channel_generation": generation.get()}),
+            serde_json::json!({
+                "channel_generation": generation.get(),
+                "current_channel_generation": status.state.channel_generation.get(),
+                "last_record": failure.context.json(),
+                "failure": failure.json(),
+                "error_code": error_code,
+            }),
         );
         shared.request_frame_wake();
-        let diagnostic = error.to_string().chars().take(4_096).collect::<String>();
-        let error_code = if diagnostic.contains("rate exceeded") {
-            messages::ERROR_RATE_LIMITED
-        } else if diagnostic.contains("flow allowance") {
-            messages::ERROR_FLOW_CONTROL
-        } else if matches!(
-            error.kind(),
-            ErrorKind::NotFound | ErrorKind::NotConnected | ErrorKind::BrokenPipe
-        ) {
-            messages::ERROR_DEVICE_LOST
-        } else {
-            messages::ERROR_DECODER
-        };
         let body = Envelope::new(
             0,
             vec![
@@ -3008,7 +3677,10 @@ fn handle_track_channel(
         // cannot hold a media connection open past its own failure.
         session.post_control(messages::TRACK_LOST, identity.track_id, body);
     }
-    result
+    match result {
+        Ok(_) => Ok(()),
+        Err(failure) => Err(failure.error),
+    }
 }
 
 /// Keep video flow within its declared live-latency horizon, but reserve two seconds for live
@@ -3149,21 +3821,40 @@ fn channel_loop(
     shared: &Arc<ServiceShared>,
     identity: TrackIdentity,
     generation: ChannelGeneration,
-) -> io::Result<()> {
-    let status = shared
-        .scene
-        .track_status(identity)
-        .ok_or_else(|| io::Error::new(ErrorKind::NotFound, "track disappeared"))?;
+) -> Result<ChannelRecordContext, ChannelFailure> {
+    let mut context = ChannelRecordContext::default();
+    macro_rules! channel_io {
+        ($kind:expr, $expression:expr) => {
+            $expression.map_err(|error| ChannelFailure::io($kind, error, context))?
+        };
+    }
+    macro_rules! channel_other {
+        ($kind:expr, $expression:expr) => {
+            $expression.map_err(|error| ChannelFailure::other($kind, error, context))?
+        };
+    }
+
+    let status = shared.scene.track_status(identity).ok_or_else(|| {
+        ChannelFailure::message(
+            ChannelFailureKind::InternalState,
+            ErrorKind::NotFound,
+            "track disappeared",
+            context,
+        )
+    })?;
     let configuration = status.configuration;
     let mut video_decoder = match &configuration.kind {
-        KindConfiguration::Video(video) => Some(Decoder::new(video, configuration.mode)?),
+        KindConfiguration::Video(video) => {
+            Some(channel_io!(ChannelFailureKind::Decode, Decoder::new(video, configuration.mode)))
+        },
         _ => None,
     };
     let mut audio = match &configuration.kind {
         KindConfiguration::Audio(audio_configuration) => {
-            let output = AudioOutput::open()?;
+            let output = channel_io!(ChannelFailureKind::AudioOutput, AudioOutput::open());
             output.set_gain(status.audio_gain);
-            let decoder = output.decoder(audio_configuration)?;
+            let decoder =
+                channel_io!(ChannelFailureKind::Decode, output.decoder(audio_configuration));
             if configuration.mode == vivid_protocol::track::TrackMode::Live {
                 output.start();
             }
@@ -3195,13 +3886,16 @@ fn channel_loop(
         let mut recovery_unit = false;
         let header = match reader.read_record_into(ConnectionKind::Track, &mut body) {
             Ok(header) => header,
-            Err(error) if error.kind() == ErrorKind::UnexpectedEof => return Ok(()),
-            Err(error) => return Err(error),
+            Err(error) if error.kind() == ErrorKind::UnexpectedEof => return Ok(context),
+            Err(error) => return Err(ChannelFailure::read(error, context)),
         };
+        context.begin_record(header.record_type, header.sequence, body.len());
         if header.object_id != identity.track_id {
-            return Err(io::Error::new(
+            return Err(ChannelFailure::message(
+                ChannelFailureKind::RecordIdentity,
                 ErrorKind::InvalidData,
                 "media record object ID does not match the track",
+                context,
             ));
         }
         if matches!(
@@ -3211,25 +3905,34 @@ fn channel_loop(
                 | messages::RASTER_FRAME
                 | messages::IMAGE_DATA
         ) {
-            pace_ingress(
-                &mut byte_bucket,
-                &mut record_bucket,
-                &mut last_rate_update,
-                u64::try_from(body.len()).unwrap_or(u64::MAX),
-            )?;
-            lock(&shared.registry)
-                .channel_opens
-                .get_mut(&identity)
-                .ok_or_else(|| io::Error::other("channel-open state disappeared"))?
-                .admit_media(generation)
-                .map_err(io::Error::other)?;
+            channel_io!(
+                ChannelFailureKind::RateLimit,
+                pace_ingress(
+                    &mut byte_bucket,
+                    &mut record_bucket,
+                    &mut last_rate_update,
+                    u64::try_from(body.len()).unwrap_or(u64::MAX),
+                )
+            );
+            let mut registry = lock(&shared.registry);
+            let channel = registry.channel_opens.get_mut(&identity).ok_or_else(|| {
+                ChannelFailure::message(
+                    ChannelFailureKind::InternalState,
+                    ErrorKind::Other,
+                    "channel-open state disappeared",
+                    context,
+                )
+            })?;
+            channel_other!(ChannelFailureKind::InternalState, channel.admit_media(generation));
         }
         match header.record_type {
             messages::RASTER_FRAME => {
                 let KindConfiguration::Raster(raster) = &configuration.kind else {
-                    return Err(io::Error::new(
+                    return Err(ChannelFailure::message(
+                        ChannelFailureKind::RecordType,
                         ErrorKind::InvalidData,
                         "RASTER_FRAME used a non-raster track",
+                        context,
                     ));
                 };
                 let (frame, media_epoch) = if let Ok(parsed) = media::parse_full_raster_frame(&body)
@@ -3238,9 +3941,11 @@ fn channel_loop(
                         || parsed.height != raster.height
                         || (parsed.compressed && !raster.zstd_enabled)
                     {
-                        return Err(io::Error::new(
+                        return Err(ChannelFailure::message(
+                            ChannelFailureKind::MediaParse,
                             ErrorKind::InvalidData,
                             "raster frame differs from immutable configuration",
+                            context,
                         ));
                     }
                     let media_epoch = parsed.epoch;
@@ -3252,58 +3957,82 @@ fn channel_loop(
                         sar_num: 1,
                         sar_den: 1,
                         alpha_mode: raster.alpha_mode,
-                        rgba: Arc::new(RgbaBuffer::new(media::decode_raster_pixels(parsed)?)),
+                        rgba: Arc::new(RgbaBuffer::new(channel_io!(
+                            ChannelFailureKind::Decode,
+                            media::decode_raster_pixels(parsed)
+                        ))),
                         damage: None,
                     };
                     (frame, media_epoch)
                 } else {
                     if !raster.delta_enabled {
-                        return Err(io::Error::new(
+                        return Err(ChannelFailure::message(
+                            ChannelFailureKind::RecordType,
                             ErrorKind::InvalidData,
                             "raster delta was not negotiated",
+                            context,
                         ));
                     }
-                    let delta = media::parse_delta_raster_frame(
-                        &body,
-                        raster.width,
-                        raster.height,
-                        u32::from(raster.maximum_delta_operations),
-                    )?;
+                    let delta = channel_io!(
+                        ChannelFailureKind::MediaParse,
+                        media::parse_delta_raster_frame(
+                            &body,
+                            raster.width,
+                            raster.height,
+                            u32::from(raster.maximum_delta_operations),
+                        )
+                    );
                     let media_epoch = delta.epoch;
                     let Some(base) = shared.scene.latest_frame(identity) else {
                         // Media §13: no base, so ask for a full frame instead of losing the track.
                         request_full_frame(writer, identity, generation, NEED_FULL_FRAME_NO_BASE);
                         continue;
                     };
-                    (apply_raster_delta(&base, delta)?, media_epoch)
+                    (
+                        channel_io!(ChannelFailureKind::Decode, apply_raster_delta(&base, delta)),
+                        media_epoch,
+                    )
                 };
-                shared
-                    .scene
-                    .publish_frame(
+                context.media(media_epoch, frame.frame_id, frame.pts_us);
+                let body_length = u32::try_from(body.len()).map_err(|_| {
+                    ChannelFailure::message(
+                        ChannelFailureKind::MediaParse,
+                        ErrorKind::InvalidData,
+                        "raster record exceeds u32",
+                        context,
+                    )
+                })?;
+                channel_other!(
+                    ChannelFailureKind::MediaAdmission,
+                    shared.scene.publish_frame(
                         identity,
                         generation,
-                        u32::try_from(body.len()).map_err(|_| {
-                            io::Error::new(ErrorKind::InvalidData, "raster record exceeds u32")
-                        })?,
+                        body_length,
                         media_epoch,
                         frame.frame_id,
                         frame.damage.is_none(),
                         header.sequence,
                         frame,
                     )
-                    .map_err(io::Error::other)?;
+                );
                 shared.request_frame_wake();
             },
             messages::IMAGE_DATA => {
-                let status = shared
-                    .scene
-                    .track_status(identity)
-                    .ok_or_else(|| io::Error::new(ErrorKind::NotFound, "track disappeared"))?;
+                let status = shared.scene.track_status(identity).ok_or_else(|| {
+                    ChannelFailure::message(
+                        ChannelFailureKind::InternalState,
+                        ErrorKind::NotFound,
+                        "track disappeared",
+                        context,
+                    )
+                })?;
                 let KindConfiguration::EncodedImage(configuration) = status.configuration.kind
                 else {
-                    return Err(io::Error::new(
+                    return Err(ChannelFailure::message(
+                        ChannelFailureKind::RecordType,
                         ErrorKind::InvalidData,
                         "IMAGE_DATA used a non-image track",
+                        context,
                     ));
                 };
                 if body.len() != configuration.encoded_length as usize
@@ -3312,32 +4041,44 @@ fn channel_loop(
                         actual != expected
                     })
                 {
-                    return Err(io::Error::new(
+                    return Err(ChannelFailure::message(
+                        ChannelFailureKind::MediaParse,
                         ErrorKind::InvalidData,
                         "encoded image length or hash differs from immutable configuration",
+                        context,
                     ));
                 }
-                let image = image::load_from_memory_with_format(
-                    &body,
-                    image_format(configuration.encoding)?,
+                let format =
+                    channel_io!(ChannelFailureKind::Decode, image_format(configuration.encoding));
+                let image = channel_other!(
+                    ChannelFailureKind::Decode,
+                    image::load_from_memory_with_format(&body, format)
                 )
-                .map_err(io::Error::other)?
                 .to_rgba8();
                 let (width, height) = image.dimensions();
                 if width != configuration.width || height != configuration.height {
-                    return Err(io::Error::new(
+                    return Err(ChannelFailure::message(
+                        ChannelFailureKind::Decode,
                         ErrorKind::InvalidData,
                         "decoded image dimensions differ from immutable configuration",
+                        context,
                     ));
                 }
-                shared
-                    .scene
-                    .publish_frame(
+                context.media(0, 1, 0);
+                let body_length = u32::try_from(body.len()).map_err(|_| {
+                    ChannelFailure::message(
+                        ChannelFailureKind::MediaParse,
+                        ErrorKind::InvalidData,
+                        "image record exceeds u32",
+                        context,
+                    )
+                })?;
+                channel_other!(
+                    ChannelFailureKind::MediaAdmission,
+                    shared.scene.publish_frame(
                         identity,
                         generation,
-                        u32::try_from(body.len()).map_err(|_| {
-                            io::Error::new(ErrorKind::InvalidData, "image record exceeds u32")
-                        })?,
+                        body_length,
                         0,
                         1,
                         true,
@@ -3354,16 +4095,20 @@ fn channel_loop(
                             damage: None,
                         },
                     )
-                    .map_err(io::Error::other)?;
+                );
                 shared.request_frame_wake();
             },
             messages::VIDEO_PACKET => {
-                let packet = media::parse_video_packet(&body)?;
+                let packet = channel_other!(
+                    ChannelFailureKind::MediaParse,
+                    media::parse_video_packet(&body)
+                );
                 let random_access = packet.flags & media::VIDEO_PACKET_KEY != 0;
                 recovery_unit = random_access;
                 let packet_epoch = packet.epoch;
                 let packet_id = packet.packet_id;
                 let packet_pts_us = packet.pts_us;
+                context.media(packet_epoch, packet_id, packet_pts_us);
                 if random_access {
                     shared.trace(
                         trace::TraceCategory::Recovery,
@@ -3384,20 +4129,26 @@ fn channel_loop(
                 // unit: the producer cannot observe OUTPUT_READY or issue PLAY until its record
                 // write completes. Later records remain paced against the playback clock.
                 let priming_record = shared.scene.latest_frame(identity).is_none();
-                shared
-                    .scene
-                    .admit_media(
+                let body_length = u32::try_from(body.len()).map_err(|_| {
+                    ChannelFailure::message(
+                        ChannelFailureKind::MediaParse,
+                        ErrorKind::InvalidData,
+                        "video record exceeds u32",
+                        context,
+                    )
+                })?;
+                channel_other!(
+                    ChannelFailureKind::MediaAdmission,
+                    shared.scene.admit_media(
                         identity,
                         generation,
-                        u32::try_from(body.len()).map_err(|_| {
-                            io::Error::new(ErrorKind::InvalidData, "video record exceeds u32")
-                        })?,
+                        body_length,
                         packet.epoch,
                         packet.packet_id,
                         random_access,
                         header.sequence,
                     )
-                    .map_err(io::Error::other)?;
+                );
                 let linked_audio =
                     shared.scene.active_track(identity.surface, scene::SLOT_AUDIO).and_then(
                         |audio_identity| lock(&shared.audio_outputs).get(&audio_identity).cloned(),
@@ -3468,9 +4219,11 @@ fn channel_loop(
                 let frames = video_decoder
                     .as_mut()
                     .ok_or_else(|| {
-                        io::Error::new(
+                        ChannelFailure::message(
+                            ChannelFailureKind::RecordType,
                             ErrorKind::InvalidData,
                             "VIDEO_PACKET used a non-video track",
+                            context,
                         )
                     })?
                     .push_discarding_before(packet, discard_before);
@@ -3506,10 +4259,14 @@ fn channel_loop(
                     );
                 }
                 if discarded != 0 || requested_keyframe {
-                    shared
-                        .scene
-                        .record_late_video_discard(identity, discarded, requested_keyframe)
-                        .map_err(io::Error::other)?;
+                    channel_other!(
+                        ChannelFailureKind::SceneState,
+                        shared.scene.record_late_video_discard(
+                            identity,
+                            discarded,
+                            requested_keyframe,
+                        )
+                    );
                 }
                 for decoded in frames {
                     let (sar_num, sar_den) = match &configuration.kind {
@@ -3519,16 +4276,19 @@ fn channel_loop(
                         ),
                         _ => unreachable!(),
                     };
-                    wait_until_video_due(
-                        shared,
-                        identity,
-                        decoded.pts_us,
-                        priming_record,
-                        configuration.mode == TrackMode::Live,
-                    )?;
-                    shared
-                        .scene
-                        .publish_decoded_frame(
+                    channel_io!(
+                        ChannelFailureKind::SceneState,
+                        wait_until_video_due(
+                            shared,
+                            identity,
+                            decoded.pts_us,
+                            priming_record,
+                            configuration.mode == TrackMode::Live,
+                        )
+                    );
+                    channel_other!(
+                        ChannelFailureKind::SceneState,
+                        shared.scene.publish_decoded_frame(
                             identity,
                             generation,
                             Frame {
@@ -3543,30 +4303,45 @@ fn channel_loop(
                                 damage: None,
                             },
                         )
-                        .map_err(io::Error::other)?;
+                    );
                     shared.request_frame_wake();
                 }
             },
             messages::AUDIO_PACKET => {
-                let packet = media::parse_audio_packet(&body)?;
-                shared
-                    .scene
-                    .admit_media(
+                let packet = channel_other!(
+                    ChannelFailureKind::MediaParse,
+                    media::parse_audio_packet(&body)
+                );
+                context.media(packet.epoch, packet.packet_id, packet.pts_us);
+                let body_length = u32::try_from(body.len()).map_err(|_| {
+                    ChannelFailure::message(
+                        ChannelFailureKind::MediaParse,
+                        ErrorKind::InvalidData,
+                        "audio record exceeds u32",
+                        context,
+                    )
+                })?;
+                channel_other!(
+                    ChannelFailureKind::MediaAdmission,
+                    shared.scene.admit_media(
                         identity,
                         generation,
-                        u32::try_from(body.len()).map_err(|_| {
-                            io::Error::new(ErrorKind::InvalidData, "audio record exceeds u32")
-                        })?,
+                        body_length,
                         packet.epoch,
                         packet.packet_id,
                         true,
                         header.sequence,
                     )
-                    .map_err(io::Error::other)?;
+                );
                 let (output, decoder) = audio.as_mut().ok_or_else(|| {
-                    io::Error::new(ErrorKind::InvalidData, "AUDIO_PACKET used a non-audio track")
+                    ChannelFailure::message(
+                        ChannelFailureKind::RecordType,
+                        ErrorKind::InvalidData,
+                        "AUDIO_PACKET used a non-audio track",
+                        context,
+                    )
                 })?;
-                let mut samples = decoder.push(packet)?;
+                let mut samples = channel_io!(ChannelFailureKind::Decode, decoder.push(packet));
                 // Classify the timeline step before reacting to it. A forward gap is a producer
                 // that dropped packets: the timeline is intact and silence of the gap's length
                 // keeps the clock honest. Only a backward jump is a restarted clock, and only that
@@ -3581,11 +4356,17 @@ fn channel_loop(
                     AudioTimelineStep::Gap(gap_us) => {
                         output.bridge_live_gap(gap_us);
                         output.observe_audio_pts(packet.pts_us);
-                        shared.scene.record_audio_rebase(identity).map_err(io::Error::other)?;
+                        channel_other!(
+                            ChannelFailureKind::SceneState,
+                            shared.scene.record_audio_rebase(identity)
+                        );
                     },
                     AudioTimelineStep::Restart => {
                         output.rebase_live(packet.pts_us);
-                        shared.scene.record_audio_rebase(identity).map_err(io::Error::other)?;
+                        channel_other!(
+                            ChannelFailureKind::SceneState,
+                            shared.scene.record_audio_rebase(identity)
+                        );
                     },
                 }
                 expected_audio_pts_us = Some(
@@ -3594,51 +4375,71 @@ fn channel_loop(
                         .saturating_add(i64::try_from(packet.duration_us).unwrap_or(i64::MAX)),
                 );
                 output.trim_before_start(packet.pts_us, packet.duration_us, &mut samples);
-                output.push(&samples)?;
-                shared.scene.mark_output_ready(identity, generation).map_err(io::Error::other)?;
+                channel_io!(ChannelFailureKind::AudioOutput, output.push(&samples));
+                channel_other!(
+                    ChannelFailureKind::SceneState,
+                    shared.scene.mark_output_ready(identity, generation)
+                );
             },
             messages::CHANNEL_EOS => {
-                let envelope = messages::decode_control(&body)?;
+                let envelope =
+                    channel_other!(ChannelFailureKind::MediaParse, messages::decode_control(&body));
                 if envelope.request_id != 0 {
-                    return Err(io::Error::new(
+                    return Err(ChannelFailure::message(
+                        ChannelFailureKind::MediaParse,
                         ErrorKind::InvalidData,
                         "CHANNEL_EOS must be uncorrelated",
+                        context,
                     ));
                 }
                 let value = Value::Map(envelope.payload);
-                let eos = StrictMap::new("CHANNEL_EOS", &value, &[0, 1, 2, 3, 4, 5])
-                    .map_err(io::Error::other)?;
+                let eos = channel_other!(
+                    ChannelFailureKind::MediaParse,
+                    StrictMap::new("CHANNEL_EOS", &value, &[0, 1, 2, 3, 4, 5])
+                );
                 let eos_epoch = eos
                     .required_u64(4)
                     .ok()
                     .and_then(|value| u32::try_from(value).ok())
                     .ok_or_else(|| {
-                        io::Error::new(ErrorKind::InvalidData, "invalid CHANNEL_EOS media epoch")
+                        ChannelFailure::message(
+                            ChannelFailureKind::MediaParse,
+                            ErrorKind::InvalidData,
+                            "invalid CHANNEL_EOS media epoch",
+                            context,
+                        )
                     })?;
+                context.media(
+                    eos_epoch,
+                    shared
+                        .scene
+                        .track_status(identity)
+                        .map_or(0, |status| status.state.last_media_id),
+                    0,
+                );
                 if eos.required_u64(0).ok() != Some(identity.surface.context.context_id)
                     || eos.required_u64(1).ok() != Some(identity.surface.surface_id)
                     || eos.required_u64(2).ok() != Some(identity.track_id)
                     || eos.required_u64(3).ok() != Some(generation.get())
                 {
-                    return Err(io::Error::new(
+                    return Err(ChannelFailure::message(
+                        ChannelFailureKind::RecordIdentity,
                         ErrorKind::InvalidData,
                         "CHANNEL_EOS does not name this track generation",
+                        context,
                     ));
                 }
-                shared
-                    .scene
-                    .mark_eos(
-                        identity,
-                        generation,
-                        eos_epoch,
-                        eos.required_u64(5).map_err(io::Error::other)?,
-                    )
-                    .map_err(io::Error::other)?;
+                let last_record_sequence =
+                    channel_other!(ChannelFailureKind::MediaParse, eos.required_u64(5));
+                channel_other!(
+                    ChannelFailureKind::SceneState,
+                    shared.scene.mark_eos(identity, generation, eos_epoch, last_record_sequence,)
+                );
                 if let Some(decoder) = video_decoder.as_mut() {
                     // CHANNEL_EOS is also one channel record. If draining it produces the first
                     // output, complete that bounded priming unit before waiting for PLAY.
                     let priming_record = shared.scene.latest_frame(identity).is_none();
-                    for decoded in decoder.finish()? {
+                    for decoded in channel_io!(ChannelFailureKind::Decode, decoder.finish()) {
                         let (sar_num, sar_den) = match &configuration.kind {
                             KindConfiguration::Video(configuration) => (
                                 u32::try_from(configuration.aspect_numerator).unwrap_or(u32::MAX),
@@ -3646,16 +4447,19 @@ fn channel_loop(
                             ),
                             _ => unreachable!(),
                         };
-                        wait_until_video_due(
-                            shared,
-                            identity,
-                            decoded.pts_us,
-                            priming_record,
-                            configuration.mode == TrackMode::Live,
-                        )?;
-                        shared
-                            .scene
-                            .publish_decoded_frame(
+                        channel_io!(
+                            ChannelFailureKind::SceneState,
+                            wait_until_video_due(
+                                shared,
+                                identity,
+                                decoded.pts_us,
+                                priming_record,
+                                configuration.mode == TrackMode::Live,
+                            )
+                        );
+                        channel_other!(
+                            ChannelFailureKind::SceneState,
+                            shared.scene.publish_decoded_frame(
                                 identity,
                                 generation,
                                 Frame {
@@ -3674,26 +4478,29 @@ fn channel_loop(
                                     damage: None,
                                 },
                             )
-                            .map_err(io::Error::other)?;
+                        );
                         shared.request_frame_wake();
                     }
-                    shared
-                        .scene
-                        .mark_buffered_ended(identity, generation)
-                        .map_err(io::Error::other)?;
+                    channel_other!(
+                        ChannelFailureKind::SceneState,
+                        shared.scene.mark_buffered_ended(identity, generation)
+                    );
                 }
                 if let Some((output, decoder)) = audio.as_mut() {
-                    output.push(&decoder.finish()?)?;
+                    let samples = channel_io!(ChannelFailureKind::Decode, decoder.finish());
+                    channel_io!(ChannelFailureKind::AudioOutput, output.push(&samples));
                     output.finish_decode();
                     output.signal_eos();
                 }
-                return Ok(());
+                return Ok(context);
             },
             _ if header.flags & RECORD_OPTIONAL != 0 => {},
             _ => {
-                return Err(io::Error::new(
+                return Err(ChannelFailure::message(
+                    ChannelFailureKind::RecordType,
                     ErrorKind::InvalidData,
                     "record is not legal on a track channel",
+                    context,
                 ));
             },
         }
@@ -3704,14 +4511,13 @@ fn channel_loop(
                 | messages::RASTER_FRAME
                 | messages::IMAGE_DATA
         ) {
-            let (maximum_bytes, maximum_records) = shared
-                .scene
-                .return_channel_capacity(identity, generation, body.len() as u64, 1)
-                .map_err(io::Error::other)?;
-            writer.write_record(
-                messages::MAX_CHANNEL_DATA,
-                identity.track_id,
-                &Envelope::new(
+            let (maximum_bytes, maximum_records) = channel_other!(
+                ChannelFailureKind::FlowControl,
+                shared.scene.return_channel_capacity(identity, generation, body.len() as u64, 1,)
+            );
+            let grant = channel_other!(
+                ChannelFailureKind::InternalState,
+                Envelope::new(
                     0,
                     vec![
                         (0, Value::Unsigned(identity.surface.context.context_id)),
@@ -3722,8 +4528,12 @@ fn channel_loop(
                         (5, Value::Unsigned(maximum_records)),
                     ],
                 )
-                .encode()?,
-            )?;
+                .encode()
+            );
+            channel_io!(
+                ChannelFailureKind::TransportWrite,
+                writer.write_record(messages::MAX_CHANNEL_DATA, identity.track_id, &grant,)
+            );
             if recovery_unit || last_flow_trace.elapsed() >= Duration::from_millis(250) {
                 shared.trace(
                     trace::TraceCategory::Flow,
@@ -4339,15 +5149,17 @@ fn require_context_operation(
 struct ControlError {
     code: u64,
     message: &'static str,
+    track: Option<TrackIdentity>,
+    trace_rejection: bool,
 }
 
 impl ControlError {
     const fn bad_message(message: &'static str) -> Self {
-        Self { code: messages::ERROR_BAD_MESSAGE, message }
+        Self { code: messages::ERROR_BAD_MESSAGE, message, track: None, trace_rejection: true }
     }
 
     const fn bad_state(message: &'static str) -> Self {
-        Self { code: messages::ERROR_BAD_STATE, message }
+        Self { code: messages::ERROR_BAD_STATE, message, track: None, trace_rejection: true }
     }
 
     const fn state(message: &'static str) -> Self {
@@ -4355,31 +5167,61 @@ impl ControlError {
     }
 
     const fn not_found(message: &'static str) -> Self {
-        Self { code: messages::ERROR_NOT_FOUND, message }
+        Self { code: messages::ERROR_NOT_FOUND, message, track: None, trace_rejection: true }
     }
 
     const fn precondition(message: &'static str) -> Self {
-        Self { code: messages::ERROR_PRECONDITION_FAILED, message }
+        Self {
+            code: messages::ERROR_PRECONDITION_FAILED,
+            message,
+            track: None,
+            trace_rejection: true,
+        }
     }
 
     const fn stale_target() -> Self {
-        Self { code: registry::error::STALE_TARGET_GENERATION, message: "stale target generation" }
+        Self {
+            code: registry::error::STALE_TARGET_GENERATION,
+            message: "stale target generation",
+            track: None,
+            trace_rejection: true,
+        }
     }
 
     const fn unsupported(message: &'static str) -> Self {
-        Self { code: messages::ERROR_UNSUPPORTED_CONFIG, message }
+        Self {
+            code: messages::ERROR_UNSUPPORTED_CONFIG,
+            message,
+            track: None,
+            trace_rejection: true,
+        }
     }
 
     const fn unsupported_profile(message: &'static str) -> Self {
-        Self { code: messages::ERROR_UNSUPPORTED_PROFILE, message }
+        Self {
+            code: messages::ERROR_UNSUPPORTED_PROFILE,
+            message,
+            track: None,
+            trace_rejection: true,
+        }
     }
 
     const fn duplicate(message: &'static str) -> Self {
-        Self { code: messages::ERROR_DUPLICATE_ID, message }
+        Self { code: messages::ERROR_DUPLICATE_ID, message, track: None, trace_rejection: true }
     }
 
     const fn limit(message: &'static str) -> Self {
-        Self { code: messages::ERROR_LIMIT_EXCEEDED, message }
+        Self { code: messages::ERROR_LIMIT_EXCEEDED, message, track: None, trace_rejection: true }
+    }
+
+    fn with_track(mut self, track: TrackIdentity) -> Self {
+        self.track = Some(track);
+        self
+    }
+
+    fn without_rejection_trace(mut self) -> Self {
+        self.trace_rejection = false;
+        self
     }
 }
 
@@ -4738,6 +5580,33 @@ mod tests {
     }
 
     #[test]
+    fn channel_failure_metadata_is_typed_sanitized_and_bounded() {
+        let mut context = ChannelRecordContext::default();
+        context.begin_record(messages::VIDEO_PACKET, 9, 4_096);
+        context.media(3, 17, 42_000);
+        let diagnostic = format!("stale\n{}", "é".repeat(1_024));
+        let failure = ChannelFailure::io(
+            ChannelFailureKind::MediaAdmission,
+            io::Error::other(diagnostic),
+            context,
+        );
+        let encoded = failure.json();
+        let diagnostic = encoded["diagnostic"].as_str().unwrap();
+        assert!(diagnostic.len() <= 1_024);
+        assert!(!diagnostic.chars().any(char::is_control));
+        assert_eq!(encoded["kind"], serde_json::json!("media_admission"));
+        assert_eq!(encoded["error_code"], serde_json::json!(messages::ERROR_FLOW_CONTROL));
+        assert_eq!(context.json()["record_sequence"], serde_json::json!(9));
+
+        let device = ChannelFailure::io(
+            ChannelFailureKind::AudioOutput,
+            io::Error::other("device stopped"),
+            context,
+        );
+        assert_eq!(device.protocol_error_code(), messages::ERROR_DEVICE_LOST);
+    }
+
+    #[test]
     fn raster_copies_match_snapshot_semantics_for_every_overlap_direction() {
         let cases = [(0, 0, 1, 0), (1, 0, 0, 0), (0, 0, 0, 1), (0, 1, 0, 0), (0, 0, 2, 2)];
         for (source_x, source_y, destination_x, destination_y) in cases {
@@ -5021,6 +5890,278 @@ mod tests {
             opacity: u16::MAX,
             clip: None,
         }
+    }
+
+    #[test]
+    fn track_control_trace_reconstructs_seek_order_and_rejections() {
+        let service =
+            socket_service!(VividService::start_with_wake(test_geometry(), Arc::new(|| {})));
+        let mut session = connect(&service);
+        let context_id = session.info().root_context_id;
+        let surface = grid_surface(&mut session, 70);
+        let track = session
+            .create_track(
+                TrackConfiguration {
+                    context_id,
+                    surface_id: surface.id(),
+                    track_id: 71,
+                    slot: scene::SLOT_RASTER,
+                    mode: TrackMode::Timed,
+                    lane: LaneClass::Bulk,
+                    maximum_record_body: 128,
+                    maximum_rate_millihertz: 60_000,
+                    maximum_encoded_bits_per_second: 1_000_000,
+                    maximum_records_per_second: 60,
+                    maximum_inflight_body_bytes: 4_096,
+                    kind: KindConfiguration::Raster(RasterConfiguration {
+                        width: 2,
+                        height: 2,
+                        alpha_mode: scene::ALPHA_STRAIGHT,
+                        delta_enabled: false,
+                        maximum_delta_operations: 1,
+                        zstd_enabled: false,
+                    }),
+                    target_latency_us: 0,
+                    maximum_latency_us: 1_000_000,
+                    retained_pixel_charge: 4,
+                },
+                &RequestMetadata::default(),
+            )
+            .unwrap();
+        let channel = session.open_track_channel(&track).unwrap();
+        channel.send_raster(0, 1, &[0x11, 0x22, 0x33, 0xff].repeat(4), false).unwrap();
+        session
+            .wait_track(
+                &track,
+                TrackWaitCondition::MilestoneSet,
+                Some(MILESTONE_OUTPUT_READY),
+                1_000_000,
+            )
+            .unwrap();
+        session
+            .activate_tracks(
+                &surface,
+                &[SlotBinding {
+                    slot: scene::SLOT_RASTER,
+                    track_id: track.id(),
+                    expected_channel_generation: track.channel_generation(),
+                    required_milestone: MILESTONE_OUTPUT_READY,
+                }],
+                &RequestMetadata::default(),
+            )
+            .unwrap();
+
+        session.play(&track, 0, 0, 1_000_000).unwrap();
+        session.pause(&track).unwrap();
+        session.flush(&track, 1).unwrap();
+        session.drain(&track).unwrap();
+        session.advance_channel(&track, 1, &RequestMetadata::default()).unwrap();
+
+        let owner =
+            SessionIdentity::new(service.shared.presenter, session.info().session_id).unwrap();
+        let identity =
+            owner.context(context_id).unwrap().surface(surface.id()).unwrap().track(71).unwrap();
+        service.scene.advance_channel(identity).unwrap();
+        assert!(
+            session.advance_channel(&track, 1, &RequestMetadata::default()).is_err(),
+            "a stale SDK generation is rejected"
+        );
+        session.destroy_track(&track, &RequestMetadata::default()).unwrap();
+        drop(channel);
+
+        let batch = service.automation_trace(
+            trace::TraceSelection::Tail,
+            128,
+            trace::TraceFilter {
+                session_id: Some(owner.session_id),
+                context_id: Some(context_id),
+                surface_id: Some(surface.id()),
+                track_id: Some(71),
+                ..trace::TraceFilter::default()
+            },
+        );
+        let names = batch.events.iter().map(|event| event.event.as_str()).collect::<Vec<_>>();
+        for expected in [
+            "track_created",
+            "track_channel_accepted",
+            "play_applied",
+            "pause_applied",
+            "flush_applied",
+            "drain_applied",
+            "channel_advanced",
+            "track_control_rejected",
+            "track_destroyed",
+        ] {
+            assert!(names.contains(&expected), "missing {expected} from {names:?}");
+        }
+        let ordered = ["play_applied", "pause_applied", "flush_applied", "channel_advanced"]
+            .map(|name| names.iter().position(|event| *event == name).unwrap());
+        assert!(ordered.windows(2).all(|pair| pair[0] < pair[1]));
+
+        let rejected =
+            batch.events.iter().find(|event| event.event == "track_control_rejected").unwrap();
+        assert_eq!(rejected.track, Some(identity.into()));
+        assert_eq!(rejected.data["operation"], serde_json::json!("advance_channel"));
+        assert!(rejected.data["control_record_sequence"].as_u64().unwrap() > 0);
+    }
+
+    fn open_raw_track_channel(
+        service: &VividService,
+        identity: TrackIdentity,
+        generation: ChannelGeneration,
+    ) -> io::Result<LocalStream> {
+        let (channel_key, configuration) = {
+            let registry = lock(&service.shared.registry);
+            let session = registry
+                .sessions
+                .get(&identity.surface.context.session.session_id)
+                .ok_or_else(|| io::Error::new(ErrorKind::NotFound, "session disappeared"))?;
+            let status = service
+                .scene
+                .track_status(identity)
+                .ok_or_else(|| io::Error::new(ErrorKind::NotFound, "track disappeared"))?;
+            (*session.channel_key.expose(), status.configuration)
+        };
+        let client_nonce = [0x52; 16];
+        let authentication_tag = auth::channel_tag(
+            &channel_key,
+            identity.surface.context.session.session_id,
+            identity.surface.context.context_id,
+            identity.surface.surface_id,
+            identity.track_id,
+            generation.get(),
+            configuration.kind.kind() as u32,
+            configuration.lane as u32,
+            &client_nonce,
+        );
+        let open = ChannelOpen {
+            session_id: identity.surface.context.session.session_id,
+            context_id: identity.surface.context.context_id,
+            surface_id: identity.surface.surface_id,
+            track_id: identity.track_id,
+            channel_generation: generation.get(),
+            track_kind: configuration.kind.kind(),
+            lane: configuration.lane,
+            client_nonce,
+            authentication_tag,
+        };
+        let envelope = Envelope::correlated(1, open.payload()).map_err(io::Error::other)?;
+        let body = envelope.encode().map_err(io::Error::other)?;
+        let mut stream = connect_endpoint(service.control_endpoint())?;
+        stream.write_all(&vivid_protocol::wire::encode_preface(
+            ConnectionKind::Track,
+            vivid_protocol::HARD_MAX_RECORD_BODY,
+        ))?;
+        write_raw(&mut stream, 1, messages::CHANNEL_OPEN, identity.track_id, &body)?;
+        let accepted = read_raw(&mut stream)?;
+        if accepted.record_type != messages::CHANNEL_ACCEPTED {
+            return Err(io::Error::other("track channel was not accepted"));
+        }
+        Ok(stream)
+    }
+
+    #[test]
+    fn channel_failure_trace_is_typed_and_generation_scoped() {
+        let service =
+            socket_service!(VividService::start_with_wake(test_geometry(), Arc::new(|| {})));
+        let mut session = connect(&service);
+        let context_id = session.info().root_context_id;
+        let surface = grid_surface(&mut session, 72);
+        let track = session
+            .create_track(
+                TrackConfiguration {
+                    context_id,
+                    surface_id: surface.id(),
+                    track_id: 73,
+                    slot: scene::SLOT_RASTER,
+                    mode: TrackMode::Timed,
+                    lane: LaneClass::Bulk,
+                    maximum_record_body: 128,
+                    maximum_rate_millihertz: 60_000,
+                    maximum_encoded_bits_per_second: 1_000_000,
+                    maximum_records_per_second: 60,
+                    maximum_inflight_body_bytes: 4_096,
+                    kind: KindConfiguration::Raster(RasterConfiguration {
+                        width: 2,
+                        height: 2,
+                        alpha_mode: scene::ALPHA_STRAIGHT,
+                        delta_enabled: false,
+                        maximum_delta_operations: 1,
+                        zstd_enabled: false,
+                    }),
+                    target_latency_us: 0,
+                    maximum_latency_us: 1_000_000,
+                    retained_pixel_charge: 4,
+                },
+                &RequestMetadata::default(),
+            )
+            .unwrap();
+        let owner =
+            SessionIdentity::new(service.shared.presenter, session.info().session_id).unwrap();
+        let identity =
+            owner.context(context_id).unwrap().surface(surface.id()).unwrap().track(73).unwrap();
+
+        let first_generation = track.channel_generation();
+        let mut superseded = open_raw_track_channel(&service, identity, first_generation).unwrap();
+        session.advance_channel(&track, 1, &RequestMetadata::default()).unwrap();
+        write_raw(&mut superseded, 2, messages::RASTER_FRAME, identity.track_id + 1, &[]).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let superseded_detach = loop {
+            let batch = service.automation_trace(
+                trace::TraceSelection::Tail,
+                128,
+                trace::TraceFilter {
+                    session_id: Some(owner.session_id),
+                    context_id: Some(context_id),
+                    surface_id: Some(surface.id()),
+                    track_id: Some(identity.track_id),
+                    ..trace::TraceFilter::default()
+                },
+            );
+            if let Some(event) = batch.events.into_iter().find(|event| {
+                event.event == "track_channel_detached"
+                    && event.data["channel_generation"] == serde_json::json!(first_generation.get())
+            }) {
+                break event;
+            }
+            assert!(Instant::now() < deadline, "superseded channel did not detach");
+            thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(superseded_detach.data["disposition"], "superseded");
+        assert_eq!(superseded_detach.data["failure"]["kind"], "record_identity");
+        assert_eq!(superseded_detach.data["last_record"]["record_sequence"], 2);
+
+        let current_generation = track.channel_generation();
+        let mut current = open_raw_track_channel(&service, identity, current_generation).unwrap();
+        write_raw(&mut current, 2, messages::RASTER_FRAME, identity.track_id + 1, &[]).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let lost = loop {
+            let batch = service.automation_trace(
+                trace::TraceSelection::Tail,
+                128,
+                trace::TraceFilter {
+                    session_id: Some(owner.session_id),
+                    context_id: Some(context_id),
+                    surface_id: Some(surface.id()),
+                    track_id: Some(identity.track_id),
+                    ..trace::TraceFilter::default()
+                },
+            );
+            if let Some(event) = batch.events.into_iter().find(|event| {
+                event.event == "track_lost"
+                    && event.data["channel_generation"]
+                        == serde_json::json!(current_generation.get())
+            }) {
+                break event;
+            }
+            assert!(Instant::now() < deadline, "current channel failure did not lose the track");
+            thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(lost.data["failure"]["kind"], "record_identity");
+        assert_eq!(lost.data["failure"]["error_code"], messages::ERROR_DECODER);
+        assert_eq!(lost.data["last_record"]["record_type"], messages::RASTER_FRAME);
+        assert_eq!(lost.data["last_record"]["body_bytes"], 0);
     }
 
     /// A seek replaces linked audio while retaining its video surface. Clearing the old slot is

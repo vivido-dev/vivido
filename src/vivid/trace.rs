@@ -69,6 +69,17 @@ pub struct TraceFilter {
     pub recovery_only: bool,
 }
 
+/// Which portion of the bounded journal an automation query selects.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum TraceSelection {
+    FromOldest,
+    After { sequence: u64 },
+    Tail,
+    Before { sequence: u64 },
+    Around { sequence: u64, preceding: u16, following: u16 },
+}
+
 impl TraceFilter {
     fn matches(self, event: &TraceEvent) -> bool {
         if self.recovery_only && event.category != TraceCategory::Recovery {
@@ -95,6 +106,7 @@ pub struct TraceGap {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TraceBatch {
     pub schema_version: u32,
+    pub selection: TraceSelection,
     pub instance_id: String,
     pub started_unix_us: u64,
     pub captured_unix_us: u64,
@@ -182,33 +194,77 @@ impl TraceJournal {
         }
     }
 
-    pub fn query(
-        &self,
-        after_sequence: Option<u64>,
-        limit: u16,
-        filter: TraceFilter,
-    ) -> TraceBatch {
+    pub fn query(&self, selection: TraceSelection, limit: u16, filter: TraceFilter) -> TraceBatch {
         let oldest_sequence = self
             .events
             .front()
             .map_or(self.next_sequence.saturating_add(1), |stored| stored.event.sequence);
-        let requested = after_sequence.unwrap_or(oldest_sequence.saturating_sub(1));
-        let gap = (after_sequence.is_some() && requested < oldest_sequence.saturating_sub(1))
-            .then_some(TraceGap {
-                requested_sequence: requested,
-                oldest_sequence,
-                current_sequence: self.next_sequence,
-            });
-        let events = self
-            .events
-            .iter()
-            .filter(|stored| stored.event.sequence > requested)
-            .filter(|stored| filter.matches(&stored.event))
-            .take(usize::from(limit.min(MAX_QUERY_EVENTS)))
-            .map(|stored| stored.event.clone())
-            .collect();
+        let gap_sequence = match selection {
+            TraceSelection::After { sequence } if sequence < oldest_sequence.saturating_sub(1) => {
+                Some(sequence)
+            },
+            TraceSelection::Before { sequence } | TraceSelection::Around { sequence, .. }
+                if sequence < oldest_sequence =>
+            {
+                Some(sequence)
+            },
+            _ => None,
+        };
+        let gap = gap_sequence.map(|requested_sequence| TraceGap {
+            requested_sequence,
+            oldest_sequence,
+            current_sequence: self.next_sequence,
+        });
+        let maximum = usize::from(limit.min(MAX_QUERY_EVENTS));
+        let matching = || self.events.iter().filter(|stored| filter.matches(&stored.event));
+        let events = match selection {
+            TraceSelection::FromOldest => {
+                matching().take(maximum).map(|stored| stored.event.clone()).collect()
+            },
+            TraceSelection::After { sequence } => matching()
+                .filter(|stored| stored.event.sequence > sequence)
+                .take(maximum)
+                .map(|stored| stored.event.clone())
+                .collect(),
+            TraceSelection::Tail => {
+                let mut events = matching()
+                    .rev()
+                    .take(maximum)
+                    .map(|stored| stored.event.clone())
+                    .collect::<Vec<_>>();
+                events.reverse();
+                events
+            },
+            TraceSelection::Before { sequence } => {
+                let mut events = matching()
+                    .rev()
+                    .filter(|stored| stored.event.sequence < sequence)
+                    .take(maximum)
+                    .map(|stored| stored.event.clone())
+                    .collect::<Vec<_>>();
+                events.reverse();
+                events
+            },
+            TraceSelection::Around { sequence, preceding, following } => {
+                let mut events = matching()
+                    .rev()
+                    .filter(|stored| stored.event.sequence < sequence)
+                    .take(usize::from(preceding.min(MAX_QUERY_EVENTS)))
+                    .map(|stored| stored.event.clone())
+                    .collect::<Vec<_>>();
+                events.reverse();
+                events.extend(
+                    matching()
+                        .filter(|stored| stored.event.sequence >= sequence)
+                        .take(usize::from(following.min(MAX_QUERY_EVENTS)))
+                        .map(|stored| stored.event.clone()),
+                );
+                events
+            },
+        };
         TraceBatch {
             schema_version: 1,
+            selection,
             instance_id: self.instance_id.clone(),
             started_unix_us: self.started_unix_us,
             captured_unix_us: unix_us(),
@@ -236,6 +292,18 @@ fn unix_us() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use vivid_protocol::identity::{PresenterInstanceId, SessionIdentity};
+
+    fn track(presenter: u8, session_id: u64) -> TrackIdentity {
+        SessionIdentity::new(PresenterInstanceId([presenter; 16]), session_id)
+            .unwrap()
+            .context(1)
+            .unwrap()
+            .surface(1)
+            .unwrap()
+            .track(1)
+            .unwrap()
+    }
 
     #[test]
     fn bounded_journal_reports_eviction_and_filters_recovery() {
@@ -245,12 +313,95 @@ mod tests {
         journal.push(TraceCategory::Recovery, "recovered", None, Value::Null);
 
         let batch = journal.query(
-            Some(0),
+            TraceSelection::After { sequence: 0 },
             16,
             TraceFilter { recovery_only: true, ..TraceFilter::default() },
         );
         assert!(batch.gap.is_some());
         assert_eq!(batch.events.len(), 2);
         assert!(batch.events.iter().all(|event| event.category == TraceCategory::Recovery));
+    }
+
+    #[test]
+    fn tail_and_before_select_the_newest_matches_chronologically() {
+        let mut journal = TraceJournal::with_limits(16, 64 * 1024);
+        for event in ["one", "two", "three", "four", "five"] {
+            journal.push(TraceCategory::Lifecycle, event, None, Value::Null);
+        }
+
+        let oldest = journal.query(TraceSelection::FromOldest, 2, TraceFilter::default());
+        assert_eq!(oldest.selection, TraceSelection::FromOldest);
+        assert_eq!(oldest.events.iter().map(|event| event.sequence).collect::<Vec<_>>(), [1, 2]);
+        let after = journal.query(TraceSelection::After { sequence: 2 }, 2, TraceFilter::default());
+        assert_eq!(after.events.iter().map(|event| event.sequence).collect::<Vec<_>>(), [3, 4]);
+
+        let tail = journal.query(TraceSelection::Tail, 2, TraceFilter::default());
+        assert_eq!(tail.events.iter().map(|event| event.sequence).collect::<Vec<_>>(), [4, 5]);
+
+        let before =
+            journal.query(TraceSelection::Before { sequence: 5 }, 2, TraceFilter::default());
+        assert_eq!(before.events.iter().map(|event| event.sequence).collect::<Vec<_>>(), [3, 4]);
+        let preceding_page =
+            journal.query(TraceSelection::Before { sequence: 3 }, 2, TraceFilter::default());
+        assert_eq!(
+            preceding_page.events.iter().map(|event| event.sequence).collect::<Vec<_>>(),
+            [1, 2]
+        );
+    }
+
+    #[test]
+    fn around_applies_filters_before_its_directional_limits() {
+        let mut journal = TraceJournal::with_limits(16, 64 * 1024);
+        journal.push(TraceCategory::Lifecycle, "one", None, Value::Null);
+        journal.push(TraceCategory::Flow, "two", None, Value::Null);
+        journal.push(TraceCategory::Lifecycle, "three", None, Value::Null);
+        journal.push(TraceCategory::Flow, "four", None, Value::Null);
+        journal.push(TraceCategory::Lifecycle, "five", None, Value::Null);
+
+        let batch = journal.query(
+            TraceSelection::Around { sequence: 4, preceding: 2, following: 1 },
+            MAX_QUERY_EVENTS,
+            TraceFilter { category: Some(TraceCategory::Lifecycle), ..TraceFilter::default() },
+        );
+        assert_eq!(batch.events.iter().map(|event| event.sequence).collect::<Vec<_>>(), [1, 3, 5]);
+    }
+
+    #[test]
+    fn historical_selection_reports_an_evicted_anchor() {
+        let mut journal = TraceJournal::with_limits(2, 64 * 1024);
+        journal.push(TraceCategory::Lifecycle, "one", None, Value::Null);
+        journal.push(TraceCategory::Lifecycle, "two", None, Value::Null);
+        journal.push(TraceCategory::Lifecycle, "three", None, Value::Null);
+
+        for selection in [
+            TraceSelection::Before { sequence: 1 },
+            TraceSelection::Around { sequence: 1, preceding: 1, following: 1 },
+        ] {
+            let batch = journal.query(selection, 16, TraceFilter::default());
+            assert_eq!(batch.gap.unwrap().oldest_sequence, 2);
+        }
+    }
+
+    #[test]
+    fn complete_owner_filter_separates_reused_local_track_ids() {
+        let mut journal = TraceJournal::with_limits(16, 64 * 1024);
+        let first = track(1, 7);
+        let second = track(1, 8);
+        journal.push(TraceCategory::Lifecycle, "track_lost", Some(first), Value::Null);
+        journal.push(TraceCategory::Lifecycle, "track_lost", Some(second), Value::Null);
+
+        let batch = journal.query(
+            TraceSelection::Tail,
+            16,
+            TraceFilter {
+                session_id: Some(7),
+                context_id: Some(1),
+                surface_id: Some(1),
+                track_id: Some(1),
+                ..TraceFilter::default()
+            },
+        );
+        assert_eq!(batch.events.len(), 1);
+        assert_eq!(batch.events[0].track, Some(first.into()));
     }
 }

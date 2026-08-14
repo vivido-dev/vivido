@@ -303,6 +303,28 @@ The CLI names those conditions `revision-after`, `milestones`, `presentation-aft
 owner filters, monotonic sequences, eviction gaps, recovery filtering, process/start anchors, and
 no credentials, media bytes, or frame hashes.
 
+A query without a selector retains its original oldest-first behavior. `--after SEQUENCE` reads
+forward, `--tail --limit N` returns the newest matching events in chronological order, and
+`--before SEQUENCE --limit N` returns the newest matches strictly before the cursor. An around
+query uses independent bounded sides:
+
+```sh
+vivido msg vivid trace --around 420 --preceding 64 --following 16
+```
+
+The selectors are mutually exclusive, and follow mode accepts only the forward form. Every batch
+contains a `selection` object describing how it was captured. `diagnose` uses tail selection, so
+its trace is the newest `trace_limit` events rather than the oldest retained events.
+
+Track control transitions emit one terminal applied or rejected event with the request ID, control
+record sequence, record type, object ID, complete authenticated track identity when available, and
+operation-specific before/after state. Covered operations are create, destroy, channel advance,
+audio gain, play, pause, flush, and drain. Channel acceptance records the open request and record
+sequence. Channel detachment records its clean/failed outcome, generation disposition, last record
+metadata, and a typed bounded failure when present; a `track_lost` event repeats the complete
+failure so it is independently diagnosable. Pre-authentication channel rejection never publishes
+the claimed identity, authenticator, nonce, or other capability material.
+
 There are no IPC v1 aliases for `vivid_sources`, `vivid_source_status`, `vivid_milestones`, or
 `wait_vivid_source`. The wire service never returns root secrets, channel keys, authenticators, or
 resume material through automation.

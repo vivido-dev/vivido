@@ -821,13 +821,36 @@ pub struct IpcVividTrace {
     #[clap(flatten)]
     #[serde(flatten)]
     pub target: IpcTarget,
-    #[clap(long)]
+    #[clap(long, conflicts_with_all = ["tail", "before", "around"])]
     pub after: Option<u64>,
+    #[clap(long, conflicts_with_all = ["after", "before", "around"])]
+    pub tail: bool,
+    #[clap(long, conflicts_with_all = ["after", "tail", "around"])]
+    pub before: Option<u64>,
+    #[clap(long, conflicts_with_all = ["after", "tail", "before", "follow"])]
+    #[serde(skip_serializing)]
+    pub around: Option<u64>,
+    #[clap(
+        long,
+        requires = "around",
+        default_value_t = 64,
+        value_parser = clap::value_parser!(u16).range(0..=512)
+    )]
+    #[serde(skip_serializing)]
+    pub preceding: u16,
+    #[clap(
+        long,
+        requires = "around",
+        default_value_t = 64,
+        value_parser = clap::value_parser!(u16).range(0..=512)
+    )]
+    #[serde(skip_serializing)]
+    pub following: u16,
     #[clap(long, default_value_t = 128, value_parser = clap::value_parser!(u16).range(1..=512))]
     pub limit: u16,
     #[clap(long, default_value = "30s", value_parser = parse_ipc_duration)]
     pub timeout: u64,
-    #[clap(long)]
+    #[clap(long, conflicts_with_all = ["tail", "before", "around"])]
     pub follow: bool,
     #[clap(long)]
     pub session_id: Option<u64>,
@@ -1631,6 +1654,50 @@ mod tests {
                 window_id: Some(42),
                 report: false,
             })
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn parse_vivid_trace_historical_selectors() {
+        let options = Options::try_parse_from([
+            "vivido",
+            "msg",
+            "vivid",
+            "trace",
+            "--around",
+            "420",
+            "--preceding",
+            "64",
+            "--following",
+            "16",
+        ])
+        .unwrap();
+        let Some(Subcommands::Msg(message)) = options.subcommands else {
+            panic!("expected msg subcommand");
+        };
+        let SocketMessage::Vivid { command: IpcVividCommand::Trace(trace) } = message.message
+        else {
+            panic!("expected Vivid trace command");
+        };
+        assert_eq!(trace.around, Some(420));
+        assert_eq!(trace.preceding, 64);
+        assert_eq!(trace.following, 16);
+
+        assert!(Options::try_parse_from(["vivido", "msg", "vivid", "trace", "--tail"]).is_ok());
+        assert!(Options::try_parse_from(["vivido", "msg", "vivid", "trace"]).is_ok());
+
+        assert!(
+            Options::try_parse_from([
+                "vivido", "msg", "vivid", "trace", "--tail", "--before", "420",
+            ])
+            .is_err()
+        );
+        assert!(
+            Options::try_parse_from([
+                "vivido", "msg", "vivid", "trace", "--around", "420", "--follow",
+            ])
+            .is_err()
         );
     }
 

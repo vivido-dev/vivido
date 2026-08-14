@@ -1666,11 +1666,11 @@ impl WindowContext {
     #[cfg(any(unix, windows))]
     pub fn automation_vivid_trace(
         &self,
-        after_sequence: Option<u64>,
+        selection: crate::vivid::trace::TraceSelection,
         limit: u16,
         filter: crate::vivid::trace::TraceFilter,
     ) -> Value {
-        serde_json::to_value(self.vivid_service.automation_trace(after_sequence, limit, filter))
+        serde_json::to_value(self.vivid_service.automation_trace(selection, limit, filter))
             .unwrap_or_else(|_| json_value!({"schema_version": 1, "events": []}))
     }
 
@@ -1711,7 +1711,7 @@ impl WindowContext {
                 "scenes": scenes,
                 "streaming": self.vivid_service.automation_streaming_metrics(),
                 "trace": self.automation_vivid_trace(
-                    None,
+                    crate::vivid::trace::TraceSelection::Tail,
                     trace_limit,
                     crate::vivid::trace::TraceFilter::default(),
                 ),
