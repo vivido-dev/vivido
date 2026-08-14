@@ -3461,7 +3461,7 @@ mod tests {
 
     #[test]
     fn parse_cargo_version() {
-        assert_eq!(version_number(env!("CARGO_PKG_VERSION")), 4_01);
+        assert_eq!(version_number(env!("CARGO_PKG_VERSION")), 4_02);
         assert_eq!(version_number("0.0.1-dev"), 1);
         assert_eq!(version_number("0.1.2-dev"), 1_02);
         assert_eq!(version_number("1.2.3-dev"), 1_02_03);

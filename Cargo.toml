@@ -1,6 +1,6 @@
 [package]
 name = "vivido"
-version = "0.4.1"
+version = "0.4.2"
 authors = ["Wensheng Wang <wenshengwang@gmail.com>"]
 license = "Apache-2.0"
 description = "A fast cross-platform terminal emulator with protocol-neutral media hooks"
