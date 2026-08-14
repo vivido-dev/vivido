@@ -1504,7 +1504,9 @@ fn suspend_lease(
     if !suspended {
         return false;
     }
-    // Input is not implemented yet; when it is, its release belongs here, before anything else.
+
+    // Security §7.1: input goes first, before any state is released.
+    revoke_input(session, grant_reason::SUSPENSION);
     shared.scene.suspend_session(session.identity);
     stop_session_audio(shared, session.identity);
     let issuer = lock(&shared.registry).sessions.get(&key.0.session_id).cloned();
@@ -8019,6 +8021,34 @@ mod tests {
         // A post-`HELLO` record closes the activation-retry window, so the only recovery left is
         // the resume proof (security §6.4 step 6).
         child.query_session().unwrap();
+
+        // Arm an input grant, so the unclean-loss suspension has an active grant to revoke.
+        let child_runtime = live_sessions(&service)
+            .into_iter()
+            .find(|session| session.identity.session_id == child_session)
+            .expect("the child session is registered");
+        let binding = InputBinding {
+            producer_epoch: vivid_protocol::revision::InputEpoch::ONE,
+            context_id,
+            surface_id: 11,
+            surface_generation: SurfaceGeneration::ONE,
+            requested_classes: vivid_protocol::input::INPUT_CLASS_KEYBOARD,
+            reason: 0,
+            requested_watchdog_us: vivid_protocol::grant::DEFAULT_WATCHDOG_US,
+        };
+        let eligibility = Eligibility {
+            focused: true,
+            consented: true,
+            surface_present: true,
+            surface_generation: binding.surface_generation,
+            capability_mask: vivid_protocol::input::INPUT_CLASS_KEYBOARD,
+            presented: true,
+            lane_live: true,
+            may_receive_input: true,
+        };
+        lock(&child_runtime.grant).apply(&binding, &eligibility, clock::now()).unwrap();
+        assert_eq!(lock(&child_runtime.grant).state(), vivid_protocol::grant::STATE_ENABLED);
+
         drop(child);
 
         let identity = SessionIdentity::new(service.shared.presenter, child_session).unwrap();
@@ -8033,6 +8063,14 @@ mod tests {
             "security §7.1 retains the suspended session's object state"
         );
         assert_eq!(lock(&service.shared.registry).leases.len(), 1, "the lease is still charged");
+
+        // Security §7.1: the suspension released input first, revoking the armed grant under
+        // the suspension reason.
+        let grant = lock(&child_runtime.grant);
+        assert!(grant.active().is_none(), "suspension deactivates the input grant");
+        assert_eq!(grant.state(), vivid_protocol::grant::STATE_DISABLED);
+        assert_eq!(grant.reason(), grant_reason::SUSPENSION);
+        drop(grant);
 
         let mut resumed =
             RawClient::resume(&service, context_id, 11, child_session, 0, &resume_key).unwrap();
