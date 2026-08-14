@@ -86,6 +86,8 @@ set of features with high performance.
 
 	On Windows, the config file will be looked for in:
 
+		. _%USERPROFILE%\\.config\\vivido\\vivido.toml_
+		. _%USERPROFILE%\\vivido\\vivido.toml_
 		. _%APPDATA%\\vivido\\vivido.toml_
 
 *-o, --option* _<OPTION>..._

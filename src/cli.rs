@@ -39,7 +39,8 @@ pub struct Options {
     #[clap(long, value_hint = ValueHint::FilePath)]
     pub config_file: Option<PathBuf>,
 
-    /// Specify alternative configuration file [default: %USERPROFILE%\vivido\vivido.toml].
+    /// Specify alternative configuration file [default:
+    /// %USERPROFILE%\.config\vivido\vivido.toml].
     #[cfg(windows)]
     #[clap(long, value_hint = ValueHint::FilePath)]
     pub config_file: Option<PathBuf>,

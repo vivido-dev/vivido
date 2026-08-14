@@ -39,7 +39,7 @@ Vivido looks for `vivido.toml` in the first of these locations that exists:
 |---|---|
 | Linux / BSD | `$XDG_CONFIG_HOME/vivido/vivido.toml`, then `$XDG_CONFIG_HOME/vivido.toml`, then `~/.config/vivido/vivido.toml`, then `~/.vivido.toml`, then `/etc/vivido/vivido.toml` |
 | macOS | `$XDG_CONFIG_HOME/vivido/vivido.toml`, then the same fallbacks as Linux |
-| Windows | `%APPDATA%\vivido\vivido.toml` |
+| Windows | `%USERPROFILE%\.config\vivido\vivido.toml`, then `%USERPROFILE%\vivido\vivido.toml`, then `%APPDATA%\vivido\vivido.toml` |
 
 TOML is the only supported configuration format. Point Vivido at an explicit file with
 `vivido --config-file <path>`.

@@ -348,17 +348,19 @@ fn first_existing_windows_config(candidates: Vec<PathBuf>) -> Option<PathBuf> {
 
 /// Return Windows configuration candidates in lookup order.
 ///
-/// `%USERPROFILE%\vivido` is authoritative for new installs. The roaming
-/// `%APPDATA%\vivido` location remains a read-only compatibility fallback.
+/// `%USERPROFILE%\.config\vivido` matches the cross-platform user location.
+/// The installer-managed `%USERPROFILE%\vivido` path and the former roaming
+/// `%APPDATA%\vivido` path remain fallbacks.
 #[cfg(any(windows, test))]
 fn windows_config_candidates(
     home_dir: Option<PathBuf>,
     roaming_config_dir: Option<PathBuf>,
 ) -> Vec<PathBuf> {
     let file_name = "vivido.toml";
-    let mut candidates = Vec::with_capacity(2);
+    let mut candidates = Vec::with_capacity(3);
 
     if let Some(home_dir) = home_dir {
+        candidates.push(home_dir.join(".config").join("vivido").join(file_name));
         candidates.push(home_dir.join("vivido").join(file_name));
     }
     if let Some(roaming_config_dir) = roaming_config_dir {
@@ -440,14 +442,18 @@ mod tests {
     }
 
     #[test]
-    fn windows_config_prefers_user_profile_and_keeps_legacy_fallback() {
+    fn windows_config_prefers_dot_config_and_keeps_existing_fallbacks() {
         let home = PathBuf::from("profile/José Example");
         let roaming = PathBuf::from("profile/José Example/AppData/Roaming");
         let candidates = windows_config_candidates(Some(home.clone()), Some(roaming.clone()));
 
         assert_eq!(
             candidates,
-            [home.join("vivido").join("vivido.toml"), roaming.join("vivido").join("vivido.toml"),]
+            [
+                home.join(".config").join("vivido").join("vivido.toml"),
+                home.join("vivido").join("vivido.toml"),
+                roaming.join("vivido").join("vivido.toml"),
+            ]
         );
     }
 
@@ -457,18 +463,24 @@ mod tests {
         let root = env::temp_dir().join(format!("vivido-config-discovery-José-{nonce}"));
         let profile = root.join("profile");
         let roaming = root.join("roaming");
-        let new_path = profile.join("vivido/vivido.toml");
+        let dot_config_path = profile.join(".config/vivido/vivido.toml");
+        let installer_path = profile.join("vivido/vivido.toml");
         let legacy_path = roaming.join("vivido/vivido.toml");
-        fs::create_dir_all(new_path.parent().unwrap()).unwrap();
+        fs::create_dir_all(dot_config_path.parent().unwrap()).unwrap();
+        fs::create_dir_all(installer_path.parent().unwrap()).unwrap();
         fs::create_dir_all(legacy_path.parent().unwrap()).unwrap();
         fs::write(&legacy_path, "legacy = true\n").unwrap();
 
         let candidates = windows_config_candidates(Some(profile.clone()), Some(roaming.clone()));
         assert_eq!(first_existing_windows_config(candidates), Some(legacy_path.clone()));
 
-        fs::write(&new_path, "new = true\n").unwrap();
+        fs::write(&installer_path, "installer = true\n").unwrap();
+        let candidates = windows_config_candidates(Some(profile.clone()), Some(roaming.clone()));
+        assert_eq!(first_existing_windows_config(candidates), Some(installer_path));
+
+        fs::write(&dot_config_path, "dot_config = true\n").unwrap();
         let candidates = windows_config_candidates(Some(profile), Some(roaming));
-        assert_eq!(first_existing_windows_config(candidates), Some(new_path));
+        assert_eq!(first_existing_windows_config(candidates), Some(dot_config_path));
         fs::remove_dir_all(root).unwrap();
     }
 }

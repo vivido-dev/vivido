@@ -41,6 +41,9 @@ fn initialize_config() -> io::Result<()> {
 }
 
 fn initialize_config_at(user_profile: &Path, app_data: &Path) -> io::Result<()> {
+    let dot_config_root = user_profile.join(".config");
+    let dot_config_dir = dot_config_root.join("vivido");
+    let dot_config_path = dot_config_dir.join("vivido.toml");
     let config_dir = user_profile.join("vivido");
     let config_path = config_dir.join("vivido.toml");
     let legacy_dir = app_data.join("vivido");
@@ -48,6 +51,12 @@ fn initialize_config_at(user_profile: &Path, app_data: &Path) -> io::Result<()> 
 
     reject_reparse_point(user_profile)?;
     reject_reparse_point(app_data)?;
+    if dot_config_path.exists() {
+        reject_reparse_point(&dot_config_root)?;
+        reject_reparse_point(&dot_config_dir)?;
+        reject_reparse_point(&dot_config_path)?;
+        return Ok(());
+    }
     if config_dir.exists() {
         reject_reparse_point(&config_dir)?;
     } else {
@@ -253,6 +262,22 @@ mod tests {
             fs::read_to_string(profile.join("vivido/vivido.toml")).unwrap(),
             "existing = true\n"
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn config_init_preserves_existing_dot_config_without_seeding_fallback() {
+        let root = temporary_root("dot-config");
+        let profile = root.join("profile");
+        let roaming = root.join("roaming");
+        let dot_config = profile.join(".config/vivido/vivido.toml");
+        fs::create_dir_all(dot_config.parent().unwrap()).unwrap();
+        fs::create_dir_all(&roaming).unwrap();
+        fs::write(&dot_config, "existing = true\n").unwrap();
+
+        initialize_config_at(&profile, &roaming).unwrap();
+        assert_eq!(fs::read_to_string(dot_config).unwrap(), "existing = true\n");
+        assert!(!profile.join("vivido/vivido.toml").exists());
         fs::remove_dir_all(root).unwrap();
     }
 

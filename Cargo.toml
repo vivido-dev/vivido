@@ -126,6 +126,10 @@ windows-sys = { version = "0.61.2", features = [
   "Win32_System_Pipes",
   "Win32_System_WindowsProgramming",
 ] }
+windows = { version = "0.62.2", default-features = false, features = [
+  "Win32_Foundation",
+  "Win32_Graphics_DirectComposition",
+] }
 wgpu = { version = "29.0", default-features = false, features = [
   "dx12",
   "std",

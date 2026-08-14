@@ -258,6 +258,11 @@ impl Window {
             .with_window_level(config.window.level.into());
 
         #[cfg(windows)]
+        {
+            window_attributes = window_attributes.with_no_redirection_bitmap(true);
+        }
+
+        #[cfg(windows)]
         if options.no_activate {
             window_attributes = window_attributes.with_active(false);
         }

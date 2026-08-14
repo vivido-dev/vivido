@@ -10,6 +10,15 @@ use vello::peniko::Color;
 use vello::util::{RenderContext, RenderSurface};
 use vello::{AaConfig, AaSupport, RenderParams, Renderer, RendererOptions, Scene, wgpu};
 use winit::dpi::{PhysicalPosition, PhysicalSize};
+#[cfg(windows)]
+use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+#[cfg(windows)]
+use windows::Win32::Graphics::DirectComposition::{
+    DCompositionCreateDevice2, IDCompositionDevice, IDCompositionTarget, IDCompositionVisual,
+};
+#[cfg(windows)]
+use windows::core::{IUnknown, Interface};
 
 use crate::terminal::graphics::GraphicsCommand;
 
@@ -27,6 +36,8 @@ pub enum Error {
     SurfaceValidation,
     NoOffscreenAdapter(String),
     NoWindowDevice,
+    #[cfg(windows)]
+    WindowsComposition(windows::core::Error),
 }
 
 /// Maximum raw screenshot readback allocation.
@@ -99,6 +110,10 @@ impl std::fmt::Display for Error {
             Self::NoWindowDevice => {
                 f.write_str("an embedded renderer requires an initialized window renderer")
             },
+            #[cfg(windows)]
+            Self::WindowsComposition(err) => {
+                write!(f, "failed to initialize Windows composition: {err}")
+            },
         }
     }
 }
@@ -110,6 +125,9 @@ pub struct SceneRenderer {
     context: Option<SharedRenderContext>,
     /// Absent when rendering offscreen: there is no windowing-system surface to present to.
     surface: Option<Box<RenderSurface<'static>>>,
+    /// Owns the DirectComposition visual tree backing a Windows surface.
+    #[cfg(windows)]
+    composition: Option<WindowsComposition>,
     renderer: Rc<RefCell<Renderer>>,
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -124,6 +142,39 @@ pub struct SceneRenderer {
     /// Whether `render_target` holds a frame. Screenshots read that texture, not the swapchain,
     /// so this is set by both the windowed and the offscreen path.
     has_rendered_frame: bool,
+}
+
+#[cfg(windows)]
+struct WindowsComposition {
+    device: IDCompositionDevice,
+    _target: IDCompositionTarget,
+    visual: IDCompositionVisual,
+}
+
+#[cfg(windows)]
+impl WindowsComposition {
+    fn new(window: &winit::window::Window) -> windows::core::Result<Self> {
+        let handle = window.window_handle().expect("Winit window must have a native handle");
+        let RawWindowHandle::Win32(handle) = handle.as_raw() else {
+            unreachable!("Windows can only create Win32 window handles");
+        };
+        let hwnd = windows::Win32::Foundation::HWND(handle.hwnd.get() as *mut std::ffi::c_void);
+
+        let device: IDCompositionDevice = unsafe { DCompositionCreateDevice2(None::<&IUnknown>) }?;
+        // Put the visual above any HWND client/child content. The HWND itself has no redirection
+        // bitmap, so transparent visual pixels reach the desktop compositor directly.
+        let target = unsafe { device.CreateTargetForHwnd(hwnd, true) }?;
+        let visual = unsafe { device.CreateVisual() }?;
+        unsafe {
+            target.SetRoot(&visual)?;
+        }
+
+        Ok(Self { device, _target: target, visual })
+    }
+
+    fn commit(&self) -> windows::core::Result<()> {
+        unsafe { self.device.Commit() }
+    }
 }
 
 /// Latest GPU frame retained by an embedded Vivido window.
@@ -174,7 +225,7 @@ impl SharedRenderState {
 impl SharedRenderContext {
     pub fn new() -> Self {
         Self(Rc::new(RefCell::new(SharedRenderState {
-            context: RenderContext::new(),
+            context: create_window_render_context(),
             renderers: Vec::new(),
         })))
     }
@@ -195,6 +246,23 @@ fn window_render_context() -> SharedRenderContext {
         .with(|slot| slot.borrow_mut().get_or_insert_with(SharedRenderContext::new).clone())
 }
 
+#[cfg(not(windows))]
+fn create_window_render_context() -> RenderContext {
+    RenderContext::new()
+}
+
+#[cfg(windows)]
+fn create_window_render_context() -> RenderContext {
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+        display: None,
+        backends: wgpu::Backends::from_env().unwrap_or(wgpu::Backends::DX12),
+        flags: wgpu::InstanceFlags::from_build_config().with_env(),
+        memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
+        backend_options: wgpu::BackendOptions::from_env_or_default(),
+    });
+    RenderContext { instance, devices: Vec::new() }
+}
+
 /// Drop the main-thread window render context before platform thread-local teardown begins.
 pub fn shutdown_window_render_context() {
     WINDOW_RENDER_CONTEXT.with(|slot| {
@@ -210,33 +278,50 @@ impl SceneRenderer {
     ) -> Result<Self, Error> {
         let size = clamp_render_size(size, wgpu::Limits::default().max_texture_dimension_2d);
         let valid_target = size.width != 0 && size.height != 0;
+        #[cfg(windows)]
+        let mut composition = None;
 
         let (context, surface, device, queue, target_size, renderer) = match source {
             RenderSource::Surface(window) => {
                 let context = window_render_context();
                 let mut context_ref = context.0.borrow_mut();
-                let mut surface = block_on(context_ref.context.create_surface(
-                    window,
+
+                #[cfg(windows)]
+                let current_composition =
+                    WindowsComposition::new(&window).map_err(Error::WindowsComposition)?;
+                #[cfg(windows)]
+                let wgpu_surface = unsafe {
+                    context_ref.context.instance.create_surface_unsafe(
+                        wgpu::SurfaceTargetUnsafe::CompositionVisual(
+                            current_composition.visual.as_raw(),
+                        ),
+                    )
+                }
+                .map_err(|err| Error::CreateSurface(err.into()))?;
+
+                #[cfg(not(windows))]
+                let wgpu_surface = context_ref
+                    .context
+                    .instance
+                    .create_surface(window)
+                    .map_err(|err| Error::CreateSurface(err.into()))?;
+
+                // Vello's convenience constructor configures once with Auto alpha before callers
+                // can select a mode. DXGI cannot change a swapchain's alpha mode via
+                // ResizeBuffers, so construct it here and make PreMultiplied part of the very
+                // first configure call.
+                let surface = create_window_surface(
+                    &mut context_ref.context,
+                    wgpu_surface,
                     size.width.max(1),
                     size.height.max(1),
-                    wgpu::PresentMode::AutoVsync,
-                ))
-                .map_err(Error::CreateSurface)?;
+                    transparent,
+                )?;
 
-                let alpha_modes = &surface
-                    .surface
-                    .get_capabilities(context_ref.context.devices[surface.dev_id].adapter())
-                    .alpha_modes;
-                surface.config.alpha_mode = surface_alpha_mode(alpha_modes);
-                context_ref.context.configure_surface(&surface);
-
-                if surface.config.alpha_mode == wgpu::CompositeAlphaMode::PostMultiplied {
-                    log::info!("Surface alpha mode: {:?}", surface.config.alpha_mode);
-                } else if transparent {
-                    log::warn!(
-                        "Window transparency is unavailable; the render surface does not support \
-                         post-multiplied alpha (supported modes: {alpha_modes:?})"
-                    );
+                #[cfg(windows)]
+                {
+                    current_composition.commit().map_err(Error::WindowsComposition)?;
+                    composition = Some(current_composition);
                 }
 
                 let handle = &context_ref.context.devices[surface.dev_id];
@@ -280,6 +365,8 @@ impl SceneRenderer {
         Ok(Self {
             context,
             surface,
+            #[cfg(windows)]
+            composition,
             renderer,
             device,
             queue,
@@ -310,6 +397,10 @@ impl SceneRenderer {
         // surface, and the shared context has to be droppable so the replacement is built on a
         // fresh device rather than the lost one.
         self.surface = None;
+        #[cfg(windows)]
+        {
+            self.composition = None;
+        }
         self.context = None;
         self.media.clear_sources();
         self.has_rendered_frame = false;
@@ -585,6 +676,66 @@ fn create_renderer(device: &wgpu::Device) -> Result<Renderer, vello::Error> {
     )
 }
 
+fn create_window_surface(
+    context: &mut RenderContext,
+    surface: wgpu::Surface<'static>,
+    width: u32,
+    height: u32,
+    transparent: bool,
+) -> Result<RenderSurface<'static>, Error> {
+    let dev_id = block_on(context.device(Some(&surface)))
+        .ok_or(Error::CreateSurface(vello::Error::NoCompatibleDevice))?;
+    let handle = &context.devices[dev_id];
+    let capabilities = surface.get_capabilities(handle.adapter());
+    let format = capabilities
+        .formats
+        .iter()
+        .copied()
+        .find(|format| {
+            matches!(format, wgpu::TextureFormat::Rgba8Unorm | wgpu::TextureFormat::Bgra8Unorm)
+        })
+        .ok_or(Error::CreateSurface(vello::Error::UnsupportedSurfaceFormat))?;
+    let alpha_mode = surface_alpha_mode(&capabilities.alpha_modes);
+    let config = wgpu::SurfaceConfiguration {
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        format,
+        width,
+        height,
+        present_mode: wgpu::PresentMode::AutoVsync,
+        desired_maximum_frame_latency: 2,
+        alpha_mode,
+        view_formats: Vec::new(),
+    };
+    let (target_texture, target_view) = create_render_target(&handle.device, width, height);
+    let blitter = if alpha_mode == wgpu::CompositeAlphaMode::PreMultiplied {
+        wgpu::util::TextureBlitterBuilder::new(&handle.device, format)
+            .blend_state(premultiply_blend_state())
+            .build()
+    } else {
+        wgpu::util::TextureBlitter::new(&handle.device, format)
+    };
+    let surface =
+        RenderSurface { surface, config, dev_id, format, target_texture, target_view, blitter };
+
+    // This must be the swapchain's first configure; DXGI AlphaMode is immutable afterwards.
+    context.configure_surface(&surface);
+
+    if matches!(
+        alpha_mode,
+        wgpu::CompositeAlphaMode::PreMultiplied | wgpu::CompositeAlphaMode::PostMultiplied
+    ) {
+        log::info!("Surface alpha mode: {alpha_mode:?}");
+    } else if transparent {
+        log::warn!(
+            "Window transparency is unavailable; the render surface does not support a \
+             compatible alpha mode (supported modes: {:?})",
+            capabilities.alpha_modes
+        );
+    }
+
+    Ok(surface)
+}
+
 /// Create a wgpu device with no surface behind it.
 ///
 /// Tries a real GPU first, then falls back to a software adapter (lavapipe on Linux, WARP on
@@ -679,6 +830,11 @@ fn screenshot_layout(width: u32, height: u32) -> Result<(u32, u64), ScreenshotEr
 }
 
 fn surface_alpha_mode(alpha_modes: &[wgpu::CompositeAlphaMode]) -> wgpu::CompositeAlphaMode {
+    // DirectComposition reliably consumes premultiplied swapchains. Other window systems can
+    // consume Vello's straight-alpha output directly.
+    #[cfg(windows)]
+    let transparent_mode = wgpu::CompositeAlphaMode::PreMultiplied;
+    #[cfg(not(windows))]
     let transparent_mode = wgpu::CompositeAlphaMode::PostMultiplied;
     if alpha_modes.contains(&transparent_mode) {
         transparent_mode
@@ -687,12 +843,24 @@ fn surface_alpha_mode(alpha_modes: &[wgpu::CompositeAlphaMode]) -> wgpu::Composi
     }
 }
 
+/// Convert Vello's straight-alpha surface blit into the premultiplied form DirectComposition uses.
+fn premultiply_blend_state() -> wgpu::BlendState {
+    wgpu::BlendState {
+        color: wgpu::BlendComponent {
+            src_factor: wgpu::BlendFactor::SrcAlpha,
+            dst_factor: wgpu::BlendFactor::Zero,
+            operation: wgpu::BlendOperation::Add,
+        },
+        alpha: wgpu::BlendComponent::REPLACE,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         RenderSource, SceneRenderer, SharedRenderContext, clamp_render_size, embedded_copy_extent,
-        offscreen_device, screenshot_layout, shutdown_window_render_context, surface_alpha_mode,
-        window_render_context,
+        offscreen_device, premultiply_blend_state, screenshot_layout,
+        shutdown_window_render_context, surface_alpha_mode, window_render_context,
     };
     use std::rc::Rc;
     use std::sync::{Mutex, MutexGuard};
@@ -791,6 +959,32 @@ mod tests {
         }
     }
 
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn offscreen_renderer_preserves_straight_alpha() {
+        let _gpu = gpu_lock();
+        if offscreen_device().is_err() {
+            eprintln!("Skipping offscreen alpha test: no wgpu adapter");
+            return;
+        }
+
+        let mut renderer =
+            SceneRenderer::new(RenderSource::Offscreen, PhysicalSize::new(8, 8), true)
+                .expect("offscreen renderer");
+        renderer
+            .render(&Scene::new(), Color::from_rgba8(200, 100, 50, 128))
+            .expect("render transparent frame");
+
+        let readback = renderer.begin_screenshot().expect("transparent screenshot");
+        let pixels = loop {
+            if let Some(pixels) = renderer.poll_screenshot(&readback).expect("poll") {
+                break pixels;
+            }
+        };
+
+        assert_eq!(&pixels.bytes[..4], &[199, 100, 50, 128]);
+    }
+
     /// Resizing an offscreen renderer must retarget without a surface to reconfigure.
     #[cfg(any(unix, windows))]
     #[test]
@@ -848,18 +1042,36 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
     #[test]
-    fn surface_prefers_transparency_over_opaque_auto_mode() {
+    fn windows_surface_prefers_premultiplied_transparency() {
+        let modes = [CompositeAlphaMode::Opaque, CompositeAlphaMode::PreMultiplied];
+
+        assert_eq!(surface_alpha_mode(&modes), CompositeAlphaMode::PreMultiplied);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_surface_uses_auto_without_premultiplied_alpha() {
+        let modes = [CompositeAlphaMode::Opaque, CompositeAlphaMode::PostMultiplied];
+
+        assert_eq!(surface_alpha_mode(&modes), CompositeAlphaMode::Auto);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn non_windows_surface_prefers_straight_alpha() {
         let modes = [CompositeAlphaMode::Opaque, CompositeAlphaMode::PostMultiplied];
 
         assert_eq!(surface_alpha_mode(&modes), CompositeAlphaMode::PostMultiplied);
     }
 
     #[test]
-    fn surface_uses_auto_mode_without_straight_alpha_support() {
-        let modes = [CompositeAlphaMode::Opaque, CompositeAlphaMode::PreMultiplied];
-
-        assert_eq!(surface_alpha_mode(&modes), CompositeAlphaMode::Auto);
+    fn direct_composition_blit_premultiplies_rgb_and_preserves_alpha() {
+        let blend = premultiply_blend_state();
+        assert_eq!(blend.color.src_factor, wgpu::BlendFactor::SrcAlpha);
+        assert_eq!(blend.color.dst_factor, wgpu::BlendFactor::Zero);
+        assert_eq!(blend.alpha, wgpu::BlendComponent::REPLACE);
     }
 
     #[test]

@@ -75,12 +75,13 @@ acknowledgement is absent; the repository does not record acceptance automatical
 
 ## Configuration ownership and upgrades
 
-Vivido now looks first for `%USERPROFILE%\vivido\vivido.toml`, then falls back to the former
-`%APPDATA%\vivido` TOML location. On a first MSI install the signed setup helper:
+Vivido looks first for `%USERPROFILE%\.config\vivido\vivido.toml`, then for the installer-managed
+`%USERPROFILE%\vivido\vivido.toml`, and finally for the former `%APPDATA%\vivido` TOML location.
+On a first MSI install the signed setup helper:
 
-1. leaves an existing new-path TOML untouched;
+1. leaves an existing dot-config or installer-managed TOML untouched;
 2. copies the legacy roaming TOML when only that file exists; or
-3. writes the default PowerShell configuration when neither exists.
+3. writes the default PowerShell configuration to the installer-managed path when none exists.
 
 The config is user-owned rather than an MSI file component, so repair, major upgrade, and uninstall
 do not remove or overwrite it. Uninstall and upgrade also call `vvmux list` and refuse to continue
