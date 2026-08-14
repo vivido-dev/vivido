@@ -24,11 +24,19 @@ pub const PTY_READ_WRITE_TOKEN: usize = 2;
 type ReadPipe = UnblockedReader<AnonRead>;
 type WritePipe = UnblockedWriter<AnonWrite>;
 
-pub struct Pty {
-    // XXX: Backend is required to be the first field, to ensure correct drop order. Dropping
-    // `conout` before `backend` will cause a deadlock (with Conpty).
-    backend: Backend,
+/// ConPTY together with the conout pipe it must outlive.
+///
+/// `ClosePseudoConsole` blocks until the conout pipe is drained, and deadlocks if the pipe has
+/// already been dropped. Owning both in one value, in this field order, makes Rust's
+/// declaration-order drop run the close before the pipe is released, whatever the field order
+/// of any surrounding struct is.
+struct ConptyBackend {
+    conpty: Backend,
     conout: ReadPipe,
+}
+
+pub struct Pty {
+    backend: ConptyBackend,
     conin: WritePipe,
     child_watcher: ChildExitWatcher,
 }
@@ -61,7 +69,11 @@ impl Pty {
         conin: impl Into<WritePipe>,
         child_watcher: ChildExitWatcher,
     ) -> Self {
-        Self { backend: backend.into(), conout: conout.into(), conin: conin.into(), child_watcher }
+        Self {
+            backend: ConptyBackend { conpty: backend.into(), conout: conout.into() },
+            conin: conin.into(),
+            child_watcher,
+        }
     }
 
     pub fn child_watcher(&self) -> &ChildExitWatcher {
@@ -86,7 +98,7 @@ impl EventedReadWrite for Pty {
         poll_opts: polling::PollMode,
     ) -> io::Result<()> {
         self.conin.register(poll, with_key(interest, PTY_READ_WRITE_TOKEN), poll_opts);
-        self.conout.register(poll, with_key(interest, PTY_READ_WRITE_TOKEN), poll_opts);
+        self.backend.conout.register(poll, with_key(interest, PTY_READ_WRITE_TOKEN), poll_opts);
         self.child_watcher.register(poll, with_key(interest, PTY_CHILD_EVENT_TOKEN));
 
         Ok(())
@@ -100,7 +112,7 @@ impl EventedReadWrite for Pty {
         poll_opts: polling::PollMode,
     ) -> io::Result<()> {
         self.conin.register(poll, with_key(interest, PTY_READ_WRITE_TOKEN), poll_opts);
-        self.conout.register(poll, with_key(interest, PTY_READ_WRITE_TOKEN), poll_opts);
+        self.backend.conout.register(poll, with_key(interest, PTY_READ_WRITE_TOKEN), poll_opts);
         self.child_watcher.register(poll, with_key(interest, PTY_CHILD_EVENT_TOKEN));
 
         Ok(())
@@ -109,7 +121,7 @@ impl EventedReadWrite for Pty {
     #[inline]
     fn deregister(&mut self, _poll: &Arc<Poller>) -> io::Result<()> {
         self.conin.deregister();
-        self.conout.deregister();
+        self.backend.conout.deregister();
         self.child_watcher.deregister();
 
         Ok(())
@@ -117,7 +129,7 @@ impl EventedReadWrite for Pty {
 
     #[inline]
     fn reader(&mut self) -> &mut Self::Reader {
-        &mut self.conout
+        &mut self.backend.conout
     }
 
     #[inline]
@@ -138,7 +150,7 @@ impl EventedPty for Pty {
 
 impl OnResize for Pty {
     fn on_resize(&mut self, window_size: WindowSize) {
-        self.backend.on_resize(window_size)
+        self.backend.conpty.on_resize(window_size)
     }
 }
 
