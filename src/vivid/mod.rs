@@ -5,6 +5,7 @@ mod audio;
 mod clock;
 mod decoder;
 mod ffmpeg;
+pub(crate) mod file_drop;
 pub(crate) mod hid;
 mod lane;
 mod lease;
@@ -36,8 +37,8 @@ use vivid_protocol::anchor::{self, AnchorKey};
 use vivid_protocol::auth::{self, Secret32};
 use vivid_protocol::cbor::Value;
 use vivid_protocol::context::{
-    ContextDefinition, ContextState, OP_DELEGATE, OP_DESKTOP_INPUT, OP_SURFACE_TRACK_MEDIA,
-    OP_TERMINAL_ANCHOR,
+    ContextDefinition, ContextState, OP_DELEGATE, OP_DESKTOP_INPUT, OP_RECEIVE_FILE_DROP,
+    OP_SURFACE_TRACK_MEDIA, OP_TERMINAL_ANCHOR,
 };
 use vivid_protocol::grant::{self, Eligibility, InputGrant, reason as grant_reason};
 use vivid_protocol::identity::{
@@ -81,6 +82,8 @@ use crate::vivid::target::{DesktopTarget, PresentationTarget, TerminalTarget};
 use crate::vivid::transport::{ReadShutdown, Reader, Writer};
 use vivid_protocol::lease::{AttemptDecision, SessionLeaseDefinition};
 
+use crate::display::SizeInfo;
+
 #[cfg(windows)]
 type LocalListener = TcpListener;
 #[cfg(windows)]
@@ -89,6 +92,10 @@ type LocalStream = TcpStream;
 type LocalListener = UnixListener;
 #[cfg(unix)]
 type LocalStream = UnixStream;
+
+fn fixed_to_f32(value: i64) -> f32 {
+    value as f32 / (1_u64 << 32) as f32
+}
 
 pub(crate) const MAX_SESSIONS: usize = 16;
 const MAX_CONNECTIONS: usize = 64;
@@ -272,6 +279,7 @@ struct ServiceShared {
     frame_wake_events: AtomicU64,
     actor_timeout_services: AtomicU64,
     trace: Mutex<trace::TraceJournal>,
+    file_drops: Mutex<file_drop::FileDropManager>,
 }
 
 enum ActorMessage {
@@ -511,6 +519,7 @@ impl VividService {
             frame_wake_events: AtomicU64::new(0),
             actor_timeout_services: AtomicU64::new(0),
             trace: Mutex::new(trace::TraceJournal::default()),
+            file_drops: Mutex::new(file_drop::FileDropManager::default()),
         });
         let shutdown = Arc::new(AtomicBool::new(false));
         let listener_thread = thread::Builder::new().name("vivid-1.5-listener".into()).spawn({
@@ -692,6 +701,92 @@ impl VividService {
     }
 
     pub fn update_visibility(&self, _visible: bool, _display_offset: usize) {}
+
+    /// Vivido-owned hover text for the currently effective file-drop binding.
+    pub fn file_drop_hover_label(
+        &self,
+        x: usize,
+        y: usize,
+        size: &SizeInfo,
+        display_offset: usize,
+    ) -> Option<&'static str> {
+        let hit = self.file_drop_surface_at(x, y, size, display_offset);
+        lock(&self.shared.file_drops).hover_label(hit)
+    }
+
+    /// Route one local regular file to the effective binding without ever exposing its path.
+    pub(crate) fn handle_file_drop(
+        &self,
+        path: &std::path::Path,
+        x: usize,
+        y: usize,
+        size: &SizeInfo,
+        display_offset: usize,
+    ) -> file_drop::LocalDropDisposition {
+        let hit = self.file_drop_surface_at(x, y, size, display_offset);
+        let (disposition, offer) = lock(&self.shared.file_drops).offer_local_file(path, hit);
+        let Some((owner, offer)) = offer else {
+            return disposition;
+        };
+        let session = lock(&self.shared.registry).sessions.get(&owner.session_id).cloned();
+        let Some(session) = session else {
+            return file_drop::LocalDropDisposition::Rejected("The remote receiver disconnected");
+        };
+        let Ok(payload) = offer.payload() else {
+            return file_drop::LocalDropDisposition::Rejected("The dropped filename is invalid");
+        };
+        let Ok(body) = Envelope::new(0, payload).encode() else {
+            return file_drop::LocalDropDisposition::Rejected(
+                "The file-drop offer could not be encoded",
+            );
+        };
+        if session.post_control(messages::FILE_DROP_OFFER, offer.binding.drop_id, body) {
+            if let Some(ingress) = lock(&session.actor_ingress).as_ref() {
+                let _ = ingress.try_send(ActorMessage::Wake);
+            }
+            disposition
+        } else {
+            file_drop::LocalDropDisposition::Rejected("The remote receiver stopped responding")
+        }
+    }
+
+    /// Resolve the topmost rendered Vivid surface under a window-space pointer.
+    ///
+    /// This deliberately uses the same fixed-point placement, target scale, scroll offset, clip,
+    /// and z-order as the renderer. A surface-qualified binding therefore cannot capture a drop
+    /// merely because it is the only such binding in the process.
+    fn file_drop_surface_at(
+        &self,
+        x: usize,
+        y: usize,
+        size: &SizeInfo,
+        display_offset: usize,
+    ) -> Option<(SurfaceIdentity, SurfaceGeneration)> {
+        let (scale_x, scale_y) = self.scene.target().placement_scale(size);
+        let pointer_x = x as f32;
+        let pointer_y = y as f32;
+        self.scene.snapshot().items.iter().rev().find_map(|item| {
+            let scroll = if item.text_anchored { display_offset as f32 } else { 0.0 };
+            let left = size.padding_x() + fixed_to_f32(item.x) * scale_x;
+            let top = size.padding_y() + (fixed_to_f32(item.y) + scroll) * scale_y;
+            let mut right = left + fixed_to_f32(item.width) * scale_x;
+            let mut bottom = top + fixed_to_f32(item.height) * scale_y;
+            let mut left = left.max(0.0);
+            let mut top = top.max(0.0);
+            right = right.min(size.width());
+            bottom = bottom.min(size.height());
+            if let Some(clip) = item.clip {
+                let clip_left = size.padding_x() + fixed_to_f32(clip.x) * scale_x;
+                let clip_top = size.padding_y() + (fixed_to_f32(clip.y) + scroll) * scale_y;
+                left = left.max(clip_left);
+                top = top.max(clip_top);
+                right = right.min(clip_left + fixed_to_f32(clip.width) * scale_x);
+                bottom = bottom.min(clip_top + fixed_to_f32(clip.height) * scale_y);
+            }
+            (pointer_x >= left && pointer_x < right && pointer_y >= top && pointer_y < bottom)
+                .then_some((item.surface_key, item.surface_generation))
+        })
+    }
 
     /// Send one desktop input event to whichever session holds the grant.
     ///
@@ -992,6 +1087,7 @@ fn handle_connection(
         ConnectionKind::Control => handle_control(&mut reader, &preface_bytes, shared, pending),
         ConnectionKind::Track => handle_track_channel(&mut reader, shared, pending),
         ConnectionKind::Lane => handle_lane(&mut reader, shared, pending),
+        ConnectionKind::FileTransfer => file_drop::handle_connection(&mut reader, shared, pending),
     }
 }
 
@@ -1169,6 +1265,7 @@ fn actor_loop(
         expire_leases(&shared, &session);
         service_input_renewal(&session);
         drain_observations(&session, &egress);
+        service_file_drop_timeouts(&shared, &session, &egress);
     }
     egress.close();
     // Flush the final reply (notably GOODBYE's OK) before closing the socket. On Windows a
@@ -1186,6 +1283,10 @@ fn actor_wait_timeout(
     pending_timeout: Option<Duration>,
     now: Instant,
 ) -> Option<Duration> {
+    let file_drop_timeout = lock(&shared.file_drops)
+        .next_deadline(session.identity)
+        .map(|deadline| deadline.saturating_duration_since(now));
+    let pending_timeout = minimum_timeout(pending_timeout, file_drop_timeout);
     let lease_timeout = lock(&shared.registry)
         .leases
         .next_deadline(session.identity)
@@ -1202,6 +1303,21 @@ fn actor_wait_timeout(
         )
     });
     select_actor_wait_timeout(pending_timeout, lease_timeout, renewal_timeout)
+}
+
+fn service_file_drop_timeouts(shared: &ServiceShared, session: &SessionRuntime, egress: &Egress) {
+    let cancellations = lock(&shared.file_drops).service_timeouts(session.identity);
+    for cancellation in cancellations {
+        let Ok(payload) = cancellation.payload() else {
+            continue;
+        };
+        let Ok(body) = Envelope::new(0, payload).encode() else {
+            continue;
+        };
+        if !egress.send(messages::FILE_DROP_CANCELLED, cancellation.binding.drop_id, body) {
+            break;
+        }
+    }
 }
 
 /// Pure deadline policy, separated from the actor's mutable registries for deterministic tests.
@@ -1497,6 +1613,7 @@ fn finish_session(shared: &Arc<ServiceShared>, session: &Arc<SessionRuntime>, cl
             revoke_lease(shared, &issuer, key, reason);
         }
     }
+    lock(&shared.file_drops).remove_session(session.identity);
     lock(&shared.registry).remove_session(session.identity.session_id);
     let removed_audio = {
         let mut outputs = lock(&shared.audio_outputs);
@@ -1992,6 +2109,121 @@ fn dispatch_control(
                 .encode(),
             )
         },
+        messages::SET_FILE_DROP_BINDING => {
+            if !session.supports(registry::FILE_DROP) {
+                return Err(ControlError::unsupported("file-drop-v1 was not negotiated"));
+            }
+            let binding =
+                vivid_protocol::file_drop::FileDropBinding::decode(record.object_id, &value)
+                    .map_err(|_| ControlError::bad_message("invalid file-drop binding"))?;
+            require_context_operation(session, binding.context_id, OP_RECEIVE_FILE_DROP)?;
+            if !binding.disabled() && binding.surface_id != 0 {
+                let identity = surface_identity(session, binding.context_id, binding.surface_id)?;
+                let status = shared
+                    .scene
+                    .surface_status(identity)
+                    .ok_or_else(|| ControlError::not_found("file-drop surface is absent"))?;
+                if status.generation != binding.surface_generation {
+                    return Err(ControlError::precondition(
+                        "file-drop surface generation is stale",
+                    ));
+                }
+            }
+            let grant = lock(&shared.file_drops)
+                .set_binding(session.identity, binding, true)
+                .map_err(ControlError::state)?;
+            (
+                messages::FILE_DROP_BOUND,
+                record.object_id,
+                Envelope::new(request_id, grant.payload()).encode(),
+            )
+        },
+        messages::ACCEPT_FILE_DROP => {
+            if !session.supports(registry::FILE_DROP) {
+                return Err(ControlError::unsupported("file-drop-v1 was not negotiated"));
+            }
+            let acceptance =
+                vivid_protocol::file_drop::AcceptFileDrop::decode(record.object_id, &value)
+                    .map_err(|_| ControlError::bad_message("invalid file-drop acceptance"))?;
+            require_context_operation(
+                session,
+                acceptance.binding.context_id,
+                OP_RECEIVE_FILE_DROP,
+            )?;
+            let accepted = lock(&shared.file_drops)
+                .accept(session.identity, acceptance)
+                .map_err(ControlError::state)?;
+            (
+                messages::FILE_DROP_ACCEPTED,
+                record.object_id,
+                Envelope::new(request_id, accepted.payload()).encode(),
+            )
+        },
+        messages::CANCEL_FILE_DROP => {
+            let cancellation = vivid_protocol::file_drop::CancelFileDrop::decode(
+                "CANCEL_FILE_DROP",
+                record.object_id,
+                &value,
+            )
+            .map_err(|_| ControlError::bad_message("invalid file-drop cancellation"))?;
+            require_context_operation(
+                session,
+                cancellation.binding.context_id,
+                OP_RECEIVE_FILE_DROP,
+            )?;
+            lock(&shared.file_drops)
+                .cancel(session.identity, cancellation)
+                .map_err(ControlError::state)?;
+            (
+                messages::FILE_DROP_CANCELLED,
+                record.object_id,
+                Envelope::new(
+                    request_id,
+                    cancellation
+                        .payload()
+                        .map_err(|_| ControlError::bad_message("invalid file-drop cancellation"))?,
+                )
+                .encode(),
+            )
+        },
+        messages::ADVANCE_FILE_TRANSFER => {
+            let advance =
+                vivid_protocol::file_drop::AdvanceFileTransfer::decode(record.object_id, &value)
+                    .map_err(|_| ControlError::bad_message("invalid file-transfer advance"))?;
+            require_context_operation(session, advance.context_id, OP_RECEIVE_FILE_DROP)?;
+            let advanced = lock(&shared.file_drops)
+                .advance(session.identity, advance)
+                .map_err(ControlError::state)?;
+            (
+                messages::FILE_TRANSFER_ADVANCED,
+                record.object_id,
+                Envelope::new(
+                    request_id,
+                    advanced.payload().map_err(|_| {
+                        ControlError::bad_message("invalid file-transfer advance reply")
+                    })?,
+                )
+                .encode(),
+            )
+        },
+        messages::QUERY_FILE_DROP => {
+            let query = vivid_protocol::file_drop::QueryFileDrop::decode(record.object_id, &value)
+                .map_err(|_| ControlError::bad_message("invalid file-drop query"))?;
+            let status = lock(&shared.file_drops)
+                .status(session.identity, query)
+                .map_err(ControlError::not_found)?;
+            (
+                messages::FILE_DROP_STATUS,
+                record.object_id,
+                Envelope::new(
+                    request_id,
+                    status
+                        .payload()
+                        .map_err(|_| ControlError::bad_message("invalid file-drop status reply"))?,
+                )
+                .encode(),
+            )
+        },
         messages::CREATE_CONTEXT => {
             let definition = ContextDefinition::decode(record.object_id, &value)
                 .map_err(|_| ControlError::bad_message("invalid context schema"))?;
@@ -2148,6 +2380,7 @@ fn dispatch_control(
             }
             drop(contexts);
             shared.scene.remove_contexts(session.identity, &removed);
+            lock(&shared.file_drops).remove_contexts(session.identity, &removed);
             (messages::OK, context_id, Ok(messages::ok(request_id)))
         },
         messages::CREATE_SURFACE => {
@@ -2230,6 +2463,13 @@ fn dispatch_control(
                     replacement,
                 )
                 .map_err(ControlError::state)?;
+            if status.generation != current.generation {
+                lock(&shared.file_drops).remove_surface(
+                    session.identity,
+                    identity.context.context_id,
+                    identity.surface_id,
+                );
+            }
             observe_surface(session, &status, SURFACE_CHANGED_GEOMETRY);
             (messages::OK, record.object_id, Ok(messages::ok(request_id)))
         },
@@ -2239,6 +2479,11 @@ fn dispatch_control(
                 observe_surface(session, &status, SURFACE_CHANGED_LIFECYCLE);
             }
             shared.scene.destroy_surface(identity).map_err(ControlError::state)?;
+            lock(&shared.file_drops).remove_surface(
+                session.identity,
+                identity.context.context_id,
+                identity.surface_id,
+            );
             (messages::OK, record.object_id, Ok(messages::ok(request_id)))
         },
         messages::QUERY_SURFACE => {

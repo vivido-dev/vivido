@@ -162,6 +162,7 @@ impl TerminalTarget {
     const PROFILES: &'static [&'static str] = &[
         registry::AUDIO_GAIN,
         registry::CORE_CONTROL,
+        registry::FILE_DROP,
         registry::LIVE_MEDIA,
         registry::OBSERVABILITY,
         registry::TERMINAL_SURFACE,
@@ -354,6 +355,7 @@ impl DesktopTarget {
         registry::CORE_CONTROL,
         registry::DESKTOP_SURFACE,
         registry::DESKTOP_INPUT,
+        registry::FILE_DROP,
         registry::LIVE_MEDIA,
         registry::OBSERVABILITY,
         registry::TIMED_MEDIA,

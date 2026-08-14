@@ -15,6 +15,7 @@ Usage: vvssh [SSH_OPTIONS] DESTINATION
 vvssh option:
   --shared-media-transport    Carry media on the interactive SSH TCP connection (legacy mode).
   --separate-media-transport  Explicitly select the default independent media connection.
+  --no-receive-drops          Do not start the optional remote vvreceive helper.
 
 All arguments are passed to ssh and DESTINATION must be the final argument. Connection options can
 also be placed in ~/.ssh/config. vvssh opens an interactive remote login shell; remote commands and
@@ -47,6 +48,7 @@ fn run() -> Result<u8, String> {
         return Ok(0);
     }
     let separate_media = take_media_transport_flags(&mut arguments)?;
+    let receive_drops = take_receive_drop_flag(&mut arguments);
     validate_arguments(&arguments)?;
 
     let endpoint = env::var("VIVID_ENDPOINT_CONTROL")
@@ -61,7 +63,14 @@ fn run() -> Result<u8, String> {
         .map(|duration| duration.as_nanos())
         .unwrap_or_default();
     let (setup_arguments, ssh_arguments, secret_file, bulk_arguments, bulk_socket) =
-        build_ssh_arguments(arguments, &endpoint, std::process::id(), nonce, separate_media)?;
+        build_ssh_arguments(
+            arguments,
+            &endpoint,
+            std::process::id(),
+            nonce,
+            separate_media,
+            receive_drops,
+        )?;
 
     let ssh = env::var_os("VVSSH_SSH").unwrap_or_else(|| OsString::from("ssh"));
     let mut setup = Command::new(&ssh)
@@ -170,6 +179,19 @@ fn take_media_transport_flags(arguments: &mut Vec<OsString>) -> Result<bool, Str
     Ok(!shared)
 }
 
+fn take_receive_drop_flag(arguments: &mut Vec<OsString>) -> bool {
+    let mut receive = true;
+    arguments.retain(|argument| {
+        if argument == OsStr::new("--no-receive-drops") {
+            receive = false;
+            false
+        } else {
+            true
+        }
+    });
+    receive
+}
+
 fn validate_arguments(arguments: &[OsString]) -> Result<(), String> {
     if arguments.is_empty() {
         return Err("missing SSH destination; run `vvssh --help` for usage".into());
@@ -193,6 +215,7 @@ fn build_ssh_arguments(
     process_id: u32,
     nonce: u128,
     separate_media: bool,
+    receive_drops: bool,
 ) -> Result<BuiltSshArguments, String> {
     let local_target = local_forward_target(endpoint)?;
     let remote_socket = format!("/tmp/vivido-vivid-{process_id}-{nonce}.sock");
@@ -211,8 +234,13 @@ fn build_ssh_arguments(
             format!(" VIVID_ENDPOINT_REALTIME={endpoint} VIVID_ENDPOINT_BULK={endpoint}")
         })
         .unwrap_or_default();
+    let receiver = if receive_drops {
+        "if command -v vvreceive >/dev/null 2>&1; then _vvreceive_ready=0; trap '_vvreceive_ready=1' USR1; vvreceive --shell-pid $$ --signal-ready </dev/null >/dev/null 2>&1 & _vvreceive_pid=$!; while [ \"$_vvreceive_ready\" -eq 0 ] && kill -0 \"$_vvreceive_pid\" 2>/dev/null; do sleep 0.01; done; trap - USR1; unset _vvreceive_ready _vvreceive_pid; fi; "
+    } else {
+        ""
+    };
     let remote_command = format!(
-        "VIVID_ROOT_SECRET=$(cat {}) && rm -f {} && export VIVID_ROOT_SECRET && env VIVID_REMOTE=1{anchor_transport} VIVID_ENDPOINT_CONTROL={}{media_environment} \"$SHELL\" -l",
+        "VIVID_ROOT_SECRET=$(cat {}) && rm -f {} && export VIVID_ROOT_SECRET && export VIVID_REMOTE=1{anchor_transport} VIVID_ENDPOINT_CONTROL={}{media_environment}; {receiver}exec \"$SHELL\" -l",
         shell_quote(&secret_file),
         shell_quote(&secret_file),
         shell_quote(&remote_endpoint),
@@ -332,6 +360,7 @@ mod tests {
             42,
             99,
             false,
+            true,
         )
         .unwrap();
         let arguments =
@@ -355,9 +384,15 @@ mod tests {
 
     #[test]
     fn builds_windows_loopback_tcp_destination() {
-        let (_, arguments, _, _, _) =
-            build_ssh_arguments(vec![OsString::from("host")], "tcp:127.0.0.1:1234", 1, 2, false)
-                .unwrap();
+        let (_, arguments, _, _, _) = build_ssh_arguments(
+            vec![OsString::from("host")],
+            "tcp:127.0.0.1:1234",
+            1,
+            2,
+            false,
+            true,
+        )
+        .unwrap();
         let arguments =
             arguments.iter().map(|argument| argument.to_string_lossy()).collect::<Vec<_>>();
         assert!(arguments.contains(&"/tmp/vivido-vivid-1-2.sock:127.0.0.1:1234".into()));
@@ -368,9 +403,15 @@ mod tests {
 
     #[test]
     fn rejects_non_loopback_tcp_endpoints() {
-        let error =
-            build_ssh_arguments(vec![OsString::from("host")], "tcp:192.0.2.1:1234", 1, 2, false)
-                .unwrap_err();
+        let error = build_ssh_arguments(
+            vec![OsString::from("host")],
+            "tcp:192.0.2.1:1234",
+            1,
+            2,
+            false,
+            true,
+        )
+        .unwrap_err();
         assert!(error.contains("not IPv4 loopback"));
     }
 
@@ -400,6 +441,7 @@ mod tests {
             "tcp:127.0.0.1:4321",
             7,
             9,
+            true,
             true,
         )
         .unwrap();
@@ -431,5 +473,40 @@ mod tests {
             OsString::from("host"),
         ];
         assert!(take_media_transport_flags(&mut conflicting).is_err());
+    }
+
+    #[test]
+    fn receiver_is_backgrounded_before_exec_and_can_be_disabled() {
+        let (_, enabled, _, _, _) = build_ssh_arguments(
+            vec![OsString::from("host")],
+            "tcp:127.0.0.1:4321",
+            7,
+            9,
+            false,
+            true,
+        )
+        .unwrap();
+        let command = enabled.last().unwrap().to_string_lossy();
+        assert!(
+            command
+                .contains("vvreceive --shell-pid $$ --signal-ready </dev/null >/dev/null 2>&1 &")
+        );
+        assert!(command.contains("trap '_vvreceive_ready=1' USR1"));
+        assert!(command.ends_with("exec \"$SHELL\" -l"));
+
+        let (_, disabled, _, _, _) = build_ssh_arguments(
+            vec![OsString::from("host")],
+            "tcp:127.0.0.1:4321",
+            7,
+            9,
+            false,
+            false,
+        )
+        .unwrap();
+        assert!(!disabled.last().unwrap().to_string_lossy().contains("vvreceive"));
+
+        let mut arguments = vec![OsString::from("--no-receive-drops"), OsString::from("host")];
+        assert!(!take_receive_drop_flag(&mut arguments));
+        assert_eq!(arguments, [OsString::from("host")]);
     }
 }

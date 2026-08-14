@@ -46,6 +46,7 @@ pub struct Reader {
     sequence: u64,
     first_record: bool,
     handshake_deadline: Option<Instant>,
+    record_idle_timeout: Option<Duration>,
 }
 
 impl Reader {
@@ -93,6 +94,7 @@ impl Reader {
                 sequence: 0,
                 first_record: true,
                 handshake_deadline: Some(handshake_deadline),
+                record_idle_timeout: None,
             },
             preface,
             bytes,
@@ -109,6 +111,26 @@ impl Reader {
         self.handshake_deadline = None;
         #[cfg(unix)]
         self.stream.set_read_timeout(None)?;
+        Ok(())
+    }
+
+    /// Bound inactivity on a dedicated transfer connection after authentication.
+    ///
+    /// The deadline is refreshed only after a complete record is received, so byte-dribbling does
+    /// not keep a half-record alive. The write timeout applies to every clone of the same socket
+    /// and prevents a credited sender from blocking forever when the receiver stops reading.
+    pub fn set_record_idle_timeout(&mut self, timeout: Duration) -> io::Result<()> {
+        if timeout.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "record idle timeout must be nonzero",
+            ));
+        }
+        self.record_idle_timeout = Some(timeout);
+        self.handshake_deadline = Instant::now().checked_add(timeout);
+        #[cfg(unix)]
+        self.stream.set_read_timeout(Some(timeout))?;
+        self.stream.set_write_timeout(Some(timeout))?;
         Ok(())
     }
 
@@ -191,6 +213,9 @@ impl Reader {
         }
         self.sequence = header.sequence;
         self.read_body_into(header.body_length as usize, body)?;
+        if let Some(timeout) = self.record_idle_timeout {
+            self.handshake_deadline = Instant::now().checked_add(timeout);
+        }
         Ok(header)
     }
 

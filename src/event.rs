@@ -62,7 +62,7 @@ use crate::display::window::{ImeInhibitor, Window};
 use crate::display::{Display, Preedit, SizeInfo};
 use crate::input::{self, ActionContext as _, FONT_SIZE_STEP};
 use crate::logging::{LOG_TARGET_CONFIG, LOG_TARGET_WINIT};
-use crate::message_bar::{Message, MessageBuffer};
+use crate::message_bar::{Message, MessageBuffer, MessageType};
 #[cfg(any(unix, windows))]
 use crate::polling::ipc::IpcRequest;
 #[cfg(any(unix, windows))]
@@ -441,10 +441,8 @@ impl Processor {
                 | WindowEvent::PinchGesture { .. }
                 | WindowEvent::AxisMotion { .. }
                 | WindowEvent::PanGesture { .. }
-                | WindowEvent::HoveredFileCancelled
                 | WindowEvent::Destroyed
                 | WindowEvent::ThemeChanged(_)
-                | WindowEvent::HoveredFile(_)
         )
     }
 
@@ -4164,9 +4162,60 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                         );
                     },
                     WindowEvent::DroppedFile(path) => {
-                        let path: String = path.to_string_lossy().into();
-                        self.ctx.paste(&(path + " "), true);
+                        let size = self.ctx.size_info();
+                        let display_offset = self.ctx.terminal.grid().display_offset();
+                        match self.ctx.vivid_service.handle_file_drop(
+                            &path,
+                            self.ctx.mouse.x,
+                            self.ctx.mouse.y,
+                            &size,
+                            display_offset,
+                        ) {
+                            crate::vivid::file_drop::LocalDropDisposition::NoBinding => {
+                                self.ctx
+                                    .paste(&crate::vivid::file_drop::local_paste_text(&path), true);
+                            },
+                            crate::vivid::file_drop::LocalDropDisposition::ConsentRequired(
+                                label,
+                            ) => {
+                                self.ctx.message_buffer.push(Message::new(
+                                    format!("{label}: drop the file again to confirm"),
+                                    MessageType::Warning,
+                                ));
+                                *self.ctx.dirty = true;
+                            },
+                            crate::vivid::file_drop::LocalDropDisposition::Offered => {
+                                self.ctx.message_buffer.push(Message::new(
+                                    "Copying file to the remote receiver".into(),
+                                    MessageType::Warning,
+                                ));
+                                *self.ctx.dirty = true;
+                            },
+                            crate::vivid::file_drop::LocalDropDisposition::Rejected(reason) => {
+                                self.ctx
+                                    .message_buffer
+                                    .push(Message::new(reason.into(), MessageType::Error));
+                                *self.ctx.dirty = true;
+                            },
+                        }
                     },
+                    WindowEvent::HoveredFile(_) => {
+                        let size = self.ctx.size_info();
+                        let display_offset = self.ctx.terminal.grid().display_offset();
+                        if let Some(label) = self.ctx.vivid_service.file_drop_hover_label(
+                            self.ctx.mouse.x,
+                            self.ctx.mouse.y,
+                            &size,
+                            display_offset,
+                        ) {
+                            let message = Message::new(label.into(), MessageType::Warning);
+                            if !self.ctx.message_buffer.is_queued(&message) {
+                                self.ctx.message_buffer.push(message);
+                                *self.ctx.dirty = true;
+                            }
+                        }
+                    },
+                    WindowEvent::HoveredFileCancelled => (),
                     WindowEvent::CursorLeft { .. } => {
                         self.ctx.mouse.inside_text_area = false;
 
@@ -4209,10 +4258,8 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                     | WindowEvent::PinchGesture { .. }
                     | WindowEvent::AxisMotion { .. }
                     | WindowEvent::PanGesture { .. }
-                    | WindowEvent::HoveredFileCancelled
                     | WindowEvent::Destroyed
                     | WindowEvent::ThemeChanged(_)
-                    | WindowEvent::HoveredFile(_)
                     | WindowEvent::RedrawRequested
                     | WindowEvent::Moved(_) => (),
                 }

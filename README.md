@@ -104,6 +104,12 @@ The media helper exports its private socket as both `VIVID_ENDPOINT_REALTIME` an
 session. `VIVID_ROOT_SECRET` travels only through the protected temporary-file setup channel,
 never in command arguments or logs.
 
+When the remote Vivi installation includes `vvreceive`, `vvssh` starts it quietly and waits only
+until it has recorded the login-shell PID identity before executing the shell. Dropping a local
+regular file on the confirmed remote-shell binding copies it over Vivid's authenticated bulk
+connection into that shell's current directory. If the helper is absent, or
+`--no-receive-drops` is passed, local filename paste remains unchanged.
+
 The 1.1 wire protocol and the version-1 automation interface are intentionally not supported. See
 the [Vivido 1.1 to 1.5 migration guide](../docs/vivido-protocol-1.1-to-1.5-migration.md).
 
