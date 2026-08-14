@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::ops::Range;
 use std::sync::Arc;
 use std::{array, env};
 
@@ -56,6 +57,29 @@ struct LayoutKey {
     font_size_bits: u32,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct TerminalLayoutKey {
+    text: Box<str>,
+    spans: Box<[TerminalStyleKey]>,
+    ligatures: bool,
+    font_size_bits: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct TerminalStyleKey {
+    end: usize,
+    variant: FontVariant,
+    color: (u8, u8, u8),
+}
+
+/// One contiguous presentation span in a terminal row shaping run.
+#[derive(Clone, Debug)]
+pub(crate) struct TerminalTextStyle {
+    pub range: Range<usize>,
+    pub flags: Flags,
+    pub color: Rgb,
+}
+
 /// Shaped layouts kept alive at once.
 ///
 /// The cache is keyed partly by the cluster's text, so a program emitting many distinct
@@ -78,10 +102,16 @@ struct CachedLayout {
     used: u64,
 }
 
+struct CachedTerminalLayout {
+    layout: Arc<Layout<Rgb>>,
+    used: u64,
+}
+
 pub struct TextSystem {
     font: Font,
     font_cx: FontContext,
     layout_cx: LayoutContext<()>,
+    terminal_layout_cx: LayoutContext<Rgb>,
     metrics: TextMetrics,
     locale: Option<Language>,
     fallback_search_families: Arc<[FamilyId]>,
@@ -90,6 +120,8 @@ pub struct TextSystem {
     variant_styles: [(ParleyFontStyle, FontWeight); 4],
     cache: AHashMap<LayoutKey, CachedLayout>,
     cache_clock: u64,
+    terminal_cache: AHashMap<TerminalLayoutKey, CachedTerminalLayout>,
+    terminal_cache_clock: u64,
 }
 
 impl TextSystem {
@@ -102,12 +134,15 @@ impl TextSystem {
             font,
             font_cx,
             layout_cx: LayoutContext::default(),
+            terminal_layout_cx: LayoutContext::default(),
             metrics: TextMetrics::default(),
             locale: text_locale(),
             fallback_search_families,
             checked_fallbacks: AHashSet::default(),
             cache: AHashMap::new(),
             cache_clock: 0,
+            terminal_cache: AHashMap::new(),
+            terminal_cache_clock: 0,
         };
         text_system.metrics = text_system.measure_metrics();
         text_system
@@ -129,6 +164,7 @@ impl TextSystem {
         self.metrics = self.measure_metrics();
         self.checked_fallbacks.clear();
         self.cache.clear();
+        self.terminal_cache.clear();
     }
 
     pub fn shape_cell(&mut self, cell: &RenderableCell) -> Option<Arc<Layout<()>>> {
@@ -153,9 +189,35 @@ impl TextSystem {
         }
     }
 
-    /// Shape a run assembled from compatible neighboring terminal cells.
-    pub fn shape_terminal_run(&mut self, text: String, flags: Flags) -> Arc<Layout<()>> {
-        self.shape_text(text, font_variant(flags))
+    /// Shape a complete terminal row run so contextual shaping and the Unicode BiDi algorithm
+    /// see the neighboring cells they require.
+    pub(crate) fn shape_terminal_run(
+        &mut self,
+        text: String,
+        styles: &[TerminalTextStyle],
+        ligatures: bool,
+    ) -> Arc<Layout<Rgb>> {
+        self.ensure_fontique_fallbacks(&text);
+
+        let style_keys = styles
+            .iter()
+            .map(|style| TerminalStyleKey {
+                end: style.range.end,
+                variant: font_variant(style.flags),
+                color: style.color.as_tuple(),
+            })
+            .collect::<Box<[_]>>();
+        let key = TerminalLayoutKey {
+            text: text.clone().into_boxed_str(),
+            spans: style_keys,
+            ligatures,
+            font_size_bits: self.font.size().as_px().to_bits(),
+        };
+        if let Some(layout) = self.cached_terminal_layout(&key) {
+            return layout;
+        }
+
+        self.build_and_cache_terminal_layout(key, &text, styles, ligatures)
     }
 
     #[cfg(test)]
@@ -282,6 +344,14 @@ impl TextSystem {
         Some(Arc::clone(&entry.layout))
     }
 
+    fn cached_terminal_layout(&mut self, key: &TerminalLayoutKey) -> Option<Arc<Layout<Rgb>>> {
+        let clock = self.terminal_cache_clock.saturating_add(1);
+        let entry = self.terminal_cache.get_mut(key)?;
+        entry.used = clock;
+        self.terminal_cache_clock = clock;
+        Some(Arc::clone(&entry.layout))
+    }
+
     /// Drop the least recently used part of the cache once it reaches its bound.
     ///
     /// The eviction is by recency rather than by insertion order, so the handful of clusters a
@@ -296,6 +366,16 @@ impl TextSystem {
         let (_, threshold, _) = used.select_nth_unstable(LAYOUT_EVICTION_BATCH);
         let threshold = *threshold;
         self.cache.retain(|_, entry| entry.used > threshold);
+    }
+
+    fn evict_cached_terminal_layouts(&mut self) {
+        if self.terminal_cache.len() < MAX_CACHED_LAYOUTS {
+            return;
+        }
+        let mut used = self.terminal_cache.values().map(|entry| entry.used).collect::<Vec<_>>();
+        let (_, threshold, _) = used.select_nth_unstable(LAYOUT_EVICTION_BATCH);
+        let threshold = *threshold;
+        self.terminal_cache.retain(|_, entry| entry.used > threshold);
     }
 
     fn build_and_cache_layout(
@@ -324,6 +404,50 @@ impl TextSystem {
         self.cache_clock = self.cache_clock.saturating_add(1);
         self.cache
             .insert(key, CachedLayout { layout: Arc::clone(&layout), used: self.cache_clock });
+        layout
+    }
+
+    fn build_and_cache_terminal_layout(
+        &mut self,
+        key: TerminalLayoutKey,
+        text: &str,
+        styles: &[TerminalTextStyle],
+        ligatures: bool,
+    ) -> Arc<Layout<Rgb>> {
+        let mut builder =
+            self.terminal_layout_cx.ranged_builder(&mut self.font_cx, text, 1.0, true);
+        builder.push_default(self.family_stacks[FontVariant::Normal.as_index()].clone());
+        builder.push_default(StyleProperty::FontSize(self.font.size().as_px()));
+        builder.push_default(StyleProperty::Locale(self.locale));
+        builder.push_default(LineHeight::Absolute(self.metrics.cell_height));
+        if !ligatures {
+            // Keep the features required for cursive scripts, but honor the terminal option for
+            // discretionary Latin/code ligatures inside a row that also contains complex text.
+            builder.push_default(parley::FontFeatures::from(
+                "\"liga\" 0, \"clig\" 0, \"dlig\" 0, \"calt\" 0",
+            ));
+        }
+
+        for style in styles {
+            let variant = font_variant(style.flags);
+            let (font_style, font_weight) = self.variant_styles[variant.as_index()];
+            builder.push(self.family_stacks[variant.as_index()].clone(), style.range.clone());
+            builder.push(StyleProperty::FontStyle(font_style), style.range.clone());
+            builder.push(StyleProperty::FontWeight(font_weight), style.range.clone());
+            builder.push(StyleProperty::Brush(style.color), style.range.clone());
+        }
+
+        let mut layout = builder.build(text);
+        layout.break_all_lines(None);
+        layout.align(Alignment::Start, AlignmentOptions::default());
+
+        let layout = Arc::new(layout);
+        self.evict_cached_terminal_layouts();
+        self.terminal_cache_clock = self.terminal_cache_clock.saturating_add(1);
+        self.terminal_cache.insert(
+            key,
+            CachedTerminalLayout { layout: Arc::clone(&layout), used: self.terminal_cache_clock },
+        );
         layout
     }
 
@@ -392,6 +516,7 @@ impl TextSystem {
         if changed {
             self.checked_fallbacks.clear();
             self.cache.clear();
+            self.terminal_cache.clear();
         }
     }
 
@@ -726,9 +851,9 @@ mod tests {
     use parley::{FontFamilyName, GenericFamily};
 
     use super::{
-        FontVariant, LAYOUT_EVICTION_BATCH, MAX_CACHED_LAYOUTS, TextSystem, family_name_sort_key,
-        font_family_stack, fontique_script_for_char, normalize_locale, parse_named_style,
-        push_configured_family_names,
+        FontVariant, LAYOUT_EVICTION_BATCH, MAX_CACHED_LAYOUTS, TerminalTextStyle, TextSystem,
+        family_name_sort_key, font_family_stack, fontique_script_for_char, normalize_locale,
+        parse_named_style, push_configured_family_names,
     };
     use crate::config::font::Font;
     use crate::display::color::Rgb;
@@ -767,6 +892,77 @@ mod tests {
 
         assert!(Arc::ptr_eq(&first, &second));
         assert_eq!(text.cache_len(), 1);
+    }
+
+    #[test]
+    fn terminal_arabic_is_contextually_shaped_as_one_rtl_run() {
+        let mut text = TextSystem::new(Font::default());
+        let content = "بب";
+        let styles = [
+            TerminalTextStyle {
+                range: 0..'ب'.len_utf8(),
+                flags: Flags::empty(),
+                color: Rgb::new(255, 255, 255),
+            },
+            TerminalTextStyle {
+                range: 'ب'.len_utf8()..content.len(),
+                flags: Flags::empty(),
+                color: Rgb::new(255, 0, 0),
+            },
+        ];
+
+        let layout = text.shape_terminal_run(content.to_owned(), &styles, true);
+        let isolated = text.shape_character('ب', false, false);
+        let isolated_glyph = isolated
+            .lines()
+            .flat_map(|line| line.items())
+            .find_map(|item| match item {
+                PositionedLayoutItem::GlyphRun(run) => run.glyphs().next().map(|glyph| glyph.id),
+                _ => None,
+            })
+            .expect("isolated Arabic glyph");
+        let glyphs = layout
+            .lines()
+            .flat_map(|line| line.items())
+            .filter_map(|item| match item {
+                PositionedLayoutItem::GlyphRun(run) => {
+                    Some(run.glyphs().map(|glyph| glyph.id).collect::<Vec<_>>())
+                },
+                _ => None,
+            })
+            .flatten()
+            .collect::<Vec<_>>();
+
+        assert!(layout.is_rtl());
+        assert!(
+            glyphs.iter().any(|glyph| *glyph != isolated_glyph),
+            "at least one Arabic letter must select a contextual form"
+        );
+    }
+
+    #[test]
+    fn terminal_mixed_direction_text_exposes_visual_rtl_cluster_order() {
+        let mut text = TextSystem::new(Font::default());
+        let content = "abc אבג";
+        let styles = [TerminalTextStyle {
+            range: 0..content.len(),
+            flags: Flags::empty(),
+            color: Rgb::new(255, 255, 255),
+        }];
+
+        let layout = text.shape_terminal_run(content.to_owned(), &styles, true);
+        let line = layout.lines().next().expect("mixed-direction line");
+        let rtl_clusters = line
+            .runs()
+            .find(|run| run.is_rtl())
+            .expect("RTL run")
+            .visual_clusters()
+            .map(|cluster| cluster.text_range().start)
+            .collect::<Vec<_>>();
+
+        assert!(!layout.is_rtl(), "the first strong character establishes an LTR paragraph");
+        assert!(rtl_clusters.len() >= 3);
+        assert!(rtl_clusters.windows(2).all(|pair| pair[0] > pair[1]));
     }
 
     #[test]

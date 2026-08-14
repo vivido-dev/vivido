@@ -41,7 +41,7 @@ use crate::display::hint::{HintMatch, HintState};
 use crate::display::meter::Meter;
 use crate::display::rects::{RenderLine, RenderLines, RenderRect, paint_rect, paint_rects};
 use crate::display::renderer::{EmbeddedFrame, SceneRenderer};
-use crate::display::text::{TextMetrics, TextSystem, color_from_rgb};
+use crate::display::text::{TerminalTextStyle, TextMetrics, TextSystem, color_from_rgb};
 use crate::display::window::Window;
 use crate::event::{Event, EventType, Mouse, SearchState};
 use crate::message_bar::{MessageBuffer, MessageType};
@@ -86,7 +86,21 @@ const DAMAGE_RECT_COLOR: Rgb = Rgb::new(255, 0, 255);
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct TerminalTextSpan {
     cells: Range<usize>,
-    ligature_run: bool,
+    shaped_run: bool,
+}
+
+/// Logical text and terminal-grid metadata for one shaped row fragment.
+struct TerminalShapingRun {
+    text: String,
+    styles: Vec<TerminalTextStyle>,
+    cells: Vec<TerminalShapingCell>,
+    origin_column: usize,
+}
+
+struct TerminalShapingCell {
+    text: Range<usize>,
+    width: usize,
+    hidden: bool,
 }
 
 #[derive(Debug)]
@@ -728,8 +742,8 @@ impl Display {
             for span in
                 terminal_text_spans(&prepared_cells, cursor.point(), text_system.ligatures())
             {
-                if span.ligature_run {
-                    Self::paint_ligature_run(
+                if span.shaped_run {
+                    Self::paint_terminal_run(
                         &mut scene,
                         text_system,
                         size_info,
@@ -986,7 +1000,7 @@ impl Display {
         );
     }
 
-    fn paint_ligature_run(
+    fn paint_terminal_run(
         scene: &mut Scene,
         text_system: &mut TextSystem,
         size: SizeInfo,
@@ -995,16 +1009,17 @@ impl Display {
         let Some(first) = cells.first() else {
             return;
         };
-        let text = cells.iter().map(|cell| cell.character).collect::<String>();
-        let layout = text_system.shape_terminal_run(text, first.flags);
+        let run = terminal_shaping_run(cells);
+        let layout =
+            text_system.shape_terminal_run(run.text.clone(), &run.styles, text_system.ligatures());
         Self::paint_terminal_run_layout(
             scene,
             &layout,
+            &run.cells,
             text_system.metrics(),
             size,
             first.point.line,
-            first.point.column.0,
-            first.fg,
+            run.origin_column,
         );
     }
 
@@ -1058,53 +1073,66 @@ impl Display {
     /// from shifting later terminal cells off the fixed grid.
     fn paint_terminal_run_layout(
         scene: &mut Scene,
-        layout: &parley::Layout<()>,
+        layout: &parley::Layout<Rgb>,
+        cells: &[TerminalShapingCell],
         metrics: TextMetrics,
         size: SizeInfo,
         line: usize,
         column: usize,
-        fg: Rgb,
     ) {
         let transform = Affine::translate((
             (size.padding_x() + column as f32 * size.cell_width() + metrics.glyph_offset_x) as f64,
             (size.padding_y() + line as f32 * size.cell_height() + metrics.glyph_offset_y) as f64,
         ));
-        let brush = vello::peniko::Brush::Solid(color_from_rgb(fg));
-
         for line in layout.lines() {
-            for item in line.items() {
-                let parley::layout::PositionedLayoutItem::GlyphRun(glyph_run) = item else {
-                    continue;
-                };
+            let baseline = line.metrics().baseline;
+            let mut visual_x = 0.0;
+            for shaped_run in line.runs() {
+                let mut pending_rtl_ligature_x = None;
+                let mut glyphs_by_style = vec![Vec::new(); layout.styles().len()];
+                for cluster in shaped_run.visual_clusters() {
+                    let Some(cell) = terminal_cell_for_byte(cells, cluster.text_range().start)
+                    else {
+                        continue;
+                    };
+                    let cluster_x = visual_x;
+                    visual_x += cell.width as f32 * size.cell_width();
 
-                let run = glyph_run.run();
-                let baseline = glyph_run.baseline();
-                let mut glyphs = Vec::new();
-                for cluster in run.visual_clusters() {
                     if cluster.is_ligature_continuation() {
+                        pending_rtl_ligature_x.get_or_insert(cluster_x);
+                        continue;
+                    }
+                    if cell.hidden {
+                        pending_rtl_ligature_x = None;
                         continue;
                     }
 
-                    let mut x = grid_x_for_text_byte(cluster.text_range().start, size.cell_width());
-                    glyphs.extend(
-                        cluster
-                            .glyphs()
-                            .map(|glyph| scene_glyph_from_layout(&mut x, baseline, glyph)),
-                    );
+                    let mut x = if shaped_run.is_rtl() {
+                        pending_rtl_ligature_x.take().unwrap_or(cluster_x)
+                    } else {
+                        cluster_x
+                    };
+                    for glyph in cluster.glyphs() {
+                        let style_index = glyph.style_index as usize;
+                        glyphs_by_style[style_index]
+                            .push(scene_glyph_from_layout(&mut x, baseline, glyph));
+                    }
                 }
 
-                if glyphs.is_empty() {
-                    continue;
+                for (style, glyphs) in layout.styles().iter().zip(glyphs_by_style) {
+                    if glyphs.is_empty() {
+                        continue;
+                    }
+                    let brush = vello::peniko::Brush::Solid(color_from_rgb(style.brush));
+                    scene
+                        .draw_glyphs(shaped_run.font())
+                        .brush(&brush)
+                        .hint(false)
+                        .transform(transform)
+                        .font_size(shaped_run.font_size())
+                        .normalized_coords(shaped_run.normalized_coords())
+                        .draw(Fill::NonZero, glyphs.into_iter());
                 }
-
-                scene
-                    .draw_glyphs(run.font())
-                    .brush(&brush)
-                    .hint(false)
-                    .transform(transform)
-                    .font_size(run.font_size())
-                    .normalized_coords(run.normalized_coords())
-                    .draw(Fill::NonZero, glyphs.into_iter());
             }
         }
     }
@@ -1506,6 +1534,77 @@ fn text_cell_width(text: &str) -> usize {
     text.chars().map(char_cell_width).sum()
 }
 
+fn terminal_shaping_run(cells: &[RenderableCell]) -> TerminalShapingRun {
+    let first = cells.first().expect("terminal shaping runs are non-empty");
+    let mut run = TerminalShapingRun {
+        text: String::new(),
+        styles: Vec::new(),
+        cells: Vec::new(),
+        origin_column: first.point.column.0,
+    };
+    let mut next_column = run.origin_column;
+
+    for cell in cells {
+        debug_assert_eq!(cell.point.line, first.point.line);
+        while next_column < cell.point.column.0 {
+            push_terminal_shaping_cell(&mut run, " ", 1, false, Flags::empty(), first.fg);
+            next_column += 1;
+        }
+
+        if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+            next_column = next_column.max(cell.point.column.0.saturating_add(1));
+            continue;
+        }
+
+        let mut content = String::new();
+        let hidden = cell.flags.contains(Flags::HIDDEN);
+        content.push(if cell.character == '\t' || hidden { ' ' } else { cell.character });
+        if !hidden
+            && let Some(zerowidth) = cell.extra.as_ref().and_then(|extra| extra.zerowidth.as_ref())
+        {
+            content.extend(zerowidth.iter().copied());
+        }
+        let width =
+            if cell.flags.contains(Flags::WIDE_CHAR) { 2 } else { char_cell_width(cell.character) };
+        push_terminal_shaping_cell(&mut run, &content, width, hidden, cell.flags, cell.fg);
+        next_column = cell.point.column.0.saturating_add(width);
+    }
+
+    run
+}
+
+fn push_terminal_shaping_cell(
+    run: &mut TerminalShapingRun,
+    content: &str,
+    width: usize,
+    hidden: bool,
+    flags: Flags,
+    color: Rgb,
+) {
+    let start = run.text.len();
+    run.text.push_str(content);
+    let end = run.text.len();
+    run.cells.push(TerminalShapingCell { text: start..end, width, hidden });
+
+    if let Some(previous) = run.styles.last_mut()
+        && previous.range.end == start
+        && terminal_font_variant(previous.flags) == terminal_font_variant(flags)
+        && previous.color == color
+    {
+        previous.range.end = end;
+    } else {
+        run.styles.push(TerminalTextStyle { range: start..end, flags, color });
+    }
+}
+
+fn terminal_cell_for_byte(
+    cells: &[TerminalShapingCell],
+    byte_index: usize,
+) -> Option<&TerminalShapingCell> {
+    let index = cells.partition_point(|cell| cell.text.end <= byte_index);
+    cells.get(index).filter(|cell| cell.text.contains(&byte_index))
+}
+
 /// Split prepared terminal cells into independent cells and compatible multi-cell shaping runs.
 fn terminal_text_spans(
     cells: &[RenderableCell],
@@ -1516,8 +1615,51 @@ fn terminal_text_spans(
     let mut start = 0;
 
     while start < cells.len() {
+        let line = cells[start].point.line;
+        let line_end = cells[start..]
+            .iter()
+            .position(|cell| cell.point.line != line)
+            .map_or(cells.len(), |offset| start + offset);
+        if cells[start..line_end].iter().any(cell_needs_complex_shaping) {
+            let content_start = (start..line_end)
+                .find(|index| cell_has_shaping_content(&cells[*index]))
+                .expect("a complex row contains shaping content");
+            let content_end = (start..line_end)
+                .rfind(|index| cell_has_shaping_content(&cells[*index]))
+                .map(|index| index + 1)
+                .expect("a complex row contains shaping content");
+
+            spans.extend(
+                (start..content_start)
+                    .map(|index| TerminalTextSpan { cells: index..index + 1, shaped_run: false }),
+            );
+
+            let mut segment_start = content_start;
+            for (offset, cell) in cells[content_start..content_end].iter().enumerate() {
+                if cell.point != cursor {
+                    continue;
+                }
+                let index = content_start + offset;
+                if segment_start < index {
+                    spans.push(TerminalTextSpan { cells: segment_start..index, shaped_run: true });
+                }
+                spans.push(TerminalTextSpan { cells: index..index + 1, shaped_run: false });
+                segment_start = index + 1;
+            }
+            if segment_start < content_end {
+                spans
+                    .push(TerminalTextSpan { cells: segment_start..content_end, shaped_run: true });
+            }
+            spans.extend(
+                (content_end..line_end)
+                    .map(|index| TerminalTextSpan { cells: index..index + 1, shaped_run: false }),
+            );
+            start = line_end;
+            continue;
+        }
+
         if !ligatures || !ligature_cell_is_eligible(&cells[start], cursor) {
-            spans.push(TerminalTextSpan { cells: start..start + 1, ligature_run: false });
+            spans.push(TerminalTextSpan { cells: start..start + 1, shaped_run: false });
             start += 1;
             continue;
         }
@@ -1530,15 +1672,35 @@ fn terminal_text_spans(
             end += 1;
         }
 
-        let ligature_run = end - start > 1;
+        let shaped_run = end - start > 1;
         spans.push(TerminalTextSpan {
-            cells: start..if ligature_run { end } else { start + 1 },
-            ligature_run,
+            cells: start..if shaped_run { end } else { start + 1 },
+            shaped_run,
         });
-        start = if ligature_run { end } else { start + 1 };
+        start = if shaped_run { end } else { start + 1 };
     }
 
     spans
+}
+
+fn cell_needs_complex_shaping(cell: &RenderableCell) -> bool {
+    !cell.flags.contains(Flags::HIDDEN)
+        && (!cell.character.is_ascii()
+            || cell.extra.as_ref().is_some_and(|extra| {
+                extra.zerowidth.as_ref().is_some_and(|characters| {
+                    characters.iter().any(|character| !character.is_ascii())
+                })
+            }))
+}
+
+fn cell_has_shaping_content(cell: &RenderableCell) -> bool {
+    !cell.flags.contains(Flags::HIDDEN)
+        && (cell.character != ' '
+            || cell
+                .extra
+                .as_ref()
+                .and_then(|extra| extra.zerowidth.as_ref())
+                .is_some_and(|characters| !characters.is_empty()))
 }
 
 fn ligature_cell_is_eligible(cell: &RenderableCell, cursor: Point<usize>) -> bool {
@@ -1564,16 +1726,11 @@ fn terminal_font_variant(flags: Flags) -> (bool, bool) {
     (flags.intersects(Flags::BOLD | Flags::DIM_BOLD), flags.contains(Flags::ITALIC))
 }
 
-/// ASCII run text has one byte per terminal cell, so byte offsets map directly to columns.
-fn grid_x_for_text_byte(byte_index: usize, cell_width: f32) -> f32 {
-    byte_index as f32 * cell_width
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        INITIAL_RENDERER_RETRY, MAX_RENDERER_RETRY, TerminalTextSpan, grid_x_for_text_byte,
-        next_renderer_retry_delay, scene_glyph_from_layout, terminal_text_spans, text_cell_width,
+        INITIAL_RENDERER_RETRY, MAX_RENDERER_RETRY, TerminalTextSpan, next_renderer_retry_delay,
+        scene_glyph_from_layout, terminal_shaping_run, terminal_text_spans, text_cell_width,
     };
     use crate::display::color::Rgb;
     use crate::display::content::RenderableCell;
@@ -1619,7 +1776,7 @@ mod tests {
 
         assert_eq!(
             terminal_text_spans(&cells, Point::new(0, Column(0)), true),
-            vec![TerminalTextSpan { cells: 0..2, ligature_run: true }]
+            vec![TerminalTextSpan { cells: 0..2, shaped_run: true }]
         );
     }
 
@@ -1630,8 +1787,8 @@ mod tests {
         assert_eq!(
             terminal_text_spans(&cells, Point::new(0, Column(0)), false),
             vec![
-                TerminalTextSpan { cells: 0..1, ligature_run: false },
-                TerminalTextSpan { cells: 1..2, ligature_run: false },
+                TerminalTextSpan { cells: 0..1, shaped_run: false },
+                TerminalTextSpan { cells: 1..2, shaped_run: false },
             ]
         );
     }
@@ -1641,7 +1798,7 @@ mod tests {
         let base =
             [renderable_cell(0, 3, '='), renderable_cell(0, 4, '>'), renderable_cell(0, 5, '>')];
         let spans = terminal_text_spans(&base, Point::new(0, Column(4)), true);
-        assert!(spans.iter().all(|span| !span.ligature_run));
+        assert!(spans.iter().all(|span| !span.shaped_run));
 
         let mut cases = Vec::new();
 
@@ -1671,7 +1828,7 @@ mod tests {
 
         for cells in cases {
             let spans = terminal_text_spans(&cells, Point::new(9, Column(9)), true);
-            assert!(!spans[0].ligature_run, "unexpected run for {cells:?}");
+            assert!(!spans[0].shaped_run, "unexpected run for {cells:?}");
         }
     }
 
@@ -1680,7 +1837,6 @@ mod tests {
         for (character, flags) in [
             ('\t', Flags::empty()),
             (' ', Flags::empty()),
-            ('今', Flags::empty()),
             ('=', Flags::HIDDEN),
             ('=', Flags::WIDE_CHAR),
         ] {
@@ -1691,17 +1847,79 @@ mod tests {
             assert!(
                 terminal_text_spans(&cells, Point::new(9, Column(9)), true)
                     .iter()
-                    .all(|span| !span.ligature_run),
+                    .all(|span| !span.shaped_run),
                 "unexpected run for {character:?} with {flags:?}"
             );
         }
     }
 
     #[test]
-    fn shaped_ascii_byte_offsets_map_to_fixed_grid_columns() {
-        assert_eq!(grid_x_for_text_byte(0, 9.5), 0.0);
-        assert_eq!(grid_x_for_text_byte(1, 9.5), 9.5);
-        assert_eq!(grid_x_for_text_byte(3, 9.5), 28.5);
+    fn complex_text_is_shaped_as_a_row_even_when_ligatures_are_disabled() {
+        let cells = [
+            renderable_cell(0, 3, 'a'),
+            renderable_cell(0, 4, ' '),
+            renderable_cell(0, 5, 'م'),
+            renderable_cell(0, 6, 'ر'),
+        ];
+
+        assert_eq!(
+            terminal_text_spans(&cells, Point::new(9, Column(9)), false),
+            vec![TerminalTextSpan { cells: 0..4, shaped_run: true }]
+        );
+    }
+
+    #[test]
+    fn cursor_cell_does_not_extend_or_shift_an_rtl_shaping_run() {
+        let cells =
+            [renderable_cell(0, 0, 'م'), renderable_cell(0, 1, 'ر'), renderable_cell(0, 20, ' ')];
+
+        assert_eq!(
+            terminal_text_spans(&cells, Point::new(0, Column(20)), true),
+            vec![
+                TerminalTextSpan { cells: 0..2, shaped_run: true },
+                TerminalTextSpan { cells: 2..3, shaped_run: false },
+            ]
+        );
+        assert_eq!(terminal_shaping_run(&cells[..2]).text, "مر");
+    }
+
+    #[test]
+    fn presentation_only_edge_spaces_do_not_extend_an_rtl_shaping_run() {
+        let cells = [
+            renderable_cell(0, 0, ' '),
+            renderable_cell(0, 3, 'م'),
+            renderable_cell(0, 4, 'ر'),
+            renderable_cell(0, 10, ' '),
+        ];
+
+        assert_eq!(
+            terminal_text_spans(&cells, Point::new(9, Column(9)), true),
+            vec![
+                TerminalTextSpan { cells: 0..1, shaped_run: false },
+                TerminalTextSpan { cells: 1..3, shaped_run: true },
+                TerminalTextSpan { cells: 3..4, shaped_run: false },
+            ]
+        );
+        let run = terminal_shaping_run(&cells[1..3]);
+        assert_eq!(run.origin_column, 3);
+        assert_eq!(run.text, "مر");
+    }
+
+    #[test]
+    fn terminal_row_run_preserves_blank_columns_and_combining_marks() {
+        let mut first = renderable_cell(0, 2, 'ب');
+        first.extra = Some(Box::new(crate::display::content::RenderableCellExtra {
+            zerowidth: Some(vec!['َ']),
+            hyperlink: None,
+        }));
+        let second = renderable_cell(0, 5, 'ت');
+
+        let run = terminal_shaping_run(&[first, second]);
+
+        assert_eq!(run.origin_column, 2);
+        assert_eq!(run.text, "بَ  ت");
+        assert_eq!(run.cells.iter().map(|cell| cell.width).collect::<Vec<_>>(), [1, 1, 1, 1]);
+        assert_eq!(run.cells[0].text, 0..4);
     }
 
     #[test]
