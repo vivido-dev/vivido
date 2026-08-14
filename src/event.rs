@@ -98,6 +98,20 @@ const HEADLESS_MIN_FRAME_INTERVAL: Duration = Duration::from_millis(16);
 /// shutdown request can sit unnoticed.
 const HEADLESS_IDLE_WAIT: Duration = Duration::from_millis(100);
 
+/// Message-bar target used to replace transient file-drop hover and state messages.
+const FILE_DROP_MESSAGE_TARGET: &str = "vivid-file-drop";
+
+fn file_drop_message(text: String, ty: MessageType) -> Message {
+    let mut message = Message::new(text, ty);
+    message.set_target(FILE_DROP_MESSAGE_TARGET.into());
+    message
+}
+
+fn replace_file_drop_message(buffer: &mut MessageBuffer, text: String, ty: MessageType) {
+    buffer.remove_target(FILE_DROP_MESSAGE_TARGET);
+    buffer.push(file_drop_message(text, ty));
+}
+
 /// The event processor.
 ///
 /// Stores some state from received events and dispatches actions when they are
@@ -4162,6 +4176,10 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                         );
                     },
                     WindowEvent::DroppedFile(path) => {
+                        // A drop supersedes the hover overlay. Leaving it at the front of the
+                        // queue hides consent, transfer, and rejection state behind stale text.
+                        self.ctx.message_buffer.remove_target(FILE_DROP_MESSAGE_TARGET);
+                        *self.ctx.dirty = true;
                         let size = self.ctx.size_info();
                         let display_offset = self.ctx.terminal.grid().display_offset();
                         match self.ctx.vivid_service.handle_file_drop(
@@ -4178,24 +4196,25 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                             crate::vivid::file_drop::LocalDropDisposition::ConsentRequired(
                                 label,
                             ) => {
-                                self.ctx.message_buffer.push(Message::new(
+                                replace_file_drop_message(
+                                    self.ctx.message_buffer,
                                     format!("{label}: drop the file again to confirm"),
                                     MessageType::Warning,
-                                ));
-                                *self.ctx.dirty = true;
+                                );
                             },
                             crate::vivid::file_drop::LocalDropDisposition::Offered => {
-                                self.ctx.message_buffer.push(Message::new(
+                                replace_file_drop_message(
+                                    self.ctx.message_buffer,
                                     "Copying file to the remote receiver".into(),
                                     MessageType::Warning,
-                                ));
-                                *self.ctx.dirty = true;
+                                );
                             },
                             crate::vivid::file_drop::LocalDropDisposition::Rejected(reason) => {
-                                self.ctx
-                                    .message_buffer
-                                    .push(Message::new(reason.into(), MessageType::Error));
-                                *self.ctx.dirty = true;
+                                replace_file_drop_message(
+                                    self.ctx.message_buffer,
+                                    reason.into(),
+                                    MessageType::Error,
+                                );
                             },
                         }
                     },
@@ -4208,14 +4227,21 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                             &size,
                             display_offset,
                         ) {
-                            let message = Message::new(label.into(), MessageType::Warning);
+                            let message = file_drop_message(label.into(), MessageType::Warning);
                             if !self.ctx.message_buffer.is_queued(&message) {
-                                self.ctx.message_buffer.push(message);
+                                replace_file_drop_message(
+                                    self.ctx.message_buffer,
+                                    label.into(),
+                                    MessageType::Warning,
+                                );
                                 *self.ctx.dirty = true;
                             }
                         }
                     },
-                    WindowEvent::HoveredFileCancelled => (),
+                    WindowEvent::HoveredFileCancelled => {
+                        self.ctx.message_buffer.remove_target(FILE_DROP_MESSAGE_TARGET);
+                        *self.ctx.dirty = true;
+                    },
                     WindowEvent::CursorLeft { .. } => {
                         self.ctx.mouse.inside_text_area = false;
 
@@ -4329,5 +4355,30 @@ mod ipc_wait_tests {
         assert_eq!(pattern_find(b"before ready> after", b"ready>", false), Some((7, 13)));
         assert_eq!(pattern_find(b"status=1234", br"status=\d+", true), Some((0, 11)));
         assert_eq!(pattern_find("界面 ready".as_bytes(), "界面".as_bytes(), false), Some((0, 6)));
+    }
+}
+
+#[cfg(test)]
+mod file_drop_message_tests {
+    use super::{FILE_DROP_MESSAGE_TARGET, file_drop_message, replace_file_drop_message};
+    use crate::message_bar::{MessageBuffer, MessageType};
+
+    #[test]
+    fn latest_file_drop_state_replaces_the_hover_message() {
+        let mut buffer = MessageBuffer::default();
+        replace_file_drop_message(&mut buffer, "Copy to remote shell".into(), MessageType::Warning);
+        replace_file_drop_message(
+            &mut buffer,
+            "Copying file to the remote receiver".into(),
+            MessageType::Warning,
+        );
+
+        let expected =
+            file_drop_message("Copying file to the remote receiver".into(), MessageType::Warning);
+        assert_eq!(buffer.message(), Some(&expected));
+        assert_eq!(
+            buffer.message().and_then(|message| message.target()).map(String::as_str),
+            Some(FILE_DROP_MESSAGE_TARGET)
+        );
     }
 }

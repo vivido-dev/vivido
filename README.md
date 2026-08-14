@@ -85,7 +85,8 @@ and `--headless-size` fixes the geometry in cells or pixels. See
 
 Vivido continues to use the `vivido` terminfo entry when it is installed, falling back to
 `xterm-256color`. This is an application compatibility detail; configuration and IPC paths use
-the `vivido` name.
+the `vivido` name. `vvssh` performs the same check on the remote host before starting its login
+shell, since SSH forwards the terminal name but not Vivido's locally materialized terminfo entry.
 
 Plain SSH does not forward the per-window Vivid media endpoint. Use the bundled `vvssh` wrapper to
 display remote images or video with Vivi; see

@@ -239,8 +239,12 @@ fn build_ssh_arguments(
     } else {
         ""
     };
+    // OpenSSH forwards the terminal name with the PTY request, but not Vivido's locally
+    // materialized terminfo database. Keep the richer entry when it is installed remotely and
+    // otherwise select the compatible system entry before the login shell starts.
+    let remote_term = "case \"${TERM-}\" in vivido|vivido-direct) if ! command -v infocmp >/dev/null 2>&1 || ! infocmp \"$TERM\" >/dev/null 2>&1; then TERM=xterm-256color; export TERM; fi;; esac; ";
     let remote_command = format!(
-        "VIVID_ROOT_SECRET=$(cat {}) && rm -f {} && export VIVID_ROOT_SECRET && export VIVID_REMOTE=1{anchor_transport} VIVID_ENDPOINT_CONTROL={}{media_environment}; {receiver}exec \"$SHELL\" -l",
+        "VIVID_ROOT_SECRET=$(cat {}) && rm -f {} && export VIVID_ROOT_SECRET && export VIVID_REMOTE=1{anchor_transport} VIVID_ENDPOINT_CONTROL={}{media_environment}; {remote_term}{receiver}exec \"$SHELL\" -l",
         shell_quote(&secret_file),
         shell_quote(&secret_file),
         shell_quote(&remote_endpoint),
@@ -508,5 +512,22 @@ mod tests {
         let mut arguments = vec![OsString::from("--no-receive-drops"), OsString::from("host")];
         assert!(!take_receive_drop_flag(&mut arguments));
         assert_eq!(arguments, [OsString::from("host")]);
+    }
+
+    #[test]
+    fn remote_shell_falls_back_when_vivido_terminfo_is_unavailable() {
+        let (_, arguments, _, _, _) = build_ssh_arguments(
+            vec![OsString::from("host")],
+            "tcp:127.0.0.1:4321",
+            7,
+            9,
+            false,
+            false,
+        )
+        .unwrap();
+        let command = arguments.last().unwrap().to_string_lossy();
+        assert!(command.contains("case \"${TERM-}\" in vivido|vivido-direct)"));
+        assert!(command.contains("infocmp \"$TERM\""));
+        assert!(command.contains("TERM=xterm-256color; export TERM"));
     }
 }

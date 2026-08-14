@@ -96,7 +96,9 @@ TERM = "vivido"
 WINIT_X11_SCALE_FACTOR = "1.0"
 ```
 
-Vivido uses the `vivido` terminfo entry when installed and falls back to `xterm-256color`.
+Vivido uses the `vivido` terminfo entry when installed and falls back to `xterm-256color`. When
+`vvssh` opens a remote login shell, it also falls back if the remote host does not have Vivido's
+terminfo entry; SSH forwards `TERM`, but not a locally materialized terminfo database.
 
 ## `window`
 
