@@ -1300,6 +1300,11 @@ impl<T: EventListener> Handler for Term<T> {
                 let text = format!("\x1b[>0;{version};1c");
                 self.event_proxy.send_event(Event::PtyWrite(text));
             },
+            Some('=') => {
+                trace!("Reporting tertiary device attributes");
+                let text = String::from("\x1bP!|00000000\x1b\\");
+                self.event_proxy.send_event(Event::PtyWrite(text));
+            },
             _ => debug!("Unsupported device attributes intermediate"),
         }
     }
@@ -1472,10 +1477,14 @@ impl<T: EventListener> Handler for Term<T> {
         self.event_proxy.send_event(Event::Bell);
     }
 
+    /// C0 SUB (0x1A) in ground state.
+    ///
+    /// Deliberately ignored, for parity with Alacritty and Kitty: xterm displays a
+    /// replacement glyph here, but the VT100 parity-error semantic vte documents ("substitute
+    /// char under cursor") is obsolete. vte's state machine still cancels any in-progress
+    /// escape sequence on SUB before this is reached.
     #[inline]
-    fn substitute(&mut self) {
-        trace!("[unimplemented] Substitute");
-    }
+    fn substitute(&mut self) {}
 
     /// Run LF/NL.
     ///
@@ -2547,8 +2556,8 @@ pub mod test {
 mod tests {
     use super::*;
 
-    #[cfg(windows)]
     use std::sync::Arc;
+    use std::sync::Mutex;
     #[cfg(windows)]
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -3490,5 +3499,29 @@ mod tests {
         assert_eq!(version_number("0.1.2-dev"), 1_02);
         assert_eq!(version_number("1.2.3-dev"), 1_02_03);
         assert_eq!(version_number("999.99.99"), 9_99_99_99);
+    }
+
+    #[derive(Clone, Default)]
+    struct PtyWriteListener(Arc<Mutex<Vec<String>>>);
+
+    impl EventListener for PtyWriteListener {
+        fn send_event(&self, event: Event) {
+            if let Event::PtyWrite(text) = event {
+                self.0.lock().unwrap().push(text);
+            }
+        }
+    }
+
+    #[test]
+    fn tertiary_device_attributes_reply() {
+        let size = TermSize::new(25, 80);
+        let listener = PtyWriteListener::default();
+        let replies = listener.0.clone();
+        let mut term = Term::new(Config::default(), &size, listener);
+        let mut parser: ansi::Processor = ansi::Processor::new();
+
+        parser.advance(&mut term, b"\x1b[=c");
+
+        assert_eq!(*replies.lock().unwrap(), vec!["\x1bP!|00000000\x1b\\".to_owned()]);
     }
 }
