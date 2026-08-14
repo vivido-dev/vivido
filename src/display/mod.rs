@@ -410,16 +410,8 @@ impl Display {
             == PhysicalSize::new(width, height)
     }
 
-    /// Build the renderer for `window` and map it.
-    ///
-    /// `no_activate` maps the window without taking the keyboard, which is what a window created
-    /// to serve as another application's pane needs.
-    pub fn new(
-        window: Window,
-        config: &UiConfig,
-        _tabbed: bool,
-        no_activate: bool,
-    ) -> Result<Display, Error> {
+    /// Build the renderer for an initially hidden `window`.
+    pub fn new(window: Window, config: &UiConfig) -> Result<Display, Error> {
         let scale_factor = window.scale_factor as f32;
         let font_size = config.font.size().scale(scale_factor);
         let font = config.font.clone().with_size(font_size);
@@ -467,33 +459,6 @@ impl Display {
                 .set_resize_increments(PhysicalSize::new(metrics.cell_width, metrics.cell_height));
         }
 
-        #[cfg(target_os = "macos")]
-        if no_activate {
-            window.order_front_without_focus();
-        } else {
-            window.set_visible(true);
-            window.focus_window();
-        }
-
-        #[cfg(not(target_os = "macos"))]
-        {
-            // Mapping a window does not hand it the keyboard here, so the hint has nothing to
-            // suppress.
-            let _ = no_activate;
-            window.set_visible(true);
-        }
-
-        #[allow(clippy::single_match)]
-        #[cfg(not(windows))]
-        if !_tabbed {
-            match config.window.startup_mode {
-                #[cfg(target_os = "macos")]
-                StartupMode::SimpleFullscreen => window.set_simple_fullscreen(true),
-                StartupMode::Maximized => window.set_maximized(true),
-                _ => (),
-            }
-        }
-
         let hint_state = HintState::new(config.hints.alphabet());
         let mut damage_tracker = DamageTracker::new(size_info.screen_lines(), size_info.columns());
         damage_tracker.debug = config.debug.highlight_damage;
@@ -527,6 +492,34 @@ impl Display {
             text_system,
             meter: Default::default(),
         })
+    }
+
+    /// Map the window after platform accessibility has been attached.
+    pub fn map_window(&self, config: &UiConfig, tabbed: bool, no_activate: bool) {
+        #[cfg(target_os = "macos")]
+        if no_activate {
+            self.window.order_front_without_focus();
+        } else {
+            self.window.set_visible(true);
+            self.window.focus_window();
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = no_activate;
+            self.window.set_visible(true);
+        }
+
+        #[allow(clippy::single_match)]
+        #[cfg(not(windows))]
+        if !tabbed {
+            match config.window.startup_mode {
+                #[cfg(target_os = "macos")]
+                StartupMode::SimpleFullscreen => self.window.set_simple_fullscreen(true),
+                StartupMode::Maximized => self.window.set_maximized(true),
+                _ => (),
+            }
+        }
     }
 
     pub fn handle_update<T>(

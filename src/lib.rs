@@ -7,6 +7,8 @@
 #[cfg(all(not(feature = "wayland"), not(any(target_os = "macos", windows))))]
 compile_error!(r#"the "wayland" feature must be enabled on Linux and other Unix desktops"#);
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+mod accessibility;
 mod automation;
 pub mod cli;
 mod clipboard;

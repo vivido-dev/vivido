@@ -73,6 +73,8 @@ winit = { version = "0.30.9", default-features = false, features = [
 pkg-config = "0.3"
 
 [dev-dependencies]
+accesskit = "0.24.1"
+accesskit_winit = { version = "0.33.2", default-features = false, features = ["rwh_06"] }
 clap_complete = "4.2.3"
 vivid_sdk = { version = "1.5", path = "../vivid_sdk" }
 
@@ -90,13 +92,34 @@ rustix-openpty = "0.2.0"
 [target.'cfg(target_os = "macos")'.dependencies]
 mac-usernotifications = { version = "0.3.1", default-features = false }
 objc2 = "0.6.1"
+objc2-application-services = { version = "0.3.2", default-features = false, features = [
+  "std",
+  "AXError",
+  "AXUIElement",
+  "AXValue",
+  "HIServices",
+  "libc",
+] }
+objc2-core-foundation = { version = "0.3.2", default-features = false, features = [
+  "std",
+  "CFArray",
+  "CFNumber",
+  "CFString",
+] }
 objc2-foundation = { version = "0.3.1", default-features = false, features = [
+  "NSArray",
+  "NSAttributedString",
   "std",
   "NSString",
   "NSLocale",
+  "NSValue",
   "NSUserDefaults",
 ] }
 objc2-app-kit = { version = "0.3.1", default-features = false, features = [
+  "NSAccessibility",
+  "NSAccessibilityConstants",
+  "NSAccessibilityElement",
+  "NSAccessibilityProtocols",
   "std",
   "NSColorSpace",
   "NSResponder",
@@ -137,6 +160,12 @@ wgpu = { version = "29.0", default-features = false, features = [
 ] }
 
 [target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+accesskit = "0.24.1"
+accesskit_winit = { version = "0.33.2", default-features = false, features = [
+  "accesskit_unix",
+  "async-io",
+  "rwh_06",
+] }
 wgpu = { version = "29.0", default-features = false, features = [
   "std",
   "vulkan",

@@ -36,6 +36,8 @@ use winit::event::{Event as WinitEvent, Modifiers, WindowEvent};
 use winit::event_loop::ActiveEventLoop;
 use winit::window::WindowId;
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+use crate::accessibility::{AccessibilitySnapshot, AccessibilityState};
 use crate::terminal::event::Event as TerminalEvent;
 #[cfg(any(unix, windows))]
 use crate::terminal::event::Notify;
@@ -117,6 +119,8 @@ impl Notify for AutomationNotifier {
 /// Event context for one individual Vivido window.
 pub struct WindowContext {
     pub message_buffer: MessageBuffer,
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    accessibility: Option<AccessibilityState>,
     pub display: Display,
     pub dirty: bool,
     event_queue: Vec<WinitEvent<Event>>,
@@ -187,9 +191,9 @@ impl WindowContext {
         options.window_identity.override_identity_config(&mut identity);
 
         let window = event_loop.create_window(&config, &identity, &mut options)?;
-        let display = Display::new(window, &config, false, options.no_activate)?;
+        let display = Display::new(window, &config)?;
 
-        Self::new(display, config, options, proxy)
+        Self::new(event_loop, display, config, options, proxy, false)
     }
 
     /// Create additional context.
@@ -211,9 +215,9 @@ impl WindowContext {
         let tabbed = false;
 
         let window = event_loop.create_window(&config, &identity, &mut options)?;
-        let display = Display::new(window, &config, tabbed, options.no_activate)?;
+        let display = Display::new(window, &config)?;
 
-        let mut window_context = Self::new(display, config, options, proxy)?;
+        let mut window_context = Self::new(event_loop, display, config, options, proxy, tabbed)?;
 
         // Set the config overrides at startup.
         //
@@ -225,10 +229,13 @@ impl WindowContext {
 
     /// Create a new terminal window context.
     fn new(
+        #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
+        event_loop_handle: LoopHandle<'_>,
         mut display: Display,
         config: Rc<UiConfig>,
         options: WindowOptions,
         proxy: EventSink,
+        tabbed: bool,
     ) -> Result<Self, Box<dyn Error>> {
         let mut pty_config = config.pty_config();
         options.terminal_options.override_pty_config(&mut pty_config);
@@ -276,6 +283,28 @@ impl WindowContext {
         // access it.
         let terminal = Term::new(config.term_options(), &display.size_info, event_proxy.clone());
         let terminal = Arc::new(FairMutex::new(terminal));
+
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        let accessibility = {
+            let snapshot = AccessibilitySnapshot::new(
+                &terminal.lock(),
+                display.size_info,
+                display.window.title(),
+            );
+            #[cfg(target_os = "macos")]
+            let state = (!display.window.is_headless() && !display.window.is_embedded())
+                .then(|| AccessibilityState::new(&display.window, options.vivid_target, snapshot));
+            #[cfg(target_os = "linux")]
+            let state = event_loop_handle.winit().and_then(|event_loop| {
+                display.window.winit_window().map(|window| {
+                    AccessibilityState::new(event_loop, window, options.vivid_target, snapshot)
+                })
+            });
+            state
+        };
+
+        // Accessibility adapters must be installed while the native window is still hidden.
+        display.map_window(&config, tabbed, options.no_activate);
 
         // Create the PTY.
         //
@@ -329,6 +358,8 @@ impl WindowContext {
         Ok(WindowContext {
             preserve_title,
             terminal,
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            accessibility,
             display,
             #[cfg(not(windows))]
             master_fd,
@@ -511,6 +542,14 @@ impl WindowContext {
         scheduler: &mut Scheduler,
         event: WinitEvent<Event>,
     ) {
+        #[cfg(target_os = "linux")]
+        if let WinitEvent::WindowEvent { event, .. } = &event
+            && let (Some(accessibility), Some(window)) =
+                (&mut self.accessibility, self.display.window.winit_window())
+        {
+            accessibility.process_event(window, event);
+        }
+
         match event {
             WinitEvent::AboutToWait
             | WinitEvent::WindowEvent { event: WindowEvent::RedrawRequested, .. } => {
@@ -1426,6 +1465,20 @@ impl WindowContext {
         let rows = (!full).then_some(changed_rows);
         let sequence = self.automation.record_screen_change(rows.clone());
         Some((sequence, rows))
+    }
+
+    /// Publish a coalesced read-only accessibility snapshot.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    pub fn sync_accessibility(&mut self) {
+        let Some(accessibility) = &mut self.accessibility else { return };
+        let terminal = self.terminal.lock();
+        let snapshot = AccessibilitySnapshot::new(
+            &terminal,
+            self.display.size_info,
+            self.display.window.title(),
+        );
+        drop(terminal);
+        accessibility.update(snapshot);
     }
 
     /// Summary used by deterministic window discovery.

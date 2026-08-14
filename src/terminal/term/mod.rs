@@ -660,6 +660,12 @@ impl<T> Term<T> {
         &self.grid
     }
 
+    /// Whether `column` is currently configured as a horizontal tab stop.
+    #[inline]
+    pub(crate) fn is_tab_stop(&self, column: Column) -> bool {
+        self.tabs[column]
+    }
+
     /// Mutable access to the raw grid data structure.
     pub fn grid_mut(&mut self) -> &mut Grid<Cell> {
         &mut self.grid

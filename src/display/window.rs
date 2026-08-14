@@ -381,6 +381,11 @@ impl Window {
         })
     }
 
+    #[cfg(target_os = "linux")]
+    pub(crate) fn winit_window(&self) -> Option<&WinitWindow> {
+        self.backend.winit().map(AsRef::as_ref)
+    }
+
     #[cfg(any(target_os = "macos", windows))]
     #[inline]
     pub fn raw_window_handle(&self) -> Option<RawWindowHandle> {

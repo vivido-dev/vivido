@@ -64,6 +64,24 @@ screenshots, sanitized PTY transcripts, Vivid 1.5 session/surface/track inspecti
 event subscriptions. Start with `vivido msg capabilities` and `vivido msg list-windows`. The
 complete CLI and JSON wire contract is documented in [Agent automation IPC](docs/ipc.md).
 
+## Accessibility
+
+Native terminal windows expose their active buffer, caret, selection, and text geometry to macOS
+Accessibility and Linux AT-SPI. The text document contains retained scrollback plus the current
+screen; the on-screen viewport is reported separately as the visible range. SGR-hidden text is
+reported as spaces, and all editing accessibility actions are intentionally unsupported. Desktop
+presentation targets expose their native application/window roles without a terminal text area;
+headless and embedded targets leave accessibility ownership to their host.
+
+On macOS, a live window's `AXVisibleCharacterRange` can be inspected with:
+
+```sh
+cargo run --example ax_visible_character_range -- "$(pgrep -n vivido)"
+```
+
+The terminal running the probe must have permission under **System Settings → Privacy & Security →
+Accessibility**.
+
 ## Headless sessions
 
 `vivido --headless` runs the whole runtime — terminal, Vivid presenter, and GPU renderer — with no
