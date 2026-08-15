@@ -56,6 +56,8 @@ struct AVChannelLayout {
 }
 
 struct Shared {
+    channel_generation: AtomicU64,
+    generation_transition: Mutex<()>,
     enabled: AtomicBool,
     prebuffered: AtomicBool,
     stopped: AtomicBool,
@@ -63,6 +65,12 @@ struct Shared {
     eos_observed: AtomicBool,
     queued_samples: AtomicU64,
     played_samples: AtomicU64,
+    /// Absolute queued-sample watermark that a timeline reset must discard through.
+    ///
+    /// A relative outstanding count races the realtime callback: it can snapshot a sample after
+    /// the callback popped it but before `played_samples` was published, then discard one sample
+    /// from the replacement timeline. An absolute watermark cannot cross that boundary.
+    discard_through_samples: AtomicU64,
     discard_samples: AtomicU64,
     rendered_samples: AtomicU64,
     timeline_origin_us: AtomicI64,
@@ -114,7 +122,7 @@ pub struct AudioOutput {
 }
 
 impl AudioOutput {
-    pub fn open() -> io::Result<Arc<Self>> {
+    pub fn open(channel_generation: u64) -> io::Result<Arc<Self>> {
         let host = cpal::default_host();
         let device = host.default_output_device().ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotFound, "no default audio output device")
@@ -125,6 +133,8 @@ impl AudioOutput {
         let format = supported.sample_format();
         let config: StreamConfig = supported.into();
         let shared = Arc::new(Shared {
+            channel_generation: AtomicU64::new(channel_generation),
+            generation_transition: Mutex::new(()),
             enabled: AtomicBool::new(false),
             prebuffered: AtomicBool::new(false),
             stopped: AtomicBool::new(false),
@@ -132,6 +142,7 @@ impl AudioOutput {
             eos_observed: AtomicBool::new(false),
             queued_samples: AtomicU64::new(0),
             played_samples: AtomicU64::new(0),
+            discard_through_samples: AtomicU64::new(0),
             discard_samples: AtomicU64::new(0),
             rendered_samples: AtomicU64::new(0),
             timeline_origin_us: AtomicI64::new(UNSET_PTS),
@@ -192,6 +203,8 @@ impl AudioOutput {
     #[cfg(test)]
     pub(super) fn test_output() -> Arc<Self> {
         let shared = Arc::new(Shared {
+            channel_generation: AtomicU64::new(1),
+            generation_transition: Mutex::new(()),
             enabled: AtomicBool::new(false),
             prebuffered: AtomicBool::new(false),
             stopped: AtomicBool::new(false),
@@ -199,6 +212,7 @@ impl AudioOutput {
             eos_observed: AtomicBool::new(false),
             queued_samples: AtomicU64::new(0),
             played_samples: AtomicU64::new(0),
+            discard_through_samples: AtomicU64::new(0),
             discard_samples: AtomicU64::new(0),
             rendered_samples: AtomicU64::new(0),
             timeline_origin_us: AtomicI64::new(UNSET_PTS),
@@ -243,6 +257,40 @@ impl AudioOutput {
         AudioDecoder::new(config, self.sample_rate, self.channels)
     }
 
+    pub fn channel_generation(&self) -> u64 {
+        self.shared.channel_generation.load(Ordering::SeqCst)
+    }
+
+    /// Retain the device stream while making every operation from the retired channel stale.
+    ///
+    /// The generation is published before waiting for an in-flight push. A producer blocked on a
+    /// full, paused ring therefore observes retirement and releases the transition lock; once the
+    /// lock is acquired, flushing is a barrier after every mutation from the old channel.
+    pub fn advance_channel(&self, current: u64, next: u64) -> bool {
+        if self
+            .shared
+            .channel_generation
+            .compare_exchange(current, next, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return false;
+        }
+        let _transition = self
+            .shared
+            .generation_transition
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.flush();
+        true
+    }
+
+    pub fn channel(self: &Arc<Self>, generation: u64) -> io::Result<ChannelAudioOutput> {
+        if self.channel_generation() != generation {
+            return Err(retired_channel());
+        }
+        Ok(ChannelAudioOutput { output: self.clone(), generation })
+    }
+
     pub fn start(&self) {
         self.shared.enabled.store(true, Ordering::SeqCst);
     }
@@ -277,12 +325,9 @@ impl AudioOutput {
 
     pub fn flush(&self) {
         self.pause();
-        let outstanding = self
-            .shared
-            .queued_samples
-            .load(Ordering::SeqCst)
-            .saturating_sub(self.shared.played_samples.load(Ordering::SeqCst));
-        self.shared.discard_samples.store(outstanding, Ordering::SeqCst);
+        let queued = self.shared.queued_samples.load(Ordering::SeqCst);
+        self.shared.discard_through_samples.fetch_max(queued, Ordering::SeqCst);
+        self.shared.discard_samples.store(0, Ordering::SeqCst);
         self.shared.hold_silence_samples.store(0, Ordering::SeqCst);
         self.shared.gap_silence_samples.store(0, Ordering::SeqCst);
         self.shared.live_delay_us.store(0, Ordering::SeqCst);
@@ -518,10 +563,18 @@ impl AudioOutput {
         true
     }
 
+    #[cfg(test)]
     pub fn push(&self, samples: &[f32]) -> io::Result<()> {
+        self.push_while(samples, || true)
+    }
+
+    fn push_while(&self, samples: &[f32], current: impl Fn() -> bool) -> io::Result<()> {
         let mut producer = self.producer.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut offset = 0;
         while offset < samples.len() {
+            if !current() {
+                return Err(retired_channel());
+            }
             if self.shared.stopped.load(Ordering::SeqCst) {
                 return Ok(());
             }
@@ -582,6 +635,65 @@ impl AudioOutput {
     }
 }
 
+pub struct ChannelAudioOutput {
+    output: Arc<AudioOutput>,
+    generation: u64,
+}
+
+impl ChannelAudioOutput {
+    fn with_current<T>(&self, operation: impl FnOnce(&AudioOutput) -> T) -> io::Result<T> {
+        let _transition = self
+            .output
+            .shared
+            .generation_transition
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.output.channel_generation() != self.generation {
+            return Err(retired_channel());
+        }
+        Ok(operation(&self.output))
+    }
+
+    pub fn observe_audio_pts(&self, pts_us: i64) -> io::Result<()> {
+        self.with_current(|output| output.observe_audio_pts(pts_us))
+    }
+
+    pub fn bridge_live_gap(&self, gap_us: u64) -> io::Result<()> {
+        self.with_current(|output| output.bridge_live_gap(gap_us))
+    }
+
+    pub fn rebase_live(&self, pts_us: i64) -> io::Result<()> {
+        self.with_current(|output| output.rebase_live(pts_us))
+    }
+
+    pub fn trim_before_start(
+        &self,
+        pts_us: i64,
+        duration_us: u64,
+        samples: &mut Vec<f32>,
+    ) -> io::Result<()> {
+        self.with_current(|output| output.trim_before_start(pts_us, duration_us, samples))
+    }
+
+    pub fn push(&self, samples: &[f32]) -> io::Result<()> {
+        self.with_current(|output| {
+            output.push_while(samples, || output.channel_generation() == self.generation)
+        })?
+    }
+
+    pub fn finish_decode(&self) -> io::Result<()> {
+        self.with_current(AudioOutput::finish_decode)
+    }
+
+    pub fn signal_eos(&self) -> io::Result<()> {
+        self.with_current(AudioOutput::signal_eos)
+    }
+}
+
+fn retired_channel() -> io::Error {
+    io::Error::new(io::ErrorKind::Interrupted, "retired audio channel generation")
+}
+
 fn build_stream<T, C>(
     device: &cpal::Device,
     config: &StreamConfig,
@@ -598,6 +710,15 @@ where
             *config,
             move |output: &mut [T], _| {
                 let mut discarded = 0_u64;
+                let discard_through = shared.discard_through_samples.load(Ordering::SeqCst);
+                let mut played = shared.played_samples.load(Ordering::SeqCst);
+                while discarded < output.len() as u64 && played < discard_through {
+                    if consumer.try_pop().is_none() {
+                        break;
+                    }
+                    discarded += 1;
+                    played += 1;
+                }
                 while discarded < output.len() as u64 {
                     if shared.discard_samples.load(Ordering::SeqCst) == 0 {
                         break;
@@ -1181,6 +1302,36 @@ mod tests {
     }
 
     #[test]
+    fn channel_advance_reuses_the_output_but_retires_every_old_generation_write() {
+        let output = AudioOutput::test_output();
+        let retired = output.channel(1).unwrap();
+        retired.observe_audio_pts(1_000_000).unwrap();
+        retired.push(&[0.25; 8]).unwrap();
+        output.configure_play(1_000_000, 1);
+        output.start();
+
+        assert!(output.advance_channel(1, 2));
+        assert_eq!(output.channel_generation(), 2);
+        assert!(!output.shared.enabled.load(Ordering::SeqCst));
+        assert_eq!(output.shared.timeline_origin_us.load(Ordering::SeqCst), UNSET_PTS);
+        assert_eq!(output.shared.discard_through_samples.load(Ordering::SeqCst), 8);
+        assert_eq!(output.shared.discard_samples.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            retired.push(&[0.5]).unwrap_err().kind(),
+            io::ErrorKind::Interrupted,
+            "the retired decoder must not contaminate the replacement clock"
+        );
+
+        let replacement = output.channel(2).unwrap();
+        replacement.observe_audio_pts(7_000_000).unwrap();
+        replacement.push(&[0.75; 4]).unwrap();
+        assert_eq!(output.shared.timeline_origin_us.load(Ordering::SeqCst), 7_000_000);
+        assert_eq!(output.shared.queued_samples.load(Ordering::SeqCst), 12);
+        assert!(!output.advance_channel(1, 3));
+        assert_eq!(output.channel_generation(), 2);
+    }
+
+    #[test]
     fn video_gate_observes_audio_clock_progress_before_declaring_a_stall() {
         let output = AudioOutput::test_output();
         output.configure_play(0, 100_000);
@@ -1306,7 +1457,8 @@ mod tests {
 
         assert!(output.shared.enabled.load(Ordering::SeqCst));
         assert_eq!(output.shared.timeline_origin_us.load(Ordering::SeqCst), 2_000_000);
-        assert_eq!(output.shared.discard_samples.load(Ordering::SeqCst), 480);
+        assert_eq!(output.shared.discard_through_samples.load(Ordering::SeqCst), 960);
+        assert_eq!(output.shared.discard_samples.load(Ordering::SeqCst), 0);
         assert!(!output.shared.prebuffered.load(Ordering::SeqCst));
     }
 

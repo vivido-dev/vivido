@@ -2662,13 +2662,12 @@ fn dispatch_control(
                 .scene
                 .advance_channel(identity)
                 .map_err(|message| ControlError::state(message).with_track(identity))?;
-            let audio_output_stopped =
-                if let Some(output) = lock(&shared.audio_outputs).remove(&identity) {
-                    output.stop();
-                    true
-                } else {
-                    false
-                };
+            let (audio_output_preserved, audio_output_stopped) = advance_audio_output(
+                &shared.audio_outputs,
+                identity,
+                current,
+                status.state.channel_generation.get(),
+            );
             observe_track(session, &status, TRACK_CHANGED_CHANNEL);
             shared.trace(
                 trace::TraceCategory::Lifecycle,
@@ -2684,6 +2683,7 @@ fn dispatch_control(
                     "track_revision_after": status.state.revision.get(),
                     "previous_channel_generation": current,
                     "channel_generation": status.state.channel_generation.get(),
+                    "audio_output_preserved": audio_output_preserved,
                     "audio_output_stopped": audio_output_stopped,
                 }),
             );
@@ -4098,15 +4098,30 @@ fn channel_loop(
     };
     let mut audio = match &configuration.kind {
         KindConfiguration::Audio(audio_configuration) => {
-            let output = channel_io!(ChannelFailureKind::AudioOutput, AudioOutput::open());
+            let output = lock(&shared.audio_outputs)
+                .get(&identity)
+                .filter(|output| output.channel_generation() == generation.get())
+                .cloned();
+            let output = match output {
+                Some(output) => output,
+                None => {
+                    let output = channel_io!(
+                        ChannelFailureKind::AudioOutput,
+                        AudioOutput::open(generation.get())
+                    );
+                    lock(&shared.audio_outputs).insert(identity, output.clone());
+                    output
+                },
+            };
             output.set_gain(status.audio_gain);
             let decoder =
                 channel_io!(ChannelFailureKind::Decode, output.decoder(audio_configuration));
             if configuration.mode == vivid_protocol::track::TrackMode::Live {
                 output.start();
             }
-            lock(&shared.audio_outputs).insert(identity, output.clone());
-            Some((output, decoder))
+            let channel_output =
+                channel_io!(ChannelFailureKind::AudioOutput, output.channel(generation.get()));
+            Some((channel_output, decoder))
         },
         _ => None,
     };
@@ -4433,14 +4448,24 @@ fn channel_loop(
                         delay_window_headroom_us = None;
                     }
                 }
-                let discard_before = if priming_record {
+                // A seek publishes PLAY(target) before sending decoder pre-roll. Decode those
+                // packets as references but never expose their pre-target pictures as the new
+                // priming frame; otherwise audio begins at the requested target while video races
+                // forward from the preceding keyframe. Initial playback has no clock yet and keeps
+                // the ordinary first-output priming rule.
+                let playback_discard_before = (configuration.mode == TrackMode::Timed)
+                    .then(|| shared.scene.playback_start_pts_us(identity))
+                    .flatten();
+                let latency_discard_before = if priming_record {
                     None
                 } else {
                     linked_audio.as_ref().and_then(|audio| {
                         audio.discard_video_before(configuration.maximum_latency_us)
                     })
                 };
-                let late = discard_before.is_some_and(|deadline| packet.pts_us < deadline);
+                let discard_before = playback_discard_before.or(latency_discard_before);
+                let late = playback_discard_before.is_none()
+                    && discard_before.is_some_and(|deadline| packet.pts_us < deadline);
                 // A key frame recovers a *broken* stream. Late media is not broken, and on a
                 // saturated link the recovery unit is the largest thing that could be added to the
                 // queue that made it late, so the request is spaced as well as deduplicated.
@@ -4599,17 +4624,29 @@ fn channel_loop(
                     packet.pts_us,
                     configuration.mode == TrackMode::Live,
                 ) {
-                    AudioTimelineStep::Continuous => output.observe_audio_pts(packet.pts_us),
+                    AudioTimelineStep::Continuous => channel_io!(
+                        ChannelFailureKind::AudioOutput,
+                        output.observe_audio_pts(packet.pts_us)
+                    ),
                     AudioTimelineStep::Gap(gap_us) => {
-                        output.bridge_live_gap(gap_us);
-                        output.observe_audio_pts(packet.pts_us);
+                        channel_io!(
+                            ChannelFailureKind::AudioOutput,
+                            output.bridge_live_gap(gap_us)
+                        );
+                        channel_io!(
+                            ChannelFailureKind::AudioOutput,
+                            output.observe_audio_pts(packet.pts_us)
+                        );
                         channel_other!(
                             ChannelFailureKind::SceneState,
                             shared.scene.record_audio_rebase(identity)
                         );
                     },
                     AudioTimelineStep::Restart => {
-                        output.rebase_live(packet.pts_us);
+                        channel_io!(
+                            ChannelFailureKind::AudioOutput,
+                            output.rebase_live(packet.pts_us)
+                        );
                         channel_other!(
                             ChannelFailureKind::SceneState,
                             shared.scene.record_audio_rebase(identity)
@@ -4621,7 +4658,10 @@ fn channel_loop(
                         .pts_us
                         .saturating_add(i64::try_from(packet.duration_us).unwrap_or(i64::MAX)),
                 );
-                output.trim_before_start(packet.pts_us, packet.duration_us, &mut samples);
+                channel_io!(
+                    ChannelFailureKind::AudioOutput,
+                    output.trim_before_start(packet.pts_us, packet.duration_us, &mut samples)
+                );
                 channel_io!(ChannelFailureKind::AudioOutput, output.push(&samples));
                 channel_other!(
                     ChannelFailureKind::SceneState,
@@ -4736,8 +4776,8 @@ fn channel_loop(
                 if let Some((output, decoder)) = audio.as_mut() {
                     let samples = channel_io!(ChannelFailureKind::Decode, decoder.finish());
                     channel_io!(ChannelFailureKind::AudioOutput, output.push(&samples));
-                    output.finish_decode();
-                    output.signal_eos();
+                    channel_io!(ChannelFailureKind::AudioOutput, output.finish_decode());
+                    channel_io!(ChannelFailureKind::AudioOutput, output.signal_eos());
                 }
                 return Ok(context);
             },
@@ -5688,6 +5728,21 @@ fn stop_failed_audio_output(
     }
 }
 
+fn advance_audio_output(
+    outputs: &Mutex<HashMap<TrackIdentity, Arc<AudioOutput>>>,
+    identity: TrackIdentity,
+    current: u64,
+    next: u64,
+) -> (bool, bool) {
+    let retained = lock(outputs).get(&identity).cloned();
+    let preserved = retained.as_ref().is_some_and(|output| output.advance_channel(current, next));
+    let stopped = retained.is_some() && !preserved;
+    if stopped && let Some(output) = lock(outputs).remove(&identity) {
+        output.stop();
+    }
+    (preserved, stopped)
+}
+
 #[cfg(unix)]
 fn bind_local_listener() -> io::Result<(LocalListener, String, Option<TempDir>)> {
     let directory = tempfile::Builder::new().prefix("vivido-vivid-1.5-").tempdir()?;
@@ -6252,6 +6307,93 @@ mod tests {
         assert!(rejected.data["control_record_sequence"].as_u64().unwrap() > 0);
     }
 
+    #[test]
+    fn active_timed_track_accepts_exact_play_target_before_replacement_output() {
+        let service =
+            socket_service!(VividService::start_with_wake(test_geometry(), Arc::new(|| {})));
+        let mut session = connect(&service);
+        let context_id = session.info().root_context_id;
+        let surface = grid_surface(&mut session, 74);
+        let track = session
+            .create_track(
+                TrackConfiguration {
+                    context_id,
+                    surface_id: surface.id(),
+                    track_id: 75,
+                    slot: scene::SLOT_RASTER,
+                    mode: TrackMode::Timed,
+                    lane: LaneClass::Bulk,
+                    maximum_record_body: 128,
+                    maximum_rate_millihertz: 60_000,
+                    maximum_encoded_bits_per_second: 1_000_000,
+                    maximum_records_per_second: 60,
+                    maximum_inflight_body_bytes: 4_096,
+                    kind: KindConfiguration::Raster(RasterConfiguration {
+                        width: 2,
+                        height: 2,
+                        alpha_mode: scene::ALPHA_STRAIGHT,
+                        delta_enabled: false,
+                        maximum_delta_operations: 1,
+                        zstd_enabled: false,
+                    }),
+                    target_latency_us: 0,
+                    maximum_latency_us: 1_000_000,
+                    retained_pixel_charge: 4,
+                },
+                &RequestMetadata::default(),
+            )
+            .unwrap();
+        let channel = session.open_track_channel(&track).unwrap();
+        channel.send_raster(0, 1, &[0x11, 0x22, 0x33, 0xff].repeat(4), false).unwrap();
+        session
+            .wait_track(
+                &track,
+                TrackWaitCondition::MilestoneSet,
+                Some(MILESTONE_OUTPUT_READY),
+                1_000_000,
+            )
+            .unwrap();
+        session
+            .activate_tracks(
+                &surface,
+                &[SlotBinding {
+                    slot: scene::SLOT_RASTER,
+                    track_id: track.id(),
+                    expected_channel_generation: track.channel_generation(),
+                    required_milestone: MILESTONE_OUTPUT_READY,
+                }],
+                &RequestMetadata::default(),
+            )
+            .unwrap();
+        session.play(&track, 0, 0, 1_000_000).unwrap();
+
+        session.pause(&track).unwrap();
+        session.advance_channel(&track, 1, &RequestMetadata::default()).unwrap();
+        channel.close().unwrap();
+        session.flush(&track, 1).unwrap();
+        let replacement = session.open_track_channel(&track).unwrap();
+        let target_pts_us = 7_000_000;
+        session.play(&track, target_pts_us, 0, 1_000_000).unwrap();
+
+        let owner =
+            SessionIdentity::new(service.shared.presenter, session.info().session_id).unwrap();
+        let identity = owner
+            .context(context_id)
+            .unwrap()
+            .surface(surface.id())
+            .unwrap()
+            .track(track.id())
+            .unwrap();
+        assert_eq!(service.scene.playback_start_pts_us(identity), Some(target_pts_us));
+        assert_eq!(
+            session.query_track(&track).unwrap().milestones & MILESTONE_OUTPUT_READY,
+            0,
+            "PLAY(target) must not require replacement output first"
+        );
+        replacement.close().unwrap();
+        session.close().unwrap();
+    }
+
     fn open_raw_track_channel(
         service: &VividService,
         identity: TrackIdentity,
@@ -6766,6 +6908,49 @@ mod tests {
         let outputs = lock(&outputs);
         assert!(!outputs.contains_key(&first));
         assert!(outputs.contains_key(&second));
+    }
+
+    #[test]
+    fn audio_channel_advance_preserves_only_the_exact_owners_device_output() {
+        let first = SessionIdentity::new(PresenterInstanceId([1; 16]), 1)
+            .unwrap()
+            .context(1)
+            .unwrap()
+            .surface(1)
+            .unwrap()
+            .track(1)
+            .unwrap();
+        let second = SessionIdentity::new(PresenterInstanceId([2; 16]), 1)
+            .unwrap()
+            .context(1)
+            .unwrap()
+            .surface(1)
+            .unwrap()
+            .track(1)
+            .unwrap();
+        let first_output = AudioOutput::test_output();
+        let second_output = AudioOutput::test_output();
+        first_output.observe_audio_pts(1_000_000);
+        first_output.push(&[0.25; 8]).unwrap();
+        first_output.start();
+        second_output.observe_audio_pts(2_000_000);
+        second_output.push(&[0.5; 4]).unwrap();
+        second_output.start();
+        let outputs = Mutex::new(HashMap::from([
+            (first, first_output.clone()),
+            (second, second_output.clone()),
+        ]));
+
+        assert_eq!(advance_audio_output(&outputs, first, 1, 2), (true, false));
+
+        let outputs = lock(&outputs);
+        assert!(Arc::ptr_eq(outputs.get(&first).unwrap(), &first_output));
+        assert_eq!(first_output.channel_generation(), 2);
+        assert!(first_output.channel(1).is_err());
+        assert!(first_output.channel(2).is_ok());
+        assert!(Arc::ptr_eq(outputs.get(&second).unwrap(), &second_output));
+        assert_eq!(second_output.channel_generation(), 1);
+        assert!(second_output.channel(1).is_ok());
     }
 
     #[test]

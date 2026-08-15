@@ -1016,6 +1016,13 @@ impl SharedScene {
         self.lock().tracks.get(&identity).and_then(|track| track.frame.clone())
     }
 
+    pub fn playback_start_pts_us(&self, identity: TrackIdentity) -> Option<i64> {
+        self.lock()
+            .tracks
+            .get(&identity)
+            .and_then(|track| track.playback.map(|playback| playback.start_pts_us))
+    }
+
     pub fn active_track(
         &self,
         surface_identity: SurfaceIdentity,
@@ -1448,11 +1455,17 @@ impl SharedScene {
             if track.configuration.mode != TrackMode::Timed
                 || track.frame.is_none()
                 || pts_us == i64::MIN
-                || priming_record
             {
                 return Ok(());
             }
             let Some(playback) = track.playback else {
+                if priming_record {
+                    // Before PLAY, every output released by the first output-bearing encoded
+                    // record must finish so the producer can observe OUTPUT_READY. A seek can
+                    // publish PLAY(target) before pre-roll, in which case only the first target
+                    // frame primes immediately and later outputs from that record obey the clock.
+                    return Ok(());
+                }
                 // Once one decoded output has primed the track, hold subsequent output until PLAY.
                 // Otherwise a fast channel can decode an entire file before the producer observes
                 // OUTPUT_READY and atomically activates the timed slots.
@@ -2847,7 +2860,35 @@ mod tests {
             TrackWaitEvaluation::Satisfied(_)
         ));
 
-        scene.mark_eos(track_identity, ChannelGeneration::ONE, 0, 0).unwrap();
+        // A seek can install its exact clock before decoder pre-roll. The first frame at the
+        // target primes immediately, but reordered future output from that same encoded record
+        // must not run ahead of the clock and audio activation.
+        scene.flush_playback(track_identity, 1).unwrap();
+        scene.start_playback(track_identity, 1_000_000).unwrap();
+        assert_eq!(scene.playback_start_pts_us(track_identity), Some(1_000_000));
+        scene.wait_until_due(track_identity, 1_000_000, true).unwrap();
+        scene
+            .publish_decoded_frame(
+                track_identity,
+                ChannelGeneration::ONE,
+                Frame {
+                    frame_id: 2,
+                    pts_us: 1_000_000,
+                    width: 1,
+                    height: 1,
+                    sar_num: 1,
+                    sar_den: 1,
+                    alpha_mode: ALPHA_STRAIGHT,
+                    rgba: Arc::new(RgbaBuffer::new(vec![0, 0, 0, 255])),
+                    damage: None,
+                },
+            )
+            .unwrap();
+        let seek_clock = Instant::now();
+        scene.wait_until_due(track_identity, 1_040_000, true).unwrap();
+        assert!(seek_clock.elapsed() >= Duration::from_millis(25));
+
+        scene.mark_eos(track_identity, ChannelGeneration::ONE, 1, 0).unwrap();
         scene.mark_buffered_ended(track_identity, ChannelGeneration::ONE).unwrap();
         assert!(matches!(
             scene.evaluate_track_wait(track_identity, ChannelGeneration::ONE, 6, None),
