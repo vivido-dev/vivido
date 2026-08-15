@@ -4186,15 +4186,17 @@ fn channel_loop(
                 | messages::RASTER_FRAME
                 | messages::IMAGE_DATA
         ) {
-            channel_io!(
-                ChannelFailureKind::RateLimit,
-                pace_ingress(
-                    &mut byte_bucket,
-                    &mut record_bucket,
-                    &mut last_rate_update,
-                    u64::try_from(body.len()).unwrap_or(u64::MAX),
-                )
-            );
+            if shapes_ingress(&configuration) {
+                channel_io!(
+                    ChannelFailureKind::RateLimit,
+                    pace_ingress(
+                        &mut byte_bucket,
+                        &mut record_bucket,
+                        &mut last_rate_update,
+                        u64::try_from(body.len()).unwrap_or(u64::MAX),
+                    )
+                );
+            }
             let mut registry = lock(&shared.registry);
             let channel = registry.channel_opens.get_mut(&identity).ok_or_else(|| {
                 ChannelFailure::message(
@@ -4856,6 +4858,24 @@ fn channel_loop(
             }
         }
     }
+}
+
+/// Whether this track's ingress is shaped against its declared rate contract.
+///
+/// Live capture arrives at the rate it was produced, and transport buffering turns that into an
+/// arrival burst worth smoothing rather than failing the track. Timed video and audio are the
+/// opposite case: the declared rate describes the *timeline*, the producer is expected to deliver
+/// ahead of the clock, and shaping delivery to the timeline rate makes a seek's pre-roll take
+/// exactly as long as the material it covers — a five-second key-frame interval became a
+/// five-second seek, because none of that pre-roll can be shown and all of it must arrive first.
+///
+/// Nothing is unbounded by dropping it there. Both kinds carry their own back-pressure — the
+/// playback clock releases pictures one at a time and the device ring blocks the audio decoder —
+/// and the channel's absolute flow allowance still bounds what is in flight, per record, on every
+/// track. Timed raster and encoded images have no such consumer, so they keep the shaping.
+fn shapes_ingress(configuration: &TrackConfiguration) -> bool {
+    configuration.mode == TrackMode::Live
+        || !matches!(configuration.kind, KindConfiguration::Video(_) | KindConfiguration::Audio(_))
 }
 
 fn pace_ingress(
@@ -6022,6 +6042,85 @@ mod tests {
         // The first packet has nothing to compare against, and timed media keeps exact PTS.
         assert_eq!(classify_audio_step(None, 5_000_000, true), Continuous);
         assert_eq!(classify_audio_step(Some(1_000_000), 9_000_000, false), Continuous);
+    }
+
+    #[test]
+    fn timed_video_and_audio_deliver_ahead_of_their_own_timeline() {
+        let shaped = |mode, kind| {
+            shapes_ingress(&TrackConfiguration {
+                context_id: 1,
+                surface_id: 1,
+                track_id: 1,
+                slot: 1,
+                mode,
+                lane: LaneClass::Bulk,
+                maximum_record_body: 4_096,
+                maximum_rate_millihertz: 30_000,
+                maximum_encoded_bits_per_second: 1_000_000,
+                maximum_records_per_second: 30,
+                maximum_inflight_body_bytes: 1 << 20,
+                kind,
+                target_latency_us: 0,
+                maximum_latency_us: 1_000_000,
+                retained_pixel_charge: 1,
+            })
+        };
+        let video = || {
+            KindConfiguration::Video(vivid_protocol::track::VideoConfiguration {
+                codec: "h264".into(),
+                packetization: "h264-avcc-au-v1".into(),
+                extradata: vec![1],
+                coded_width: 2,
+                coded_height: 2,
+                profile: 66,
+                level: 30,
+                maximum_reorder_depth: 1,
+                color_primaries: 1,
+                transfer: 1,
+                matrix: 1,
+                signal_range: 1,
+                aspect_numerator: 1,
+                aspect_denominator: 1,
+                maximum_access_unit_bytes: 512,
+                codec_string: None,
+                decoder_configuration: None,
+            })
+        };
+        let audio = || {
+            KindConfiguration::Audio(vivid_protocol::track::AudioConfiguration {
+                codec: "opus".into(),
+                packetization: "opus-packet-v1".into(),
+                extradata: vec![],
+                sample_rate: 48_000,
+                channels: 2,
+                channel_mask: 3,
+                maximum_access_unit_bytes: 512,
+                codec_string: None,
+            })
+        };
+        let raster = || {
+            KindConfiguration::Raster(RasterConfiguration {
+                width: 1,
+                height: 1,
+                alpha_mode: scene::ALPHA_STRAIGHT,
+                delta_enabled: false,
+                maximum_delta_operations: 1,
+                zstd_enabled: false,
+            })
+        };
+
+        // Regression: shaping timed delivery to the timeline rate made a seek's pre-roll take as
+        // long as the material it covers — three to six seconds for a five-second key-frame
+        // interval, against roughly a hundred and thirty milliseconds without it.
+        assert!(!shaped(TrackMode::Timed, video()));
+        assert!(!shaped(TrackMode::Timed, audio()));
+        // Live capture keeps its burst smoothing: it really does arrive at the rate it was made.
+        assert!(shaped(TrackMode::Live, video()));
+        assert!(shaped(TrackMode::Live, audio()));
+        // Raster and encoded images have no clock or device ring holding them back, so the rate
+        // contract is the only thing pacing them, in either mode.
+        assert!(shaped(TrackMode::Timed, raster()));
+        assert!(shaped(TrackMode::Live, raster()));
     }
 
     #[test]
