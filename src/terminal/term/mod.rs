@@ -3524,4 +3524,29 @@ mod tests {
 
         assert_eq!(*replies.lock().unwrap(), vec!["\x1bP!|00000000\x1b\\".to_owned()]);
     }
+
+    /// Producers that draw into their own pixels ask whether mode 1016 took effect before they map
+    /// mouse reports, and the reply is the only answer available to a producer running over a
+    /// forwarded session, where no per-window environment reaches the remote shell.
+    #[test]
+    fn sgr_pixel_mouse_mode_is_reported() {
+        let size = TermSize::new(25, 80);
+        let listener = PtyWriteListener::default();
+        let replies = listener.0.clone();
+        let mut term = Term::new(Config::default(), &size, listener);
+        let mut parser: ansi::Processor = ansi::Processor::new();
+
+        parser.advance(&mut term, b"\x1b[?1016$p");
+        parser.advance(&mut term, b"\x1b[?1016h\x1b[?1016$p");
+        parser.advance(&mut term, b"\x1b[?1016l\x1b[?1016$p");
+
+        assert_eq!(
+            *replies.lock().unwrap(),
+            vec![
+                "\x1b[?1016;2$y".to_owned(),
+                "\x1b[?1016;1$y".to_owned(),
+                "\x1b[?1016;2$y".to_owned(),
+            ]
+        );
+    }
 }
