@@ -1023,6 +1023,15 @@ impl SharedScene {
             .and_then(|track| track.playback.map(|playback| playback.start_pts_us))
     }
 
+    /// Where the track's clock reads now, which a paused clock holds at its start.
+    #[cfg(test)]
+    pub fn playback_position_pts_us(&self, identity: TrackIdentity) -> Option<i64> {
+        self.lock()
+            .tracks
+            .get(&identity)
+            .and_then(|track| track.playback.map(PlaybackClock::current_pts_us))
+    }
+
     pub fn active_track(
         &self,
         surface_identity: SurfaceIdentity,
@@ -1475,6 +1484,12 @@ impl SharedScene {
             let remaining = pts_us.saturating_sub(playback.current_pts_us());
             if remaining <= 0 {
                 return Ok(());
+            }
+            if playback.started_at.is_none() {
+                // A paused clock cannot reach this output by itself. A seek installs its exact
+                // target this way, so the wait here is for PLAY, not for time to pass.
+                state = self.0.changed.wait(state).unwrap_or_else(|poisoned| poisoned.into_inner());
+                continue;
             }
             let wait = Duration::from_micros(u64::try_from(remaining).unwrap_or(u64::MAX))
                 .min(Duration::from_millis(20));
@@ -2860,11 +2875,14 @@ mod tests {
             TrackWaitEvaluation::Satisfied(_)
         ));
 
-        // A seek can install its exact clock before decoder pre-roll. The first frame at the
-        // target primes immediately, but reordered future output from that same encoded record
-        // must not run ahead of the clock and audio activation.
+        // A seek installs its exact target as a frozen clock: PLAY says where the replacement
+        // timeline starts so pre-roll pictures before it can be discarded, and PAUSE keeps that
+        // clock from running while linked audio is still being restarted. The first frame at the
+        // target primes immediately; everything after it waits for the authoritative PLAY that
+        // starts picture and sound together.
         scene.flush_playback(track_identity, 1).unwrap();
         scene.start_playback(track_identity, 1_000_000).unwrap();
+        scene.pause_playback(track_identity).unwrap();
         assert_eq!(scene.playback_start_pts_us(track_identity), Some(1_000_000));
         scene.wait_until_due(track_identity, 1_000_000, true).unwrap();
         scene
@@ -2884,8 +2902,17 @@ mod tests {
                 },
             )
             .unwrap();
+        let held_scene = scene.clone();
+        let held =
+            std::thread::spawn(move || held_scene.wait_until_due(track_identity, 1_040_000, true));
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(
+            !held.is_finished(),
+            "a frozen seek clock must hold every output past its exact target"
+        );
         let seek_clock = Instant::now();
-        scene.wait_until_due(track_identity, 1_040_000, true).unwrap();
+        scene.start_playback(track_identity, 1_000_000).unwrap();
+        held.join().unwrap().unwrap();
         assert!(seek_clock.elapsed() >= Duration::from_millis(25));
 
         scene.mark_eos(track_identity, ChannelGeneration::ONE, 1, 0).unwrap();

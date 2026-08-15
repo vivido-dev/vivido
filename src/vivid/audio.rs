@@ -317,6 +317,7 @@ impl AudioOutput {
                 rendered_samples: self.shared.rendered_samples.load(Ordering::SeqCst),
                 observed_at: Instant::now(),
             };
+        self.realign_timeline();
     }
 
     pub fn pause(&self) {
@@ -345,47 +346,56 @@ impl AudioOutput {
             ClockProgress { rendered_samples: 0, observed_at: Instant::now() };
     }
 
-    fn observe_timeline_pts(&self, pts_us: i64) {
-        if pts_us == UNSET_PTS {
+    /// Anchor the media clock on the audio this timeline will actually render.
+    ///
+    /// The clock is `origin + rendered/rate`, so the anchor only means anything while nothing has
+    /// been rendered against it: once samples have left the device, moving the origin rewrites
+    /// time that has already been presented. Within that window PLAY and the first packet may
+    /// arrive in either order and both have to agree, so the origin is the earlier of the
+    /// requested start and the audio actually queued, and the distance between them is leading
+    /// silence rather than clock the device would otherwise run early.
+    fn realign_timeline(&self) {
+        if self.shared.rendered_samples.load(Ordering::SeqCst) != 0 {
             return;
         }
-        if self.shared.requested_start_pts_us.load(Ordering::SeqCst) != UNSET_PTS {
-            return;
-        }
-        let mut current = self.shared.timeline_origin_us.load(Ordering::SeqCst);
-        while current == UNSET_PTS || pts_us < current {
-            match self.shared.timeline_origin_us.compare_exchange(
-                current,
-                pts_us,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            ) {
-                Ok(_) => break,
-                Err(actual) => current = actual,
-            }
-        }
-        let origin = self.shared.timeline_origin_us.load(Ordering::SeqCst);
+        let requested = self.shared.requested_start_pts_us.load(Ordering::SeqCst);
         let audio_pts = self.shared.first_audio_pts_us.load(Ordering::SeqCst);
-        if origin != UNSET_PTS && audio_pts != UNSET_PTS {
-            let desired_samples =
-                leading_silence_sample_count(origin, audio_pts, self.sample_rate, self.channels);
-            let rendered = self.shared.rendered_samples.load(Ordering::SeqCst);
-            self.shared
-                .leading_silence_samples
-                .store(desired_samples.saturating_sub(rendered), Ordering::SeqCst);
-        }
+        let origin = match (requested, audio_pts) {
+            (UNSET_PTS, UNSET_PTS) => return,
+            (UNSET_PTS, audio) => audio,
+            (start, UNSET_PTS) => start,
+            (start, audio) => start.min(audio),
+        };
+        self.shared.timeline_origin_us.store(origin, Ordering::SeqCst);
+        let leading_silence = if audio_pts == UNSET_PTS {
+            0
+        } else {
+            leading_silence_sample_count(origin, audio_pts, self.sample_rate, self.channels)
+        };
+        self.shared.leading_silence_samples.store(leading_silence, Ordering::SeqCst);
     }
 
     pub fn observe_audio_pts(&self, pts_us: i64) {
         if pts_us != UNSET_PTS {
-            let _ = self.shared.first_audio_pts_us.compare_exchange(
-                UNSET_PTS,
-                pts_us,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            );
+            // A packet straddling an already requested start is trimmed to that start before it is
+            // pushed, so the first sample the device will render is the later of the two. Anchor
+            // on that rather than on the packet header, which would run the clock a packet slow.
+            let requested = self.shared.requested_start_pts_us.load(Ordering::SeqCst);
+            let queued_pts = if requested == UNSET_PTS { pts_us } else { pts_us.max(requested) };
+            let mut current = self.shared.first_audio_pts_us.load(Ordering::SeqCst);
+            while current == UNSET_PTS || queued_pts < current {
+                match self.shared.first_audio_pts_us.compare_exchange(
+                    current,
+                    queued_pts,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                ) {
+                    Ok(_) => break,
+                    Err(actual) => current = actual,
+                }
+            }
         }
-        self.observe_timeline_pts(pts_us);
+        self.realign_timeline();
     }
 
     pub fn trim_before_start(&self, pts_us: i64, duration_us: u64, samples: &mut Vec<f32>) {
@@ -694,6 +704,39 @@ fn retired_channel() -> io::Error {
     io::Error::new(io::ErrorKind::Interrupted, "retired audio channel generation")
 }
 
+/// Drop everything a timeline reset or a shrinking live delay asked for, in one callback.
+///
+/// Both are index arithmetic on the ring rather than work proportional to a device period, so
+/// there is nothing to pace. Pacing them anyway is what made a seek cost the whole buffered
+/// reserve: the output stayed silent, `rendered_samples` stood still, and every linked video frame
+/// paced by this clock stalled with it for as long as the ring was deep. Returns how many samples
+/// were dropped, which is media the caller must not also render.
+fn discard_stale_samples<C: Consumer<Item = f32>>(shared: &Shared, consumer: &mut C) -> u64 {
+    let mut discarded = 0_u64;
+    let discard_through = shared.discard_through_samples.load(Ordering::SeqCst);
+    let played = shared.played_samples.load(Ordering::SeqCst);
+    if played < discard_through {
+        let outstanding = usize::try_from(discard_through - played).unwrap_or(usize::MAX);
+        discarded += consumer.skip(outstanding) as u64;
+    }
+    let requested = shared.discard_samples.load(Ordering::SeqCst);
+    if requested != 0 {
+        let removed = consumer.skip(usize::try_from(requested).unwrap_or(usize::MAX)) as u64;
+        if removed != 0 {
+            let _ = shared.discard_samples.fetch_update(
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+                |remaining| Some(remaining.saturating_sub(removed)),
+            );
+            discarded += removed;
+        }
+    }
+    if discarded > 0 {
+        shared.played_samples.fetch_add(discarded, Ordering::SeqCst);
+    }
+    discarded
+}
+
 fn build_stream<T, C>(
     device: &cpal::Device,
     config: &StreamConfig,
@@ -709,32 +752,7 @@ where
         .build_output_stream(
             *config,
             move |output: &mut [T], _| {
-                let mut discarded = 0_u64;
-                let discard_through = shared.discard_through_samples.load(Ordering::SeqCst);
-                let mut played = shared.played_samples.load(Ordering::SeqCst);
-                while discarded < output.len() as u64 && played < discard_through {
-                    if consumer.try_pop().is_none() {
-                        break;
-                    }
-                    discarded += 1;
-                    played += 1;
-                }
-                while discarded < output.len() as u64 {
-                    if shared.discard_samples.load(Ordering::SeqCst) == 0 {
-                        break;
-                    }
-                    if consumer.try_pop().is_none() {
-                        break;
-                    }
-                    let _ = shared.discard_samples.fetch_update(
-                        Ordering::SeqCst,
-                        Ordering::SeqCst,
-                        |remaining| remaining.checked_sub(1),
-                    );
-                    discarded += 1;
-                }
-                if discarded > 0 {
-                    shared.played_samples.fetch_add(discarded, Ordering::SeqCst);
+                if discard_stale_samples(&shared, &mut consumer) > 0 {
                     output.fill_with(|| T::from_sample(0.0));
                     return;
                 }
@@ -1299,6 +1317,72 @@ mod tests {
         let samples = [0.0, 0.25, -0.5, 1.0, -1.0, 0.75];
         output.push(&samples).unwrap();
         assert_eq!(output.shared.queued_samples.load(Ordering::SeqCst), samples.len() as u64);
+    }
+
+    #[test]
+    fn a_timeline_reset_frees_the_whole_reserve_in_one_callback() {
+        let output = AudioOutput::test_output();
+        let (mut producer, mut consumer) = HeapRb::<f32>::new(4_096).split();
+        // A seek arrives with the device reserve full, which is the steady state of timed audio.
+        let buffered = producer.push_slice(&[0.5; 4_096]) as u64;
+        assert_eq!(buffered, 4_096);
+        output.shared.queued_samples.store(buffered, Ordering::SeqCst);
+        output.flush();
+
+        // One device period is a few hundred samples. Draining the reserve at that rate silenced
+        // the output, and every video frame paced by its clock, for the whole two-second reserve.
+        assert_eq!(discard_stale_samples(&output.shared, &mut consumer), buffered);
+        assert_eq!(output.shared.played_samples.load(Ordering::SeqCst), buffered);
+        assert_eq!(consumer.try_pop(), None);
+
+        // The replacement timeline pushed behind the watermark survives untouched.
+        assert_eq!(producer.push_slice(&[0.25; 8]), 8);
+        output.shared.queued_samples.fetch_add(8, Ordering::SeqCst);
+        assert_eq!(discard_stale_samples(&output.shared, &mut consumer), 0);
+        assert_eq!(consumer.try_pop(), Some(0.25));
+    }
+
+    #[test]
+    fn play_anchors_the_clock_on_the_audio_already_queued_for_the_new_timeline() {
+        let output = AudioOutput::test_output();
+        // The replacement channel can push before PLAY is dispatched: control and media travel on
+        // independent connections. Its first packet straddles the seek target and is not trimmed,
+        // so the clock has to start where that sample does or every frame is shown a packet early.
+        output.observe_audio_pts(6_980_000);
+        output.push(&[0.5; 8]).unwrap();
+        output.configure_play(7_000_000, 0);
+
+        assert_eq!(output.shared.timeline_origin_us.load(Ordering::SeqCst), 6_980_000);
+        assert_eq!(output.shared.leading_silence_samples.load(Ordering::SeqCst), 0);
+
+        // Audio that starts after the requested target is leading silence, not a head start.
+        let later = AudioOutput::test_output();
+        later.configure_play(7_000_000, 0);
+        later.observe_audio_pts(7_010_000);
+        assert_eq!(later.shared.timeline_origin_us.load(Ordering::SeqCst), 7_000_000);
+        assert_eq!(
+            later.shared.leading_silence_samples.load(Ordering::SeqCst),
+            leading_silence_sample_count(7_000_000, 7_010_000, 48_000, 2)
+        );
+
+        // A packet straddling an already published start is trimmed to it before it is pushed.
+        let trimmed = AudioOutput::test_output();
+        trimmed.configure_play(7_000_000, 0);
+        trimmed.observe_audio_pts(6_980_000);
+        assert_eq!(trimmed.shared.timeline_origin_us.load(Ordering::SeqCst), 7_000_000);
+        assert_eq!(trimmed.shared.leading_silence_samples.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn a_running_clock_keeps_its_anchor_when_play_moves_the_start() {
+        // A relay that re-issues PLAY without flushing has already rendered part of this timeline.
+        // Re-anchoring there would rewrite time the device has presented, so the origin stands.
+        let output = AudioOutput::test_output();
+        output.observe_audio_pts(1_000_000);
+        output.shared.rendered_samples.store(96_000, Ordering::SeqCst);
+        output.configure_play(7_000_000, 1);
+        assert_eq!(output.shared.timeline_origin_us.load(Ordering::SeqCst), 7_000_000);
+        assert_eq!(output.shared.first_audio_pts_us.load(Ordering::SeqCst), 1_000_000);
     }
 
     #[test]

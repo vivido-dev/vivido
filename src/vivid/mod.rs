@@ -3987,6 +3987,25 @@ enum AudioTimelineStep {
     Restart,
 }
 
+/// Which decoded video is not worth converting, and whether the record says the stream is behind.
+///
+/// Output before the requested start was never meant to be seen; output older than the latency
+/// window arrived too late to be seen. Both are skipped, and the deadline is therefore the later
+/// of the two. Only the second one is lateness: treating a seek's pre-roll as late asked for a key
+/// unit on every seek, and letting the start pts stand in for the latency window left a track that
+/// fell behind with no way to catch up for the rest of its playback.
+fn video_discard_plan(
+    start_before: Option<i64>,
+    latency_before: Option<i64>,
+    pts_us: i64,
+) -> (Option<i64>, bool) {
+    let discard_before = match (start_before, latency_before) {
+        (Some(start), Some(latency)) => Some(start.max(latency)),
+        (start, latency) => start.or(latency),
+    };
+    (discard_before, latency_before.is_some_and(|deadline| pts_us < deadline))
+}
+
 fn classify_audio_step(expected_pts_us: Option<i64>, pts_us: i64, live: bool) -> AudioTimelineStep {
     let Some(expected) = expected_pts_us.filter(|_| live) else {
         return AudioTimelineStep::Continuous;
@@ -4448,12 +4467,12 @@ fn channel_loop(
                         delay_window_headroom_us = None;
                     }
                 }
-                // A seek publishes PLAY(target) before sending decoder pre-roll. Decode those
-                // packets as references but never expose their pre-target pictures as the new
-                // priming frame; otherwise audio begins at the requested target while video races
-                // forward from the preceding keyframe. Initial playback has no clock yet and keeps
-                // the ordinary first-output priming rule.
-                let playback_discard_before = (configuration.mode == TrackMode::Timed)
+                // A seek publishes its target as a paused clock before sending decoder pre-roll.
+                // Decode those packets as references but never expose their pre-target pictures as
+                // the new priming frame; otherwise audio begins at the requested target while
+                // video races forward from the preceding keyframe. Initial playback has no clock
+                // yet and keeps the ordinary first-output priming rule.
+                let start_discard_before = (configuration.mode == TrackMode::Timed)
                     .then(|| shared.scene.playback_start_pts_us(identity))
                     .flatten();
                 let latency_discard_before = if priming_record {
@@ -4463,9 +4482,8 @@ fn channel_loop(
                         audio.discard_video_before(configuration.maximum_latency_us)
                     })
                 };
-                let discard_before = playback_discard_before.or(latency_discard_before);
-                let late = playback_discard_before.is_none()
-                    && discard_before.is_some_and(|deadline| packet.pts_us < deadline);
+                let (discard_before, late) =
+                    video_discard_plan(start_discard_before, latency_discard_before, packet.pts_us);
                 // A key frame recovers a *broken* stream. Late media is not broken, and on a
                 // saturated link the recovery unit is the largest thing that could be added to the
                 // queue that made it late, so the request is spaced as well as deduplicated.
@@ -6007,6 +6025,24 @@ mod tests {
     }
 
     #[test]
+    fn a_seek_target_skips_pre_roll_without_calling_it_late() {
+        // Pre-roll for a seek is decoded for its references and its pictures thrown away, but it
+        // is not lateness: asking for a key unit here made every seek trigger decoder recovery.
+        assert_eq!(video_discard_plan(Some(7_000_000), None, 6_000_000), (Some(7_000_000), false));
+        // Once the clock is running, the latency window still has to be able to discard and
+        // recover. Regression: letting the start pts stand in for it left a track that fell behind
+        // playing every late frame for the rest of the file, permanently behind its own audio.
+        assert_eq!(
+            video_discard_plan(Some(1_000), Some(9_000_000), 8_000_000),
+            (Some(9_000_000), true)
+        );
+        // Neither threshold is allowed to resurrect what the other already ruled out.
+        assert_eq!(video_discard_plan(Some(9_000_000), Some(1_000), 500), (Some(9_000_000), true));
+        assert_eq!(video_discard_plan(None, Some(1_000), 2_000), (Some(1_000), false));
+        assert_eq!(video_discard_plan(None, None, 2_000), (None, false));
+    }
+
+    #[test]
     fn live_channel_allowance_matches_the_declared_latency_horizon() {
         let configuration = TrackConfiguration {
             context_id: 1,
@@ -6374,6 +6410,9 @@ mod tests {
         let replacement = session.open_track_channel(&track).unwrap();
         let target_pts_us = 7_000_000;
         session.play(&track, target_pts_us, 0, 1_000_000).unwrap();
+        // The producer freezes the clock it just published: the target is where the replacement
+        // timeline starts, not permission to start running it before linked audio is restored.
+        session.pause(&track).unwrap();
 
         let owner =
             SessionIdentity::new(service.shared.presenter, session.info().session_id).unwrap();
@@ -6389,6 +6428,17 @@ mod tests {
             session.query_track(&track).unwrap().milestones & MILESTONE_OUTPUT_READY,
             0,
             "PLAY(target) must not require replacement output first"
+        );
+        let frozen = service.scene.playback_position_pts_us(identity).unwrap();
+        std::thread::sleep(Duration::from_millis(30));
+        assert_eq!(
+            service.scene.playback_position_pts_us(identity),
+            Some(frozen),
+            "a frozen seek clock must not run before activation issues PLAY"
+        );
+        assert!(
+            (frozen - target_pts_us) < 1_000,
+            "the frozen clock holds the exact seek target, not {frozen}"
         );
         replacement.close().unwrap();
         session.close().unwrap();
