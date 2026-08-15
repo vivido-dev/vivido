@@ -285,15 +285,23 @@ struct Track {
 #[derive(Debug, Clone, Copy)]
 struct PlaybackClock {
     start_pts_us: i64,
+    /// The media epoch this exact start was published for.
+    ///
+    /// A start PTS only describes the timeline the producer flushed to. A relay forwards PLAY
+    /// without the FLUSH that preceded it, so its start can name a position in a timeline this
+    /// track has already left; honouring it against a later epoch discards that epoch's output
+    /// wholesale and leaves the surface with nothing to show.
+    start_media_epoch: u32,
     started_at: Option<Instant>,
     played_before_pause: Duration,
     eos: bool,
 }
 
 impl PlaybackClock {
-    fn started(start_pts_us: i64) -> Self {
+    fn started(start_pts_us: i64, start_media_epoch: u32) -> Self {
         Self {
             start_pts_us,
+            start_media_epoch,
             started_at: Some(Instant::now()),
             played_before_pause: Duration::ZERO,
             eos: false,
@@ -1016,11 +1024,14 @@ impl SharedScene {
         self.lock().tracks.get(&identity).and_then(|track| track.frame.clone())
     }
 
+    /// The exact start this track's current media epoch was told to resume at, if any.
     pub fn playback_start_pts_us(&self, identity: TrackIdentity) -> Option<i64> {
-        self.lock()
-            .tracks
-            .get(&identity)
-            .and_then(|track| track.playback.map(|playback| playback.start_pts_us))
+        self.lock().tracks.get(&identity).and_then(|track| {
+            track
+                .playback
+                .filter(|playback| playback.start_media_epoch == track.state.media_epoch)
+                .map(|playback| playback.start_pts_us)
+        })
     }
 
     /// Where the track's clock reads now, which a paused clock holds at its start.
@@ -1347,7 +1358,7 @@ impl SharedScene {
             if track.configuration.mode != TrackMode::Timed || track.lifecycle != 1 {
                 continue;
             }
-            track.playback = Some(PlaybackClock::started(start_pts_us));
+            track.playback = Some(PlaybackClock::started(start_pts_us, track.state.media_epoch));
             track.state.milestones |= MILESTONE_CLOCK_STARTED;
             track.state.revision =
                 track.state.revision.advance().map_err(|_| "track revision exhausted")?;
@@ -1485,12 +1496,11 @@ impl SharedScene {
             if remaining <= 0 {
                 return Ok(());
             }
-            if playback.started_at.is_none() {
-                // A paused clock cannot reach this output by itself. A seek installs its exact
-                // target this way, so the wait here is for PLAY, not for time to pass.
-                state = self.0.changed.wait(state).unwrap_or_else(|poisoned| poisoned.into_inner());
-                continue;
-            }
+            // A paused clock cannot reach this output by itself, but it must not be waited on
+            // indefinitely either: a relay pauses the clock it forwards without flushing it, and a
+            // wait that only a notification can end deadlocks the whole surface behind whichever
+            // PLAY that relay decided to skip. Re-check on the same bounded interval as a running
+            // clock, so the reader always makes progress on its own.
             let wait = Duration::from_micros(u64::try_from(remaining).unwrap_or(u64::MAX))
                 .min(Duration::from_millis(20));
             let result = self
@@ -2902,6 +2912,35 @@ mod tests {
                 },
             )
             .unwrap();
+        // The exact start belongs to the epoch it was published for. A relay forwards PLAY without
+        // the FLUSH that preceded it, so a start naming a timeline this track already left must
+        // not discard the new epoch's output wholesale.
+        scene.flush_playback(track_identity, 2).unwrap();
+        assert_eq!(scene.playback_start_pts_us(track_identity), None);
+        scene.start_playback(track_identity, 1_000_000).unwrap();
+        assert_eq!(scene.playback_start_pts_us(track_identity), Some(1_000_000));
+        scene.flush_playback(track_identity, 3).unwrap();
+        scene.start_playback(track_identity, 1_000_000).unwrap();
+        scene.pause_playback(track_identity).unwrap();
+        scene.wait_until_due(track_identity, 1_000_000, true).unwrap();
+        scene
+            .publish_decoded_frame(
+                track_identity,
+                ChannelGeneration::ONE,
+                Frame {
+                    frame_id: 3,
+                    pts_us: 1_000_000,
+                    width: 1,
+                    height: 1,
+                    sar_num: 1,
+                    sar_den: 1,
+                    alpha_mode: ALPHA_STRAIGHT,
+                    rgba: Arc::new(RgbaBuffer::new(vec![0, 0, 0, 255])),
+                    damage: None,
+                },
+            )
+            .unwrap();
+
         let held_scene = scene.clone();
         let held =
             std::thread::spawn(move || held_scene.wait_until_due(track_identity, 1_040_000, true));
@@ -2915,7 +2954,7 @@ mod tests {
         held.join().unwrap().unwrap();
         assert!(seek_clock.elapsed() >= Duration::from_millis(25));
 
-        scene.mark_eos(track_identity, ChannelGeneration::ONE, 1, 0).unwrap();
+        scene.mark_eos(track_identity, ChannelGeneration::ONE, 3, 0).unwrap();
         scene.mark_buffered_ended(track_identity, ChannelGeneration::ONE).unwrap();
         assert!(matches!(
             scene.evaluate_track_wait(track_identity, ChannelGeneration::ONE, 6, None),

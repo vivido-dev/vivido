@@ -4003,7 +4003,13 @@ fn video_discard_plan(
         (Some(start), Some(latency)) => Some(start.max(latency)),
         (start, latency) => start.or(latency),
     };
-    (discard_before, latency_before.is_some_and(|deadline| pts_us < deadline))
+    // Media the producer sent to reach its own requested start is pre-roll, whatever the latency
+    // window says about it. Calling it late asks for a key unit the producer is already about to
+    // send, and through a relay that request is a recovery episode per seek: the forwarded clock
+    // is momentarily stale, so every pre-roll access unit trips the window at once.
+    let pre_roll = start_before.is_some_and(|start| pts_us < start);
+    let late = !pre_roll && latency_before.is_some_and(|deadline| pts_us < deadline);
+    (discard_before, late)
 }
 
 fn classify_audio_step(expected_pts_us: Option<i64>, pts_us: i64, live: bool) -> AudioTimelineStep {
@@ -6128,6 +6134,13 @@ mod tests {
         // Pre-roll for a seek is decoded for its references and its pictures thrown away, but it
         // is not lateness: asking for a key unit here made every seek trigger decoder recovery.
         assert_eq!(video_discard_plan(Some(7_000_000), None, 6_000_000), (Some(7_000_000), false));
+        // Regression: a relay turns one late verdict into a recovery episode for the whole seek,
+        // because the clock it forwards is momentarily stale and every pre-roll unit trips it.
+        assert_eq!(
+            video_discard_plan(Some(7_000_000), Some(9_000_000), 6_000_000),
+            (Some(9_000_000), false),
+            "media before the requested start is pre-roll, never a stream that fell behind"
+        );
         // Once the clock is running, the latency window still has to be able to discard and
         // recover. Regression: letting the start pts stand in for it left a track that fell behind
         // playing every late frame for the rest of the file, permanently behind its own audio.
@@ -6135,8 +6148,9 @@ mod tests {
             video_discard_plan(Some(1_000), Some(9_000_000), 8_000_000),
             (Some(9_000_000), true)
         );
-        // Neither threshold is allowed to resurrect what the other already ruled out.
-        assert_eq!(video_discard_plan(Some(9_000_000), Some(1_000), 500), (Some(9_000_000), true));
+        // Neither threshold is allowed to resurrect what the other already ruled out, and output
+        // that is both pre-roll and past the latency window is still only pre-roll.
+        assert_eq!(video_discard_plan(Some(9_000_000), Some(1_000), 500), (Some(9_000_000), false));
         assert_eq!(video_discard_plan(None, Some(1_000), 2_000), (Some(1_000), false));
         assert_eq!(video_discard_plan(None, None, 2_000), (None, false));
     }
