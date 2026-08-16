@@ -116,6 +116,7 @@ pub struct TextSystem {
     locale: Option<Language>,
     fallback_search_families: Arc<[FamilyId]>,
     checked_fallbacks: AHashSet<(FallbackKey, char)>,
+    pua_fallback_family_names: Arc<[FontFamilyName<'static>]>,
     family_stacks: [FontFamily<'static>; 4],
     variant_styles: [(ParleyFontStyle, FontWeight); 4],
     cache: AHashMap<LayoutKey, CachedLayout>,
@@ -128,8 +129,9 @@ impl TextSystem {
     pub fn new(font: Font) -> Self {
         let mut font_cx = FontContext::default();
         let fallback_search_families = fallback_search_families(&mut font_cx);
+        let pua_fallback_family_names = pua_fallback_family_names(&mut font_cx);
         let mut text_system = Self {
-            family_stacks: family_stacks_for_font(&font),
+            family_stacks: family_stacks_for_font(&font, &pua_fallback_family_names),
             variant_styles: variant_styles_for_font(&font),
             font,
             font_cx,
@@ -139,6 +141,7 @@ impl TextSystem {
             locale: text_locale(),
             fallback_search_families,
             checked_fallbacks: AHashSet::default(),
+            pua_fallback_family_names,
             cache: AHashMap::new(),
             cache_clock: 0,
             terminal_cache: AHashMap::new(),
@@ -159,7 +162,7 @@ impl TextSystem {
 
     pub fn update_font(&mut self, font: Font) {
         self.font = font;
-        self.family_stacks = family_stacks_for_font(&self.font);
+        self.family_stacks = family_stacks_for_font(&self.font, &self.pua_fallback_family_names);
         self.variant_styles = variant_styles_for_font(&self.font);
         self.metrics = self.measure_metrics();
         self.checked_fallbacks.clear();
@@ -702,7 +705,10 @@ pub fn color_from_rgb(color: Rgb) -> Color {
     Color::from_rgb8(color.r, color.g, color.b)
 }
 
-fn family_stacks_for_font(font: &Font) -> [FontFamily<'static>; 4] {
+fn family_stacks_for_font(
+    font: &Font,
+    pua_fallbacks: &[FontFamilyName<'static>],
+) -> [FontFamily<'static>; 4] {
     array::from_fn(|index| {
         let variant = match index {
             0 => FontVariant::Normal,
@@ -711,11 +717,15 @@ fn family_stacks_for_font(font: &Font) -> [FontFamily<'static>; 4] {
             3 => FontVariant::BoldItalic,
             _ => unreachable!("font variant index out of range"),
         };
-        FontFamily::List(Cow::Owned(font_family_stack(font, variant)))
+        FontFamily::List(Cow::Owned(font_family_stack(font, variant, pua_fallbacks)))
     })
 }
 
-fn font_family_stack(font: &Font, variant: FontVariant) -> Vec<FontFamilyName<'static>> {
+fn font_family_stack(
+    font: &Font,
+    variant: FontVariant,
+    pua_fallbacks: &[FontFamilyName<'static>],
+) -> Vec<FontFamilyName<'static>> {
     let mut families = Vec::new();
     push_configured_family_names(&mut families, variant_family_spec(font, variant));
 
@@ -728,7 +738,26 @@ fn font_family_stack(font: &Font, variant: FontVariant) -> Vec<FontFamilyName<'s
     push_family_name(&mut families, GenericFamily::SystemUi.into());
     push_family_name(&mut families, GenericFamily::Emoji.into());
 
+    for family in pua_fallbacks {
+        push_family_name(&mut families, family.clone());
+    }
+
     families
+}
+
+fn pua_fallback_family_names(font_cx: &mut FontContext) -> Arc<[FontFamilyName<'static>]> {
+    let mut names = font_cx
+        .collection
+        .family_names()
+        .filter(|name| name.to_ascii_lowercase().contains("nerd font"))
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    names.sort_unstable_by_key(|name| {
+        let lowercase = name.to_ascii_lowercase();
+        (!lowercase.starts_with("symbols nerd font"), lowercase)
+    });
+    names.dedup();
+    names.into_iter().map(named_family).collect::<Vec<_>>().into()
 }
 
 fn variant_family_spec(font: &Font, variant: FontVariant) -> Cow<'_, str> {
@@ -833,11 +862,25 @@ fn normalize_locale(locale: &str) -> Option<String> {
 fn fontique_script_for_char(character: char) -> Option<parley::fontique::Script> {
     let script = character.script();
     let name = script.short_name();
+    // Private-use characters have the Unknown script, but terminal icon fonts intentionally map
+    // them. Keeping the Zzzz key gives Fontique a fallback bucket matching the shaped run; generic
+    // Common/Inherited punctuation still uses the neighboring run's normal fallback behavior.
+    if name == "Zzzz" && is_private_use(character) {
+        return parley::fontique::Script::parse(name).ok();
+    }
     if matches!(name, "Zyyy" | "Zinh" | "Zzzz") {
         return None;
     }
     parley::fontique::Script::parse(name).ok()
 }
+
+fn is_private_use(character: char) -> bool {
+    matches!(character as u32, 0xE000..=0xF8FF | 0xF0000..=0xFFFFD | 0x100000..=0x10FFFD)
+}
+
+#[cfg(test)]
+#[path = "glyph_corpus.rs"]
+mod glyph_corpus;
 
 #[cfg(test)]
 mod tests {
@@ -852,8 +895,9 @@ mod tests {
 
     use super::{
         FontVariant, LAYOUT_EVICTION_BATCH, MAX_CACHED_LAYOUTS, TerminalTextStyle, TextSystem,
-        family_name_sort_key, font_family_stack, fontique_script_for_char, normalize_locale,
-        parse_named_style, push_configured_family_names,
+        family_name_sort_key, font_family_stack, fontique_script_for_char,
+        glyph_corpus::GLYPH_CORPUS, is_private_use, normalize_locale, parse_named_style,
+        push_configured_family_names,
     };
     use crate::config::font::Font;
     use crate::display::color::Rgb;
@@ -1076,6 +1120,76 @@ mod tests {
         assert_eq!(fontique_script_for_char('あ'), Some(Script::from_str_unchecked("Hira")));
         assert_eq!(fontique_script_for_char('한'), Some(Script::from_str_unchecked("Hang")));
         assert_eq!(fontique_script_for_char('!'), None);
+        assert_eq!(fontique_script_for_char('\u{f026}'), Some(Script::from_str_unchecked("Zzzz")));
+        assert!(is_private_use('\u{f0001}'));
+    }
+
+    #[test]
+    fn glyph_corpus_shapes_real_glyphs_with_nerd_font_fallback_when_available() {
+        let mut text = TextSystem::new(Font::default());
+        let nerd_text = GLYPH_CORPUS
+            .iter()
+            .filter(|entry| entry.requires_nerd_font)
+            .map(|entry| entry.codepoint)
+            .collect::<String>();
+        let family_names = text
+            .font_cx
+            .collection
+            .family_names()
+            .filter(|name| name.to_ascii_lowercase().contains("nerd font"))
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let nerd_family = family_names.into_iter().find(|family_name| {
+            let Some(family_id) = text.font_cx.collection.family_id(family_name) else {
+                return false;
+            };
+            text.family_supports_text(family_id, &nerd_text)
+        });
+        let Some(nerd_family) = nerd_family else {
+            eprintln!("skipping Nerd Font PUA corpus: no installed Nerd Font covers every fixture");
+            return;
+        };
+
+        for entry in GLYPH_CORPUS {
+            let content = entry.codepoint.to_string();
+            let glyph_id = first_layout_glyph_id(&mut text, &content);
+            assert!(
+                glyph_id.is_some_and(|glyph_id| glyph_id != 0),
+                "missing U+{:04X} group={} expected={} note={} installed_reference={nerd_family}",
+                entry.codepoint as u32,
+                entry.group,
+                entry.expected_family,
+                entry.note,
+            );
+            if entry.requires_nerd_font {
+                let selected = selected_family_name(&mut text, &content);
+                assert!(
+                    selected
+                        .as_deref()
+                        .is_some_and(|name| name.to_ascii_lowercase().contains("nerd font")),
+                    "U+{:04X} resolved through unexpected family {selected:?}",
+                    entry.codepoint as u32,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fallback_checks_are_memoized_and_font_updates_clear_them() {
+        let mut text = TextSystem::new(Font::default());
+        let character = '\u{f026}';
+
+        // The first PUA shape may seed Fontique and clear the probe set. The second records the
+        // now-satisfied check; the third must reuse it without growing the set.
+        text.shape_character(character, false, false);
+        text.shape_character(character, false, false);
+        let checked = text.checked_fallbacks.len();
+        text.shape_character(character, false, false);
+        assert_eq!(text.checked_fallbacks.len(), checked);
+        assert!(checked <= 1);
+
+        text.update_font(Font::default());
+        assert!(text.checked_fallbacks.is_empty());
     }
 
     #[test]
@@ -1097,7 +1211,7 @@ mod tests {
 
     #[test]
     fn variant_family_stack_deduplicates_configured_and_generic_fallbacks() {
-        let families = font_family_stack(&Font::default(), FontVariant::Bold);
+        let families = font_family_stack(&Font::default(), FontVariant::Bold, &[]);
 
         assert_eq!(
             families.iter().filter(|family| **family == GenericFamily::Monospace.into()).count(),
