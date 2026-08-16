@@ -436,14 +436,12 @@ impl Display {
             config.window_opacity() < 1.0,
         )?;
         let viewport_size = scene_renderer.clamp_render_size(viewport_size);
-        let padding = config.window.padding(window.scale_factor as f32);
-        let size_info = SizeInfo::new(
-            viewport_size.width as f32,
-            viewport_size.height as f32,
+        let size_info = scaled_size_info(
+            viewport_size,
             metrics.cell_width,
             metrics.cell_height,
-            padding.0,
-            padding.1,
+            config.window.padding(1.0),
+            scale_factor,
             config.window.dynamic_padding && config.window.dimensions().is_none(),
         );
 
@@ -550,14 +548,12 @@ impl Display {
             height = dimensions.height as f32;
         }
 
-        let padding = config.window.padding(self.window.scale_factor as f32);
-        let mut new_size = SizeInfo::new(
-            width,
-            height,
+        let mut new_size = scaled_size_info(
+            PhysicalSize::new(width as u32, height as u32),
             metrics.cell_width,
             metrics.cell_height,
-            padding.0,
-            padding.1,
+            config.window.padding(1.0),
+            self.window.scale_factor as f32,
             config.window.dynamic_padding,
         );
 
@@ -1723,12 +1719,16 @@ fn terminal_font_variant(flags: Flags) -> (bool, bool) {
 mod tests {
     use super::{
         INITIAL_RENDERER_RETRY, MAX_RENDERER_RETRY, TerminalTextSpan, next_renderer_retry_delay,
-        scene_glyph_from_layout, terminal_shaping_run, terminal_text_spans, text_cell_width,
+        rescale_font_size, scale_padding, scaled_size_info, scene_glyph_from_layout,
+        terminal_shaping_run, terminal_text_spans, text_cell_width,
     };
+    use crate::config::font::FontSize;
     use crate::display::color::Rgb;
     use crate::display::content::RenderableCell;
+    use crate::terminal::grid::Dimensions as _;
     use crate::terminal::index::{Column, Point};
     use crate::terminal::term::cell::Flags;
+    use winit::dpi::PhysicalSize;
 
     fn renderable_cell(line: usize, column: usize, character: char) -> RenderableCell {
         RenderableCell {
@@ -1741,6 +1741,26 @@ mod tests {
             flags: Flags::empty(),
             extra: None,
         }
+    }
+
+    #[test]
+    fn scale_math_handles_integer_fractional_and_repeated_factor_changes() {
+        let base = FontSize::new(12.0);
+        assert_eq!(rescale_font_size(base, 1.0, 2.0).as_pt(), 24.0);
+        assert_eq!(rescale_font_size(base, 1.0, 1.5).as_pt(), 18.0);
+        assert_eq!(rescale_font_size(base, 1.5, 1.5), base);
+        assert_eq!(scale_padding((3.0, 5.0), 1.5), (4.0, 7.0));
+    }
+
+    #[test]
+    fn proportionally_scaled_viewport_metrics_and_padding_preserve_the_grid() {
+        let one = scaled_size_info(PhysicalSize::new(800, 600), 10.0, 20.0, (4.0, 6.0), 1.0, false);
+        let two =
+            scaled_size_info(PhysicalSize::new(1600, 1200), 20.0, 40.0, (4.0, 6.0), 2.0, false);
+        assert_eq!(one.columns(), two.columns());
+        assert_eq!(one.screen_lines(), two.screen_lines());
+        assert_eq!(two.padding_x(), one.padding_x() * 2.0);
+        assert_eq!(two.padding_y(), one.padding_y() * 2.0);
     }
 
     #[test]
@@ -2035,10 +2055,45 @@ fn window_size(
     cell_height: f32,
     scale_factor: f32,
 ) -> PhysicalSize<u32> {
-    let padding = config.window.padding(scale_factor);
+    let padding = scale_padding(config.window.padding(1.0), scale_factor);
     let grid_width = cell_width * dimensions.columns.max(MIN_COLUMNS) as f32;
     let grid_height = cell_height * dimensions.lines.max(MIN_SCREEN_LINES) as f32;
     let width = padding.0.mul_add(2., grid_width).floor();
     let height = padding.1.mul_add(2., grid_height).floor();
     PhysicalSize::new(width as u32, height as u32)
+}
+
+pub(crate) fn rescale_font_size(
+    font_size: crate::config::font::FontSize,
+    old_factor: f64,
+    new_factor: f64,
+) -> crate::config::font::FontSize {
+    if old_factor <= 0.0 || new_factor <= 0.0 || old_factor == new_factor {
+        return font_size;
+    }
+    font_size.scale((new_factor / old_factor) as f32)
+}
+
+fn scale_padding(logical: (f32, f32), scale_factor: f32) -> (f32, f32) {
+    ((logical.0 * scale_factor).floor(), (logical.1 * scale_factor).floor())
+}
+
+fn scaled_size_info(
+    viewport: PhysicalSize<u32>,
+    cell_width: f32,
+    cell_height: f32,
+    logical_padding: (f32, f32),
+    scale_factor: f32,
+    dynamic_padding: bool,
+) -> SizeInfo {
+    let padding = scale_padding(logical_padding, scale_factor);
+    SizeInfo::new(
+        viewport.width as f32,
+        viewport.height as f32,
+        cell_width,
+        cell_height,
+        padding.0,
+        padding.1,
+        dynamic_padding,
+    )
 }

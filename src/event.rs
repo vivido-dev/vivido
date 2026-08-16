@@ -4123,8 +4123,11 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                         let display_update_pending = &mut self.ctx.display.pending_update;
 
                         // Rescale font size for the new factor.
-                        let font_scale = scale_factor as f32 / old_scale_factor as f32;
-                        self.ctx.display.font_size = self.ctx.display.font_size.scale(font_scale);
+                        self.ctx.display.font_size = crate::display::rescale_font_size(
+                            self.ctx.display.font_size,
+                            old_scale_factor,
+                            scale_factor,
+                        );
 
                         let font = self.ctx.config.font.clone();
                         display_update_pending.set_font(font.with_size(self.ctx.display.font_size));
@@ -4133,7 +4136,7 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                         // Ignore resize events to zero in any dimension, to avoid issues with Winit
                         // and the ConPTY. A 0x0 resize will also occur when the window is minimized
                         // on Windows.
-                        if size.width == 0 || size.height == 0 {
+                        if !is_renderable_resize(size) {
                             return;
                         }
 
@@ -4308,6 +4311,10 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
     }
 }
 
+fn is_renderable_resize(size: PhysicalSize<u32>) -> bool {
+    size.width != 0 && size.height != 0
+}
+
 #[derive(Debug, Clone)]
 pub struct EventProxy {
     proxy: EventSink,
@@ -4387,5 +4394,19 @@ mod file_drop_message_tests {
             buffer.message().and_then(|message| message.target()).map(String::as_str),
             Some(FILE_DROP_MESSAGE_TARGET)
         );
+    }
+}
+
+#[cfg(test)]
+mod window_resize_tests {
+    use super::is_renderable_resize;
+    use winit::dpi::PhysicalSize;
+
+    #[test]
+    fn monitor_move_resize_sequence_accepts_physical_size_and_ignores_zero_axes() {
+        assert!(is_renderable_resize(PhysicalSize::new(2560, 1600)));
+        assert!(!is_renderable_resize(PhysicalSize::new(0, 1600)));
+        assert!(!is_renderable_resize(PhysicalSize::new(2560, 0)));
+        assert!(!is_renderable_resize(PhysicalSize::new(0, 0)));
     }
 }
