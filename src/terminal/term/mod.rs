@@ -2566,7 +2566,7 @@ mod tests {
     use crate::terminal::grid::Grid;
     use crate::terminal::grid::Scroll;
     use crate::terminal::index::{Column, Point, Side};
-    use crate::terminal::selection::{Selection, SelectionType};
+    use crate::terminal::selection::{Selection, SelectionRange, SelectionType};
     #[cfg(feature = "serde")]
     use crate::terminal::term::cell::Cell;
     use crate::terminal::term::cell::Flags;
@@ -2890,6 +2890,190 @@ mod tests {
             s.update(Point { line: Line(3), column: Column(4) }, Side::Right);
         }
         assert_eq!(term.selection_to_string(), Some(String::from("\na\"\na\"\na")));
+    }
+
+    /// A selection is grid coordinates, not cell content: rewriting the selected cells — the
+    /// identical rewrite a TUI full redraw performs, and even a rewrite with different values —
+    /// must never clear or move it. This locks the WezTerm #7984 bug class out of vivido.
+    #[test]
+    fn selection_survives_rewrite_of_selected_cells() {
+        let size = TermSize::new(20, 5);
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+        {
+            let grid = term.grid_mut();
+            for (i, text) in ["htop redraw", "cpu 42%", "mem 13%"].iter().enumerate() {
+                for (j, c) in text.chars().enumerate() {
+                    grid[Line(i as i32)][Column(j)].c = c;
+                }
+            }
+        }
+        term.selection = Some(Selection::new(
+            SelectionType::Simple,
+            Point { line: Line(1), column: Column(0) },
+            Side::Left,
+        ));
+        if let Some(s) = term.selection.as_mut() {
+            s.update(Point { line: Line(1), column: Column(6) }, Side::Right);
+        }
+        // An identical redraw of the selected cells keeps both the selection and its text.
+        {
+            let grid = term.grid_mut();
+            for (j, c) in "cpu 42%".chars().enumerate() {
+                grid[Line(1)][Column(j)].c = c;
+            }
+        }
+        assert_eq!(term.selection_to_string().as_deref(), Some("cpu 42%"));
+        assert_eq!(
+            term.selection.as_ref().and_then(|s| s.to_range(&term)),
+            Some(SelectionRange {
+                start: Point { line: Line(1), column: Column(0) },
+                end: Point { line: Line(1), column: Column(6) },
+                is_block: false,
+            })
+        );
+
+        // Even a redraw that changes the selected values keeps the selection on the same
+        // coordinates; the extracted text tracks the new content, the range does not move.
+        {
+            let grid = term.grid_mut();
+            for (j, c) in "cpu 99%".chars().enumerate() {
+                grid[Line(1)][Column(j)].c = c;
+            }
+            grid[Line(4)][Column(0)].c = 'x';
+        }
+        assert_eq!(term.selection_to_string().as_deref(), Some("cpu 99%"));
+        assert_eq!(
+            term.selection.as_ref().and_then(|s| s.to_range(&term)),
+            Some(SelectionRange {
+                start: Point { line: Line(1), column: Column(0) },
+                end: Point { line: Line(1), column: Column(6) },
+                is_block: false,
+            })
+        );
+    }
+
+    /// The intentional clears must stay intentional: swapping to the alternate screen, clearing
+    /// the whole screen, erasing the selected line, a full reset, and a column-changing resize
+    /// all drop the selection — while clears that miss the selection keep it.
+    #[test]
+    fn selection_clears_only_on_intentional_operations() {
+        let select = |term: &mut Term<VoidListener>, line: i32| {
+            term.selection = Some(Selection::new(
+                SelectionType::Simple,
+                Point { line: Line(line), column: Column(0) },
+                Side::Left,
+            ));
+            if let Some(s) = term.selection.as_mut() {
+                s.update(Point { line: Line(line), column: Column(3) }, Side::Right);
+            }
+        };
+
+        // Alt-screen swap clears.
+        let size = TermSize::new(20, 5);
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+        select(&mut term, 1);
+        term.swap_alt();
+        assert!(term.selection.is_none());
+
+        // Erasing the whole screen clears; erasing above a selection below the cursor keeps it.
+        select(&mut term, 3);
+        term.clear_screen(ansi::ClearMode::All);
+        assert!(term.selection.is_none());
+        select(&mut term, 3);
+        term.clear_screen(ansi::ClearMode::Above);
+        assert!(term.selection.is_some());
+
+        // Erasing the cursor's line clears only a selection on that line.
+        term.clear_line(ansi::LineClearMode::All);
+        assert!(term.selection.is_some(), "EL on line 0 must keep a line-3 selection");
+        select(&mut term, 0);
+        term.clear_line(ansi::LineClearMode::All);
+        assert!(term.selection.is_none());
+
+        // A full reset clears.
+        select(&mut term, 2);
+        term.reset_state();
+        assert!(term.selection.is_none());
+
+        // A column-changing resize clears; a rows-only resize keeps (rotates) the selection.
+        select(&mut term, 2);
+        term.resize(TermSize::new(10, 5));
+        assert!(term.selection.is_none());
+        select(&mut term, 2);
+        term.resize(TermSize::new(10, 7));
+        assert!(term.selection.is_some());
+    }
+
+    /// Content scrolling rotates the selection with the text instead of clearing it: the
+    /// selected text stays selected as lines move up, including when it recedes into scrollback.
+    #[test]
+    fn selection_rotates_with_content_scroll() {
+        let size = TermSize::new(20, 5);
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+        let mut parser: ansi::Processor = ansi::Processor::new();
+        parser.advance(&mut term, b"alpha\r\nbravo\r\ncharlie\r\ndelta\r\necho");
+
+        term.selection = Some(Selection::new(
+            SelectionType::Simple,
+            Point { line: Line(2), column: Column(0) },
+            Side::Left,
+        ));
+        if let Some(s) = term.selection.as_mut() {
+            s.update(Point { line: Line(3), column: Column(4) }, Side::Right);
+        }
+        let selected = term.selection_to_string();
+        assert_eq!(selected.as_deref(), Some("charlie\ndelta"));
+
+        // Newline at the bottom scrolls the grid up by one; the selection must follow the text.
+        term.newline();
+        assert_eq!(term.selection_to_string(), selected);
+        assert_eq!(
+            term.selection.as_ref().and_then(|s| s.to_range(&term)),
+            Some(SelectionRange {
+                start: Point { line: Line(1), column: Column(0) },
+                end: Point { line: Line(2), column: Column(4) },
+                is_block: false,
+            })
+        );
+
+        // Keep scrolling: the selected text recedes into scrollback but stays selected.
+        for _ in 0..3 {
+            term.newline();
+            assert_eq!(term.selection_to_string(), selected);
+        }
+        assert!(term.selection.is_some());
+    }
+
+    /// Display-offset scrolling is a pure viewport change: it must not move or clear a
+    /// selection anchored in grid coordinates.
+    #[test]
+    fn selection_ignores_display_offset_scroll() {
+        let size = TermSize::new(20, 5);
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+        let mut parser: ansi::Processor = ansi::Processor::new();
+        parser.advance(&mut term, b"alpha\r\nbravo\r\ncharlie\r\ndelta\r\necho");
+        for _ in 0..10 {
+            term.newline();
+        }
+
+        term.selection = Some(Selection::new(
+            SelectionType::Simple,
+            Point { line: Line(1), column: Column(0) },
+            Side::Left,
+        ));
+        if let Some(s) = term.selection.as_mut() {
+            s.update(Point { line: Line(1), column: Column(5) }, Side::Right);
+        }
+        let before = term.selection.as_ref().and_then(|s| s.to_range(&term));
+
+        term.scroll_display(Scroll::PageUp);
+        assert_eq!(term.grid.display_offset(), 5);
+        assert_eq!(term.selection.as_ref().and_then(|s| s.to_range(&term)), before);
+
+        term.scroll_display(Scroll::Delta(2));
+        assert_eq!(term.grid.display_offset(), 7);
+        assert_eq!(term.selection.as_ref().and_then(|s| s.to_range(&term)), before);
+        assert!(term.selection.is_some());
     }
 
     /// Check that the grid can be serialized back and forth losslessly.
