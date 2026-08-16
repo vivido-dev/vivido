@@ -3696,6 +3696,42 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Default)]
+    struct ClipboardStoreListener(Arc<Mutex<Vec<(ClipboardType, String)>>>);
+
+    impl EventListener for ClipboardStoreListener {
+        fn send_event(&self, event: Event) {
+            if let Event::ClipboardStore(ty, text) = event {
+                self.0.lock().unwrap().push((ty, text));
+            }
+        }
+    }
+
+    #[test]
+    fn osc52_store_obeys_copy_policy() {
+        for (osc52, expected) in [
+            (Osc52::OnlyCopy, true),
+            (Osc52::CopyPaste, true),
+            (Osc52::Disabled, false),
+            (Osc52::OnlyPaste, false),
+        ] {
+            let size = TermSize::new(25, 80);
+            let listener = ClipboardStoreListener::default();
+            let stores = listener.0.clone();
+            let config = Config { osc52, ..Config::default() };
+            let mut term = Term::new(config, &size, listener);
+            let mut parser: ansi::Processor = ansi::Processor::new();
+
+            parser.advance(&mut term, b"\x1b]52;c;aMOpbGxvIPCfpoA=\x1b\\");
+
+            let stores = stores.lock().unwrap();
+            assert_eq!(!stores.is_empty(), expected, "policy={osc52:?}");
+            if expected {
+                assert_eq!(stores.as_slice(), &[(ClipboardType::Clipboard, "héllo 🦀".to_owned())]);
+            }
+        }
+    }
+
     #[test]
     fn tertiary_device_attributes_reply() {
         let size = TermSize::new(25, 80);
