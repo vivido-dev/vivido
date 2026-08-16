@@ -497,12 +497,12 @@ impl State {
                             None => (start, end),
                         });
                     }
-                    self.parser.advance(terminal, &bytes);
+                    terminal.advance(&mut self.parser, &bytes);
                 },
                 VividChunk::Marker { raw, marker } => {
                     processed += raw.len();
                     #[cfg(not(windows))]
-                    self.parser.advance(terminal, &raw);
+                    terminal.advance(&mut self.parser, &raw);
                     terminal.vivid_marker(marker);
                 },
             }

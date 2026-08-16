@@ -49,6 +49,127 @@ const KEYBOARD_MODE_STACK_MAX_DEPTH: usize = TITLE_STACK_MAX_DEPTH;
 
 /// Default tab interval, corresponding to terminfo `it` value.
 const INITIAL_TABSTOPS: usize = 8;
+const DCS_MAX_BYTES: usize = 4096;
+
+#[derive(Debug, Default)]
+struct DcsScanner {
+    state: DcsState,
+    body: Vec<u8>,
+    raw: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+enum DcsState {
+    #[default]
+    Ground,
+    Escape,
+    Body,
+    BodyEscape,
+    Discarding,
+    DiscardingEscape,
+}
+
+#[derive(Debug)]
+enum DcsChunk {
+    Bytes(Vec<u8>),
+    Request(DcsRequest),
+}
+
+#[derive(Debug)]
+enum DcsRequest {
+    Decrqss(Vec<u8>),
+    Xtgettcap(Vec<u8>),
+    Xtsettcap(Vec<u8>),
+}
+
+impl DcsScanner {
+    fn push(&mut self, bytes: &[u8]) -> Vec<DcsChunk> {
+        let mut chunks = Vec::new();
+        for &byte in bytes {
+            match self.state {
+                DcsState::Ground if byte == 0x1b => self.state = DcsState::Escape,
+                DcsState::Ground => push_dcs_bytes(&mut chunks, &[byte]),
+                DcsState::Escape if byte == b'P' => {
+                    self.body.clear();
+                    self.raw.clear();
+                    self.raw.extend_from_slice(b"\x1bP");
+                    self.state = DcsState::Body;
+                },
+                DcsState::Escape if byte == 0x1b => push_dcs_bytes(&mut chunks, b"\x1b"),
+                DcsState::Escape => {
+                    push_dcs_bytes(&mut chunks, &[0x1b, byte]);
+                    self.state = DcsState::Ground;
+                },
+                DcsState::Body if byte == 0x1b => {
+                    self.state = DcsState::BodyEscape;
+                },
+                DcsState::Body => self.push_body(byte),
+                DcsState::BodyEscape if byte == b'\\' => {
+                    self.raw.extend_from_slice(b"\x1b\\");
+                    self.finish(&mut chunks);
+                },
+                DcsState::BodyEscape => {
+                    self.push_body(0x1b);
+                    if matches!(self.state, DcsState::Body) {
+                        self.push_body(byte);
+                    }
+                },
+                DcsState::Discarding if byte == 0x1b => {
+                    self.state = DcsState::DiscardingEscape;
+                },
+                DcsState::Discarding => {},
+                DcsState::DiscardingEscape if byte == b'\\' => {
+                    self.body.clear();
+                    self.raw.clear();
+                    self.state = DcsState::Ground;
+                },
+                DcsState::DiscardingEscape if byte == 0x1b => {},
+                DcsState::DiscardingEscape => self.state = DcsState::Discarding,
+            }
+        }
+        chunks
+    }
+
+    fn push_body(&mut self, byte: u8) {
+        self.body.push(byte);
+        self.raw.push(byte);
+        self.state = if self.body.len() > DCS_MAX_BYTES {
+            self.body.clear();
+            self.raw.clear();
+            DcsState::Discarding
+        } else {
+            DcsState::Body
+        };
+    }
+
+    fn finish(&mut self, chunks: &mut Vec<DcsChunk>) {
+        let request = self
+            .body
+            .strip_prefix(b"$q")
+            .map(|body| DcsRequest::Decrqss(body.to_vec()))
+            .or_else(|| {
+                self.body.strip_prefix(b"+q").map(|body| DcsRequest::Xtgettcap(body.to_vec()))
+            })
+            .or_else(|| {
+                self.body.strip_prefix(b"+p").map(|body| DcsRequest::Xtsettcap(body.to_vec()))
+            });
+        chunks.push(match request {
+            Some(request) => DcsChunk::Request(request),
+            None => DcsChunk::Bytes(mem::take(&mut self.raw)),
+        });
+        self.body.clear();
+        self.raw.clear();
+        self.state = DcsState::Ground;
+    }
+}
+
+fn push_dcs_bytes(chunks: &mut Vec<DcsChunk>, bytes: &[u8]) {
+    if let Some(DcsChunk::Bytes(previous)) = chunks.last_mut() {
+        previous.extend_from_slice(bytes);
+    } else {
+        chunks.push(DcsChunk::Bytes(bytes.to_vec()));
+    }
+}
 
 bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -325,6 +446,9 @@ pub struct Term<T> {
 
     /// Config directly for the terminal.
     config: Config,
+
+    /// Fragment-safe DCS interception for requests upstream vte intentionally discards.
+    dcs_scanner: DcsScanner,
 }
 
 /// A semantic terminal position carried through one grid resize/reflow.
@@ -428,7 +552,86 @@ impl<T> Term<T> {
             selection: Default::default(),
             title: Default::default(),
             mode: Default::default(),
+            dcs_scanner: Default::default(),
         }
+    }
+
+    /// Advance terminal input while intercepting the bounded DCS queries that vte's ANSI adapter
+    /// otherwise discards before they reach [`Handler`].
+    pub fn advance(&mut self, processor: &mut ansi::Processor, bytes: &[u8])
+    where
+        T: EventListener,
+    {
+        for chunk in self.dcs_scanner.push(bytes) {
+            match chunk {
+                DcsChunk::Bytes(bytes) => processor.advance(self, &bytes),
+                DcsChunk::Request(DcsRequest::Decrqss(request)) => {
+                    self.report_status_string(&request);
+                },
+                DcsChunk::Request(DcsRequest::Xtgettcap(request)) => {
+                    self.report_termcap(&request);
+                },
+                DcsChunk::Request(DcsRequest::Xtsettcap(request)) => {
+                    // Parse and ignore. Applications cannot mutate the emulator's identity or
+                    // capability set, and no payload is logged.
+                    let _valid = request
+                        .split(|byte| *byte == b';')
+                        .all(|item| !item.is_empty() && decode_hex(item).is_some());
+                },
+            }
+        }
+    }
+
+    fn report_status_string(&self, request: &[u8])
+    where
+        T: EventListener,
+    {
+        let status = match request {
+            b"m" => sgr_status(&self.grid.cursor.template),
+            b"r" => format!("{};{}r", self.scroll_region.start.0 + 1, self.scroll_region.end.0),
+            b"\"p" => "61;1\"p".to_owned(),
+            b"\"q" => "0\"q".to_owned(),
+            _ => {
+                self.event_proxy.send_event(Event::PtyWrite("\x1bP0$r\x1b\\".to_owned()));
+                return;
+            },
+        };
+        self.event_proxy.send_event(Event::PtyWrite(format!("\x1bP1$r{status}\x1b\\")));
+    }
+
+    fn report_termcap(&self, request: &[u8])
+    where
+        T: EventListener,
+    {
+        let mut values = Vec::new();
+        for encoded_name in request.split(|byte| *byte == b';') {
+            let Some(name) = decode_hex(encoded_name) else { continue };
+            let value = match name.as_slice() {
+                b"TN" => Some(Some(b"xterm-vivido".as_slice())),
+                b"Co" => Some(Some(b"256".as_slice())),
+                b"RGB" => Some(Some(b"8".as_slice())),
+                b"Tc" => Some(None),
+                _ => None,
+            };
+            let Some(value) = value else { continue };
+            let mut entry = encoded_name.to_vec();
+            if let Some(value) = value {
+                entry.push(b'=');
+                entry.extend_from_slice(encode_hex(value).as_bytes());
+            }
+            values.push(entry);
+        }
+        let reply = if values.is_empty() {
+            "\x1bP0+r\x1b\\".to_owned()
+        } else {
+            let values = values
+                .iter()
+                .map(|value| String::from_utf8_lossy(value))
+                .collect::<Vec<_>>()
+                .join(";");
+            format!("\x1bP1+r{values}\x1b\\")
+        };
+        self.event_proxy.send_event(Event::PtyWrite(reply));
     }
 
     /// Collect the information about the changes in the lines, which
@@ -2359,6 +2562,91 @@ fn version_number(mut version: &str) -> usize {
     version_number
 }
 
+fn decode_hex(value: &[u8]) -> Option<Vec<u8>> {
+    if !value.len().is_multiple_of(2) {
+        return None;
+    }
+    value
+        .chunks_exact(2)
+        .map(|pair| {
+            let high = (pair[0] as char).to_digit(16)?;
+            let low = (pair[1] as char).to_digit(16)?;
+            Some(((high << 4) | low) as u8)
+        })
+        .collect()
+}
+
+fn encode_hex(value: &[u8]) -> String {
+    use std::fmt::Write;
+
+    let mut encoded = String::with_capacity(value.len() * 2);
+    for byte in value {
+        write!(encoded, "{byte:02x}").unwrap();
+    }
+    encoded
+}
+
+fn sgr_status(cell: &Cell) -> String {
+    let mut params = Vec::new();
+    if cell.flags.contains(Flags::BOLD) {
+        params.push("1".to_owned());
+    }
+    if cell.flags.contains(Flags::DIM) {
+        params.push("2".to_owned());
+    }
+    if cell.flags.contains(Flags::ITALIC) {
+        params.push("3".to_owned());
+    }
+    for (flag, value) in [
+        (Flags::UNDERLINE, "4"),
+        (Flags::DOUBLE_UNDERLINE, "4:2"),
+        (Flags::UNDERCURL, "4:3"),
+        (Flags::DOTTED_UNDERLINE, "4:4"),
+        (Flags::DASHED_UNDERLINE, "4:5"),
+    ] {
+        if cell.flags.contains(flag) {
+            params.push(value.to_owned());
+            break;
+        }
+    }
+    if cell.flags.contains(Flags::INVERSE) {
+        params.push("7".to_owned());
+    }
+    if cell.flags.contains(Flags::HIDDEN) {
+        params.push("8".to_owned());
+    }
+    if cell.flags.contains(Flags::STRIKEOUT) {
+        params.push("9".to_owned());
+    }
+    push_sgr_color(&mut params, cell.fg, true);
+    push_sgr_color(&mut params, cell.bg, false);
+    if params.is_empty() {
+        params.push("0".to_owned());
+    }
+    format!("{}m", params.join(";"))
+}
+
+fn push_sgr_color(params: &mut Vec<String>, color: Color, foreground: bool) {
+    let base = if foreground { 30_u8 } else { 40_u8 };
+    match color {
+        Color::Named(named) if (named as usize) < 8 => {
+            params.push((base + named as u8).to_string());
+        },
+        Color::Named(named) if (named as usize) < 16 => {
+            params.push((base + 60 + named as u8 - 8).to_string());
+        },
+        Color::Named(_) => {},
+        Color::Indexed(index @ 0..=7) => params.push((base + index).to_string()),
+        Color::Indexed(index @ 8..=15) => params.push((base + 60 + index - 8).to_string()),
+        Color::Indexed(index) => {
+            params.push(format!("{};5;{index}", if foreground { 38 } else { 48 }));
+        },
+        Color::Spec(Rgb { r, g, b }) => {
+            params.push(format!("{};2;{r};{g};{b}", if foreground { 38 } else { 48 }))
+        },
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClipboardType {
     Clipboard,
@@ -3743,6 +4031,57 @@ mod tests {
         parser.advance(&mut term, b"\x1b[=c");
 
         assert_eq!(*replies.lock().unwrap(), vec!["\x1bP!|00000000\x1b\\".to_owned()]);
+    }
+
+    #[test]
+    fn decrqss_reports_sgr_scroll_region_and_refuses_unknown_requests() {
+        let size = TermSize::new(10, 20);
+        let listener = PtyWriteListener::default();
+        let replies = listener.0.clone();
+        let mut term = Term::new(Config::default(), &size, listener);
+        let mut parser: ansi::Processor = ansi::Processor::new();
+
+        term.advance(&mut parser, b"\x1b[1;31m\x1b[3;7r");
+        term.advance(&mut parser, b"\x1bP$qm\x1b\\");
+        term.advance(&mut parser, b"\x1bP$qr\x1b\\");
+        term.advance(&mut parser, b"\x1bP$qz\x1b\\");
+
+        assert_eq!(
+            *replies.lock().unwrap(),
+            vec![
+                "\x1bP1$r1;31m\x1b\\".to_owned(),
+                "\x1bP1$r3;7r\x1b\\".to_owned(),
+                "\x1bP0$r\x1b\\".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn xtgettcap_is_fragment_safe_bounded_and_reports_honest_capabilities() {
+        let size = TermSize::new(10, 20);
+        let listener = PtyWriteListener::default();
+        let replies = listener.0.clone();
+        let mut term = Term::new(Config::default(), &size, listener);
+        let mut parser: ansi::Processor = ansi::Processor::new();
+
+        term.advance(&mut parser, b"\x1bP+q544e;524");
+        assert!(replies.lock().unwrap().is_empty());
+        term.advance(&mut parser, b"742;5463;756e6b6e6f776e\x1b\\");
+        term.advance(&mut parser, b"\x1bP+q756e6b6e6f776e\x1b\\");
+        term.advance(&mut parser, b"\x1bP+p544e=6576696c\x1b\\");
+
+        let mut oversized = b"\x1bP+q".to_vec();
+        oversized.extend(std::iter::repeat_n(b'a', DCS_MAX_BYTES + 1));
+        oversized.extend_from_slice(b"\x1b\\");
+        term.advance(&mut parser, &oversized);
+
+        assert_eq!(
+            *replies.lock().unwrap(),
+            vec![
+                "\x1bP1+r544e=787465726d2d76697669646f;524742=38;5463\x1b\\".to_owned(),
+                "\x1bP0+r\x1b\\".to_owned(),
+            ]
+        );
     }
 
     /// Producers that draw into their own pixels ask whether mode 1016 took effect before they map
