@@ -193,3 +193,7 @@ resolver = "2"
 lto = "thin"
 debug = 1
 incremental = false
+
+[profile.dev]
+debug = "line-tables-only"
+
