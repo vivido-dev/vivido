@@ -449,6 +449,27 @@ pub struct Term<T> {
 
     /// Fragment-safe DCS interception for requests upstream vte intentionally discards.
     dcs_scanner: DcsScanner,
+
+    /// Grid scroll accumulated since the last delivery. See [`PendingGridScroll`].
+    pending_grid_scroll: Option<PendingGridScroll>,
+}
+
+/// A grid scroll awaiting delivery to the Vivid scene.
+///
+/// Scrolling text produces one scroll per line, and every delivery is a cross-thread wakeup that
+/// costs a run-loop syscall, so sending them individually dominates the parse loop. Merging
+/// consecutive scrolls that share a region and a direction is exactly equivalent to applying them
+/// one at a time: an anchor survives `n` single-line scrolls of `origin..end` precisely when it
+/// survives one `n`-line scroll of the same region.
+///
+/// Direction and region must both match to merge. An anchor scrolled out of a region is removed
+/// for good, so folding a later scroll back over it would revive an anchor that should be gone.
+#[derive(Debug, Clone, Copy)]
+struct PendingGridScroll {
+    origin: i32,
+    end: i32,
+    lines: i32,
+    history_size: usize,
 }
 
 /// A semantic terminal position carried through one grid resize/reflow.
@@ -553,6 +574,50 @@ impl<T> Term<T> {
             title: Default::default(),
             mode: Default::default(),
             dcs_scanner: Default::default(),
+            pending_grid_scroll: None,
+        }
+    }
+
+    /// Accumulate a grid scroll instead of delivering it immediately.
+    ///
+    /// Merges into the pending scroll when that is equivalent, and otherwise delivers the pending
+    /// one first so scrolls reach the scene in order.
+    fn queue_grid_scroll(&mut self, origin: i32, end: i32, lines: i32, history_size: usize)
+    where
+        T: EventListener,
+    {
+        match &mut self.pending_grid_scroll {
+            Some(pending)
+                if pending.origin == origin
+                    && pending.end == end
+                    && pending.lines.signum() == lines.signum() =>
+            {
+                pending.lines = pending.lines.saturating_add(lines);
+                pending.history_size = history_size;
+            },
+            _ => {
+                self.flush_grid_scroll();
+                self.pending_grid_scroll =
+                    Some(PendingGridScroll { origin, end, lines, history_size });
+            },
+        }
+    }
+
+    /// Deliver the accumulated grid scroll.
+    ///
+    /// Must run at the end of every parsed chunk and before any other event that reads or places
+    /// anchors, so the scene never observes an anchor against a grid it has not been scrolled to.
+    fn flush_grid_scroll(&mut self)
+    where
+        T: EventListener,
+    {
+        if let Some(pending) = self.pending_grid_scroll.take() {
+            self.event_proxy.send_event(Event::VividGridScroll {
+                origin: pending.origin,
+                end: pending.end,
+                lines: pending.lines,
+                history_size: pending.history_size,
+            });
         }
     }
 
@@ -580,6 +645,8 @@ impl<T> Term<T> {
                 },
             }
         }
+
+        self.flush_grid_scroll();
     }
 
     fn report_status_string(&self, request: &[u8])
@@ -1006,6 +1073,7 @@ impl<T> Term<T> {
         mem::swap(&mut self.grid, &mut self.inactive_grid);
         self.mode ^= TermMode::ALT_SCREEN;
         self.selection = None;
+        self.flush_grid_scroll();
         self.event_proxy.send_event(Event::VividScreenSwap {
             alternate: self.mode.contains(TermMode::ALT_SCREEN),
         });
@@ -1035,12 +1103,8 @@ impl<T> Term<T> {
         // Scroll between origin and bottom
         self.grid.scroll_down(&region, lines);
         if lines > 0 {
-            self.event_proxy.send_event(Event::VividGridScroll {
-                origin: origin.0,
-                end: self.scroll_region.end.0,
-                lines: -(lines as i32),
-                history_size: self.history_size(),
-            });
+            let (end, history_size) = (self.scroll_region.end.0, self.history_size());
+            self.queue_grid_scroll(origin.0, end, -(lines as i32), history_size);
         }
         self.mark_fully_damaged();
     }
@@ -1066,12 +1130,8 @@ impl<T> Term<T> {
         self.grid.scroll_up(&region, lines);
 
         if lines > 0 {
-            self.event_proxy.send_event(Event::VividGridScroll {
-                origin: origin.0,
-                end: self.scroll_region.end.0,
-                lines: lines as i32,
-                history_size: self.history_size(),
-            });
+            let (end, history_size) = (self.scroll_region.end.0, self.history_size());
+            self.queue_grid_scroll(origin.0, end, lines as i32, history_size);
         }
 
         self.mark_fully_damaged();
@@ -1100,10 +1160,12 @@ impl<T> Term<T> {
 
     /// Attach an authenticated Vivid marker to the cursor position after all preceding PTY bytes
     /// have been interpreted.
-    pub(crate) fn vivid_marker(&self, marker: String)
+    pub(crate) fn vivid_marker(&mut self, marker: String)
     where
         T: EventListener,
     {
+        // An anchor is placed at a grid line, so it must not overtake a scroll of that grid.
+        self.flush_grid_scroll();
         let point = self.grid.cursor.point;
         self.event_proxy.send_event(Event::VividMarker {
             marker,
@@ -2057,6 +2119,7 @@ impl<T: EventListener> Handler for Term<T> {
         }
 
         if clears_vivid_scene {
+            self.flush_grid_scroll();
             self.event_proxy.send_event(Event::VividClear);
         }
 
@@ -2915,6 +2978,99 @@ mod tests {
         parser.advance(&mut term, b"\x1b[3J\x1b[H");
 
         assert_eq!(clear_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[derive(Clone, Default)]
+    struct VividSceneListener(Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl EventListener for VividSceneListener {
+        fn send_event(&self, event: Event) {
+            let recorded = match event {
+                Event::VividGridScroll { origin, end, lines, .. } => {
+                    format!("scroll({origin}..{end}, {lines})")
+                },
+                Event::VividMarker { marker, .. } => format!("marker({marker})"),
+                Event::VividClear => "clear".to_owned(),
+                Event::VividScreenSwap { alternate } => format!("swap({alternate})"),
+                _ => return,
+            };
+            self.0.lock().unwrap().push(recorded);
+        }
+    }
+
+    fn scene_term(lines: u16) -> (Term<VividSceneListener>, Arc<std::sync::Mutex<Vec<String>>>) {
+        let size = TermSize::new(10, usize::from(lines));
+        let listener = VividSceneListener::default();
+        let events = listener.0.clone();
+        (Term::new(Config::default(), &size, listener), events)
+    }
+
+    #[test]
+    fn scrolls_sharing_a_region_and_direction_are_delivered_once() {
+        let (mut term, events) = scene_term(3);
+        let mut parser: ansi::Processor = ansi::Processor::new();
+
+        // Two linefeeds reach the last line, the next three each scroll one line.
+        term.advance(&mut parser, b"\n\n\n\n\n");
+
+        assert_eq!(*events.lock().unwrap(), ["scroll(0..3, 3)"]);
+    }
+
+    #[test]
+    fn a_reversed_scroll_is_not_folded_into_the_pending_one() {
+        let (mut term, events) = scene_term(6);
+        let mut parser: ansi::Processor = ansi::Processor::new();
+
+        // An anchor scrolled out of a region stays gone, so scrolling back must be its own event.
+        term.advance(&mut parser, b"\x1b[2S\x1b[1T\x1b[1S");
+
+        assert_eq!(
+            *events.lock().unwrap(),
+            ["scroll(0..6, 2)", "scroll(0..6, -1)", "scroll(0..6, 1)"]
+        );
+    }
+
+    #[test]
+    fn scrolls_of_different_regions_are_not_folded_together() {
+        let (mut term, events) = scene_term(6);
+        let mut parser: ansi::Processor = ansi::Processor::new();
+
+        // `delete_lines` scrolls from the cursor, so each origin is a distinct region.
+        term.advance(&mut parser, b"\x1b[3;1H\x1b[1M\x1b[2;1H\x1b[1M");
+
+        assert_eq!(*events.lock().unwrap(), ["scroll(2..6, 1)", "scroll(1..6, 1)"]);
+    }
+
+    #[test]
+    fn a_pending_scroll_is_delivered_before_the_anchor_it_moves() {
+        let (mut term, events) = scene_term(3);
+        let mut parser: ansi::Processor = ansi::Processor::new();
+
+        // Drive the handler without `Term::advance`, so only the ordering rule can flush.
+        parser.advance(&mut term, b"\n\n\n\n\n");
+        term.vivid_marker("anchor".into());
+
+        assert_eq!(*events.lock().unwrap(), ["scroll(0..3, 3)", "marker(anchor)"]);
+    }
+
+    #[test]
+    fn a_pending_scroll_is_delivered_before_the_scene_is_cleared() {
+        let (mut term, events) = scene_term(3);
+        let mut parser: ansi::Processor = ansi::Processor::new();
+
+        parser.advance(&mut term, b"\n\n\n\n\n\x1b[2J");
+
+        assert_eq!(*events.lock().unwrap(), ["scroll(0..3, 3)", "clear"]);
+    }
+
+    #[test]
+    fn a_pending_scroll_is_delivered_before_the_screen_is_swapped() {
+        let (mut term, events) = scene_term(3);
+        let mut parser: ansi::Processor = ansi::Processor::new();
+
+        parser.advance(&mut term, b"\n\n\n\n\n\x1b[?1049h");
+
+        assert_eq!(*events.lock().unwrap(), ["scroll(0..3, 3)", "swap(true)"]);
     }
 
     #[test]
