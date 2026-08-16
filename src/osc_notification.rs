@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 use base64::Engine;
 use base64::engine::general_purpose::{STANDARD as BASE64, STANDARD_NO_PAD as BASE64_NO_PAD};
 use log::warn;
+use memchr::{memchr, memchr2};
 
 use crate::event::{EventProxy, EventType};
 use crate::terminal::event::Notify;
@@ -90,59 +91,57 @@ enum Sound {
 ///
 /// The raw capture is necessary because VTE intentionally exposes at most sixteen semicolon
 /// parameters, while notification bodies are arbitrary plain text and may contain more.
+///
+/// Both machines only ever disagree about a delimited body, so the confirming parser replays one
+/// completed body at a time rather than reading every byte that crosses the PTY.
 #[derive(Default)]
 pub(crate) struct OscNotificationParser {
     parser: vte::Parser<8193>,
     capture: OscCapture,
-    suppress_until_terminator: bool,
-    pending_dispatch: bool,
 }
 
 impl OscNotificationParser {
     pub(crate) fn advance(&mut self, bytes: &[u8]) -> Vec<OscNotification> {
         let mut notifications = Vec::new();
+        let mut rest = bytes;
 
-        for &byte in bytes {
-            let observation = self.capture.advance(byte);
-            match observation {
-                CaptureObservation::Overflow => {
-                    // Reset before VTE's fixed ArrayVec can fill and panic. Ignore everything until
-                    // the actual string terminator so an overlong suffix cannot become a new OSC.
-                    self.parser = vte::Parser::default();
-                    self.suppress_until_terminator = true;
-                    self.pending_dispatch = false;
-                    continue;
-                },
-                CaptureObservation::Complete(None) if self.suppress_until_terminator => {
-                    self.parser = vte::Parser::default();
-                    self.suppress_until_terminator = false;
-                    self.pending_dispatch = false;
-                    continue;
-                },
-                _ if self.suppress_until_terminator => continue,
-                _ => (),
+        while !rest.is_empty() {
+            // Ordinary output in the ground state, and the body of a sequence already known to be
+            // uninteresting, cannot do anything until a byte that matters arrives. Find that byte
+            // instead of stepping the state machine over every one in between.
+            if self.capture.is_ground() {
+                let Some(index) = memchr(0x1b, rest) else { break };
+                rest = &rest[index..];
+            } else if self.capture.is_skipping_body() {
+                let Some(index) = memchr2(0x07, 0x1b, rest) else { break };
+                rest = &rest[index..];
             }
 
-            let mut performer = OscDispatch::default();
-            self.parser.advance(&mut performer, std::slice::from_ref(&byte));
-            self.pending_dispatch |= performer.dispatched;
+            let Some((&byte, remainder)) = rest.split_first() else { break };
+            rest = remainder;
 
-            if matches!(&observation, CaptureObservation::Discard) {
-                self.pending_dispatch = false;
-            }
-
-            if let CaptureObservation::Complete(raw) = observation {
-                if self.pending_dispatch
-                    && let Some(raw) = raw
-                    && let Some(notification) = parse_osc(&raw)
-                {
-                    notifications.push(notification);
-                }
-                self.pending_dispatch = false;
+            if let CaptureObservation::Complete(Some(raw)) = self.capture.advance(byte)
+                && self.is_top_level_notification(&raw)
+                && let Some(notification) = parse_osc(&raw)
+            {
+                notifications.push(notification);
             }
         }
 
         notifications
+    }
+
+    /// Confirm a captured body is a real top-level OSC whose first parameter is 9 or 99.
+    ///
+    /// The body is bounded by [`MAX_OSC_BYTES`] and the parser is reset first, so one sequence can
+    /// never leak a dispatch into the decision made about the next one.
+    fn is_top_level_notification(&mut self, raw: &[u8]) -> bool {
+        self.parser = vte::Parser::default();
+        let mut performer = OscDispatch::default();
+        self.parser.advance(&mut performer, b"\x1b]");
+        self.parser.advance(&mut performer, raw);
+        self.parser.advance(&mut performer, b"\x07");
+        performer.dispatched
     }
 }
 
@@ -173,18 +172,30 @@ enum CaptureState {
     Osc {
         raw: Vec<u8>,
         escape: bool,
-        overflow: bool,
+        discarding: bool,
     },
 }
 
 enum CaptureObservation {
     None,
-    Discard,
-    Overflow,
+    /// A string sequence ended. `Some` carries the body of an OSC still worth inspecting.
     Complete(Option<Vec<u8>>),
 }
 
 impl OscCapture {
+    /// Whether no sequence is open, so only an escape can change this state machine.
+    fn is_ground(&self) -> bool {
+        matches!(self.state, CaptureState::Ground)
+    }
+
+    /// Whether a body that cannot become a notification is being scanned for its terminator.
+    ///
+    /// Only `BEL` and `ESC` matter in that state. A pending escape is excluded because the byte
+    /// after it decides whether the sequence ends.
+    fn is_skipping_body(&self) -> bool {
+        matches!(self.state, CaptureState::Osc { discarding: true, escape: false, .. })
+    }
+
     fn advance(&mut self, byte: u8) -> CaptureObservation {
         match &mut self.state {
             CaptureState::Ground => {
@@ -197,7 +208,7 @@ impl OscCapture {
                     self.state = CaptureState::Osc {
                         raw: Vec::with_capacity(128),
                         escape: false,
-                        overflow: false,
+                        discarding: false,
                     };
                 },
                 b'P' | b'_' | b'^' | b'X' => {
@@ -209,20 +220,20 @@ impl OscCapture {
             CaptureState::OtherString { escape } => {
                 if *escape && byte == b'\\' {
                     self.state = CaptureState::Ground;
-                    return CaptureObservation::Discard;
+                    return CaptureObservation::Complete(None);
                 } else {
                     *escape = byte == b'\x1b';
                 }
             },
-            CaptureState::Osc { raw, escape, overflow } => {
+            CaptureState::Osc { raw, escape, discarding } => {
                 let complete = byte == b'\x07' || (*escape && byte == b'\\');
                 if complete {
-                    let raw = (!*overflow).then(|| std::mem::take(raw));
+                    let raw = (!*discarding).then(|| std::mem::take(raw));
                     self.state = CaptureState::Ground;
                     return CaptureObservation::Complete(raw);
                 }
 
-                if *overflow {
+                if *discarding {
                     *escape = byte == b'\x1b';
                     return CaptureObservation::None;
                 }
@@ -235,16 +246,29 @@ impl OscCapture {
                     raw.push(byte);
                 }
 
-                if raw.len() > MAX_OSC_BYTES {
+                // Only OSC 9 and OSC 99 can become notifications. Stop retaining a body once it
+                // cannot be either, so an unrelated sequence is scanned for its terminator rather
+                // than buffered and re-parsed. Oversized bodies drop out the same way.
+                if raw.len() > MAX_OSC_BYTES || !may_be_notification(raw) {
                     raw.clear();
-                    *overflow = true;
-                    return CaptureObservation::Overflow;
+                    *discarding = true;
                 }
             },
         }
 
         CaptureObservation::None
     }
+}
+
+/// Whether a body captured so far can still turn out to be an OSC 9 or OSC 99 notification.
+///
+/// This mirrors the prefixes [`parse_osc`] accepts, so discarding a body that fails it cannot
+/// suppress a notification that would otherwise have been produced.
+fn may_be_notification(prefix: &[u8]) -> bool {
+    [b"9;".as_slice(), b"99;".as_slice()].iter().any(|candidate| {
+        let shared = prefix.len().min(candidate.len());
+        prefix[..shared] == candidate[..shared]
+    })
 }
 
 fn parse_osc(raw: &[u8]) -> Option<OscNotification> {
@@ -1262,6 +1286,59 @@ mod tests {
         assert!(
             matches!(parse(&bytes).as_slice(), [OscNotification::Legacy(value)] if value == "ok")
         );
+    }
+
+    #[test]
+    fn skips_ordinary_output_without_losing_a_following_sequence() {
+        let mut parser = OscNotificationParser::default();
+        assert!(parser.advance(b"plain text with no escape at all").is_empty());
+        // An escape can be the last byte of a read, so the open sequence must survive the split.
+        assert!(parser.advance(b"more text\x1b").is_empty());
+        assert!(matches!(
+            parser.advance(b"]9;split\x07").as_slice(),
+            [OscNotification::Legacy(value)] if value == "split"
+        ));
+    }
+
+    #[test]
+    fn an_unrelated_osc_is_discarded_and_resynchronizes() {
+        // OSC 6 can never be a notification, so its body is dropped instead of buffered. The
+        // sequence must still be scanned to its terminator so the next OSC is seen.
+        let mut bytes = b"\x1b]6;".to_vec();
+        bytes.extend(std::iter::repeat_n(b'x', MAX_OSC_BYTES * 2));
+        bytes.extend_from_slice(b"\x07\x1b]9;after\x07");
+        assert!(
+            matches!(parse(&bytes).as_slice(), [OscNotification::Legacy(value)] if value == "after")
+        );
+    }
+
+    #[test]
+    fn an_escape_inside_a_discarded_body_does_not_end_it_early() {
+        // While skipping an unwanted body only BEL and ESC are examined, so an ESC that is not a
+        // string terminator must not resynchronize the scan onto the wrong byte.
+        let bytes = b"\x1b]6;aaa\x1bXbbb;9;still-not-a-notification\x1b\\\x1b]9;after\x07";
+        assert!(
+            matches!(parse(bytes).as_slice(), [OscNotification::Legacy(value)] if value == "after")
+        );
+    }
+
+    #[test]
+    fn only_the_first_parameter_selects_a_notification_family() {
+        assert!(parse(b"\x1b]999;nope\x07").is_empty());
+        assert!(parse(b"\x1b]98;nope\x07").is_empty());
+        assert!(parse(b"\x1b];9;nope\x07").is_empty());
+        assert!(parse(b"\x1b]9\x07").is_empty());
+        assert!(matches!(
+            parse(b"\x1b]9;yes\x07").as_slice(),
+            [OscNotification::Legacy(value)] if value == "yes"
+        ));
+    }
+
+    #[test]
+    fn a_dispatch_does_not_leak_between_sequences() {
+        // A body VTE would not dispatch as OSC 9/99 must not inherit the preceding one's verdict.
+        let notifications = parse(b"\x1b]9;first\x07\x1b]6;second\x07");
+        assert!(matches!(notifications.as_slice(), [OscNotification::Legacy(v)] if v == "first"));
     }
 
     #[test]

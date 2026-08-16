@@ -41,6 +41,7 @@ image = { version = "0.25", default-features = false, features = [
 ] }
 libc = "0.2"
 log = { version = "0.4", features = ["std", "serde"] }
+memchr = "2.7"
 notify = "8.0.0"
 notify-rust = { version = "4.18.0", features = ["preview-macos-un"] }
 parking_lot = "0.12.0"

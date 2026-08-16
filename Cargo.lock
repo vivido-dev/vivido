@@ -3845,6 +3845,7 @@ dependencies = [
  "libc",
  "log",
  "mac-usernotifications",
+ "memchr",
  "miow",
  "notify",
  "notify-rust",
