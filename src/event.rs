@@ -1955,9 +1955,16 @@ impl Processor {
         let Some(window) = self.windows.get_mut(&window_id) else {
             return;
         };
-        let now = Instant::now();
         let waiters = std::mem::take(&mut window.automation.waiters);
-        let visible_text = window.text(None);
+        if waiters.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+
+        // Only `WaitKind::Text` reads the screen, and reading it locks the terminal against the
+        // PTY reader. Snapshot on first use, then share it so every text waiter in this pass
+        // matches against the same frame.
+        let mut visible_text: Option<String> = None;
         let screen_sequence = window.automation.screen_sequence;
         let frame_sequence = window.automation.frame_sequence;
         let last_screen_change = window.automation.last_screen_change;
@@ -2005,8 +2012,12 @@ impl Processor {
                 WaitKind::Text { pattern, regex, after_screen } => {
                     let eligible = after_screen.is_none_or(|after| screen_sequence > after);
                     if eligible
-                        && pattern_find(visible_text.as_bytes(), pattern.as_bytes(), *regex)
-                            .is_some()
+                        && pattern_find(
+                            visible_text.get_or_insert_with(|| window.text(None)).as_bytes(),
+                            pattern.as_bytes(),
+                            *regex,
+                        )
+                        .is_some()
                     {
                         Some(Ok(serde_json::json!({
                             "matched": true,
