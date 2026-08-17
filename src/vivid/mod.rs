@@ -6844,7 +6844,18 @@ mod tests {
         assert_eq!(neighbor_status.revision, neighbor_revision);
         assert_eq!(neighbor_status.active_slots.get(&scene::SLOT_RASTER), Some(&91));
         neighbor_channel.send_raster(0, 95, &[0x11, 0x22, 0x33, 0xff].repeat(4), false).unwrap();
-        let neighbor_track_status = neighbor.query_track(&neighbor_track).unwrap();
+        // Media and control use independently ordered connections, so a query issued immediately
+        // after the send can legitimately overtake this frame. Wait for presenter truth before
+        // using the accepted media ID to prove that the other owner's channel remained intact.
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let neighbor_track_status = loop {
+            let status = neighbor.query_track(&neighbor_track).unwrap();
+            if status.last_media_id == 95 {
+                break status;
+            }
+            assert!(Instant::now() < deadline, "neighbor frame was not accepted");
+            thread::sleep(Duration::from_millis(1));
+        };
         assert_eq!(neighbor_track_status.lifecycle, 1);
         assert_eq!(neighbor_track_status.last_media_id, 95);
 

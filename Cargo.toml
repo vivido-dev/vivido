@@ -64,7 +64,7 @@ vte = { version = "0.15.0", default-features = false, features = [
   "ansi",
   "serde",
 ] }
-vello = { version = "0.9.0", default-features = false, features = ["wgpu"] }
+vello = { version = "0.10", default-features = false, features = ["wgpu"] }
 winit = { version = "0.30.9", default-features = false, features = [
   "rwh_06",
   "serde",
@@ -75,7 +75,9 @@ pkg-config = "0.3"
 
 [dev-dependencies]
 accesskit = "0.24.1"
-accesskit_winit = { version = "0.33.2", default-features = false, features = ["rwh_06"] }
+accesskit_winit = { version = "0.33.2", default-features = false, features = [
+  "rwh_06",
+] }
 clap_complete = "4.2.3"
 vivid_sdk = { version = "1.5", path = "../vivid_sdk" }
 
@@ -197,4 +199,3 @@ incremental = false
 
 [profile.dev]
 debug = "line-tables-only"
-
