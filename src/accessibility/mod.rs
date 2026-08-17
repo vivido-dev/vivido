@@ -231,6 +231,7 @@ impl AccessibilitySnapshot {
         }
     }
 
+    #[cfg(target_os = "macos")]
     pub(crate) fn utf16_text(&self, range: Range<usize>) -> String {
         let start = utf16_to_byte(&self.text, range.start);
         let end = utf16_to_byte(&self.text, range.end);
@@ -340,6 +341,7 @@ fn visible_range(lines: &[AccessibleLine], top: Line, bottom: Line) -> Accessibl
     }
 }
 
+#[cfg(target_os = "macos")]
 fn utf16_to_byte(text: &str, target: usize) -> usize {
     let mut utf16 = 0usize;
     for (byte, character) in text.char_indices() {
