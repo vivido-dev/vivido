@@ -2811,7 +2811,7 @@ impl Processor {
             );
         }
 
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
         for window_context in self.windows.values_mut() {
             window_context.sync_accessibility();
         }

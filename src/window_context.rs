@@ -120,7 +120,7 @@ impl Notify for AutomationNotifier {
 /// Event context for one individual Vivido window.
 pub struct WindowContext {
     pub message_buffer: MessageBuffer,
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
     accessibility: Option<AccessibilityState>,
     pub display: Display,
     pub dirty: bool,
@@ -285,7 +285,7 @@ impl WindowContext {
         let terminal = Term::new(config.term_options(), &display.size_info, event_proxy.clone());
         let terminal = Arc::new(FairMutex::new(terminal));
 
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
         let accessibility = {
             let snapshot = AccessibilitySnapshot::new(
                 &terminal.lock(),
@@ -295,7 +295,7 @@ impl WindowContext {
             #[cfg(target_os = "macos")]
             let state = (!display.window.is_headless() && !display.window.is_embedded())
                 .then(|| AccessibilityState::new(&display.window, options.vivid_target, snapshot));
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "windows"))]
             let state = event_loop_handle.winit().and_then(|event_loop| {
                 display.window.winit_window().map(|window| {
                     AccessibilityState::new(event_loop, window, options.vivid_target, snapshot)
@@ -543,7 +543,7 @@ impl WindowContext {
         scheduler: &mut Scheduler,
         event: WinitEvent<Event>,
     ) {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
         if let WinitEvent::WindowEvent { event, .. } = &event
             && let (Some(accessibility), Some(window)) =
                 (&mut self.accessibility, self.display.window.winit_window())
@@ -1469,7 +1469,7 @@ impl WindowContext {
     }
 
     /// Publish a coalesced read-only accessibility snapshot.
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
     pub fn sync_accessibility(&mut self) {
         let Some(accessibility) = &mut self.accessibility else { return };
         let terminal = self.terminal.lock();

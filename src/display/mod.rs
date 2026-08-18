@@ -494,6 +494,9 @@ impl Display {
 
     /// Map the window after platform accessibility has been attached.
     pub fn map_window(&self, config: &UiConfig, tabbed: bool, no_activate: bool) {
+        #[cfg(windows)]
+        let _ = (config, tabbed);
+
         #[cfg(target_os = "macos")]
         if no_activate {
             self.window.order_front_without_focus();

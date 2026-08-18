@@ -10,17 +10,17 @@ use crate::terminal::selection::SelectionRange;
 use crate::terminal::term::Term;
 use crate::terminal::term::cell::{Flags, LineLength};
 
-#[cfg(target_os = "linux")]
-mod linux;
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+mod accesskit_backend;
 #[cfg(all(test, target_os = "macos"))]
 #[allow(dead_code)]
-#[path = "linux.rs"]
-mod linux_compile;
+#[path = "accesskit_backend.rs"]
+mod accesskit_backend_compile;
 #[cfg(target_os = "macos")]
 mod macos;
 
-#[cfg(target_os = "linux")]
-pub(crate) use linux::AccessibilityState;
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+pub(crate) use accesskit_backend::AccessibilityState;
 #[cfg(target_os = "macos")]
 pub(crate) use macos::AccessibilityState;
 
