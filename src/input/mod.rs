@@ -134,6 +134,12 @@ pub trait ActionContext<T: EventListener> {
     fn send_desktop_input(&self, _event: vivid_protocol::input::InputEvent) -> bool {
         false
     }
+    /// Route clipboard media to the live file-drop binding, returning whether it took the paste.
+    ///
+    /// The default is "no binding", which is every context that is not a live window.
+    fn paste_clipboard_media(&mut self) -> bool {
+        false
+    }
     fn mouse_mut(&mut self) -> &mut Mouse;
     fn mouse(&self) -> &Mouse;
     fn touch_purpose(&mut self) -> &mut TouchPurpose;
@@ -221,10 +227,12 @@ impl<T: EventListener> Execute<T> for Action {
             #[cfg(not(any(target_os = "macos", windows)))]
             Action::CopySelection => ctx.copy_selection(ClipboardType::Selection),
             Action::ClearSelection => ctx.clear_selection(),
-            Action::Paste => {
+            Action::Paste if !ctx.paste_clipboard_media() => {
                 let text = ctx.clipboard_mut().load(ClipboardType::Clipboard);
                 ctx.paste(&text, true);
             },
+            // Clipboard media took the paste and routed it to a file-drop binding.
+            Action::Paste => {},
             Action::PasteSelection => {
                 let text = ctx.clipboard_mut().load(ClipboardType::Selection);
                 ctx.paste(&text, true);

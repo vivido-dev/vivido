@@ -125,9 +125,11 @@ never in command arguments or logs.
 
 When the remote Vivi installation includes `vvreceive`, `vvssh` starts it quietly and waits only
 until it has recorded the login-shell PID identity before executing the shell. Dropping a local
-regular file on the confirmed remote-shell binding copies it over Vivid's authenticated bulk
-connection into that shell's current directory. If the helper is absent, or
-`--no-receive-drops` is passed, local filename paste remains unchanged.
+regular file copies it over Vivid's authenticated bulk connection into that shell's current
+directory; one drop transfers, with the hover label naming the destination beforehand. Pasting
+(`Ctrl+Shift+V`) does the same when the clipboard holds a copied file or an image, which is
+re-encoded as PNG under a `pasted-image-*` name. If the helper is absent, or `--no-receive-drops`
+is passed, local filename paste remains unchanged.
 
 The 1.1 wire protocol and the version-1 automation interface are intentionally not supported. See
 the [Vivido 1.1 to 1.5 migration guide](../docs/vivido-protocol-1.1-to-1.5-migration.md).

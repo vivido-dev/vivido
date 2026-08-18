@@ -24,7 +24,10 @@ activated through configured keys or the mouse and do not depend on a vi cursor.
 
 ## Graphics and media
 
-The Vivid side channel transfers, places, plays, and deletes raster and video media. Vivido
+The Vivid side channel transfers, places, plays, and deletes raster and video media. Over a
+`vvssh` session with the remote `vvreceive` helper, dropping a local file — or pasting one
+(`Control+Shift+V`) when the clipboard holds a copied file or an image — copies it into the remote
+shell's current directory in one gesture. Vivido
 decodes frames independently of the renderer, uploads visible sources through wgpu, and
 composites them between terminal backgrounds and glyphs. Other escape-sequence media commands are
 recognized as extension points but are not rendered yet.

@@ -725,6 +725,38 @@ impl VividService {
     ) -> file_drop::LocalDropDisposition {
         let hit = self.file_drop_surface_at(x, y, size, display_offset);
         let (disposition, offer) = lock(&self.shared.file_drops).offer_local_file(path, hit);
+        self.post_offer(disposition, offer)
+    }
+
+    /// Route one local regular file named by the clipboard to the target-wide binding.
+    ///
+    /// A paste has no pointer, so it never carries a surface hit and always resolves through the
+    /// same target-wide fallback a drop uses when it lands outside every bound surface.
+    pub(crate) fn handle_pasted_file(
+        &self,
+        path: &std::path::Path,
+    ) -> file_drop::LocalDropDisposition {
+        let (disposition, offer) = lock(&self.shared.file_drops).offer_local_file(path, None);
+        self.post_offer(disposition, offer)
+    }
+
+    /// Route retained clipboard bytes to the target-wide binding without ever touching the disk.
+    pub(crate) fn handle_pasted_bytes(
+        &self,
+        name: String,
+        bytes: Vec<u8>,
+    ) -> file_drop::LocalDropDisposition {
+        let (disposition, offer) =
+            lock(&self.shared.file_drops).offer_local_bytes(name, bytes, None);
+        self.post_offer(disposition, offer)
+    }
+
+    /// Deliver an admitted offer to its owning session, keeping the manager's disposition.
+    fn post_offer(
+        &self,
+        disposition: file_drop::LocalDropDisposition,
+        offer: Option<(SessionIdentity, vivid_protocol::file_drop::FileDropOffer)>,
+    ) -> file_drop::LocalDropDisposition {
         let Some((owner, offer)) = offer else {
             return disposition;
         };

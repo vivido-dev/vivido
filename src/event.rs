@@ -3164,6 +3164,66 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
         self.vivid_service.send_input(event)
     }
 
+    fn paste_clipboard_media(&mut self) -> bool {
+        use crate::clipboard::ClipboardMedia;
+        use crate::vivid::file_drop::LocalDropDisposition;
+
+        let Some(media) = self.clipboard.load_media() else {
+            return false;
+        };
+        self.message_buffer.remove_target(FILE_DROP_MESSAGE_TARGET);
+        *self.dirty = true;
+        match media {
+            ClipboardMedia::Files(paths) => {
+                for path in &paths {
+                    match self.vivid_service.handle_pasted_file(path) {
+                        LocalDropDisposition::NoBinding => {
+                            self.paste(&crate::vivid::file_drop::local_paste_text(path), true);
+                        },
+                        LocalDropDisposition::Offered => {
+                            replace_file_drop_message(
+                                self.message_buffer,
+                                "Copying file to the remote receiver".into(),
+                                MessageType::Warning,
+                            );
+                        },
+                        LocalDropDisposition::Rejected(reason) => {
+                            replace_file_drop_message(
+                                self.message_buffer,
+                                reason.into(),
+                                MessageType::Error,
+                            );
+                        },
+                    }
+                }
+                true
+            },
+            ClipboardMedia::Image { name, png } => {
+                match self.vivid_service.handle_pasted_bytes(name, png) {
+                    // Without a binding there is nothing to copy the pixels to, so the paste falls
+                    // back to whatever text the clipboard also carries.
+                    LocalDropDisposition::NoBinding => false,
+                    LocalDropDisposition::Offered => {
+                        replace_file_drop_message(
+                            self.message_buffer,
+                            "Copying the pasted image to the remote receiver".into(),
+                            MessageType::Warning,
+                        );
+                        true
+                    },
+                    LocalDropDisposition::Rejected(reason) => {
+                        replace_file_drop_message(
+                            self.message_buffer,
+                            reason.into(),
+                            MessageType::Error,
+                        );
+                        true
+                    },
+                }
+            },
+        }
+    }
+
     #[inline]
     fn write_to_pty<B: Into<Cow<'static, [u8]>>>(&self, val: B) {
         if let Err(error) = self.notifier.notify(val) {
@@ -4198,7 +4258,7 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                     },
                     WindowEvent::DroppedFile(path) => {
                         // A drop supersedes the hover overlay. Leaving it at the front of the
-                        // queue hides consent, transfer, and rejection state behind stale text.
+                        // queue hides transfer and rejection state behind stale text.
                         self.ctx.message_buffer.remove_target(FILE_DROP_MESSAGE_TARGET);
                         *self.ctx.dirty = true;
                         let size = self.ctx.size_info();
@@ -4213,15 +4273,6 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                             crate::vivid::file_drop::LocalDropDisposition::NoBinding => {
                                 self.ctx
                                     .paste(&crate::vivid::file_drop::local_paste_text(&path), true);
-                            },
-                            crate::vivid::file_drop::LocalDropDisposition::ConsentRequired(
-                                label,
-                            ) => {
-                                replace_file_drop_message(
-                                    self.ctx.message_buffer,
-                                    format!("{label}: drop the file again to confirm"),
-                                    MessageType::Warning,
-                                );
                             },
                             crate::vivid::file_drop::LocalDropDisposition::Offered => {
                                 replace_file_drop_message(

@@ -39,18 +39,19 @@ struct BindingEntry {
     binding: FileDropBinding,
     grant: FileDropGrant,
     activation: u64,
-    consent: ConsentState,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ConsentState {
-    Unconfirmed,
-    ConfirmOnNextDrop,
-    Confirmed,
+/// Where a retained drop source reads its bytes from.
+///
+/// A dropped file keeps an open handle so a later rename or unlink cannot retarget the transfer.
+/// A pasted image has no path at all, so its bytes are retained in memory for the same reason.
+enum SourceData {
+    File(File),
+    Memory(Arc<[u8]>),
 }
 
 struct FileSource {
-    file: File,
+    data: SourceData,
     length: u64,
     suggested_name: String,
     cancelled: AtomicBool,
@@ -68,6 +69,18 @@ impl std::fmt::Debug for FileSource {
 }
 
 impl FileSource {
+    /// Open an independent forward-only reader positioned at offset zero.
+    fn open_stream(&self) -> io::Result<Box<dyn Read + Send>> {
+        match &self.data {
+            SourceData::File(file) => {
+                let mut file = file.try_clone()?;
+                file.seek(SeekFrom::Start(0))?;
+                Ok(Box::new(file))
+            },
+            SourceData::Memory(bytes) => Ok(Box::new(io::Cursor::new(bytes.clone()))),
+        }
+    }
+
     fn install_shutdown(&self, shutdown: ReadShutdown) {
         if self.cancelled.load(Ordering::Acquire) {
             shutdown.stop();
@@ -129,7 +142,6 @@ struct TransferEntry {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum LocalDropDisposition {
     NoBinding,
-    ConsentRequired(&'static str),
     Offered,
     Rejected(&'static str),
 }
@@ -174,9 +186,6 @@ impl FileDropManager {
 
         if binding.disabled() {
             self.remove_binding(key);
-            for entry in self.bindings.values_mut() {
-                entry.consent = ConsentState::Unconfirmed;
-            }
             let reply = FileDropGrant {
                 producer_epoch: binding.producer_epoch,
                 grant_generation: FileDropGrantGeneration::ZERO,
@@ -223,9 +232,6 @@ impl FileDropManager {
             reason: (!allow) as u64,
         };
         if allow {
-            for entry in self.bindings.values_mut() {
-                entry.consent = ConsentState::Unconfirmed;
-            }
             self.next_activation = self
                 .next_activation
                 .checked_add(1)
@@ -236,7 +242,6 @@ impl FileDropManager {
                     binding: binding.clone(),
                     grant: reply,
                     activation: self.next_activation,
-                    consent: ConsentState::Unconfirmed,
                 },
             );
         }
@@ -271,20 +276,48 @@ impl FileDropManager {
                 return (LocalDropDisposition::Rejected("Only regular files can be copied"), None);
             },
         };
+        self.offer_source(key, source)
+    }
+
+    /// Route retained clipboard bytes to the effective binding under a presenter-chosen name.
+    pub(crate) fn offer_local_bytes(
+        &mut self,
+        name: String,
+        bytes: Vec<u8>,
+        hit: Option<(SurfaceIdentity, SurfaceGeneration)>,
+    ) -> (LocalDropDisposition, Option<(SessionIdentity, FileDropOffer)>) {
+        self.expire();
+        let Some(key) = self.effective_binding_key(hit) else {
+            return (LocalDropDisposition::NoBinding, None);
+        };
+        if file_drop::validate_suggested_name(&name).is_err() {
+            return (LocalDropDisposition::Rejected("The pasted name is invalid"), None);
+        }
+        let Ok(length) = u64::try_from(bytes.len()) else {
+            return (LocalDropDisposition::Rejected("The pasted data is too large"), None);
+        };
+        let source = Arc::new(FileSource {
+            data: SourceData::Memory(bytes.into()),
+            length,
+            suggested_name: name,
+            cancelled: AtomicBool::new(false),
+            shutdown: Mutex::new(None),
+        });
+        self.offer_source(key, source)
+    }
+
+    /// Admit one retained source against the binding's ceilings and record the pending offer.
+    fn offer_source(
+        &mut self,
+        key: BindingKey,
+        source: Arc<FileSource>,
+    ) -> (LocalDropDisposition, Option<(SessionIdentity, FileDropOffer)>) {
         let entry = self.bindings.get_mut(&key).expect("effective binding is live");
         if source.length > entry.grant.maximum_file_bytes {
             return (
                 LocalDropDisposition::Rejected("The dropped file exceeds the remote limit"),
                 None,
             );
-        }
-        match entry.consent {
-            ConsentState::Unconfirmed => {
-                entry.consent = ConsentState::ConfirmOnNextDrop;
-                return (LocalDropDisposition::ConsentRequired(self.hover_label_for(key)), None);
-            },
-            ConsentState::ConfirmOnNextDrop => entry.consent = ConsentState::Confirmed,
-            ConsentState::Confirmed => {},
         }
         let pending = self
             .offers
@@ -796,14 +829,6 @@ impl FileDropManager {
             .map(|(key, _)| *key)
     }
 
-    fn hover_label_for(&self, key: BindingKey) -> &'static str {
-        match self.bindings[&key].binding.destination {
-            Some(file_drop::FileDropDestination::ShellCwd) => "Copy to remote shell",
-            Some(file_drop::FileDropDestination::DesktopFolder) => "Copy to remote desktop",
-            None => "Copy file",
-        }
-    }
-
     fn expire(&mut self) {
         let now = Instant::now();
         let terminal_expired = self
@@ -964,8 +989,7 @@ fn stream_source(
     source: &FileSource,
 ) -> io::Result<FileResult> {
     source.ensure_active()?;
-    let mut file = source.file.try_clone()?;
-    file.seek(SeekFrom::Start(0))?;
+    let mut file = source.open_stream()?;
     let chunk_size =
         usize::try_from(open.maximum_record_body - file_drop::FILE_DATA_PREFIX_SIZE as u32)
             .unwrap_or(64 * 1024)
@@ -1167,7 +1191,7 @@ fn open_source(path: &Path) -> io::Result<FileSource> {
         .unwrap_or("dropped-file")
         .to_owned();
     Ok(FileSource {
-        file,
+        data: SourceData::File(file),
         length: metadata.len(),
         suggested_name,
         cancelled: AtomicBool::new(false),
@@ -1262,6 +1286,101 @@ mod tests {
         let path = Path::new("folder/report.txt");
         assert_eq!(manager.offer_local_file(path, None), (LocalDropDisposition::NoBinding, None));
         assert_eq!(local_paste_text(path), "folder/report.txt ");
+    }
+
+    fn persisted_temp_file(bytes: &[u8]) -> std::path::PathBuf {
+        use std::io::Write;
+
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(bytes).unwrap();
+        file.keep().unwrap().1
+    }
+
+    #[test]
+    fn a_single_drop_offers_immediately() {
+        let owner = session(1);
+        let mut manager = FileDropManager::default();
+        manager
+            .set_binding(owner, binding(4, 0, Some(FileDropDestination::ShellCwd)), true)
+            .unwrap();
+
+        let path = persisted_temp_file(b"report");
+        let (disposition, offer) = manager.offer_local_file(&path, None);
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(disposition, LocalDropDisposition::Offered);
+        let (receiver, offer) = offer.unwrap();
+        assert_eq!(receiver, owner);
+        assert_eq!(offer.declared_length, 6);
+    }
+
+    #[test]
+    fn a_second_owner_binding_does_not_disturb_the_first() {
+        let first = session(1);
+        let second = session(2);
+        let mut manager = FileDropManager::default();
+        manager
+            .set_binding(first, binding(4, 0, Some(FileDropDestination::ShellCwd)), true)
+            .unwrap();
+        // The same local IDs under a second owner reactivate the target-wide binding without
+        // disturbing drops onto the first.
+        manager
+            .set_binding(second, binding(4, 0, Some(FileDropDestination::ShellCwd)), true)
+            .unwrap();
+
+        let path = persisted_temp_file(b"report");
+        let (disposition, _) = manager.offer_local_file(&path, None);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(disposition, LocalDropDisposition::Offered);
+
+        // Tearing the newer owner down leaves the first intact for another single-drop offer.
+        manager.remove_session(second);
+        let path = persisted_temp_file(b"again");
+        let (disposition, offer) = manager.offer_local_file(&path, None);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(disposition, LocalDropDisposition::Offered);
+        let (receiver, _) = offer.unwrap();
+        assert_eq!(receiver, first);
+    }
+
+    #[test]
+    fn pasted_bytes_stream_identically_to_a_file_source() {
+        let bytes = b"clipboard payload";
+        let path = persisted_temp_file(bytes);
+        let file = open_source(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let memory = FileSource {
+            data: SourceData::Memory(bytes.to_vec().into()),
+            length: bytes.len() as u64,
+            suggested_name: "pasted-image.png".into(),
+            cancelled: AtomicBool::new(false),
+            shutdown: Mutex::new(None),
+        };
+        assert_eq!(file.length, memory.length);
+
+        let mut from_file = Vec::new();
+        file.open_stream().unwrap().read_to_end(&mut from_file).unwrap();
+        let mut from_memory = Vec::new();
+        memory.open_stream().unwrap().read_to_end(&mut from_memory).unwrap();
+        assert_eq!(from_file, from_memory);
+        assert_eq!(from_memory, bytes);
+    }
+
+    #[test]
+    fn an_invalid_pasted_name_is_rejected() {
+        let owner = session(1);
+        let mut manager = FileDropManager::default();
+        manager
+            .set_binding(owner, binding(4, 0, Some(FileDropDestination::ShellCwd)), true)
+            .unwrap();
+        assert_eq!(
+            manager.offer_local_bytes("../escape".into(), b"x".to_vec(), None),
+            (LocalDropDisposition::Rejected("The pasted name is invalid"), None)
+        );
+        assert_eq!(
+            manager.offer_local_bytes("pasted-image.png".into(), b"x".to_vec(), None).0,
+            LocalDropDisposition::Offered
+        );
     }
 
     #[test]
