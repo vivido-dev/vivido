@@ -66,6 +66,7 @@ impl MediaClipboard {
 
 /// The boxed-error result copypasta's `ClipboardProvider` uses; its alias is private to that
 /// crate, so implementations spell the concrete type.
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "android", target_os = "emscripten")),))]
 type ProviderResult<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync + 'static>>;
 
 /// A copypasta-compatible text provider backed by arboard.
