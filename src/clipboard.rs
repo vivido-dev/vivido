@@ -64,6 +64,54 @@ impl MediaClipboard {
     }
 }
 
+/// The boxed-error result copypasta's `ClipboardProvider` uses; its alias is private to that
+/// crate, so implementations spell the concrete type.
+type ProviderResult<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync + 'static>>;
+
+/// A copypasta-compatible text provider backed by arboard.
+///
+/// copypasta is not built with an X11 backend, so under X11 arboard carries text as well as
+/// images. `primary` addresses the X11 primary selection used by middle-click paste.
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "android", target_os = "emscripten")),))]
+struct ArboardText {
+    clipboard: arboard::Clipboard,
+    primary: bool,
+}
+
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "android", target_os = "emscripten")),))]
+impl ArboardText {
+    fn clipboard(clipboard: arboard::Clipboard) -> Self {
+        Self { clipboard, primary: false }
+    }
+
+    fn primary(clipboard: arboard::Clipboard) -> Self {
+        Self { clipboard, primary: true }
+    }
+}
+
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "android", target_os = "emscripten")),))]
+impl ClipboardProvider for ArboardText {
+    fn set_contents(&mut self, text: String) -> ProviderResult<()> {
+        use arboard::SetExtLinux;
+
+        let mut operation = self.clipboard.set();
+        if self.primary {
+            operation = operation.clipboard(arboard::LinuxClipboardKind::Primary);
+        }
+        operation.text(text).map_err(|err| Box::new(err) as _)
+    }
+
+    fn get_contents(&mut self) -> ProviderResult<String> {
+        use arboard::GetExtLinux;
+
+        let mut operation = self.clipboard.get();
+        if self.primary {
+            operation = operation.clipboard(arboard::LinuxClipboardKind::Primary);
+        }
+        operation.text().map_err(|err| Box::new(err) as _)
+    }
+}
+
 impl Clipboard {
     pub unsafe fn new(display: RawDisplayHandle) -> Self {
         match display {
@@ -78,7 +126,39 @@ impl Clipboard {
                     media: MediaClipboard::Unopened,
                 }
             },
+            // copypasta has no X11 backend, so arboard carries text and the primary selection.
+            #[cfg(all(
+                unix,
+                not(any(target_os = "macos", target_os = "android", target_os = "emscripten")),
+            ))]
+            RawDisplayHandle::Xlib(_) | RawDisplayHandle::Xcb(_) => Self::new_arboard_text(),
             _ => Self::default(),
+        }
+    }
+
+    /// Open the text and primary-selection clipboards through arboard.
+    ///
+    /// A session without any usable clipboard server keeps the nop behavior: no text, and media
+    /// permanently unavailable.
+    #[cfg(all(
+        unix,
+        not(any(target_os = "macos", target_os = "android", target_os = "emscripten")),
+    ))]
+    fn new_arboard_text() -> Self {
+        let Ok(clipboard) = arboard::Clipboard::new() else {
+            warn!("Unable to open the X11 clipboard; text clipboard stays disabled");
+            return Self::new_nop();
+        };
+        let selection = arboard::Clipboard::new().map(ArboardText::primary).map_err(|err| {
+            warn!("Unable to open the X11 primary selection: {err}");
+            err
+        });
+        Self {
+            clipboard: Box::new(ArboardText::clipboard(clipboard)),
+            selection: selection
+                .ok()
+                .map(|adapter| Box::new(adapter) as Box<dyn ClipboardProvider>),
+            media: MediaClipboard::Unopened,
         }
     }
 
@@ -219,5 +299,22 @@ mod tests {
     #[test]
     fn a_pasted_image_name_is_accepted_by_the_wire_validator() {
         vivid_protocol::file_drop::validate_suggested_name(&pasted_image_name()).unwrap();
+    }
+
+    /// Runs only when opted in (`VIVIDO_CLIPBOARD_TEST=1`) because it round-trips through the
+    /// real session clipboard and would otherwise clobber the user's copy buffer mid-build.
+    #[cfg(all(
+        unix,
+        not(any(target_os = "macos", target_os = "android", target_os = "emscripten")),
+    ))]
+    #[test]
+    fn an_arboard_text_provider_round_trips_when_opted_in() {
+        if std::env::var_os("VIVIDO_CLIPBOARD_TEST").is_none() {
+            return;
+        }
+        let Ok(clipboard) = arboard::Clipboard::new() else { return };
+        let mut provider = ArboardText::clipboard(clipboard);
+        provider.set_contents("vivido".into()).unwrap();
+        assert_eq!(provider.get_contents().unwrap(), "vivido");
     }
 }

@@ -180,8 +180,10 @@ wgpu = { version = "29.0", default-features = false, features = [
 embed-resource = "3.0.2"
 
 [features]
-default = ["serde", "wayland"]
+default = ["serde", "wayland", "x11"]
 serde = []
+# Winit picks its backend at runtime: Wayland when WAYLAND_DISPLAY is set, X11 otherwise.
+x11 = ["winit/x11"]
 wayland = [
   "arboard/wayland-data-control",
   "copypasta/wayland",

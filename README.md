@@ -2,7 +2,7 @@
 
 Vivido is a fast, cross-platform terminal emulator. It uses Vello and
 wgpu for GPU rendering, targeting Metal on macOS, DirectX 12 on Windows, and Vulkan on Linux.
-Linux uses Wayland exclusively.
+On Linux, winit prefers Wayland and falls back to X11 when no Wayland session exists.
 
 ## Vivid Protocol
 
@@ -138,8 +138,9 @@ the [Vivido 1.1 to 1.5 migration guide](../docs/vivido-protocol-1.1-to-1.5-migra
 
 Vivido is derived from Alacritty, but differs significantly from Alacritty:
 
-- Linux has no X11, Xlib, XCB, or GLX backend. The `wayland` feature is the only Unix desktop
-  backend and is enabled by default.
+- Rendering has no Xlib, XCB, or GLX surface path; wgpu's Vulkan backend owns every GPU surface.
+  Winit still carries both Unix backends, Wayland preferred and X11 (`x11` feature, on by default)
+  as a fallback; on X11 the text and primary-selection clipboards run through arboard.
 - Vi mode, vi search, vi cursor actions, and vi-specific configuration are removed.
 - In mouse selection, semantic, whole-line, double/triple-click, and right-click expansion are
   removed.
