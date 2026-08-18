@@ -931,6 +931,7 @@ impl<T> Term<T> {
     }
 
     /// Whether `column` is currently configured as a horizontal tab stop.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[inline]
     pub(crate) fn is_tab_stop(&self, column: Column) -> bool {
         self.tabs[column]
