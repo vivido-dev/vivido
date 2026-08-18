@@ -754,7 +754,13 @@ impl SharedScene {
     pub fn clear_terminal(&self) -> Vec<AnchorIdentity> {
         let mut state = self.lock();
         state.invalidate_topology();
-        let removed = state.anchors.keys().copied().collect::<Vec<_>>();
+        let removed = state
+            .anchors
+            .iter()
+            .filter_map(|(&identity, anchor)| {
+                (anchor.alternate == state.alternate_screen).then_some(identity)
+            })
+            .collect::<Vec<_>>();
         remove_anchors(&mut state, &removed);
         self.0.changed.notify_all();
         removed
@@ -2773,6 +2779,16 @@ mod tests {
         assert_eq!(scene.snapshot().items.len(), 1);
         assert!(scene.scroll_anchors(0, 24, 2, 0).is_empty());
         assert_eq!(scene.snapshot().items[0].y, 3_i64 << 32);
+
+        assert!(scene.set_alternate_screen(true).is_empty());
+        assert!(scene.snapshot().items.is_empty());
+        assert!(
+            scene.clear_terminal().is_empty(),
+            "clearing the alternate screen must preserve a primary-screen anchor"
+        );
+        assert!(scene.set_alternate_screen(false).is_empty());
+        assert_eq!(scene.snapshot().items.len(), 1);
+
         assert_eq!(scene.clear_terminal(), vec![anchor_identity]);
         assert!(scene.snapshot().items.is_empty());
     }
