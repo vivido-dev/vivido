@@ -136,6 +136,10 @@ wgpu = { version = "29.0", default-features = false, features = [
 ] }
 
 [target.'cfg(windows)'.dependencies]
+accesskit = "0.24.1"
+accesskit_winit = { version = "0.33.2", default-features = false, features = [
+  "rwh_06",
+] }
 dirs = "6.0.0"
 miow = "0.6.0"
 piper = "0.2.1"
