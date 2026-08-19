@@ -36,7 +36,7 @@ use winit::event::{Event as WinitEvent, Modifiers, WindowEvent};
 use winit::event_loop::ActiveEventLoop;
 use winit::window::WindowId;
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 use crate::accessibility::{AccessibilitySnapshot, AccessibilityState};
 use crate::terminal::event::Event as TerminalEvent;
 #[cfg(any(unix, windows))]
@@ -359,7 +359,7 @@ impl WindowContext {
         Ok(WindowContext {
             preserve_title,
             terminal,
-            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            #[cfg(any(target_os = "macos", target_os = "linux", windows))]
             accessibility,
             display,
             #[cfg(not(windows))]

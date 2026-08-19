@@ -381,7 +381,7 @@ impl Window {
         })
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     pub(crate) fn winit_window(&self) -> Option<&WinitWindow> {
         self.backend.winit().map(AsRef::as_ref)
     }
