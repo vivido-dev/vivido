@@ -29,7 +29,8 @@ fontconfig, FreeType, CMake, and pkg-config. For example, on Debian or Ubuntu:
 
 ```sh
 sudo apt install cmake g++ pkg-config libfontconfig1-dev libfreetype6-dev \
-  libwayland-dev libxkbcommon-dev
+  libwayland-dev libxkbcommon-dev libasound2-dev \
+  libavcodec-dev libavdevice-dev libavformat-dev libavutil-dev libswscale-dev libswresample-dev
 cargo build --release
 ```
 
