@@ -1,4 +1,4 @@
-//! Bounded OSC 9/99 parsing and desktop-notification lifecycle management.
+//! Bounded OSC 7/9/99 parsing and desktop-notification lifecycle management.
 
 use std::collections::{HashMap, VecDeque};
 #[cfg(target_os = "macos")]
@@ -33,6 +33,22 @@ const RATE_REFILL_PER_SECOND: f64 = 1.;
 pub enum OscNotification {
     Legacy(String),
     Kitty(KittyNotification),
+}
+
+/// One complete, bounded OSC sequence `vte` does not dispatch itself.
+#[derive(Clone, Debug)]
+pub(crate) enum OscMessage {
+    Notification(OscNotification),
+    WorkingDirectory(OscWorkingDirectory),
+}
+
+/// A parsed OSC 7 `file://host/path` report; the consumer validates the host.
+///
+/// The body is bounded by [`MAX_OSC_BYTES`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct OscWorkingDirectory {
+    pub(crate) host: String,
+    pub(crate) path: String,
 }
 
 #[derive(Clone, Debug)]
@@ -101,8 +117,8 @@ pub(crate) struct OscNotificationParser {
 }
 
 impl OscNotificationParser {
-    pub(crate) fn advance(&mut self, bytes: &[u8]) -> Vec<OscNotification> {
-        let mut notifications = Vec::new();
+    pub(crate) fn advance(&mut self, bytes: &[u8]) -> Vec<OscMessage> {
+        let mut messages = Vec::new();
         let mut rest = bytes;
 
         while !rest.is_empty() {
@@ -122,16 +138,16 @@ impl OscNotificationParser {
 
             if let CaptureObservation::Complete(Some(raw)) = self.capture.advance(byte)
                 && self.is_top_level_notification(&raw)
-                && let Some(notification) = parse_osc(&raw)
+                && let Some(message) = parse_osc(&raw)
             {
-                notifications.push(notification);
+                messages.push(message);
             }
         }
 
-        notifications
+        messages
     }
 
-    /// Confirm a captured body is a real top-level OSC whose first parameter is 9 or 99.
+    /// Confirm a captured body is a real top-level OSC whose first parameter is 7, 9, or 99.
     ///
     /// The body is bounded by [`MAX_OSC_BYTES`] and the parser is reset first, so one sequence can
     /// never leak a dispatch into the decision made about the next one.
@@ -152,7 +168,7 @@ struct OscDispatch {
 
 impl Perform for OscDispatch {
     fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
-        self.dispatched = params.first().is_some_and(|param| matches!(*param, b"9" | b"99"));
+        self.dispatched = params.first().is_some_and(|param| matches!(*param, b"7" | b"9" | b"99"));
     }
 }
 
@@ -246,10 +262,10 @@ impl OscCapture {
                     raw.push(byte);
                 }
 
-                // Only OSC 9 and OSC 99 can become notifications. Stop retaining a body once it
-                // cannot be either, so an unrelated sequence is scanned for its terminator rather
+                // Only OSC 7, 9, and 99 are captured. Stop retaining a body once it cannot be
+                // one of them, so an unrelated sequence is scanned for its terminator rather
                 // than buffered and re-parsed. Oversized bodies drop out the same way.
-                if raw.len() > MAX_OSC_BYTES || !may_be_notification(raw) {
+                if raw.len() > MAX_OSC_BYTES || !may_be_captured(raw) {
                     raw.clear();
                     *discarding = true;
                 }
@@ -260,25 +276,57 @@ impl OscCapture {
     }
 }
 
-/// Whether a body captured so far can still turn out to be an OSC 9 or OSC 99 notification.
+/// Whether a body captured so far can still turn out to be a captured OSC 7, 9, or 99 message.
 ///
 /// This mirrors the prefixes [`parse_osc`] accepts, so discarding a body that fails it cannot
-/// suppress a notification that would otherwise have been produced.
-fn may_be_notification(prefix: &[u8]) -> bool {
-    [b"9;".as_slice(), b"99;".as_slice()].iter().any(|candidate| {
+/// suppress a message that would otherwise have been produced.
+fn may_be_captured(prefix: &[u8]) -> bool {
+    [b"7;".as_slice(), b"9;".as_slice(), b"99;".as_slice()].iter().any(|candidate| {
         let shared = prefix.len().min(candidate.len());
         prefix[..shared] == candidate[..shared]
     })
 }
 
-fn parse_osc(raw: &[u8]) -> Option<OscNotification> {
+fn parse_osc(raw: &[u8]) -> Option<OscMessage> {
+    if let Some(url) = raw.strip_prefix(b"7;") {
+        return parse_working_directory(url).map(OscMessage::WorkingDirectory);
+    }
+
     if let Some(message) = raw.strip_prefix(b"9;") {
-        return parse_legacy(message).map(OscNotification::Legacy);
+        return parse_legacy(message).map(OscNotification::Legacy).map(OscMessage::Notification);
     }
 
     let rest = raw.strip_prefix(b"99;")?;
     let separator = rest.iter().position(|&byte| byte == b';')?;
-    parse_kitty(&rest[..separator], &rest[separator + 1..]).map(OscNotification::Kitty)
+    parse_kitty(&rest[..separator], &rest[separator + 1..])
+        .map(OscNotification::Kitty)
+        .map(OscMessage::Notification)
+}
+
+/// Parse an OSC 7 `file://host/path` working-directory report.
+///
+/// Only the `file` scheme is accepted. The host ends at the first `/` after the prefix — an
+/// empty one for `file:///path` — and a report without any `/` names no directory. The path is
+/// percent-decoded and must decode to control-free UTF-8.
+fn parse_working_directory(url: &[u8]) -> Option<OscWorkingDirectory> {
+    if !is_escape_safe(url) {
+        return None;
+    }
+
+    let rest = url.strip_prefix(b"file://")?;
+    let separator = rest.iter().position(|&byte| byte == b'/')?;
+    let (host, encoded_path) = (&rest[..separator], &rest[separator..]);
+
+    let host = std::str::from_utf8(host).ok()?.to_owned();
+    let path = percent_encoding::percent_decode_str(std::str::from_utf8(encoded_path).ok()?)
+        .decode_utf8()
+        .ok()?
+        .to_string();
+    if path.chars().any(is_control) {
+        return None;
+    }
+
+    Some(OscWorkingDirectory { host, path })
 }
 
 fn parse_legacy(message: &[u8]) -> Option<String> {
@@ -1176,6 +1224,16 @@ mod tests {
     use crate::terminal::event_loop::EventLoopSendError;
 
     fn parse(bytes: &[u8]) -> Vec<OscNotification> {
+        parse_messages(bytes)
+            .into_iter()
+            .filter_map(|message| match message {
+                OscMessage::Notification(notification) => Some(notification),
+                OscMessage::WorkingDirectory(_) => None,
+            })
+            .collect()
+    }
+
+    fn parse_messages(bytes: &[u8]) -> Vec<OscMessage> {
         OscNotificationParser::default().advance(bytes)
     }
 
@@ -1296,13 +1354,13 @@ mod tests {
         assert!(parser.advance(b"more text\x1b").is_empty());
         assert!(matches!(
             parser.advance(b"]9;split\x07").as_slice(),
-            [OscNotification::Legacy(value)] if value == "split"
+            [OscMessage::Notification(OscNotification::Legacy(value))] if value == "split"
         ));
     }
 
     #[test]
     fn an_unrelated_osc_is_discarded_and_resynchronizes() {
-        // OSC 6 can never be a notification, so its body is dropped instead of buffered. The
+        // OSC 6 can never be captured, so its body is dropped instead of buffered. The
         // sequence must still be scanned to its terminator so the next OSC is seen.
         let mut bytes = b"\x1b]6;".to_vec();
         bytes.extend(std::iter::repeat_n(b'x', MAX_OSC_BYTES * 2));
@@ -1323,14 +1381,77 @@ mod tests {
     }
 
     #[test]
-    fn only_the_first_parameter_selects_a_notification_family() {
+    fn only_the_first_parameter_selects_a_message_family() {
         assert!(parse(b"\x1b]999;nope\x07").is_empty());
         assert!(parse(b"\x1b]98;nope\x07").is_empty());
         assert!(parse(b"\x1b];9;nope\x07").is_empty());
         assert!(parse(b"\x1b]9\x07").is_empty());
+        assert!(parse_messages(b"\x1b]77;file:///nope\x07").is_empty());
+        assert!(parse_messages(b"\x1b]7\x07").is_empty());
+        assert!(parse_messages(b"\x1b]7;file\x07").is_empty());
         assert!(matches!(
             parse(b"\x1b]9;yes\x07").as_slice(),
             [OscNotification::Legacy(value)] if value == "yes"
+        ));
+    }
+
+    #[test]
+    fn parses_osc7_working_directory() {
+        assert!(matches!(
+            parse_messages(b"\x1b]7;file://host/tmp\x07").as_slice(),
+            [OscMessage::WorkingDirectory(OscWorkingDirectory { host, path })]
+                if host == "host" && path == "/tmp"
+        ));
+        assert!(matches!(
+            parse_messages(b"\x1b]7;file:///home/user\x1b\\").as_slice(),
+            [OscMessage::WorkingDirectory(OscWorkingDirectory { host, path })]
+                if host.is_empty() && path == "/home/user"
+        ));
+    }
+
+    #[test]
+    fn decodes_percent_encoded_osc7_paths() {
+        assert!(matches!(
+            parse_messages(b"\x1b]7;file://host/tmp/my%20dir\x07").as_slice(),
+            [OscMessage::WorkingDirectory(OscWorkingDirectory { path, .. })] if path == "/tmp/my dir"
+        ));
+    }
+
+    #[test]
+    fn rejects_malformed_osc7_reports() {
+        // A scheme other than `file` names no local directory.
+        assert!(parse_messages(b"\x1b]7;ssh://host/tmp\x07").is_empty());
+        // An authority without a path names no directory.
+        assert!(parse_messages(b"\x1b]7;file://host\x07").is_empty());
+        // Invalid UTF-8, raw or percent-encoded, is rejected.
+        assert!(parse_messages(b"\x1b]7;file:///tmp/\xff\x07").is_empty());
+        assert!(parse_messages(b"\x1b]7;file:///tmp/%ff\x07").is_empty());
+        // Control characters never reach a decoded path.
+        assert!(parse_messages(b"\x1b]7;file:///tmp/a\tb\x07").is_empty());
+    }
+
+    #[test]
+    fn osc7_survives_read_boundaries() {
+        let mut parser = OscNotificationParser::default();
+        let messages = b"\x1b]7;file:///tmp\x07"
+            .iter()
+            .flat_map(|byte| parser.advance(std::slice::from_ref(byte)))
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            messages.as_slice(),
+            [OscMessage::WorkingDirectory(OscWorkingDirectory { path, .. })] if path == "/tmp"
+        ));
+    }
+
+    #[test]
+    fn unrelated_osc7_and_notifications_keep_their_order() {
+        let messages = parse_messages(b"\x1b]6;noise\x07\x1b]7;file:///tmp\x07\x1b]9;after\x07");
+        assert!(matches!(
+            messages.as_slice(),
+            [
+                OscMessage::WorkingDirectory(OscWorkingDirectory { path, .. }),
+                OscMessage::Notification(OscNotification::Legacy(value)),
+            ] if path == "/tmp" && value == "after"
         ));
     }
 

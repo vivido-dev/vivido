@@ -680,9 +680,12 @@ impl Display {
         let total_lines = terminal.grid().total_lines();
         let metrics = self.text_system.metrics();
 
+        let app_cursor_icon = terminal.mouse_cursor_icon();
+        let mouse_reporting = terminal.mode().intersects(TermMode::MOUSE_MODE);
+
         drop(terminal);
 
-        self.validate_hint_highlights(display_offset);
+        self.validate_hint_highlights(display_offset, app_cursor_icon, mouse_reporting);
 
         let requires_full_damage = self.visual_bell.intensity() != 0.
             || self.hint_state.active()
@@ -932,11 +935,12 @@ impl Display {
             self.window.set_mouse_cursor(CursorIcon::Pointer);
         } else if self.highlighted_hint.is_some() {
             self.hint_mouse_point = None;
-            if term.mode().intersects(TermMode::MOUSE_MODE) {
-                self.window.set_mouse_cursor(CursorIcon::Default);
-            } else {
-                self.window.set_mouse_cursor(CursorIcon::Text);
-            }
+            self.window.set_mouse_cursor(resolve_mouse_cursor(
+                None,
+                false,
+                term.mouse_cursor_icon(),
+                term.mode().intersects(TermMode::MOUSE_MODE),
+            ));
         }
 
         let mouse_highlight_dirty = self.highlighted_hint != highlighted_hint;
@@ -1385,7 +1389,12 @@ impl Display {
         }
     }
 
-    fn validate_hint_highlights(&mut self, display_offset: usize) {
+    fn validate_hint_highlights(
+        &mut self,
+        display_offset: usize,
+        app_icon: Option<CursorIcon>,
+        mouse_reporting: bool,
+    ) {
         let frame = self.damage_tracker.frame();
         let hints = [(&mut self.highlighted_hint, &mut self.highlighted_hint_age, true)];
 
@@ -1410,7 +1419,12 @@ impl Display {
 
             if frame.intersects(start, end) {
                 if reset_mouse {
-                    self.window.set_mouse_cursor(CursorIcon::Default);
+                    self.window.set_mouse_cursor(resolve_mouse_cursor(
+                        None,
+                        false,
+                        app_icon,
+                        mouse_reporting,
+                    ));
                 }
                 frame.mark_fully_damaged();
                 *hint = None;
@@ -1501,6 +1515,31 @@ impl Display {
         let timer_id = TimerId::new(Topic::Frame, window_id);
         let event = Event::new(EventType::Frame, window_id);
         scheduler.schedule(event, swap_timeout, false, timer_id);
+    }
+}
+
+/// Resolve the visible mouse cursor from interaction state.
+///
+/// Precedence: message bar and highlighted hints are Vivido UI affordances; then the shape the
+/// application requested with OSC 22; then the arrow while the application reports mouse
+/// events; otherwise the text caret. Callers without modifier state pass mouse reporting
+/// without the shift exemption, matching the historical behavior of the display-side restores.
+pub(crate) fn resolve_mouse_cursor(
+    ui_icon: Option<CursorIcon>,
+    hint_highlighted: bool,
+    app_icon: Option<CursorIcon>,
+    mouse_reporting: bool,
+) -> CursorIcon {
+    if let Some(icon) = ui_icon {
+        icon
+    } else if hint_highlighted {
+        CursorIcon::Pointer
+    } else if let Some(icon) = app_icon {
+        icon
+    } else if mouse_reporting {
+        CursorIcon::Default
+    } else {
+        CursorIcon::Text
     }
 }
 
@@ -1722,8 +1761,8 @@ fn terminal_font_variant(flags: Flags) -> (bool, bool) {
 mod tests {
     use super::{
         INITIAL_RENDERER_RETRY, MAX_RENDERER_RETRY, TerminalTextSpan, next_renderer_retry_delay,
-        rescale_font_size, scale_padding, scaled_size_info, scene_glyph_from_layout,
-        terminal_shaping_run, terminal_text_spans, text_cell_width,
+        rescale_font_size, resolve_mouse_cursor, scale_padding, scaled_size_info,
+        scene_glyph_from_layout, terminal_shaping_run, terminal_text_spans, text_cell_width,
     };
     use crate::config::font::FontSize;
     use crate::display::color::Rgb;
@@ -1732,6 +1771,7 @@ mod tests {
     use crate::terminal::index::{Column, Point};
     use crate::terminal::term::cell::Flags;
     use winit::dpi::PhysicalSize;
+    use winit::window::CursorIcon;
 
     fn renderable_cell(line: usize, column: usize, character: char) -> RenderableCell {
         RenderableCell {
@@ -1744,6 +1784,31 @@ mod tests {
             flags: Flags::empty(),
             extra: None,
         }
+    }
+
+    #[test]
+    fn mouse_cursor_resolution_precedence() {
+        // Each layer outranks the one below it.
+        assert_eq!(
+            resolve_mouse_cursor(
+                Some(CursorIcon::Crosshair),
+                true,
+                Some(CursorIcon::Progress),
+                true
+            ),
+            CursorIcon::Crosshair
+        );
+        assert_eq!(
+            resolve_mouse_cursor(None, true, Some(CursorIcon::Progress), true),
+            CursorIcon::Pointer
+        );
+        // An application shape outranks the mouse-reporting arrow.
+        assert_eq!(
+            resolve_mouse_cursor(None, false, Some(CursorIcon::Progress), true),
+            CursorIcon::Progress
+        );
+        assert_eq!(resolve_mouse_cursor(None, false, None, true), CursorIcon::Default);
+        assert_eq!(resolve_mouse_cursor(None, false, None, false), CursorIcon::Text);
     }
 
     #[test]

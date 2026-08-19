@@ -689,8 +689,18 @@ impl WindowContext {
         self.display.window.title()
     }
 
-    /// Working directory of the foreground process, when the platform can report it.
+    /// Working directory of the local shell: its OSC 7 report when available, otherwise the
+    /// foreground process's.
     pub fn current_directory(&self) -> Option<PathBuf> {
+        self.terminal
+            .lock()
+            .working_directory()
+            .map(PathBuf::from)
+            .or_else(|| self.probed_working_directory())
+    }
+
+    /// Working directory of the foreground process, when the platform can report it.
+    fn probed_working_directory(&self) -> Option<PathBuf> {
         #[cfg(not(windows))]
         {
             crate::daemon::foreground_process_path(self.master_fd, self.shell_pid).ok()
@@ -1533,8 +1543,13 @@ impl WindowContext {
         let executable = foreground_pgid.and_then(foreground_executable_basename);
         #[cfg(windows)]
         let executable = None::<String>;
-        let current_directory =
-            self.current_directory().map(|path| path.to_string_lossy().into_owned());
+        // The terminal lock is already held here and not reentrant, so this resolves the same
+        // preference as [`Self::current_directory`] inline instead of calling it.
+        let current_directory = terminal
+            .working_directory()
+            .map(PathBuf::from)
+            .or_else(|| self.probed_working_directory())
+            .map(|path| path.to_string_lossy().into_owned());
         #[cfg(unix)]
         let mut attributes = std::mem::MaybeUninit::<libc::termios>::uninit();
         #[cfg(unix)]

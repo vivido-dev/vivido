@@ -215,7 +215,9 @@ physical modifiers pressed.
   foreground process group, optional executable basename/current directory, echo state, exit
   status, global event sequence, and effective automation limits. It never returns process
   arguments, environment values, Vivid root/resume secrets, channel authenticators, or derived
-  capabilities.
+  capabilities. `current_directory` prefers the shell's OSC 7 report when its host is this
+  machine and falls back to the foreground-process probe; over Windows OSC 7 is the only
+  source.
 - `diagnose` captures window, renderer, presenter, track, flow, connection-health, and bounded
   recent-trace metadata in one event-loop turn. It does not wait for rendering or transport;
   asynchronous metrics carry an age.
@@ -348,10 +350,12 @@ Event frames have this shape:
 {"version":2,"subscription_id":7,"event_sequence":123,"window_id":42,"event":{"type":"screen_changed","data":{}}}
 ```
 
-Kinds are `screen_changed`, `output`, `frame_presented`, `title_changed`, `focus_changed`, `resized`,
-`moved`, `bell`, `child_exit`, `window_created`, `window_closed`, and `overflow`. Output data is split into
+Kinds are `screen_changed`, `output`, `frame_presented`, `title_changed`, `directory_changed`,
+`focus_changed`, `resized`, `moved`, `bell`, `child_exit`, `window_created`, `window_closed`, and
+`overflow`. Output data is split into
 at most 64 KiB chunks with start/end offsets and base64 bytes. Screen-change data contains current
-row replacements. The process replay ring is bounded by both 4 MiB and 4,096 events.
+row replacements. `directory_changed` fires when the local shell reports a new working directory
+through OSC 7 and carries `{"directory":"/path"}`. The process replay ring is bounded by both 4 MiB and 4,096 events.
 
 `since_event` atomically replays retained matching events before live delivery. If history is gone,
 the first event is `overflow` with the gap and current window sequences so the client can recover

@@ -2600,6 +2600,16 @@ impl Processor {
                 }
             },
             #[cfg(any(unix, windows))]
+            (EventType::Terminal(TerminalEvent::WorkingDirectory(directory)), Some(window_id)) => {
+                self.automation.emit(
+                    self.windows.get(window_id).map(WindowContext::ipc_window_id),
+                    "directory_changed",
+                    serde_json::json!({"directory": directory}),
+                );
+                // The terminal itself holds the reported directory; there is no window state
+                // to update.
+            },
+            #[cfg(any(unix, windows))]
             (EventType::Terminal(TerminalEvent::Bell), Some(window_id)) => {
                 self.automation.emit(
                     self.windows.get(window_id).map(WindowContext::ipc_window_id),
@@ -3391,8 +3401,11 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
     #[cfg(not(windows))]
     fn create_new_window(&mut self, #[cfg(target_os = "macos")] tabbing_id: Option<String>) {
         let mut options = WindowOptions::default();
-        options.terminal_options.working_directory =
-            foreground_process_path(self.master_fd, self.shell_pid).ok();
+        options.terminal_options.working_directory = self
+            .terminal
+            .working_directory()
+            .map(PathBuf::from)
+            .or_else(|| foreground_process_path(self.master_fd, self.shell_pid).ok());
 
         #[cfg(target_os = "macos")]
         {
@@ -3404,9 +3417,11 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
 
     #[cfg(windows)]
     fn create_new_window(&mut self) {
-        let _ = self
-            .event_proxy
-            .send_event(Event::new(EventType::CreateWindow(WindowOptions::default()), None));
+        let mut options = WindowOptions::default();
+        options.terminal_options.working_directory =
+            self.terminal.working_directory().map(PathBuf::from);
+
+        let _ = self.event_proxy.send_event(Event::new(EventType::CreateWindow(options), None));
     }
 
     fn spawn_daemon<I, S>(&self, program: &str, args: I)
@@ -4082,6 +4097,9 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                             self.ctx.display.window.set_title(window_config.identity.title.clone());
                         }
                     },
+                    // The reported directory lives on the terminal; the IPC processor already
+                    // emitted `directory_changed` before dropping the event.
+                    TerminalEvent::WorkingDirectory(_) => (),
                     TerminalEvent::Bell => {
                         // Set window urgency hint when window is not focused.
                         let focused = self.ctx.terminal.is_focused;

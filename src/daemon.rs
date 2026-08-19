@@ -13,6 +13,7 @@ use std::os::windows::process::CommandExt;
 use std::process::{Command, Stdio};
 #[cfg(target_os = "openbsd")]
 use std::ptr;
+use std::sync::OnceLock;
 
 #[rustfmt::skip]
 #[cfg(not(windows))]
@@ -163,5 +164,61 @@ pub fn foreground_process_path(
     } else {
         let foreground_path = unsafe { CStr::from_ptr(buf.as_ptr().cast()) }.to_str()?;
         Ok(PathBuf::from(foreground_path))
+    }
+}
+
+/// Whether an OSC 7 working-directory report's host refers to this machine.
+pub(crate) fn is_local_host(host: &str) -> bool {
+    host_matches(host, local_hostname())
+}
+
+/// Empty hosts and `localhost` always match; any other host must equal the local name.
+fn host_matches(host: &str, local: &str) -> bool {
+    host.is_empty() || host.eq_ignore_ascii_case("localhost") || host.eq_ignore_ascii_case(local)
+}
+
+/// This machine's hostname, cached for the process lifetime; empty when unavailable.
+fn local_hostname() -> &'static str {
+    static HOSTNAME: OnceLock<String> = OnceLock::new();
+    HOSTNAME.get_or_init(probe_hostname)
+}
+
+#[cfg(not(windows))]
+fn probe_hostname() -> String {
+    let mut buffer = [0u8; 256];
+    let result = unsafe { libc::gethostname(buffer.as_mut_ptr().cast(), buffer.len()) };
+    if result != 0 {
+        return String::new();
+    }
+    // The buffer is not guaranteed to be NUL-terminated when the name is truncated.
+    let end = buffer.iter().position(|&byte| byte == 0).unwrap_or(buffer.len());
+    String::from_utf8_lossy(&buffer[..end]).into_owned()
+}
+
+#[cfg(windows)]
+fn probe_hostname() -> String {
+    std::env::var("COMPUTERNAME").unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::host_matches;
+
+    #[test]
+    fn local_host_forms_match() {
+        assert!(host_matches("", "machine"));
+        assert!(host_matches("localhost", "machine"));
+        assert!(host_matches("LOCALHOST", "machine"));
+        assert!(host_matches("machine", "machine"));
+        assert!(host_matches("MACHINE", "machine"));
+    }
+
+    #[test]
+    fn foreign_hosts_do_not_match() {
+        assert!(!host_matches("remote", "machine"));
+        assert!(!host_matches("machine-2", "machine"));
+        // With no local hostname only the implicit-local forms match.
+        assert!(!host_matches("remote", ""));
+        assert!(host_matches("", ""));
     }
 }

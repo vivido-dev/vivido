@@ -13,6 +13,7 @@ use bitflags::bitflags;
 use log::{debug, trace};
 use unicode_width::UnicodeWidthChar;
 
+use crate::osc_notification::OscWorkingDirectory;
 use crate::terminal::event::{Event, EventListener};
 use crate::terminal::graphics::GraphicsCommand;
 use crate::terminal::grid::{Dimensions, Grid, GridIterator, Scroll};
@@ -25,6 +26,8 @@ use crate::terminal::vte::ansi::{
     KeyboardModesApplyBehavior, NamedColor, NamedMode, NamedPrivateMode, PrivateMode, Rgb,
     StandardCharset,
 };
+// The same `cursor-icon` type winit re-exports, keeping this module winit-free.
+use crate::terminal::vte::ansi::cursor_icon::CursorIcon;
 
 pub mod cell;
 pub mod color;
@@ -425,6 +428,9 @@ pub struct Term<T> {
     /// Current style of the cursor.
     cursor_style: Option<CursorStyle>,
 
+    /// Pointer shape requested with OSC 22; `None` until the application sets one.
+    mouse_cursor_icon: Option<CursorIcon>,
+
     /// Proxy for sending events to the event loop.
     event_proxy: T,
 
@@ -434,6 +440,9 @@ pub struct Term<T> {
     /// Stack of saved window titles. When a title is popped from this stack, the `title` for the
     /// term is set.
     title_stack: Vec<Option<String>>,
+
+    /// Working directory reported with OSC 7 by the local shell.
+    working_directory: Option<String>,
 
     /// The stack for the keyboard modes.
     keyboard_mode_stack: Vec<KeyboardModes>,
@@ -567,8 +576,10 @@ impl<T> Term<T> {
             keyboard_mode_stack: Default::default(),
             active_charset: Default::default(),
             cursor_style: Default::default(),
+            mouse_cursor_icon: Default::default(),
             colors: color::Colors::default(),
             title_stack: Default::default(),
+            working_directory: Default::default(),
             is_focused: Default::default(),
             selection: Default::default(),
             title: Default::default(),
@@ -1186,6 +1197,26 @@ impl<T> Term<T> {
         self.event_proxy.send_event(Event::DesktopNotification(notification));
     }
 
+    /// Apply an OSC 7 working-directory report from the shell.
+    ///
+    /// Reports naming another host — a shell behind `vvssh` or plain `ssh` — are ignored so a
+    /// remote path never becomes a local spawn directory. The event fires only when the directory
+    /// changes, since shells re-emit OSC 7 at every prompt.
+    pub(crate) fn working_directory_report(&mut self, report: OscWorkingDirectory)
+    where
+        T: EventListener,
+    {
+        if !crate::daemon::is_local_host(&report.host) {
+            trace!("Ignoring OSC 7 for foreign host {:?}", report.host);
+            return;
+        }
+
+        if self.working_directory.as_deref() != Some(report.path.as_str()) {
+            self.working_directory = Some(report.path.clone());
+            self.event_proxy.send_event(Event::WorkingDirectory(report.path));
+        }
+    }
+
     /// Forward a decoded graphics/media command to the UI renderer.
     ///
     /// Escape-sequence parsers can call this after translating Sixel, Kitty, or custom protocol
@@ -1246,6 +1277,18 @@ impl<T> Term<T> {
     #[inline]
     pub fn cursor_style(&self) -> CursorStyle {
         self.cursor_style.unwrap_or(self.config.default_cursor_style)
+    }
+
+    /// Pointer shape requested with OSC 22, if the application set one.
+    #[inline]
+    pub fn mouse_cursor_icon(&self) -> Option<CursorIcon> {
+        self.mouse_cursor_icon
+    }
+
+    /// Working directory reported with OSC 7 by the local shell.
+    #[inline]
+    pub fn working_directory(&self) -> Option<&str> {
+        self.working_directory.as_deref()
     }
 
     pub fn colors(&self) -> &Colors {
@@ -2154,6 +2197,8 @@ impl<T: EventListener> Handler for Term<T> {
         self.tabs = TabStops::new(self.columns());
         self.title_stack = Vec::new();
         self.title = None;
+        self.working_directory = None;
+        self.mouse_cursor_icon = None;
         self.selection = None;
         self.keyboard_mode_stack = Default::default();
         self.inactive_keyboard_mode_stack = Default::default();
@@ -2161,6 +2206,9 @@ impl<T: EventListener> Handler for Term<T> {
         self.mode = TermMode::default();
 
         self.event_proxy.send_event(Event::CursorBlinkingChange);
+        // Resetting the modes above includes the mouse-reporting modes, so the pointer shape
+        // must be re-resolved alongside the cursor style.
+        self.event_proxy.send_event(Event::MouseCursorDirty);
         self.mark_fully_damaged();
     }
 
@@ -2545,6 +2593,17 @@ impl<T: EventListener> Handler for Term<T> {
         };
 
         self.event_proxy.send_event(title_event);
+    }
+
+    /// OSC 22: pointer shape requested by the application.
+    #[inline]
+    fn set_mouse_cursor_icon(&mut self, icon: CursorIcon) {
+        trace!("Setting mouse cursor icon {icon:?}");
+
+        self.mouse_cursor_icon = Some(icon);
+
+        // The pointer shape depends on this state, so the UI must re-resolve it.
+        self.event_proxy.send_event(Event::MouseCursorDirty);
     }
 
     #[inline]
@@ -4053,6 +4112,62 @@ mod tests {
         let size = TermSize::new(10, 10);
         term.resize(size);
         assert!(term.damage.full);
+    }
+
+    #[derive(Clone, Default)]
+    struct DirectoryListener(Arc<Mutex<Vec<String>>>);
+
+    impl EventListener for DirectoryListener {
+        fn send_event(&self, event: Event) {
+            let Event::WorkingDirectory(directory) = event else { return };
+            self.0.lock().unwrap().push(directory);
+        }
+    }
+
+    fn directory_report(host: &str, path: &str) -> OscWorkingDirectory {
+        OscWorkingDirectory { host: host.to_owned(), path: path.to_owned() }
+    }
+
+    #[test]
+    fn osc7_working_directory() {
+        let size = TermSize::new(7, 17);
+        let listener = DirectoryListener::default();
+        let directories = listener.0.clone();
+        let mut term = Term::new(Config::default(), &size, listener);
+
+        // Any local host form is accepted.
+        term.working_directory_report(directory_report("", "/tmp"));
+        term.working_directory_report(directory_report("LoCaLhOsT", "/var"));
+        // Shells re-emit OSC 7 at every prompt; only a change notifies.
+        term.working_directory_report(directory_report("", "/var"));
+        // A report naming another host — a shell behind vvssh — never applies.
+        term.working_directory_report(directory_report("-foreign-", "/remote"));
+
+        assert_eq!(term.working_directory(), Some("/var"));
+        assert_eq!(*directories.lock().unwrap(), vec!["/tmp".to_owned(), "/var".to_owned()]);
+
+        // The report is forgotten when the terminal state is reset.
+        term.reset_state();
+        assert_eq!(term.working_directory(), None);
+    }
+
+    #[test]
+    fn osc22_mouse_cursor_icon() {
+        let size = TermSize::new(7, 17);
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+        let mut parser: ansi::Processor = ansi::Processor::new();
+
+        assert_eq!(term.mouse_cursor_icon(), None);
+
+        parser.advance(&mut term, b"\x1b]22;progress\x07");
+        assert_eq!(term.mouse_cursor_icon(), Some(CursorIcon::Progress));
+
+        parser.advance(&mut term, b"\x1b]22;text\x07");
+        assert_eq!(term.mouse_cursor_icon(), Some(CursorIcon::Text));
+
+        // The requested shape is forgotten when the terminal state is reset.
+        term.reset_state();
+        assert_eq!(term.mouse_cursor_icon(), None);
     }
 
     #[test]

@@ -18,7 +18,7 @@ use polling::{Event as PollingEvent, Events, PollMode, Poller};
 
 #[cfg(any(unix, windows))]
 use crate::automation::Transcript;
-use crate::osc_notification::OscNotificationParser;
+use crate::osc_notification::{OscMessage, OscNotificationParser};
 use crate::terminal::event::{self, Event, EventListener, WindowSize};
 use crate::terminal::sync::FairMutex;
 use crate::terminal::term::Term;
@@ -480,8 +480,15 @@ impl State {
         bytes: &[u8],
         #[cfg(any(unix, windows))] transcript: &Arc<Mutex<Transcript>>,
     ) -> usize {
-        for notification in self.osc_notifications.advance(bytes) {
-            terminal.desktop_notification(notification);
+        for message in self.osc_notifications.advance(bytes) {
+            match message {
+                OscMessage::Notification(notification) => {
+                    terminal.desktop_notification(notification);
+                },
+                OscMessage::WorkingDirectory(report) => {
+                    terminal.working_directory_report(report);
+                },
+            }
         }
 
         let mut processed = 0;

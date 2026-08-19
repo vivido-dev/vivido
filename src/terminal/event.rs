@@ -24,6 +24,9 @@ pub enum Event {
     /// Reset to the default window title.
     ResetTitle,
 
+    /// Local working directory reported with OSC 7.
+    WorkingDirectory(String),
+
     /// Request to store a text string in the clipboard.
     ClipboardStore(ClipboardType, String),
 
@@ -100,6 +103,7 @@ impl Debug for Event {
             Event::ColorRequest(index, _) => write!(f, "ColorRequest({index})"),
             Event::PtyWrite(text) => write!(f, "PtyWrite({text})"),
             Event::Title(title) => write!(f, "Title({title})"),
+            Event::WorkingDirectory(path) => write!(f, "WorkingDirectory({path})"),
             Event::CursorBlinkingChange => write!(f, "CursorBlinkingChange"),
             Event::MouseCursorDirty => write!(f, "MouseCursorDirty"),
             Event::ResetTitle => write!(f, "ResetTitle"),

@@ -891,13 +891,12 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
             let new_icon = match current_lines.cmp(&new_lines) {
                 Ordering::Less => CursorIcon::Default,
                 Ordering::Equal => CursorIcon::Pointer,
-                Ordering::Greater => {
-                    if self.ctx.mouse_mode() {
-                        CursorIcon::Default
-                    } else {
-                        CursorIcon::Text
-                    }
-                },
+                Ordering::Greater => crate::display::resolve_mouse_cursor(
+                    None,
+                    false,
+                    self.ctx.terminal().mouse_cursor_icon(),
+                    self.ctx.mouse_mode(),
+                ),
             };
 
             self.ctx.window().set_mouse_cursor(new_icon);
@@ -982,15 +981,12 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
         // Function to check if mouse is on top of a hint.
         let hint_highlighted = |hint: &HintMatch| hint.should_highlight(point, hyperlink.as_ref());
 
-        if let Some(mouse_state) = self.message_bar_cursor_state() {
-            mouse_state
-        } else if self.ctx.display().highlighted_hint.as_ref().is_some_and(hint_highlighted) {
-            CursorIcon::Pointer
-        } else if !self.modifiers_state().shift_key() && self.ctx.mouse_mode() {
-            CursorIcon::Default
-        } else {
-            CursorIcon::Text
-        }
+        crate::display::resolve_mouse_cursor(
+            self.message_bar_cursor_state(),
+            self.ctx.display().highlighted_hint.as_ref().is_some_and(hint_highlighted),
+            self.ctx.terminal().mouse_cursor_icon(),
+            !self.modifiers_state().shift_key() && self.ctx.mouse_mode(),
+        )
     }
 
     /// Handle automatic scrolling when selecting above/below the window.
