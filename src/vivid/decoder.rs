@@ -396,7 +396,7 @@ fn check_ffmpeg(context: &str, result: c_int) -> io::Result<()> {
 }
 
 fn ffmpeg_error(context: &str, code: c_int) -> io::Error {
-    let mut buffer = [0_i8; 256];
+    let mut buffer: [c_char; 256] = [0; 256];
     let description = if unsafe { av_strerror(code, buffer.as_mut_ptr(), buffer.len()) } == 0 {
         unsafe { CStr::from_ptr(buffer.as_ptr()) }.to_string_lossy().into_owned()
     } else {

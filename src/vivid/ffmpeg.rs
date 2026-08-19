@@ -300,10 +300,18 @@ fn probe_packet() -> Option<()> {
 impl Abi {
     /// The always-stable head of an `AVFrame`.
     ///
+    /// Returned by value. A `&AVFrameHead` would take its lifetime from `&self`, and [`abi`] hands
+    /// out `&'static Abi`, so the reference would outlive the frame as far as the borrow checker
+    /// could tell. Every field here is `Copy`, and callers only read, so returning the head requires
+    /// no allocation or ownership transfer. The plane pointers inside it stay valid exactly as long
+    /// as the frame does — copying the head does not copy the pixel data.
+    ///
     /// # Safety
     /// `frame` must be a live `AVFrame` allocated by FFmpeg.
-    pub unsafe fn frame(&self, frame: *const c_void) -> &AVFrameHead {
-        unsafe { &*(frame as *const AVFrameHead) }
+    pub unsafe fn frame(&self, frame: *const c_void) -> AVFrameHead {
+        // SAFETY: the caller guarantees a live `AVFrame`, and this head covers only fields that
+        // have never moved, so it needs no layout selection.
+        unsafe { (frame as *const AVFrameHead).read() }
     }
 
     /// An `AVFrame`'s presentation timestamp, read at the offset this library actually uses.
@@ -338,48 +346,68 @@ impl Abi {
             head.extradata = extradata;
             head.extradata_size = extradata_size;
         }
-        let tail = unsafe { self.parameters_tail(parameters) };
-        *tail.bit_rate = 0;
-        if let Some(profile) = description.profile {
-            *tail.profile = profile;
-        }
-        if let Some(level) = description.level {
-            *tail.level = level;
-        }
-        if let Some((width, height)) = description.dimensions {
-            *tail.width = width;
-            *tail.height = height;
-        }
-        if let Some(format) = description.format {
-            *tail.format = format;
+        // SAFETY: same live allocation, still borrowed only for the duration of this call.
+        unsafe {
+            self.with_parameters_tail(parameters, |tail| {
+                *tail.bit_rate = 0;
+                if let Some(profile) = description.profile {
+                    *tail.profile = profile;
+                }
+                if let Some(level) = description.level {
+                    *tail.level = level;
+                }
+                if let Some((width, height)) = description.dimensions {
+                    *tail.width = width;
+                    *tail.height = height;
+                }
+                if let Some(format) = description.format {
+                    *tail.format = format;
+                }
+            });
         }
     }
 
+    /// Run `write` against the layout-selected tail of `parameters`.
+    ///
+    /// The tail is handed to a closure rather than returned. A returned `Tail` would take its
+    /// lifetime from `&self`, and [`abi`] hands out `&'static Abi`, so the borrow checker would
+    /// happily let one outlive the allocation it points into — the reference would say nothing
+    /// about how long FFmpeg keeps that memory. Passing it to a closure keeps the borrow inside a
+    /// scope the caller cannot escape, which is the only span the pointer is known to be live for.
+    ///
     /// # Safety
-    /// `parameters` must be a live `AVCodecParameters` allocated by FFmpeg.
-    unsafe fn parameters_tail(&self, parameters: *mut c_void) -> Tail<'_> {
+    /// `parameters` must be a live `AVCodecParameters` allocated by FFmpeg, and must stay live for
+    /// the duration of the call.
+    unsafe fn with_parameters_tail<R>(
+        &self,
+        parameters: *mut c_void,
+        write: impl FnOnce(Tail<'_>) -> R,
+    ) -> R {
         match self.parameters {
             ParametersLayout::Legacy => {
+                // SAFETY: the caller guarantees a live allocation, and the probe established that
+                // this library uses the legacy layout.
                 let fields = unsafe { &mut *(parameters as *mut AVCodecParametersLegacy) };
-                Tail {
+                write(Tail {
                     format: &mut fields.format,
                     bit_rate: &mut fields.bit_rate,
                     profile: &mut fields.profile,
                     level: &mut fields.level,
                     width: &mut fields.width,
                     height: &mut fields.height,
-                }
+                })
             },
             ParametersLayout::Current => {
+                // SAFETY: as above, for the layout carrying `coded_side_data`.
                 let fields = unsafe { &mut *(parameters as *mut AVCodecParametersCurrent) };
-                Tail {
+                write(Tail {
                     format: &mut fields.format,
                     bit_rate: &mut fields.bit_rate,
                     profile: &mut fields.profile,
                     level: &mut fields.level,
                     width: &mut fields.width,
                     height: &mut fields.height,
-                }
+                })
             },
         }
     }
@@ -506,10 +534,13 @@ mod tests {
                 },
             );
         }
-        let tail = unsafe { abi.parameters_tail(parameters) };
-        assert_eq!((*tail.width, *tail.height), (1920, 1080));
-        assert_eq!((*tail.profile, *tail.level), (77, 31));
-        assert_eq!(*tail.bit_rate, 0);
+        unsafe {
+            abi.with_parameters_tail(parameters, |tail| {
+                assert_eq!((*tail.width, *tail.height), (1920, 1080));
+                assert_eq!((*tail.profile, *tail.level), (77, 31));
+                assert_eq!(*tail.bit_rate, 0);
+            });
+        }
         let head = unsafe { &*(parameters as *const AVCodecParametersHead) };
         assert_eq!((head.codec_type, head.codec_id), (0, 27));
         free_parameters(&mut parameters);
