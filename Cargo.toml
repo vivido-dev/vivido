@@ -200,6 +200,12 @@ nightly = []
 
 [workspace]
 resolver = "2"
+exclude = ["vendor/winit"]
+
+[patch.crates-io]
+# Weston does not advertise xdg-decoration and relies on winit's CSD. Keep the
+# button-press serial valid by starting its interactive move immediately.
+winit = { path = "vendor/winit" }
 
 [profile.release]
 lto = "thin"
