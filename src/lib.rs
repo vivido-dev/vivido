@@ -48,6 +48,20 @@ pub use crate::window_context::WindowContext;
 pub use config::UiConfig;
 pub use config::monitor::ConfigMonitor;
 
+/// Surface an in-process host needs to run and extend Vivido's automation endpoint.
+///
+/// Embedding [`Processor`] gives a host windows and terminals but no automation service: the
+/// listener is started by the caller. Spawning [`IoListener`] offers the documented IPC endpoint on
+/// behalf of the embedding process, and [`Processor::claim_ipc_methods`] lets the host answer
+/// methods Vivido cannot — or place a window itself rather than letting `create_window` build a
+/// top-level one.
+#[cfg(any(unix, windows))]
+pub mod host {
+    pub use crate::polling::ipc::{IpcConnection, IpcError, IpcRequest, default_endpoint};
+    pub use crate::polling::transport::LocalStream;
+    pub use crate::polling::{IoListener, IoListenerHandle};
+}
+
 /// Internal exports used by the package's executable targets.
 #[doc(hidden)]
 pub mod binary {

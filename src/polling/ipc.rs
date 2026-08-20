@@ -11,7 +11,7 @@ use std::io::{self, BufRead, BufReader, Error as IoError, ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, SyncSender, TrySendError};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use base64::Engine;
@@ -122,6 +122,36 @@ pub const METHODS: &[&str] = &[
     "transcript",
     "subscribe",
 ];
+
+/// Additional methods an in-process host has claimed, advertised alongside [`METHODS`].
+///
+/// The handshake is answered on the listener thread, while claiming happens on the main loop, so
+/// the claimed set lives here rather than on the processor that owns it.
+static HOST_METHODS: RwLock<Vec<String>> = RwLock::new(Vec::new());
+
+/// Publish the host's claimed method names for the handshake to advertise.
+pub(crate) fn publish_host_methods<'a>(methods: impl IntoIterator<Item = &'a String>) {
+    let claimed = methods.into_iter().cloned().collect::<Vec<_>>();
+    match HOST_METHODS.write() {
+        Ok(mut host_methods) => *host_methods = claimed,
+        Err(poisoned) => *poisoned.into_inner() = claimed,
+    }
+}
+
+/// Every method the handshake advertises: Vivido's own plus the host's claimed names.
+fn advertised_methods() -> Vec<String> {
+    let mut methods = METHODS.iter().map(|method| (*method).to_owned()).collect::<Vec<_>>();
+    let host_methods = match HOST_METHODS.read() {
+        Ok(host_methods) => host_methods,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    for method in host_methods.iter() {
+        if !methods.iter().any(|advertised| advertised == method) {
+            methods.push(method.clone());
+        }
+    }
+    methods
+}
 
 /// Event kinds advertised by the protocol handshake.
 pub const EVENT_KINDS: &[&str] = &[
@@ -338,7 +368,7 @@ impl IpcConnection {
     }
 }
 
-struct OutputFrame {
+pub(crate) struct OutputFrame {
     bytes: Vec<u8>,
     _event_slot: Option<EventQueueSlot>,
 }
@@ -648,7 +678,7 @@ fn hello_result() -> Value {
         "headless": instance.is_some_and(|instance| instance.headless),
         "session": instance.and_then(|instance| instance.session.clone()),
         "automation_name": instance.and_then(|instance| instance.automation_name.clone()),
-        "methods": METHODS,
+        "methods": advertised_methods(),
         "event_kinds": EVENT_KINDS,
         "error_codes": [
             "unsupported_version", "invalid_request", "invalid_params",
@@ -1271,6 +1301,22 @@ pub fn socket_prefix() -> String {
     String::from("Vivido")
 }
 
+/// A connection whose frames land in the returned channel, for tests in this and other modules.
+#[cfg(test)]
+pub(crate) fn test_connection() -> (IpcConnection, mpsc::Receiver<OutputFrame>) {
+    let (output, receiver) = mpsc::sync_channel(OUTPUT_QUEUE_FRAMES);
+    let connection = IpcConnection {
+        inner: Arc::new(ConnectionInner {
+            id: 1,
+            output,
+            in_flight: Mutex::new(HashSet::new()),
+            alive: AtomicBool::new(true),
+            shutdown: Mutex::new(None),
+        }),
+    };
+    (connection, receiver)
+}
+
 #[cfg(test)]
 mod tests {
     #[cfg(windows)]
@@ -1284,20 +1330,6 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-
-    fn test_connection() -> (IpcConnection, mpsc::Receiver<OutputFrame>) {
-        let (output, receiver) = mpsc::sync_channel(OUTPUT_QUEUE_FRAMES);
-        let connection = IpcConnection {
-            inner: Arc::new(ConnectionInner {
-                id: 1,
-                output,
-                in_flight: Mutex::new(HashSet::new()),
-                alive: AtomicBool::new(true),
-                shutdown: Mutex::new(None),
-            }),
-        };
-        (connection, receiver)
-    }
 
     #[test]
     fn protocol_envelopes_round_trip() {
@@ -1582,6 +1614,22 @@ mod tests {
         {
             assert!(!hello["methods"].as_array().unwrap().iter().any(|value| value == retired));
         }
+    }
+
+    #[test]
+    fn hello_advertises_host_claimed_methods_beside_vivido_own() {
+        let claimed = [String::from("vvbox_list_tabs"), String::from("create_window")];
+        publish_host_methods(claimed.iter());
+
+        let methods = advertised_methods();
+        // A host name is added once, and re-claiming a built-in never duplicates it.
+        assert_eq!(methods.iter().filter(|method| *method == "vvbox_list_tabs").count(), 1);
+        assert_eq!(methods.iter().filter(|method| *method == "create_window").count(), 1);
+        // Claiming does not withdraw anything Vivido still answers itself.
+        assert!(methods.iter().any(|method| method == "get_grid"));
+
+        publish_host_methods([].iter());
+        assert!(!advertised_methods().iter().any(|method| method == "vvbox_list_tabs"));
     }
 
     /// A connection from this very process is by definition the owner, so it must be accepted.

@@ -160,6 +160,23 @@ physical modifiers pressed.
   frame is presented. Only one readback per window may run at once and raw allocation is capped at
   256 MiB.
 
+### Host-claimed methods
+
+An in-process host that embeds Vivido as a library — a shell that arranges terminals into its own
+tabs, splits, or panels — serves this endpoint on Vivido's behalf and may claim methods. A claimed
+request is handed to the host verbatim instead of being dispatched, so the host can answer from
+state Vivido does not have, and can take over a built-in method: a host that claims `create_window`
+places the new window in its own layout rather than letting Vivido build a top-level one.
+
+Claimed names appear in the `hello` handshake's `methods` array alongside Vivido's own, so
+`capabilities` remains the single description of what an endpoint answers. Claiming a name Vivido
+already advertises replaces its handler without duplicating the entry. Everything the host does not
+claim behaves exactly as documented here.
+
+Errors, limits, framing, request IDs, and subscriptions are unchanged: a claimed method is an
+ordinary request that a different component answers. A host that never replies leaves the client
+waiting until it disconnects, the same as any unanswered request.
+
 ### Mode-aware input and process control
 
 - `key {"key":"Enter","mods":["Ctrl"],"repeat":1,"route":"application","target":{...}}`

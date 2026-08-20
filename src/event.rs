@@ -4,6 +4,8 @@ use crate::ConfigMonitor;
 use std::borrow::Cow;
 use std::cell::Cell;
 use std::cmp::min;
+#[cfg(any(unix, windows))]
+use std::collections::BTreeSet;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::error::Error;
@@ -129,6 +131,12 @@ pub struct Processor {
     global_ipc_options: ParsedOptions,
     #[cfg(any(unix, windows))]
     automation: AutomationHub,
+    /// Automation methods the embedding host answers instead of Vivido.
+    #[cfg(any(unix, windows))]
+    host_methods: BTreeSet<String>,
+    /// Claimed requests waiting for the host to drain them.
+    #[cfg(any(unix, windows))]
+    host_requests: Vec<IpcRequest>,
     cli_options: CliOptions,
     config: Rc<UiConfig>,
     /// Earliest time the headless loop may draw again. Unused in windowed mode.
@@ -195,6 +203,10 @@ impl Processor {
             global_ipc_options: Default::default(),
             #[cfg(any(unix, windows))]
             automation: Default::default(),
+            #[cfg(any(unix, windows))]
+            host_methods: BTreeSet::new(),
+            #[cfg(any(unix, windows))]
+            host_requests: Vec::new(),
             config_monitor,
             next_headless_draw: Instant::now(),
         }
@@ -503,6 +515,13 @@ impl Processor {
 
     #[cfg(any(unix, windows))]
     fn handle_ipc_request(&mut self, event_loop: LoopHandle<'_>, request: IpcRequest) {
+        // A claimed method belongs to the embedding host, which answers it from its own state.
+        // Queue it verbatim rather than dispatching: the host owns the reply.
+        if self.host_methods.contains(&request.method) {
+            self.host_requests.push(request);
+            return;
+        }
+
         use crate::cli::{
             IpcConfig, IpcGetConfig, IpcGetGrid, IpcGetText, IpcInputRoute, IpcKey, IpcMouse,
             IpcPaste, IpcResize, IpcScreenshot, IpcSetGeometry, IpcSetGeometryBatch, IpcSetLevel,
@@ -2236,6 +2255,27 @@ impl Processor {
         info!("Initialisation complete");
     }
 
+    /// Claim automation methods for the embedding host.
+    ///
+    /// A request naming a claimed method is queued instead of dispatched, so a host can answer it
+    /// from state Vivido does not have — its own tabs, splits, or panels — and can take over a
+    /// built-in method such as `create_window` to place the new window itself. Claimed names are
+    /// advertised by the `hello` handshake alongside Vivido's own.
+    ///
+    /// The host must drain [`Processor::take_host_requests`] and reply to or error on every request
+    /// it takes; an unanswered request leaves its automation client waiting until it disconnects.
+    #[cfg(any(unix, windows))]
+    pub fn claim_ipc_methods(&mut self, methods: &[&str]) {
+        self.host_methods = methods.iter().map(|method| (*method).to_owned()).collect();
+        crate::polling::ipc::publish_host_methods(&self.host_methods);
+    }
+
+    /// Take the claimed automation requests received so far, oldest first.
+    #[cfg(any(unix, windows))]
+    pub fn take_host_requests(&mut self) -> Vec<IpcRequest> {
+        std::mem::take(&mut self.host_requests)
+    }
+
     /// Route one winit event through Vivido's embedded event processor.
     ///
     /// An in-process host can use this instead of exposing the processor's window map, clipboard,
@@ -2475,6 +2515,8 @@ impl Processor {
 
         // Handle events which don't mandate the WindowId.
         match (event.payload, event.window_id.as_ref()) {
+            // The host woke the loop for its own reasons; delivering the event is the whole effect.
+            (EventType::HostWakeup, _) => (),
             #[cfg(any(unix, windows))]
             (EventType::IpcRequest(request), _) => self.handle_ipc_request(event_loop, request),
             #[cfg(any(unix, windows))]
@@ -3059,6 +3101,8 @@ pub enum EventType {
     Frame,
     RendererRecovery,
     VividResizeSettled(u64),
+    /// Wake the loop on behalf of an in-process host. Vivido itself does nothing with it.
+    HostWakeup,
 }
 
 impl From<TerminalEvent> for EventType {
@@ -4195,6 +4239,7 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                 | EventType::NotificationActivated
                 | EventType::Frame
                 | EventType::RendererRecovery
+                | EventType::HostWakeup
                 | EventType::VividResizeSettled(_) => (),
                 EventType::VividFrame => (),
             },
@@ -4488,5 +4533,73 @@ mod window_resize_tests {
         assert!(!is_renderable_resize(PhysicalSize::new(0, 1600)));
         assert!(!is_renderable_resize(PhysicalSize::new(2560, 0)));
         assert!(!is_renderable_resize(PhysicalSize::new(0, 0)));
+    }
+}
+
+#[cfg(all(test, any(unix, windows)))]
+mod host_claim_tests {
+    use serde_json::json;
+
+    use super::*;
+    use crate::polling::ipc::test_connection;
+
+    fn headless_processor() -> Processor {
+        let (proxy, _receiver) = EventSink::headless();
+        // The receiver is dropped, so any event the processor emits is discarded rather than
+        // steering this test; only the claim decision is under examination.
+        Processor::new_headless(UiConfig::default(), CliOptions::default(), proxy)
+    }
+
+    fn request(
+        connection: &crate::polling::ipc::IpcConnection,
+        id: u64,
+        method: &str,
+    ) -> IpcRequest {
+        IpcRequest {
+            connection: connection.clone(),
+            id,
+            method: String::from(method),
+            params: json!({}),
+        }
+    }
+
+    /// A claimed method is the host's to answer: Vivido must neither dispatch nor reply to it.
+    #[test]
+    fn a_claimed_method_is_queued_for_the_host_instead_of_dispatched() {
+        let mut processor = headless_processor();
+        processor.claim_ipc_methods(&["vvbox_list_tabs", "create_window"]);
+        let (connection, frames) = test_connection();
+        let loop_handle =
+            LoopHandle::Embedded { size: PhysicalSize::new(80, 24), scale_factor: 1.0 };
+
+        processor.handle_ipc_request(loop_handle, request(&connection, 7, "vvbox_list_tabs"));
+        processor.handle_ipc_request(loop_handle, request(&connection, 8, "create_window"));
+
+        assert!(frames.try_recv().is_err(), "Vivido answered a request the host claimed");
+        let taken = processor.take_host_requests();
+        assert_eq!(
+            taken.iter().map(|request| (request.id, request.method.as_str())).collect::<Vec<_>>(),
+            [(7, "vvbox_list_tabs"), (8, "create_window")],
+        );
+        assert!(processor.take_host_requests().is_empty(), "draining did not consume the queue");
+
+        crate::polling::ipc::publish_host_methods([].iter());
+    }
+
+    /// Claiming one method must not silently capture the rest of the automation surface.
+    #[test]
+    fn an_unclaimed_method_still_reaches_vivido() {
+        let mut processor = headless_processor();
+        processor.claim_ipc_methods(&["vvbox_list_tabs"]);
+        let (connection, frames) = test_connection();
+        let loop_handle =
+            LoopHandle::Embedded { size: PhysicalSize::new(80, 24), scale_factor: 1.0 };
+
+        processor.handle_ipc_request(loop_handle, request(&connection, 9, "ping"));
+
+        assert!(frames.try_recv().is_ok(), "Vivido did not answer an unclaimed request");
+        assert!(processor.take_host_requests().is_empty());
+
+        crate::polling::ipc::publish_host_methods([].iter());
     }
 }
