@@ -637,6 +637,17 @@ impl Window {
         }
     }
 
+    /// Set whether the windowing system may resize the window through user interaction.
+    ///
+    /// Programmatic resizing keeps working either way; this only removes the system-owned
+    /// resize affordances. Embedding hosts call it to keep shell-managed pane geometry out
+    /// of the user's hands.
+    pub fn set_resizable(&self, resizable: bool) {
+        if let Some(window) = self.backend.winit() {
+            window.set_resizable(resizable);
+        }
+    }
+
     pub fn set_resize_increments(&self, increments: PhysicalSize<f32>) {
         if let Some(window) = self.backend.winit() {
             window.set_resize_increments(Some(increments));
