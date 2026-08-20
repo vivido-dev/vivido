@@ -5,8 +5,13 @@ use std::ffi::{OsStr, OsString};
 use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
-use std::process::{Command, ExitCode, Stdio};
+use std::process::{ExitCode, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+#[path = "vvssh/askpass.rs"]
+mod askpass;
+
+use askpass::CredentialBroker;
 
 const HELP: &str = r#"Forward the current Vivido window's Vivid endpoint over SSH.
 
@@ -28,6 +33,15 @@ Examples:
 "#;
 
 fn main() -> ExitCode {
+    if askpass::is_helper() {
+        return match askpass::run_helper() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("vvssh askpass: {error}");
+                ExitCode::FAILURE
+            },
+        };
+    }
     match run() {
         Ok(code) => ExitCode::from(code),
         Err(error) => {
@@ -73,7 +87,10 @@ fn run() -> Result<u8, String> {
         )?;
 
     let ssh = env::var_os("VVSSH_SSH").unwrap_or_else(|| OsString::from("ssh"));
-    let mut setup = Command::new(&ssh)
+    let credential_broker = CredentialBroker::new(std::process::id(), nonce)
+        .map_err(|error| format!("could not initialize SSH credential broker: {error}"))?;
+    let mut setup_command = credential_broker.command(&ssh, "setup");
+    let mut setup = setup_command
         .args(&setup_arguments)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
@@ -87,31 +104,30 @@ fn run() -> Result<u8, String> {
     let setup_status =
         setup.wait().map_err(|error| format!("root-secret setup failed: {error}"))?;
     if let Err(error) = transfer_result {
-        let _ = cleanup_remote_secret(&ssh, &setup_arguments, &secret_file);
+        let _ = cleanup_remote_secret(&credential_broker, &ssh, &setup_arguments, &secret_file);
         return Err(format!("could not transfer Vivid root secret: {error}"));
     }
     if !setup_status.success() {
-        let _ = cleanup_remote_secret(&ssh, &setup_arguments, &secret_file);
+        let _ = cleanup_remote_secret(&credential_broker, &ssh, &setup_arguments, &secret_file);
         return Err("remote host rejected the protected Vivid root-secret setup channel".into());
     }
     let mut bulk = if let Some(arguments) = bulk_arguments {
-        let mut child = match Command::new(&ssh)
-            .args(arguments)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()
-        {
-            Ok(child) => child,
-            Err(error) => {
-                let _ = cleanup_remote_paths(
-                    &ssh,
-                    &setup_arguments,
-                    &secret_file,
-                    bulk_socket.as_deref(),
-                );
-                return Err(format!("could not start separate media transport: {error}"));
-            },
-        };
+        let mut bulk_command = credential_broker.command(&ssh, "media");
+        let mut child =
+            match bulk_command.args(arguments).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn()
+            {
+                Ok(child) => child,
+                Err(error) => {
+                    let _ = cleanup_remote_paths(
+                        &credential_broker,
+                        &ssh,
+                        &setup_arguments,
+                        &secret_file,
+                        bulk_socket.as_deref(),
+                    );
+                    return Err(format!("could not start separate media transport: {error}"));
+                },
+            };
         let mut ready = [0_u8; 16];
         let readiness = match child.stdout.as_mut() {
             Some(stdout) => stdout
@@ -122,30 +138,46 @@ fn run() -> Result<u8, String> {
         if let Err(error) = readiness {
             let _ = child.kill();
             let _ = child.wait();
-            let _ =
-                cleanup_remote_paths(&ssh, &setup_arguments, &secret_file, bulk_socket.as_deref());
+            let _ = cleanup_remote_paths(
+                &credential_broker,
+                &ssh,
+                &setup_arguments,
+                &secret_file,
+                bulk_socket.as_deref(),
+            );
             return Err(error);
         }
         if &ready != b"VIVID-BULK-READY" {
             let _ = child.kill();
             let _ = child.wait();
-            let _ =
-                cleanup_remote_paths(&ssh, &setup_arguments, &secret_file, bulk_socket.as_deref());
+            let _ = cleanup_remote_paths(
+                &credential_broker,
+                &ssh,
+                &setup_arguments,
+                &secret_file,
+                bulk_socket.as_deref(),
+            );
             return Err("separate media transport returned an invalid readiness marker".into());
         }
         Some(child)
     } else {
         None
     };
-    let status = match Command::new(&ssh).args(&ssh_arguments).status() {
+    let status = match credential_broker.command(&ssh, "interactive").args(&ssh_arguments).status()
+    {
         Ok(status) => status,
         Err(error) => {
             if let Some(child) = bulk.as_mut() {
                 let _ = child.kill();
                 let _ = child.wait();
             }
-            let _ =
-                cleanup_remote_paths(&ssh, &setup_arguments, &secret_file, bulk_socket.as_deref());
+            let _ = cleanup_remote_paths(
+                &credential_broker,
+                &ssh,
+                &setup_arguments,
+                &secret_file,
+                bulk_socket.as_deref(),
+            );
             return Err(format!("could not run {}: {error}", Path::new(&ssh).display()));
         },
     };
@@ -154,7 +186,13 @@ fn run() -> Result<u8, String> {
         let _ = child.kill();
         let _ = child.wait();
     }
-    let _ = cleanup_remote_paths(&ssh, &setup_arguments, &secret_file, bulk_socket.as_deref());
+    let _ = cleanup_remote_paths(
+        &credential_broker,
+        &ssh,
+        &setup_arguments,
+        &secret_file,
+        bulk_socket.as_deref(),
+    );
 
     Ok(status.code().and_then(|code| u8::try_from(code).ok()).unwrap_or(1))
 }
@@ -318,13 +356,15 @@ fn local_forward_target(endpoint: &str) -> Result<String, String> {
 }
 
 fn cleanup_remote_secret(
+    credential_broker: &CredentialBroker,
     ssh: &OsStr,
     setup_arguments: &[OsString],
     secret_file: &str,
 ) -> Result<(), String> {
     let mut arguments = setup_arguments[..setup_arguments.len().saturating_sub(1)].to_vec();
     arguments.push(OsString::from(format!("rm -f {}", shell_quote(secret_file))));
-    Command::new(ssh)
+    credential_broker
+        .command(ssh, "cleanup")
         .args(arguments)
         .status()
         .map(|_| ())
@@ -332,6 +372,7 @@ fn cleanup_remote_secret(
 }
 
 fn cleanup_remote_paths(
+    credential_broker: &CredentialBroker,
     ssh: &OsStr,
     setup_arguments: &[OsString],
     secret_file: &str,
@@ -340,7 +381,8 @@ fn cleanup_remote_paths(
     let mut arguments = setup_arguments[..setup_arguments.len().saturating_sub(1)].to_vec();
     let bulk = bulk_socket.map(|socket| format!(" {}", shell_quote(socket))).unwrap_or_default();
     arguments.push(OsString::from(format!("rm -f {}{bulk}", shell_quote(secret_file))));
-    Command::new(ssh)
+    credential_broker
+        .command(ssh, "cleanup")
         .args(arguments)
         .status()
         .map(|_| ())

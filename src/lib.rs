@@ -77,6 +77,7 @@ pub mod binary {
 
     pub mod polling {
         pub use crate::polling::IoListener;
+        pub use crate::polling::transport::{LocalListener, LocalStream};
 
         pub mod ipc {
             pub use crate::polling::ipc::{request_once, send_message};

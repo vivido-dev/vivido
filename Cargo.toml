@@ -51,6 +51,7 @@ parley = "0.11"
 polling = "3.11.0"
 pollster = "1.0"
 regex-automata = "0.4.3"
+rpassword = "7.4.0"
 serde_json = "1"
 serde = { version = "1", features = ["derive", "rc"] }
 sha2 = "0.11"
@@ -66,6 +67,7 @@ vte = { version = "0.15.0", default-features = false, features = [
   "ansi",
   "serde",
 ] }
+zeroize = "1.8.1"
 vello = { version = "0.10", default-features = false, features = ["wgpu"] }
 winit = { version = "0.30.9", default-features = false, features = [
   "rwh_06",

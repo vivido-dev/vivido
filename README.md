@@ -121,8 +121,10 @@ vvssh --shared-media-transport user@host
 
 The media helper exports its private socket as both `VIVID_ENDPOINT_REALTIME` and
 `VIVID_ENDPOINT_BULK`, avoids OpenSSH control-master reuse, and is cleaned up with the main
-session. `VIVID_ROOT_SECRET` travels only through the protected temporary-file setup channel,
-never in command arguments or logs.
+session. When password authentication is needed, `vvssh` asks once and reuses the answer through
+an owner-authenticated local broker for only the SSH processes belonging to that invocation;
+one-time verification-code prompts are never reused. `VIVID_ROOT_SECRET` travels only through the
+protected temporary-file setup channel, never in command arguments or logs.
 
 When the remote Vivi installation includes `vvreceive`, `vvssh` starts it quietly and waits only
 until it has recorded the login-shell PID identity before executing the shell. Dropping a local
