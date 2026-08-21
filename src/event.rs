@@ -137,6 +137,9 @@ pub struct Processor {
     /// Claimed requests waiting for the host to drain them.
     #[cfg(any(unix, windows))]
     host_requests: Vec<IpcRequest>,
+    /// Bounded window-management requests waiting for an embedding chrome.
+    #[cfg(any(target_os = "linux", windows))]
+    shell_actions: VecDeque<crate::shell::ShellActionRequest>,
     cli_options: CliOptions,
     config: Rc<UiConfig>,
     /// Earliest time the headless loop may draw again. Unused in windowed mode.
@@ -160,6 +163,12 @@ impl Processor {
         let clipboard = unsafe { Clipboard::new(event_loop.display_handle().unwrap().as_raw()) };
 
         Self::with_sink(config, cli_options, proxy, clipboard)
+    }
+
+    /// Transfer startup-window ownership to an embedding application.
+    #[cfg(any(target_os = "linux", windows))]
+    pub fn take_initial_window_options(&mut self) -> Option<WindowOptions> {
+        self.initial_window_options.take()
     }
 
     /// Create an event processor with no windowing system behind it.
@@ -207,6 +216,8 @@ impl Processor {
             host_methods: BTreeSet::new(),
             #[cfg(any(unix, windows))]
             host_requests: Vec::new(),
+            #[cfg(any(target_os = "linux", windows))]
+            shell_actions: VecDeque::new(),
             config_monitor,
             next_headless_draw: Instant::now(),
         }
@@ -2276,6 +2287,12 @@ impl Processor {
         std::mem::take(&mut self.host_requests)
     }
 
+    /// Take shell actions accumulated since the previous embedding-host turn.
+    #[cfg(any(target_os = "linux", windows))]
+    pub fn take_shell_actions(&mut self) -> Vec<crate::shell::ShellActionRequest> {
+        self.shell_actions.drain(..).collect()
+    }
+
     /// Route one winit event through Vivido's embedded event processor.
     ///
     /// An in-process host can use this instead of exposing the processor's window map, clipboard,
@@ -2565,6 +2582,33 @@ impl Processor {
                         window_context.update_config(self.config.clone());
                     }
                 }
+            },
+            #[cfg(any(target_os = "linux", windows))]
+            (EventType::ShellAction(action), Some(source)) => {
+                use crate::shell::{MAX_PENDING_SHELL_ACTIONS, ShellActionRequest};
+
+                if matches!(
+                    action,
+                    crate::shell::ShellAction::Activate | crate::shell::ShellAction::Resize { .. }
+                ) {
+                    self.shell_actions.retain(|pending| {
+                        pending.source != *source
+                            || !matches!(
+                                (&pending.action, &action),
+                                (
+                                    crate::shell::ShellAction::Activate,
+                                    crate::shell::ShellAction::Activate
+                                ) | (
+                                    crate::shell::ShellAction::Resize { .. },
+                                    crate::shell::ShellAction::Resize { .. }
+                                )
+                            )
+                    });
+                }
+                if self.shell_actions.len() == MAX_PENDING_SHELL_ACTIONS {
+                    self.shell_actions.pop_front();
+                }
+                self.shell_actions.push_back(ShellActionRequest { source: *source, action });
             },
             // Create a new terminal window.
             (EventType::CreateWindow(options), _) => {
@@ -3087,6 +3131,8 @@ pub enum EventType {
     Message(Message),
     Scroll(Scroll),
     CreateWindow(WindowOptions),
+    #[cfg(any(target_os = "linux", windows))]
+    ShellAction(crate::shell::ShellAction),
     #[cfg(any(unix, windows))]
     IpcRequest(IpcRequest),
     #[cfg(any(unix, windows))]
@@ -3445,6 +3491,25 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
         }
 
         self.spawn_daemon(&program, &args);
+    }
+
+    #[cfg(any(target_os = "linux", windows))]
+    fn shell_action(&mut self, action: crate::shell::ShellAction) {
+        let window_id = self.display.window.id();
+        let _ = self.event_proxy.send_event(Event::new(EventType::ShellAction(action), window_id));
+    }
+
+    #[cfg(any(target_os = "linux", windows))]
+    fn create_new_tab(&mut self) {
+        let mut options = WindowOptions::default();
+        options.terminal_options.working_directory =
+            self.terminal.working_directory().map(PathBuf::from);
+        #[cfg(not(windows))]
+        if options.terminal_options.working_directory.is_none() {
+            options.terminal_options.working_directory =
+                foreground_process_path(self.master_fd, self.shell_pid).ok();
+        }
+        self.shell_action(crate::shell::ShellAction::CreateTab(options));
     }
 
     #[cfg(not(windows))]
@@ -4246,6 +4311,8 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                 | EventType::RendererRecovery
                 | EventType::HostWakeup
                 | EventType::VividResizeSettled(_) => (),
+                #[cfg(any(target_os = "linux", windows))]
+                EventType::ShellAction(_) => (),
                 EventType::VividFrame => (),
             },
             WinitEvent::WindowEvent { event, .. } => {

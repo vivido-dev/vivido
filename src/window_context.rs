@@ -125,6 +125,7 @@ pub struct WindowContext {
     pub display: Display,
     pub dirty: bool,
     event_queue: Vec<WinitEvent<Event>>,
+    event_proxy: EventProxy,
     terminal: Arc<FairMutex<Term<EventProxy>>>,
     cursor_blink_timed_out: bool,
     prev_bell_cmd: Option<Instant>,
@@ -167,6 +168,12 @@ const SCREENSHOT_POLL_INTERVAL: Duration = Duration::from_millis(5);
 const SCREENSHOT_READBACK_TIMEOUT: Duration = Duration::from_secs(5);
 
 impl WindowContext {
+    /// Close this terminal even when its configured hold policy is enabled.
+    pub fn request_close(&mut self) {
+        self.display.window.hold = false;
+        self.terminal.lock().exit();
+    }
+
     pub(crate) fn acknowledge_vivid_frame(&mut self) {
         self.vivid_service.acknowledge_frame_wake();
         self.display.mark_vivid_frame();
@@ -359,6 +366,7 @@ impl WindowContext {
         Ok(WindowContext {
             preserve_title,
             terminal,
+            event_proxy,
             #[cfg(any(target_os = "macos", target_os = "linux", windows))]
             accessibility,
             display,
@@ -697,6 +705,22 @@ impl WindowContext {
             .working_directory()
             .map(PathBuf::from)
             .or_else(|| self.probed_working_directory())
+    }
+
+    /// Immutable accessibility state for composition by a containing shell.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn accessibility_snapshot(&self) -> AccessibilitySnapshot {
+        AccessibilitySnapshot::new(
+            &self.terminal.lock(),
+            self.display.size_info,
+            self.display.window.title(),
+        )
+    }
+
+    /// Current terminal content size in physical pixels.
+    #[cfg(any(target_os = "linux", windows))]
+    pub(crate) fn terminal_content_size(&self) -> winit::dpi::PhysicalSize<u32> {
+        self.display.window.inner_size()
     }
 
     /// Working directory of the foreground process, when the platform can report it.
@@ -1268,6 +1292,15 @@ impl WindowContext {
                 "requested client size must produce a 2x1 through 65535x65535 PTY grid",
             ));
         }
+        #[cfg(any(target_os = "linux", windows))]
+        if self.display.window.is_hosted() {
+            self.event_proxy.send_event(EventType::ShellAction(
+                crate::shell::ShellAction::Resize { width, height },
+            ));
+        } else {
+            self.display.window.request_inner_size(winit::dpi::PhysicalSize::new(width, height));
+        }
+        #[cfg(not(any(target_os = "linux", windows)))]
         self.display.window.request_inner_size(winit::dpi::PhysicalSize::new(width, height));
         Ok((width, height, grid))
     }
@@ -1292,6 +1325,14 @@ impl WindowContext {
     /// Ask the window system to activate this window.
     #[cfg(any(unix, windows))]
     pub fn request_automation_focus(&self) {
+        #[cfg(any(target_os = "linux", windows))]
+        if self.display.window.is_hosted() {
+            self.event_proxy
+                .send_event(EventType::ShellAction(crate::shell::ShellAction::Activate));
+        } else {
+            self.display.window.focus_window();
+        }
+        #[cfg(not(any(target_os = "linux", windows)))]
         self.display.window.focus_window();
     }
 

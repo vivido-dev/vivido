@@ -150,6 +150,10 @@ pub trait ActionContext<T: EventListener> {
     fn terminal(&self) -> &Term<T>;
     fn terminal_mut(&mut self) -> &mut Term<T>;
     fn spawn_new_instance(&mut self) {}
+    #[cfg(any(target_os = "linux", windows))]
+    fn shell_action(&mut self, _action: crate::shell::ShellAction) {}
+    #[cfg(any(target_os = "linux", windows))]
+    fn create_new_tab(&mut self) {}
     #[cfg(target_os = "macos")]
     fn create_new_window(&mut self, _tabbing_id: Option<String>) {}
     #[cfg(not(target_os = "macos"))]
@@ -237,7 +241,15 @@ impl<T: EventListener> Execute<T> for Action {
                 let text = ctx.clipboard_mut().load(ClipboardType::Selection);
                 ctx.paste(&text, true);
             },
+            #[cfg(any(target_os = "linux", windows))]
+            Action::ToggleFullscreen if ctx.window().is_hosted() => {
+                ctx.shell_action(crate::shell::ShellAction::ToggleFullscreen);
+            },
             Action::ToggleFullscreen => ctx.window().toggle_fullscreen(),
+            #[cfg(any(target_os = "linux", windows))]
+            Action::ToggleMaximized if ctx.window().is_hosted() => {
+                ctx.shell_action(crate::shell::ShellAction::ToggleMaximized);
+            },
             Action::ToggleMaximized => ctx.window().toggle_maximized(),
             #[cfg(target_os = "macos")]
             Action::ToggleSimpleFullscreen => ctx.window().toggle_simple_fullscreen(),
@@ -253,8 +265,16 @@ impl<T: EventListener> Execute<T> for Action {
                     event_loop.hide_other_applications();
                 }
             },
+            #[cfg(any(target_os = "linux", windows))]
+            Action::Hide if ctx.window().is_hosted() => {
+                ctx.shell_action(crate::shell::ShellAction::Hide);
+            },
             #[cfg(not(target_os = "macos"))]
             Action::Hide => ctx.window().set_visible(false),
+            #[cfg(any(target_os = "linux", windows))]
+            Action::Minimize if ctx.window().is_hosted() => {
+                ctx.shell_action(crate::shell::ShellAction::Minimize);
+            },
             Action::Minimize => ctx.window().set_minimized(true),
             Action::Quit => {
                 ctx.window().hold = false;
@@ -283,6 +303,8 @@ impl<T: EventListener> Execute<T> for Action {
             Action::ScrollToBottom => ctx.scroll(Scroll::Bottom),
             Action::ClearHistory => ctx.terminal_mut().clear_screen(ClearMode::Saved),
             Action::ClearLogNotice => ctx.pop_message(),
+            #[cfg(any(target_os = "linux", windows))]
+            Action::CreateNewWindow if ctx.window().is_hosted() => ctx.create_new_tab(),
             #[cfg(not(target_os = "macos"))]
             Action::CreateNewWindow => ctx.create_new_window(),
             Action::SpawnNewInstance => ctx.spawn_new_instance(),
@@ -296,6 +318,58 @@ impl<T: EventListener> Execute<T> for Action {
             },
             #[cfg(target_os = "macos")]
             Action::CreateNewTab => (),
+            #[cfg(any(target_os = "linux", windows))]
+            Action::CreateNewTab if ctx.window().is_hosted() => ctx.create_new_tab(),
+            #[cfg(any(target_os = "linux", windows))]
+            Action::CreateNewTab => ctx.create_new_window(),
+            #[cfg(any(target_os = "linux", windows))]
+            Action::SelectNextTab if ctx.window().is_hosted() => {
+                ctx.shell_action(crate::shell::ShellAction::SelectNextTab);
+            },
+            #[cfg(any(target_os = "linux", windows))]
+            Action::SelectPreviousTab if ctx.window().is_hosted() => {
+                ctx.shell_action(crate::shell::ShellAction::SelectPreviousTab);
+            },
+            #[cfg(any(target_os = "linux", windows))]
+            Action::SelectTab1 if ctx.window().is_hosted() => {
+                ctx.shell_action(crate::shell::ShellAction::SelectTab(0));
+            },
+            #[cfg(any(target_os = "linux", windows))]
+            Action::SelectTab2 if ctx.window().is_hosted() => {
+                ctx.shell_action(crate::shell::ShellAction::SelectTab(1));
+            },
+            #[cfg(any(target_os = "linux", windows))]
+            Action::SelectTab3 if ctx.window().is_hosted() => {
+                ctx.shell_action(crate::shell::ShellAction::SelectTab(2));
+            },
+            #[cfg(any(target_os = "linux", windows))]
+            Action::SelectTab4 if ctx.window().is_hosted() => {
+                ctx.shell_action(crate::shell::ShellAction::SelectTab(3));
+            },
+            #[cfg(any(target_os = "linux", windows))]
+            Action::SelectTab5 if ctx.window().is_hosted() => {
+                ctx.shell_action(crate::shell::ShellAction::SelectTab(4));
+            },
+            #[cfg(any(target_os = "linux", windows))]
+            Action::SelectTab6 if ctx.window().is_hosted() => {
+                ctx.shell_action(crate::shell::ShellAction::SelectTab(5));
+            },
+            #[cfg(any(target_os = "linux", windows))]
+            Action::SelectTab7 if ctx.window().is_hosted() => {
+                ctx.shell_action(crate::shell::ShellAction::SelectTab(6));
+            },
+            #[cfg(any(target_os = "linux", windows))]
+            Action::SelectTab8 if ctx.window().is_hosted() => {
+                ctx.shell_action(crate::shell::ShellAction::SelectTab(7));
+            },
+            #[cfg(any(target_os = "linux", windows))]
+            Action::SelectTab9 if ctx.window().is_hosted() => {
+                ctx.shell_action(crate::shell::ShellAction::SelectTab(8));
+            },
+            #[cfg(any(target_os = "linux", windows))]
+            Action::SelectLastTab if ctx.window().is_hosted() => {
+                ctx.shell_action(crate::shell::ShellAction::SelectLastTab);
+            },
             #[cfg(target_os = "macos")]
             Action::SelectNextTab => ctx.window().select_next_tab(),
             #[cfg(target_os = "macos")]

@@ -412,7 +412,7 @@ Each binding needs a `key`, optional `mods` and `mode`, and one of `action`, `ch
 
 Window / app: `Quit`, `Hide`, `HideOtherApplications` (macOS), `Minimize`, `ToggleFullscreen`,
 `ToggleMaximized`, `ToggleSimpleFullscreen` (macOS), `SpawnNewInstance`, `CreateNewWindow`,
-`CreateNewTab` (macOS), `SelectNextTab`, `SelectPreviousTab`, `SelectTab1`…`SelectTab9`,
+`CreateNewTab`, `SelectNextTab`, `SelectPreviousTab`, `SelectTab1`…`SelectTab9`,
 `SelectLastTab`.
 
 Clipboard / selection: `Copy`, `Paste`, `CopySelection`, `PasteSelection`, `ClearSelection`.
@@ -429,6 +429,20 @@ Search: `SearchForward`, `SearchBackward`. Inside search mode: `SearchFocusNext`
 Misc: `ClearHistory`, `ClearLogNotice`, `ReceiveChar`, `None`.
 
 > There is no vi mode, so vi-motion, vi-cursor, and vi-selection actions do not exist in Vivido.
+
+### Default Windows/Linux tab bindings
+
+| Keys | Action |
+|---|---|
+| `Ctrl+Shift+T` | Create and activate a tab |
+| `Ctrl+Shift+W` | Close the active tab |
+| `Ctrl+Tab` / `Ctrl+Shift+Tab` | Select the next / previous tab, wrapping at either end |
+| `Alt+1`…`Alt+8` | Select the matching tab from the left |
+| `Alt+9` | Select the last tab |
+
+On Windows and Linux, `CreateNewWindow` also creates a tab in the current Vivido window.
+`SpawnNewInstance` is the action for another top-level OS window. Custom bindings replace these
+defaults by trigger in the normal way.
 
 ### Default macOS tab bindings
 

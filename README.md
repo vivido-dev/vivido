@@ -2,7 +2,14 @@
 
 Vivido is a fast, cross-platform terminal emulator. It uses Vello and
 wgpu for GPU rendering, targeting Metal on macOS, DirectX 12 on Windows, and Vulkan on Linux.
-On Linux, winit prefers Wayland and falls back to X11 when no Wayland session exists.
+Headed Linux sessions use Wayland.
+
+On Windows and Linux, every headed Vivido window includes an integrated tab strip. Use
+`Ctrl+Shift+T` to create a tab, `Ctrl+Shift+W` to close the active tab, `Ctrl+Tab` and
+`Ctrl+Shift+Tab` to move through tabs, and `Alt+1`…`Alt+9` to select by position. macOS retains its
+native window tabs and Command-key shortcuts. `CreateNewWindow` and IPC `create_window` add a tab
+to the current process on Windows/Linux; `SpawnNewInstance` explicitly starts another top-level
+window.
 
 ## Vivid Protocol
 
@@ -70,9 +77,10 @@ Native terminal windows expose their active buffer, caret, selection, and text g
 Accessibility, Linux AT-SPI, and Windows UI Automation. The text document contains retained
 scrollback plus the current screen; the on-screen viewport is reported separately as the visible
 range. SGR-hidden text is reported as spaces, and all editing accessibility actions are
-intentionally unsupported. Desktop presentation targets expose their native application/window
-roles without a terminal text area; headless and embedded targets leave accessibility ownership to
-their host.
+intentionally unsupported. The Windows/Linux tab chrome exposes its tab list and controls; Linux
+composes only the active terminal document into that tree, while Windows keeps the active child
+terminal's native adapter. Desktop presentation targets expose their native application/window
+roles without a terminal text area; headless targets leave accessibility ownership to their host.
 
 On macOS, a live window's `AXVisibleCharacterRange` can be inspected with:
 

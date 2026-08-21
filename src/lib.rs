@@ -32,6 +32,8 @@ mod scheduler;
 mod screenshot;
 mod serde_replace;
 mod session;
+#[cfg(any(target_os = "linux", windows))]
+pub mod shell;
 mod string;
 pub mod terminal;
 mod vivid;

@@ -401,6 +401,19 @@ fn common_keybindings() -> Vec<KeyBinding> {
         "v",    ModifiersState::CONTROL | ModifiersState::SHIFT;                                         Action::Paste;
         "f",    ModifiersState::CONTROL | ModifiersState::SHIFT, ~BindingMode::SEARCH;                   Action::SearchForward;
         "b",    ModifiersState::CONTROL | ModifiersState::SHIFT, ~BindingMode::SEARCH;                   Action::SearchBackward;
+        "t",    ModifiersState::CONTROL | ModifiersState::SHIFT;                                         Action::CreateNewTab;
+        "w",    ModifiersState::CONTROL | ModifiersState::SHIFT;                                         Action::Quit;
+        Tab,    ModifiersState::CONTROL;                                                                  Action::SelectNextTab;
+        Tab,    ModifiersState::CONTROL | ModifiersState::SHIFT;                                          Action::SelectPreviousTab;
+        "1",    ModifiersState::ALT;                                                                     Action::SelectTab1;
+        "2",    ModifiersState::ALT;                                                                     Action::SelectTab2;
+        "3",    ModifiersState::ALT;                                                                     Action::SelectTab3;
+        "4",    ModifiersState::ALT;                                                                     Action::SelectTab4;
+        "5",    ModifiersState::ALT;                                                                     Action::SelectTab5;
+        "6",    ModifiersState::ALT;                                                                     Action::SelectTab6;
+        "7",    ModifiersState::ALT;                                                                     Action::SelectTab7;
+        "8",    ModifiersState::ALT;                                                                     Action::SelectTab8;
+        "9",    ModifiersState::ALT;                                                                     Action::SelectLastTab;
         Insert, ModifiersState::SHIFT;                       Action::PasteSelection;
         "c",    ModifiersState::CONTROL | ModifiersState::SHIFT;                                         Action::Copy;
         "0",    ModifiersState::CONTROL;                                                                 Action::ResetFontSize;
@@ -1395,6 +1408,51 @@ mod tests {
             notmode: BindingMode::empty(),
         };
 
+        defaults.retain(|binding| !binding.triggers_match(&custom));
+        assert!(!defaults.iter().any(|binding| binding.triggers_match(&custom)));
+    }
+
+    #[test]
+    fn non_macos_tab_shortcuts_cover_creation_navigation_and_positions() {
+        let bindings = common_keybindings();
+        let expected = [
+            ("t", ModifiersState::CONTROL | ModifiersState::SHIFT, Action::CreateNewTab),
+            ("1", ModifiersState::ALT, Action::SelectTab1),
+            ("8", ModifiersState::ALT, Action::SelectTab8),
+            ("9", ModifiersState::ALT, Action::SelectLastTab),
+        ];
+        for (key, mods, action) in expected {
+            let trigger =
+                BindingKey::Keycode { key: Key::Character(key.into()), location: KeyLocation::Any };
+            assert!(bindings.iter().any(|binding| {
+                binding.trigger == trigger && binding.mods == mods && binding.action == action
+            }));
+        }
+        for (mods, action) in [
+            (ModifiersState::CONTROL, Action::SelectNextTab),
+            (ModifiersState::CONTROL | ModifiersState::SHIFT, Action::SelectPreviousTab),
+        ] {
+            let trigger =
+                BindingKey::Keycode { key: Key::Named(NamedKey::Tab), location: KeyLocation::Any };
+            assert!(bindings.iter().any(|binding| {
+                binding.trigger == trigger && binding.mods == mods && binding.action == action
+            }));
+        }
+    }
+
+    #[test]
+    fn custom_new_tab_binding_replaces_the_default_trigger() {
+        let mut defaults = common_keybindings();
+        let custom = KeyBinding {
+            trigger: BindingKey::Keycode {
+                key: Key::Character("t".into()),
+                location: KeyLocation::Any,
+            },
+            mods: ModifiersState::CONTROL | ModifiersState::SHIFT,
+            action: Action::ReceiveChar,
+            mode: BindingMode::empty(),
+            notmode: BindingMode::empty(),
+        };
         defaults.retain(|binding| !binding.triggers_match(&custom));
         assert!(!defaults.iter().any(|binding| binding.triggers_match(&custom)));
     }

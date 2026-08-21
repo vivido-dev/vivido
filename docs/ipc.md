@@ -135,7 +135,10 @@ physical modifiers pressed.
 - `create_window`: synchronously constructs a complete window and returns `{"window_id":ID}`.
   The CLI is `vivido msg create-window` with its existing window, command, directory, hold, title,
   class, and config options. `ipc_window_id` is optional and must be unique. The response does not
-  wait for the first rendered frame. `--vivid-target desktop` creates a `desktop-surface-v1` window
+  wait for the first rendered frame. In a headed Windows/Linux process this method creates and
+  activates a tab in the existing top-level window; each tab's returned window ID remains its
+  stable public identity. macOS and headless sessions retain their existing window semantics.
+  `--vivid-target desktop` creates a `desktop-surface-v1` window
   instead of the default `terminal-surface-v1` one; a desktop window has no grid, no anchors, and no
   shell, so terminal-shaped methods do not apply to it.
 - `config` and `get_config`: back the existing `config` and `get-config` commands. Configuration
@@ -167,6 +170,10 @@ tabs, splits, or panels — serves this endpoint on Vivido's behalf and may clai
 request is handed to the host verbatim instead of being dispatched, so the host can answer from
 state Vivido does not have, and can take over a built-in method: a host that claims `create_window`
 places the new window in its own layout rather than letting Vivido build a top-level one.
+
+Standalone Vivido is itself such a host on Windows and Linux. Its `list_windows` response reports
+only the active tab as visible; focusing an inactive window ID selects and reveals that tab first,
+and a resize preserves the requested terminal content size while resizing every tab consistently.
 
 Claimed names appear in the `hello` handshake's `methods` array alongside Vivido's own, so
 `capabilities` remains the single description of what an endpoint answers. Claiming a name Vivido

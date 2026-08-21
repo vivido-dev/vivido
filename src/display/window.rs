@@ -202,6 +202,9 @@ pub struct Window {
 
     backend: Backend,
 
+    /// Whether top-level window management belongs to an embedding chrome.
+    hosted: bool,
+
     /// Current window title.
     title: String,
 
@@ -225,6 +228,10 @@ impl Window {
         identity: &Identity,
         options: &mut WindowOptions,
     ) -> Result<Window> {
+        #[cfg(any(target_os = "macos", windows))]
+        let hosted = options.parent_window.is_some();
+        #[cfg(not(any(target_os = "macos", windows)))]
+        let hosted = false;
         let identity = identity.clone();
         let mut window_attributes = Window::get_platform_window(
             &identity,
@@ -307,6 +314,7 @@ impl Window {
             has_frame: true,
             scale_factor,
             backend: Backend::Winit(window),
+            hosted,
             ime_inhibitor: Default::default(),
             ime_cursor_area: Cell::new(None),
             #[cfg(target_os = "macos")]
@@ -340,6 +348,7 @@ impl Window {
             has_frame: true,
             scale_factor,
             backend: Backend::Headless(headless),
+            hosted: false,
             ime_inhibitor: Default::default(),
             ime_cursor_area: Cell::new(None),
             #[cfg(target_os = "macos")]
@@ -369,6 +378,7 @@ impl Window {
             has_frame: true,
             scale_factor,
             backend: Backend::Headless(embedded),
+            hosted: true,
             ime_inhibitor: Default::default(),
             ime_cursor_area: Cell::new(None),
             #[cfg(target_os = "macos")]
@@ -387,6 +397,12 @@ impl Window {
     #[inline]
     pub fn is_embedded(&self) -> bool {
         matches!(&self.backend, Backend::Headless(window) if window.embedded)
+    }
+
+    /// Whether top-level window operations must be delegated to an embedding chrome.
+    #[inline]
+    pub fn is_hosted(&self) -> bool {
+        self.hosted
     }
 
     pub fn embedded_input_state(&self) -> Option<EmbeddedInputState> {

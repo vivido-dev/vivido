@@ -36,6 +36,8 @@ use vivido::cli::{
 };
 use vivido::config;
 use vivido::config::UiConfig;
+#[cfg(any(target_os = "linux", windows))]
+use vivido::config::window::Decorations;
 use vivido::event::{Event, EventSink, Processor};
 use vivido::terminal::tty;
 
@@ -367,7 +369,15 @@ fn vivido(mut options: Options) -> Result<(), Box<dyn Error>> {
 
     // Setup winit event loop.
     #[cfg(not(target_os = "macos"))]
-    let window_event_loop = EventLoop::<Event>::with_user_event().build()?;
+    let window_event_loop = {
+        let mut builder = EventLoop::<Event>::with_user_event();
+        #[cfg(target_os = "linux")]
+        {
+            use winit::platform::wayland::EventLoopBuilderExtWayland;
+            builder.with_wayland();
+        }
+        builder.build()?
+    };
 
     // An accessory instance exists to serve another application's windows, so it takes neither a
     // Dock icon nor the activation the frontmost application currently holds.
@@ -404,6 +414,15 @@ fn vivido(mut options: Options) -> Result<(), Box<dyn Error>> {
 
     // Update the log level from config.
     log::set_max_level(config.debug.log_level);
+
+    #[cfg(any(target_os = "linux", windows))]
+    let chrome_config = config.clone();
+    #[cfg(any(target_os = "linux", windows))]
+    {
+        // Terminal panes are hosted inside the shell's integrated chrome.
+        config.window.decorations = Decorations::None;
+        config.window.resize_increments = false;
+    }
 
     // Set tty environment variables.
     let _terminfo_guard = tty::setup_env();
@@ -446,9 +465,14 @@ fn vivido(mut options: Options) -> Result<(), Box<dyn Error>> {
     let _registry_guard = session::RegistryGuard::new(automation_paths, registry);
 
     // Event processor.
+    #[allow(unused_mut)]
     let mut processor = Processor::new(config, options, &window_event_loop);
 
     // Start event loop and block until shutdown.
+    #[cfg(any(target_os = "linux", windows))]
+    let (mut processor, result) =
+        vivido::shell::TabbedApplication::new(processor, chrome_config).run(window_event_loop);
+    #[cfg(target_os = "macos")]
     let result = processor.run(window_event_loop);
 
     // `Processor` must be dropped before calling `FreeConsole` so the window contexts and their

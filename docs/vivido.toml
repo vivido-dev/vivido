@@ -315,7 +315,8 @@ command = "xdg-open"          # Linux
 # Actions include: Copy, Paste, CopySelection, PasteSelection, ClearSelection,
 # IncreaseFontSize, DecreaseFontSize, ResetFontSize, Scroll*{LineUp,PageDown,ToTop,…},
 # SearchForward, SearchBackward, ToggleFullscreen, ToggleMaximized, SpawnNewInstance,
-# CreateNewWindow, Quit, Hide, Minimize, ClearHistory, ReceiveChar, None, …
+# CreateNewWindow, CreateNewTab, SelectNextTab, SelectPreviousTab, SelectTab1…SelectTab9,
+# SelectLastTab, Quit, Hide, Minimize, ClearHistory, ReceiveChar, None, …
 # (See configuration.md for the complete list. Vivido has no vi-mode actions.)
 
 # [[keyboard.bindings]]
