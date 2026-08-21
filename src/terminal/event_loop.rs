@@ -506,10 +506,12 @@ impl State {
                     }
                     terminal.advance(&mut self.parser, &bytes);
                 },
-                VividChunk::Marker { raw, marker } => {
+                VividChunk::Marker { raw, marker, pass_to_terminal: _pass_to_terminal } => {
                     processed += raw.len();
                     #[cfg(not(windows))]
-                    terminal.advance(&mut self.parser, &raw);
+                    if _pass_to_terminal {
+                        terminal.advance(&mut self.parser, &raw);
+                    }
                     terminal.vivid_marker(marker);
                 },
             }
@@ -550,26 +552,33 @@ impl State {
     }
 }
 
-#[cfg(not(windows))]
-const VIVID_MARKER_PREFIX: &[u8] = b"\x1b_VIVID;3;";
-#[cfg(windows)]
-const VIVID_MARKER_PREFIX: &[u8] = b"VIVID;3;";
-#[cfg(not(windows))]
-const VIVID_MARKER_TERMINATOR: &[u8] = b"\x1b\\";
-#[cfg(windows)]
-const VIVID_MARKER_TERMINATOR: &[u8] = b";VIVID-END";
-#[cfg(not(windows))]
-const VIVID_MARKER_PAYLOAD_SKIP: usize = 2;
-#[cfg(windows)]
-const VIVID_MARKER_PAYLOAD_SKIP: usize = 0;
-#[cfg(not(windows))]
 const MAX_VIVID_MARKER_BYTES: usize = vivid_protocol::anchor::MAX_MARKER_BYTES;
-#[cfg(windows)]
-const MAX_VIVID_MARKER_BYTES: usize = vivid_protocol::anchor::MAX_MARKER_BYTES;
+
+#[derive(Clone, Copy)]
+struct VividMarkerEnvelope {
+    prefix: &'static [u8],
+    terminator: &'static [u8],
+    payload_skip: usize,
+    pass_to_terminal: bool,
+}
+
+const APC_VIVID_MARKER: VividMarkerEnvelope = VividMarkerEnvelope {
+    prefix: b"\x1b_VIVID;3;",
+    terminator: b"\x1b\\",
+    payload_skip: 2,
+    pass_to_terminal: true,
+};
+const CONPTY_VIVID_MARKER: VividMarkerEnvelope = VividMarkerEnvelope {
+    prefix: b"VIVID;3;",
+    terminator: b";VIVID-END",
+    payload_skip: 0,
+    pass_to_terminal: false,
+};
+const VIVID_MARKER_ENVELOPES: [VividMarkerEnvelope; 2] = [APC_VIVID_MARKER, CONPTY_VIVID_MARKER];
 
 enum VividChunk {
     Bytes(Vec<u8>),
-    Marker { raw: Vec<u8>, marker: String },
+    Marker { raw: Vec<u8>, marker: String, pass_to_terminal: bool },
 }
 
 #[derive(Default)]
@@ -584,9 +593,13 @@ impl VividMarkerScanner {
         let mut cursor = 0;
 
         loop {
-            let Some(relative_start) = find_bytes(&self.pending[cursor..], VIVID_MARKER_PREFIX)
+            let Some((relative_start, envelope)) = find_marker_envelope(&self.pending[cursor..])
             else {
-                let keep = partial_prefix_len(&self.pending[cursor..], VIVID_MARKER_PREFIX);
+                let keep = VIVID_MARKER_ENVELOPES
+                    .iter()
+                    .map(|envelope| partial_prefix_len(&self.pending[cursor..], envelope.prefix))
+                    .max()
+                    .unwrap_or(0);
                 let end = self.pending.len().saturating_sub(keep);
                 push_bytes(&mut chunks, &self.pending[cursor..end]);
                 cursor = end;
@@ -594,18 +607,15 @@ impl VividMarkerScanner {
             };
             let start = cursor + relative_start;
             push_bytes(&mut chunks, &self.pending[cursor..start]);
-            let payload_start = start + VIVID_MARKER_PAYLOAD_SKIP;
-            let terminator_search = start + VIVID_MARKER_PREFIX.len();
+            let payload_start = start + envelope.payload_skip;
+            let terminator_search = start + envelope.prefix.len();
 
             let Some(relative_end) =
-                find_bytes(&self.pending[terminator_search..], VIVID_MARKER_TERMINATOR)
+                find_bytes(&self.pending[terminator_search..], envelope.terminator)
             else {
                 if self.pending.len() - start > MAX_VIVID_MARKER_BYTES {
-                    push_bytes(
-                        &mut chunks,
-                        &self.pending[start..start + VIVID_MARKER_PREFIX.len()],
-                    );
-                    cursor = start + VIVID_MARKER_PREFIX.len();
+                    push_bytes(&mut chunks, &self.pending[start..start + envelope.prefix.len()]);
+                    cursor = start + envelope.prefix.len();
                     continue;
                 }
                 cursor = start;
@@ -613,16 +623,20 @@ impl VividMarkerScanner {
             };
 
             let terminator = terminator_search + relative_end;
-            let end = terminator + VIVID_MARKER_TERMINATOR.len();
+            let end = terminator + envelope.terminator.len();
             if end - start > MAX_VIVID_MARKER_BYTES {
-                push_bytes(&mut chunks, &self.pending[start..start + VIVID_MARKER_PREFIX.len()]);
-                cursor = start + VIVID_MARKER_PREFIX.len();
+                push_bytes(&mut chunks, &self.pending[start..start + envelope.prefix.len()]);
+                cursor = start + envelope.prefix.len();
                 continue;
             }
 
             let raw = self.pending[start..end].to_vec();
             match std::str::from_utf8(&self.pending[payload_start..terminator]) {
-                Ok(marker) => chunks.push(VividChunk::Marker { raw, marker: marker.to_owned() }),
+                Ok(marker) => chunks.push(VividChunk::Marker {
+                    raw,
+                    marker: marker.to_owned(),
+                    pass_to_terminal: envelope.pass_to_terminal,
+                }),
                 Err(_) => push_bytes(&mut chunks, &raw),
             }
             cursor = end;
@@ -631,6 +645,13 @@ impl VividMarkerScanner {
         self.pending.drain(..cursor);
         chunks
     }
+}
+
+fn find_marker_envelope(bytes: &[u8]) -> Option<(usize, VividMarkerEnvelope)> {
+    VIVID_MARKER_ENVELOPES
+        .iter()
+        .filter_map(|envelope| find_bytes(bytes, envelope.prefix).map(|start| (start, *envelope)))
+        .min_by_key(|(start, _)| *start)
 }
 
 fn push_bytes(chunks: &mut Vec<VividChunk>, bytes: &[u8]) {
@@ -713,45 +734,63 @@ impl<T> PeekableReceiver<T> {
 mod vivid_marker_tests {
     use super::*;
 
+    const MARKER_PAYLOAD: &[u8] =
+        b"A;AAAAAAAAAAAAAAAAAAAAAA;0000000000000003;0000000000000007;AAAAAAAAAAAAAAAAAAAAAA";
+    const MARKER_BODY: &str =
+        "VIVID;3;A;AAAAAAAAAAAAAAAAAAAAAA;0000000000000003;0000000000000007;AAAAAAAAAAAAAAAAAAAAAA";
+
     #[test]
-    fn marker_is_recognized_across_every_read_boundary() {
-        #[cfg(not(windows))]
-        let input = b"before\x1b_VIVID;3;A;AAAAAAAAAAAAAAAAAAAAAA;0000000000000003;0000000000000007;AAAAAAAAAAAAAAAAAAAAAA\x1b\\after";
-        #[cfg(windows)]
-        let input = b"beforeVIVID;3;A;AAAAAAAAAAAAAAAAAAAAAA;0000000000000003;0000000000000007;AAAAAAAAAAAAAAAAAAAAAA;VIVID-ENDafter";
+    fn both_marker_envelopes_are_recognized_across_every_read_boundary() {
+        assert_marker_envelope(APC_VIVID_MARKER);
+        assert_marker_envelope(CONPTY_VIVID_MARKER);
+    }
+
+    fn assert_marker_envelope(envelope: VividMarkerEnvelope) {
+        let mut input = b"before".to_vec();
+        input.extend_from_slice(envelope.prefix);
+        input.extend_from_slice(MARKER_PAYLOAD);
+        input.extend_from_slice(envelope.terminator);
+        input.extend_from_slice(b"after");
         let mut scanner = VividMarkerScanner::default();
         let mut text = Vec::new();
         let mut markers = Vec::new();
 
-        for byte in input {
+        for byte in &input {
             for chunk in scanner.push(std::slice::from_ref(byte)) {
                 match chunk {
                     VividChunk::Bytes(bytes) => text.extend(bytes),
-                    VividChunk::Marker { raw, marker } => {
-                        assert!(raw.starts_with(VIVID_MARKER_PREFIX));
-                        markers.push(marker);
+                    VividChunk::Marker { raw, marker, pass_to_terminal } => {
+                        assert!(raw.starts_with(envelope.prefix));
+                        markers.push((marker, pass_to_terminal));
                     },
                 }
             }
         }
 
         assert_eq!(text, b"beforeafter");
-        assert_eq!(
-            markers,
-            [
-                "VIVID;3;A;AAAAAAAAAAAAAAAAAAAAAA;0000000000000003;0000000000000007;AAAAAAAAAAAAAAAAAAAAAA"
-            ]
-        );
+        assert_eq!(markers, [(MARKER_BODY.to_owned(), envelope.pass_to_terminal)]);
         assert!(scanner.pending.is_empty());
     }
 
     #[test]
-    fn oversized_candidate_is_left_to_the_terminal_parser() {
-        let mut input = VIVID_MARKER_PREFIX.to_vec();
-        input.extend(std::iter::repeat_n(b'x', MAX_VIVID_MARKER_BYTES));
-        input.extend_from_slice(VIVID_MARKER_TERMINATOR);
-        let mut scanner = VividMarkerScanner::default();
-        let chunks = scanner.push(&input);
-        assert!(chunks.iter().all(|chunk| matches!(chunk, VividChunk::Bytes(_))));
+    fn printable_conpty_envelope_is_removed_instead_of_reaching_terminal_text() {
+        let mut input = CONPTY_VIVID_MARKER.prefix.to_vec();
+        input.extend_from_slice(MARKER_PAYLOAD);
+        input.extend_from_slice(CONPTY_VIVID_MARKER.terminator);
+        let chunks = VividMarkerScanner::default().push(&input);
+
+        assert!(matches!(chunks.as_slice(), [VividChunk::Marker { pass_to_terminal: false, .. }]));
+    }
+
+    #[test]
+    fn oversized_candidates_are_left_to_the_terminal_parser() {
+        for envelope in VIVID_MARKER_ENVELOPES {
+            let mut input = envelope.prefix.to_vec();
+            input.extend(std::iter::repeat_n(b'x', MAX_VIVID_MARKER_BYTES));
+            input.extend_from_slice(envelope.terminator);
+            let mut scanner = VividMarkerScanner::default();
+            let chunks = scanner.push(&input);
+            assert!(chunks.iter().all(|chunk| matches!(chunk, VividChunk::Bytes(_))));
+        }
     }
 }

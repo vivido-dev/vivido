@@ -201,7 +201,7 @@ not fit at end-of-line get a leading spacer cell when DECAWM is on.
 | XTSETTCAP | `DCS + p … ST` | ⚠️ | Parsed and hex-validated, then ignored — applications cannot change the identity. |
 | Sixel | `DCS … q … ST` | ⚠️ | Consumed cleanly (never rendered as garbage); no decoder yet. `terminal/graphics.rs` defines protocol-neutral `GraphicsCommand` extension points (Sixel/Kitty/custom) that nothing currently emits. |
 | Kitty graphics | `APC G … ST` | ⚠️ | Silently consumed by the parser; not rendered. |
-| **Vivid 1.5 anchors** | `ESC _ VIVID ; 3 ; … ST` (Windows: bare `VIVID;3;…;VIVID-END`) | ✅ | The authenticated media anchor is the only escape Vivido adds to the PTY stream. It is scanned in the event loop, attached to the cursor's grid position (`Event::VividMarker`), and drives the side-channel media pipeline (images/video/audio). Media bytes themselves never touch the PTY. |
+| **Vivid 1.5 anchors** | `ESC _ VIVID ; 3 ; … ST` (ConPTY path: bare `VIVID;3;…;VIVID-END`) | ✅ | The authenticated media anchor is the only escape Vivido adds to the PTY stream. The event loop accepts either bounded envelope so a remote Windows ConPTY hop can reach a macOS/Linux presenter, attaches the anchor to the cursor's grid position (`Event::VividMarker`), and drives the side-channel media pipeline (images/video/audio). Media bytes themselves never touch the PTY. |
 
 ## Input-side protocols (what Vivido sends)
 
