@@ -435,6 +435,11 @@ fn windows_keybindings() -> Vec<KeyBinding> {
 
 #[cfg(all(target_os = "macos", not(test)))]
 pub fn platform_key_bindings() -> Vec<KeyBinding> {
+    macos_keybindings()
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn macos_keybindings() -> Vec<KeyBinding> {
     bindings!(
         KeyBinding;
         Insert, ModifiersState::SHIFT, ~BindingMode::SEARCH; Action::Esc("\x1b[2;2~".into());
@@ -1324,6 +1329,32 @@ mod tests {
         assert!(binding.is_triggered_by(BindingMode::SEARCH, mods, &t));
         assert!(!binding.is_triggered_by(BindingMode::ALT_SCREEN, mods, &t));
         assert!(!binding.is_triggered_by(BindingMode::ALT_SCREEN | BindingMode::SEARCH, mods, &t));
+    }
+
+    #[test]
+    fn macos_number_shortcuts_select_matching_tabs_and_last_tab() {
+        let expected = [
+            ("1", Action::SelectTab1),
+            ("2", Action::SelectTab2),
+            ("3", Action::SelectTab3),
+            ("4", Action::SelectTab4),
+            ("5", Action::SelectTab5),
+            ("6", Action::SelectTab6),
+            ("7", Action::SelectTab7),
+            ("8", Action::SelectTab8),
+            ("9", Action::SelectLastTab),
+        ];
+        let bindings = macos_keybindings();
+
+        for (key, action) in expected {
+            let trigger =
+                BindingKey::Keycode { key: Key::Character(key.into()), location: KeyLocation::Any };
+            assert!(bindings.iter().any(|binding| {
+                binding.trigger == trigger
+                    && binding.mods == ModifiersState::SUPER
+                    && binding.action == action
+            }));
+        }
     }
 
     #[test]

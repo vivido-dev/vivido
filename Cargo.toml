@@ -123,15 +123,21 @@ objc2-foundation = { version = "0.3.1", default-features = false, features = [
   "NSUserDefaults",
 ] }
 objc2-app-kit = { version = "0.3.1", default-features = false, features = [
+  "objc2-core-foundation",
   "NSAccessibility",
   "NSAccessibilityConstants",
   "NSAccessibilityElement",
   "NSAccessibilityProtocols",
   "std",
   "NSColorSpace",
+  "NSControl",
+  "NSLayoutAnchor",
+  "NSLayoutConstraint",
   "NSResponder",
+  "NSTextField",
   "NSView",
   "NSWindow",
+  "NSWindowTab",
 ] }
 wgpu = { version = "29.0", default-features = false, features = [
   "metal",

@@ -15,8 +15,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 #[cfg(target_os = "macos")]
 use {
-    objc2::MainThreadMarker,
-    objc2_app_kit::{NSColorSpace, NSView},
+    objc2::{MainThreadMarker, rc::Retained},
+    objc2_app_kit::{NSColorSpace, NSTextField, NSView},
+    objc2_foundation::NSString,
     winit::platform::macos::{OptionAsAlt, WindowAttributesExtMacOS, WindowExtMacOS},
 };
 
@@ -208,6 +209,10 @@ pub struct Window {
     mouse_visible: bool,
     ime_inhibitor: ImeInhibitor,
     ime_cursor_area: Cell<Option<(PhysicalPosition<f64>, PhysicalSize<f64>)>>,
+    #[cfg(target_os = "macos")]
+    tab_shortcut_label: Option<Retained<NSTextField>>,
+    #[cfg(target_os = "macos")]
+    tab_shortcut: Option<u8>,
 }
 
 impl Window {
@@ -304,6 +309,10 @@ impl Window {
             backend: Backend::Winit(window),
             ime_inhibitor: Default::default(),
             ime_cursor_area: Cell::new(None),
+            #[cfg(target_os = "macos")]
+            tab_shortcut_label: None,
+            #[cfg(target_os = "macos")]
+            tab_shortcut: None,
         })
     }
 
@@ -333,6 +342,10 @@ impl Window {
             backend: Backend::Headless(headless),
             ime_inhibitor: Default::default(),
             ime_cursor_area: Cell::new(None),
+            #[cfg(target_os = "macos")]
+            tab_shortcut_label: None,
+            #[cfg(target_os = "macos")]
+            tab_shortcut: None,
         }
     }
 
@@ -358,6 +371,10 @@ impl Window {
             backend: Backend::Headless(embedded),
             ime_inhibitor: Default::default(),
             ime_cursor_area: Cell::new(None),
+            #[cfg(target_os = "macos")]
+            tab_shortcut_label: None,
+            #[cfg(target_os = "macos")]
+            tab_shortcut: None,
         }
     }
 
@@ -763,6 +780,57 @@ impl Window {
         view.window().unwrap().setHasShadow(has_shadows);
     }
 
+    /// Synchronize the native tab's right-aligned keyboard shortcut badge.
+    #[cfg(target_os = "macos")]
+    pub fn refresh_tab_shortcut_badge(&mut self) {
+        let Some(mtm) = MainThreadMarker::new() else { return };
+        let Some(RawWindowHandle::AppKit(handle)) = self.raw_window_handle() else {
+            return;
+        };
+
+        // SAFETY: Winit owns this NSView for the lifetime of the live window, and the main-thread
+        // marker above proves this AppKit access is occurring on the main thread.
+        let view = unsafe { handle.ns_view.cast::<NSView>().as_ref() };
+        let Some(window) = view.window() else { return };
+        let tab = window.tab();
+        let shortcut = window.tabbedWindows().and_then(|windows| {
+            let tab_count = windows.len();
+            (0..tab_count)
+                .find(|&index| {
+                    let candidate = windows.objectAtIndex(index);
+                    std::ptr::eq(&*candidate, &*window)
+                })
+                .and_then(|index| tab_shortcut(index, tab_count))
+        });
+
+        if self.tab_shortcut == shortcut {
+            return;
+        }
+
+        let Some(shortcut) = shortcut else {
+            tab.setAccessoryView(None);
+            self.tab_shortcut = None;
+            return;
+        };
+
+        let label = match &self.tab_shortcut_label {
+            Some(label) => {
+                label.setStringValue(&NSString::from_str(&format!("⌘{shortcut}")));
+                label
+            },
+            None => {
+                let label = NSTextField::labelWithString(&NSString::from_str("⌘8"), mtm);
+                let size = label.intrinsicContentSize();
+                label.widthAnchor().constraintEqualToConstant(size.width).setActive(true);
+                label.heightAnchor().constraintEqualToConstant(size.height).setActive(true);
+                label.setStringValue(&NSString::from_str(&format!("⌘{shortcut}")));
+                self.tab_shortcut_label.insert(label)
+            },
+        };
+        tab.setAccessoryView(Some(label));
+        self.tab_shortcut = Some(shortcut);
+    }
+
     /// Select tab at the given `index`.
     #[cfg(target_os = "macos")]
     pub fn select_tab_at_index(&self, index: usize) {
@@ -824,6 +892,22 @@ fn use_srgb_color_space(window: &WinitWindow) {
     view.window().unwrap().setColorSpace(Some(&NSColorSpace::sRGBColorSpace()));
 }
 
+/// Map a zero-based tab position to its browser-style Command-number shortcut.
+#[cfg(any(target_os = "macos", test))]
+fn tab_shortcut(index: usize, tab_count: usize) -> Option<u8> {
+    const POSITIONAL_SHORTCUTS: [u8; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
+
+    if index >= tab_count {
+        None
+    } else if let Some(shortcut) = POSITIONAL_SHORTCUTS.get(index) {
+        Some(*shortcut)
+    } else if index == tab_count - 1 {
+        Some(9)
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -853,5 +937,44 @@ mod tests {
         assert_eq!(input.cursor, CursorIcon::Pointer);
         assert!(input.cursor_visible);
         assert!(input.ime_allowed);
+    }
+
+    #[test]
+    fn tab_shortcuts_match_positions_through_nine_tabs() {
+        for tab_count in 1..=9 {
+            for index in 0..tab_count {
+                assert_eq!(tab_shortcut(index, tab_count), Some(u8::try_from(index + 1).unwrap()));
+            }
+        }
+    }
+
+    #[test]
+    fn tab_shortcuts_use_command_nine_for_last_tab_above_nine() {
+        let shortcuts: Vec<_> = (0..12).map(|index| tab_shortcut(index, 12)).collect();
+
+        assert_eq!(
+            shortcuts,
+            vec![
+                Some(1),
+                Some(2),
+                Some(3),
+                Some(4),
+                Some(5),
+                Some(6),
+                Some(7),
+                Some(8),
+                None,
+                None,
+                None,
+                Some(9),
+            ]
+        );
+    }
+
+    #[test]
+    fn tab_shortcuts_reject_empty_and_out_of_range_positions() {
+        assert_eq!(tab_shortcut(0, 0), None);
+        assert_eq!(tab_shortcut(3, 3), None);
+        assert_eq!(tab_shortcut(usize::MAX, usize::MAX), None);
     }
 }

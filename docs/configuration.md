@@ -430,6 +430,19 @@ Misc: `ClearHistory`, `ClearLogNotice`, `ReceiveChar`, `None`.
 
 > There is no vi mode, so vi-motion, vi-cursor, and vi-selection actions do not exist in Vivido.
 
+### Default macOS tab bindings
+
+| Keys | Action |
+|---|---|
+| `Command+T` | Create a new tab |
+| `Command+Tab` / `Command+Shift+Tab` | Select the next / previous tab |
+| `Command+1`…`Command+8` | Select the matching tab from the left |
+| `Command+9` | Select the last tab |
+
+When the native tab bar is visible, each reachable tab shows its shortcut at the right edge. With
+more than nine tabs, the first eight show `⌘1`…`⌘8`, the last shows `⌘9`, and intervening tabs have
+no number badge. The badges follow the current tab order after tabs are created, closed, or moved.
+
 ### Default search bindings
 
 | Keys | Action |
