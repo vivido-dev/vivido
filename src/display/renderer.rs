@@ -830,20 +830,24 @@ fn screenshot_layout(width: u32, height: u32) -> Result<(u32, u64), ScreenshotEr
 }
 
 fn surface_alpha_mode(alpha_modes: &[wgpu::CompositeAlphaMode]) -> wgpu::CompositeAlphaMode {
-    // DirectComposition reliably consumes premultiplied swapchains. Other window systems can
-    // consume Vello's straight-alpha output directly.
+    // Both transparent modes work; only the preferred one differs. DirectComposition reliably
+    // consumes premultiplied swapchains, while other window systems can consume Vello's
+    // straight-alpha output directly. Wayland and X11 compositors commonly offer only
+    // PreMultiplied, so accept it there too and let the blit premultiply on the way out.
     #[cfg(windows)]
-    let transparent_mode = wgpu::CompositeAlphaMode::PreMultiplied;
+    let preferences =
+        [wgpu::CompositeAlphaMode::PreMultiplied, wgpu::CompositeAlphaMode::PostMultiplied];
     #[cfg(not(windows))]
-    let transparent_mode = wgpu::CompositeAlphaMode::PostMultiplied;
-    if alpha_modes.contains(&transparent_mode) {
-        transparent_mode
-    } else {
-        wgpu::CompositeAlphaMode::Auto
-    }
+    let preferences =
+        [wgpu::CompositeAlphaMode::PostMultiplied, wgpu::CompositeAlphaMode::PreMultiplied];
+    preferences
+        .into_iter()
+        .find(|mode| alpha_modes.contains(mode))
+        .unwrap_or(wgpu::CompositeAlphaMode::Auto)
 }
 
-/// Convert Vello's straight-alpha surface blit into the premultiplied form DirectComposition uses.
+/// Convert Vello's straight-alpha surface blit into the premultiplied form that
+/// DirectComposition and premultiplied-only Wayland/X11 surfaces expect.
 fn premultiply_blend_state() -> wgpu::BlendState {
     wgpu::BlendState {
         color: wgpu::BlendComponent {
@@ -1052,10 +1056,10 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn windows_surface_uses_auto_without_premultiplied_alpha() {
+    fn windows_surface_falls_back_to_straight_alpha() {
         let modes = [CompositeAlphaMode::Opaque, CompositeAlphaMode::PostMultiplied];
 
-        assert_eq!(surface_alpha_mode(&modes), CompositeAlphaMode::Auto);
+        assert_eq!(surface_alpha_mode(&modes), CompositeAlphaMode::PostMultiplied);
     }
 
     #[cfg(not(windows))]
@@ -1066,8 +1070,24 @@ mod tests {
         assert_eq!(surface_alpha_mode(&modes), CompositeAlphaMode::PostMultiplied);
     }
 
+    #[cfg(not(windows))]
     #[test]
-    fn direct_composition_blit_premultiplies_rgb_and_preserves_alpha() {
+    fn non_windows_surface_accepts_premultiplied_alpha() {
+        // Wayland and X11 surfaces routinely advertise only this transparent mode.
+        let modes = [CompositeAlphaMode::Opaque, CompositeAlphaMode::PreMultiplied];
+
+        assert_eq!(surface_alpha_mode(&modes), CompositeAlphaMode::PreMultiplied);
+    }
+
+    #[test]
+    fn opaque_only_surface_uses_auto() {
+        let modes = [CompositeAlphaMode::Opaque];
+
+        assert_eq!(surface_alpha_mode(&modes), CompositeAlphaMode::Auto);
+    }
+
+    #[test]
+    fn premultiplied_blit_premultiplies_rgb_and_preserves_alpha() {
         let blend = premultiply_blend_state();
         assert_eq!(blend.color.src_factor, wgpu::BlendFactor::SrcAlpha);
         assert_eq!(blend.color.dst_factor, wgpu::BlendFactor::Zero);
