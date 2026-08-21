@@ -8,6 +8,8 @@ use std::path::Path;
 use std::process::{ExitCode, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use base64::Engine;
+
 #[path = "vvssh/askpass.rs"]
 mod askpass;
 
@@ -15,22 +17,35 @@ use askpass::CredentialBroker;
 
 const HELP: &str = r#"Forward the current Vivido window's Vivid endpoint over SSH.
 
-Usage: vvssh [SSH_OPTIONS] DESTINATION
+Usage: vvssh [SSH_OPTIONS] DESTINATION [REMOTE_SHELL [ARGUMENTS...]]
 
 vvssh option:
   --shared-media-transport    Carry media on the interactive SSH TCP connection (legacy mode).
   --separate-media-transport  Explicitly select the default independent media connection.
   --no-receive-drops          Do not start the optional remote vvreceive helper.
 
-All arguments are passed to ssh and DESTINATION must be the final argument. Connection options can
-also be placed in ~/.ssh/config. vvssh opens an interactive remote login shell; remote commands and
-options that suppress the remote session (such as -N, -T, and -W) are not supported.
+SSH connection options are passed through and can also be placed in ~/.ssh/config. vvssh opens an
+interactive remote login shell. A shell command may follow DESTINATION, for example `pwsh.exe` on a
+Windows SSH server. Options that suppress the remote session (such as -N, -T, and -W) are not
+supported.
 
 Examples:
   vvssh user@host
   vvssh -p 2222 user@host
   vvssh -J bastion user@host
+  vvssh user@windows-host pwsh.exe
 "#;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RemotePlatform {
+    Posix,
+    Windows,
+}
+
+struct SshInvocation {
+    connection: Vec<OsString>,
+    remote_shell: Vec<OsString>,
+}
 
 fn main() -> ExitCode {
     if askpass::is_helper() {
@@ -63,7 +78,7 @@ fn run() -> Result<u8, String> {
     }
     let separate_media = take_media_transport_flags(&mut arguments)?;
     let receive_drops = take_receive_drop_flag(&mut arguments);
-    validate_arguments(&arguments)?;
+    let invocation = parse_ssh_invocation(arguments)?;
 
     let endpoint = env::var("VIVID_ENDPOINT_CONTROL")
         .map_err(|_| "VIVID_ENDPOINT_CONTROL is not set; run vvssh inside Vivido".to_owned())?;
@@ -76,19 +91,20 @@ fn run() -> Result<u8, String> {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_nanos())
         .unwrap_or_default();
+    let ssh = env::var_os("VVSSH_SSH").unwrap_or_else(|| OsString::from("ssh"));
+    let credential_broker = CredentialBroker::new(std::process::id(), nonce)
+        .map_err(|error| format!("could not initialize SSH credential broker: {error}"))?;
+    let remote_platform = detect_remote_platform(&credential_broker, &ssh, &invocation.connection)?;
     let (setup_arguments, ssh_arguments, secret_file, bulk_arguments, bulk_socket) =
         build_ssh_arguments(
-            arguments,
+            invocation,
             &endpoint,
             std::process::id(),
             nonce,
             separate_media,
             receive_drops,
+            remote_platform,
         )?;
-
-    let ssh = env::var_os("VVSSH_SSH").unwrap_or_else(|| OsString::from("ssh"));
-    let credential_broker = CredentialBroker::new(std::process::id(), nonce)
-        .map_err(|error| format!("could not initialize SSH credential broker: {error}"))?;
     let mut setup_command = credential_broker.command(&ssh, "setup");
     let mut setup = setup_command
         .args(&setup_arguments)
@@ -104,11 +120,23 @@ fn run() -> Result<u8, String> {
     let setup_status =
         setup.wait().map_err(|error| format!("root-secret setup failed: {error}"))?;
     if let Err(error) = transfer_result {
-        let _ = cleanup_remote_secret(&credential_broker, &ssh, &setup_arguments, &secret_file);
+        let _ = cleanup_remote_secret(
+            &credential_broker,
+            &ssh,
+            &setup_arguments,
+            &secret_file,
+            remote_platform,
+        );
         return Err(format!("could not transfer Vivid root secret: {error}"));
     }
     if !setup_status.success() {
-        let _ = cleanup_remote_secret(&credential_broker, &ssh, &setup_arguments, &secret_file);
+        let _ = cleanup_remote_secret(
+            &credential_broker,
+            &ssh,
+            &setup_arguments,
+            &secret_file,
+            remote_platform,
+        );
         return Err("remote host rejected the protected Vivid root-secret setup channel".into());
     }
     let mut bulk = if let Some(arguments) = bulk_arguments {
@@ -124,6 +152,7 @@ fn run() -> Result<u8, String> {
                         &setup_arguments,
                         &secret_file,
                         bulk_socket.as_deref(),
+                        remote_platform,
                     );
                     return Err(format!("could not start separate media transport: {error}"));
                 },
@@ -144,6 +173,7 @@ fn run() -> Result<u8, String> {
                 &setup_arguments,
                 &secret_file,
                 bulk_socket.as_deref(),
+                remote_platform,
             );
             return Err(error);
         }
@@ -156,6 +186,7 @@ fn run() -> Result<u8, String> {
                 &setup_arguments,
                 &secret_file,
                 bulk_socket.as_deref(),
+                remote_platform,
             );
             return Err("separate media transport returned an invalid readiness marker".into());
         }
@@ -177,6 +208,7 @@ fn run() -> Result<u8, String> {
                 &setup_arguments,
                 &secret_file,
                 bulk_socket.as_deref(),
+                remote_platform,
             );
             return Err(format!("could not run {}: {error}", Path::new(&ssh).display()));
         },
@@ -192,6 +224,7 @@ fn run() -> Result<u8, String> {
         &setup_arguments,
         &secret_file,
         bulk_socket.as_deref(),
+        remote_platform,
     );
 
     Ok(status.code().and_then(|code| u8::try_from(code).ok()).unwrap_or(1))
@@ -230,32 +263,150 @@ fn take_receive_drop_flag(arguments: &mut Vec<OsString>) -> bool {
     receive
 }
 
-fn validate_arguments(arguments: &[OsString]) -> Result<(), String> {
+fn parse_ssh_invocation(arguments: Vec<OsString>) -> Result<SshInvocation, String> {
     if arguments.is_empty() {
         return Err("missing SSH destination; run `vvssh --help` for usage".into());
     }
-    if arguments.last().is_some_and(|argument| argument.to_string_lossy().starts_with('-')) {
-        return Err("missing final SSH destination; run `vvssh --help` for usage".into());
+
+    let mut index = 0;
+    let mut options_done = false;
+    while index < arguments.len() {
+        let argument = arguments[index].to_string_lossy();
+        if options_done || !argument.starts_with('-') || argument == "-" {
+            let connection = arguments[..=index].to_vec();
+            let remote_shell = arguments[index + 1..].to_vec();
+            return Ok(SshInvocation { connection, remote_shell });
+        }
+        if argument == "--" {
+            options_done = true;
+            index += 1;
+            continue;
+        }
+        if ssh_option_takes_value(&argument) && argument.len() == 2 {
+            index += 1;
+            if index == arguments.len() {
+                return Err(format!("SSH option {argument} requires an argument"));
+            }
+        }
+        index += 1;
     }
-    Ok(())
+
+    Err("missing SSH destination; run `vvssh --help` for usage".into())
+}
+
+fn ssh_option_takes_value(argument: &str) -> bool {
+    matches!(
+        argument.as_bytes().get(1),
+        Some(
+            b'B' | b'b'
+                | b'c'
+                | b'D'
+                | b'E'
+                | b'e'
+                | b'F'
+                | b'I'
+                | b'i'
+                | b'J'
+                | b'L'
+                | b'l'
+                | b'm'
+                | b'O'
+                | b'o'
+                | b'p'
+                | b'Q'
+                | b'R'
+                | b'S'
+                | b'W'
+                | b'w'
+        )
+    )
 }
 
 fn matches_argument(argument: &OsStr, candidates: &[&str]) -> bool {
     candidates.iter().any(|candidate| argument == OsStr::new(candidate))
 }
 
+fn detect_remote_platform(
+    credential_broker: &CredentialBroker,
+    ssh: &OsStr,
+    connection: &[OsString],
+) -> Result<RemotePlatform, String> {
+    let windows_status = remote_probe_status(
+        credential_broker,
+        ssh,
+        connection,
+        "probe-windows",
+        "cmd.exe /d /c exit 23",
+    )?;
+    if windows_status == Some(23) {
+        return Ok(RemotePlatform::Windows);
+    }
+
+    let posix_status =
+        remote_probe_status(credential_broker, ssh, connection, "probe-posix", "sh -c 'exit 24'")?;
+    if posix_status == Some(24) {
+        return Ok(RemotePlatform::Posix);
+    }
+
+    Err("could not identify the SSH server as POSIX or Windows".into())
+}
+
+fn remote_probe_status(
+    credential_broker: &CredentialBroker,
+    ssh: &OsStr,
+    connection: &[OsString],
+    context: &str,
+    remote_command: &str,
+) -> Result<Option<i32>, String> {
+    let mut arguments = connection.to_vec();
+    arguments.push(OsString::from(remote_command));
+    credential_broker
+        .command(ssh, context)
+        .args(arguments)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.code())
+        .map_err(|error| format!("could not probe remote SSH platform: {error}"))
+}
+
 type BuiltSshArguments =
     (Vec<OsString>, Vec<OsString>, String, Option<Vec<OsString>>, Option<String>);
 
 fn build_ssh_arguments(
-    passthrough: Vec<OsString>,
+    invocation: SshInvocation,
     endpoint: &str,
     process_id: u32,
     nonce: u128,
     separate_media: bool,
     receive_drops: bool,
+    remote_platform: RemotePlatform,
 ) -> Result<BuiltSshArguments, String> {
     let local_target = local_forward_target(endpoint)?;
+    match remote_platform {
+        RemotePlatform::Posix => build_posix_ssh_arguments(
+            invocation,
+            local_target,
+            process_id,
+            nonce,
+            separate_media,
+            receive_drops,
+        ),
+        RemotePlatform::Windows => {
+            build_windows_ssh_arguments(invocation, local_target, process_id, nonce, separate_media)
+        },
+    }
+}
+
+fn build_posix_ssh_arguments(
+    invocation: SshInvocation,
+    local_target: String,
+    process_id: u32,
+    nonce: u128,
+    separate_media: bool,
+    receive_drops: bool,
+) -> Result<BuiltSshArguments, String> {
     let remote_socket = format!("/tmp/vivido-vivid-{process_id}-{nonce}.sock");
     let secret_file = format!("/tmp/vivido-vivid-{process_id}-{nonce}.secret");
     let remote_endpoint = format!("unix:{remote_socket}");
@@ -281,15 +432,16 @@ fn build_ssh_arguments(
     // materialized terminfo database. Keep the richer entry when it is installed remotely and
     // otherwise select the compatible system entry before the login shell starts.
     let remote_term = "case \"${TERM-}\" in vivido|vivido-direct) if ! command -v infocmp >/dev/null 2>&1 || ! infocmp \"$TERM\" >/dev/null 2>&1; then TERM=xterm-256color; export TERM; fi;; esac; ";
+    let login_shell = posix_login_shell(&invocation.remote_shell)?;
     let remote_command = format!(
-        "VIVID_ROOT_SECRET=$(cat {}) && rm -f {} && export VIVID_ROOT_SECRET && export VIVID_REMOTE=1{anchor_transport} VIVID_ENDPOINT_CONTROL={}{media_environment}; {remote_term}{receiver}exec \"$SHELL\" -l",
+        "VIVID_ROOT_SECRET=$(cat {}) && rm -f {} && export VIVID_ROOT_SECRET && export VIVID_REMOTE=1{anchor_transport} VIVID_ENDPOINT_CONTROL={}{media_environment}; {remote_term}{receiver}{login_shell}",
         shell_quote(&secret_file),
         shell_quote(&secret_file),
         shell_quote(&remote_endpoint),
     );
     let remote_forward = format!("{remote_socket}:{local_target}");
 
-    let mut setup = passthrough.clone();
+    let mut setup = invocation.connection.clone();
     setup.push(OsString::from(format!("umask 077 && cat > {}", shell_quote(&secret_file))));
     let mut arguments = vec![
         OsString::from("-tt"),
@@ -302,7 +454,7 @@ fn build_ssh_arguments(
         OsString::from("-R"),
         OsString::from(remote_forward),
     ];
-    arguments.extend(passthrough);
+    arguments.extend(invocation.connection);
     arguments.push(OsString::from(remote_command));
     let bulk_arguments = bulk_socket.as_ref().map(|socket| {
         let remote_forward = format!("{socket}:{local_target}");
@@ -326,6 +478,163 @@ fn build_ssh_arguments(
         arguments
     });
     Ok((setup, arguments, secret_file, bulk_arguments, bulk_socket))
+}
+
+fn build_windows_ssh_arguments(
+    invocation: SshInvocation,
+    local_target: String,
+    process_id: u32,
+    nonce: u128,
+    separate_media: bool,
+) -> Result<BuiltSshArguments, String> {
+    let secret_directory = format!("vivido-vivid-{process_id}-{nonce}");
+    let (control_port, bulk_port) = windows_remote_ports(process_id, nonce);
+    let remote_endpoint = format!("tcp:127.0.0.1:{control_port}");
+    let bulk_endpoint = separate_media.then(|| format!("tcp:127.0.0.1:{bulk_port}"));
+    let setup_script = windows_setup_script(&secret_directory);
+    let remote_script = windows_login_script(
+        &secret_directory,
+        &remote_endpoint,
+        bulk_endpoint.as_deref(),
+        &invocation.remote_shell,
+    )?;
+
+    let mut setup = invocation.connection.clone();
+    setup.push(powershell_encoded_command(&setup_script));
+
+    let remote_forward = format!("127.0.0.1:{control_port}:{local_target}");
+    let mut arguments = vec![
+        OsString::from("-tt"),
+        OsString::from("-o"),
+        OsString::from("ExitOnForwardFailure=yes"),
+        OsString::from("-R"),
+        OsString::from(remote_forward),
+    ];
+    arguments.extend(invocation.connection.clone());
+    arguments.push(powershell_encoded_command(&remote_script));
+
+    let bulk_arguments = bulk_endpoint.as_ref().map(|_| {
+        let remote_forward = format!("127.0.0.1:{bulk_port}:{local_target}");
+        let mut arguments = vec![
+            OsString::from("-T"),
+            OsString::from("-o"),
+            OsString::from("ControlMaster=no"),
+            OsString::from("-o"),
+            OsString::from("ControlPath=none"),
+            OsString::from("-o"),
+            OsString::from("ExitOnForwardFailure=yes"),
+            OsString::from("-R"),
+            OsString::from(remote_forward),
+        ];
+        arguments.extend(invocation.connection);
+        arguments.push(powershell_encoded_command(
+            "$output=[Console]::OpenStandardOutput(); $marker=[Text.Encoding]::ASCII.GetBytes('VIVID-BULK-READY'); $output.Write($marker,0,$marker.Length); $output.Flush(); [Console]::OpenStandardInput().CopyTo([IO.Stream]::Null)",
+        ));
+        arguments
+    });
+
+    Ok((setup, arguments, secret_directory, bulk_arguments, bulk_endpoint))
+}
+
+fn posix_login_shell(remote_shell: &[OsString]) -> Result<String, String> {
+    if remote_shell.is_empty() {
+        return Ok("exec \"$SHELL\" -l".into());
+    }
+    let arguments = remote_shell
+        .iter()
+        .map(|argument| {
+            argument
+                .to_str()
+                .map(shell_quote)
+                .ok_or_else(|| "remote shell arguments must be valid UTF-8".to_owned())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(format!("exec {}", arguments.join(" ")))
+}
+
+fn windows_remote_ports(process_id: u32, nonce: u128) -> (u16, u16) {
+    const DYNAMIC_PORT_FIRST: u16 = 49_152;
+    const DYNAMIC_PORT_COUNT: u16 = 16_384;
+    let mixed = nonce ^ u128::from(process_id).rotate_left(31);
+    let control_offset = u16::try_from(mixed % u128::from(DYNAMIC_PORT_COUNT))
+        .expect("dynamic port offset is bounded to u16");
+    let mut bulk_offset = u16::try_from((mixed >> 14) % u128::from(DYNAMIC_PORT_COUNT))
+        .expect("dynamic port offset is bounded to u16");
+    if bulk_offset == control_offset {
+        bulk_offset = (bulk_offset + 1) % DYNAMIC_PORT_COUNT;
+    }
+    (DYNAMIC_PORT_FIRST + control_offset, DYNAMIC_PORT_FIRST + bulk_offset)
+}
+
+fn windows_setup_script(secret_directory: &str) -> String {
+    let directory = powershell_quote(secret_directory);
+    format!(
+        "$ErrorActionPreference='Stop'; \
+         $directory=Join-Path ([IO.Path]::GetTempPath()) {directory}; \
+         [IO.Directory]::CreateDirectory($directory) | Out-Null; \
+         $sid=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value; \
+         & (Join-Path $env:SystemRoot 'System32\\icacls.exe') $directory '/inheritance:r' '/grant:r' ('*'+$sid+':(OI)(CI)(F)') | Out-Null; \
+         if ($LASTEXITCODE -ne 0) {{ throw 'could not protect Vivid secret directory' }}; \
+         $path=Join-Path $directory 'root.secret'; \
+         $file=[IO.File]::Open($path,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None); \
+         try {{ [Console]::OpenStandardInput().CopyTo($file) }} finally {{ $file.Dispose() }}"
+    )
+}
+
+fn windows_login_script(
+    secret_directory: &str,
+    control_endpoint: &str,
+    bulk_endpoint: Option<&str>,
+    remote_shell: &[OsString],
+) -> Result<String, String> {
+    let directory = powershell_quote(secret_directory);
+    let control_endpoint = powershell_quote(control_endpoint);
+    let media_environment = bulk_endpoint
+        .map(|endpoint| {
+            let endpoint = powershell_quote(endpoint);
+            format!(
+                "$env:VIVID_ENDPOINT_REALTIME={endpoint}; $env:VIVID_ENDPOINT_BULK={endpoint}; "
+            )
+        })
+        .unwrap_or_default();
+    let launch = if remote_shell.is_empty() {
+        "$shell=(Get-ItemProperty -LiteralPath 'HKLM:\\SOFTWARE\\OpenSSH' -Name DefaultShell -ErrorAction SilentlyContinue).DefaultShell; if ([string]::IsNullOrWhiteSpace($shell)) { $shell=$env:COMSPEC }; & $shell"
+            .to_owned()
+    } else {
+        let arguments = remote_shell
+            .iter()
+            .map(|argument| {
+                argument
+                    .to_str()
+                    .map(powershell_quote)
+                    .ok_or_else(|| "remote shell arguments must be valid UTF-8".to_owned())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        format!("& {}", arguments.join(" "))
+    };
+    Ok(format!(
+        "$ErrorActionPreference='Stop'; \
+         $directory=Join-Path ([IO.Path]::GetTempPath()) {directory}; \
+         $path=Join-Path $directory 'root.secret'; \
+         try {{ $secret=[IO.File]::ReadAllText($path) }} finally {{ Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue }}; \
+         if ([string]::IsNullOrEmpty($secret)) {{ throw 'empty Vivid root secret' }}; \
+         $env:VIVID_ROOT_SECRET=$secret; $secret=$null; \
+         $env:VIVID_REMOTE='1'; $env:VIVID_ANCHOR_TRANSPORT='conpty'; \
+         $env:VIVID_ENDPOINT_CONTROL={control_endpoint}; \
+         {media_environment}{launch}; exit $LASTEXITCODE"
+    ))
+}
+
+fn powershell_encoded_command(script: &str) -> OsString {
+    let bytes = script.encode_utf16().flat_map(u16::to_le_bytes).collect::<Vec<_>>();
+    let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+    OsString::from(format!(
+        "powershell.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand {encoded}"
+    ))
+}
+
+fn powershell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
 }
 
 fn local_forward_target(endpoint: &str) -> Result<String, String> {
@@ -360,9 +669,10 @@ fn cleanup_remote_secret(
     ssh: &OsStr,
     setup_arguments: &[OsString],
     secret_file: &str,
+    remote_platform: RemotePlatform,
 ) -> Result<(), String> {
     let mut arguments = setup_arguments[..setup_arguments.len().saturating_sub(1)].to_vec();
-    arguments.push(OsString::from(format!("rm -f {}", shell_quote(secret_file))));
+    arguments.push(cleanup_remote_command(secret_file, None, remote_platform));
     credential_broker
         .command(ssh, "cleanup")
         .args(arguments)
@@ -377,16 +687,37 @@ fn cleanup_remote_paths(
     setup_arguments: &[OsString],
     secret_file: &str,
     bulk_socket: Option<&str>,
+    remote_platform: RemotePlatform,
 ) -> Result<(), String> {
     let mut arguments = setup_arguments[..setup_arguments.len().saturating_sub(1)].to_vec();
-    let bulk = bulk_socket.map(|socket| format!(" {}", shell_quote(socket))).unwrap_or_default();
-    arguments.push(OsString::from(format!("rm -f {}{bulk}", shell_quote(secret_file))));
+    arguments.push(cleanup_remote_command(secret_file, bulk_socket, remote_platform));
     credential_broker
         .command(ssh, "cleanup")
         .args(arguments)
         .status()
         .map(|_| ())
         .map_err(|error| format!("could not clean remote Vivid paths: {error}"))
+}
+
+fn cleanup_remote_command(
+    secret_file: &str,
+    bulk_socket: Option<&str>,
+    remote_platform: RemotePlatform,
+) -> OsString {
+    match remote_platform {
+        RemotePlatform::Posix => {
+            let bulk =
+                bulk_socket.map(|socket| format!(" {}", shell_quote(socket))).unwrap_or_default();
+            OsString::from(format!("rm -f {}{bulk}", shell_quote(secret_file)))
+        },
+        RemotePlatform::Windows => {
+            let directory = powershell_quote(secret_file);
+            powershell_encoded_command(&format!(
+                "$directory=Join-Path ([IO.Path]::GetTempPath()) {directory}; \
+                 Remove-Item -LiteralPath $directory -Recurse -Force -ErrorAction SilentlyContinue"
+            ))
+        },
+    }
 }
 
 fn shell_quote(value: &str) -> String {
@@ -397,16 +728,35 @@ fn shell_quote(value: &str) -> String {
 mod tests {
     use super::*;
 
+    fn invocation(connection: &[&str], remote_shell: &[&str]) -> SshInvocation {
+        SshInvocation {
+            connection: connection.iter().map(OsString::from).collect(),
+            remote_shell: remote_shell.iter().map(OsString::from).collect(),
+        }
+    }
+
+    fn decoded_powershell_script(command: &OsStr) -> String {
+        let command = command.to_string_lossy();
+        let encoded = command.split_whitespace().last().unwrap();
+        let bytes = base64::engine::general_purpose::STANDARD.decode(encoded).unwrap();
+        let utf16 = bytes
+            .chunks_exact(2)
+            .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
+            .collect::<Vec<_>>();
+        String::from_utf16(&utf16).unwrap()
+    }
+
     #[cfg(unix)]
     #[test]
     fn builds_private_stream_local_forward() {
         let (_, arguments, secret_file, _, _) = build_ssh_arguments(
-            vec![OsString::from("-p"), OsString::from("2222"), OsString::from("user@host")],
+            invocation(&["-p", "2222", "user@host"], &[]),
             "unix:/private/tmp/vivido/endpoint.sock",
             42,
             99,
             false,
             true,
+            RemotePlatform::Posix,
         )
         .unwrap();
         let arguments =
@@ -429,14 +779,15 @@ mod tests {
     }
 
     #[test]
-    fn builds_windows_loopback_tcp_destination() {
+    fn builds_posix_forward_to_local_windows_loopback_destination() {
         let (_, arguments, _, _, _) = build_ssh_arguments(
-            vec![OsString::from("host")],
+            invocation(&["host"], &[]),
             "tcp:127.0.0.1:1234",
             1,
             2,
             false,
             true,
+            RemotePlatform::Posix,
         )
         .unwrap();
         let arguments =
@@ -450,12 +801,13 @@ mod tests {
     #[test]
     fn rejects_non_loopback_tcp_endpoints() {
         let error = build_ssh_arguments(
-            vec![OsString::from("host")],
+            invocation(&["host"], &[]),
             "tcp:192.0.2.1:1234",
             1,
             2,
             false,
             true,
+            RemotePlatform::Posix,
         )
         .unwrap_err();
         assert!(error.contains("not IPv4 loopback"));
@@ -474,21 +826,34 @@ mod tests {
     }
 
     #[test]
-    fn requires_final_destination() {
-        assert!(validate_arguments(&[]).is_err());
-        assert!(validate_arguments(&[OsString::from("-v")]).is_err());
-        assert!(validate_arguments(&[OsString::from("-v"), OsString::from("host")]).is_ok());
+    fn parses_destination_and_optional_remote_shell_like_ssh() {
+        assert!(parse_ssh_invocation(Vec::new()).is_err());
+        assert!(parse_ssh_invocation(vec![OsString::from("-v")]).is_err());
+
+        let parsed = parse_ssh_invocation(
+            ["-p", "2222", "wensh@host", "pwsh.exe", "-Login"]
+                .into_iter()
+                .map(OsString::from)
+                .collect(),
+        )
+        .unwrap();
+        assert_eq!(
+            parsed.connection,
+            [OsString::from("-p"), OsString::from("2222"), OsString::from("wensh@host")]
+        );
+        assert_eq!(parsed.remote_shell, [OsString::from("pwsh.exe"), OsString::from("-Login")]);
     }
 
     #[test]
-    fn separate_media_transport_is_distinct_and_exported() {
+    fn posix_separate_media_transport_is_distinct_and_exported() {
         let (_, interactive, _, bulk, bulk_socket) = build_ssh_arguments(
-            vec![OsString::from("user@host")],
+            invocation(&["user@host"], &[]),
             "tcp:127.0.0.1:4321",
             7,
             9,
             true,
             true,
+            RemotePlatform::Posix,
         )
         .unwrap();
         let interactive =
@@ -524,12 +889,13 @@ mod tests {
     #[test]
     fn receiver_is_backgrounded_before_exec_and_can_be_disabled() {
         let (_, enabled, _, _, _) = build_ssh_arguments(
-            vec![OsString::from("host")],
+            invocation(&["host"], &[]),
             "tcp:127.0.0.1:4321",
             7,
             9,
             false,
             true,
+            RemotePlatform::Posix,
         )
         .unwrap();
         let command = enabled.last().unwrap().to_string_lossy();
@@ -541,12 +907,13 @@ mod tests {
         assert!(command.ends_with("exec \"$SHELL\" -l"));
 
         let (_, disabled, _, _, _) = build_ssh_arguments(
-            vec![OsString::from("host")],
+            invocation(&["host"], &[]),
             "tcp:127.0.0.1:4321",
             7,
             9,
             false,
             false,
+            RemotePlatform::Posix,
         )
         .unwrap();
         assert!(!disabled.last().unwrap().to_string_lossy().contains("vvreceive"));
@@ -559,17 +926,76 @@ mod tests {
     #[test]
     fn remote_shell_falls_back_when_vivido_terminfo_is_unavailable() {
         let (_, arguments, _, _, _) = build_ssh_arguments(
-            vec![OsString::from("host")],
+            invocation(&["host"], &[]),
             "tcp:127.0.0.1:4321",
             7,
             9,
             false,
             false,
+            RemotePlatform::Posix,
         )
         .unwrap();
         let command = arguments.last().unwrap().to_string_lossy();
         assert!(command.contains("case \"${TERM-}\" in vivido|vivido-direct)"));
         assert!(command.contains("infocmp \"$TERM\""));
         assert!(command.contains("TERM=xterm-256color; export TERM"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn windows_server_uses_loopback_tcp_forward_and_powershell_bootstrap() {
+        let (setup, interactive, secret_directory, bulk, bulk_endpoint) = build_ssh_arguments(
+            invocation(&["wensh@192.168.2.246"], &["pwsh.exe"]),
+            "unix:/private/tmp/vivido/endpoint.sock",
+            42,
+            99,
+            true,
+            true,
+            RemotePlatform::Windows,
+        )
+        .unwrap();
+        let (control_port, bulk_port) = windows_remote_ports(42, 99);
+
+        assert!(interactive.iter().any(|argument| {
+            argument
+                .to_string_lossy()
+                .contains(&format!("127.0.0.1:{control_port}:/private/tmp/vivido/endpoint.sock"))
+        }));
+        assert!(
+            !interactive
+                .iter()
+                .any(|argument| { argument.to_string_lossy().contains("StreamLocalBind") })
+        );
+        let setup_script = decoded_powershell_script(setup.last().unwrap());
+        assert!(setup_script.contains("icacls.exe"));
+        assert!(setup_script.contains("/inheritance:r"));
+        assert!(setup_script.contains("OpenStandardInput"));
+        assert!(setup_script.contains(&secret_directory));
+
+        let login_script = decoded_powershell_script(interactive.last().unwrap());
+        assert!(login_script.contains(&format!("tcp:127.0.0.1:{control_port}")));
+        assert!(login_script.contains("$env:VIVID_ROOT_SECRET=$secret"));
+        assert!(login_script.contains("$env:VIVID_ANCHOR_TRANSPORT='conpty'"));
+        assert!(login_script.contains("& 'pwsh.exe'"));
+        assert!(!login_script.contains("0123abcd"));
+
+        let bulk = bulk.unwrap();
+        assert!(bulk.iter().any(|argument| {
+            argument
+                .to_string_lossy()
+                .contains(&format!("127.0.0.1:{bulk_port}:/private/tmp/vivido/endpoint.sock"))
+        }));
+        assert_eq!(bulk_endpoint.unwrap(), format!("tcp:127.0.0.1:{bulk_port}"));
+        let bulk_script = decoded_powershell_script(bulk.last().unwrap());
+        assert!(bulk_script.contains("VIVID-BULK-READY"));
+    }
+
+    #[test]
+    fn remote_shell_arguments_are_quoted_for_each_platform() {
+        assert_eq!(
+            posix_login_shell(&[OsString::from("fish"), OsString::from("a'b")]).unwrap(),
+            "exec 'fish' 'a'\\''b'"
+        );
+        assert_eq!(powershell_quote("a'b"), "'a''b'");
     }
 }
