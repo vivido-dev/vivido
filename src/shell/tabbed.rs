@@ -239,6 +239,16 @@ impl TabbedApplication {
         self.update_chrome_title();
     }
 
+    #[cfg(windows)]
+    fn focus_active_pane(&mut self) {
+        let Some(active) = active_pane_for_chrome_focus(self.tabs.active_window()) else {
+            return;
+        };
+        if let Some(host) = self.host() {
+            host.focus(&mut self.processor, active);
+        }
+    }
+
     fn update_chrome_title(&self) {
         if let (Some(chrome), Some(tab)) = (&self.chrome, self.tabs.active()) {
             chrome.set_title(&tab.title);
@@ -759,10 +769,18 @@ impl TabbedApplication {
             {
                 self.click_chrome(event_loop)
             },
+            #[cfg(windows)]
+            WindowEvent::Focused(true) => {
+                // The integrated chrome is the top-level activation target, while keyboard input
+                // belongs to its active child pane. Windows can return focus to the chrome after
+                // an application-mode transition; hand it straight back so the next key is not
+                // discarded until a tab switch happens to call `SetFocus`.
+                self.focus_active_pane();
+            },
+            #[cfg(windows)]
+            WindowEvent::Focused(false) => {},
+            #[cfg(target_os = "linux")]
             WindowEvent::Focused(focused) => {
-                #[cfg(windows)]
-                let _ = focused;
-                #[cfg(target_os = "linux")]
                 if let Some(active) = self.tabs.active_window() {
                     self.processor.set_embedded_window_focused(active, focused);
                 }
@@ -773,6 +791,11 @@ impl TabbedApplication {
             _ => (),
         }
     }
+}
+
+#[cfg(windows)]
+fn active_pane_for_chrome_focus(active: Option<WindowId>) -> Option<WindowId> {
+    active
 }
 
 fn resize_direction_at(
@@ -868,5 +891,18 @@ impl ApplicationHandler<Event> for TabbedApplication {
         self.accessibility = None;
         self.chrome = None;
         self.chrome_id = None;
+    }
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn focused_chrome_hands_keyboard_focus_to_the_active_pane() {
+        let active = WindowId::from(7);
+
+        assert_eq!(active_pane_for_chrome_focus(Some(active)), Some(active));
+        assert_eq!(active_pane_for_chrome_focus(None), None);
     }
 }
