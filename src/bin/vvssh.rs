@@ -527,8 +527,11 @@ fn build_windows_ssh_arguments(
             OsString::from(remote_forward),
         ];
         arguments.extend(invocation.connection);
+        // The SSH session owns this helper's lifetime. Waiting on stdin made the Windows forward
+        // disappear when that incidental stream reached EOF even though the interactive session
+        // was still live; the next track generation then saw WSAECONNREFUSED.
         arguments.push(powershell_encoded_command(
-            "$output=[Console]::OpenStandardOutput(); $marker=[Text.Encoding]::ASCII.GetBytes('VIVID-BULK-READY'); $output.Write($marker,0,$marker.Length); $output.Flush(); [Console]::OpenStandardInput().CopyTo([IO.Stream]::Null)",
+            "$output=[Console]::OpenStandardOutput(); $marker=[Text.Encoding]::ASCII.GetBytes('VIVID-BULK-READY'); $output.Write($marker,0,$marker.Length); $output.Flush(); [Threading.Thread]::Sleep([Threading.Timeout]::Infinite)",
         ));
         arguments
     });
@@ -988,6 +991,8 @@ mod tests {
         assert_eq!(bulk_endpoint.unwrap(), format!("tcp:127.0.0.1:{bulk_port}"));
         let bulk_script = decoded_powershell_script(bulk.last().unwrap());
         assert!(bulk_script.contains("VIVID-BULK-READY"));
+        assert!(bulk_script.contains("Sleep([Threading.Timeout]::Infinite)"));
+        assert!(!bulk_script.contains("OpenStandardInput"));
     }
 
     #[test]
