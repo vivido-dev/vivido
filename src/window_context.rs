@@ -125,6 +125,7 @@ pub struct WindowContext {
     pub display: Display,
     pub dirty: bool,
     event_queue: Vec<WinitEvent<Event>>,
+    #[cfg(any(target_os = "linux", windows))]
     event_proxy: EventProxy,
     terminal: Arc<FairMutex<Term<EventProxy>>>,
     cursor_blink_timed_out: bool,
@@ -368,6 +369,7 @@ impl WindowContext {
         Ok(WindowContext {
             preserve_title,
             terminal,
+            #[cfg(any(target_os = "linux", windows))]
             event_proxy,
             #[cfg(any(target_os = "macos", target_os = "linux", windows))]
             accessibility,

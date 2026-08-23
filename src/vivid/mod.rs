@@ -5957,12 +5957,24 @@ mod tests {
     }
 
     fn connect(service: &VividService) -> vivid_sdk::Session {
-        vivid_sdk::Session::connect(ProducerConfig {
+        vivid_sdk::Session::connect(test_config(service)).unwrap()
+    }
+
+    /// A producer config pinned to one test presenter on every endpoint.
+    ///
+    /// Only the control endpoint is passed explicitly by callers; the SDK resolves the others
+    /// from `VIVID_ENDPOINT_*` before it falls back to control, so a suite running inside a live
+    /// Vivid session would otherwise open its bulk and realtime connections against the real
+    /// presenter that session belongs to.
+    fn test_config(service: &VividService) -> ProducerConfig {
+        ProducerConfig {
             endpoint_control: Some(service.control_endpoint().to_owned()),
+            endpoint_interactive: Some(service.control_endpoint().to_owned()),
+            endpoint_bulk: Some(service.control_endpoint().to_owned()),
+            endpoint_realtime: Some(service.control_endpoint().to_owned()),
             authentication: ProducerAuthentication::root_hex(service.root_secret()).unwrap(),
             ..ProducerConfig::default()
-        })
-        .unwrap()
+        }
     }
 
     /// Connect a receiver that offers `file-drop-path-v1` the way `vvreceive` does.
@@ -5974,11 +5986,9 @@ mod tests {
         ];
         required.sort();
         vivid_sdk::Session::connect(ProducerConfig {
-            endpoint_control: Some(service.control_endpoint().to_owned()),
-            authentication: ProducerAuthentication::root_hex(service.root_secret()).unwrap(),
             required_profiles: required,
             optional_profiles: vec![registry::FILE_DROP_PATH.to_owned()],
-            ..ProducerConfig::default()
+            ..test_config(service)
         })
         .unwrap()
     }
@@ -6019,6 +6029,126 @@ mod tests {
         assert!(!offered.contains(&registry::FILE_DROP_PATH));
         service.set_remote_drop_paste(true);
         assert!(service.shared.offered_profiles().contains(&registry::FILE_DROP_PATH));
+    }
+
+    /// End-to-end: a pasted image reaches a `vvreceive`-shaped receiver and its committed path
+    /// comes back out of the presenter's paste queue.
+    #[test]
+    fn a_pasted_image_queues_the_committed_remote_path() {
+        use vivid_protocol::file_drop::{
+            DEFAULT_ACTIVE_FILE_TRANSFERS, DEFAULT_FILE_DROP_ACCEPTANCE_US,
+            DEFAULT_FILE_TRANSFER_IDLE_US, DEFAULT_PENDING_FILE_DROPS, FileDropDestination,
+            FileResult, FileResultCode,
+        };
+        use vivid_protocol::revision::FileTransferGeneration;
+        use vivid_sdk::{
+            AcceptFileDrop, FileDropBindingGuard, IncomingFileTransferEvent,
+            IncomingFileTransferRequest,
+        };
+
+        let service =
+            socket_service!(VividService::start_with_wake(test_geometry(), Arc::new(|_| {})));
+        let session = connect_file_drop_receiver(&service);
+        assert!(session.supports(registry::FILE_DROP_PATH), "path profile must negotiate");
+
+        let mut binding = FileDropBindingGuard::new();
+        let request = binding
+            .enable(
+                session.info().root_context_id,
+                0,
+                SurfaceGeneration::ZERO,
+                FileDropDestination::ShellCwd,
+                1 << 20,
+                DEFAULT_PENDING_FILE_DROPS,
+                DEFAULT_ACTIVE_FILE_TRANSFERS,
+                64 * 1024,
+                DEFAULT_FILE_DROP_ACCEPTANCE_US,
+                DEFAULT_FILE_TRANSFER_IDLE_US,
+            )
+            .unwrap();
+        let grant = session.set_file_drop_binding(&request, &RequestMetadata::default()).unwrap();
+        binding.handle_bound(grant).unwrap();
+
+        let payload = b"pasted image bytes".to_vec();
+        assert_eq!(
+            service.handle_pasted_bytes("pasted-image.png".to_owned(), payload.clone()),
+            file_drop::LocalDropDisposition::Offered,
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let offer = loop {
+            assert!(Instant::now() < deadline, "no file-drop offer arrived");
+            match session.take_event().unwrap() {
+                Some(SessionEvent::FileDropOffered(offer)) => break offer,
+                _ => std::thread::sleep(Duration::from_millis(5)),
+            }
+        };
+
+        let transfer_id = session.allocate_id().unwrap();
+        session
+            .accept_file_drop(
+                AcceptFileDrop {
+                    binding: offer.binding,
+                    transfer_id,
+                    transfer_generation: FileTransferGeneration::ONE,
+                    maximum_record_body: 64 * 1024,
+                    initial_maximum_body_bytes: 1 << 20,
+                    initial_maximum_records: 32,
+                },
+                &RequestMetadata::default(),
+            )
+            .unwrap();
+
+        let mut channel = session
+            .open_incoming_file_transfer(IncomingFileTransferRequest {
+                context_id: offer.binding.context_id,
+                surface_id: offer.binding.surface_id,
+                producer_epoch: offer.binding.producer_epoch,
+                grant_generation: offer.binding.grant_generation,
+                surface_generation: offer.binding.surface_generation,
+                drop_id: offer.binding.drop_id,
+                transfer_id,
+                transfer_generation: FileTransferGeneration::ONE,
+                resume_offset: 0,
+                declared_length: offer.declared_length,
+                maximum_record_body: 64 * 1024,
+                maximum_body_bytes: 1 << 20,
+                maximum_records: 32,
+            })
+            .unwrap();
+
+        let mut received = Vec::new();
+        loop {
+            match channel.read_event().unwrap() {
+                IncomingFileTransferEvent::Data { bytes, .. } => received.extend_from_slice(&bytes),
+                IncomingFileTransferEvent::Finished(_) => break,
+                IncomingFileTransferEvent::Aborted(_) => panic!("transfer aborted"),
+            }
+        }
+        assert_eq!(received, payload);
+
+        let committed = "/home/tester/pasted-image.png".to_owned();
+        channel
+            .send_result(&FileResult {
+                transfer_id,
+                transfer_generation: FileTransferGeneration::ONE,
+                result: FileResultCode::Committed,
+                committed_length: offer.declared_length,
+                final_name: "pasted-image.png".to_owned(),
+                committed_path: Some(committed.clone()),
+            })
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let pastes = loop {
+            let pastes = service.take_file_drop_pastes();
+            if !pastes.is_empty() {
+                break pastes;
+            }
+            assert!(Instant::now() < deadline, "the committed path was never queued");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(pastes, vec![format!("{committed} ")]);
     }
 
     #[test]
@@ -7123,11 +7253,7 @@ mod tests {
     fn live_resize_reaches_the_sdk_as_a_same_generation_final_settle() {
         let service =
             socket_service!(VividService::start_with_wake(test_geometry(), Arc::new(|_| {})));
-        let config = ProducerConfig {
-            endpoint_control: Some(service.control_endpoint().to_owned()),
-            authentication: ProducerAuthentication::root_hex(service.root_secret()).unwrap(),
-            ..ProducerConfig::default()
-        };
+        let config = test_config(&service);
         let mut session = vivid_sdk::Session::connect(config).unwrap();
         let generation = service
             .update_metrics(DisplayGeometry {
@@ -7560,12 +7686,10 @@ mod tests {
         ];
         required.sort();
         vivid_sdk::Session::connect(ProducerConfig {
-            endpoint_control: Some(service.control_endpoint().to_owned()),
-            authentication: ProducerAuthentication::root_hex(service.root_secret()).unwrap(),
             target_profile: registry::DESKTOP_SURFACE.to_owned(),
             required_profiles: required,
             optional_profiles: vec![registry::OBSERVABILITY.to_owned()],
-            ..ProducerConfig::default()
+            ..test_config(service)
         })
         .unwrap()
     }
@@ -7585,12 +7709,10 @@ mod tests {
             vec![registry::OBSERVABILITY.to_owned(), registry::WEB_CARRIER.to_owned()];
         optional.sort();
         let session = vivid_sdk::Session::connect(ProducerConfig {
-            endpoint_control: Some(service.control_endpoint().to_owned()),
-            authentication: ProducerAuthentication::root_hex(service.root_secret()).unwrap(),
             target_profile: registry::DESKTOP_SURFACE.to_owned(),
             required_profiles: required,
             optional_profiles: optional,
-            ..ProducerConfig::default()
+            ..test_config(&service)
         })
         .unwrap();
         let info = session.info();
@@ -7716,12 +7838,7 @@ mod tests {
         // Stage 1 D1: a window presents exactly one target profile.
         let service = socket_service!(desktop_service());
         assert!(
-            vivid_sdk::Session::connect(ProducerConfig {
-                endpoint_control: Some(service.control_endpoint().to_owned()),
-                authentication: ProducerAuthentication::root_hex(service.root_secret()).unwrap(),
-                ..ProducerConfig::default()
-            })
-            .is_err(),
+            vivid_sdk::Session::connect(test_config(&service)).is_err(),
             "a terminal-surface-v1 producer must be refused by a desktop window"
         );
     }
@@ -7910,7 +8027,6 @@ mod tests {
         secret: &Secret32,
     ) -> io::Result<vivid_sdk::Session> {
         vivid_sdk::Session::connect(ProducerConfig {
-            endpoint_control: Some(service.control_endpoint().to_owned()),
             authentication: ProducerAuthentication::LeaseActivation {
                 context_id,
                 lease_id,
@@ -7918,7 +8034,7 @@ mod tests {
                 attempt_id: [0x77; 16],
                 proof_of_possession: None,
             },
-            ..ProducerConfig::default()
+            ..test_config(service)
         })
     }
 
