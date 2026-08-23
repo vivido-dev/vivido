@@ -738,6 +738,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn decoded_powershell_script(command: &OsStr) -> String {
         let command = command.to_string_lossy();
         let encoded = command.split_whitespace().last().unwrap();

@@ -77,17 +77,28 @@ impl AccessibilityState {
         self.adapter.process_event(window, event);
     }
 
+    /// Whether an assistive-technology client has requested this window's tree.
+    #[cfg(windows)]
+    pub(crate) fn should_sync(&self, visible: bool) -> bool {
+        should_sync(self.active.load(Ordering::Acquire), visible)
+    }
+
     pub(crate) fn update(&mut self, snapshot: AccessibilitySnapshot) {
         if snapshot == self.last_snapshot {
             return;
         }
-        self.last_snapshot = snapshot.clone();
         let update = build_tree(&snapshot, self.target);
+        self.last_snapshot = snapshot;
         *self.latest.lock().unwrap() = update.clone();
         if self.active.load(Ordering::Acquire) {
             self.adapter.update_if_active(|| update);
         }
     }
+}
+
+#[cfg(windows)]
+fn should_sync(active: bool, visible: bool) -> bool {
+    active && visible
 }
 
 fn line_id(index: usize) -> NodeId {
@@ -207,5 +218,14 @@ mod tests {
         assert_eq!(update.nodes.len(), 1);
         assert_eq!(update.nodes[0].0, WINDOW_ID);
         assert!(update.nodes[0].1.children().is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn terminal_document_sync_requires_an_active_client_and_visible_pane() {
+        assert!(!should_sync(false, true));
+        assert!(!should_sync(true, false));
+        assert!(!should_sync(false, false));
+        assert!(should_sync(true, true));
     }
 }

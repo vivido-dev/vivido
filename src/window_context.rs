@@ -1530,6 +1530,16 @@ impl WindowContext {
     #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
     pub fn sync_accessibility(&mut self) {
         let Some(accessibility) = &mut self.accessibility else { return };
+
+        // A retained terminal document carries per-cell text geometry for the entire scrollback.
+        // On Windows, rebuilding it without a UI Automation client made every event-loop turn
+        // proportional to the history size. AccessKit's Windows adapter also does not report
+        // deactivation, so a hidden tab that was inspected once must be excluded explicitly.
+        #[cfg(windows)]
+        if !accessibility.should_sync(self.display.window.is_visible() != Some(false)) {
+            return;
+        }
+
         let terminal = self.terminal.lock();
         let snapshot = AccessibilitySnapshot::new(
             &terminal,
