@@ -114,8 +114,13 @@ impl TabbedApplication {
         }
         #[cfg(windows)]
         {
-            attributes =
-                attributes.with_clip_children(true).with_undecorated_shadow(self.draw_controls);
+            // Chrome is presented through DirectComposition. An HWND redirection bitmap would
+            // retain an opaque copy of the initial client area underneath that visual, making
+            // transparency appear only in regions exposed by a later resize.
+            attributes = attributes
+                .with_no_redirection_bitmap(true)
+                .with_clip_children(true)
+                .with_undecorated_shadow(self.draw_controls);
         }
         let chrome = Arc::new(event_loop.create_window(attributes)?);
         let accessibility =
