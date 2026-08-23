@@ -23,10 +23,11 @@ repair, uninstall, bundle prerequisite testing, and signed-artifact verification
 ## Reproducible inputs
 
 `release.json` pins Rust, vcpkg, WiX, and the unmodified Microsoft PowerShell MSI. `vcpkg.json`
-selects only FFmpeg `avcodec`, `avformat`, `dav1d`, `swresample`, and `swscale` with default
-features disabled. The BSD-licensed dav1d dependency provides the software AV1 fallback required
-on systems without AV1 hardware decoding. Do not add `gpl`, `all-gpl`, `nonfree`, or `fdk-aac`
-features to the public build.
+selects the modern DirectX Shader Compiler plus only FFmpeg `avcodec`, `avformat`, `dav1d`,
+`swresample`, and `swscale` with default features disabled. DXC avoids wgpu's multi-second legacy
+FXC shader-compilation fallback during startup. The BSD-licensed dav1d dependency provides the
+software AV1 fallback required on systems without AV1 hardware decoding. Do not add `gpl`,
+`all-gpl`, `nonfree`, or `fdk-aac` features to the public build.
 
 The release workflow runs Cargo independently in `vivid_protocol`, `vivi`, `vivido`, and `vvmux`;
 the repository root is not a Cargo workspace. `scripts/prepare-release.ps1` rejects mismatched

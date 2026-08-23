@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::cell::RefCell;
 use std::ops::Range;
 use std::sync::Arc;
 use std::{array, env};
@@ -96,6 +97,18 @@ const MAX_CACHED_LAYOUTS: usize = 4096;
 /// amount each instead of a full scan apiece.
 const LAYOUT_EVICTION_BATCH: usize = MAX_CACHED_LAYOUTS / 4;
 
+thread_local! {
+    /// Parley designs its font context as one application/thread resource. Keep a pristine
+    /// per-thread template so every pane and the integrated chrome share the same DirectWrite
+    /// system collection while retaining independent query, source, and layout caches.
+    static FONT_CONTEXT: RefCell<Option<FontContext>> = const { RefCell::new(None) };
+
+    #[cfg(test)]
+    static FONT_CONTEXT_INITIALIZATIONS: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+}
+
 struct CachedLayout {
     layout: Arc<Layout<()>>,
     /// The value of `cache_clock` when this layout was last handed out.
@@ -127,7 +140,7 @@ pub struct TextSystem {
 
 impl TextSystem {
     pub fn new(font: Font) -> Self {
-        let mut font_cx = FontContext::default();
+        let mut font_cx = shared_font_context();
         let fallback_search_families = fallback_search_families(&mut font_cx);
         let pua_fallback_family_names = pua_fallback_family_names(&mut font_cx);
         let mut text_system = Self {
@@ -598,6 +611,18 @@ impl TextSystem {
     }
 }
 
+fn shared_font_context() -> FontContext {
+    FONT_CONTEXT.with_borrow_mut(|shared| {
+        shared
+            .get_or_insert_with(|| {
+                #[cfg(test)]
+                FONT_CONTEXT_INITIALIZATIONS.with(|count| count.set(count.get() + 1));
+                FontContext::default()
+            })
+            .clone()
+    })
+}
+
 impl FontVariant {
     const fn as_index(self) -> usize {
         match self {
@@ -894,14 +919,26 @@ mod tests {
     use parley::{FontFamilyName, GenericFamily};
 
     use super::{
-        FontVariant, LAYOUT_EVICTION_BATCH, MAX_CACHED_LAYOUTS, TerminalTextStyle, TextSystem,
-        family_name_sort_key, font_family_stack, fontique_script_for_char,
-        glyph_corpus::GLYPH_CORPUS, is_private_use, normalize_locale, parse_named_style,
-        push_configured_family_names,
+        FONT_CONTEXT_INITIALIZATIONS, FontVariant, LAYOUT_EVICTION_BATCH, MAX_CACHED_LAYOUTS,
+        TerminalTextStyle, TextSystem, family_name_sort_key, font_family_stack,
+        fontique_script_for_char, glyph_corpus::GLYPH_CORPUS, is_private_use, normalize_locale,
+        parse_named_style, push_configured_family_names,
     };
     use crate::config::font::Font;
     use crate::display::color::Rgb;
     use crate::display::content::RenderableCell;
+
+    #[test]
+    fn text_systems_reuse_the_thread_font_collection() {
+        let before = FONT_CONTEXT_INITIALIZATIONS.with(std::cell::Cell::get);
+        let _first = TextSystem::new(Font::default());
+        let after_first = FONT_CONTEXT_INITIALIZATIONS.with(std::cell::Cell::get);
+        let _second = TextSystem::new(Font::default());
+        let after_second = FONT_CONTEXT_INITIALIZATIONS.with(std::cell::Cell::get);
+
+        assert!(after_first == before || after_first == before + 1);
+        assert_eq!(after_second, after_first);
+    }
 
     #[test]
     fn font_update_recomputes_metrics() {

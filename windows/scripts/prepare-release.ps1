@@ -38,6 +38,10 @@ $forbiddenFfmpegFeatures = @('gpl', 'all-gpl', 'nonfree', 'fdk-aac')
 if ($actualFfmpegFeatures | Where-Object { $_ -in $forbiddenFfmpegFeatures }) {
     throw 'A prohibited FFmpeg feature is enabled'
 }
+$dxcDependency = @($vcpkgManifest.dependencies | Where-Object { $_ -is [string] -and $_ -ceq 'directx-dxc' })
+if ($dxcDependency.Count -ne 1) {
+    throw 'vcpkg.json must contain exactly one directx-dxc dependency'
+}
 
 function Get-CargoPackageVersion([string]$Manifest) {
     $inPackage = $false
@@ -77,6 +81,13 @@ foreach ($entry in $binarySources.GetEnumerator()) {
     }
     Copy-Item -LiteralPath $entry.Value -Destination (Join-Path $stage $entry.Key)
 }
+foreach ($runtime in @('dxcompiler.dll', 'dxil.dll')) {
+    $source = Join-Path $RepositoryRoot "vivido\target\release\$runtime"
+    if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
+        throw "Vivido shader compiler runtime not found: $source"
+    }
+    Copy-Item -LiteralPath $source -Destination (Join-Path $stage $runtime)
+}
 
 $helper = Join-Path $RepositoryRoot 'vivido\windows\setup-helper\target\release\vivido-windows-setup.exe'
 if (-not (Test-Path -LiteralPath $helper -PathType Leaf)) {
@@ -97,6 +108,8 @@ $system32 = Join-Path $env:SystemRoot 'System32'
 $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
 $queue = [Collections.Generic.Queue[string]]::new()
 foreach ($name in $binarySources.Keys) { $queue.Enqueue((Join-Path $stage $name)) }
+$queue.Enqueue((Join-Path $stage 'dxcompiler.dll'))
+$queue.Enqueue((Join-Path $stage 'dxil.dll'))
 $queue.Enqueue((Join-Path $stage 'installer\vivido-windows-setup.exe'))
 
 function Find-VcRuntime([string]$Name) {
@@ -161,6 +174,7 @@ vcpkg baseline: $($vcpkgManifest.'builtin-baseline')
 triplet: x64-windows (dynamic libraries)
 FFmpeg source repository: https://github.com/FFmpeg/FFmpeg
 FFmpeg enabled components: $($actualFfmpegFeatures -join ', ')
+DirectX Shader Compiler source repository: https://github.com/microsoft/DirectXShaderCompiler
 
 Resolved vcpkg packages:
 $($resolvedPackages -join "`r`n")
