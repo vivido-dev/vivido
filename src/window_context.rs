@@ -267,9 +267,11 @@ impl WindowContext {
 
         let vivid_service = {
             let service = match options.vivid_target {
-                VividTarget::Terminal => {
-                    VividService::start(display.size_info.into(), event_proxy.clone())?
-                },
+                VividTarget::Terminal => VividService::start(
+                    display.size_info.into(),
+                    event_proxy.clone(),
+                    config.file_drop.paste_remote_path,
+                )?,
                 VividTarget::Desktop => {
                     VividService::start_desktop(display.size_info.into(), event_proxy.clone())?
                 },
@@ -410,6 +412,7 @@ impl WindowContext {
         self.display.update_config(&self.config);
         self.terminal.lock().set_options(self.config.term_options());
         self.notifications.set_enabled(self.config.terminal.osc_notifications);
+        self.vivid_service.set_remote_drop_paste(self.config.file_drop.paste_remote_path);
 
         // Reload cursor if its thickness has changed.
         if (old_config.cursor.thickness() - self.config.cursor.thickness()).abs() > f32::EPSILON {

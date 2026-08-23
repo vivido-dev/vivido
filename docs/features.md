@@ -27,7 +27,10 @@ activated through configured keys or the mouse and do not depend on a vi cursor.
 The Vivid side channel transfers, places, plays, and deletes raster and video media. Over a
 `vvssh` session with the remote `vvreceive` helper, dropping a local file — or pasting one
 (`Control+Shift+V`) when the clipboard holds a copied file or an image — copies it into the remote
-shell's current directory in one gesture. Vivido
+shell's current directory in one gesture, then types the file's committed absolute remote path at
+the prompt, the way a local drag types a local path. An AI-agent CLI running on the remote host
+therefore sees an image path and attaches it, exactly as it would locally. Set
+`[file_drop] paste_remote_path = false` to copy the file and type nothing. Vivido
 decodes frames independently of the renderer, uploads visible sources through wgpu, and
 composites them between terminal backgrounds and glyphs. Other escape-sequence media commands are
 recognized as extension points but are not rendered yet.

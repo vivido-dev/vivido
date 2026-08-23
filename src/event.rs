@@ -3152,6 +3152,11 @@ pub enum EventType {
     Frame,
     RendererRecovery,
     VividResizeSettled(u64),
+    /// A remote receiver committed a dropped file; type its committed path into the PTY.
+    ///
+    /// This deliberately has no outer-`Processor` arm: the catch-all forwards it into
+    /// `WindowContext::handle_event`, which is the only place an `ActionContext` exists.
+    VividFileDropPaste,
     /// Wake the loop on behalf of an in-process host. Vivido itself does nothing with it.
     HostWakeup,
 }
@@ -4176,6 +4181,19 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
     pub fn handle_event(&mut self, event: WinitEvent<Event>) {
         match event {
             WinitEvent::UserEvent(Event { payload, .. }) => match payload {
+                EventType::VividFileDropPaste => {
+                    let pastes = self.ctx.vivid_service.take_file_drop_pastes();
+                    if !pastes.is_empty() {
+                        // The typed path is the completion feedback, so retire the transfer
+                        // notice rather than leaving it to expire on its own.
+                        self.ctx.message_buffer.remove_target(FILE_DROP_MESSAGE_TARGET);
+                        *self.ctx.dirty = true;
+                    }
+                    for text in &pastes {
+                        // Bracketed, exactly like the local no-binding drop fallback.
+                        self.ctx.paste(text, true);
+                    }
+                },
                 EventType::SearchNext => self.ctx.goto_match(None),
                 EventType::Scroll(scroll) => self.ctx.scroll(scroll),
                 EventType::BlinkCursor => {

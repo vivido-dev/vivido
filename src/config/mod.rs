@@ -12,6 +12,7 @@ pub mod bell;
 pub mod color;
 pub mod cursor;
 pub mod debug;
+pub mod file_drop;
 pub mod font;
 pub mod general;
 pub mod monitor;

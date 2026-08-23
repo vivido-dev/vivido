@@ -274,12 +274,14 @@ struct ServiceShared {
     next_session: AtomicU64,
     active_connections: AtomicUsize,
     pending_handshakes: Mutex<PendingHandshakes>,
-    wake: Arc<dyn Fn() + Send + Sync>,
+    wake: Arc<dyn Fn(PresenterWake) + Send + Sync>,
     wake_pending: AtomicBool,
     frame_wake_events: AtomicU64,
     actor_timeout_services: AtomicU64,
     trace: Mutex<trace::TraceJournal>,
     file_drops: Mutex<file_drop::FileDropManager>,
+    /// Whether this window offers `file-drop-path-v1` and types committed remote paths.
+    remote_drop_paste: AtomicBool,
 }
 
 enum ActorMessage {
@@ -462,12 +464,49 @@ pub struct VividService {
     _directory: Option<TempDir>,
 }
 
+/// Why the Vivid worker is waking the event loop.
+///
+/// A committed file drop has to reach the loop that owns the PTY, and it must not ride the frame
+/// wake: that one coalesces on `wake_pending`, and a dropped paste is not recoverable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PresenterWake {
+    Frame,
+    FileDropPaste,
+}
+
 impl VividService {
-    pub fn start(geometry: DisplayGeometry, event_proxy: EventProxy) -> io::Result<Self> {
-        Self::start_with_wake(
+    pub fn start(
+        geometry: DisplayGeometry,
+        event_proxy: EventProxy,
+        paste_remote_path: bool,
+    ) -> io::Result<Self> {
+        let service = Self::start_with_wake(
             geometry,
-            Arc::new(move || event_proxy.send_event(EventType::VividFrame)),
-        )
+            Arc::new(move |kind| {
+                event_proxy.send_event(match kind {
+                    PresenterWake::Frame => EventType::VividFrame,
+                    PresenterWake::FileDropPaste => EventType::VividFileDropPaste,
+                })
+            }),
+        )?;
+        service.set_remote_drop_paste(paste_remote_path);
+        Ok(service)
+    }
+
+    /// Honor a live config reload: stop typing immediately, and stop offering the profile to
+    /// sessions established from now on. Profiles are negotiated once, so re-enabling only
+    /// reaches sessions created afterwards.
+    pub fn set_remote_drop_paste(&self, enabled: bool) {
+        self.shared.remote_drop_paste.store(enabled, Ordering::Relaxed);
+    }
+
+    /// Take the committed remote paths the event loop still has to type into the PTY.
+    ///
+    /// The queue is drained either way, so turning the option off between the commit and this
+    /// call discards the path rather than typing it late.
+    pub(crate) fn take_file_drop_pastes(&self) -> Vec<String> {
+        let pastes = lock(&self.shared.file_drops).take_pending_pastes();
+        if self.shared.remote_drop_paste.load(Ordering::Relaxed) { pastes } else { Vec::new() }
     }
 
     /// Start a window that presents `desktop-surface-v1` instead of a terminal.
@@ -476,15 +515,16 @@ impl VividService {
     /// session never has to reconcile two coordinate truths.
     pub fn start_desktop(geometry: DisplayGeometry, event_proxy: EventProxy) -> io::Result<Self> {
         let target = Arc::new(DesktopTarget::new(geometry).map_err(io::Error::other)?);
+        // A desktop target never queues a paste, so both wake reasons mean the same thing here.
         Self::start_with_target(
             target,
-            Arc::new(move || event_proxy.send_event(EventType::VividFrame)),
+            Arc::new(move |_| event_proxy.send_event(EventType::VividFrame)),
         )
     }
 
     fn start_with_wake(
         geometry: DisplayGeometry,
-        wake: Arc<dyn Fn() + Send + Sync>,
+        wake: Arc<dyn Fn(PresenterWake) + Send + Sync>,
     ) -> io::Result<Self> {
         let target = Arc::new(TerminalTarget::new(geometry).map_err(io::Error::other)?);
         Self::start_with_target(target, wake)
@@ -492,7 +532,7 @@ impl VividService {
 
     fn start_with_target(
         target: Arc<dyn PresentationTarget>,
-        wake: Arc<dyn Fn() + Send + Sync>,
+        wake: Arc<dyn Fn(PresenterWake) + Send + Sync>,
     ) -> io::Result<Self> {
         let (listener, control_endpoint, directory) = bind_local_listener()?;
         let mut secret = [0_u8; 32];
@@ -520,6 +560,7 @@ impl VividService {
             actor_timeout_services: AtomicU64::new(0),
             trace: Mutex::new(trace::TraceJournal::default()),
             file_drops: Mutex::new(file_drop::FileDropManager::default()),
+            remote_drop_paste: AtomicBool::new(true),
         });
         let shutdown = Arc::new(AtomicBool::new(false));
         let listener_thread = thread::Builder::new().name("vivid-1.5-listener".into()).spawn({
@@ -711,7 +752,8 @@ impl VividService {
         display_offset: usize,
     ) -> Option<&'static str> {
         let hit = self.file_drop_surface_at(x, y, size, display_offset);
-        lock(&self.shared.file_drops).hover_label(hit)
+        let types_path = self.shared.remote_drop_paste.load(Ordering::Relaxed);
+        lock(&self.shared.file_drops).hover_label(hit, types_path)
     }
 
     /// Route one local regular file to the effective binding without ever exposing its path.
@@ -1032,8 +1074,31 @@ impl ServiceShared {
             .is_ok()
         {
             self.frame_wake_events.fetch_add(1, Ordering::Relaxed);
-            (self.wake)();
+            (self.wake)(PresenterWake::Frame);
         }
+    }
+
+    /// Wake the event loop for a queued file-drop paste.
+    ///
+    /// Deliberately not coalesced through `wake_pending`: draining is idempotent, so a spare wake
+    /// costs nothing while a lost one would silently swallow a path the user is waiting to see.
+    fn request_file_drop_paste_wake(&self) {
+        (self.wake)(PresenterWake::FileDropPaste);
+    }
+
+    /// The profiles this target offers right now.
+    ///
+    /// The path sub-profile is config-gated, so a deployment with it turned off simply never
+    /// negotiates it and every peer degrades to the pre-feature wire.
+    fn offered_profiles(&self) -> Vec<&'static str> {
+        let allow = self.remote_drop_paste.load(Ordering::Relaxed);
+        self.scene
+            .target()
+            .supported_profiles()
+            .iter()
+            .copied()
+            .filter(|profile| allow || *profile != registry::FILE_DROP_PATH)
+            .collect()
     }
 
     /// Build a complete track identity for a session this presenter owns.
@@ -1800,7 +1865,7 @@ fn establish_root_session(
             "this window presents a different target profile",
         ));
     }
-    let supported = target.supported_profiles();
+    let supported = shared.offered_profiles();
     if hello.required_profiles.iter().any(|profile| !supported.contains(&profile.as_str())) {
         return Err(send_fatal(
             &writer,
@@ -2306,7 +2371,7 @@ fn dispatch_control(
             }
             require_context_operation(session, definition.context_id, OP_DELEGATE)?;
             // Permitted profiles form a closed set, and this target has to implement all of them.
-            let supported = shared.scene.target().supported_profiles();
+            let supported = shared.offered_profiles();
             if definition
                 .permitted_profiles
                 .iter()
@@ -5900,6 +5965,70 @@ mod tests {
         .unwrap()
     }
 
+    /// Connect a receiver that offers `file-drop-path-v1` the way `vvreceive` does.
+    fn connect_file_drop_receiver(service: &VividService) -> vivid_sdk::Session {
+        let mut required = vec![
+            registry::CORE_CONTROL.to_owned(),
+            registry::FILE_DROP.to_owned(),
+            registry::TERMINAL_SURFACE.to_owned(),
+        ];
+        required.sort();
+        vivid_sdk::Session::connect(ProducerConfig {
+            endpoint_control: Some(service.control_endpoint().to_owned()),
+            authentication: ProducerAuthentication::root_hex(service.root_secret()).unwrap(),
+            required_profiles: required,
+            optional_profiles: vec![registry::FILE_DROP_PATH.to_owned()],
+            ..ProducerConfig::default()
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn the_path_profile_is_negotiated_only_while_the_option_is_on() {
+        let service =
+            socket_service!(VividService::start_with_wake(test_geometry(), Arc::new(|_| {})));
+        let session = connect_file_drop_receiver(&service);
+        assert!(session.supports(registry::FILE_DROP_PATH));
+        session.close().unwrap();
+
+        // With the option off the offer is not made, so a receiver can never send a path and the
+        // wire is exactly what it was before the profile existed.
+        service.set_remote_drop_paste(false);
+        let session = connect_file_drop_receiver(&service);
+        assert!(!session.supports(registry::FILE_DROP_PATH));
+        assert!(session.supports(registry::FILE_DROP));
+        assert_eq!(
+            session.info().accepted_profiles,
+            vec![
+                registry::FILE_DROP.to_owned(),
+                registry::TERMINAL_SURFACE.to_owned(),
+                registry::CORE_CONTROL.to_owned(),
+            ]
+        );
+        session.close().unwrap();
+    }
+
+    #[test]
+    fn a_disabled_option_refuses_a_lease_that_permits_the_path_profile() {
+        let service =
+            socket_service!(VividService::start_with_wake(test_geometry(), Arc::new(|_| {})));
+        service.set_remote_drop_paste(false);
+        // A lease may only permit profiles the window is actually offering, so the gate cannot be
+        // walked around by delegating.
+        let offered = service.shared.offered_profiles();
+        assert!(!offered.contains(&registry::FILE_DROP_PATH));
+        service.set_remote_drop_paste(true);
+        assert!(service.shared.offered_profiles().contains(&registry::FILE_DROP_PATH));
+    }
+
+    #[test]
+    fn a_desktop_target_never_offers_the_path_profile() {
+        let service = socket_service!(desktop_service());
+        // Enabled or not: a desktop surface has no PTY, so there is nothing to type into.
+        service.set_remote_drop_paste(true);
+        assert!(!service.shared.offered_profiles().contains(&registry::FILE_DROP_PATH));
+    }
+
     /// Read the columns, rows, and settled flag out of a terminal target descriptor.
     fn descriptor_summary(descriptor: &[(u64, Value)]) -> (u64, u64, bool) {
         (
@@ -5915,7 +6044,7 @@ mod tests {
         let counted = wakes.clone();
         let service = socket_service!(VividService::start_with_wake(
             test_geometry(),
-            Arc::new(move || {
+            Arc::new(move |_| {
                 counted.fetch_add(1, Ordering::AcqRel);
             }),
         ));
@@ -5930,7 +6059,7 @@ mod tests {
     #[test]
     fn an_idle_actor_has_no_periodic_timeout_service() {
         let service =
-            socket_service!(VividService::start_with_wake(test_geometry(), Arc::new(|| {}),));
+            socket_service!(VividService::start_with_wake(test_geometry(), Arc::new(|_| {}),));
         let session = connect(&service);
         thread::sleep(Duration::from_millis(25));
         assert_eq!(
@@ -6288,7 +6417,7 @@ mod tests {
     #[test]
     fn a_display_change_reaches_live_and_later_sessions() {
         let service =
-            socket_service!(VividService::start_with_wake(test_geometry(), Arc::new(|| {})));
+            socket_service!(VividService::start_with_wake(test_geometry(), Arc::new(|_| {})));
         let live = connect(&service);
         assert_eq!(descriptor_summary(&live.info().target_descriptor), (80, 24, true));
 
@@ -6378,7 +6507,7 @@ mod tests {
     #[test]
     fn track_control_trace_reconstructs_seek_order_and_rejections() {
         let service =
-            socket_service!(VividService::start_with_wake(test_geometry(), Arc::new(|| {})));
+            socket_service!(VividService::start_with_wake(test_geometry(), Arc::new(|_| {})));
         let mut session = connect(&service);
         let context_id = session.info().root_context_id;
         let surface = grid_surface(&mut session, 70);
@@ -6491,7 +6620,7 @@ mod tests {
     #[test]
     fn active_timed_track_accepts_exact_play_target_before_replacement_output() {
         let service =
-            socket_service!(VividService::start_with_wake(test_geometry(), Arc::new(|| {})));
+            socket_service!(VividService::start_with_wake(test_geometry(), Arc::new(|_| {})));
         let mut session = connect(&service);
         let context_id = session.info().root_context_id;
         let surface = grid_surface(&mut session, 74);
@@ -6647,7 +6776,7 @@ mod tests {
     #[test]
     fn channel_failure_trace_is_typed_and_generation_scoped() {
         let service =
-            socket_service!(VividService::start_with_wake(test_geometry(), Arc::new(|| {})));
+            socket_service!(VividService::start_with_wake(test_geometry(), Arc::new(|_| {})));
         let mut session = connect(&service);
         let context_id = session.info().root_context_id;
         let surface = grid_surface(&mut session, 72);
@@ -6754,7 +6883,7 @@ mod tests {
     #[test]
     fn clear_then_destroy_keeps_repeated_track_replacements_revision_synchronized() {
         let service =
-            socket_service!(VividService::start_with_wake(test_geometry(), Arc::new(|| {})));
+            socket_service!(VividService::start_with_wake(test_geometry(), Arc::new(|_| {})));
         let mut seeking = connect(&service);
         let mut neighbor = connect(&service);
         let seeking_context = seeking.info().root_context_id;
@@ -6913,7 +7042,7 @@ mod tests {
     #[test]
     fn an_announced_display_change_carries_every_live_scene_onto_the_new_target() {
         let service =
-            socket_service!(VividService::start_with_wake(test_geometry(), Arc::new(|| {})));
+            socket_service!(VividService::start_with_wake(test_geometry(), Arc::new(|_| {})));
         let mut first = connect(&service);
         let mut second = connect(&service);
         let mut unaware = connect(&service);
@@ -6976,7 +7105,7 @@ mod tests {
     #[test]
     fn an_unchanged_stale_or_degenerate_display_change_is_never_announced() {
         let service =
-            socket_service!(VividService::start_with_wake(test_geometry(), Arc::new(|| {})));
+            socket_service!(VividService::start_with_wake(test_geometry(), Arc::new(|_| {})));
         let live = connect(&service);
 
         assert_eq!(service.update_metrics(test_geometry()), None);
@@ -6993,7 +7122,7 @@ mod tests {
     #[test]
     fn live_resize_reaches_the_sdk_as_a_same_generation_final_settle() {
         let service =
-            socket_service!(VividService::start_with_wake(test_geometry(), Arc::new(|| {})));
+            socket_service!(VividService::start_with_wake(test_geometry(), Arc::new(|_| {})));
         let config = ProducerConfig {
             endpoint_control: Some(service.control_endpoint().to_owned()),
             authentication: ProducerAuthentication::root_hex(service.root_secret()).unwrap(),
@@ -7162,7 +7291,7 @@ mod tests {
     #[test]
     fn migrated_sdk_submits_a_live_raster_over_an_authenticated_channel() {
         let service =
-            socket_service!(VividService::start_with_wake(test_geometry(), Arc::new(|| {})));
+            socket_service!(VividService::start_with_wake(test_geometry(), Arc::new(|_| {})));
         let mut session = connect(&service);
         let context_id = session.info().root_context_id;
         let surface = session
@@ -7300,7 +7429,7 @@ mod tests {
     #[test]
     fn a_delta_capable_raster_track_grants_and_then_applies_delta_frames() {
         let service =
-            socket_service!(VividService::start_with_wake(test_geometry(), Arc::new(|| {})));
+            socket_service!(VividService::start_with_wake(test_geometry(), Arc::new(|_| {})));
         let mut session = connect(&service);
         let context_id = session.info().root_context_id;
         let surface = session
@@ -7420,7 +7549,7 @@ mod tests {
 
     fn desktop_service() -> io::Result<VividService> {
         let target = Arc::new(DesktopTarget::new(test_geometry()).unwrap());
-        VividService::start_with_target(target, Arc::new(|| {}))
+        VividService::start_with_target(target, Arc::new(|_| {}))
     }
 
     fn connect_desktop(service: &VividService) -> vivid_sdk::Session {
@@ -7611,7 +7740,7 @@ mod tests {
         );
 
         let terminal =
-            socket_service!(VividService::start_with_wake(test_geometry(), Arc::new(|| {})));
+            socket_service!(VividService::start_with_wake(test_geometry(), Arc::new(|_| {})));
         let mut session = connect(&terminal);
         let context_id = session.info().root_context_id;
         assert!(
@@ -7796,7 +7925,7 @@ mod tests {
     #[test]
     fn a_lease_reply_carries_no_secret_and_activates_a_child_session() {
         let service =
-            socket_service!(VividService::start_with_wake(test_geometry(), Arc::new(|| {})));
+            socket_service!(VividService::start_with_wake(test_geometry(), Arc::new(|_| {})));
         let mut controller = connect(&service);
         let context_id = controller.info().root_context_id;
         let secret = Secret32::new([0x5c; 32]);
@@ -7824,7 +7953,7 @@ mod tests {
     #[test]
     fn a_wrong_activation_secret_is_refused() {
         let service =
-            socket_service!(VividService::start_with_wake(test_geometry(), Arc::new(|| {})));
+            socket_service!(VividService::start_with_wake(test_geometry(), Arc::new(|_| {})));
         let mut controller = connect(&service);
         let context_id = controller.info().root_context_id;
         let secret = Secret32::new([0x11; 32]);
@@ -7850,7 +7979,7 @@ mod tests {
     #[test]
     fn revoking_a_lease_closes_only_its_child() {
         let service =
-            socket_service!(VividService::start_with_wake(test_geometry(), Arc::new(|| {})));
+            socket_service!(VividService::start_with_wake(test_geometry(), Arc::new(|_| {})));
         let mut controller = connect(&service);
         let context_id = controller.info().root_context_id;
         let first = Secret32::new([0x21; 32]);
@@ -7885,7 +8014,7 @@ mod tests {
     fn closing_the_issuer_takes_its_leases_with_it() {
         // Security §4.3: parent cleanup removes only that subtree.
         let service =
-            socket_service!(VividService::start_with_wake(test_geometry(), Arc::new(|| {})));
+            socket_service!(VividService::start_with_wake(test_geometry(), Arc::new(|_| {})));
         let mut controller = connect(&service);
         let context_id = controller.info().root_context_id;
         let secret = Secret32::new([0x31; 32]);
@@ -7913,7 +8042,7 @@ mod tests {
         // Core §10, and the reason the previous payload was unusable: it described identity
         // rather than revisions, so nothing could be compared after a resume.
         let service =
-            socket_service!(VividService::start_with_wake(test_geometry(), Arc::new(|| {})));
+            socket_service!(VividService::start_with_wake(test_geometry(), Arc::new(|_| {})));
         let mut session = connect(&service);
         let context_id = session.info().root_context_id;
         session
@@ -8204,7 +8333,7 @@ mod tests {
     #[test]
     fn an_anchor_marker_flood_is_bounded_and_costs_no_other_session_anything() {
         let service =
-            socket_service!(VividService::start_with_wake(test_geometry(), Arc::new(|| {})));
+            socket_service!(VividService::start_with_wake(test_geometry(), Arc::new(|_| {})));
         let flooded = connect(&service);
         let flooded_context = flooded.info().root_context_id;
         let [flooded_session] = live_sessions(&service).try_into().ok().expect("one session");
@@ -8251,7 +8380,7 @@ mod tests {
     #[test]
     fn a_departing_session_unpublishes_only_its_own_marker_tag() {
         let service =
-            socket_service!(VividService::start_with_wake(test_geometry(), Arc::new(|| {})));
+            socket_service!(VividService::start_with_wake(test_geometry(), Arc::new(|_| {})));
         let leaving = connect(&service);
         let [leaving_session] = live_sessions(&service).try_into().ok().expect("one session");
         let staying = connect(&service);
@@ -8333,7 +8462,7 @@ mod tests {
     #[test]
     fn silent_connections_cannot_lock_a_producer_out_of_the_endpoint() {
         let service =
-            socket_service!(VividService::start_with_wake(test_geometry(), Arc::new(|| {})));
+            socket_service!(VividService::start_with_wake(test_geometry(), Arc::new(|_| {})));
         let endpoint = service.control_endpoint().to_owned();
 
         // Fill the unauthenticated budget and add one more silent peer. This is the smallest flood
@@ -8394,7 +8523,7 @@ mod tests {
     #[test]
     fn an_unclean_loss_suspends_a_resumable_lease_and_resume_restores_it() {
         let service =
-            socket_service!(VividService::start_with_wake(test_geometry(), Arc::new(|| {})));
+            socket_service!(VividService::start_with_wake(test_geometry(), Arc::new(|_| {})));
         let mut controller = connect(&service);
         let context_id = controller.info().root_context_id;
         let secret = Secret32::new([0x61; 32]);
@@ -8473,7 +8602,7 @@ mod tests {
     #[test]
     fn a_consumed_resume_cannot_be_replayed() {
         let service =
-            socket_service!(VividService::start_with_wake(test_geometry(), Arc::new(|| {})));
+            socket_service!(VividService::start_with_wake(test_geometry(), Arc::new(|_| {})));
         let mut controller = connect(&service);
         let context_id = controller.info().root_context_id;
         let secret = Secret32::new([0x62; 32]);
@@ -8506,7 +8635,7 @@ mod tests {
     #[test]
     fn a_wrong_resume_proof_is_refused() {
         let service =
-            socket_service!(VividService::start_with_wake(test_geometry(), Arc::new(|| {})));
+            socket_service!(VividService::start_with_wake(test_geometry(), Arc::new(|_| {})));
         let mut controller = connect(&service);
         let context_id = controller.info().root_context_id;
         let secret = Secret32::new([0x65; 32]);
@@ -8542,7 +8671,7 @@ mod tests {
     fn a_lease_without_grace_closes_instead_of_suspending() {
         // Cleanup policy zero closes immediately, even on an unclean loss (security §7.1).
         let service =
-            socket_service!(VividService::start_with_wake(test_geometry(), Arc::new(|| {})));
+            socket_service!(VividService::start_with_wake(test_geometry(), Arc::new(|_| {})));
         let mut controller = connect(&service);
         let context_id = controller.info().root_context_id;
         let secret = Secret32::new([0x63; 32]);
@@ -8575,7 +8704,7 @@ mod tests {
     #[test]
     fn a_suspended_lease_is_released_when_its_grace_expires() {
         let service =
-            socket_service!(VividService::start_with_wake(test_geometry(), Arc::new(|| {})));
+            socket_service!(VividService::start_with_wake(test_geometry(), Arc::new(|_| {})));
         let mut controller = connect(&service);
         let context_id = controller.info().root_context_id;
         let secret = Secret32::new([0x66; 32]);
@@ -8602,7 +8731,7 @@ mod tests {
     #[test]
     fn an_authenticated_interactive_lane_opens_and_answers_ping() {
         let service =
-            socket_service!(VividService::start_with_wake(test_geometry(), Arc::new(|| {})));
+            socket_service!(VividService::start_with_wake(test_geometry(), Arc::new(|_| {})));
         let session = connect(&service);
         // The SDK opens a lane only when `desktop-input-v1` was accepted, which a terminal target
         // does not offer, so drive the wire directly.
@@ -8628,7 +8757,7 @@ mod tests {
     #[test]
     fn a_lane_with_a_bad_tag_or_unknown_session_is_refused() {
         let service =
-            socket_service!(VividService::start_with_wake(test_geometry(), Arc::new(|| {})));
+            socket_service!(VividService::start_with_wake(test_geometry(), Arc::new(|_| {})));
         let session = connect(&service);
         assert!(
             RawLane::open_with_key(&service, session.info().session_id, 1, &Secret32::new([0; 32]))
@@ -8644,7 +8773,7 @@ mod tests {
     #[test]
     fn the_lane_refuses_records_it_does_not_carry() {
         let service =
-            socket_service!(VividService::start_with_wake(test_geometry(), Arc::new(|| {})));
+            socket_service!(VividService::start_with_wake(test_geometry(), Arc::new(|_| {})));
         let session = connect(&service);
         let mut lane = RawLane::open(&service, &session, 1).unwrap();
         // A control record on the interactive lane is a framing error, not a mutation.
@@ -8848,7 +8977,7 @@ mod tests {
     #[test]
     fn a_producer_that_stops_draining_control_cannot_stall_the_terminal_or_the_window() {
         let service =
-            socket_service!(VividService::start_with_wake(test_geometry(), Arc::new(|| {})));
+            socket_service!(VividService::start_with_wake(test_geometry(), Arc::new(|_| {})));
         // A producer that completes HELLO and then never reads another byte.
         let stalled = RawClient::root(&service).expect("root session");
         assert!(
@@ -8893,7 +9022,7 @@ mod tests {
     #[test]
     fn a_stalled_producer_is_closed_without_disturbing_a_healthy_one() {
         let service =
-            socket_service!(VividService::start_with_wake(test_geometry(), Arc::new(|| {})));
+            socket_service!(VividService::start_with_wake(test_geometry(), Arc::new(|_| {})));
         let mut healthy = connect(&service);
         let healthy_context = healthy.info().root_context_id;
         let healthy_surface = grid_surface(&mut healthy, 1);
@@ -9016,7 +9145,7 @@ mod tests {
         // A terminal target masks off the input operation class, so the forwarding path in the
         // keyboard handler is inert for an ordinary window.
         let service =
-            socket_service!(VividService::start_with_wake(test_geometry(), Arc::new(|| {})));
+            socket_service!(VividService::start_with_wake(test_geometry(), Arc::new(|_| {})));
         let _session = connect(&service);
         assert!(!service.send_input(vivid_protocol::input::InputEvent::Key {
             binding: zero_tuple(),
@@ -9148,7 +9277,7 @@ mod tests {
     #[test]
     fn a_subscribed_session_observes_its_own_mutations() {
         let service =
-            socket_service!(VividService::start_with_wake(test_geometry(), Arc::new(|| {})));
+            socket_service!(VividService::start_with_wake(test_geometry(), Arc::new(|_| {})));
         let mut session = connect(&service);
         let context_id = session.info().root_context_id;
         session.set_observation(observation::class::SURFACE).unwrap();
@@ -9194,7 +9323,7 @@ mod tests {
     #[test]
     fn an_unsubscribed_session_observes_nothing() {
         let service =
-            socket_service!(VividService::start_with_wake(test_geometry(), Arc::new(|| {})));
+            socket_service!(VividService::start_with_wake(test_geometry(), Arc::new(|_| {})));
         let mut session = connect(&service);
         let context_id = session.info().root_context_id;
         // No SET_OBSERVATION: the default mask is zero, so nothing is queued at all.
@@ -9233,7 +9362,7 @@ mod tests {
     #[test]
     fn an_unassigned_observation_class_is_refused() {
         let service =
-            socket_service!(VividService::start_with_wake(test_geometry(), Arc::new(|| {})));
+            socket_service!(VividService::start_with_wake(test_geometry(), Arc::new(|_| {})));
         let session = connect(&service);
         assert!(session.set_observation(1 << 9).is_err());
     }
@@ -9263,7 +9392,7 @@ mod tests {
         // parser. Registering a wait that cannot be satisfied used to be harmless only because
         // it spawned a thread; the actor now holds it, so prove the session still answers.
         let service =
-            socket_service!(VividService::start_with_wake(test_geometry(), Arc::new(|| {})));
+            socket_service!(VividService::start_with_wake(test_geometry(), Arc::new(|_| {})));
         let mut session = connect(&service);
         let context_id = session.info().root_context_id;
         let surface = session

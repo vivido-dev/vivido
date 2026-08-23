@@ -24,6 +24,7 @@ channel, which is configured through the environment rather than this file — s
 - [`selection`](#selection)
 - [`cursor`](#cursor)
 - [`terminal`](#terminal)
+- [`file_drop`](#file_drop)
 - [`mouse`](#mouse)
 - [`hints`](#hints)
 - [`keyboard`](#keyboard)
@@ -318,6 +319,30 @@ osc52 = "onlycopy"
 osc_notifications = true
 shell = { program = "/usr/bin/fish", args = ["--login"] }
 ```
+
+## `file_drop`
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `paste_remote_path` | bool | `true` | After a remote receiver copies a dropped or pasted file, type its committed absolute remote path into the terminal. |
+
+```toml
+[file_drop]
+paste_remote_path = true
+```
+
+`paste_remote_path` applies only to a drop that a remote `vvreceive` accepted over `vvssh`. It
+makes the remote gesture end the way a local drag does — with the file's path typed at the
+prompt — so an AI-agent CLI running on the remote host sees an image path and attaches it. The
+path is shell-quoted only when it contains whitespace or shell metacharacters.
+
+With the option off, Vivido does not offer the `file-drop-path-v1` profile, so the receiver never
+sends a path and nothing is typed; the file is still copied. Turning it off takes effect
+immediately, while turning it on applies to sessions started afterwards, because profiles are
+negotiated once when a producer connects.
+
+Dropping several files at once queues one path per file. Files that finish within the same frame
+are typed in the order they were dropped; a slow transfer types its path whenever it lands.
 
 Vivido accepts legacy iTerm2 notifications (`OSC 9 ; message ST`) and the core Kitty OSC 99
 protocol for bounded title/body chunks, IDs, update/close, visibility policy, urgency, expiry,

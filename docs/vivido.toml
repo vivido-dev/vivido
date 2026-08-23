@@ -265,6 +265,15 @@ osc_notifications = true
 # shell = { program = "/usr/bin/fish", args = ["--login"] }
 
 # ─────────────────────────────────────────────────────────────────────────────
+# file_drop
+# ─────────────────────────────────────────────────────────────────────────────
+[file_drop]
+# After a remote vvreceive copies a dropped or pasted file over vvssh, type its committed
+# absolute remote path into the terminal, the way a local drag types a local path. Turn this
+# off to copy the file and type nothing.
+paste_remote_path = true
+
+# ─────────────────────────────────────────────────────────────────────────────
 # mouse
 # ─────────────────────────────────────────────────────────────────────────────
 [mouse]

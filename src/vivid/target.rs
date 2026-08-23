@@ -163,6 +163,8 @@ impl TerminalTarget {
         registry::AUDIO_GAIN,
         registry::CORE_CONTROL,
         registry::FILE_DROP,
+        // Offered only when the config option is on; see `ServiceShared::offered_profiles`.
+        registry::FILE_DROP_PATH,
         registry::LIVE_MEDIA,
         registry::OBSERVABILITY,
         registry::TERMINAL_SURFACE,

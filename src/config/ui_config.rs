@@ -26,6 +26,7 @@ use crate::config::bindings::{
 use crate::config::color::Colors;
 use crate::config::cursor::Cursor;
 use crate::config::debug::Debug;
+use crate::config::file_drop::FileDrop;
 use crate::config::font::Font;
 use crate::config::general::General;
 use crate::config::mouse::Mouse;
@@ -83,6 +84,9 @@ pub struct UiConfig {
 
     /// Config for the vivido_terminal itself.
     pub terminal: Terminal,
+
+    /// File-drop and clipboard-media configuration.
+    pub file_drop: FileDrop,
 
     /// Keyboard configuration.
     keyboard: Keyboard,
@@ -666,6 +670,7 @@ impl_config_deserialize!(UiConfig {
     config_paths: skip,
     hints,
     terminal,
+    file_drop,
     keyboard,
     shell: option_deprecated("use terminal.shell instead"),
     import: option_deprecated("use general.import instead"),
