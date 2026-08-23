@@ -29,6 +29,7 @@ use crate::config::debug::Debug;
 use crate::config::file_drop::FileDrop;
 use crate::config::font::Font;
 use crate::config::general::General;
+use crate::config::message_bar::MessageBar;
 use crate::config::mouse::Mouse;
 use crate::config::scrolling::Scrolling;
 use crate::config::selection::Selection;
@@ -87,6 +88,9 @@ pub struct UiConfig {
 
     /// File-drop and clipboard-media configuration.
     pub file_drop: FileDrop,
+
+    /// Warning and error message bar configuration.
+    pub message_bar: MessageBar,
 
     /// Keyboard configuration.
     keyboard: Keyboard,
@@ -671,6 +675,7 @@ impl_config_deserialize!(UiConfig {
     hints,
     terminal,
     file_drop,
+    message_bar,
     keyboard,
     shell: option_deprecated("use terminal.shell instead"),
     import: option_deprecated("use general.import instead"),

@@ -114,6 +114,32 @@ fn replace_file_drop_message(buffer: &mut MessageBuffer, text: String, ty: Messa
     buffer.push(file_drop_message(text, ty));
 }
 
+fn schedule_message_timeout(
+    buffer: &MessageBuffer,
+    config: &UiConfig,
+    scheduler: &mut Scheduler,
+    window_id: WindowId,
+) {
+    let timer_id = TimerId::new(Topic::MessageTimeout, window_id);
+    scheduler.unschedule(timer_id);
+
+    let Some(message) = buffer.message().filter(|message| message.ty() == MessageType::Warning)
+    else {
+        return;
+    };
+    let timeout = config.message_bar.warning_timeout();
+    if timeout.is_zero() {
+        return;
+    }
+
+    scheduler.schedule(
+        Event::new(EventType::MessageTimeout(message.clone()), window_id),
+        timeout,
+        false,
+        timer_id,
+    );
+}
+
 /// The event processor.
 ///
 /// Stores some state from received events and dispatches actions when they are
@@ -635,6 +661,12 @@ impl Processor {
                     } else {
                         window.add_window_config(self.config.clone(), &options);
                     }
+                    schedule_message_timeout(
+                        &window.message_buffer,
+                        window.config(),
+                        &mut self.scheduler,
+                        window.id(),
+                    );
                 }
                 if matched {
                     if requested.is_none() {
@@ -2580,6 +2612,12 @@ impl Processor {
 
                     for window_context in self.windows.values_mut() {
                         window_context.update_config(self.config.clone());
+                        schedule_message_timeout(
+                            &window_context.message_buffer,
+                            window_context.config(),
+                            &mut self.scheduler,
+                            window_context.id(),
+                        );
                     }
                 }
             },
@@ -3152,6 +3190,8 @@ pub enum EventType {
     Frame,
     RendererRecovery,
     VividResizeSettled(u64),
+    /// Dismiss the warning that was visible when this timer was scheduled.
+    MessageTimeout(Message),
     /// A remote receiver committed a dropped file; type its committed path into the PTY.
     ///
     /// This deliberately has no outer-`Processor` arm: the catch-all forwards it into
@@ -3282,7 +3322,6 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
             return false;
         };
         self.message_buffer.remove_target(FILE_DROP_MESSAGE_TARGET);
-        *self.dirty = true;
         match media {
             ClipboardMedia::Files(paths) => {
                 for path in &paths {
@@ -3306,19 +3345,24 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
                         },
                     }
                 }
+                self.message_buffer_changed();
                 true
             },
             ClipboardMedia::Image { name, png } => {
                 match self.vivid_service.handle_pasted_bytes(name, png) {
                     // Without a binding there is nothing to copy the pixels to, so the paste falls
                     // back to whatever text the clipboard also carries.
-                    LocalDropDisposition::NoBinding => false,
+                    LocalDropDisposition::NoBinding => {
+                        self.message_buffer_changed();
+                        false
+                    },
                     LocalDropDisposition::Offered => {
                         replace_file_drop_message(
                             self.message_buffer,
                             "Copying the pasted image to the remote receiver".into(),
                             MessageType::Warning,
                         );
+                        self.message_buffer_changed();
                         true
                     },
                     LocalDropDisposition::Rejected(reason) => {
@@ -3327,6 +3371,7 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
                             reason.into(),
                             MessageType::Error,
                         );
+                        self.message_buffer_changed();
                         true
                     },
                 }
@@ -3578,8 +3623,8 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
     #[inline]
     fn pop_message(&mut self) {
         if !self.message_buffer.is_empty() {
-            self.display.pending_update.dirty = true;
             self.message_buffer.pop();
+            self.message_buffer_changed();
         }
     }
 
@@ -3898,6 +3943,18 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
 }
 
 impl<'a, N: Notify + 'a, T: EventListener> ActionContext<'a, N, T> {
+    /// Recalculate the footer geometry and restart any warning dismissal timer.
+    fn message_buffer_changed(&mut self) {
+        self.display.pending_update.dirty = true;
+        *self.dirty = true;
+        schedule_message_timeout(
+            self.message_buffer,
+            self.config,
+            self.scheduler,
+            self.display.window.id(),
+        );
+    }
+
     fn update_search(&mut self) {
         let regex = match self.search_state.regex() {
             Some(regex) => regex,
@@ -4187,7 +4244,7 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                         // The typed path is the completion feedback, so retire the transfer
                         // notice rather than leaving it to expire on its own.
                         self.ctx.message_buffer.remove_target(FILE_DROP_MESSAGE_TARGET);
-                        *self.ctx.dirty = true;
+                        self.ctx.message_buffer_changed();
                     }
                     for text in &pastes {
                         // Bracketed, exactly like the local no-binding drop fallback.
@@ -4215,7 +4272,14 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                 // Add message only if it's not already queued.
                 EventType::Message(message) if !self.ctx.message_buffer.is_queued(&message) => {
                     self.ctx.message_buffer.push(message);
-                    self.ctx.display.pending_update.dirty = true;
+                    self.ctx.message_buffer_changed();
+                },
+                EventType::MessageTimeout(message)
+                    if message.ty() == MessageType::Warning
+                        && self.ctx.message_buffer.message() == Some(&message) =>
+                {
+                    self.ctx.message_buffer.pop();
+                    self.ctx.message_buffer_changed();
                 },
                 EventType::Terminal(event) => match event {
                     TerminalEvent::Title(title) => {
@@ -4322,6 +4386,7 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                 | EventType::AutomationTick
                 | EventType::Shutdown => (),
                 EventType::Message(_)
+                | EventType::MessageTimeout(_)
                 | EventType::ConfigReload(_)
                 | EventType::CreateWindow(_)
                 | EventType::NotificationActivated
@@ -4413,7 +4478,6 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                         // A drop supersedes the hover overlay. Leaving it at the front of the
                         // queue hides transfer and rejection state behind stale text.
                         self.ctx.message_buffer.remove_target(FILE_DROP_MESSAGE_TARGET);
-                        *self.ctx.dirty = true;
                         let size = self.ctx.size_info();
                         let display_offset = self.ctx.terminal.grid().display_offset();
                         match self.ctx.vivid_service.handle_file_drop(
@@ -4442,6 +4506,7 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                                 );
                             },
                         }
+                        self.ctx.message_buffer_changed();
                     },
                     WindowEvent::HoveredFile(_) => {
                         let size = self.ctx.size_info();
@@ -4459,13 +4524,13 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                                     label.into(),
                                     MessageType::Warning,
                                 );
-                                *self.ctx.dirty = true;
+                                self.ctx.message_buffer_changed();
                             }
                         }
                     },
                     WindowEvent::HoveredFileCancelled => {
                         self.ctx.message_buffer.remove_target(FILE_DROP_MESSAGE_TARGET);
-                        *self.ctx.dirty = true;
+                        self.ctx.message_buffer_changed();
                     },
                     WindowEvent::CursorLeft { .. } => {
                         self.ctx.mouse.inside_text_area = false;

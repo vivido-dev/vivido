@@ -15,6 +15,7 @@ pub mod debug;
 pub mod file_drop;
 pub mod font;
 pub mod general;
+pub mod message_bar;
 pub mod monitor;
 pub mod scrolling;
 pub mod selection;

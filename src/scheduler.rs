@@ -30,6 +30,7 @@ pub enum Topic {
     Frame,
     RendererRecovery,
     VividResizeSettled,
+    MessageTimeout,
     #[cfg(any(unix, windows))]
     ScreenshotReadback,
     #[cfg(any(unix, windows))]

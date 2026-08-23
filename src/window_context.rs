@@ -490,6 +490,7 @@ impl WindowContext {
     pub fn reset_window_config(&mut self, config: Rc<UiConfig>) {
         // Clear previous window errors.
         self.message_buffer.remove_target(LOG_TARGET_IPC_CONFIG);
+        self.display.pending_update.dirty = true;
 
         self.window_config.clear();
 
@@ -502,6 +503,7 @@ impl WindowContext {
     pub fn add_window_config(&mut self, config: Rc<UiConfig>, options: &ParsedOptions) {
         // Clear previous window errors.
         self.message_buffer.remove_target(LOG_TARGET_IPC_CONFIG);
+        self.display.pending_update.dirty = true;
 
         self.window_config.extend_from_slice(options);
 

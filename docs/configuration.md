@@ -25,6 +25,7 @@ channel, which is configured through the environment rather than this file — s
 - [`cursor`](#cursor)
 - [`terminal`](#terminal)
 - [`file_drop`](#file_drop)
+- [`message_bar`](#message_bar)
 - [`mouse`](#mouse)
 - [`hints`](#hints)
 - [`keyboard`](#keyboard)
@@ -84,6 +85,21 @@ key ordering pitfalls.
 [general]
 live_config_reload = true
 working_directory = "~/work"
+```
+
+## `message_bar`
+
+Warnings and errors are shown in a footer that grows to fit the wrapped message text. Warnings are
+dismissed automatically; errors remain until the `[X]` button is clicked or the
+`ClearLogNotice` action is invoked.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `warning_timeout` | integer (s) | `5` | Seconds before a warning is dismissed. `0` keeps warnings visible until dismissed manually. |
+
+```toml
+[message_bar]
+warning_timeout = 5
 ```
 
 ## `env`

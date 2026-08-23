@@ -30,6 +30,14 @@ live_config_reload = true
 ipc_socket = true
 
 # ─────────────────────────────────────────────────────────────────────────────
+# message_bar
+# ─────────────────────────────────────────────────────────────────────────────
+[message_bar]
+# Seconds before warnings are dismissed automatically. 0 keeps them visible.
+# Errors always require manual dismissal.
+warning_timeout = 5
+
+# ─────────────────────────────────────────────────────────────────────────────
 # env — environment variables exported to spawned processes
 # ─────────────────────────────────────────────────────────────────────────────
 [env]
