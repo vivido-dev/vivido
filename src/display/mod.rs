@@ -1502,6 +1502,15 @@ impl Display {
     fn request_frame(&mut self, scheduler: &mut Scheduler) {
         self.window.has_frame = false;
 
+        let window_id = self.window.id();
+        let timer_id = TimerId::new(Topic::Frame, window_id);
+        // OS redraws can bypass our frame gate. Preserve both the existing deadline and the frame
+        // timer's synchronization point when that happens: restarting either on every redraw can
+        // starve or jitter frames under continuous wheel input.
+        if scheduler.scheduled(timer_id) {
+            return;
+        }
+
         let monitor_vblank_interval = 1_000_000.
             / self
                 .window
@@ -1512,8 +1521,6 @@ impl Display {
             Duration::from_micros((1000. * monitor_vblank_interval) as u64);
 
         let swap_timeout = self.frame_timer.compute_timeout(monitor_vblank_interval);
-        let window_id = self.window.id();
-        let timer_id = TimerId::new(Topic::Frame, window_id);
         let event = Event::new(EventType::Frame, window_id);
         scheduler.schedule(event, swap_timeout, false, timer_id);
     }

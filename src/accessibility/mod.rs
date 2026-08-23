@@ -24,6 +24,15 @@ pub(crate) use accesskit_backend::AccessibilityState;
 #[cfg(target_os = "macos")]
 pub(crate) use macos::AccessibilityState;
 
+/// Whether the native adapter should expose retained terminal scrollback.
+///
+/// AccessKit represents every retained row and its character geometry as nodes. Rebuilding that
+/// tree on Windows and Linux makes wheel scrolling proportional to the configured history size,
+/// so those platforms expose only the lightweight window and tab controls.
+pub(crate) const fn terminal_document_enabled() -> bool {
+    cfg!(target_os = "macos")
+}
+
 /// A text range expressed in both platform offset systems.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct AccessibleRange {
@@ -365,6 +374,12 @@ mod tests {
 
     fn term(columns: usize, lines: usize) -> Term<VoidListener> {
         Term::new(Default::default(), &TermSize::new(columns, lines), VoidListener)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[test]
+    fn retained_scrollback_is_not_on_the_scroll_hot_path() {
+        assert!(!terminal_document_enabled());
     }
 
     fn size(columns: usize, lines: usize) -> SizeInfo {

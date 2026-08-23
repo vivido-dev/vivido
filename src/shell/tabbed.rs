@@ -17,6 +17,8 @@ use winit::window::{CursorIcon, Fullscreen, ResizeDirection, Window, WindowId};
 #[cfg(windows)]
 use winit::platform::windows::WindowAttributesExtWindows;
 
+#[cfg(target_os = "linux")]
+use crate::accessibility::terminal_document_enabled;
 use crate::cli::WindowOptions;
 use crate::config::UiConfig;
 use crate::config::window::Decorations;
@@ -453,11 +455,14 @@ impl TabbedApplication {
             .map_or(self.config.window.identity.title.as_str(), |tab| tab.title.as_str())
             .to_owned();
         #[cfg(target_os = "linux")]
-        let terminal = self
-            .tabs
-            .active_window()
-            .and_then(|id| self.processor.window(id))
-            .map(|window| window.accessibility_snapshot());
+        let terminal = if terminal_document_enabled() {
+            self.tabs
+                .active_window()
+                .and_then(|id| self.processor.window(id))
+                .map(|window| window.accessibility_snapshot())
+        } else {
+            None
+        };
         #[cfg(windows)]
         let terminal = None;
         if let Some(accessibility) = &mut self.accessibility {

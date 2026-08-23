@@ -73,14 +73,14 @@ complete CLI and JSON wire contract is documented in [Agent automation IPC](docs
 
 ## Accessibility
 
-Native terminal windows expose their active buffer, caret, selection, and text geometry to macOS
-Accessibility, Linux AT-SPI, and Windows UI Automation. The text document contains retained
-scrollback plus the current screen; the on-screen viewport is reported separately as the visible
-range. SGR-hidden text is reported as spaces, and all editing accessibility actions are
-intentionally unsupported. The Windows/Linux tab chrome exposes its tab list and controls; Linux
-composes only the active terminal document into that tree, while Windows keeps the active child
-terminal's native adapter. Desktop presentation targets expose their native application/window
-roles without a terminal text area; headless targets leave accessibility ownership to their host.
+Native terminal windows on macOS expose their active buffer, caret, selection, and text geometry.
+The text document contains retained scrollback plus the current screen; the on-screen viewport is
+reported separately as the visible range. SGR-hidden text is reported as spaces, and all editing
+accessibility actions are intentionally unsupported. Windows and Linux expose the lightweight tab
+list and window controls, but omit the history-sized terminal document so scrolling cost remains
+independent of retained scrollback. Desktop presentation targets expose their native
+application/window roles without a terminal text area; headless targets leave accessibility
+ownership to their host.
 
 On macOS, a live window's `AXVisibleCharacterRange` can be inspected with:
 

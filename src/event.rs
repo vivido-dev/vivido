@@ -2491,6 +2491,8 @@ impl Processor {
         };
 
         let is_redraw = matches!(event, WindowEvent::RedrawRequested);
+        #[cfg(windows)]
+        let is_latency_sensitive = matches!(event, WindowEvent::MouseWheel { .. });
         #[cfg(any(unix, windows))]
         let focus_confirmed = matches!(&event, WindowEvent::Focused(true));
         #[cfg(any(unix, windows))]
@@ -2535,18 +2537,27 @@ impl Processor {
             self.automation.emit(Some(window_context.ipc_window_id()), kind, data);
         }
 
-        if is_redraw {
-            let _presented = window_context.draw(&mut self.scheduler);
-            #[cfg(any(unix, windows))]
-            if _presented {
-                let ipc_window_id = window_context.ipc_window_id();
-                let frame_sequence = window_context.automation.record_frame();
-                self.automation.emit(
-                    Some(ipc_window_id),
-                    "frame_presented",
-                    serde_json::json!({"frame_sequence": frame_sequence}),
-                );
+        let _presented = if is_redraw {
+            Some(window_context.draw(&mut self.scheduler))
+        } else {
+            #[cfg(windows)]
+            {
+                is_latency_sensitive
+                    .then(|| window_context.draw_latency_sensitive(&mut self.scheduler))
+                    .flatten()
             }
+            #[cfg(not(windows))]
+            None
+        };
+        #[cfg(any(unix, windows))]
+        if _presented == Some(true) {
+            let ipc_window_id = window_context.ipc_window_id();
+            let frame_sequence = window_context.automation.record_frame();
+            self.automation.emit(
+                Some(ipc_window_id),
+                "frame_presented",
+                serde_json::json!({"frame_sequence": frame_sequence}),
+            );
         }
 
         #[cfg(any(unix, windows))]

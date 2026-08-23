@@ -37,7 +37,7 @@ use winit::event_loop::ActiveEventLoop;
 use winit::window::WindowId;
 
 #[cfg(any(target_os = "macos", target_os = "linux", windows))]
-use crate::accessibility::{AccessibilitySnapshot, AccessibilityState};
+use crate::accessibility::{AccessibilitySnapshot, AccessibilityState, terminal_document_enabled};
 use crate::terminal::event::Event as TerminalEvent;
 #[cfg(any(unix, windows))]
 use crate::terminal::event::Notify;
@@ -98,6 +98,10 @@ type AutomationResize = (u32, u32, Option<(u16, u16)>);
 
 const VIVID_RESIZE_SETTLE_DELAY: Duration = Duration::from_millis(120);
 
+/// Maximum delay between directly presented frames during continuous Windows wheel input.
+#[cfg(windows)]
+const LATENCY_SENSITIVE_FRAME_INTERVAL: Duration = Duration::from_millis(16);
+
 #[cfg(any(unix, windows))]
 #[derive(Default)]
 struct AutomationNotifier(RefCell<Vec<u8>>);
@@ -125,6 +129,8 @@ pub struct WindowContext {
     pub display: Display,
     pub dirty: bool,
     event_queue: Vec<WinitEvent<Event>>,
+    #[cfg(windows)]
+    last_latency_sensitive_draw: Option<Instant>,
     #[cfg(any(target_os = "linux", windows))]
     event_proxy: EventProxy,
     terminal: Arc<FairMutex<Term<EventProxy>>>,
@@ -167,6 +173,31 @@ const SCREENSHOT_POLL_INTERVAL: Duration = Duration::from_millis(5);
 
 #[cfg(any(unix, windows))]
 const SCREENSHOT_READBACK_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Whether an event must bypass batching and frame-token gating.
+///
+/// Wheel input is intentionally latency-sensitive: a freely spinning wheel can keep the native
+/// message queue busy indefinitely, so neither `AboutToWait` nor a scheduled `Frame` user event is
+/// guaranteed to run promptly. The native redraw request still coalesces outstanding paints.
+fn is_latency_sensitive_input(event: &WinitEvent<Event>) -> bool {
+    cfg!(any(target_os = "linux", target_os = "windows"))
+        && matches!(event, WinitEvent::WindowEvent { event: WindowEvent::MouseWheel { .. }, .. })
+}
+
+/// Whether an event must flush input already staged for this window.
+fn flushes_staged_input(event: &WinitEvent<Event>) -> bool {
+    matches!(
+        event,
+        WinitEvent::AboutToWait
+            | WinitEvent::WindowEvent { event: WindowEvent::RedrawRequested, .. }
+    ) || is_latency_sensitive_input(event)
+}
+
+#[cfg(windows)]
+fn latency_sensitive_draw_due(last_draw: Option<Instant>, now: Instant) -> bool {
+    last_draw
+        .is_none_or(|last_draw| now.duration_since(last_draw) >= LATENCY_SENSITIVE_FRAME_INTERVAL)
+}
 
 impl WindowContext {
     /// Close this terminal even when its configured hold policy is enabled.
@@ -296,7 +327,7 @@ impl WindowContext {
         let terminal = Arc::new(FairMutex::new(terminal));
 
         #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
-        let accessibility = {
+        let accessibility = if terminal_document_enabled() {
             let snapshot = AccessibilitySnapshot::new(
                 &terminal.lock(),
                 display.size_info,
@@ -312,9 +343,11 @@ impl WindowContext {
                 })
             });
             state
+        } else {
+            None
         };
 
-        // Accessibility adapters must be installed while the native window is still hidden.
+        // Map only after any enabled native accessibility adapter has been installed.
         display.map_window(&config, tabbed, options.no_activate);
 
         // Create the PTY.
@@ -386,6 +419,8 @@ impl WindowContext {
             window_config: Default::default(),
             search_state: Default::default(),
             event_queue: Default::default(),
+            #[cfg(windows)]
+            last_latency_sensitive_draw: None,
             modifiers: Default::default(),
             occluded: Default::default(),
             mouse: Default::default(),
@@ -549,6 +584,28 @@ impl WindowContext {
         )
     }
 
+    /// Present wheel-driven state without waiting for Windows to synthesize `WM_PAINT`.
+    ///
+    /// `WM_PAINT` has lower priority than posted input, so an infinite wheel can otherwise update
+    /// the terminal model for seconds without presenting it. The timestamp is recorded after the
+    /// draw, allowing subsequent wheel reports to accumulate for one frame interval instead of
+    /// rendering each report and falling behind the input stream.
+    #[cfg(windows)]
+    pub fn draw_latency_sensitive(&mut self, scheduler: &mut Scheduler) -> Option<bool> {
+        if !self.dirty || self.occluded {
+            return None;
+        }
+
+        let now = Instant::now();
+        if !latency_sensitive_draw_due(self.last_latency_sensitive_draw, now) {
+            return None;
+        }
+
+        let presented = self.draw(scheduler);
+        self.last_latency_sensitive_draw = Some(Instant::now());
+        Some(presented)
+    }
+
     /// Process events for this terminal window.
     pub fn handle_event(
         &mut self,
@@ -566,6 +623,13 @@ impl WindowContext {
             accessibility.process_event(window, event);
         }
 
+        let redraw_requested =
+            matches!(&event, WinitEvent::WindowEvent { event: WindowEvent::RedrawRequested, .. });
+        let focus_lost =
+            matches!(&event, WinitEvent::WindowEvent { event: WindowEvent::Focused(false), .. });
+        let latency_sensitive_input = is_latency_sensitive_input(&event);
+        let flush_staged_input = flushes_staged_input(&event);
+
         match event {
             WinitEvent::AboutToWait
             | WinitEvent::WindowEvent { event: WindowEvent::RedrawRequested, .. } => {
@@ -575,6 +639,12 @@ impl WindowContext {
                 }
 
                 // Continue to process all pending events.
+            },
+            // A freely spinning wheel can keep the platform message queue non-empty, preventing
+            // `AboutToWait` from arriving. Flush the staged input on every wheel report so the
+            // viewport advances continuously instead of jumping only after the wheel pauses.
+            event if flush_staged_input => {
+                self.event_queue.push(event);
             },
             event => {
                 self.event_queue.push(event);
@@ -588,7 +658,7 @@ impl WindowContext {
 
         // Desktop §4: focus loss revokes the effective input grant, and nothing reinstates it
         // when focus returns — the producer must issue a strictly greater epoch.
-        if let WinitEvent::WindowEvent { event: WindowEvent::Focused(false), .. } = &event {
+        if focus_lost {
             self.vivid_service.revoke_all_input(vivid_protocol::grant::reason::FOCUS_LOSS);
         }
 
@@ -680,9 +750,9 @@ impl WindowContext {
         // Don't call `request_redraw` when event is `RedrawRequested` since the `dirty` flag
         // represents the current frame, but redraw is for the next frame.
         if self.dirty
-            && self.display.window.has_frame
+            && (self.display.window.has_frame || latency_sensitive_input)
             && !self.occluded
-            && !matches!(event, WinitEvent::WindowEvent { event: WindowEvent::RedrawRequested, .. })
+            && !redraw_requested
         {
             self.display.window.request_redraw();
         }
@@ -1529,6 +1599,9 @@ impl WindowContext {
     /// Publish a coalesced read-only accessibility snapshot.
     #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
     pub fn sync_accessibility(&mut self) {
+        if !terminal_document_enabled() {
+            return;
+        }
         let Some(accessibility) = &mut self.accessibility else { return };
 
         // A retained terminal document carries per-cell text geometry for the entire scrollback.
@@ -2651,7 +2724,46 @@ mod vivid_environment_tests {
     use super::configure_vivid_pty_environment;
     #[cfg(windows)]
     use super::vivid_wslenv;
+    #[cfg(windows)]
+    use super::{LATENCY_SENSITIVE_FRAME_INTERVAL, latency_sensitive_draw_due};
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    use super::{flushes_staged_input, is_latency_sensitive_input};
     use std::collections::HashMap;
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    use winit::event::{DeviceId, Event as WinitEvent, MouseScrollDelta, TouchPhase, WindowEvent};
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    use winit::window::WindowId;
+
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[test]
+    fn mouse_wheel_flushes_staged_input_without_waiting_for_idle() {
+        let device_id = DeviceId::dummy();
+        let window_id = WindowId::dummy();
+        let event = WinitEvent::WindowEvent {
+            window_id,
+            event: WindowEvent::MouseWheel {
+                device_id,
+                delta: MouseScrollDelta::LineDelta(0., 1.),
+                phase: TouchPhase::Moved,
+            },
+        };
+
+        assert!(flushes_staged_input(&event));
+        assert!(is_latency_sensitive_input(&event));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn latency_sensitive_draws_are_bounded_to_one_per_frame_interval() {
+        let start = std::time::Instant::now();
+
+        assert!(latency_sensitive_draw_due(None, start));
+        assert!(!latency_sensitive_draw_due(
+            Some(start),
+            start + LATENCY_SENSITIVE_FRAME_INTERVAL - std::time::Duration::from_nanos(1)
+        ));
+        assert!(latency_sensitive_draw_due(Some(start), start + LATENCY_SENSITIVE_FRAME_INTERVAL));
+    }
 
     #[test]
     fn child_receives_the_platform_marker_transport() {
