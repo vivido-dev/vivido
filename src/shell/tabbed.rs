@@ -34,7 +34,13 @@ const INITIAL_WIDTH: f64 = 1000.0;
 const INITIAL_HEIGHT: f64 = 700.0;
 const MINIMUM_WIDTH: f64 = 320.0;
 const MINIMUM_HEIGHT: f64 = 160.0;
-const RESIZE_EDGE_LOGICAL: f64 = if cfg!(windows) { 10.0 } else { 6.0 };
+/// Width of the frame band along each window edge which starts a resize.
+const RESIZE_EDGE_LOGICAL: f64 = if cfg!(windows) { 10.0 } else { 8.0 };
+/// How far a diagonal corner grip reaches along both of its edges.
+///
+/// The edge band alone would leave a grip only as large as its own width, which is too small a
+/// target to find with a pointer; every desktop frame widens its corners the same way.
+const RESIZE_CORNER_LOGICAL: f64 = 16.0;
 const CLAIMED_METHODS: [&str; 1] = ["create_window"];
 
 /// Windows/Linux headed Vivido with one integrated top-level tab host.
@@ -620,11 +626,21 @@ impl TabbedApplication {
         resize_direction_at(chrome.inner_size(), chrome.scale_factor(), position)
     }
 
+    /// Whether the pointer is in a band which resizes the window rather than reaching the pane.
+    fn pointer_over_resize_edge(&self) -> bool {
+        self.pointer_resize_direction().is_some()
+    }
+
+    fn pointer_resize_direction(&self) -> Option<ResizeDirection> {
+        self.cursor.and_then(|position| self.resize_direction(position))
+    }
+
     fn update_resize_cursor(&self, position: PhysicalPosition<f64>) {
         let Some(chrome) = &self.chrome else { return };
         let icon =
             self.resize_direction(position).map(resize_cursor).unwrap_or(CursorIcon::Default);
         chrome.set_cursor(icon);
+        chrome.set_cursor_visible(true);
     }
 
     #[cfg(target_os = "linux")]
@@ -702,8 +718,12 @@ impl TabbedApplication {
         else {
             return;
         };
-        chrome.set_cursor(state.cursor);
-        chrome.set_cursor_visible(state.cursor_visible);
+        // The frame owns the pointer while it sits in a resize band, so the pane's own cursor —
+        // a text bar over the terminal — must not replace the grip the edge just set.
+        if !self.pointer_over_resize_edge() {
+            chrome.set_cursor(state.cursor);
+            chrome.set_cursor_visible(state.cursor_visible);
+        }
         chrome.set_ime_allowed(state.ime_allowed);
         if let Some((position, size)) = state.ime_cursor_area {
             chrome.set_ime_cursor_area(
@@ -757,9 +777,9 @@ impl TabbedApplication {
                 state: ElementState::Pressed,
                 button: MouseButton::Left,
                 ..
-            } if self.cursor.and_then(|position| self.resize_direction(position)).is_some() => {
+            } if self.pointer_over_resize_edge() => {
                 if let (Some(chrome), Some(direction)) =
-                    (&self.chrome, self.cursor.and_then(|position| self.resize_direction(position)))
+                    (&self.chrome, self.pointer_resize_direction())
                 {
                     let _ = chrome.drag_resize_window(direction);
                 }
@@ -808,11 +828,29 @@ fn resize_direction_at(
     scale_factor: f64,
     position: PhysicalPosition<f64>,
 ) -> Option<ResizeDirection> {
-    let edge = (RESIZE_EDGE_LOGICAL * scale_factor).max(1.0);
-    let left = position.x < edge;
-    let right = position.x >= f64::from(size.width) - edge;
-    let top = position.y < edge;
-    let bottom = position.y >= f64::from(size.height) - edge;
+    let width = f64::from(size.width);
+    let height = f64::from(size.height);
+    // Clamping both bands to half the window keeps opposite edges from claiming the same pixel.
+    let edge_x = (RESIZE_EDGE_LOGICAL * scale_factor).max(1.0).min(width / 2.0);
+    let edge_y = (RESIZE_EDGE_LOGICAL * scale_factor).max(1.0).min(height / 2.0);
+    let corner_x = (RESIZE_CORNER_LOGICAL * scale_factor).max(edge_x).min(width / 2.0);
+    let corner_y = (RESIZE_CORNER_LOGICAL * scale_factor).max(edge_y).min(height / 2.0);
+
+    let on_left = position.x < edge_x;
+    let on_right = position.x >= width - edge_x;
+    let on_top = position.y < edge_y;
+    let on_bottom = position.y >= height - edge_y;
+    if !(on_left || on_right || on_top || on_bottom) {
+        return None;
+    }
+
+    // Along a horizontal edge the corner grip reaches further in from the sides, and vice versa.
+    let vertical = on_top || on_bottom;
+    let horizontal = on_left || on_right;
+    let left = on_left || (vertical && position.x < corner_x);
+    let right = on_right || (vertical && position.x >= width - corner_x);
+    let top = on_top || (horizontal && position.y < corner_y);
+    let bottom = on_bottom || (horizontal && position.y >= height - corner_y);
     match (left, right, top, bottom) {
         (true, false, true, false) => Some(ResizeDirection::NorthWest),
         (false, true, true, false) => Some(ResizeDirection::NorthEast),
@@ -899,10 +937,74 @@ impl ApplicationHandler<Event> for TabbedApplication {
     }
 }
 
-#[cfg(all(test, windows))]
+#[cfg(test)]
 mod tests {
     use super::*;
+    use winit::dpi::PhysicalSize;
 
+    fn direction(x: f64, y: f64) -> Option<ResizeDirection> {
+        resize_direction_at(PhysicalSize::new(800, 600), 1.0, PhysicalPosition::new(x, y))
+    }
+
+    #[test]
+    fn every_corner_grips_its_diagonal() {
+        let inside_corner = RESIZE_CORNER_LOGICAL - 1.0;
+        assert_eq!(direction(0.0, 0.0), Some(ResizeDirection::NorthWest));
+        assert_eq!(direction(inside_corner, 1.0), Some(ResizeDirection::NorthWest));
+        assert_eq!(direction(1.0, inside_corner), Some(ResizeDirection::NorthWest));
+        assert_eq!(direction(799.0, 0.0), Some(ResizeDirection::NorthEast));
+        assert_eq!(direction(800.0 - inside_corner, 1.0), Some(ResizeDirection::NorthEast));
+        assert_eq!(direction(0.0, 599.0), Some(ResizeDirection::SouthWest));
+        assert_eq!(direction(1.0, 600.0 - inside_corner), Some(ResizeDirection::SouthWest));
+        assert_eq!(direction(799.0, 599.0), Some(ResizeDirection::SouthEast));
+        assert_eq!(direction(800.0 - inside_corner, 599.0), Some(ResizeDirection::SouthEast));
+    }
+
+    #[test]
+    fn edges_outside_the_corners_resize_along_one_axis() {
+        assert_eq!(direction(400.0, 1.0), Some(ResizeDirection::North));
+        assert_eq!(direction(400.0, 599.0), Some(ResizeDirection::South));
+        assert_eq!(direction(1.0, 300.0), Some(ResizeDirection::West));
+        assert_eq!(direction(799.0, 300.0), Some(ResizeDirection::East));
+    }
+
+    #[test]
+    fn the_window_interior_is_not_a_grip() {
+        assert_eq!(direction(400.0, 300.0), None);
+        assert_eq!(direction(RESIZE_EDGE_LOGICAL, RESIZE_CORNER_LOGICAL), None);
+        assert_eq!(direction(RESIZE_CORNER_LOGICAL, RESIZE_EDGE_LOGICAL), None);
+    }
+
+    #[test]
+    fn grips_scale_with_the_window_and_never_overlap() {
+        let scaled = resize_direction_at(
+            PhysicalSize::new(1600, 1200),
+            2.0,
+            PhysicalPosition::new(30.0, 4.0),
+        );
+        assert_eq!(scaled, Some(ResizeDirection::NorthWest));
+
+        // A window narrower than two corner grips must still split them left from right.
+        let tiny = PhysicalSize::new(20, 20);
+        assert_eq!(
+            resize_direction_at(tiny, 1.0, PhysicalPosition::new(5.0, 5.0)),
+            Some(ResizeDirection::NorthWest)
+        );
+        assert_eq!(
+            resize_direction_at(tiny, 1.0, PhysicalPosition::new(15.0, 15.0)),
+            Some(ResizeDirection::SouthEast)
+        );
+        assert_eq!(
+            resize_direction_at(tiny, 1.0, PhysicalPosition::new(9.9, 1.0)),
+            Some(ResizeDirection::NorthWest)
+        );
+        assert_eq!(
+            resize_direction_at(tiny, 1.0, PhysicalPosition::new(10.0, 1.0)),
+            Some(ResizeDirection::NorthEast)
+        );
+    }
+
+    #[cfg(windows)]
     #[test]
     fn focused_chrome_hands_keyboard_focus_to_the_active_pane() {
         let active = WindowId::from(7);

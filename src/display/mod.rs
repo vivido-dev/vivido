@@ -59,6 +59,7 @@ pub mod text;
 pub mod window;
 
 mod bell;
+mod corners;
 mod damage;
 mod media;
 mod meter;

@@ -24,6 +24,13 @@ const MIN_TAB_WIDTH_LOGICAL: f64 = 80.0;
 const NEW_TAB_LOGICAL: f64 = 36.0;
 const OVERFLOW_LOGICAL: f64 = 28.0;
 const MIN_CONTENT_HEIGHT_LOGICAL: f64 = 80.0;
+/// Corner radius of the window frame the shell draws for itself.
+///
+/// Wayland compositors such as Mutter leave a Vivido chrome window undecorated, so its frame —
+/// rounded corners included — is ours to paint. Windows draws the rounded frame itself around the
+/// undecorated shadow, so this only applies on Linux.
+#[cfg(target_os = "linux")]
+const CORNER_RADIUS_LOGICAL: f64 = 12.0;
 
 const BACKGROUND: Rgb = Rgb::new(24, 24, 29);
 const ACTIVE: Rgb = Rgb::new(53, 53, 65);
@@ -67,6 +74,8 @@ pub fn compute_layout(size: PhysicalSize<u32>, scale: f64) -> ChromeLayout {
 }
 
 pub struct ChromeRenderer {
+    #[cfg(target_os = "linux")]
+    window: Arc<Window>,
     renderer: SceneRenderer,
     text: TextSystem,
     scale: f64,
@@ -83,6 +92,8 @@ impl ChromeRenderer {
                 window.inner_size(),
                 true,
             )?,
+            #[cfg(target_os = "linux")]
+            window,
             text: text_system(config, scale),
             scale,
             background: config.colors.primary.background,
@@ -108,6 +119,8 @@ impl ChromeRenderer {
         frames: &[EmbeddedFramePlacement<'_>],
     ) -> Result<(ChromeLayout, ChromeHitMap, bool), Error> {
         let scale = self.scale;
+        #[cfg(target_os = "linux")]
+        self.renderer.set_corner_radius(self.corner_radius());
         let layout = compute_layout(size, scale);
         let mut hits = ChromeHitMap::default();
         let mut scene = Scene::new();
@@ -157,6 +170,18 @@ impl ChromeRenderer {
             frames,
         )?;
         Ok((layout, hits, presented))
+    }
+
+    /// Physical corner radius for the current window state.
+    ///
+    /// A maximized or fullscreen window fills its output edge to edge, where a rounded corner
+    /// would only cut a notch out of the desktop behind it.
+    #[cfg(target_os = "linux")]
+    fn corner_radius(&self) -> f32 {
+        if self.window.is_maximized() || self.window.fullscreen().is_some() {
+            return 0.0;
+        }
+        (CORNER_RADIUS_LOGICAL * self.scale) as f32
     }
 
     fn paint_tabs(

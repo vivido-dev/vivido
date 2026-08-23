@@ -23,6 +23,7 @@ use windows::core::{IUnknown, Interface};
 use crate::terminal::graphics::GraphicsCommand;
 
 use crate::display::SizeInfo;
+use crate::display::corners::CornerMask;
 #[cfg(any(unix, windows))]
 use crate::display::media::CaptureRedaction;
 use crate::display::media::VividMediaRenderer;
@@ -135,6 +136,10 @@ pub struct SceneRenderer {
     valid_target: bool,
     max_surface_dimension: u32,
     media: VividMediaRenderer,
+    /// Rounds the finished frame's corners. Built only for a window which draws its own frame.
+    corners: Option<CornerMask>,
+    /// Physical corner radius applied to the finished frame; zero leaves the corners square.
+    corner_radius: f32,
     render_target: wgpu::Texture,
     render_target_view: wgpu::TextureView,
     /// Size of `render_target`, which is also the surface size when there is a surface.
@@ -373,6 +378,8 @@ impl SceneRenderer {
             valid_target,
             max_surface_dimension,
             media,
+            corners: None,
+            corner_radius: 0.0,
             render_target,
             render_target_view,
             target_size,
@@ -429,6 +436,19 @@ impl SceneRenderer {
 
     pub fn clamp_render_size(&self, size: PhysicalSize<u32>) -> PhysicalSize<u32> {
         clamp_render_size(size, self.max_surface_dimension)
+    }
+
+    /// Round the finished frame's corners by `radius` physical pixels.
+    ///
+    /// A window whose frame the desktop does not draw has to round itself; everything else keeps
+    /// the square corners its decorations already cover. The mask pipeline is built on the first
+    /// non-zero radius so a terminal pane never pays for one.
+    pub fn set_corner_radius(&mut self, radius: f32) {
+        let radius = if radius.is_finite() { radius.max(0.0) } else { 0.0 };
+        if radius > 0.0 && self.corners.is_none() {
+            self.corners = Some(CornerMask::new(&self.device));
+        }
+        self.corner_radius = radius;
     }
 
     pub fn set_vivid_scene(&mut self, scene: crate::vivid::scene::SharedScene) {
@@ -534,6 +554,18 @@ impl SceneRenderer {
                 );
             }
             self.queue.submit([encoder.finish()]);
+        }
+
+        // Rounding comes last: the scene and every embedded frame are already in the target, so
+        // one pass rounds the whole composited window rather than each layer of it.
+        if let Some(corners) = &self.corners {
+            corners.apply(
+                &self.device,
+                &self.queue,
+                &self.render_target_view,
+                self.target_size,
+                self.corner_radius,
+            );
         }
 
         // The offscreen target is the finished image; only a windowed renderer blits and presents.
@@ -805,6 +837,7 @@ fn create_render_target(
         format: wgpu::TextureFormat::Rgba8Unorm,
         usage: wgpu::TextureUsages::STORAGE_BINDING
             | wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::RENDER_ATTACHMENT
             | wgpu::TextureUsages::COPY_SRC
             | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
@@ -987,6 +1020,43 @@ mod tests {
         };
 
         assert_eq!(&pixels.bytes[..4], &[199, 100, 50, 128]);
+    }
+
+    /// The corner mask must clear alpha in the corners and leave every other pixel untouched.
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn a_corner_radius_rounds_only_the_corners() {
+        let _gpu = gpu_lock();
+        if offscreen_device().is_err() {
+            eprintln!("Skipping corner radius test: no wgpu adapter");
+            return;
+        }
+
+        let size = PhysicalSize::new(64, 64);
+        let mut renderer =
+            SceneRenderer::new(RenderSource::Offscreen, size, true).expect("offscreen renderer");
+        renderer.set_corner_radius(12.0);
+        renderer.render(&Scene::new(), Color::from_rgb8(10, 20, 30)).expect("render");
+
+        let readback = renderer.begin_screenshot().expect("rounded screenshot");
+        let pixels = loop {
+            if let Some(pixels) = renderer.poll_screenshot(&readback).expect("poll") {
+                break pixels;
+            }
+        };
+        let pixel = |x: usize, y: usize| {
+            let offset = y * pixels.padded_bytes_per_row as usize + x * 4;
+            <[u8; 4]>::try_from(&pixels.bytes[offset..offset + 4]).expect("pixel")
+        };
+
+        for (x, y) in [(0, 0), (63, 0), (0, 63), (63, 63)] {
+            assert_eq!(pixel(x, y)[3], 0, "corner ({x}, {y}) kept its alpha");
+        }
+        // The colour under the cleared alpha is left alone, and the interior is untouched.
+        assert_eq!(pixel(0, 0)[..3], pixel(32, 32)[..3]);
+        for (x, y) in [(32, 0), (32, 63), (0, 32), (63, 32), (32, 32)] {
+            assert_eq!(pixel(x, y)[3], 255, "pixel ({x}, {y}) lost its alpha");
+        }
     }
 
     /// Resizing an offscreen renderer must retarget without a surface to reconfigure.
