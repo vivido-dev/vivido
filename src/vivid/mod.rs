@@ -5923,7 +5923,9 @@ fn wake_listener(endpoint: &str) {
 mod tests {
     use super::*;
     use vivid_protocol::messages::LaneClass;
-    use vivid_protocol::track::{KindConfiguration, TrackConfiguration, TrackMode};
+    use vivid_protocol::track::{
+        AudioConfiguration, KindConfiguration, TrackConfiguration, TrackMode,
+    };
 
     macro_rules! socket_service {
         ($service:expr) => {
@@ -6506,6 +6508,119 @@ mod tests {
         let (bytes, records) = live_channel_flow(&audio);
         assert_eq!(bytes, 36_096);
         assert_eq!(records, 200);
+    }
+
+    #[test]
+    #[ignore = "requires the machine's default audio output device"]
+    fn vvdoom_float_pcm_reaches_the_live_presenter_audio_clock() {
+        let service =
+            socket_service!(VividService::start_with_wake(test_geometry(), Arc::new(|_| {})));
+        let mut session = connect(&service);
+        let context_id = session.info().root_context_id;
+        let surface = grid_surface(&mut session, 1);
+        let access_unit_bytes = 960 * 2 * size_of::<f32>();
+        let maximum_record_body =
+            media::audio_body_len(access_unit_bytes as u32).expect("audio body length");
+        let track = session
+            .create_track(
+                TrackConfiguration {
+                    context_id,
+                    surface_id: surface.id(),
+                    track_id: 2,
+                    slot: scene::SLOT_AUDIO,
+                    mode: TrackMode::Live,
+                    lane: LaneClass::Realtime,
+                    maximum_record_body,
+                    maximum_rate_millihertz: 50_000,
+                    maximum_encoded_bits_per_second: u64::from(maximum_record_body) * 8 * 50,
+                    maximum_records_per_second: 50,
+                    maximum_inflight_body_bytes: u64::from(maximum_record_body) * 8,
+                    kind: KindConfiguration::Audio(AudioConfiguration {
+                        codec: "pcm_f32le".into(),
+                        packetization: "pcm-packet-v1".into(),
+                        extradata: Vec::new(),
+                        sample_rate: 48_000,
+                        channels: 2,
+                        channel_mask: 3,
+                        maximum_access_unit_bytes: access_unit_bytes as u32,
+                        codec_string: Some("pcm-f32".into()),
+                    }),
+                    target_latency_us: 40_000,
+                    maximum_latency_us: 250_000,
+                    retained_pixel_charge: 0,
+                },
+                &RequestMetadata::default(),
+            )
+            .unwrap();
+        let channel = session.open_track_channel(&track).unwrap();
+        let packet = (0..960)
+            .flat_map(|frame| {
+                let phase = frame as f32 * 440.0 * std::f32::consts::TAU / 48_000.0;
+                std::iter::repeat_n(phase.sin() * 0.2, 2)
+            })
+            .flat_map(f32::to_le_bytes)
+            .collect::<Vec<_>>();
+        for packet_id in 1..=5 {
+            let pts_us = i64::try_from((packet_id - 1) * 20_000).unwrap();
+            channel
+                .send_audio(media::AudioPacket {
+                    epoch: 1,
+                    packet_id,
+                    pts_us,
+                    dts_us: pts_us,
+                    duration_us: 20_000,
+                    trim_start_samples: 0,
+                    trim_end_samples: 0,
+                    data: &packet,
+                })
+                .unwrap();
+        }
+        session
+            .wait_track(
+                &track,
+                TrackWaitCondition::MilestoneSet,
+                Some(MILESTONE_OUTPUT_READY),
+                2_000_000,
+            )
+            .unwrap();
+        session
+            .activate_tracks(
+                &surface,
+                &[SlotBinding {
+                    slot: scene::SLOT_AUDIO,
+                    track_id: track.id(),
+                    expected_channel_generation: channel.generation(),
+                    required_milestone: MILESTONE_OUTPUT_READY,
+                }],
+                &RequestMetadata::default(),
+            )
+            .unwrap();
+        for packet_id in 6..=25 {
+            let pts_us = i64::try_from((packet_id - 1) * 20_000).unwrap();
+            channel
+                .send_audio(media::AudioPacket {
+                    epoch: 1,
+                    packet_id,
+                    pts_us,
+                    dts_us: pts_us,
+                    duration_us: 20_000,
+                    trim_start_samples: 0,
+                    trim_end_samples: 0,
+                    data: &packet,
+                })
+                .unwrap();
+        }
+        let identity = service.shared.presenter_track(
+            session.info().session_id,
+            context_id,
+            surface.id(),
+            track.id(),
+        );
+        let output = lock(&service.shared.audio_outputs).get(&identity).cloned().unwrap();
+        assert!(
+            wait_until(Duration::from_secs(2), || output.rendered_pts().is_some_and(|pts| pts > 0)),
+            "Vvdoom PCM never advanced the physical output clock"
+        );
     }
 
     fn next_target_change(session: &vivid_sdk::Session) -> messages::PayloadMap {

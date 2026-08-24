@@ -1580,6 +1580,66 @@ mod tests {
     }
 
     #[test]
+    fn ffmpeg_decodes_vvdoom_float_pcm_access_units() {
+        let config = AudioConfiguration {
+            codec: "pcm_f32le".into(),
+            packetization: "pcm-packet-v1".into(),
+            extradata: Vec::new(),
+            sample_rate: 48_000,
+            channels: 2,
+            channel_mask: 3,
+            maximum_access_unit_bytes: (960 * 2 * size_of::<f32>()) as u32,
+            codec_string: Some("pcm-f32".into()),
+        };
+        let source = (0..960 * 2)
+            .map(|sample| if sample % 2 == 0 { 0.5_f32 } else { -0.25_f32 })
+            .collect::<Vec<_>>();
+        let encoded = source.iter().flat_map(|sample| sample.to_le_bytes()).collect::<Vec<_>>();
+        assert!(supports(&config));
+        let mut decoder = AudioDecoder::new(&config, 48_000, 2).unwrap();
+        let mut samples = decoder
+            .push(ParsedAudioPacket {
+                epoch: 1,
+                packet_id: 1,
+                pts_us: 0,
+                dts_us: 0,
+                duration_us: 20_000,
+                trim_start_samples: 0,
+                trim_end_samples: 0,
+                data: &encoded,
+            })
+            .unwrap();
+        samples.extend(decoder.finish().unwrap());
+        assert_eq!(samples, source);
+    }
+
+    #[test]
+    #[ignore = "requires the machine's default audio output device"]
+    fn default_audio_device_renders_vvdoom_float_pcm() {
+        let output = AudioOutput::open(1).unwrap();
+        let sample_rate = output.sample_rate;
+        let channels = usize::from(output.channels);
+        let frame_count = sample_rate as usize / 2;
+        let samples = (0..frame_count)
+            .flat_map(|frame| {
+                let phase = frame as f32 * 440.0 * std::f32::consts::TAU / sample_rate as f32;
+                std::iter::repeat_n(phase.sin() * 0.2, channels)
+            })
+            .collect::<Vec<_>>();
+        output.observe_audio_pts(0);
+        output.start();
+        output.push(&samples).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while output.shared.played_samples.load(Ordering::SeqCst) == 0 && Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+        output.stop();
+        assert!(output.shared.played_samples.load(Ordering::SeqCst) > 0);
+        assert!(output.shared.error().is_none());
+    }
+
+    #[test]
     fn gain_updates_without_changing_audio_clock_state() {
         let output = AudioOutput::test_output();
         output.shared.rendered_samples.store(42, Ordering::SeqCst);
