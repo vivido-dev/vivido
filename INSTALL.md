@@ -22,22 +22,16 @@ cargo install --path .
 This installs both `vivido` and its `vvssh` companion command. Do not select only the `vivido`
 binary with `--bin` if remote Vivid forwarding is needed.
 
-Vivido carries its own terminfo entry and makes it available to child applications automatically
-when no system entry is installed. Extended underline styles such as Neovim undercurls therefore
-work for both source builds and Cargo installs without a separate `tic` step.
+Vivido carries its own terminfo entry and makes it available to ordinary child applications when
+no system entry is installed. Linux users should also install it system-wide so it remains
+available across environment boundaries such as `sudo`; see the Linux guide below.
 
 ### Linux
 
-Linux builds are Wayland-only. Install the development packages for Wayland, xkbcommon,
-fontconfig, FreeType, CMake, and pkg-config. For example, on Debian or Ubuntu:
-
-```sh
-sudo apt install cmake g++ pkg-config libfontconfig1-dev libfreetype6-dev \
-  libwayland-dev libxkbcommon-dev
-cargo build --release
-```
-
-There is intentionally no X11 feature or fallback. Run Vivido inside a Wayland session.
+Linux builds are Wayland-only, and there is currently no Linux package or installer. See
+[Installing and setting up Vivido on Linux](docs/linux.md) for build dependencies, Cargo
+installation, the required system terminfo setup, desktop integration, configuration, shell
+completions, and manual pages.
 
 ### macOS
 

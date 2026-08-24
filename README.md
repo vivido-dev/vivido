@@ -49,9 +49,9 @@ Vivido requires Rust 1.88 or newer.
 cargo build --release
 ```
 
-On Linux, install the Wayland, Vulkan, font discovery, input, and FFmpeg development libraries. On
-Windows, install FFmpeg with vcpkg and keep its DLL directory on `PATH`; see
-[Installing Vivido](INSTALL.md#windows).
+On Linux, install the Wayland, Vulkan, font discovery, input, audio, and FFmpeg development
+libraries; see [Installing and setting up Vivido on Linux](docs/linux.md). On Windows, install
+FFmpeg with vcpkg and keep its DLL directory on `PATH`; see [Installing Vivido](INSTALL.md#windows).
 The resulting executables are `target/release/vivido` and `target/release/vvssh`.
 
 Useful verification commands:
