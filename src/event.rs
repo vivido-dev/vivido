@@ -16,6 +16,8 @@ use std::os::unix::io::RawFd;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
+#[cfg(windows)]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 use std::{env, f32, mem};
@@ -2835,6 +2837,8 @@ impl Processor {
             },
             (EventType::Terminal(TerminalEvent::Wakeup), Some(window_id)) => {
                 if let Some(window_context) = self.windows.get_mut(window_id) {
+                    #[cfg(windows)]
+                    window_context.acknowledge_terminal_wakeup();
                     window_context.dirty = true;
 
                     // Posted PTY events can keep Windows' higher-priority message queues busy
@@ -2864,6 +2868,8 @@ impl Processor {
             #[cfg(any(unix, windows))]
             (EventType::Terminal(TerminalEvent::PtyOutput { start, end }), Some(window_id)) => {
                 if let Some(window) = self.windows.get(window_id) {
+                    #[cfg(windows)]
+                    let (start, end) = window.take_pty_output((start, end));
                     let transcript = window.automation.transcript.lock().unwrap();
                     if let Ok(bytes) = transcript.range(start, end.saturating_sub(start) as usize) {
                         self.automation.emit_output(window.ipc_window_id(), start, &bytes);
@@ -4737,22 +4743,145 @@ fn is_renderable_resize(size: PhysicalSize<u32>) -> bool {
 pub struct EventProxy {
     proxy: EventSink,
     window_id: WindowId,
+    #[cfg(windows)]
+    pending_terminal_events: Arc<PendingTerminalEvents>,
 }
 
 impl EventProxy {
     pub fn new(proxy: EventSink, window_id: WindowId) -> Self {
-        Self { proxy, window_id }
+        Self {
+            proxy,
+            window_id,
+            #[cfg(windows)]
+            pending_terminal_events: Arc::default(),
+        }
     }
 
     /// Send an event to the event loop.
     pub fn send_event(&self, event: EventType) {
         let _ = self.proxy.send_event(Event::new(event, self.window_id));
     }
+
+    /// Permit the next terminal-model wake after the UI has started handling this one.
+    #[cfg(windows)]
+    pub fn acknowledge_terminal_wakeup(&self) {
+        self.pending_terminal_events.wakeup.store(false, Ordering::Release);
+    }
+
+    /// Take every transcript span represented by this coalesced PTY-output notification.
+    #[cfg(windows)]
+    pub fn take_pty_output(&self, fallback: (u64, u64)) -> (u64, u64) {
+        self.pending_terminal_events.output.lock().take().unwrap_or(fallback)
+    }
 }
 
 impl EventListener for EventProxy {
     fn send_event(&self, event: TerminalEvent) {
+        #[cfg(windows)]
+        match event {
+            TerminalEvent::Wakeup => {
+                // WSL commonly exposes `cat` output to ConPTY in very small chunks. Posting a
+                // winit user event for every chunk can fill Windows' 10,000-message queue. Winit
+                // ignores `PostMessageW` failure after first enqueueing the Rust-side event, so
+                // the unpaired tail then remains invisible until unrelated native input arrives.
+                if self.pending_terminal_events.wakeup.swap(true, Ordering::AcqRel) {
+                    return;
+                }
+
+                if self
+                    .proxy
+                    .send_event(Event::new(
+                        EventType::Terminal(TerminalEvent::Wakeup),
+                        self.window_id,
+                    ))
+                    .is_err()
+                {
+                    self.pending_terminal_events.wakeup.store(false, Ordering::Release);
+                }
+                return;
+            },
+            TerminalEvent::PtyOutput { start, end } => {
+                let mut output = self.pending_terminal_events.output.lock();
+                if let Some((pending_start, pending_end)) = output.as_mut() {
+                    *pending_start = (*pending_start).min(start);
+                    *pending_end = (*pending_end).max(end);
+                    return;
+                }
+                *output = Some((start, end));
+                drop(output);
+
+                let _ = self.proxy.send_event(Event::new(
+                    EventType::Terminal(TerminalEvent::PtyOutput { start, end }),
+                    self.window_id,
+                ));
+                return;
+            },
+            _ => (),
+        }
+
         let _ = self.proxy.send_event(Event::new(event.into(), self.window_id));
+    }
+}
+
+#[cfg(windows)]
+#[derive(Debug, Default)]
+struct PendingTerminalEvents {
+    wakeup: AtomicBool,
+    output: Mutex<Option<(u64, u64)>>,
+}
+
+#[cfg(all(test, windows))]
+mod windows_event_proxy_tests {
+    use super::*;
+
+    #[test]
+    fn terminal_wakeups_are_coalesced_until_acknowledged() {
+        let (sink, receiver) = EventSink::headless();
+        let proxy = EventProxy::new(sink, WindowId::dummy());
+
+        for _ in 0..20_000 {
+            EventListener::send_event(&proxy, TerminalEvent::Wakeup);
+        }
+
+        assert!(matches!(
+            receiver.recv().unwrap().payload,
+            EventType::Terminal(TerminalEvent::Wakeup)
+        ));
+        assert!(receiver.try_recv().is_err());
+
+        proxy.acknowledge_terminal_wakeup();
+        EventListener::send_event(&proxy, TerminalEvent::Wakeup);
+        assert!(matches!(
+            receiver.recv().unwrap().payload,
+            EventType::Terminal(TerminalEvent::Wakeup)
+        ));
+    }
+
+    #[test]
+    fn transcript_ranges_are_coalesced_without_losing_bytes() {
+        let (sink, receiver) = EventSink::headless();
+        let proxy = EventProxy::new(sink, WindowId::dummy());
+
+        for offset in 0..20_000 {
+            EventListener::send_event(
+                &proxy,
+                TerminalEvent::PtyOutput { start: 10 + offset, end: 11 + offset },
+            );
+        }
+
+        assert!(matches!(
+            receiver.recv().unwrap().payload,
+            EventType::Terminal(TerminalEvent::PtyOutput { .. })
+        ));
+        assert!(receiver.try_recv().is_err());
+        assert_eq!(proxy.take_pty_output((0, 0)), (10, 20_010));
+
+        EventListener::send_event(&proxy, TerminalEvent::PtyOutput { start: 20_010, end: 20_015 });
+        assert!(matches!(
+            receiver.recv().unwrap().payload,
+            EventType::Terminal(TerminalEvent::PtyOutput { .. })
+        ));
+        assert_eq!(proxy.take_pty_output((0, 0)), (20_010, 20_015));
     }
 }
 

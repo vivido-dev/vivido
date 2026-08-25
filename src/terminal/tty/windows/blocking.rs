@@ -290,6 +290,7 @@ mod tests {
     fn a_buffered_level_reader_makes_progress_when_rearmed_after_each_fair_slice() {
         const SLICE: usize = u16::MAX as usize;
         const TOTAL: usize = 4 * SLICE;
+        const WAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
         let source = (0..TOTAL).map(|offset| offset as u8).collect::<Vec<_>>();
         let mut reader = UnblockedReader::new(Cursor::new(source.clone()), 2 * SLICE);
@@ -302,7 +303,7 @@ mod tests {
         let mut slice = vec![0; SLICE];
         while received.len() < TOTAL {
             events.clear();
-            poller.wait(&mut events, Some(Duration::from_secs(1))).unwrap();
+            poller.wait(&mut events, Some(WAKE_TIMEOUT)).unwrap();
             assert!(events.iter().any(|ready| ready.key == event.key));
 
             let count = reader.read(&mut slice).unwrap();

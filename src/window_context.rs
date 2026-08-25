@@ -722,6 +722,18 @@ impl WindowContext {
         self.latency_sensitive_frame_timer.acknowledge();
     }
 
+    /// Open the coalescing gate for another terminal-model notification.
+    #[cfg(windows)]
+    pub fn acknowledge_terminal_wakeup(&self) {
+        self.event_proxy.acknowledge_terminal_wakeup();
+    }
+
+    /// Take the complete transcript span accumulated behind one Windows UI notification.
+    #[cfg(windows)]
+    pub fn take_pty_output(&self, fallback: (u64, u64)) -> (u64, u64) {
+        self.event_proxy.take_pty_output(fallback)
+    }
+
     /// Process events for this terminal window.
     pub fn handle_event(
         &mut self,
