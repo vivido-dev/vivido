@@ -52,6 +52,8 @@ use crate::automation::{PendingWrite, WaitKind, Waiter};
 use crate::cli::ParsedOptions;
 use crate::cli::{Options as CliOptions, WindowOptions};
 use crate::clipboard::Clipboard;
+#[cfg(target_os = "macos")]
+use crate::config::Action;
 use crate::config::font::FontSize;
 use crate::config::ui_config::{HintAction, HintInternalAction};
 use crate::config::{self, UiConfig};
@@ -64,6 +66,8 @@ use crate::display::window::{ImeInhibitor, Window};
 use crate::display::{Display, Preedit, SizeInfo};
 use crate::input::{self, ActionContext as _, FONT_SIZE_STEP};
 use crate::logging::{LOG_TARGET_CONFIG, LOG_TARGET_WINIT};
+#[cfg(target_os = "macos")]
+use crate::macos::{self, menu::MenuCommand};
 use crate::message_bar::{Message, MessageBuffer, MessageType};
 #[cfg(any(unix, windows))]
 use crate::polling::ipc::IpcRequest;
@@ -102,6 +106,25 @@ const HEADLESS_IDLE_WAIT: Duration = Duration::from_millis(100);
 
 /// Message-bar target used to replace transient file-drop hover and state messages.
 const FILE_DROP_MESSAGE_TARGET: &str = "vivid-file-drop";
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, PartialEq, Eq)]
+enum MenuEffect {
+    Action(Action),
+    Clear,
+}
+
+#[cfg(target_os = "macos")]
+fn menu_effect(command: MenuCommand) -> MenuEffect {
+    match command {
+        MenuCommand::NewWindow => MenuEffect::Action(Action::CreateNewWindow),
+        MenuCommand::NewTab => MenuEffect::Action(Action::CreateNewTab),
+        MenuCommand::Copy => MenuEffect::Action(Action::Copy),
+        MenuCommand::Paste => MenuEffect::Action(Action::Paste),
+        MenuCommand::Find => MenuEffect::Action(Action::SearchForward),
+        MenuCommand::Clear => MenuEffect::Clear,
+    }
+}
 
 fn file_drop_message(text: String, ty: MessageType) -> Message {
     let mut message = Message::new(text, ty);
@@ -2283,6 +2306,11 @@ impl Processor {
 
     /// Create the startup window, if this invocation is meant to have one.
     fn on_init(&mut self, event_loop: LoopHandle<'_>) {
+        #[cfg(target_os = "macos")]
+        if !self.cli_options.accessory {
+            macos::menu::install(self.proxy.clone());
+        }
+
         if self.cli_options.daemon {
             return;
         }
@@ -2669,6 +2697,31 @@ impl Processor {
                     }
                 } else if let Err(err) = self.create_window(event_loop, options) {
                     error!("Could not open window: {err:?}");
+                }
+            },
+            #[cfg(target_os = "macos")]
+            (EventType::MacOsMenu(command), _) => {
+                let target = self
+                    .windows
+                    .iter()
+                    .find_map(|(id, window)| window.is_focused().then_some(*id))
+                    .or_else(|| {
+                        if self.windows.len() == 1 {
+                            self.windows.keys().next().copied()
+                        } else {
+                            None
+                        }
+                    });
+                if let Some(window_id) = target
+                    && let Some(window_context) = self.windows.get_mut(&window_id)
+                {
+                    window_context.handle_event(
+                        event_loop.winit(),
+                        &self.proxy,
+                        &mut self.clipboard,
+                        &mut self.scheduler,
+                        WinitEvent::UserEvent(Event::new(EventType::MacOsMenu(command), window_id)),
+                    );
                 }
             },
             // Shutdown all windows.
@@ -3180,6 +3233,9 @@ pub enum EventType {
     Message(Message),
     Scroll(Scroll),
     CreateWindow(WindowOptions),
+    #[cfg(target_os = "macos")]
+    #[allow(private_interfaces)]
+    MacOsMenu(MenuCommand),
     #[cfg(any(target_os = "linux", windows))]
     ShellAction(crate::shell::ShellAction),
     #[cfg(any(unix, windows))]
@@ -4249,6 +4305,14 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
     pub fn handle_event(&mut self, event: WinitEvent<Event>) {
         match event {
             WinitEvent::UserEvent(Event { payload, .. }) => match payload {
+                #[cfg(target_os = "macos")]
+                EventType::MacOsMenu(command) => match menu_effect(command) {
+                    MenuEffect::Action(action) => self.execute_action(&action),
+                    MenuEffect::Clear => {
+                        self.execute_action(&Action::Esc("\x0c".into()));
+                        self.execute_action(&Action::ClearHistory);
+                    },
+                },
                 EventType::VividFileDropPaste => {
                     let pastes = self.ctx.vivid_service.take_file_drop_pastes();
                     if !pastes.is_empty() {
@@ -4699,6 +4763,27 @@ mod window_resize_tests {
         assert!(!is_renderable_resize(PhysicalSize::new(0, 1600)));
         assert!(!is_renderable_resize(PhysicalSize::new(2560, 0)));
         assert!(!is_renderable_resize(PhysicalSize::new(0, 0)));
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod macos_menu_tests {
+    use super::*;
+
+    #[test]
+    fn terminal_menu_commands_reuse_existing_actions() {
+        let expected = [
+            (MenuCommand::NewWindow, Action::CreateNewWindow),
+            (MenuCommand::NewTab, Action::CreateNewTab),
+            (MenuCommand::Copy, Action::Copy),
+            (MenuCommand::Paste, Action::Paste),
+            (MenuCommand::Find, Action::SearchForward),
+        ];
+
+        for (command, action) in expected {
+            assert_eq!(menu_effect(command), MenuEffect::Action(action));
+        }
+        assert_eq!(menu_effect(MenuCommand::Clear), MenuEffect::Clear);
     }
 }
 
