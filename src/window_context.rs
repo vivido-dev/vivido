@@ -734,6 +734,12 @@ impl WindowContext {
         self.event_proxy.take_pty_output(fallback)
     }
 
+    /// Take the ordered Vivid terminal-position updates represented by one Windows notification.
+    #[cfg(windows)]
+    pub fn take_pending_vivid_terminal_events(&self) -> std::collections::VecDeque<TerminalEvent> {
+        self.event_proxy.take_pending_vivid_terminal_events()
+    }
+
     /// Process events for this terminal window.
     pub fn handle_event(
         &mut self,

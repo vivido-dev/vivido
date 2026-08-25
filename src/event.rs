@@ -3032,6 +3032,36 @@ impl Processor {
                     }
                 }
             },
+            #[cfg(windows)]
+            (EventType::TerminalVividBatch, Some(window_id)) => {
+                if let Some(window_context) = self.windows.get_mut(window_id) {
+                    let events = window_context.take_pending_vivid_terminal_events();
+                    if events.is_empty() {
+                        return;
+                    }
+
+                    for event in events {
+                        window_context.handle_event(
+                            &self.proxy,
+                            &mut self.clipboard,
+                            &mut self.scheduler,
+                            WinitEvent::UserEvent(Event::new(
+                                EventType::Terminal(event),
+                                *window_id,
+                            )),
+                        );
+                    }
+
+                    // These events normally use WindowContext's batching path. Flush the complete
+                    // coalesced batch now so another PTY batch cannot accumulate behind it.
+                    window_context.handle_event(
+                        &self.proxy,
+                        &mut self.clipboard,
+                        &mut self.scheduler,
+                        WinitEvent::AboutToWait,
+                    );
+                }
+            },
             (EventType::RendererRecovery, Some(window_id)) => {
                 if let Some(window_context) = self.windows.get_mut(window_id) {
                     window_context.retry_renderer(&mut self.scheduler);
@@ -3322,6 +3352,9 @@ pub enum EventType {
     Frame,
     #[cfg(windows)]
     LatencySensitiveFrame,
+    /// Drain the bounded, ordered terminal-position updates accumulated by a Windows PTY.
+    #[cfg(windows)]
+    TerminalVividBatch,
     RendererRecovery,
     VividResizeSettled(u64),
     /// Dismiss the warning that was visible when this timer was scheduled.
@@ -4537,7 +4570,7 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                 | EventType::HostWakeup
                 | EventType::VividResizeSettled(_) => (),
                 #[cfg(windows)]
-                EventType::LatencySensitiveFrame => (),
+                EventType::LatencySensitiveFrame | EventType::TerminalVividBatch => (),
                 #[cfg(any(target_os = "linux", windows))]
                 EventType::ShellAction(_) => (),
                 EventType::VividFrame => (),
@@ -4773,6 +4806,12 @@ impl EventProxy {
     pub fn take_pty_output(&self, fallback: (u64, u64)) -> (u64, u64) {
         self.pending_terminal_events.output.lock().take().unwrap_or(fallback)
     }
+
+    /// Take the complete ordered Vivid terminal-position batch behind one Windows notification.
+    #[cfg(windows)]
+    pub fn take_pending_vivid_terminal_events(&self) -> VecDeque<TerminalEvent> {
+        self.pending_terminal_events.take_vivid_events()
+    }
 }
 
 impl EventListener for EventProxy {
@@ -4816,6 +4855,17 @@ impl EventListener for EventProxy {
                 ));
                 return;
             },
+            event @ (TerminalEvent::VividGridScroll { .. }
+            | TerminalEvent::VividMarker { .. }
+            | TerminalEvent::VividClear
+            | TerminalEvent::VividScreenSwap { .. }) => {
+                if self.pending_terminal_events.push_vivid_event(event) {
+                    let _ = self
+                        .proxy
+                        .send_event(Event::new(EventType::TerminalVividBatch, self.window_id));
+                }
+                return;
+            },
             _ => (),
         }
 
@@ -4828,6 +4878,80 @@ impl EventListener for EventProxy {
 struct PendingTerminalEvents {
     wakeup: AtomicBool,
     output: Mutex<Option<(u64, u64)>>,
+    vivid: Mutex<PendingVividEvents>,
+}
+
+/// Maximum ordered Vivid terminal events retained behind one Windows UI notification.
+///
+/// Authenticated anchors are independently capped at 4,096. Twice that limit leaves room for
+/// their ordering barriers while keeping a hostile terminal stream from creating an unbounded
+/// producer-to-UI queue.
+#[cfg(windows)]
+const MAX_PENDING_VIVID_EVENTS: usize = 8_192;
+
+#[cfg(windows)]
+#[derive(Debug, Default)]
+struct PendingVividEvents {
+    events: VecDeque<TerminalEvent>,
+    notification_pending: bool,
+    overflowed: bool,
+}
+
+#[cfg(windows)]
+impl PendingTerminalEvents {
+    /// Queue one ordered terminal-position update and report whether the UI needs one notification.
+    fn push_vivid_event(&self, event: TerminalEvent) -> bool {
+        let mut pending = self.vivid.lock();
+
+        if pending.events.len() >= MAX_PENDING_VIVID_EVENTS {
+            pending.events.clear();
+            pending.events.push_back(TerminalEvent::VividClear);
+            if !pending.overflowed {
+                warn!(
+                    "dropping saturated Windows terminal-position detail and clearing Vivid anchors"
+                );
+                pending.overflowed = true;
+            }
+        }
+
+        let merged = match (pending.events.back_mut(), &event) {
+            (
+                Some(TerminalEvent::VividGridScroll {
+                    origin: pending_origin,
+                    end: pending_end,
+                    lines: pending_lines,
+                    history_size: pending_history_size,
+                }),
+                TerminalEvent::VividGridScroll { origin, end, lines, history_size },
+            ) if *pending_origin == *origin
+                && *pending_end == *end
+                && pending_lines.signum() == lines.signum() =>
+            {
+                *pending_lines = pending_lines.saturating_add(*lines);
+                *pending_history_size = *history_size;
+                true
+            },
+            _ => false,
+        };
+
+        if !merged {
+            pending.events.push_back(event);
+        }
+
+        if pending.notification_pending {
+            false
+        } else {
+            pending.notification_pending = true;
+            true
+        }
+    }
+
+    fn take_vivid_events(&self) -> VecDeque<TerminalEvent> {
+        let mut pending = self.vivid.lock();
+        pending.notification_pending = false;
+        pending.overflowed = false;
+        mem::take(&mut pending.events)
+    }
 }
 
 #[cfg(all(test, windows))]
@@ -4882,6 +5006,111 @@ mod windows_event_proxy_tests {
             EventType::Terminal(TerminalEvent::PtyOutput { .. })
         ));
         assert_eq!(proxy.take_pty_output((0, 0)), (20_010, 20_015));
+    }
+
+    #[test]
+    fn wsl_sized_scroll_output_keeps_exit_notification_reachable() {
+        let (sink, receiver) = EventSink::headless();
+        let proxy = EventProxy::new(sink, WindowId::dummy());
+
+        for offset in 0..20_000_u64 {
+            EventListener::send_event(
+                &proxy,
+                TerminalEvent::VividGridScroll {
+                    origin: 0,
+                    end: 25,
+                    lines: 1,
+                    history_size: offset as usize,
+                },
+            );
+            EventListener::send_event(&proxy, TerminalEvent::Wakeup);
+            EventListener::send_event(
+                &proxy,
+                TerminalEvent::PtyOutput { start: offset, end: offset + 1 },
+            );
+        }
+        EventListener::send_event(&proxy, TerminalEvent::Exit);
+
+        let events = receiver.try_iter().map(|event| event.payload).collect::<Vec<_>>();
+        assert_eq!(events.len(), 4);
+        assert!(matches!(events[0], EventType::TerminalVividBatch));
+        assert!(matches!(events[1], EventType::Terminal(TerminalEvent::Wakeup)));
+        assert!(matches!(events[2], EventType::Terminal(TerminalEvent::PtyOutput { .. })));
+        assert!(matches!(events[3], EventType::Terminal(TerminalEvent::Exit)));
+
+        let vivid_events = proxy.take_pending_vivid_terminal_events();
+        assert!(matches!(
+            vivid_events.front(),
+            Some(TerminalEvent::VividGridScroll {
+                origin: 0,
+                end: 25,
+                lines: 20_000,
+                history_size: 19_999,
+            })
+        ));
+        assert_eq!(vivid_events.len(), 1);
+    }
+
+    #[test]
+    fn vivid_terminal_batch_preserves_marker_and_screen_order() {
+        let (sink, receiver) = EventSink::headless();
+        let proxy = EventProxy::new(sink, WindowId::dummy());
+
+        EventListener::send_event(
+            &proxy,
+            TerminalEvent::VividGridScroll { origin: 0, end: 25, lines: 3, history_size: 3 },
+        );
+        EventListener::send_event(
+            &proxy,
+            TerminalEvent::VividMarker {
+                marker: "anchor".into(),
+                line: 4,
+                column: 5,
+                alternate: false,
+            },
+        );
+        EventListener::send_event(
+            &proxy,
+            TerminalEvent::VividGridScroll { origin: 0, end: 25, lines: 2, history_size: 5 },
+        );
+        EventListener::send_event(&proxy, TerminalEvent::VividScreenSwap { alternate: true });
+
+        assert!(matches!(receiver.recv().unwrap().payload, EventType::TerminalVividBatch));
+        assert!(receiver.try_recv().is_err());
+
+        let events = proxy.take_pending_vivid_terminal_events().into_iter().collect::<Vec<_>>();
+        assert!(matches!(events[0], TerminalEvent::VividGridScroll { lines: 3, .. }));
+        assert!(matches!(
+            &events[1],
+            TerminalEvent::VividMarker { marker, line: 4, column: 5, alternate: false }
+                if marker == "anchor"
+        ));
+        assert!(matches!(events[2], TerminalEvent::VividGridScroll { lines: 2, .. }));
+        assert!(matches!(events[3], TerminalEvent::VividScreenSwap { alternate: true }));
+    }
+
+    #[test]
+    fn saturated_vivid_terminal_batch_is_bounded_and_clears_anchor_state() {
+        let (sink, receiver) = EventSink::headless();
+        let proxy = EventProxy::new(sink, WindowId::dummy());
+
+        for index in 0..=MAX_PENDING_VIVID_EVENTS {
+            EventListener::send_event(
+                &proxy,
+                TerminalEvent::VividGridScroll {
+                    origin: (index % 2) as i32,
+                    end: 25,
+                    lines: 1,
+                    history_size: index,
+                },
+            );
+        }
+
+        assert!(matches!(receiver.recv().unwrap().payload, EventType::TerminalVividBatch));
+        assert!(receiver.try_recv().is_err());
+        let events = proxy.take_pending_vivid_terminal_events();
+        assert!(events.len() <= MAX_PENDING_VIVID_EVENTS);
+        assert!(matches!(events.front(), Some(TerminalEvent::VividClear)));
     }
 }
 
