@@ -359,10 +359,18 @@ where
 
                 // Register write interest if necessary.
                 let needs_write = state.needs_write();
-                if needs_write != interest.writable {
+                let write_interest_changed = needs_write != interest.writable;
+                if write_interest_changed {
                     interest.writable = needs_write;
+                }
 
-                    // Re-register with new interest.
+                // Windows emulates readiness for its blocking ConPTY pipes by posting an IOCP
+                // packet. `pty_read` deliberately stops at `MAX_LOCKED_READ` for fairness, and
+                // when that leaves the intermediary pipe nonempty no empty-read occurs to install
+                // another waker. Re-registering posts the next packet for the still-readable pipe;
+                // native pollers remain level-triggered and only need updates when interest
+                // changes.
+                if write_interest_changed || cfg!(windows) {
                     self.pty.reregister(&self.poll, interest, poll_opts).unwrap();
                 }
             }
