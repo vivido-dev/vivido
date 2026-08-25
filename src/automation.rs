@@ -275,6 +275,14 @@ pub enum WaitKind {
         pty_token: Option<u64>,
         pty_complete: bool,
     },
+    Gesture {
+        after_frame: Option<u64>,
+        pty_token: Option<u64>,
+        pty_complete: bool,
+        written_bytes: usize,
+        points: usize,
+        duration_ms: u64,
+    },
     Focus {
         after_focus: u64,
     },

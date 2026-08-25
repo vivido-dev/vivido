@@ -26,6 +26,42 @@ vivido msg --target vivido-1234 vivid trace --after 40 --follow --recovery-only
 vivido debug-bundle --target vivido-1234 --output vivido-debug.zip
 ```
 
+For a multi-step task, `run-plan` keeps one owner-verified IPC connection open for the complete
+workflow. It reads JSON from standard input by default or from `--file PATH`, and emits compact
+NDJSON events for the plan, each step, and final status:
+
+```json
+{
+  "version": 1,
+  "steps": [
+    {
+      "id": "inspect",
+      "method": "inspect",
+      "params": {"window_id": 42},
+      "bind": {"target": "/window/window_id"}
+    },
+    {
+      "id": "click",
+      "method": "mouse",
+      "params": {"action": {"click": {"button": "left", "position": {
+        "relative_x": 0.5, "relative_y": 0.5, "mods": [], "route": "ui",
+        "target": {"window_id": {"$ref": "target"}}
+      }}}},
+      "verify": {"window_id": {"$ref": "target"}, "frame_changed": true,
+                 "screenshot": true, "timeout": 30000}
+    }
+  ]
+}
+```
+
+Plans contain 1 through 256 bounded linear steps. `bind` maps a plan-local alias to a JSON Pointer
+in that step's result; a later JSON value containing only `{"$ref":"alias"}` substitutes it. An
+optional `when` compares one alias with an exact JSON `equals` value. `on_error` is `abort` by
+default or `continue`. There are no loops, scripts, persistent aliases, or forward references.
+Request parameters are not repeated in trace events. `--dry-run` validates without executing;
+`--preflight` executes observation methods only and reports mutations or unavailable dependencies
+as skipped.
+
 ## Endpoint discovery and targeting
 
 The endpoint is an owner-only Unix socket with mode `0600` on Unix, and a named pipe with an
@@ -76,6 +112,11 @@ its optional session and `automation_name`, methods, event kinds, stable error c
 ```json
 {"version":2,"id":1,"ok":true,"result":{"server_version":"0.0.0","protocol_version":2,"headless":true,"session":"build","methods":[],"event_kinds":[],"limits":{}}}
 ```
+
+The additive `method_capabilities` array classifies every method as `observe`, `input`, `window`,
+`config`, `process`, `lifecycle`, or `extension`, and records `mutating` and `host_claimed` flags.
+The original `methods` array remains the compatibility authority. An unclassified host claim is a
+mutating `extension`.
 
 `headless` is `false` and `session` is `null` for a windowed instance. `automation_name` addresses
 either form uniformly. All are fixed at startup.
@@ -164,6 +205,9 @@ physical modifiers pressed.
   invalidates the stored frame until another
   frame is presented. Only one readback per window may run at once and raw allocation is capped at
   256 MiB.
+- `vivido msg capture` is a client-side composite over existing methods. `--activate` first calls
+  an advertised `vivida_activate_pane`, `--after-frame N` requires a newer frame, `--stable[=TIME]`
+  waits for semantic screen stability (250 ms by default), and the final result is screenshot JSON.
 
 ### Host-claimed methods
 
@@ -207,6 +251,12 @@ waiting until it disconnects, the same as any unanswered request.
   the live-bottom viewport. SGR pixel mouse mode preserves exact physical coordinates; other mouse
   modes resolve them to terminal cells. UI routing can select text, invoke mouse bindings, follow
   links, or report to the application as normal UI input would without requiring OS focus.
+  A position may instead contain `relative_x` and `relative_y`, both finite fractions from 0
+  through 1; they are atomically mapped to the current physical client area. `mouse path
+  --duration TIME` paces one gesture for 1 ms through 30 seconds, with at most one paced gesture per
+  window. Vivido always releases the held button on completion, failure, disconnect, cancellation,
+  or window loss. `--wait-frame` delays success until a frame newer than the pre-gesture frame and
+  accepts the normal bounded `--timeout`. Omitting duration preserves the original one-write path.
 - `resize {"columns":C,"rows":R,"width":null,"height":null,"target":{...}}` requests exact grid
   dimensions; replace the grid pair with `width`/`height` for exact physical client pixels. Grid
   size is at least 2 by 1 and must fit renderer and PTY limits. Only one resize per window is active.

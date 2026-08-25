@@ -974,6 +974,15 @@ impl WindowContext {
         self.notifier.0.send(Msg::Input { bytes: bytes.into(), completion: Some(completion) })
     }
 
+    /// Write automation bytes without creating a correlated completion response.
+    #[cfg(any(unix, windows))]
+    pub fn write_automation_bytes(&self, bytes: Vec<u8>) -> Result<(), EventLoopSendError> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        self.notifier.0.send(Msg::Input { bytes: bytes.into(), completion: None })
+    }
+
     /// Apply the current terminal dimensions to the PTY and report completion.
     #[cfg(any(unix, windows))]
     pub fn write_pty_resize_with_completion(
@@ -1478,8 +1487,15 @@ impl WindowContext {
         position: &IpcMousePosition,
     ) -> Result<ResolvedMousePosition, IpcError> {
         let size = self.display.size_info;
-        match (position.cell_column, position.cell_row, position.x, position.y) {
-            (Some(column), Some(row), None, None) => {
+        match (
+            position.cell_column,
+            position.cell_row,
+            position.x,
+            position.y,
+            position.relative_x,
+            position.relative_y,
+        ) {
+            (Some(column), Some(row), None, None, None, None) => {
                 let column = column as usize;
                 let row = row as usize;
                 if column >= size.columns() || row >= size.screen_lines() {
@@ -1502,7 +1518,7 @@ impl WindowContext {
                     physical: PhysicalPosition::new(x, y),
                 })
             },
-            (None, None, Some(x), Some(y)) if x.is_finite() && y.is_finite() => {
+            (None, None, Some(x), Some(y), None, None) if x.is_finite() && y.is_finite() => {
                 if x < 0.0
                     || y < 0.0
                     || x >= f64::from(size.width())
@@ -1531,9 +1547,29 @@ impl WindowContext {
                     physical: PhysicalPosition::new(x, y),
                 })
             },
+            (None, None, None, None, Some(relative_x), Some(relative_y))
+                if relative_x.is_finite()
+                    && relative_y.is_finite()
+                    && (0.0..=1.0).contains(&relative_x)
+                    && (0.0..=1.0).contains(&relative_y) =>
+            {
+                let x = relative_x * f64::from((size.width() - 1.0).max(0.0));
+                let y = relative_y * f64::from((size.height() - 1.0).max(0.0));
+                let column = ((x - f64::from(size.padding_x())).max(0.0)
+                    / f64::from(size.cell_width())) as usize;
+                let row = ((y - f64::from(size.padding_y())).max(0.0)
+                    / f64::from(size.cell_height())) as usize;
+                Ok(ResolvedMousePosition {
+                    column: column.min(size.columns().saturating_sub(1)),
+                    row: row.min(size.screen_lines().saturating_sub(1)),
+                    pixel_x: x.floor() as usize,
+                    pixel_y: y.floor() as usize,
+                    physical: PhysicalPosition::new(x, y),
+                })
+            },
             _ => Err(IpcError::new(
                 "invalid_params",
-                "mouse requires exactly one cell or pixel coordinate pair",
+                "mouse requires exactly one cell, pixel, or relative coordinate pair",
             )),
         }
     }
@@ -3001,6 +3037,18 @@ fn validate_mouse_path(path: &IpcMousePath) -> Result<(), IpcError> {
     }
     if path.points.iter().any(|point| !point.x.is_finite() || !point.y.is_finite()) {
         return Err(IpcError::new("invalid_params", "mouse path coordinates must be finite"));
+    }
+    if path.duration.is_some_and(|duration| !(1..=30_000).contains(&duration)) {
+        return Err(IpcError::new(
+            "invalid_params",
+            "paced mouse path duration must be 1 ms through 30 seconds",
+        ));
+    }
+    if path.wait_frame && !(1..=86_400_000).contains(&path.timeout) {
+        return Err(IpcError::new(
+            "invalid_params",
+            "mouse path timeout must be 1 ms through 24 hours",
+        ));
     }
     Ok(())
 }

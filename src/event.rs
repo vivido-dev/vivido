@@ -72,9 +72,9 @@ use crate::logging::{LOG_TARGET_CONFIG, LOG_TARGET_WINIT};
 use crate::macos::{self, menu::MenuCommand};
 use crate::message_bar::{Message, MessageBuffer, MessageType};
 #[cfg(any(unix, windows))]
-use crate::polling::ipc::IpcRequest;
+use crate::polling::ipc::{IpcConnection, IpcRequest};
 #[cfg(any(unix, windows))]
-use crate::polling::ipc::{IpcError, MAX_INPUT_BYTES, MAX_IPC_TEXT_BYTES};
+use crate::polling::ipc::{IpcError, MAX_INPUT_BYTES, MAX_IPC_TEXT_BYTES, MethodCapability};
 use crate::scheduler::{Scheduler, TimerId, Topic};
 use crate::vivid::VividService;
 #[cfg(windows)]
@@ -89,6 +89,44 @@ const MAX_SEARCH_WHILE_TYPING: Option<usize> = Some(1000);
 
 /// Maximum number of search terms stored in the history.
 const MAX_SEARCH_HISTORY_SIZE: usize = 255;
+
+#[cfg(any(unix, windows))]
+struct PacedGesture {
+    path: crate::cli::IpcMousePath,
+    connection: IpcConnection,
+    request_id: u64,
+    next_action: usize,
+    interval: Duration,
+    next_due: Instant,
+    before_frame: u64,
+    written_bytes: usize,
+}
+
+#[cfg(any(unix, windows))]
+fn paced_mouse_action(gesture: &PacedGesture, window_id: u64) -> crate::cli::IpcMouse {
+    use crate::cli::{IpcMouse, IpcMouseAction, IpcMouseButtonAction, IpcMousePosition, IpcTarget};
+
+    let point_index = gesture.next_action.min(gesture.path.points.len().saturating_sub(1));
+    let point = gesture.path.points[point_index];
+    let position = IpcMousePosition {
+        x: Some(point.x),
+        y: Some(point.y),
+        mods: gesture.path.mods.clone(),
+        route: gesture.path.route,
+        target: IpcTarget { window_id: Some(window_id) },
+        ..IpcMousePosition::default()
+    };
+    let action = if gesture.next_action == 0 {
+        IpcMouseAction::Down(IpcMouseButtonAction { button: gesture.path.button, position })
+    } else if gesture.next_action == gesture.path.points.len() {
+        IpcMouseAction::Up(IpcMouseButtonAction { button: gesture.path.button, position })
+    } else if gesture.path.route == crate::cli::IpcInputRoute::Ui {
+        IpcMouseAction::Move(position)
+    } else {
+        IpcMouseAction::Drag(IpcMouseButtonAction { button: gesture.path.button, position })
+    };
+    IpcMouse { action }
+}
 
 /// Touch zoom speed.
 const TOUCH_ZOOM_FACTOR: f32 = 0.01;
@@ -190,6 +228,9 @@ pub struct Processor {
     /// Claimed requests waiting for the host to drain them.
     #[cfg(any(unix, windows))]
     host_requests: Vec<IpcRequest>,
+    /// One scheduled pointer gesture per target window.
+    #[cfg(any(unix, windows))]
+    paced_gestures: HashMap<WindowId, PacedGesture, RandomState>,
     /// Bounded window-management requests waiting for an embedding chrome.
     #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     shell_actions: VecDeque<crate::shell::ShellActionRequest>,
@@ -269,6 +310,8 @@ impl Processor {
             host_methods: BTreeSet::new(),
             #[cfg(any(unix, windows))]
             host_requests: Vec::new(),
+            #[cfg(any(unix, windows))]
+            paced_gestures: Default::default(),
             #[cfg(any(target_os = "linux", target_os = "macos", windows))]
             shell_actions: VecDeque::new(),
             config_monitor,
@@ -896,6 +939,12 @@ impl Processor {
                         return;
                     },
                 };
+                if let crate::cli::IpcMouseAction::Path(path) = &params.action
+                    && path.duration.is_some()
+                {
+                    self.start_paced_gesture(event_loop, target, path.clone(), request);
+                    return;
+                }
                 match route {
                     IpcInputRoute::Application => {
                         let result = match &params.action {
@@ -907,7 +956,13 @@ impl Processor {
                         match result {
                             Ok(bytes) => {
                                 let window_id = self.windows[&target].ipc_window_id();
-                                self.queue_ipc_input(Some(window_id), bytes, &request);
+                                if let crate::cli::IpcMouseAction::Path(path) = &params.action
+                                    && path.wait_frame
+                                {
+                                    self.queue_gesture_input(target, bytes, path, &request);
+                                } else {
+                                    self.queue_ipc_input(Some(window_id), bytes, &request);
+                                }
                             },
                             Err(error) => request.connection.error(request.id, error),
                         }
@@ -935,11 +990,23 @@ impl Processor {
                         };
                         match result {
                             Ok(bytes) if bytes.is_empty() => {
-                                request.connection.reply(request.id, serde_json::json!({}));
+                                if let crate::cli::IpcMouseAction::Path(path) = &params.action
+                                    && path.wait_frame
+                                {
+                                    self.queue_gesture_input(target, bytes, path, &request);
+                                } else {
+                                    request.connection.reply(request.id, serde_json::json!({}));
+                                }
                             },
                             Ok(bytes) => {
                                 let window_id = self.windows[&target].ipc_window_id();
-                                self.queue_ipc_input(Some(window_id), bytes, &request);
+                                if let crate::cli::IpcMouseAction::Path(path) = &params.action
+                                    && path.wait_frame
+                                {
+                                    self.queue_gesture_input(target, bytes, path, &request);
+                                } else {
+                                    self.queue_ipc_input(Some(window_id), bytes, &request);
+                                }
                             },
                             Err(error) => request.connection.error(request.id, error),
                         }
@@ -1845,6 +1912,232 @@ impl Processor {
     }
 
     #[cfg(any(unix, windows))]
+    fn queue_gesture_input(
+        &mut self,
+        target: WindowId,
+        bytes: Vec<u8>,
+        path: &crate::cli::IpcMousePath,
+        request: &IpcRequest,
+    ) {
+        let written_bytes = bytes.len();
+        let before_frame = self.windows[&target].automation.frame_sequence;
+        let token = (!bytes.is_empty()).then(|| self.automation.next_write_token());
+        if let Some(token) = token
+            && let Err(error) = self.windows[&target].write_to_pty_with_completion(bytes, token)
+        {
+            request.connection.error(
+                request.id,
+                IpcError::new("pty_closed", format!("failed to queue mouse gesture: {error}")),
+            );
+            return;
+        }
+        self.windows.get_mut(&target).unwrap().automation.waiters.push(Waiter {
+            connection: request.connection.clone(),
+            request_id: request.id,
+            deadline: Instant::now() + Duration::from_millis(path.timeout),
+            kind: WaitKind::Gesture {
+                after_frame: Some(before_frame),
+                pty_token: token,
+                pty_complete: token.is_none(),
+                written_bytes,
+                points: path.points.len(),
+                duration_ms: 0,
+            },
+        });
+        self.evaluate_waiters(target);
+        self.schedule_automation_timer(target);
+    }
+
+    #[cfg(any(unix, windows))]
+    fn start_paced_gesture(
+        &mut self,
+        event_loop: LoopHandle<'_>,
+        target: WindowId,
+        path: crate::cli::IpcMousePath,
+        request: IpcRequest,
+    ) {
+        if !(2..=1000).contains(&path.points.len())
+            || path.points.iter().any(|point| !point.x.is_finite() || !point.y.is_finite())
+            || path.duration.is_none_or(|duration| !(1..=30_000).contains(&duration))
+            || (path.wait_frame && !(1..=86_400_000).contains(&path.timeout))
+        {
+            request
+                .connection
+                .error(request.id, IpcError::new("invalid_params", "invalid paced mouse gesture"));
+            return;
+        }
+        if self.paced_gestures.contains_key(&target) {
+            request.connection.error(
+                request.id,
+                IpcError::new("limit_exceeded", "a paced mouse gesture is already active"),
+            );
+            return;
+        }
+        let duration = path.duration.expect("paced gesture has a duration");
+        let intervals = path.points.len() as f64;
+        let interval = Duration::from_secs_f64(duration as f64 / 1_000.0 / intervals);
+        let before_frame = self.windows[&target].automation.frame_sequence;
+        self.paced_gestures.insert(
+            target,
+            PacedGesture {
+                path,
+                connection: request.connection,
+                request_id: request.id,
+                next_action: 0,
+                interval,
+                next_due: Instant::now(),
+                before_frame,
+                written_bytes: 0,
+            },
+        );
+        self.advance_paced_gesture(event_loop, target);
+    }
+
+    #[cfg(any(unix, windows))]
+    fn advance_paced_gesture(&mut self, event_loop: LoopHandle<'_>, target: WindowId) {
+        let Some(mut gesture) = self.paced_gestures.remove(&target) else {
+            return;
+        };
+        if Instant::now() < gesture.next_due {
+            let remaining = gesture.next_due.saturating_duration_since(Instant::now());
+            self.paced_gestures.insert(target, gesture);
+            self.scheduler.schedule(
+                Event::new(EventType::AutomationTick, target),
+                remaining,
+                false,
+                TimerId::new(Topic::Automation, target),
+            );
+            return;
+        }
+        let Some(window_id) = self.windows.get(&target).map(WindowContext::ipc_window_id) else {
+            gesture.connection.error(
+                gesture.request_id,
+                IpcError::new("window_not_found", "paced gesture target closed"),
+            );
+            return;
+        };
+        let mouse = paced_mouse_action(&gesture, window_id);
+        let bytes = match gesture.path.route {
+            crate::cli::IpcInputRoute::Application => {
+                self.windows[&target].application_mouse(&mouse)
+            },
+            crate::cli::IpcInputRoute::Ui => self.windows.get_mut(&target).unwrap().ui_mouse(
+                &mouse,
+                #[cfg(target_os = "macos")]
+                event_loop.winit(),
+                &self.proxy,
+                &mut self.clipboard,
+                &mut self.scheduler,
+            ),
+        };
+        let bytes = match bytes {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.release_paced_gesture(event_loop, target, &gesture);
+                gesture.connection.error(gesture.request_id, error);
+                return;
+            },
+        };
+        gesture.written_bytes = gesture.written_bytes.saturating_add(bytes.len());
+        let final_action = gesture.next_action == gesture.path.points.len();
+        if final_action {
+            self.finish_paced_gesture(target, gesture, bytes);
+            return;
+        }
+        if let Err(error) = self.windows[&target].write_automation_bytes(bytes) {
+            self.release_paced_gesture(event_loop, target, &gesture);
+            gesture.connection.error(
+                gesture.request_id,
+                IpcError::new("pty_closed", format!("failed to queue paced mouse input: {error}")),
+            );
+            return;
+        }
+        gesture.next_action = gesture.next_action.saturating_add(1);
+        gesture.next_due += gesture.interval;
+        let interval = gesture.interval;
+        self.paced_gestures.insert(target, gesture);
+        self.scheduler.schedule(
+            Event::new(EventType::AutomationTick, target),
+            interval,
+            false,
+            TimerId::new(Topic::Automation, target),
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    fn finish_paced_gesture(&mut self, target: WindowId, gesture: PacedGesture, bytes: Vec<u8>) {
+        let token = (!bytes.is_empty()).then(|| self.automation.next_write_token());
+        let pty_complete = token.is_none();
+        if let Some(token) = token
+            && let Err(error) = self.windows[&target].write_to_pty_with_completion(bytes, token)
+        {
+            gesture.connection.error(
+                gesture.request_id,
+                IpcError::new("pty_closed", format!("failed to finish paced gesture: {error}")),
+            );
+            return;
+        }
+        let after_frame = gesture.path.wait_frame.then_some(gesture.before_frame);
+        let timeout = if gesture.path.wait_frame { gesture.path.timeout } else { 5_000 };
+        self.windows.get_mut(&target).unwrap().automation.waiters.push(Waiter {
+            connection: gesture.connection,
+            request_id: gesture.request_id,
+            deadline: Instant::now() + Duration::from_millis(timeout),
+            kind: WaitKind::Gesture {
+                after_frame,
+                pty_token: token,
+                pty_complete,
+                written_bytes: gesture.written_bytes,
+                points: gesture.path.points.len(),
+                duration_ms: gesture.path.duration.unwrap_or_default(),
+            },
+        });
+        self.evaluate_waiters(target);
+        self.schedule_automation_timer(target);
+    }
+
+    #[cfg(any(unix, windows))]
+    fn release_paced_gesture(
+        &mut self,
+        event_loop: LoopHandle<'_>,
+        target: WindowId,
+        gesture: &PacedGesture,
+    ) {
+        #[cfg(not(target_os = "macos"))]
+        let _ = event_loop;
+        if gesture.next_action == 0 || !self.windows.contains_key(&target) {
+            return;
+        }
+        let release = PacedGesture {
+            path: gesture.path.clone(),
+            connection: gesture.connection.clone(),
+            request_id: gesture.request_id,
+            next_action: gesture.path.points.len(),
+            interval: gesture.interval,
+            next_due: Instant::now(),
+            before_frame: gesture.before_frame,
+            written_bytes: gesture.written_bytes,
+        };
+        let mouse = paced_mouse_action(&release, self.windows[&target].ipc_window_id());
+        let bytes = match release.path.route {
+            crate::cli::IpcInputRoute::Application => {
+                self.windows[&target].application_mouse(&mouse)
+            },
+            crate::cli::IpcInputRoute::Ui => self.windows.get_mut(&target).unwrap().ui_mouse(
+                &mouse,
+                #[cfg(target_os = "macos")]
+                event_loop.winit(),
+                &self.proxy,
+                &mut self.clipboard,
+                &mut self.scheduler,
+            ),
+        };
+        if let Ok(bytes) = bytes {
+            let _ = self.windows[&target].write_automation_bytes(bytes);
+        }
+    }
+
+    #[cfg(any(unix, windows))]
     fn queue_ipc_input(&mut self, requested: Option<u64>, bytes: Vec<u8>, request: &IpcRequest) {
         if bytes.len() > MAX_INPUT_BYTES + 16 {
             request
@@ -1884,7 +2177,19 @@ impl Processor {
     }
 
     #[cfg(any(unix, windows))]
-    fn handle_ipc_disconnect(&mut self, connection_id: u64) {
+    fn handle_ipc_disconnect(&mut self, event_loop: LoopHandle<'_>, connection_id: u64) {
+        let targets = self
+            .paced_gestures
+            .iter()
+            .filter_map(|(target, gesture)| {
+                (gesture.connection.id() == connection_id).then_some(*target)
+            })
+            .collect::<Vec<_>>();
+        for target in targets {
+            if let Some(gesture) = self.paced_gestures.remove(&target) {
+                self.release_paced_gesture(event_loop, target, &gesture);
+            }
+        }
         self.automation.disconnect(connection_id);
         for window in self.windows.values_mut() {
             if window.cancel_automation_connection(connection_id) {
@@ -1937,7 +2242,8 @@ impl Processor {
     }
 
     #[cfg(any(unix, windows))]
-    fn automation_tick(&mut self, window_id: WindowId) {
+    fn automation_tick(&mut self, event_loop: LoopHandle<'_>, window_id: WindowId) {
+        self.advance_paced_gesture(event_loop, window_id);
         let Some(window) = self.windows.get_mut(&window_id) else {
             return;
         };
@@ -2270,6 +2576,26 @@ impl Processor {
                             }))
                         })
                 },
+                WaitKind::Gesture {
+                    after_frame,
+                    pty_complete,
+                    written_bytes,
+                    points,
+                    duration_ms,
+                    ..
+                } => (*pty_complete
+                    && after_frame.is_none_or(|after| window.automation.frame_sequence > after))
+                .then(|| {
+                    Ok(serde_json::json!({
+                        "window_id": window.ipc_window_id(),
+                        "written_bytes": written_bytes,
+                        "points": points,
+                        "duration_ms": duration_ms,
+                        "pty_write_completed": true,
+                        "frame_sequence": after_frame.map(|_| window.automation.frame_sequence),
+                        "application_consumption_observed": false,
+                    }))
+                }),
                 WaitKind::Focus { after_focus } => {
                     (window.automation.focus_confirmation > *after_focus && window.is_focused())
                         .then(|| Ok(serde_json::json!({"focused": true})))
@@ -2373,6 +2699,15 @@ impl Processor {
     pub fn claim_ipc_methods(&mut self, methods: &[&str]) {
         self.host_methods = methods.iter().map(|method| (*method).to_owned()).collect();
         crate::polling::ipc::publish_host_methods(&self.host_methods);
+        crate::polling::ipc::publish_host_method_capabilities(&[]);
+    }
+
+    /// Claim host automation methods and advertise their effect classifications.
+    #[cfg(any(unix, windows))]
+    pub fn claim_ipc_method_capabilities(&mut self, capabilities: &[MethodCapability]) {
+        self.host_methods = capabilities.iter().map(|capability| capability.name.clone()).collect();
+        crate::polling::ipc::publish_host_methods(&self.host_methods);
+        crate::polling::ipc::publish_host_method_capabilities(capabilities);
     }
 
     /// Take the claimed automation requests received so far, oldest first.
@@ -2643,7 +2978,7 @@ impl Processor {
             (EventType::IpcRequest(request), _) => self.handle_ipc_request(event_loop, request),
             #[cfg(any(unix, windows))]
             (EventType::IpcDisconnect(connection_id), _) => {
-                self.handle_ipc_disconnect(connection_id);
+                self.handle_ipc_disconnect(event_loop, connection_id);
             },
             #[cfg(any(unix, windows))]
             (EventType::ScreenshotReadback, Some(window_id)) => {
@@ -2658,7 +2993,9 @@ impl Processor {
                 }
             },
             #[cfg(any(unix, windows))]
-            (EventType::AutomationTick, Some(window_id)) => self.automation_tick(*window_id),
+            (EventType::AutomationTick, Some(window_id)) => {
+                self.automation_tick(event_loop, *window_id);
+            },
             (EventType::ConfigReload(path), _) => {
                 // Clear config logs from message bar for all terminals.
                 for window_context in self.windows.values_mut() {
@@ -2929,6 +3266,18 @@ impl Processor {
                         }),
                     );
                 }
+                if let Some(window) = self.windows.get_mut(window_id)
+                    && let Some(waiter) = window.automation.waiters.iter_mut().find(|waiter| {
+                        matches!(
+                            waiter.kind,
+                            WaitKind::Gesture { pty_token: Some(expected), .. } if expected == token
+                        )
+                    })
+                    && let WaitKind::Gesture { pty_complete, .. } = &mut waiter.kind
+                {
+                    *pty_complete = true;
+                }
+                self.evaluate_waiters(*window_id);
                 self.schedule_automation_timer(*window_id);
             },
             #[cfg(any(unix, windows))]

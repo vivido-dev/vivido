@@ -60,8 +60,8 @@ pub use config::monitor::ConfigMonitor;
 #[cfg(any(unix, windows))]
 pub mod host {
     pub use crate::polling::ipc::{
-        IpcConnection, IpcError, IpcRequest, default_endpoint, request_method, request_once,
-        send_message,
+        IpcConnection, IpcError, IpcRequest, MethodCapability, MethodClass, default_endpoint,
+        request_method, request_once, send_message,
     };
     pub use crate::polling::transport::LocalStream;
     pub use crate::polling::{IoListener, IoListenerHandle};

@@ -1,5 +1,5 @@
 use std::cmp::max;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ops::{Deref, DerefMut};
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -481,6 +481,12 @@ pub enum SocketMessage {
     /// Print supported automation methods, events, and limits.
     Capabilities,
 
+    /// Execute a bounded JSON automation plan over one IPC connection.
+    RunPlan(IpcRunPlan),
+
+    /// Activate, settle, and capture a window in one client operation.
+    Capture(IpcCapture),
+
     /// Send one mode-aware key to a terminal.
     Key(IpcKey),
 
@@ -534,6 +540,130 @@ pub enum SocketMessage {
 
     /// Stream automation events until interrupted.
     Subscribe(IpcSubscribe),
+}
+
+/// Parameters to the client-side `run-plan` composite command.
+#[cfg(any(unix, windows))]
+#[derive(Args, Debug, Clone, PartialEq, Eq)]
+pub struct IpcRunPlan {
+    /// JSON plan file. Omit this option or pass `-` to read standard input.
+    #[clap(long, value_name = "PATH", value_hint = ValueHint::FilePath)]
+    pub file: Option<PathBuf>,
+
+    /// Validate the plan and advertised methods without executing any step.
+    #[clap(long, conflicts_with = "preflight")]
+    pub dry_run: bool,
+
+    /// Execute observation steps only and report mutating steps as skipped.
+    #[clap(long, conflicts_with = "dry_run")]
+    pub preflight: bool,
+}
+
+/// Parameters to the client-side `capture` composite command.
+#[cfg(any(unix, windows))]
+#[derive(Args, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct IpcCapture {
+    /// Window ID for the capture.
+    #[clap(short, long, env = "VIVIDO_WINDOW_ID")]
+    pub window_id: Option<u64>,
+
+    /// Select and reveal the pane through an advertised host activation method.
+    #[clap(long)]
+    pub activate: bool,
+
+    /// Require a frame newer than this sequence before capture.
+    #[clap(long)]
+    pub after_frame: Option<u64>,
+
+    /// Wait for the terminal screen to remain unchanged; defaults to 250 ms when present.
+    #[clap(
+        long,
+        value_name = "DURATION",
+        num_args = 0..=1,
+        default_missing_value = "250ms",
+        value_parser = parse_ipc_duration
+    )]
+    pub stable: Option<u64>,
+
+    /// Maximum wait time.
+    #[clap(long, default_value = "30s", value_parser = parse_ipc_duration)]
+    pub timeout: u64,
+}
+
+/// Versioned bounded automation plan consumed by `run-plan`.
+#[cfg(any(unix, windows))]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct IpcAutomationPlan {
+    pub version: u16,
+    pub steps: Vec<IpcAutomationPlanStep>,
+}
+
+/// One sequential plan step.
+#[cfg(any(unix, windows))]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct IpcAutomationPlanStep {
+    pub id: String,
+    pub method: String,
+    #[serde(default = "default_plan_params")]
+    pub params: serde_json::Value,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub bind: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub when: Option<IpcPlanCondition>,
+    #[serde(default)]
+    pub on_error: IpcPlanErrorPolicy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verify: Option<IpcPlanVerification>,
+}
+
+#[cfg(any(unix, windows))]
+fn default_plan_params() -> serde_json::Value {
+    serde_json::Value::Object(Default::default())
+}
+
+/// Equality condition evaluated against a previously bound plan-local alias.
+#[cfg(any(unix, windows))]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct IpcPlanCondition {
+    pub reference: String,
+    pub equals: serde_json::Value,
+}
+
+/// Failure policy for one plan step.
+#[cfg(any(unix, windows))]
+#[derive(Debug, Default, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum IpcPlanErrorPolicy {
+    #[default]
+    Abort,
+    Continue,
+}
+
+/// Optional post-action frame confirmation and capture.
+#[cfg(any(unix, windows))]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct IpcPlanVerification {
+    pub window_id: serde_json::Value,
+    #[serde(default = "default_true")]
+    pub frame_changed: bool,
+    #[serde(default)]
+    pub screenshot: bool,
+    #[serde(default = "default_ipc_timeout")]
+    pub timeout: u64,
+}
+
+#[cfg(any(unix, windows))]
+const fn default_true() -> bool {
+    true
+}
+
+#[cfg(any(unix, windows))]
+const fn default_ipc_timeout() -> u64 {
+    30_000
 }
 
 /// A raw parent handle that can cross the event-loop proxy boundary.
@@ -966,6 +1096,22 @@ pub struct IpcMousePosition {
     #[clap(long, requires = "x", conflicts_with_all = ["cell_column", "cell_row"])]
     pub y: Option<f64>,
 
+    /// Horizontal fraction of the current client area, from 0 through 1.
+    #[clap(
+        long,
+        requires = "relative_y",
+        conflicts_with_all = ["cell_column", "cell_row", "x", "y"]
+    )]
+    pub relative_x: Option<f64>,
+
+    /// Vertical fraction of the current client area, from 0 through 1.
+    #[clap(
+        long,
+        requires = "relative_x",
+        conflicts_with_all = ["cell_column", "cell_row", "x", "y"]
+    )]
+    pub relative_y: Option<f64>,
+
     /// Comma-separated Ctrl, Alt, Shift, and Super modifiers.
     #[clap(long, value_delimiter = ',')]
     pub mods: Vec<String>,
@@ -1076,6 +1222,21 @@ pub struct IpcMousePath {
     /// Input routing mode.
     #[clap(long, value_enum, default_value_t)]
     pub route: IpcInputRoute,
+
+    /// Pace the complete gesture across this duration; omission preserves one-write delivery.
+    #[clap(long, value_name = "DURATION", value_parser = parse_ipc_duration)]
+    #[serde(default)]
+    pub duration: Option<u64>,
+
+    /// Wait for a frame newer than the pre-gesture frame before replying.
+    #[clap(long)]
+    #[serde(default)]
+    pub wait_frame: bool,
+
+    /// Maximum frame wait after the gesture.
+    #[clap(long, default_value = "30s", value_parser = parse_ipc_duration)]
+    #[serde(default = "default_ipc_timeout")]
+    pub timeout: u64,
 
     #[clap(flatten)]
     pub target: IpcTarget,
@@ -1918,6 +2079,99 @@ mod tests {
         assert_eq!(path.points.len(), 2);
         assert_eq!(path.points[0], IpcMousePoint { x: 10.0, y: 20.0 });
         assert_eq!(path.target.window_id, Some(42));
+        assert_eq!(path.duration, None);
+        assert!(!path.wait_frame);
+
+        let options = Options::try_parse_from([
+            "vivido",
+            "msg",
+            "mouse",
+            "path",
+            "--point",
+            "10,20",
+            "30,40",
+            "--duration",
+            "250ms",
+            "--wait-frame",
+            "--timeout",
+            "2s",
+        ])
+        .unwrap();
+        let Some(Subcommands::Msg(message)) = options.subcommands else {
+            panic!("expected msg subcommand");
+        };
+        let SocketMessage::Mouse(IpcMouse { action: IpcMouseAction::Path(path) }) = message.message
+        else {
+            panic!("expected mouse path");
+        };
+        assert_eq!(path.duration, Some(250));
+        assert!(path.wait_frame);
+        assert_eq!(path.timeout, 2_000);
+
+        let options = Options::try_parse_from([
+            "vivido",
+            "msg",
+            "mouse",
+            "click",
+            "--relative-x",
+            "0.5",
+            "--relative-y",
+            "1",
+            "--route",
+            "ui",
+        ])
+        .unwrap();
+        let Some(Subcommands::Msg(message)) = options.subcommands else {
+            panic!("expected msg subcommand");
+        };
+        let SocketMessage::Mouse(IpcMouse { action: IpcMouseAction::Click(click) }) =
+            message.message
+        else {
+            panic!("expected mouse click");
+        };
+        assert_eq!(click.position.relative_x, Some(0.5));
+        assert_eq!(click.position.relative_y, Some(1.0));
+
+        let options = Options::try_parse_from([
+            "vivido",
+            "msg",
+            "run-plan",
+            "--file",
+            "plan.json",
+            "--preflight",
+        ])
+        .unwrap();
+        let Some(Subcommands::Msg(message)) = options.subcommands else {
+            panic!("expected msg subcommand");
+        };
+        assert!(matches!(
+            message.message,
+            SocketMessage::RunPlan(IpcRunPlan { preflight: true, .. })
+        ));
+
+        let options = Options::try_parse_from([
+            "vivido",
+            "msg",
+            "capture",
+            "--window-id",
+            "42",
+            "--activate",
+            "--stable",
+        ])
+        .unwrap();
+        let Some(Subcommands::Msg(message)) = options.subcommands else {
+            panic!("expected msg subcommand");
+        };
+        assert_eq!(
+            message.message,
+            SocketMessage::Capture(IpcCapture {
+                window_id: Some(42),
+                activate: true,
+                after_frame: None,
+                stable: Some(250),
+                timeout: 30_000,
+            })
+        );
     }
 
     #[cfg(any(unix, windows))]
