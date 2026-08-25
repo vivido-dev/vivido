@@ -153,8 +153,10 @@ physical modifiers pressed.
   visible viewport at its current scroll position. `rows` accepts 1 through 1000 and reads newest
   physical rows at the live bottom, including scrollback. The CLI writes text exactly, without an
   added newline. Styling, cursor, media, search, and message overlays are excluded.
-- `screenshot {"window_id":ID}`: returns `{"path":"/absolute/private/file.png"}`. The CLI prints
-  the path plus a newline. The PNG is the last successfully presented client-area frame at physical
+- `screenshot {"window_id":ID}`: returns the private PNG `path` together with `window_id`, captured
+  `frame_sequence`, physical `width`/`height`, `scale_factor`, and cell metrics. The CLI prints only
+  the path by default or the complete result with `--json`. The PNG is the last successfully
+  presented client-area frame at physical
   resolution and includes terminal rendering, cursor, selection, Vivido overlays, and Vivid media.
   It excludes OS decorations and desktop content. Straight alpha is preserved. The persistent temp
   file has mode `0600` on Unix and lives in the per-user temporary directory on Windows; its caller
@@ -196,12 +198,15 @@ waiting until it disconnects, the same as any unanswered request.
   paste uses Vivido's bracketed-paste filtering and newline normalization without entering local UI
   state. UI paste can instead update an active search.
 - `mouse {"action":{"move":POSITION}}` supports `move`, `click`, `double_click`, `down`, `up`,
-  `drag`, and `scroll`. A position contains exactly one zero-based cell pair
+  `drag`, `path`, and `scroll`. A position contains exactly one zero-based cell pair
   (`cell_column`,`cell_row`) or physical-pixel pair (`x`,`y`), plus `mods`, `route`, and `target`.
-  Button actions add `button` (`left`, `middle`, or `right`). Scroll adds finite `vertical` and
-  `horizontal` amounts and is capped at 1000 reports. Application routing requires active terminal
-  mouse reporting and the live-bottom viewport. UI routing can select text, invoke mouse bindings,
-  follow links, or report to the application as normal UI input would.
+  Button actions add `button` (`left`, `middle`, or `right`). A path contains 2 through 1,000
+  physical-pixel `{x,y}` points plus one button, modifier set, route, and target; it performs one
+  press/move/release gesture in one request. Scroll adds finite `vertical` and `horizontal` amounts
+  and is capped at 1000 reports. Application routing requires active terminal mouse reporting and
+  the live-bottom viewport. SGR pixel mouse mode preserves exact physical coordinates; other mouse
+  modes resolve them to terminal cells. UI routing can select text, invoke mouse bindings, follow
+  links, or report to the application as normal UI input would without requiring OS focus.
 - `resize {"columns":C,"rows":R,"width":null,"height":null,"target":{...}}` requests exact grid
   dimensions; replace the grid pair with `width`/`height` for exact physical client pixels. Grid
   size is at least 2 by 1 and must fit renderer and PTY limits. Only one resize per window is active.
@@ -222,7 +227,10 @@ waiting until it disconnects, the same as any unanswered request.
   relative to other windows, including other applications'.
 - `focus {"window_id":ID}` requests real operating-system activation. It succeeds only after an
   actual focused event and otherwise returns `focus_denied` after two seconds. Vivido never
-  synthesizes terminal focus state. On Wayland, the request uses `xdg_activation_v1` to obtain and
+  synthesizes terminal focus state. On Windows, the CLI makes a best-effort
+  `AllowSetForegroundWindow` grant to the owner-verified server process before requesting focus;
+  Windows foreground-lock rules may still deny activation. On Wayland, the request uses
+  `xdg_activation_v1` to obtain and
   apply a compositor-approved client activation token when that protocol is available. A headless
   session has no compositor, so `focus` cannot succeed there.
 - `signal {"signal":"INT","target":{...}}` accepts `INT`, `TERM`, `HUP`, `QUIT`, `TSTP`, `CONT`,
@@ -393,5 +401,6 @@ or pressing Ctrl-C cancels CLI subscriptions. Wire clients may send
 New structured observations, waits, transcript metadata, capabilities, and subscription events are
 one compact JSON object per line. Controls are silent on success. `create-window` prints only the
 new numeric ID, `get-text` prints exact text without a newline, `screenshot` prints one absolute path
-with a newline, and `transcript --raw` prints exact decoded bytes without a newline. Structured IPC
-errors make `vivido msg` exit nonzero and are written to standard error.
+with a newline unless `--json` requests its capture metadata, and `transcript --raw` prints exact
+decoded bytes without a newline. Structured IPC errors make `vivido msg` exit nonzero and are
+written to standard error.

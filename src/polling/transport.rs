@@ -298,6 +298,15 @@ mod platform {
             Ok(())
         }
 
+        /// Process ID of the owner-side named-pipe server.
+        pub fn server_process_id(&self) -> io::Result<u32> {
+            let mut pid = 0;
+            if unsafe { GetNamedPipeServerProcessId(self.handle.raw(), &mut pid) } == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(pid)
+        }
+
         pub fn shutdown(&self) -> io::Result<()> {
             unsafe {
                 CancelIoEx(self.handle.raw(), ptr::null());

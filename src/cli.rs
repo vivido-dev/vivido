@@ -723,6 +723,11 @@ pub struct IpcScreenshot {
     /// The focused window is used when no ID is specified.
     #[clap(short, long, env = "VIVIDO_WINDOW_ID")]
     pub window_id: Option<u64>,
+
+    /// Print capture metadata together with the private PNG path.
+    #[clap(long)]
+    #[serde(default, skip_serializing)]
+    pub json: bool,
 }
 
 /// Common target selection for IPC commands.
@@ -1023,7 +1028,57 @@ pub enum IpcMouseAction {
     Down(IpcMouseButtonAction),
     Up(IpcMouseButtonAction),
     Drag(IpcMouseButtonAction),
+    /// Draw one bounded press/move/release gesture.
+    Path(IpcMousePath),
     Scroll(IpcMouseScroll),
+}
+
+/// One physical-pixel point in a pointer path.
+#[cfg(any(unix, windows))]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
+pub struct IpcMousePoint {
+    pub x: f64,
+    pub y: f64,
+}
+
+#[cfg(any(unix, windows))]
+impl std::str::FromStr for IpcMousePoint {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let (x, y) =
+            value.split_once(',').ok_or_else(|| String::from("mouse point must be X,Y"))?;
+        let x = x.parse::<f64>().map_err(|_| String::from("mouse point X is not a number"))?;
+        let y = y.parse::<f64>().map_err(|_| String::from("mouse point Y is not a number"))?;
+        if !x.is_finite() || !y.is_finite() {
+            return Err(String::from("mouse point coordinates must be finite"));
+        }
+        Ok(Self { x, y })
+    }
+}
+
+/// Parameters for one complete physical-pixel pointer gesture.
+#[cfg(any(unix, windows))]
+#[derive(Args, Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct IpcMousePath {
+    /// Ordered physical-pixel points, each written as X,Y.
+    #[clap(long = "point", required = true, num_args = 2..=1000, value_name = "X,Y")]
+    pub points: Vec<IpcMousePoint>,
+
+    /// Mouse button held for the gesture.
+    #[clap(long, value_enum, default_value_t)]
+    pub button: IpcMouseButton,
+
+    /// Comma-separated Ctrl, Alt, Shift, and Super modifiers.
+    #[clap(long, value_delimiter = ',')]
+    pub mods: Vec<String>,
+
+    /// Input routing mode.
+    #[clap(long, value_enum, default_value_t)]
+    pub route: IpcInputRoute,
+
+    #[clap(flatten)]
+    pub target: IpcTarget,
 }
 
 /// Parameters to the `mouse` IPC subcommand.
@@ -1836,8 +1891,33 @@ mod tests {
         };
         assert_eq!(
             message.message,
-            SocketMessage::Screenshot(IpcScreenshot { window_id: Some(42) })
+            SocketMessage::Screenshot(IpcScreenshot { window_id: Some(42), json: false })
         );
+
+        let options = Options::try_parse_from([
+            "vivido",
+            "msg",
+            "mouse",
+            "path",
+            "--point",
+            "10,20",
+            "30,40",
+            "--route",
+            "ui",
+            "--window-id",
+            "42",
+        ])
+        .unwrap();
+        let Some(Subcommands::Msg(message)) = options.subcommands else {
+            panic!("expected msg subcommand");
+        };
+        let SocketMessage::Mouse(IpcMouse { action: IpcMouseAction::Path(path) }) = message.message
+        else {
+            panic!("expected mouse path");
+        };
+        assert_eq!(path.points.len(), 2);
+        assert_eq!(path.points[0], IpcMousePoint { x: 10.0, y: 20.0 });
+        assert_eq!(path.target.window_id, Some(42));
     }
 
     #[cfg(any(unix, windows))]

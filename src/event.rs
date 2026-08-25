@@ -873,25 +873,38 @@ impl Processor {
                         return;
                     },
                 };
-                let position = match &params.action {
-                    crate::cli::IpcMouseAction::Move(position) => position,
+                let (requested, route) = match &params.action {
+                    crate::cli::IpcMouseAction::Move(position) => {
+                        (position.target.window_id, position.route)
+                    },
                     crate::cli::IpcMouseAction::Click(action)
                     | crate::cli::IpcMouseAction::DoubleClick(action)
                     | crate::cli::IpcMouseAction::Down(action)
                     | crate::cli::IpcMouseAction::Up(action)
-                    | crate::cli::IpcMouseAction::Drag(action) => &action.position,
-                    crate::cli::IpcMouseAction::Scroll(action) => &action.position,
+                    | crate::cli::IpcMouseAction::Drag(action) => {
+                        (action.position.target.window_id, action.position.route)
+                    },
+                    crate::cli::IpcMouseAction::Path(path) => (path.target.window_id, path.route),
+                    crate::cli::IpcMouseAction::Scroll(action) => {
+                        (action.position.target.window_id, action.position.route)
+                    },
                 };
-                let target = match self.resolve_ipc_target(position.target.window_id) {
+                let target = match self.resolve_ipc_target(requested) {
                     Ok(target) => target,
                     Err(error) => {
                         request.connection.error(request.id, error);
                         return;
                     },
                 };
-                match position.route {
+                match route {
                     IpcInputRoute::Application => {
-                        match self.windows[&target].application_mouse(&params) {
+                        let result = match &params.action {
+                            crate::cli::IpcMouseAction::Path(path) => {
+                                self.windows[&target].application_mouse_path(path)
+                            },
+                            _ => self.windows[&target].application_mouse(&params),
+                        };
+                        match result {
                             Ok(bytes) => {
                                 let window_id = self.windows[&target].ipc_window_id();
                                 self.queue_ipc_input(Some(window_id), bytes, &request);
@@ -900,14 +913,26 @@ impl Processor {
                         }
                     },
                     IpcInputRoute::Ui => {
-                        let result = self.windows.get_mut(&target).unwrap().ui_mouse(
-                            &params,
-                            #[cfg(target_os = "macos")]
-                            event_loop.winit(),
-                            &self.proxy,
-                            &mut self.clipboard,
-                            &mut self.scheduler,
-                        );
+                        let result = match &params.action {
+                            crate::cli::IpcMouseAction::Path(path) => {
+                                self.windows.get_mut(&target).unwrap().ui_mouse_path(
+                                    path,
+                                    #[cfg(target_os = "macos")]
+                                    event_loop.winit(),
+                                    &self.proxy,
+                                    &mut self.clipboard,
+                                    &mut self.scheduler,
+                                )
+                            },
+                            _ => self.windows.get_mut(&target).unwrap().ui_mouse(
+                                &params,
+                                #[cfg(target_os = "macos")]
+                                event_loop.winit(),
+                                &self.proxy,
+                                &mut self.clipboard,
+                                &mut self.scheduler,
+                            ),
+                        };
                         match result {
                             Ok(bytes) if bytes.is_empty() => {
                                 request.connection.reply(request.id, serde_json::json!({}));
@@ -2090,7 +2115,12 @@ impl Processor {
                     WaitKind::Focus { .. } => IpcError::new(
                         "focus_denied",
                         "window system did not confirm focus within two seconds",
-                    ),
+                    )
+                    .with_data(serde_json::json!({
+                        "reason": "operating_system_activation_not_confirmed",
+                        "timeout_ms": 2_000,
+                        "background_input_available": true,
+                    })),
                     _ => IpcError::new("timeout", "IPC wait timed out"),
                 };
                 waiter.connection.error(waiter.request_id, error);

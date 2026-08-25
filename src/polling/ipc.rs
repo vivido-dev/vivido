@@ -721,6 +721,7 @@ pub fn send_message(options: MessageOptions) -> io::Result<()> {
     validate_message(&options.message)?;
     let mut stream = find_socket(options.socket, options.target.as_deref())?;
     stream.set_nonblocking(false)?;
+    grant_focus_activation_if_requested(&stream, &options.message);
     let mut reader = BufReader::new(stream.try_clone()?);
 
     send_client_request(&mut stream, 1, "hello", json!({}))?;
@@ -766,6 +767,7 @@ pub fn request_once(
     validate_message(message)?;
     let mut stream = find_socket(socket, target)?;
     stream.set_nonblocking(false)?;
+    grant_focus_activation_if_requested(&stream, message);
     let mut reader = BufReader::new(stream.try_clone()?);
     send_client_request(&mut stream, 1, "hello", json!({}))?;
     let hello = read_client_response(&mut reader, 1)?;
@@ -777,6 +779,24 @@ pub fn request_once(
     let result = read_client_response(&mut reader, 2)?;
     Ok((hello, result))
 }
+
+#[cfg(windows)]
+fn grant_focus_activation_if_requested(stream: &LocalStream, message: &SocketMessage) {
+    if !matches!(message, SocketMessage::Focus(_)) {
+        return;
+    }
+    let Ok(server_pid) = stream.server_process_id() else {
+        return;
+    };
+    // Windows accepts this grant only when the caller is itself foreground-eligible. Failure is
+    // deliberately non-fatal: the server may already be foreground and still confirm focus.
+    unsafe {
+        windows_sys::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow(server_pid);
+    }
+}
+
+#[cfg(not(windows))]
+fn grant_focus_activation_if_requested(_stream: &LocalStream, _message: &SocketMessage) {}
 
 /// Issue one bounded automation request by wire method name.
 ///
@@ -1049,6 +1069,17 @@ fn validate_message(message: &SocketMessage) -> io::Result<()> {
             | IpcMouseAction::Down(action)
             | IpcMouseAction::Up(action)
             | IpcMouseAction::Drag(action) => &action.position,
+            IpcMouseAction::Path(path) => {
+                if !(2..=1000).contains(&path.points.len())
+                    || path.points.iter().any(|point| !point.x.is_finite() || !point.y.is_finite())
+                {
+                    return Err(IoError::new(
+                        ErrorKind::InvalidInput,
+                        "mouse path requires 2 through 1000 finite physical-pixel points",
+                    ));
+                }
+                return Ok(());
+            },
             IpcMouseAction::Scroll(action) => &action.position,
         };
         let cell = position.cell_column.is_some() && position.cell_row.is_some();
@@ -1099,6 +1130,7 @@ fn write_cli_result(message: &SocketMessage, result: &Value) -> io::Result<()> {
     match message {
         SocketMessage::GetText(_) => stdout
             .write_all(result.get("text").and_then(Value::as_str).unwrap_or_default().as_bytes()),
+        SocketMessage::Screenshot(params) if params.json => write_json_to(&mut stdout, result),
         SocketMessage::Screenshot(_) => {
             let path = result.get("path").and_then(Value::as_str).ok_or_else(|| {
                 IoError::new(ErrorKind::InvalidData, "screenshot reply is missing path")

@@ -65,7 +65,7 @@ pub mod host {
     };
     pub use crate::polling::transport::LocalStream;
     pub use crate::polling::{IoListener, IoListenerHandle};
-    pub use crate::session::{RegistryGuard, SessionPaths};
+    pub use crate::session::{RegistryGuard, SessionPaths, SessionRegistry, list_registries};
 }
 
 /// Internal exports used by the package's executable targets.

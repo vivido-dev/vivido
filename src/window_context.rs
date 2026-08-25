@@ -67,7 +67,8 @@ use crate::terminal::vte::ansi::{Color, NamedColor};
 use crate::automation::{AutomationWindowState, Transcript};
 #[cfg(any(unix, windows))]
 use crate::cli::{
-    IpcKey, IpcMouse, IpcMouseAction, IpcMouseButton, IpcMousePosition, IpcSignalName,
+    IpcKey, IpcMouse, IpcMouseAction, IpcMouseButton, IpcMousePath, IpcMousePoint,
+    IpcMousePosition, IpcSignalName,
 };
 use crate::cli::{ParsedOptions, VividTarget, WindowOptions};
 use crate::clipboard::Clipboard;
@@ -226,6 +227,7 @@ struct PendingScreenshot {
     readback: ScreenshotReadback,
     connection: IpcConnection,
     request_id: u64,
+    metadata: serde_json::Value,
 }
 
 #[cfg(any(unix, windows))]
@@ -1131,15 +1133,16 @@ impl WindowContext {
             | IpcMouseAction::Down(action)
             | IpcMouseAction::Up(action)
             | IpcMouseAction::Drag(action) => &action.position,
+            IpcMouseAction::Path(_) => {
+                return Err(IpcError::new(
+                    "invalid_params",
+                    "mouse paths require the path input handler",
+                ));
+            },
             IpcMouseAction::Scroll(action) => &action.position,
         };
         let modifier_override = crate::input::keyboard::ipc_modifier_state(&position.mods)?;
-        let (column, row) = self.mouse_cell(position)?;
-        let size = self.display.size_info;
-        let physical = PhysicalPosition::new(
-            f64::from(size.padding_x()) + (column as f64 + 0.5) * f64::from(size.cell_width()),
-            f64::from(size.padding_y()) + (row as f64 + 0.5) * f64::from(size.cell_height()),
-        );
+        let physical = self.resolve_mouse_position(position)?.physical;
 
         let mut notifier = AutomationNotifier::default();
         {
@@ -1204,11 +1207,76 @@ impl WindowContext {
                     processor.mouse_input(ElementState::Pressed, button(action.button));
                     processor.mouse_moved(physical);
                 },
+                IpcMouseAction::Path(_) => unreachable!("mouse paths use ui_mouse_path"),
                 IpcMouseAction::Scroll(action) => processor.mouse_wheel_input(
                     MouseScrollDelta::LineDelta(action.horizontal as f32, action.vertical as f32),
                     TouchPhase::Moved,
                 ),
             }
+        }
+        Ok(notifier.into_bytes())
+    }
+
+    /// Process one bounded physical-pixel gesture through Vivido's UI mouse processor.
+    #[cfg(any(unix, windows))]
+    pub fn ui_mouse_path(
+        &mut self,
+        path: &IpcMousePath,
+        #[cfg(target_os = "macos")] event_loop: Option<&ActiveEventLoop>,
+        event_proxy: &EventSink,
+        clipboard: &mut Clipboard,
+        scheduler: &mut Scheduler,
+    ) -> Result<Vec<u8>, IpcError> {
+        validate_mouse_path(path)?;
+        let modifier_override = crate::input::keyboard::ipc_modifier_state(&path.mods)?;
+        let points = path
+            .points
+            .iter()
+            .map(|point| self.resolve_pixel_point(*point).map(|position| position.physical))
+            .collect::<Result<Vec<_>, _>>()?;
+        let button = match path.button {
+            IpcMouseButton::Left => MouseButton::Left,
+            IpcMouseButton::Middle => MouseButton::Middle,
+            IpcMouseButton::Right => MouseButton::Right,
+        };
+
+        let mut notifier = AutomationNotifier::default();
+        {
+            let mut terminal = self.terminal.lock();
+            let context = ActionContext {
+                cursor_blink_timed_out: &mut self.cursor_blink_timed_out,
+                prev_bell_cmd: &mut self.prev_bell_cmd,
+                message_buffer: &mut self.message_buffer,
+                search_state: &mut self.search_state,
+                modifiers: &mut self.modifiers,
+                notifier: &mut notifier,
+                display: &mut self.display,
+                mouse: &mut self.mouse,
+                touch: &mut self.touch,
+                dirty: &mut self.dirty,
+                occluded: &mut self.occluded,
+                terminal: &mut terminal,
+                #[cfg(not(windows))]
+                master_fd: self.master_fd,
+                #[cfg(not(windows))]
+                shell_pid: self.shell_pid,
+                preserve_title: self.preserve_title,
+                vivid_service: &self.vivid_service,
+                config: &self.config,
+                event_proxy,
+                #[cfg(target_os = "macos")]
+                event_loop,
+                clipboard,
+                scheduler,
+            };
+            let mut processor = input::Processor::new(context);
+            processor.set_modifier_override(modifier_override);
+            processor.mouse_moved(points[0]);
+            processor.mouse_input(ElementState::Pressed, button);
+            for point in points.iter().skip(1) {
+                processor.mouse_moved(*point);
+            }
+            processor.mouse_input(ElementState::Released, button);
         }
         Ok(notifier.into_bytes())
     }
@@ -1248,12 +1316,18 @@ impl WindowContext {
             IpcMouseAction::Drag(action) => {
                 (&action.position, MouseEncodingAction::Drag(action.button))
             },
+            IpcMouseAction::Path(_) => {
+                return Err(IpcError::new(
+                    "invalid_params",
+                    "mouse paths require the path input handler",
+                ));
+            },
             IpcMouseAction::Scroll(action) => {
                 (&action.position, MouseEncodingAction::Scroll(action.vertical, action.horizontal))
             },
         };
-        let (column, row) = self.mouse_cell(position)?;
         let modifiers = mouse_modifier_code(&position.mods)?;
+        let position = self.resolve_mouse_position(position)?;
         let mut output = Vec::new();
         let button_code = |button| match button {
             IpcMouseButton::Left => 0,
@@ -1268,21 +1342,20 @@ impl WindowContext {
                         "terminal application has not enabled mouse motion reporting",
                     ));
                 }
-                append_mouse_report(&mut output, mode, column, row, 35 + modifiers, true)?;
+                append_mouse_report(&mut output, mode, position, 35 + modifiers, true)?;
             },
             MouseEncodingAction::Click(button, count) => {
                 let code = button_code(button) + modifiers;
                 for _ in 0..count {
-                    append_mouse_report(&mut output, mode, column, row, code, true)?;
-                    append_mouse_report(&mut output, mode, column, row, code, false)?;
+                    append_mouse_report(&mut output, mode, position, code, true)?;
+                    append_mouse_report(&mut output, mode, position, code, false)?;
                 }
             },
             MouseEncodingAction::Down(button) => {
                 append_mouse_report(
                     &mut output,
                     mode,
-                    column,
-                    row,
+                    position,
                     button_code(button) + modifiers,
                     true,
                 )?;
@@ -1291,8 +1364,7 @@ impl WindowContext {
                 append_mouse_report(
                     &mut output,
                     mode,
-                    column,
-                    row,
+                    position,
                     button_code(button) + modifiers,
                     false,
                 )?;
@@ -1307,8 +1379,7 @@ impl WindowContext {
                 append_mouse_report(
                     &mut output,
                     mode,
-                    column,
-                    row,
+                    position,
                     32 + button_code(button) + modifiers,
                     true,
                 )?;
@@ -1331,8 +1402,7 @@ impl WindowContext {
                     append_mouse_report(
                         &mut output,
                         mode,
-                        column,
-                        row,
+                        position,
                         vertical_code + modifiers,
                         true,
                     )?;
@@ -1341,8 +1411,7 @@ impl WindowContext {
                     append_mouse_report(
                         &mut output,
                         mode,
-                        column,
-                        row,
+                        position,
                         horizontal_code + modifiers,
                         true,
                     )?;
@@ -1352,12 +1421,87 @@ impl WindowContext {
         Ok(output)
     }
 
+    /// Encode one complete physical-pixel application gesture into one PTY write.
     #[cfg(any(unix, windows))]
-    fn mouse_cell(&self, position: &IpcMousePosition) -> Result<(usize, usize), IpcError> {
+    pub fn application_mouse_path(&self, path: &IpcMousePath) -> Result<Vec<u8>, IpcError> {
+        validate_mouse_path(path)?;
+        let terminal = self.terminal.lock();
+        let mode = *terminal.mode();
+        if !mode.intersects(TermMode::MOUSE_MODE) {
+            return Err(IpcError::new(
+                "unsupported",
+                "terminal application has not enabled mouse reporting",
+            ));
+        }
+        if terminal.grid().display_offset() != 0 {
+            return Err(IpcError::new(
+                "invalid_state",
+                "application mouse input requires the live-bottom viewport",
+            ));
+        }
+        if !mode.intersects(TermMode::MOUSE_DRAG | TermMode::MOUSE_MOTION) {
+            return Err(IpcError::new(
+                "unsupported",
+                "terminal application has not enabled mouse drag reporting",
+            ));
+        }
+
+        let positions = path
+            .points
+            .iter()
+            .map(|point| self.resolve_pixel_point(*point))
+            .collect::<Result<Vec<_>, _>>()?;
+        let modifiers = mouse_modifier_code(&path.mods)?;
+        let button = match path.button {
+            IpcMouseButton::Left => 0,
+            IpcMouseButton::Middle => 1,
+            IpcMouseButton::Right => 2,
+        };
+        let mut output = Vec::with_capacity(positions.len().saturating_add(2) * 24);
+        append_mouse_report(&mut output, mode, positions[0], button + modifiers, true)?;
+        for position in positions.iter().copied().skip(1) {
+            append_mouse_report(&mut output, mode, position, 32 + button + modifiers, true)?;
+        }
+        append_mouse_report(
+            &mut output,
+            mode,
+            *positions.last().expect("validated path has at least two points"),
+            button + modifiers,
+            false,
+        )?;
+        Ok(output)
+    }
+
+    #[cfg(any(unix, windows))]
+    fn resolve_mouse_position(
+        &self,
+        position: &IpcMousePosition,
+    ) -> Result<ResolvedMousePosition, IpcError> {
         let size = self.display.size_info;
-        let (column, row) = match (position.cell_column, position.cell_row, position.x, position.y)
-        {
-            (Some(column), Some(row), None, None) => (column as usize, row as usize),
+        match (position.cell_column, position.cell_row, position.x, position.y) {
+            (Some(column), Some(row), None, None) => {
+                let column = column as usize;
+                let row = row as usize;
+                if column >= size.columns() || row >= size.screen_lines() {
+                    return Err(IpcError::new(
+                        "invalid_params",
+                        "mouse coordinate is outside the terminal grid",
+                    ));
+                }
+                let x = (f64::from(size.padding_x())
+                    + (column as f64 + 0.5) * f64::from(size.cell_width()))
+                .min(f64::from(size.width()) - 1.0);
+                let y = (f64::from(size.padding_y())
+                    + (row as f64 + 0.5) * f64::from(size.cell_height()))
+                .min(f64::from(size.height()) - 1.0);
+                Ok(ResolvedMousePosition {
+                    column,
+                    row,
+                    pixel_x: x.floor() as usize,
+                    pixel_y: y.floor() as usize,
+                    physical: PhysicalPosition::new(x, y),
+                })
+            },
             (None, None, Some(x), Some(y)) if x.is_finite() && y.is_finite() => {
                 if x < 0.0
                     || y < 0.0
@@ -1373,22 +1517,34 @@ impl WindowContext {
                     / f64::from(size.cell_width())) as usize;
                 let row = ((y - f64::from(size.padding_y())).max(0.0)
                     / f64::from(size.cell_height())) as usize;
-                (column, row)
+                if column >= size.columns() || row >= size.screen_lines() {
+                    return Err(IpcError::new(
+                        "invalid_params",
+                        "mouse coordinate is outside the terminal grid",
+                    ));
+                }
+                Ok(ResolvedMousePosition {
+                    column,
+                    row,
+                    pixel_x: x.floor() as usize,
+                    pixel_y: y.floor() as usize,
+                    physical: PhysicalPosition::new(x, y),
+                })
             },
-            _ => {
-                return Err(IpcError::new(
-                    "invalid_params",
-                    "mouse requires exactly one cell or pixel coordinate pair",
-                ));
-            },
-        };
-        if column >= size.columns() || row >= size.screen_lines() {
-            return Err(IpcError::new(
+            _ => Err(IpcError::new(
                 "invalid_params",
-                "mouse coordinate is outside the terminal grid",
-            ));
+                "mouse requires exactly one cell or pixel coordinate pair",
+            )),
         }
-        Ok((column, row))
+    }
+
+    #[cfg(any(unix, windows))]
+    fn resolve_pixel_point(&self, point: IpcMousePoint) -> Result<ResolvedMousePosition, IpcError> {
+        self.resolve_mouse_position(&IpcMousePosition {
+            x: Some(point.x),
+            y: Some(point.y),
+            ..IpcMousePosition::default()
+        })
     }
 
     /// Send an explicit signal to the foreground process group, falling back to the child group.
@@ -2331,7 +2487,17 @@ impl WindowContext {
         }
 
         let readback = self.display.begin_screenshot().map_err(|err| err.to_string())?;
-        self.screenshot = Some(PendingScreenshot { readback, connection, request_id });
+        let pixels = self.display.window.inner_size();
+        let size = self.display.size_info;
+        let metadata = serde_json::json!({
+            "window_id": self.ipc_window_id(),
+            "frame_sequence": self.automation.frame_sequence,
+            "width": pixels.width,
+            "height": pixels.height,
+            "scale_factor": self.display.window.scale_factor,
+            "cell": {"width": size.cell_width(), "height": size.cell_height()},
+        });
+        self.screenshot = Some(PendingScreenshot { readback, connection, request_id, metadata });
         self.screenshot_busy = true;
 
         let window_id = self.id();
@@ -2367,9 +2533,11 @@ impl WindowContext {
                 thread::spawn_named("screenshot encoder", move || {
                     match screenshot::save(pixels) {
                         Ok(path) => match path.to_str() {
-                            Some(path) => pending
-                                .connection
-                                .reply(pending.request_id, serde_json::json!({"path": path})),
+                            Some(path) => {
+                                let mut result = pending.metadata;
+                                result["path"] = serde_json::Value::String(path.to_owned());
+                                pending.connection.reply(pending.request_id, result);
+                            },
                             None => pending.connection.error(
                                 pending.request_id,
                                 IpcError::new(
@@ -2814,6 +2982,30 @@ enum MouseEncodingAction {
 }
 
 #[cfg(any(unix, windows))]
+#[derive(Copy, Clone, Debug, PartialEq)]
+struct ResolvedMousePosition {
+    column: usize,
+    row: usize,
+    pixel_x: usize,
+    pixel_y: usize,
+    physical: PhysicalPosition<f64>,
+}
+
+#[cfg(any(unix, windows))]
+fn validate_mouse_path(path: &IpcMousePath) -> Result<(), IpcError> {
+    if !(2..=1000).contains(&path.points.len()) {
+        return Err(IpcError::new(
+            "limit_exceeded",
+            "mouse path must contain 2 through 1000 points",
+        ));
+    }
+    if path.points.iter().any(|point| !point.x.is_finite() || !point.y.is_finite()) {
+        return Err(IpcError::new("invalid_params", "mouse path coordinates must be finite"));
+    }
+    Ok(())
+}
+
+#[cfg(any(unix, windows))]
 fn mouse_modifier_code(modifiers: &[String]) -> Result<u8, IpcError> {
     let mut code = 0;
     for modifier in modifiers {
@@ -2842,15 +3034,19 @@ fn mouse_modifier_code(modifiers: &[String]) -> Result<u8, IpcError> {
 fn append_mouse_report(
     output: &mut Vec<u8>,
     mode: TermMode,
-    column: usize,
-    row: usize,
+    position: ResolvedMousePosition,
     button: u8,
     pressed: bool,
 ) -> Result<(), IpcError> {
     if mode.contains(TermMode::SGR_MOUSE) {
         let terminator = if pressed { 'M' } else { 'm' };
+        let (x, y) = if mode.contains(TermMode::SGR_PIXEL_MOUSE) {
+            (position.pixel_x, position.pixel_y)
+        } else {
+            (position.column, position.row)
+        };
         output.extend_from_slice(
-            format!("\x1b[<{button};{};{}{terminator}", column + 1, row + 1).as_bytes(),
+            format!("\x1b[<{button};{};{}{terminator}", x + 1, y + 1).as_bytes(),
         );
         return Ok(());
     }
@@ -2858,15 +3054,15 @@ fn append_mouse_report(
     let button = if pressed { button } else { 3 + (button & (4 | 8 | 16)) };
     let utf8 = mode.contains(TermMode::UTF8_MOUSE);
     let maximum = if utf8 { 2015 } else { 223 };
-    if column >= maximum || row >= maximum {
+    if position.column >= maximum || position.row >= maximum {
         return Err(IpcError::new(
             "limit_exceeded",
             "mouse coordinate exceeds the active terminal mouse protocol",
         ));
     }
     output.extend_from_slice(&[b'\x1b', b'[', b'M', 32 + button]);
-    append_legacy_mouse_coordinate(output, column, utf8);
-    append_legacy_mouse_coordinate(output, row, utf8);
+    append_legacy_mouse_coordinate(output, position.column, utf8);
+    append_legacy_mouse_coordinate(output, position.row, utf8);
     Ok(())
 }
 
@@ -2960,17 +3156,70 @@ mod vivid_environment_tests {
         LATENCY_SENSITIVE_FRAME_INTERVAL, LatencySensitiveFrameTimer, latency_sensitive_draw_delay,
         windows_path_from_shell_report,
     };
+    #[cfg(any(unix, windows))]
+    use super::{ResolvedMousePosition, append_mouse_report};
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     use super::{flushes_staged_input, is_latency_sensitive_input};
     use std::collections::HashMap;
     #[cfg(windows)]
     use std::path::PathBuf;
+    #[cfg(any(unix, windows))]
+    use winit::dpi::PhysicalPosition;
     #[cfg(windows)]
     use winit::event::Ime;
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     use winit::event::{DeviceId, Event as WinitEvent, MouseScrollDelta, TouchPhase, WindowEvent};
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     use winit::window::WindowId;
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn automation_sgr_pixel_mouse_preserves_physical_coordinates() {
+        let position = ResolvedMousePosition {
+            column: 92,
+            row: 20,
+            pixel_x: 1013,
+            pixel_y: 485,
+            physical: PhysicalPosition::new(1013.0, 485.0),
+        };
+        let mut output = Vec::new();
+
+        append_mouse_report(
+            &mut output,
+            crate::terminal::term::TermMode::SGR_MOUSE
+                | crate::terminal::term::TermMode::SGR_PIXEL_MOUSE,
+            position,
+            0,
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(output, b"\x1b[<0;1014;486M");
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn automation_legacy_sgr_mouse_uses_cell_coordinates() {
+        let position = ResolvedMousePosition {
+            column: 92,
+            row: 20,
+            pixel_x: 1013,
+            pixel_y: 485,
+            physical: PhysicalPosition::new(1013.0, 485.0),
+        };
+        let mut output = Vec::new();
+
+        append_mouse_report(
+            &mut output,
+            crate::terminal::term::TermMode::SGR_MOUSE,
+            position,
+            0,
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(output, b"\x1b[<0;93;21M");
+    }
 
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     #[test]
