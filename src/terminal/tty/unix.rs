@@ -127,34 +127,21 @@ impl ShellUser {
     /// look for shell, username, longname, and home dir in the respective environment variables
     /// before falling back on looking into `passwd`.
     fn from_env() -> Result<Self> {
-        let mut buf = [0; 1024];
-        let pw = get_pw_entry(&mut buf);
-
-        let user = match env::var("USER") {
-            Ok(user) => user,
-            Err(_) => match pw {
-                Ok(ref pw) => pw.name.to_owned(),
-                Err(err) => return Err(err),
+        let user = env::var("USER");
+        let home = env::var("HOME");
+        let shell = env::var("SHELL");
+        match (user, home, shell) {
+            (Ok(user), Ok(home), Ok(shell)) => Ok(Self { user, home, shell }),
+            (user, home, shell) => {
+                let mut buf = [0; 1024];
+                let pw = get_pw_entry(&mut buf)?;
+                Ok(Self {
+                    user: user.unwrap_or_else(|_| pw.name.to_owned()),
+                    home: home.unwrap_or_else(|_| pw.dir.to_owned()),
+                    shell: shell.unwrap_or_else(|_| pw.shell.to_owned()),
+                })
             },
-        };
-
-        let home = match env::var("HOME") {
-            Ok(home) => home,
-            Err(_) => match pw {
-                Ok(ref pw) => pw.dir.to_owned(),
-                Err(err) => return Err(err),
-            },
-        };
-
-        let shell = match env::var("SHELL") {
-            Ok(shell) => shell,
-            Err(_) => match pw {
-                Ok(ref pw) => pw.shell.to_owned(),
-                Err(err) => return Err(err),
-            },
-        };
-
-        Ok(Self { user, home, shell })
+        }
     }
 }
 

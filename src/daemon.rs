@@ -125,8 +125,15 @@ where
     I: IntoIterator<Item = String>,
 {
     let mut relaunch = Vec::new();
-    let mut args = args.into_iter();
-    while let Some(argument) = args.next() {
+    #[cfg(not(windows))]
+    let mut skip_working_directory = false;
+    for argument in args {
+        #[cfg(not(windows))]
+        if skip_working_directory {
+            skip_working_directory = false;
+            continue;
+        }
+
         if argument == "-e" || argument == "--command" {
             // `--command` takes every remaining argument, so nothing after it can be kept.
             break;
@@ -134,7 +141,7 @@ where
 
         #[cfg(not(windows))]
         if argument == "--working-directory" {
-            let _ = args.next();
+            skip_working_directory = true;
             continue;
         }
 

@@ -47,6 +47,7 @@ pub enum AccessibilityCommand {
     /// Open the `+` button's launch menu.
     ShowNewTabMenu,
     /// Run the launch entry at this index of the open menu.
+    #[cfg(target_os = "linux")]
     MenuItem(usize),
     PreviousTabs,
     NextTabs,

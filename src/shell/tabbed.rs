@@ -423,9 +423,11 @@ impl TabbedApplication {
                     self.refresh_menu();
                 }
             },
-            WindowEvent::MouseInput { state: ElementState::Pressed, button, .. }
-                if button == MouseButton::Left =>
-            {
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button: MouseButton::Left,
+                ..
+            } => {
                 let hit = self.cursor.and_then(|position| {
                     self.menu.as_ref().and_then(|menu| menu.hit(position.x, position.y))
                 });
@@ -721,6 +723,7 @@ impl TabbedApplication {
                     }
                 },
                 AccessibilityCommand::ShowNewTabMenu => self.toggle_new_tab_menu(event_loop),
+                #[cfg(target_os = "linux")]
                 AccessibilityCommand::MenuItem(index) => {
                     self.activate_menu_entry(event_loop, index);
                 },
