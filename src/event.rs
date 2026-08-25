@@ -3009,6 +3009,23 @@ impl Processor {
                     }
                 }
             },
+            #[cfg(windows)]
+            (EventType::LatencySensitiveFrame, Some(window_id)) => {
+                if let Some(window_context) = self.windows.get_mut(window_id) {
+                    window_context.acknowledge_latency_sensitive_frame();
+                    let presented = window_context.draw_latency_sensitive(&mut self.scheduler);
+
+                    if presented == Some(true) {
+                        let ipc_window_id = window_context.ipc_window_id();
+                        let frame_sequence = window_context.automation.record_frame();
+                        self.automation.emit(
+                            Some(ipc_window_id),
+                            "frame_presented",
+                            serde_json::json!({"frame_sequence": frame_sequence}),
+                        );
+                    }
+                }
+            },
             (EventType::RendererRecovery, Some(window_id)) => {
                 if let Some(window_context) = self.windows.get_mut(window_id) {
                     window_context.retry_renderer(&mut self.scheduler);
@@ -3297,6 +3314,8 @@ pub enum EventType {
     #[cfg(any(unix, windows))]
     Shutdown,
     Frame,
+    #[cfg(windows)]
+    LatencySensitiveFrame,
     RendererRecovery,
     VividResizeSettled(u64),
     /// Dismiss the warning that was visible when this timer was scheduled.
@@ -4511,6 +4530,8 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                 | EventType::RendererRecovery
                 | EventType::HostWakeup
                 | EventType::VividResizeSettled(_) => (),
+                #[cfg(windows)]
+                EventType::LatencySensitiveFrame => (),
                 #[cfg(any(target_os = "linux", windows))]
                 EventType::ShellAction(_) => (),
                 EventType::VividFrame => (),

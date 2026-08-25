@@ -19,6 +19,10 @@ use std::rc::Rc;
 use std::sync::Arc;
 #[cfg(any(unix, windows))]
 use std::sync::Mutex;
+#[cfg(windows)]
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(windows)]
+use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::time::{Duration, Instant};
 
 #[cfg(any(unix, windows))]
@@ -131,6 +135,8 @@ pub struct WindowContext {
     event_queue: Vec<WinitEvent<Event>>,
     #[cfg(windows)]
     last_latency_sensitive_draw: Option<Instant>,
+    #[cfg(windows)]
+    latency_sensitive_frame_timer: LatencySensitiveFrameTimer,
     #[cfg(any(target_os = "linux", windows))]
     event_proxy: EventProxy,
     terminal: Arc<FairMutex<Term<EventProxy>>>,
@@ -159,6 +165,60 @@ pub struct WindowContext {
     screenshot_busy: bool,
     #[cfg(any(unix, windows))]
     pub automation: AutomationWindowState,
+}
+
+/// Active Windows wake for the final update accumulated by the direct-draw rate limiter.
+///
+/// The ordinary scheduler advances from winit's `AboutToWait` callback. ConPTY and native input
+/// can keep the Windows message queue busy enough that callback never arrives, so a timer stored
+/// only in the scheduler can leave the last prompt or selection change invisible indefinitely.
+/// This worker owns a bounded one-slot queue and coalesces all requests until the main loop
+/// acknowledges the corresponding event.
+#[cfg(windows)]
+struct LatencySensitiveFrameTimer {
+    sender: SyncSender<Duration>,
+    pending: Arc<AtomicBool>,
+}
+
+#[cfg(windows)]
+impl LatencySensitiveFrameTimer {
+    fn new(event_sink: EventSink, window_id: WindowId) -> Self {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let pending = Arc::new(AtomicBool::new(false));
+        let worker_pending = Arc::clone(&pending);
+        let _worker = thread::spawn_named("latency-sensitive frame timer", move || {
+            while let Ok(delay) = receiver.recv() {
+                std::thread::sleep(delay);
+                if event_sink
+                    .send_event(Event::new(EventType::LatencySensitiveFrame, window_id))
+                    .is_err()
+                {
+                    worker_pending.store(false, Ordering::Relaxed);
+                    break;
+                }
+            }
+        });
+
+        Self { sender, pending }
+    }
+
+    fn schedule(&self, delay: Duration) {
+        if self.pending.compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed).is_err()
+        {
+            return;
+        }
+
+        match self.sender.try_send(delay) {
+            Ok(()) | Err(TrySendError::Full(_)) => (),
+            Err(TrySendError::Disconnected(_)) => {
+                self.pending.store(false, Ordering::Relaxed);
+            },
+        }
+    }
+
+    fn acknowledge(&self) {
+        self.pending.store(false, Ordering::Relaxed);
+    }
 }
 
 #[cfg(any(unix, windows))]
@@ -210,9 +270,12 @@ fn flushes_staged_input(event: &WinitEvent<Event>) -> bool {
 }
 
 #[cfg(windows)]
-fn latency_sensitive_draw_due(last_draw: Option<Instant>, now: Instant) -> bool {
-    last_draw
-        .is_none_or(|last_draw| now.duration_since(last_draw) >= LATENCY_SENSITIVE_FRAME_INTERVAL)
+fn latency_sensitive_draw_delay(last_draw: Option<Instant>, now: Instant) -> Option<Duration> {
+    last_draw.and_then(|last_draw| {
+        LATENCY_SENSITIVE_FRAME_INTERVAL
+            .checked_sub(now.saturating_duration_since(last_draw))
+            .filter(|delay| !delay.is_zero())
+    })
 }
 
 impl WindowContext {
@@ -306,6 +369,9 @@ impl WindowContext {
             display.size_info.columns()
         );
 
+        #[cfg(windows)]
+        let latency_sensitive_frame_timer =
+            LatencySensitiveFrameTimer::new(proxy.clone(), display.window.id());
         let event_proxy = EventProxy::new(proxy, display.window.id());
         let notifications = NotificationController::new(
             config.terminal.osc_notifications,
@@ -437,6 +503,8 @@ impl WindowContext {
             event_queue: Default::default(),
             #[cfg(windows)]
             last_latency_sensitive_draw: None,
+            #[cfg(windows)]
+            latency_sensitive_frame_timer,
             modifiers: Default::default(),
             occluded: Default::default(),
             mouse: Default::default(),
@@ -617,7 +685,8 @@ impl WindowContext {
         }
 
         let now = Instant::now();
-        if !latency_sensitive_draw_due(self.last_latency_sensitive_draw, now) {
+        if let Some(delay) = latency_sensitive_draw_delay(self.last_latency_sensitive_draw, now) {
+            self.latency_sensitive_frame_timer.schedule(delay);
             return None;
         }
 
@@ -645,6 +714,12 @@ impl WindowContext {
         let presented = self.draw(scheduler);
         self.last_latency_sensitive_draw = Some(Instant::now());
         Some(presented)
+    }
+
+    /// Acknowledge the active Windows tail-frame wake so another interval can be queued.
+    #[cfg(windows)]
+    pub fn acknowledge_latency_sensitive_frame(&self) {
+        self.latency_sensitive_frame_timer.acknowledge();
     }
 
     /// Process events for this terminal window.
@@ -2841,7 +2916,7 @@ mod vivid_environment_tests {
     use super::vivid_wslenv;
     #[cfg(windows)]
     use super::{
-        LATENCY_SENSITIVE_FRAME_INTERVAL, latency_sensitive_draw_due,
+        LATENCY_SENSITIVE_FRAME_INTERVAL, LatencySensitiveFrameTimer, latency_sensitive_draw_delay,
         windows_path_from_shell_report,
     };
     #[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -2906,12 +2981,38 @@ mod vivid_environment_tests {
     fn latency_sensitive_draws_are_bounded_to_one_per_frame_interval() {
         let start = std::time::Instant::now();
 
-        assert!(latency_sensitive_draw_due(None, start));
-        assert!(!latency_sensitive_draw_due(
-            Some(start),
-            start + LATENCY_SENSITIVE_FRAME_INTERVAL - std::time::Duration::from_nanos(1)
-        ));
-        assert!(latency_sensitive_draw_due(Some(start), start + LATENCY_SENSITIVE_FRAME_INTERVAL));
+        assert_eq!(latency_sensitive_draw_delay(None, start), None);
+        assert_eq!(
+            latency_sensitive_draw_delay(
+                Some(start),
+                start + LATENCY_SENSITIVE_FRAME_INTERVAL - std::time::Duration::from_nanos(1)
+            ),
+            Some(std::time::Duration::from_nanos(1))
+        );
+        assert_eq!(
+            latency_sensitive_draw_delay(Some(start), start + LATENCY_SENSITIVE_FRAME_INTERVAL),
+            None
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn latency_sensitive_tail_wake_is_active_and_coalesced() {
+        let (sink, receiver) = crate::event::EventSink::headless();
+        let timer = LatencySensitiveFrameTimer::new(sink, WindowId::dummy());
+
+        timer.schedule(std::time::Duration::from_millis(1));
+        timer.schedule(std::time::Duration::from_millis(1));
+        receiver
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("the active timer wakes without an event-loop idle callback");
+        assert!(receiver.try_recv().is_err(), "concurrent wake requests are coalesced");
+
+        timer.acknowledge();
+        timer.schedule(std::time::Duration::from_millis(1));
+        receiver
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("acknowledgement permits the next tail wake");
     }
 
     #[cfg(windows)]
