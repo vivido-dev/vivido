@@ -16,6 +16,8 @@ use crate::display::renderer::{EmbeddedFramePlacement, Error, SceneRenderer};
 use crate::display::text::TextSystem;
 use crate::display::window::RenderSource;
 
+use super::launch::LaunchEntry;
+use super::menu::NewTabMenu;
 use super::{PhysicalRect, Tabs};
 
 pub const TAB_BAR_LOGICAL: f64 = 35.0;
@@ -33,11 +35,14 @@ const MIN_CONTENT_HEIGHT_LOGICAL: f64 = 80.0;
 const CORNER_RADIUS_LOGICAL: f64 = 12.0;
 
 const BACKGROUND: Rgb = Rgb::new(24, 24, 29);
-const ACTIVE: Rgb = Rgb::new(53, 53, 65);
-const BORDER: Rgb = Rgb::new(68, 68, 82);
-const TEXT: Rgb = Rgb::new(232, 232, 238);
+pub(super) const ACTIVE: Rgb = Rgb::new(53, 53, 65);
+pub(super) const BORDER: Rgb = Rgb::new(68, 68, 82);
+pub(super) const TEXT: Rgb = Rgb::new(232, 232, 238);
 const MUTED: Rgb = Rgb::new(155, 155, 170);
 const ACCENT: Rgb = Rgb::new(129, 140, 248);
+/// Surface of a panel floating above terminal content, a shade lighter than the tab strip so its
+/// edge reads against both the bar and the pane behind it.
+pub(super) const SURFACE: Rgb = Rgb::new(38, 38, 46);
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ChromeLayout {
@@ -111,12 +116,24 @@ impl ChromeRenderer {
         }
     }
 
+    /// Lay a `+` menu out with the chrome's own text system and scale factor.
+    pub fn layout_menu(
+        &mut self,
+        entries: Vec<LaunchEntry>,
+        anchor: PhysicalRect,
+        bounds: PhysicalSize<u32>,
+    ) -> Option<NewTabMenu> {
+        NewTabMenu::new(entries, anchor, bounds, &mut self.text, self.scale)
+    }
+
+    /// Draw the chrome, optionally with an open `+` menu floating over the pane area.
     pub fn render(
         &mut self,
         size: PhysicalSize<u32>,
         tabs: &mut Tabs,
         draw_controls: bool,
         frames: &[EmbeddedFramePlacement<'_>],
+        menu: Option<&NewTabMenu>,
     ) -> Result<(ChromeLayout, ChromeHitMap, bool), Error> {
         let scale = self.scale;
         #[cfg(target_os = "linux")]
@@ -164,10 +181,25 @@ impl ChromeRenderer {
             &mut hits,
         );
 
+        // Windows presents the menu in its own child window above the pane HWND, so only the
+        // Linux compositing path draws it here and cuts it out of the frame copy.
+        let exclude = menu.filter(|_| cfg!(target_os = "linux")).map(|menu| {
+            menu.paint(&mut scene, &mut self.text, scale, (0.0, 0.0));
+            let rect = menu.rect();
+            (
+                winit::dpi::PhysicalPosition::new(
+                    u32::try_from(rect.x.max(0)).unwrap_or_default(),
+                    u32::try_from(rect.y.max(0)).unwrap_or_default(),
+                ),
+                PhysicalSize::new(rect.width, rect.height),
+            )
+        });
+
         let presented = self.renderer.render_composited(
             &scene,
             Color::from_rgba8(BACKGROUND.r, BACKGROUND.g, BACKGROUND.b, 0),
             frames,
+            exclude,
         )?;
         Ok((layout, hits, presented))
     }
@@ -337,7 +369,7 @@ fn title_clip(tab: PhysicalRect, close_width: u32, scale: f64) -> Option<Rect> {
     })
 }
 
-fn ellipsize(title: &str, width: f64, scale: f64) -> String {
+pub(super) fn ellipsize(title: &str, width: f64, scale: f64) -> String {
     let capacity = (width / (7.0 * scale.max(0.1))).floor() as usize;
     let count = title.chars().count();
     if count <= capacity {
@@ -351,7 +383,7 @@ fn ellipsize(title: &str, width: f64, scale: f64) -> String {
     clipped
 }
 
-fn text_system(config: &UiConfig, scale: f64) -> TextSystem {
+pub(super) fn text_system(config: &UiConfig, scale: f64) -> TextSystem {
     TextSystem::new(config.font.clone().with_size(FontSize::new((13.0 * scale) as f32)))
 }
 

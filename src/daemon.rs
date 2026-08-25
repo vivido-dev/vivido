@@ -54,12 +54,15 @@ where
 }
 
 /// Start a new process in the background.
+///
+/// `working_directory` is the directory the daemon starts in; callers which have a PTY pass the
+/// foreground process' directory, and callers which do not — the tab chrome — pass whatever they
+/// know, or `None` to inherit this process' directory.
 #[cfg(not(windows))]
 pub fn spawn_daemon<I, S>(
     program: &str,
     args: I,
-    master_fd: RawFd,
-    shell_pid: u32,
+    working_directory: Option<PathBuf>,
 ) -> io::Result<()>
 where
     I: IntoIterator<Item = S> + Copy,
@@ -68,9 +71,8 @@ where
     let mut command = Command::new(program);
     command.args(args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
 
-    let working_directory = foreground_process_path(master_fd, shell_pid)
-        .ok()
-        .and_then(|path| CString::new(path.into_os_string().into_vec()).ok());
+    let working_directory =
+        working_directory.and_then(|path| CString::new(path.into_os_string().into_vec()).ok());
 
     unsafe {
         command
@@ -111,6 +113,34 @@ where
             .wait()
             .map(|_| ())
     }
+}
+
+/// Arguments for relaunching this executable as another top-level Vivido window.
+///
+/// A new window starts a fresh session, so it must not inherit the command the current one was
+/// asked to run, nor — off Windows, where [`spawn_daemon`] sets the directory itself — the working
+/// directory. `args` is this process' argv with the program name already removed.
+pub fn relaunch_arguments<I>(args: I) -> Vec<String>
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut relaunch = Vec::new();
+    let mut args = args.into_iter();
+    while let Some(argument) = args.next() {
+        if argument == "-e" || argument == "--command" {
+            // `--command` takes every remaining argument, so nothing after it can be kept.
+            break;
+        }
+
+        #[cfg(not(windows))]
+        if argument == "--working-directory" {
+            let _ = args.next();
+            continue;
+        }
+
+        relaunch.push(argument);
+    }
+    relaunch
 }
 
 /// Get working directory of controlling process.
@@ -202,7 +232,37 @@ fn probe_hostname() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::host_matches;
+    use super::{host_matches, relaunch_arguments};
+
+    fn relaunch(args: &[&str]) -> Vec<String> {
+        relaunch_arguments(args.iter().map(|argument| (*argument).to_owned()))
+    }
+
+    #[test]
+    fn a_relaunch_keeps_the_window_arguments_it_was_started_with() {
+        assert_eq!(
+            relaunch(&["--title", "Vivido", "-o", "window.blur=true"]),
+            ["--title", "Vivido", "-o", "window.blur=true"]
+        );
+    }
+
+    #[test]
+    fn a_relaunch_never_inherits_the_command() {
+        assert_eq!(
+            relaunch(&["--title", "Vivido", "-e", "htop", "--sort", "cpu"]),
+            ["--title", "Vivido"]
+        );
+        assert_eq!(relaunch(&["--command", "htop"]), Vec::<String>::new());
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn a_unix_relaunch_drops_the_working_directory_the_daemon_sets_itself() {
+        assert_eq!(
+            relaunch(&["--working-directory", "/tmp", "--title", "Vivido"]),
+            ["--title", "Vivido"]
+        );
+    }
 
     #[test]
     fn local_host_forms_match() {

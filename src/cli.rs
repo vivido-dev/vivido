@@ -265,6 +265,13 @@ impl TerminalOptions {
         Some(Program::WithArgs { program: program.clone(), args: args.to_vec() })
     }
 
+    /// Replace the program this window launches instead of the configured shell.
+    pub fn set_command(&mut self, command: &Program) {
+        self.command = std::iter::once(command.program().to_owned())
+            .chain(command.args().iter().cloned())
+            .collect();
+    }
+
     /// Override the [`PtyOptions`]'s fields with the [`TerminalOptions`].
     pub fn override_pty_config(&self, pty_config: &mut PtyOptions) {
         if let Some(working_directory) = &self.working_directory {

@@ -265,6 +265,18 @@ impl TextSystem {
         self.shape_char(character, font_variant_from_style(bold, italic))
     }
 
+    /// Measure one UI text run without painting it.
+    ///
+    /// Chrome which sizes itself around a label — a menu panel, a button — needs the advance before
+    /// it has a scene to paint into, and shaping goes through the same cache `paint_text` uses.
+    pub fn measure_text(&mut self, text: &str, bold: bool) -> f32 {
+        if text.is_empty() {
+            return 0.0;
+        }
+
+        self.shape_text(text.to_owned(), font_variant_from_style(bold, false)).full_width()
+    }
+
     /// Shape and paint one UI text run at a physical-pixel origin.
     ///
     /// This uses the same font fallback, named-style, and glyph positioning path as terminal text,

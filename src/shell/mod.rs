@@ -57,7 +57,17 @@ mod chrome;
 #[cfg(any(target_os = "linux", windows))]
 pub use chrome::{ChromeHitMap, ChromeLayout, ChromeRenderer, TAB_BAR_LOGICAL, compute_layout};
 #[cfg(any(target_os = "linux", windows))]
+mod launch;
+#[cfg(any(target_os = "linux", windows))]
+pub use launch::{LaunchAction, LaunchEntry};
+#[cfg(any(target_os = "linux", windows))]
+mod menu;
+#[cfg(any(target_os = "linux", windows))]
+pub use menu::NewTabMenu;
+#[cfg(any(target_os = "linux", windows))]
 mod accessibility;
+#[cfg(windows)]
+mod menu_window;
 #[cfg(any(target_os = "linux", windows))]
 mod tabbed;
 #[cfg(any(target_os = "linux", windows))]
