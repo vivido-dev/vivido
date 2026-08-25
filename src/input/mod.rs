@@ -404,6 +404,7 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
         Self { ctx, modifier_override: None, _phantom: Default::default() }
     }
 
+    #[cfg(target_os = "macos")]
     pub(crate) fn execute_action(&mut self, action: &Action) {
         action.execute(&mut self.ctx);
     }
