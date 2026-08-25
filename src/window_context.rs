@@ -178,19 +178,24 @@ const SCREENSHOT_READBACK_TIMEOUT: Duration = Duration::from_secs(5);
 ///
 /// Wheel input is intentionally latency-sensitive: a freely spinning wheel can keep the native
 /// message queue busy indefinitely, so neither `AboutToWait` nor a scheduled `Frame` user event is
-/// guaranteed to run promptly. Windows keyboard and IME events must also flush immediately. If
-/// they remain staged behind PTY events, ConPTY echo cannot wake the renderer because the input has
-/// not reached the child yet. The native redraw request still coalesces outstanding paints.
+/// guaranteed to run promptly. Windows keyboard, IME, and pointer events must also flush
+/// immediately. Staged keyboard events have not reached the child yet, while staged pointer events
+/// have not updated selection state. The native redraw request still coalesces outstanding paints.
+pub(crate) fn is_latency_sensitive_window_event(event: &WindowEvent) -> bool {
+    match event {
+        WindowEvent::MouseWheel { .. } => cfg!(any(target_os = "linux", target_os = "windows")),
+        #[cfg(windows)]
+        WindowEvent::KeyboardInput { is_synthetic: false, .. }
+        | WindowEvent::Ime(_)
+        | WindowEvent::MouseInput { .. }
+        | WindowEvent::CursorMoved { .. } => true,
+        _ => false,
+    }
+}
+
 fn is_latency_sensitive_input(event: &WinitEvent<Event>) -> bool {
     match event {
-        WinitEvent::WindowEvent { event: WindowEvent::MouseWheel { .. }, .. } => {
-            cfg!(any(target_os = "linux", target_os = "windows"))
-        },
-        #[cfg(windows)]
-        WinitEvent::WindowEvent {
-            event: WindowEvent::KeyboardInput { is_synthetic: false, .. } | WindowEvent::Ime(_),
-            ..
-        } => true,
+        WinitEvent::WindowEvent { event, .. } => is_latency_sensitive_window_event(event),
         _ => false,
     }
 }
@@ -676,9 +681,9 @@ impl WindowContext {
 
                 // Continue to process all pending events.
             },
-            // Windows keyboard/IME input and a freely spinning wheel can keep the platform
-            // message queue non-empty, preventing `AboutToWait` from arriving. Flush all staged
-            // input on each latency-sensitive event so it reaches the child without an idle turn.
+            // Windows keyboard, IME, and pointer input and a freely spinning wheel can keep the
+            // platform message queue non-empty, preventing `AboutToWait` from arriving. Flush all
+            // staged input on each latency-sensitive event so it takes effect without an idle turn.
             event if flush_staged_input => {
                 self.event_queue.push(event);
             },
@@ -2875,6 +2880,21 @@ mod vivid_environment_tests {
         let event = WinitEvent::WindowEvent {
             window_id: WindowId::dummy(),
             event: WindowEvent::Ime(Ime::Commit("echo hello".into())),
+        };
+
+        assert!(flushes_staged_input(&event));
+        assert!(is_latency_sensitive_input(&event));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_drag_motion_flushes_staged_selection_without_waiting_for_idle() {
+        let event = WinitEvent::WindowEvent {
+            window_id: WindowId::dummy(),
+            event: WindowEvent::CursorMoved {
+                device_id: DeviceId::dummy(),
+                position: winit::dpi::PhysicalPosition::new(120., 240.),
+            },
         };
 
         assert!(flushes_staged_input(&event));

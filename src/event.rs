@@ -75,6 +75,8 @@ use crate::polling::ipc::IpcRequest;
 use crate::polling::ipc::{IpcError, MAX_INPUT_BYTES, MAX_IPC_TEXT_BYTES};
 use crate::scheduler::{Scheduler, TimerId, Topic};
 use crate::vivid::VividService;
+#[cfg(windows)]
+use crate::window_context::is_latency_sensitive_window_event;
 use crate::window_context::{WindowContext, reported_working_directory};
 
 /// Duration after the last user input until an unlimited search is performed.
@@ -2520,7 +2522,7 @@ impl Processor {
 
         let is_redraw = matches!(event, WindowEvent::RedrawRequested);
         #[cfg(windows)]
-        let is_latency_sensitive = matches!(event, WindowEvent::MouseWheel { .. });
+        let is_latency_sensitive = is_latency_sensitive_window_event(&event);
         #[cfg(any(unix, windows))]
         let focus_confirmed = matches!(&event, WindowEvent::Focused(true));
         #[cfg(any(unix, windows))]
