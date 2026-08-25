@@ -178,10 +178,21 @@ const SCREENSHOT_READBACK_TIMEOUT: Duration = Duration::from_secs(5);
 ///
 /// Wheel input is intentionally latency-sensitive: a freely spinning wheel can keep the native
 /// message queue busy indefinitely, so neither `AboutToWait` nor a scheduled `Frame` user event is
-/// guaranteed to run promptly. The native redraw request still coalesces outstanding paints.
+/// guaranteed to run promptly. Windows keyboard and IME events must also flush immediately. If
+/// they remain staged behind PTY events, ConPTY echo cannot wake the renderer because the input has
+/// not reached the child yet. The native redraw request still coalesces outstanding paints.
 fn is_latency_sensitive_input(event: &WinitEvent<Event>) -> bool {
-    cfg!(any(target_os = "linux", target_os = "windows"))
-        && matches!(event, WinitEvent::WindowEvent { event: WindowEvent::MouseWheel { .. }, .. })
+    match event {
+        WinitEvent::WindowEvent { event: WindowEvent::MouseWheel { .. }, .. } => {
+            cfg!(any(target_os = "linux", target_os = "windows"))
+        },
+        #[cfg(windows)]
+        WinitEvent::WindowEvent {
+            event: WindowEvent::KeyboardInput { is_synthetic: false, .. } | WindowEvent::Ime(_),
+            ..
+        } => true,
+        _ => false,
+    }
 }
 
 /// Whether an event must flush input already staged for this window.
@@ -610,6 +621,27 @@ impl WindowContext {
         Some(presented)
     }
 
+    /// Present the accumulated state when the Windows frame timer expires.
+    ///
+    /// The latency-sensitive path deliberately accumulates updates for one frame interval. Its
+    /// timer must finish that interval with a direct presentation; falling back to `WM_PAINT`
+    /// recreates the starvation this path exists to avoid and can leave the final typed bytes
+    /// invisible until another mouse event arrives.
+    #[cfg(windows)]
+    pub fn draw_scheduled_frame(&mut self, scheduler: &mut Scheduler) -> Option<bool> {
+        if !self.dirty
+            || self.occluded
+            || self.display.window.is_headless()
+            || self.display.window.is_visible() == Some(false)
+        {
+            return None;
+        }
+
+        let presented = self.draw(scheduler);
+        self.last_latency_sensitive_draw = Some(Instant::now());
+        Some(presented)
+    }
+
     /// Process events for this terminal window.
     pub fn handle_event(
         &mut self,
@@ -644,9 +676,9 @@ impl WindowContext {
 
                 // Continue to process all pending events.
             },
-            // A freely spinning wheel can keep the platform message queue non-empty, preventing
-            // `AboutToWait` from arriving. Flush the staged input on every wheel report so the
-            // viewport advances continuously instead of jumping only after the wheel pauses.
+            // Windows keyboard/IME input and a freely spinning wheel can keep the platform
+            // message queue non-empty, preventing `AboutToWait` from arriving. Flush all staged
+            // input on each latency-sensitive event so it reaches the child without an idle turn.
             event if flush_staged_input => {
                 self.event_queue.push(event);
             },
@@ -2812,6 +2844,8 @@ mod vivid_environment_tests {
     use std::collections::HashMap;
     #[cfg(windows)]
     use std::path::PathBuf;
+    #[cfg(windows)]
+    use winit::event::Ime;
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     use winit::event::{DeviceId, Event as WinitEvent, MouseScrollDelta, TouchPhase, WindowEvent};
     #[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -2829,6 +2863,18 @@ mod vivid_environment_tests {
                 delta: MouseScrollDelta::LineDelta(0., 1.),
                 phase: TouchPhase::Moved,
             },
+        };
+
+        assert!(flushes_staged_input(&event));
+        assert!(is_latency_sensitive_input(&event));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_text_input_flushes_staged_input_without_waiting_for_idle() {
+        let event = WinitEvent::WindowEvent {
+            window_id: WindowId::dummy(),
+            event: WindowEvent::Ime(Ime::Commit("echo hello".into())),
         };
 
         assert!(flushes_staged_input(&event));

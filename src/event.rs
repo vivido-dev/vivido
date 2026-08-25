@@ -2982,8 +2982,28 @@ impl Processor {
             (EventType::Frame, Some(window_id)) => {
                 if let Some(window_context) = self.windows.get_mut(window_id) {
                     window_context.display.window.has_frame = true;
-                    if window_context.dirty {
+
+                    // A latency-sensitive Windows draw accumulates updates until this timer. End
+                    // the interval with a direct presentation instead of returning to WM_PAINT,
+                    // which can remain starved behind ConPTY and keyboard messages.
+                    #[cfg(windows)]
+                    let presented = window_context.draw_scheduled_frame(&mut self.scheduler);
+                    #[cfg(not(windows))]
+                    let presented = None::<bool>;
+
+                    if presented.is_none() && window_context.dirty {
                         window_context.display.window.request_redraw();
+                    }
+
+                    #[cfg(any(unix, windows))]
+                    if presented == Some(true) {
+                        let ipc_window_id = window_context.ipc_window_id();
+                        let frame_sequence = window_context.automation.record_frame();
+                        self.automation.emit(
+                            Some(ipc_window_id),
+                            "frame_presented",
+                            serde_json::json!({"frame_sequence": frame_sequence}),
+                        );
                     }
                 }
             },
