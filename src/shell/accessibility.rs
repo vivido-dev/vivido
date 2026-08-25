@@ -16,6 +16,7 @@ use winit::window::Window;
 
 use crate::accessibility::AccessibilitySnapshot;
 
+use super::menu::NewTabMenu;
 use super::{ChromeHitMap, ChromeLayout, PhysicalRect, Tabs};
 
 const WINDOW_ID: NodeId = NodeId(1);
@@ -31,6 +32,10 @@ const MINIMIZE_ID: NodeId = NodeId(0x2_003);
 const MAXIMIZE_ID: NodeId = NodeId(0x2_004);
 const CLOSE_WINDOW_ID: NodeId = NodeId(0x2_005);
 #[cfg(target_os = "linux")]
+const MENU_ID: NodeId = NodeId(0x2_006);
+#[cfg(target_os = "linux")]
+const FIRST_MENU_ITEM_ID: u64 = 0x3_000;
+#[cfg(target_os = "linux")]
 const FIRST_LINE_ID: u64 = 0x10_000;
 
 /// Command produced by an assistive-technology action.
@@ -39,6 +44,10 @@ pub enum AccessibilityCommand {
     SelectTab(usize),
     CloseTab(usize),
     NewTab,
+    /// Open the `+` button's launch menu.
+    ShowNewTabMenu,
+    /// Run the launch entry at this index of the open menu.
+    MenuItem(usize),
     PreviousTabs,
     NextTabs,
     Minimize,
@@ -64,10 +73,7 @@ struct Actions {
 
 impl ActionHandler for Actions {
     fn do_action(&mut self, request: ActionRequest) {
-        if !matches!(request.action, Action::Click | Action::Focus) {
-            return;
-        }
-        if let Some(command) = command_for_node(request.target_node) {
+        if let Some(command) = command_for_action(request.action, request.target_node) {
             self.commands.lock().unwrap().push(command);
         }
     }
@@ -81,6 +87,17 @@ impl DeactivationHandler for Deactivation {
     fn deactivate_accessibility(&mut self) {
         self.active.store(false, Ordering::Release);
     }
+}
+
+/// Everything the chrome is currently showing, as one argument for the tree.
+pub(super) struct ChromeState<'a> {
+    pub(super) title: &'a str,
+    pub(super) tabs: &'a Tabs,
+    pub(super) layout: ChromeLayout,
+    pub(super) hits: &'a ChromeHitMap,
+    pub(super) draw_controls: bool,
+    pub(super) menu: Option<&'a NewTabMenu>,
+    pub(super) terminal: Option<&'a AccessibilitySnapshot>,
 }
 
 /// AccessKit adapter owned by the integrated tab window.
@@ -110,16 +127,16 @@ impl ShellAccessibility {
         self.adapter.process_event(window, event);
     }
 
-    pub(super) fn update(
-        &mut self,
-        title: &str,
-        tabs: &Tabs,
-        layout: ChromeLayout,
-        hits: &ChromeHitMap,
-        draw_controls: bool,
-        terminal: Option<&AccessibilitySnapshot>,
-    ) {
-        let update = build_tree(title, tabs, layout, hits, draw_controls, terminal);
+    pub(super) fn update(&mut self, state: ChromeState<'_>) {
+        let update = build_tree(
+            state.title,
+            state.tabs,
+            state.layout,
+            state.hits,
+            state.draw_controls,
+            state.menu,
+            state.terminal,
+        );
         *self.latest.lock().unwrap() = update.clone();
         if self.active.load(Ordering::Acquire) {
             self.adapter.update_if_active(|| update);
@@ -148,6 +165,7 @@ fn build_tree(
     layout: ChromeLayout,
     hits: &ChromeHitMap,
     draw_controls: bool,
+    menu: Option<&NewTabMenu>,
     terminal: Option<&AccessibilitySnapshot>,
 ) -> TreeUpdate {
     let mut nodes = Vec::new();
@@ -157,6 +175,13 @@ fn build_tree(
     if terminal.is_some() {
         root_children.push(TERMINAL_ID);
     }
+    // Windows presents the menu in its own child window, which carries no adapter of its own yet.
+    #[cfg(target_os = "linux")]
+    if menu.is_some() {
+        root_children.push(MENU_ID);
+    }
+    #[cfg(windows)]
+    let _ = menu;
 
     let mut root = Node::new(Role::Window);
     root.set_label(title);
@@ -188,15 +213,20 @@ fn build_tree(
             nodes.push((close_node_id, button("Close tab", *close_rect)));
         }
     }
-    for (id, label, bounds) in [
-        (PREVIOUS_ID, "Previous tabs", hits.previous),
-        (NEXT_ID, "Next tabs", hits.next),
-        (NEW_TAB_ID, "New tab", hits.new_tab),
-    ] {
+    for (id, label, bounds) in
+        [(PREVIOUS_ID, "Previous tabs", hits.previous), (NEXT_ID, "Next tabs", hits.next)]
+    {
         if bounds.width > 0 {
             tab_list_children.push(id);
             nodes.push((id, button(label, bounds)));
         }
+    }
+    if hits.new_tab.width > 0 {
+        tab_list_children.push(NEW_TAB_ID);
+        let mut new_tab = button("New tab", hits.new_tab);
+        // The same button offers the launch menu a right-click opens.
+        new_tab.add_action(Action::ShowContextMenu);
+        nodes.push((NEW_TAB_ID, new_tab));
     }
     if draw_controls {
         for (id, label, bounds) in [
@@ -215,6 +245,11 @@ fn build_tree(
     nodes.push((TAB_LIST_ID, tab_list));
 
     #[cfg(target_os = "linux")]
+    if let Some(menu) = menu {
+        add_menu_nodes(&mut nodes, menu);
+    }
+
+    #[cfg(target_os = "linux")]
     if let Some(snapshot) = terminal {
         add_terminal_nodes(&mut nodes, snapshot, layout.content);
     }
@@ -231,6 +266,26 @@ fn build_tree(
     #[cfg(windows)]
     let focus = tabs.active_index().map(tab_id).unwrap_or(WINDOW_ID);
     TreeUpdate { nodes, tree: Some(Tree::new(WINDOW_ID)), tree_id: TreeId::ROOT, focus }
+}
+
+#[cfg(target_os = "linux")]
+fn add_menu_nodes(nodes: &mut Vec<(NodeId, Node)>, menu: &NewTabMenu) {
+    let mut children = Vec::new();
+    for (index, bounds) in menu.rows() {
+        let Some(entry) = menu.entries().get(index) else { continue };
+        let id = menu_item_id(index);
+        children.push(id);
+        let mut node = Node::new(Role::MenuItem);
+        node.set_label(entry.label.clone());
+        node.set_bounds(rect(bounds));
+        node.add_action(Action::Click);
+        nodes.push((id, node));
+    }
+    let mut node = Node::new(Role::Menu);
+    node.set_label("New tab options");
+    node.set_bounds(rect(menu.rect()));
+    node.set_children(children);
+    nodes.push((MENU_ID, node));
 }
 
 #[cfg(target_os = "linux")]
@@ -306,11 +361,33 @@ fn close_id(index: usize) -> NodeId {
 }
 
 #[cfg(target_os = "linux")]
+fn menu_item_id(index: usize) -> NodeId {
+    NodeId(
+        FIRST_MENU_ITEM_ID
+            .saturating_add(u64::try_from(index).unwrap_or(u64::MAX - FIRST_MENU_ITEM_ID)),
+    )
+}
+
+#[cfg(target_os = "linux")]
 fn line_id(index: usize) -> NodeId {
     NodeId(FIRST_LINE_ID.saturating_add(u64::try_from(index).unwrap_or(u64::MAX - FIRST_LINE_ID)))
 }
 
+fn command_for_action(action: Action, id: NodeId) -> Option<AccessibilityCommand> {
+    if action == Action::ShowContextMenu {
+        return (id == NEW_TAB_ID).then_some(AccessibilityCommand::ShowNewTabMenu);
+    }
+    if !matches!(action, Action::Click | Action::Focus) {
+        return None;
+    }
+    command_for_node(id)
+}
+
 fn command_for_node(id: NodeId) -> Option<AccessibilityCommand> {
+    #[cfg(target_os = "linux")]
+    if id.0 >= FIRST_MENU_ITEM_ID && id.0 < FIRST_LINE_ID {
+        return usize::try_from(id.0 - FIRST_MENU_ITEM_ID).ok().map(AccessibilityCommand::MenuItem);
+    }
     if (FIRST_TAB_ID..FIRST_CLOSE_ID).contains(&id.0) {
         return usize::try_from(id.0 - FIRST_TAB_ID).ok().map(AccessibilityCommand::SelectTab);
     }
@@ -362,5 +439,25 @@ mod tests {
     fn tab_and_close_nodes_map_to_commands() {
         assert_eq!(command_for_node(tab_id(7)), Some(AccessibilityCommand::SelectTab(7)));
         assert_eq!(command_for_node(close_id(3)), Some(AccessibilityCommand::CloseTab(3)));
+    }
+
+    #[test]
+    fn the_new_tab_button_answers_click_and_context_menu_differently() {
+        assert_eq!(
+            command_for_action(Action::Click, NEW_TAB_ID),
+            Some(AccessibilityCommand::NewTab)
+        );
+        assert_eq!(
+            command_for_action(Action::ShowContextMenu, NEW_TAB_ID),
+            Some(AccessibilityCommand::ShowNewTabMenu)
+        );
+        assert_eq!(command_for_action(Action::ShowContextMenu, CLOSE_WINDOW_ID), None);
+        assert_eq!(command_for_action(Action::Increment, NEW_TAB_ID), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn menu_item_nodes_map_to_their_entry() {
+        assert_eq!(command_for_node(menu_item_id(2)), Some(AccessibilityCommand::MenuItem(2)));
     }
 }

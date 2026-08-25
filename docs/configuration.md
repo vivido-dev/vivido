@@ -485,6 +485,25 @@ On Windows and Linux, `CreateNewWindow` also creates a tab in the current Vivido
 `SpawnNewInstance` is the action for another top-level OS window. Custom bindings replace these
 defaults by trigger in the normal way.
 
+### The tab strip's `+` menu
+
+Left-clicking `+` creates a tab immediately, running whatever the active tab runs. Right-clicking it
+opens a small menu of launch choices instead, which the pointer or the arrow keys select from,
+`Enter` runs, and `Esc` or a click elsewhere dismisses.
+
+What the menu offers depends on the platform:
+
+| Platform | Entries |
+|---|---|
+| Linux | `New Tab`, and `New Window` for another top-level Vivido |
+| Windows | `PowerShell` — `pwsh.exe` when it is installed, otherwise `powershell.exe` — and one `WSL: <distribution>` row per installed WSL distribution |
+
+Windows probes for those programs once per session, so a distribution installed while Vivido is
+running appears the next time it starts. A tab opened from the menu keeps its shell: clicking `+`
+from a WSL tab opens another WSL tab.
+
+macOS has no `+` button — it uses native window tabbing — so the menu does not apply there.
+
 ### Default macOS tab bindings
 
 | Keys | Action |

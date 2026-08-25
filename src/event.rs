@@ -3716,26 +3716,7 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
     fn spawn_new_instance(&mut self) {
         let mut env_args = env::args();
         let program = env_args.next().unwrap();
-
-        let mut args: Vec<String> = Vec::new();
-
-        // Reuse the arguments passed to Vivido for the new instance.
-        #[allow(clippy::while_let_on_iterator)]
-        while let Some(arg) = env_args.next() {
-            // New instances shouldn't inherit command.
-            if arg == "-e" || arg == "--command" {
-                break;
-            }
-
-            // On unix, the working directory of the foreground shell is used by `start_daemon`.
-            #[cfg(not(windows))]
-            if arg == "--working-directory" {
-                let _ = env_args.next();
-                continue;
-            }
-
-            args.push(arg);
-        }
+        let args = crate::daemon::relaunch_arguments(env_args);
 
         self.spawn_daemon(&program, &args);
     }
@@ -3791,7 +3772,11 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
         S: AsRef<OsStr>,
     {
         #[cfg(not(windows))]
-        let result = spawn_daemon(program, args, self.master_fd, self.shell_pid);
+        let result = spawn_daemon(
+            program,
+            args,
+            crate::daemon::foreground_process_path(self.master_fd, self.shell_pid).ok(),
+        );
         #[cfg(windows)]
         let result = spawn_daemon(program, args);
 
