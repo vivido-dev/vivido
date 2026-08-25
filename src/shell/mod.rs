@@ -43,7 +43,13 @@ mod windows;
 pub use tabs::{Tab, Tabs, VisibleTabs};
 mod chrome;
 pub use chrome::{ChromeHitMap, ChromeLayout, ChromeRenderer, TAB_BAR_LOGICAL, compute_layout};
+mod launch;
+pub use launch::{LaunchAction, LaunchEntry};
+mod menu;
+pub use menu::NewTabMenu;
 mod accessibility;
+#[cfg(windows)]
+mod menu_window;
 mod tabbed;
 pub use tabbed::TabbedApplication;
 

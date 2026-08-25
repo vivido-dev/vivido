@@ -10,8 +10,11 @@ use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalPosition, LogicalSize, PhysicalPosition};
 #[cfg(target_os = "linux")]
 use winit::event::TouchPhase;
-use winit::event::{ElementState, Event as WinitEvent, MouseButton, StartCause, WindowEvent};
+use winit::event::{
+    ElementState, Event as WinitEvent, KeyEvent, MouseButton, StartCause, WindowEvent,
+};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
+use winit::keyboard::{Key, NamedKey};
 use winit::window::{CursorIcon, Fullscreen, ResizeDirection, Window, WindowId};
 
 #[cfg(windows)]
@@ -26,10 +29,14 @@ use crate::display::renderer::EmbeddedFramePlacement;
 use crate::event::{Event, Processor};
 use crate::host::{IpcError, IpcRequest};
 
-use super::accessibility::{AccessibilityCommand, ShellAccessibility};
+use super::accessibility::{AccessibilityCommand, ChromeState, ShellAccessibility};
+use super::launch::{LaunchAction, LaunchEntry};
+use super::menu::NewTabMenu;
+#[cfg(windows)]
+use super::menu_window::MenuWindow;
 use super::{
     ChromeHitMap, ChromeLayout, ChromeRenderer, NativePaneHost, PaneHost, ShellAction, Tabs,
-    compute_layout,
+    compute_layout, launch,
 };
 
 const INITIAL_WIDTH: f64 = 1000.0;
@@ -58,6 +65,11 @@ pub struct TabbedApplication {
     hits: ChromeHitMap,
     tabs: Tabs,
     tab_options: HashMap<WindowId, WindowOptions>,
+    menu: Option<NewTabMenu>,
+    /// Launch entries, probed once: enumerating them costs a process spawn on Windows.
+    launch_entries: Option<Vec<LaunchEntry>>,
+    #[cfg(windows)]
+    menu_window: Option<MenuWindow>,
     cursor: Option<PhysicalPosition<f64>>,
     last_title_click: Option<(Instant, PhysicalPosition<f64>)>,
     draw_controls: bool,
@@ -85,6 +97,10 @@ impl TabbedApplication {
             hits: ChromeHitMap::default(),
             tabs: Tabs::default(),
             tab_options: HashMap::new(),
+            menu: None,
+            launch_entries: None,
+            #[cfg(windows)]
+            menu_window: None,
             cursor: None,
             last_title_click: None,
             draw_controls,
@@ -223,6 +239,204 @@ impl TabbedApplication {
         }
         options.terminal_options.working_directory = None;
         options
+    }
+
+    /// Open the `+` button's launch menu, or close it when it is already open.
+    fn toggle_new_tab_menu(&mut self, event_loop: &ActiveEventLoop) {
+        if self.menu.is_some() {
+            self.close_menu();
+            return;
+        }
+        let anchor = self.hits.new_tab;
+        let Some(bounds) = self.chrome.as_ref().map(|chrome| chrome.inner_size()) else { return };
+        if anchor.width == 0 {
+            return;
+        }
+        let entries = self.launch_entries.get_or_insert_with(launch::entries).clone();
+        let Some(renderer) = &mut self.renderer else { return };
+        let Some(menu) = renderer.layout_menu(entries, anchor, bounds) else { return };
+        #[cfg(windows)]
+        self.show_menu_window(event_loop, &menu);
+        #[cfg(target_os = "linux")]
+        let _ = event_loop;
+        self.menu = Some(menu);
+        self.request_redraw();
+    }
+
+    /// Close the menu and hand the keyboard back to the terminal.
+    fn close_menu(&mut self) {
+        self.dismiss_menu(true);
+    }
+
+    /// Close the menu, restoring pane focus only when this side gave the focus away.
+    ///
+    /// Dismissal triggered by the popup losing focus must not take it back: on Windows the user
+    /// may have clicked another application entirely, and refocusing the pane would drag Vivido
+    /// back in front of it.
+    fn dismiss_menu(&mut self, restore_focus: bool) {
+        if self.menu.take().is_none() {
+            return;
+        }
+        #[cfg(windows)]
+        {
+            if let Some(window) = &self.menu_window {
+                window.hide();
+            }
+            if restore_focus
+                && let (Some(active), Some(host)) = (self.tabs.active_window(), self.host())
+            {
+                host.focus(&mut self.processor, active);
+            }
+        }
+        #[cfg(target_os = "linux")]
+        let _ = restore_focus;
+        self.request_redraw();
+    }
+
+    /// Redraw whichever surface presents the open menu.
+    fn refresh_menu(&self) {
+        #[cfg(windows)]
+        if let Some(window) = &self.menu_window {
+            window.request_redraw();
+        }
+        #[cfg(target_os = "linux")]
+        self.request_redraw();
+    }
+
+    fn activate_menu_entry(&mut self, event_loop: &ActiveEventLoop, index: usize) {
+        let action = self.menu.as_ref().and_then(|menu| menu.action(index)).cloned();
+        self.close_menu();
+        if let Some(action) = action {
+            self.launch(event_loop, &action);
+        }
+    }
+
+    fn launch(&mut self, event_loop: &ActiveEventLoop, action: &LaunchAction) {
+        match action {
+            LaunchAction::NewTab(program) => {
+                let mut options = self.inherited_tab_options(None);
+                // Without a program the entry is the plain `+` click, which keeps whatever the
+                // active tab was started with.
+                if let Some(program) = program {
+                    options.terminal_options.set_command(program);
+                }
+                if let Err(error) = self.create_tab(event_loop, options) {
+                    log::error!("could not create tab: {error}");
+                }
+            },
+            LaunchAction::NewWindow => self.spawn_new_window(),
+        }
+    }
+
+    /// Start another top-level Vivido, the way the `SpawnNewInstance` action does.
+    ///
+    /// One chrome window owns one tab strip, so a second window is a second process rather than
+    /// another surface inside this one.
+    fn spawn_new_window(&mut self) {
+        let program = match std::env::current_exe() {
+            Ok(program) => program,
+            Err(error) => {
+                log::error!("could not locate the Vivido executable: {error}");
+                return;
+            },
+        };
+        let arguments = crate::daemon::relaunch_arguments(std::env::args().skip(1));
+        #[cfg(not(windows))]
+        let working_directory = self
+            .tabs
+            .active_window()
+            .and_then(|id| self.processor.window(id))
+            .and_then(|window| window.current_directory());
+
+        let program = program.to_string_lossy().into_owned();
+        #[cfg(not(windows))]
+        let result = crate::daemon::spawn_daemon(&program, &arguments, working_directory);
+        #[cfg(windows)]
+        let result = crate::daemon::spawn_daemon(&program, &arguments);
+        if let Err(error) = result {
+            log::error!("could not open a new Vivido window: {error}");
+        }
+    }
+
+    /// Apply one key press to the open menu.
+    fn menu_key(&mut self, event_loop: &ActiveEventLoop, key: &KeyEvent) {
+        if key.state != ElementState::Pressed {
+            return;
+        }
+        match key.logical_key {
+            Key::Named(NamedKey::Escape) => self.close_menu(),
+            Key::Named(NamedKey::ArrowDown) => self.move_menu_selection(1),
+            Key::Named(NamedKey::ArrowUp) => self.move_menu_selection(-1),
+            Key::Named(NamedKey::Enter) => {
+                if let Some(index) = self.menu.as_ref().and_then(NewTabMenu::selected_index) {
+                    self.activate_menu_entry(event_loop, index);
+                }
+            },
+            _ => (),
+        }
+    }
+
+    fn move_menu_selection(&mut self, delta: isize) {
+        if self.menu.as_mut().is_some_and(|menu| menu.move_selection(delta)) {
+            self.refresh_menu();
+        }
+    }
+
+    #[cfg(windows)]
+    fn show_menu_window(&mut self, event_loop: &ActiveEventLoop, menu: &NewTabMenu) {
+        if self.menu_window.is_none() {
+            let Some(chrome) = self.chrome.clone() else { return };
+            match MenuWindow::new(event_loop, &chrome, &self.config) {
+                Ok(window) => self.menu_window = Some(window),
+                Err(error) => {
+                    log::error!("could not create the Vivido tab menu window: {error}");
+                    return;
+                },
+            }
+        }
+        let scale = self.chrome.as_ref().map_or(1.0, |chrome| chrome.scale_factor());
+        if let Some(window) = &mut self.menu_window {
+            window.rescale(scale, &self.config);
+            window.show(menu);
+        }
+    }
+
+    #[cfg(windows)]
+    fn handle_menu_window_event(&mut self, event_loop: &ActiveEventLoop, event: WindowEvent) {
+        match event {
+            WindowEvent::RedrawRequested => {
+                if let (Some(window), Some(menu)) = (&mut self.menu_window, &self.menu) {
+                    window.render(menu);
+                }
+            },
+            WindowEvent::CursorMoved { position, .. } => {
+                let Some(point) = self
+                    .menu_window
+                    .as_ref()
+                    .map(|window| window.to_chrome(position.x, position.y))
+                else {
+                    return;
+                };
+                // The popup reports its own coordinates; the menu and the chrome share one space.
+                self.cursor = Some(PhysicalPosition::new(point.0, point.1));
+                if self.menu.as_mut().is_some_and(|menu| menu.hover(point.0, point.1)) {
+                    self.refresh_menu();
+                }
+            },
+            WindowEvent::MouseInput { state: ElementState::Pressed, button, .. }
+                if button == MouseButton::Left =>
+            {
+                let hit = self.cursor.and_then(|position| {
+                    self.menu.as_ref().and_then(|menu| menu.hit(position.x, position.y))
+                });
+                match hit {
+                    Some(index) => self.activate_menu_entry(event_loop, index),
+                    None => self.close_menu(),
+                }
+            },
+            WindowEvent::Focused(false) | WindowEvent::CloseRequested => self.dismiss_menu(false),
+            _ => (),
+        }
     }
 
     fn switch_to(&mut self, index: usize) {
@@ -466,14 +680,15 @@ impl TabbedApplication {
         #[cfg(windows)]
         let terminal = None;
         if let Some(accessibility) = &mut self.accessibility {
-            accessibility.update(
-                &title,
-                &self.tabs,
-                self.layout,
-                &self.hits,
-                self.draw_controls,
-                terminal.as_ref(),
-            );
+            accessibility.update(ChromeState {
+                title: &title,
+                tabs: &self.tabs,
+                layout: self.layout,
+                hits: &self.hits,
+                draw_controls: self.draw_controls,
+                menu: self.menu.as_ref(),
+                terminal: terminal.as_ref(),
+            });
         }
     }
 
@@ -489,6 +704,10 @@ impl TabbedApplication {
                     if let Err(error) = self.create_tab(event_loop, options) {
                         log::error!("could not create accessible tab: {error}");
                     }
+                },
+                AccessibilityCommand::ShowNewTabMenu => self.toggle_new_tab_menu(event_loop),
+                AccessibilityCommand::MenuItem(index) => {
+                    self.activate_menu_entry(event_loop, index);
                 },
                 AccessibilityCommand::PreviousTabs => {
                     self.tabs.shift_visible(-1, self.hits.tabs.len().max(1));
@@ -539,8 +758,13 @@ impl TabbedApplication {
         let frames = Vec::<EmbeddedFramePlacement<'_>>::new();
 
         if let Some(renderer) = &mut self.renderer {
-            match renderer.render(chrome.inner_size(), &mut self.tabs, self.draw_controls, &frames)
-            {
+            match renderer.render(
+                chrome.inner_size(),
+                &mut self.tabs,
+                self.draw_controls,
+                &frames,
+                self.menu.as_ref(),
+            ) {
                 Ok((layout, hits, _)) => {
                     let geometry_changed = layout != self.layout;
                     self.layout = layout;
@@ -751,6 +975,7 @@ impl TabbedApplication {
                 event_loop.exit();
             },
             WindowEvent::Resized(size) => {
+                self.close_menu();
                 if let (Some(renderer), Some(chrome)) = (&mut self.renderer, &self.chrome) {
                     renderer.resize(size, chrome.scale_factor(), &self.config);
                 }
@@ -762,6 +987,7 @@ impl TabbedApplication {
                 self.request_redraw();
             },
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                self.close_menu();
                 if let (Some(renderer), Some(chrome)) = (&mut self.renderer, &self.chrome) {
                     renderer.resize(chrome.inner_size(), scale_factor, &self.config);
                     self.layout = compute_layout(chrome.inner_size(), scale_factor);
@@ -773,10 +999,49 @@ impl TabbedApplication {
             event @ WindowEvent::CursorMoved { position, .. } => {
                 self.cursor = Some(position);
                 self.update_resize_cursor(position);
+                // An open menu owns the pointer, so the pane never sees a move behind it.
+                if let Some(changed) =
+                    self.menu.as_mut().map(|menu| menu.hover(position.x, position.y))
+                {
+                    if changed {
+                        self.refresh_menu();
+                    }
+                    return;
+                }
                 #[cfg(target_os = "linux")]
                 self.route_linux_input(event);
                 #[cfg(windows)]
                 let _ = event;
+            },
+            WindowEvent::MouseInput { state: ElementState::Pressed, button, .. }
+                if self.menu.is_some() =>
+            {
+                // A press anywhere dismisses the menu and never reaches the pane behind it; only a
+                // left press on a row also launches it.
+                let hit = (button == MouseButton::Left)
+                    .then(|| {
+                        self.cursor.and_then(|position| {
+                            self.menu.as_ref().and_then(|menu| menu.hit(position.x, position.y))
+                        })
+                    })
+                    .flatten();
+                match hit {
+                    Some(index) => self.activate_menu_entry(event_loop, index),
+                    None => self.close_menu(),
+                }
+            },
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button: MouseButton::Right,
+                ..
+            } if self
+                .cursor
+                .is_some_and(|position| self.hits.new_tab.contains(position.x, position.y)) =>
+            {
+                self.toggle_new_tab_menu(event_loop)
+            },
+            WindowEvent::KeyboardInput { event: key, .. } if self.menu.is_some() => {
+                self.menu_key(event_loop, &key);
             },
             WindowEvent::MouseInput {
                 state: ElementState::Pressed,
@@ -804,13 +1069,19 @@ impl TabbedApplication {
                 // The integrated chrome is the top-level activation target, while keyboard input
                 // belongs to its active child pane. Windows can return focus to the chrome after
                 // an application-mode transition; hand it straight back so the next key is not
-                // discarded until a tab switch happens to call `SetFocus`.
-                self.focus_active_pane();
+                // discarded until a tab switch happens to call `SetFocus`. An open menu is the one
+                // exception: it holds the keyboard until it closes.
+                if self.menu.is_none() {
+                    self.focus_active_pane();
+                }
             },
             #[cfg(windows)]
             WindowEvent::Focused(false) => {},
             #[cfg(target_os = "linux")]
             WindowEvent::Focused(focused) => {
+                if !focused {
+                    self.dismiss_menu(false);
+                }
                 if let Some(active) = self.tabs.active_window() {
                     self.processor.set_embedded_window_focused(active, focused);
                 }
@@ -902,6 +1173,11 @@ impl ApplicationHandler<Event> for TabbedApplication {
             self.handle_chrome_event(event_loop, event);
             return;
         }
+        #[cfg(windows)]
+        if self.menu_window.as_ref().is_some_and(|window| window.id() == window_id) {
+            self.handle_menu_window_event(event_loop, event);
+            return;
+        }
         if self.processor.window(window_id).is_none() {
             return;
         }
@@ -935,6 +1211,11 @@ impl ApplicationHandler<Event> for TabbedApplication {
             self.close_all();
         }
         self.processor.handle_winit_event(event_loop, WinitEvent::LoopExiting);
+        self.menu = None;
+        #[cfg(windows)]
+        {
+            self.menu_window = None;
+        }
         self.renderer = None;
         self.accessibility = None;
         self.chrome = None;

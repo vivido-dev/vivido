@@ -473,14 +473,20 @@ impl SceneRenderer {
     }
 
     pub fn render(&mut self, scene: &Scene, base_color: Color) -> Result<bool, Error> {
-        self.render_composited(scene, base_color, &[])
+        self.render_composited(scene, base_color, &[], None)
     }
 
+    /// Paint `scene`, then copy each embedded frame over it, leaving `exclude` untouched.
+    ///
+    /// An embedded pane is copied on top of the finished scene, so anything the chrome draws in the
+    /// pane's rectangle — a dropdown anchored to the tab strip — would be overwritten. Naming that
+    /// rectangle here keeps the overlay visible without a second scene pass.
     pub fn render_composited(
         &mut self,
         scene: &Scene,
         base_color: Color,
         frames: &[EmbeddedFramePlacement<'_>],
+        exclude: Option<(PhysicalPosition<u32>, PhysicalSize<u32>)>,
     ) -> Result<bool, Error> {
         if !self.valid_target {
             return Ok(false);
@@ -528,30 +534,31 @@ impl SceneRenderer {
                 label: Some("Vivido.vello.embedded_composite"),
             });
             for placement in frames {
-                let PhysicalSize { width, height } =
+                let extent =
                     embedded_copy_extent(placement.frame.size, placement.origin, self.target_size);
-                if width == 0 || height == 0 {
-                    continue;
-                }
-                encoder.copy_texture_to_texture(
-                    wgpu::TexelCopyTextureInfo {
-                        texture: placement.frame.texture,
-                        mip_level: 0,
-                        origin: wgpu::Origin3d::ZERO,
-                        aspect: wgpu::TextureAspect::All,
-                    },
-                    wgpu::TexelCopyTextureInfo {
-                        texture: &self.render_target,
-                        mip_level: 0,
-                        origin: wgpu::Origin3d {
-                            x: placement.origin.x,
-                            y: placement.origin.y,
-                            z: 0,
+                for (source, destination, size) in
+                    frame_copy_regions(placement.origin, extent, exclude)
+                {
+                    encoder.copy_texture_to_texture(
+                        wgpu::TexelCopyTextureInfo {
+                            texture: placement.frame.texture,
+                            mip_level: 0,
+                            origin: wgpu::Origin3d { x: source.x, y: source.y, z: 0 },
+                            aspect: wgpu::TextureAspect::All,
                         },
-                        aspect: wgpu::TextureAspect::All,
-                    },
-                    wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
-                );
+                        wgpu::TexelCopyTextureInfo {
+                            texture: &self.render_target,
+                            mip_level: 0,
+                            origin: wgpu::Origin3d { x: destination.x, y: destination.y, z: 0 },
+                            aspect: wgpu::TextureAspect::All,
+                        },
+                        wgpu::Extent3d {
+                            width: size.width,
+                            height: size.height,
+                            depth_or_array_layers: 1,
+                        },
+                    );
+                }
             }
             self.queue.submit([encoder.finish()]);
         }
@@ -690,6 +697,59 @@ fn embedded_copy_extent(
         source.width.min(target.width.saturating_sub(origin.x)),
         source.height.min(target.height.saturating_sub(origin.y)),
     )
+}
+
+/// Split one embedded-frame copy into the regions which survive an excluded rectangle.
+///
+/// Coordinates are physical pixels: `origin`/`size` place the frame in the render target, `exclude`
+/// is in the same target space, and each returned triple is `(source, destination, size)` with the
+/// source in frame-local coordinates. At most four regions come back — above, below, left, and
+/// right of the cut.
+fn frame_copy_regions(
+    origin: PhysicalPosition<u32>,
+    size: PhysicalSize<u32>,
+    exclude: Option<(PhysicalPosition<u32>, PhysicalSize<u32>)>,
+) -> Vec<(PhysicalPosition<u32>, PhysicalPosition<u32>, PhysicalSize<u32>)> {
+    let mut regions = Vec::new();
+    if size.width == 0 || size.height == 0 {
+        return regions;
+    }
+
+    let left = origin.x;
+    let top = origin.y;
+    let right = left.saturating_add(size.width);
+    let bottom = top.saturating_add(size.height);
+
+    let cut = exclude.map(|(cut_origin, cut_size)| {
+        (
+            cut_origin.x.clamp(left, right),
+            cut_origin.y.clamp(top, bottom),
+            cut_origin.x.saturating_add(cut_size.width).clamp(left, right),
+            cut_origin.y.saturating_add(cut_size.height).clamp(top, bottom),
+        )
+    });
+    let Some((cut_left, cut_top, cut_right, cut_bottom)) =
+        cut.filter(|(l, t, r, b)| l < r && t < b)
+    else {
+        regions.push((PhysicalPosition::new(0, 0), origin, size));
+        return regions;
+    };
+
+    let mut push = |x: u32, y: u32, width: u32, height: u32| {
+        if width == 0 || height == 0 {
+            return;
+        }
+        regions.push((
+            PhysicalPosition::new(x.saturating_sub(left), y.saturating_sub(top)),
+            PhysicalPosition::new(x, y),
+            PhysicalSize::new(width, height),
+        ));
+    };
+    push(left, top, size.width, cut_top.saturating_sub(top));
+    push(left, cut_bottom, size.width, bottom.saturating_sub(cut_bottom));
+    push(left, cut_top, cut_left.saturating_sub(left), cut_bottom.saturating_sub(cut_top));
+    push(cut_right, cut_top, right.saturating_sub(cut_right), cut_bottom.saturating_sub(cut_top));
+    regions
 }
 
 impl Drop for SceneRenderer {
@@ -896,7 +956,7 @@ fn premultiply_blend_state() -> wgpu::BlendState {
 mod tests {
     use super::{
         RenderSource, SceneRenderer, SharedRenderContext, clamp_render_size, embedded_copy_extent,
-        offscreen_device, premultiply_blend_state, screenshot_layout,
+        frame_copy_regions, offscreen_device, premultiply_blend_state, screenshot_layout,
         shutdown_window_render_context, surface_alpha_mode, window_render_context,
     };
     use std::rc::Rc;
@@ -1113,6 +1173,112 @@ mod tests {
                 PhysicalSize::new(1000, 600),
             ),
             PhysicalSize::new(0, 0),
+        );
+    }
+
+    #[test]
+    fn a_frame_without_an_exclusion_copies_in_one_region() {
+        assert_eq!(
+            frame_copy_regions(PhysicalPosition::new(0, 35), PhysicalSize::new(800, 565), None),
+            vec![(
+                PhysicalPosition::new(0, 0),
+                PhysicalPosition::new(0, 35),
+                PhysicalSize::new(800, 565)
+            )],
+        );
+    }
+
+    #[test]
+    fn an_interior_exclusion_leaves_four_regions_around_it() {
+        let regions = frame_copy_regions(
+            PhysicalPosition::new(0, 35),
+            PhysicalSize::new(800, 565),
+            Some((PhysicalPosition::new(600, 135), PhysicalSize::new(160, 60))),
+        );
+
+        assert_eq!(
+            regions,
+            vec![
+                // Above, below, then the two flanks of the cut.
+                (
+                    PhysicalPosition::new(0, 0),
+                    PhysicalPosition::new(0, 35),
+                    PhysicalSize::new(800, 100)
+                ),
+                (
+                    PhysicalPosition::new(0, 160),
+                    PhysicalPosition::new(0, 195),
+                    PhysicalSize::new(800, 405)
+                ),
+                (
+                    PhysicalPosition::new(0, 100),
+                    PhysicalPosition::new(0, 135),
+                    PhysicalSize::new(600, 60)
+                ),
+                (
+                    PhysicalPosition::new(760, 100),
+                    PhysicalPosition::new(760, 135),
+                    PhysicalSize::new(40, 60)
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_exclusion_on_an_edge_drops_the_empty_regions() {
+        let regions = frame_copy_regions(
+            PhysicalPosition::new(0, 35),
+            PhysicalSize::new(800, 565),
+            Some((PhysicalPosition::new(700, 0), PhysicalSize::new(200, 100))),
+        );
+
+        // The cut reaches past the top and right edges, so only "below" and "left" survive.
+        assert_eq!(
+            regions,
+            vec![
+                (
+                    PhysicalPosition::new(0, 65),
+                    PhysicalPosition::new(0, 100),
+                    PhysicalSize::new(800, 500)
+                ),
+                (
+                    PhysicalPosition::new(0, 0),
+                    PhysicalPosition::new(0, 35),
+                    PhysicalSize::new(700, 65)
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_disjoint_exclusion_copies_the_whole_frame() {
+        assert_eq!(
+            frame_copy_regions(
+                PhysicalPosition::new(0, 35),
+                PhysicalSize::new(800, 565),
+                Some((PhysicalPosition::new(0, 0), PhysicalSize::new(800, 35))),
+            ),
+            vec![(
+                PhysicalPosition::new(0, 0),
+                PhysicalPosition::new(0, 35),
+                PhysicalSize::new(800, 565)
+            )],
+        );
+    }
+
+    #[test]
+    fn a_covering_exclusion_or_an_empty_frame_copies_nothing() {
+        assert!(
+            frame_copy_regions(
+                PhysicalPosition::new(0, 35),
+                PhysicalSize::new(800, 565),
+                Some((PhysicalPosition::new(0, 0), PhysicalSize::new(1000, 1000))),
+            )
+            .is_empty()
+        );
+        assert!(
+            frame_copy_regions(PhysicalPosition::new(0, 35), PhysicalSize::new(0, 565), None)
+                .is_empty()
         );
     }
 
