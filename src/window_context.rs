@@ -98,7 +98,7 @@ type AutomationResize = (u32, u32, Option<(u16, u16)>);
 
 const VIVID_RESIZE_SETTLE_DELAY: Duration = Duration::from_millis(120);
 
-/// Maximum delay between directly presented frames during continuous Windows wheel input.
+/// Maximum delay between directly presented frames during continuous Windows input or PTY output.
 #[cfg(windows)]
 const LATENCY_SENSITIVE_FRAME_INTERVAL: Duration = Duration::from_millis(16);
 
@@ -584,15 +584,19 @@ impl WindowContext {
         )
     }
 
-    /// Present wheel-driven state without waiting for Windows to synthesize `WM_PAINT`.
+    /// Present latency-sensitive state without waiting for Windows to synthesize `WM_PAINT`.
     ///
-    /// `WM_PAINT` has lower priority than posted input, so an infinite wheel can otherwise update
-    /// the terminal model for seconds without presenting it. The timestamp is recorded after the
-    /// draw, allowing subsequent wheel reports to accumulate for one frame interval instead of
-    /// rendering each report and falling behind the input stream.
+    /// `WM_PAINT` has lower priority than posted input and PTY wakeups, so a continuous stream can
+    /// otherwise update the terminal model for seconds without presenting it. The timestamp is
+    /// recorded after the draw, allowing subsequent updates to accumulate for one frame interval
+    /// instead of rendering each event and falling behind the stream.
     #[cfg(windows)]
     pub fn draw_latency_sensitive(&mut self, scheduler: &mut Scheduler) -> Option<bool> {
-        if !self.dirty || self.occluded {
+        if !self.dirty
+            || self.occluded
+            || self.display.window.is_headless()
+            || self.display.window.is_visible() == Some(false)
+        {
             return None;
         }
 
@@ -780,7 +784,7 @@ impl WindowContext {
         self.terminal
             .lock()
             .working_directory()
-            .map(PathBuf::from)
+            .and_then(reported_working_directory)
             .or_else(|| self.probed_working_directory())
     }
 
@@ -2724,6 +2728,50 @@ fn append_legacy_mouse_coordinate(output: &mut Vec<u8>, coordinate: usize, utf8:
     }
 }
 
+/// Turn a shell-reported working directory into a path the local process can inherit.
+///
+/// OSC 7 describes the shell's namespace. On Windows a WSL shell therefore reports a Linux path,
+/// even though `CreateProcessW` requires a Windows directory. Drive mounts and Windows file-URI
+/// paths have lossless lexical translations; other WSL paths have no stable native spelling
+/// without the distribution name, so they fall back to Vivido's own working directory.
+pub(crate) fn reported_working_directory(path: &str) -> Option<PathBuf> {
+    #[cfg(not(windows))]
+    {
+        Some(PathBuf::from(path))
+    }
+
+    #[cfg(windows)]
+    {
+        let native = PathBuf::from(path);
+        if native.is_dir() {
+            return Some(native);
+        }
+
+        windows_path_from_shell_report(path).filter(|path| path.is_dir())
+    }
+}
+
+#[cfg(windows)]
+fn windows_path_from_shell_report(path: &str) -> Option<PathBuf> {
+    let (drive, tail) = if let Some(rest) = path.strip_prefix("/mnt/") {
+        let (drive, tail) = rest.split_once('/').unwrap_or((rest, ""));
+        (drive, tail)
+    } else {
+        let rest = path.strip_prefix('/')?;
+        let (drive, tail) = rest.split_once(':')?;
+        (drive, tail.strip_prefix('/').unwrap_or(tail))
+    };
+
+    if drive.len() != 1 || !drive.as_bytes()[0].is_ascii_alphabetic() {
+        return None;
+    }
+
+    let drive = char::from(drive.as_bytes()[0]).to_ascii_uppercase();
+    let mut converted = PathBuf::from(format!("{drive}:\\"));
+    converted.extend(tail.split('/').filter(|component| !component.is_empty()));
+    Some(converted)
+}
+
 /// Feed one cell color into a screen-change hash.
 ///
 /// The hash only has to separate colors that differ within a single run, so the variant tag plus
@@ -2755,10 +2803,15 @@ mod vivid_environment_tests {
     #[cfg(windows)]
     use super::vivid_wslenv;
     #[cfg(windows)]
-    use super::{LATENCY_SENSITIVE_FRAME_INTERVAL, latency_sensitive_draw_due};
+    use super::{
+        LATENCY_SENSITIVE_FRAME_INTERVAL, latency_sensitive_draw_due,
+        windows_path_from_shell_report,
+    };
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     use super::{flushes_staged_input, is_latency_sensitive_input};
     use std::collections::HashMap;
+    #[cfg(windows)]
+    use std::path::PathBuf;
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     use winit::event::{DeviceId, Event as WinitEvent, MouseScrollDelta, TouchPhase, WindowEvent};
     #[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -2793,6 +2846,20 @@ mod vivid_environment_tests {
             start + LATENCY_SENSITIVE_FRAME_INTERVAL - std::time::Duration::from_nanos(1)
         ));
         assert!(latency_sensitive_draw_due(Some(start), start + LATENCY_SENSITIVE_FRAME_INTERVAL));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn shell_reports_translate_wsl_mounts_and_windows_file_uri_paths() {
+        assert_eq!(
+            windows_path_from_shell_report("/mnt/f/Github/vivido-private/vivido"),
+            Some(PathBuf::from(r"F:\Github\vivido-private\vivido"))
+        );
+        assert_eq!(
+            windows_path_from_shell_report("/C:/Users/example/My Files"),
+            Some(PathBuf::from(r"C:\Users\example\My Files"))
+        );
+        assert_eq!(windows_path_from_shell_report("/home/example"), None);
     }
 
     #[test]

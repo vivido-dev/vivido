@@ -75,7 +75,7 @@ use crate::polling::ipc::IpcRequest;
 use crate::polling::ipc::{IpcError, MAX_INPUT_BYTES, MAX_IPC_TEXT_BYTES};
 use crate::scheduler::{Scheduler, TimerId, Topic};
 use crate::vivid::VividService;
-use crate::window_context::WindowContext;
+use crate::window_context::{WindowContext, reported_working_directory};
 
 /// Duration after the last user input until an unlimited search is performed.
 pub const TYPING_SEARCH_DELAY: Duration = Duration::from_millis(500);
@@ -2834,8 +2834,28 @@ impl Processor {
             (EventType::Terminal(TerminalEvent::Wakeup), Some(window_id)) => {
                 if let Some(window_context) = self.windows.get_mut(window_id) {
                     window_context.dirty = true;
-                    if window_context.display.window.has_frame {
+
+                    // Posted PTY events can keep Windows' higher-priority message queues busy
+                    // long enough to starve both WM_PAINT and AboutToWait. Present through the
+                    // same bounded direct path as continuous wheel input so output remains live.
+                    #[cfg(windows)]
+                    let presented = window_context.draw_latency_sensitive(&mut self.scheduler);
+                    #[cfg(not(windows))]
+                    let presented = None::<bool>;
+
+                    if presented.is_none() && window_context.display.window.has_frame {
                         window_context.display.window.request_redraw();
+                    }
+
+                    #[cfg(any(unix, windows))]
+                    if presented == Some(true) {
+                        let ipc_window_id = window_context.ipc_window_id();
+                        let frame_sequence = window_context.automation.record_frame();
+                        self.automation.emit(
+                            Some(ipc_window_id),
+                            "frame_presented",
+                            serde_json::json!({"frame_sequence": frame_sequence}),
+                        );
                     }
                 }
             },
@@ -3620,7 +3640,7 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
     fn create_new_tab(&mut self) {
         let mut options = WindowOptions::default();
         options.terminal_options.working_directory =
-            self.terminal.working_directory().map(PathBuf::from);
+            self.terminal.working_directory().and_then(reported_working_directory);
         #[cfg(not(windows))]
         if options.terminal_options.working_directory.is_none() {
             options.terminal_options.working_directory =
@@ -3635,7 +3655,7 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
         options.terminal_options.working_directory = self
             .terminal
             .working_directory()
-            .map(PathBuf::from)
+            .and_then(reported_working_directory)
             .or_else(|| foreground_process_path(self.master_fd, self.shell_pid).ok());
 
         #[cfg(target_os = "macos")]
@@ -3650,7 +3670,7 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
     fn create_new_window(&mut self) {
         let mut options = WindowOptions::default();
         options.terminal_options.working_directory =
-            self.terminal.working_directory().map(PathBuf::from);
+            self.terminal.working_directory().and_then(reported_working_directory);
 
         let _ = self.event_proxy.send_event(Event::new(EventType::CreateWindow(options), None));
     }
