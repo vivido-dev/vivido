@@ -137,7 +137,7 @@ pub struct WindowContext {
     last_latency_sensitive_draw: Option<Instant>,
     #[cfg(windows)]
     latency_sensitive_frame_timer: LatencySensitiveFrameTimer,
-    #[cfg(any(target_os = "linux", windows))]
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     event_proxy: EventProxy,
     terminal: Arc<FairMutex<Term<EventProxy>>>,
     cursor_blink_timed_out: bool,
@@ -484,7 +484,7 @@ impl WindowContext {
         Ok(WindowContext {
             preserve_title,
             terminal,
-            #[cfg(any(target_os = "linux", windows))]
+            #[cfg(any(target_os = "linux", target_os = "macos", windows))]
             event_proxy,
             #[cfg(any(target_os = "macos", target_os = "linux", windows))]
             accessibility,
@@ -1503,7 +1503,7 @@ impl WindowContext {
                 "requested client size must produce a 2x1 through 65535x65535 PTY grid",
             ));
         }
-        #[cfg(any(target_os = "linux", windows))]
+        #[cfg(any(target_os = "linux", target_os = "macos", windows))]
         if self.display.window.is_hosted() {
             self.event_proxy.send_event(EventType::ShellAction(
                 crate::shell::ShellAction::Resize { width, height },
@@ -1511,7 +1511,7 @@ impl WindowContext {
         } else {
             self.display.window.request_inner_size(winit::dpi::PhysicalSize::new(width, height));
         }
-        #[cfg(not(any(target_os = "linux", windows)))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
         self.display.window.request_inner_size(winit::dpi::PhysicalSize::new(width, height));
         Ok((width, height, grid))
     }
@@ -1536,14 +1536,14 @@ impl WindowContext {
     /// Ask the window system to activate this window.
     #[cfg(any(unix, windows))]
     pub fn request_automation_focus(&self) {
-        #[cfg(any(target_os = "linux", windows))]
+        #[cfg(any(target_os = "linux", target_os = "macos", windows))]
         if self.display.window.is_hosted() {
             self.event_proxy
                 .send_event(EventType::ShellAction(crate::shell::ShellAction::Activate));
         } else {
             self.display.window.focus_window();
         }
-        #[cfg(not(any(target_os = "linux", windows)))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
         self.display.window.focus_window();
     }
 
@@ -1601,7 +1601,13 @@ impl WindowContext {
 
         match (x, y) {
             (Some(x), Some(y)) => {
-                self.display.window.set_outer_position(winit::dpi::PhysicalPosition::new(x, y));
+                if self.display.window.is_hosted() {
+                    self.event_proxy.send_event(EventType::ShellAction(
+                        crate::shell::ShellAction::SetPosition { x, y },
+                    ));
+                } else {
+                    self.display.window.set_outer_position(winit::dpi::PhysicalPosition::new(x, y));
+                }
             },
             (None, None) => (),
             _ => {
@@ -1634,6 +1640,17 @@ impl WindowContext {
     /// Mapping deliberately does not take the keyboard: an external layout owner reveals a pane
     /// while its own window stays key.
     #[cfg(any(unix, windows))]
+    pub fn request_automation_visible(&mut self, visible: bool) {
+        if self.display.window.is_hosted() {
+            self.event_proxy
+                .send_event(EventType::ShellAction(crate::shell::ShellAction::SetVisible(visible)));
+            return;
+        }
+        self.set_automation_visible(visible);
+    }
+
+    /// Apply visibility selected by this window's native or embedded host.
+    #[cfg(any(unix, windows))]
     pub fn set_automation_visible(&mut self, visible: bool) {
         #[cfg(target_os = "macos")]
         let mapped_without_focus = visible && !self.display.window.is_headless();
@@ -1662,7 +1679,13 @@ impl WindowContext {
     /// Set the window's stacking level.
     #[cfg(any(unix, windows))]
     pub fn set_automation_level(&self, level: crate::cli::IpcWindowLevel) {
-        self.display.window.set_window_level(level.into());
+        let level = level.into();
+        if self.display.window.is_hosted() {
+            self.event_proxy
+                .send_event(EventType::ShellAction(crate::shell::ShellAction::SetLevel(level)));
+        } else {
+            self.display.window.set_window_level(level);
+        }
     }
 
     /// Coalesce terminal-model mutations into one semantic screen sequence change.

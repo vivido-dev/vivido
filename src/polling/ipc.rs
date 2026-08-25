@@ -778,6 +778,36 @@ pub fn request_once(
     Ok((hello, result))
 }
 
+/// Issue one bounded automation request by wire method name.
+///
+/// This is the extension point for an embedding host which adds methods beyond
+/// [`SocketMessage`]. It performs the same endpoint discovery, owner checks, handshake, framing,
+/// and response validation as [`send_message`].
+pub fn request_method(
+    socket: Option<PathBuf>,
+    target: Option<&str>,
+    method: &str,
+    params: Value,
+) -> io::Result<(Value, Value)> {
+    if method.is_empty()
+        || method.len() > 128
+        || !method.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    {
+        return Err(IoError::new(
+            ErrorKind::InvalidInput,
+            "IPC method must contain 1-128 ASCII letters, digits, or underscores",
+        ));
+    }
+    let mut stream = find_socket(socket, target)?;
+    stream.set_nonblocking(false)?;
+    let mut reader = BufReader::new(stream.try_clone()?);
+    send_client_request(&mut stream, 1, "hello", json!({}))?;
+    let hello = read_client_response(&mut reader, 1)?;
+    send_client_request(&mut stream, 2, method, params)?;
+    let result = read_client_response(&mut reader, 2)?;
+    Ok((hello, result))
+}
+
 fn run_vivid_trace_follow(
     stream: &mut LocalStream,
     reader: &mut BufReader<LocalStream>,
@@ -1715,5 +1745,11 @@ mod tests {
         assert_eq!(hello["headless"], serde_json::json!(false));
         assert_eq!(hello["session"], Value::Null);
         assert!(hello["methods"].as_array().unwrap().iter().any(|value| value == "quit"));
+    }
+
+    #[test]
+    fn extension_method_names_are_validated_before_endpoint_discovery() {
+        let error = request_method(None, None, "invalid-method", json!({})).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
     }
 }

@@ -1,12 +1,18 @@
 //! Shared host primitives for applications which embed Vivido terminal panes.
 
+#[cfg(any(target_os = "linux", windows))]
 use std::error::Error;
+#[cfg(any(target_os = "linux", windows))]
 use std::path::Path;
 
+#[cfg(any(target_os = "linux", windows))]
 use winit::event_loop::ActiveEventLoop;
 use winit::window::WindowId;
+use winit::window::WindowLevel;
 
+#[cfg(any(target_os = "linux", windows))]
 use crate::Processor;
+#[cfg(any(target_os = "linux", windows))]
 use crate::cli::{TerminalOptions, WindowOptions};
 
 /// Maximum number of shell actions retained between event-loop turns.
@@ -26,6 +32,9 @@ pub enum ShellAction {
     Hide,
     Activate,
     Resize { width: u32, height: u32 },
+    SetPosition { x: i32, y: i32 },
+    SetVisible(bool),
+    SetLevel(WindowLevel),
 }
 
 /// One shell action together with the terminal pane which originated it.
@@ -37,14 +46,21 @@ pub struct ShellActionRequest {
 
 #[cfg(target_os = "linux")]
 mod linux;
+#[cfg(any(target_os = "linux", windows))]
 mod tabs;
 #[cfg(target_os = "windows")]
 mod windows;
+#[cfg(any(target_os = "linux", windows))]
 pub use tabs::{Tab, Tabs, VisibleTabs};
+#[cfg(any(target_os = "linux", windows))]
 mod chrome;
+#[cfg(any(target_os = "linux", windows))]
 pub use chrome::{ChromeHitMap, ChromeLayout, ChromeRenderer, TAB_BAR_LOGICAL, compute_layout};
+#[cfg(any(target_os = "linux", windows))]
 mod accessibility;
+#[cfg(any(target_os = "linux", windows))]
 mod tabbed;
+#[cfg(any(target_os = "linux", windows))]
 pub use tabbed::TabbedApplication;
 
 #[cfg(target_os = "linux")]
@@ -82,6 +98,7 @@ impl PhysicalRect {
 }
 
 /// Platform boundary used by a chrome window to own Vivido terminal panes.
+#[cfg(any(target_os = "linux", windows))]
 pub trait PaneHost {
     /// Create one terminal pane attached to this host.
     fn create_pane(

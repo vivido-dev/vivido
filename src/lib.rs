@@ -32,7 +32,7 @@ mod scheduler;
 mod screenshot;
 mod serde_replace;
 mod session;
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 pub mod shell;
 mod string;
 pub mod terminal;
@@ -59,9 +59,13 @@ pub use config::monitor::ConfigMonitor;
 /// top-level one.
 #[cfg(any(unix, windows))]
 pub mod host {
-    pub use crate::polling::ipc::{IpcConnection, IpcError, IpcRequest, default_endpoint};
+    pub use crate::polling::ipc::{
+        IpcConnection, IpcError, IpcRequest, default_endpoint, request_method, request_once,
+        send_message,
+    };
     pub use crate::polling::transport::LocalStream;
     pub use crate::polling::{IoListener, IoListenerHandle};
+    pub use crate::session::{RegistryGuard, SessionPaths};
 }
 
 /// Internal exports used by the package's executable targets.

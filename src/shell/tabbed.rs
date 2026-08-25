@@ -404,6 +404,21 @@ impl TabbedApplication {
                         ));
                     }
                 },
+                ShellAction::SetPosition { x, y } => {
+                    if let Some(chrome) = &self.chrome {
+                        chrome.set_outer_position(winit::dpi::PhysicalPosition::new(x, y));
+                    }
+                },
+                ShellAction::SetVisible(visible) => {
+                    if let Some(chrome) = &self.chrome {
+                        chrome.set_visible(visible);
+                    }
+                },
+                ShellAction::SetLevel(level) => {
+                    if let Some(chrome) = &self.chrome {
+                        chrome.set_window_level(level);
+                    }
+                },
             }
         }
     }

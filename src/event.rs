@@ -191,7 +191,7 @@ pub struct Processor {
     #[cfg(any(unix, windows))]
     host_requests: Vec<IpcRequest>,
     /// Bounded window-management requests waiting for an embedding chrome.
-    #[cfg(any(target_os = "linux", windows))]
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     shell_actions: VecDeque<crate::shell::ShellActionRequest>,
     cli_options: CliOptions,
     config: Rc<UiConfig>,
@@ -269,7 +269,7 @@ impl Processor {
             host_methods: BTreeSet::new(),
             #[cfg(any(unix, windows))]
             host_requests: Vec::new(),
-            #[cfg(any(target_os = "linux", windows))]
+            #[cfg(any(target_os = "linux", target_os = "macos", windows))]
             shell_actions: VecDeque::new(),
             config_monitor,
             next_headless_draw: Instant::now(),
@@ -1088,7 +1088,7 @@ impl Processor {
                 };
                 self.resolve_ipc_target(params.target.window_id).map(|target| {
                     if let Some(window) = self.windows.get_mut(&target) {
-                        window.set_automation_visible(params.visible);
+                        window.request_automation_visible(params.visible);
                     }
                     serde_json::json!({"visible": params.visible})
                 })
@@ -2352,7 +2352,7 @@ impl Processor {
     }
 
     /// Take shell actions accumulated since the previous embedding-host turn.
-    #[cfg(any(target_os = "linux", windows))]
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     pub fn take_shell_actions(&mut self) -> Vec<crate::shell::ShellActionRequest> {
         self.shell_actions.drain(..).collect()
     }
@@ -2664,7 +2664,7 @@ impl Processor {
                     }
                 }
             },
-            #[cfg(any(target_os = "linux", windows))]
+            #[cfg(any(target_os = "linux", target_os = "macos", windows))]
             (EventType::ShellAction(action), Some(source)) => {
                 use crate::shell::{MAX_PENDING_SHELL_ACTIONS, ShellActionRequest};
 
@@ -3331,7 +3331,7 @@ pub enum EventType {
     #[cfg(target_os = "macos")]
     #[allow(private_interfaces)]
     MacOsMenu(MenuCommand),
-    #[cfg(any(target_os = "linux", windows))]
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     ShellAction(crate::shell::ShellAction),
     #[cfg(any(unix, windows))]
     IpcRequest(IpcRequest),
@@ -3710,13 +3710,13 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
         self.spawn_daemon(&program, &args);
     }
 
-    #[cfg(any(target_os = "linux", windows))]
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     fn shell_action(&mut self, action: crate::shell::ShellAction) {
         let window_id = self.display.window.id();
         let _ = self.event_proxy.send_event(Event::new(EventType::ShellAction(action), window_id));
     }
 
-    #[cfg(any(target_os = "linux", windows))]
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     fn create_new_tab(&mut self) {
         let mut options = WindowOptions::default();
         options.terminal_options.working_directory =
@@ -4571,7 +4571,7 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                 | EventType::VividResizeSettled(_) => (),
                 #[cfg(windows)]
                 EventType::LatencySensitiveFrame | EventType::TerminalVividBatch => (),
-                #[cfg(any(target_os = "linux", windows))]
+                #[cfg(any(target_os = "linux", target_os = "macos", windows))]
                 EventType::ShellAction(_) => (),
                 EventType::VividFrame => (),
             },

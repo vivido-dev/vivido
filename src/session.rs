@@ -132,6 +132,22 @@ impl SessionPaths {
         Ok(registry)
     }
 
+    /// Publish this process as the owner of the prepared endpoint and return its cleanup guard.
+    ///
+    /// The endpoint listener must already be bound before this is called. Dropping the returned
+    /// guard removes only registry/socket state which still belongs to this exact process.
+    pub fn register(
+        self,
+        name: &str,
+        dimensions: (u16, u16),
+        headless: bool,
+    ) -> io::Result<RegistryGuard> {
+        let mut nonce = [0_u8; 32];
+        getrandom::fill(&mut nonce).map_err(io::Error::other)?;
+        let registry = self.write_registry(name, &nonce, dimensions, headless)?;
+        Ok(RegistryGuard::new(self, registry))
+    }
+
     pub fn read_registry(&self) -> io::Result<SessionRegistry> {
         let registry = read_registry_file(&self.registry)?;
         self.validate_identity(&registry)?;
@@ -853,6 +869,26 @@ mod tests {
         assert!(registry_process_matches(&written), "our own process must match its birth time");
         assert_eq!(list_registries_in_root(&root).unwrap(), vec![written.clone()]);
 
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn registration_guard_publishes_and_removes_the_exact_instance() {
+        let root =
+            std::env::temp_dir().join(format!("vivido-session-guard-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let paths = SessionPaths::for_session_in_root("guarded", &root).unwrap();
+
+        let guard = paths.clone().register("guarded", (120, 50), false).unwrap();
+        let registered = paths.read_registry().unwrap();
+        assert_eq!((registered.columns, registered.lines), (120, 50));
+        assert!(!registered.headless);
+        assert!(registry_process_matches(&registered));
+
+        drop(guard);
+        assert!(!paths.registry.exists());
+        #[cfg(unix)]
+        assert!(!paths.socket.exists());
         let _ = fs::remove_dir_all(&root);
     }
 
