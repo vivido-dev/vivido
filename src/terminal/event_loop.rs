@@ -5,6 +5,7 @@ use std::collections::VecDeque;
 use std::fmt::{self, Display, Formatter};
 use std::fs::File;
 use std::io::{self, ErrorKind, Read, Write};
+use std::mem;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 #[cfg(any(unix, windows))]
@@ -14,6 +15,7 @@ use std::thread::JoinHandle;
 use std::time::Instant;
 
 use log::error;
+use memchr::memmem;
 use polling::{Event as PollingEvent, Events, PollMode, Poller};
 
 #[cfg(any(unix, windows))]
@@ -492,30 +494,35 @@ impl State {
         }
 
         let mut processed = 0;
-        for chunk in self.vivid_markers.push(bytes) {
-            match chunk {
-                VividChunk::Bytes(bytes) => {
-                    processed += bytes.len();
-                    #[cfg(any(unix, windows))]
-                    {
-                        let (start, end) = transcript.lock().unwrap().append(&bytes);
-                        self.output_range = Some(match self.output_range {
-                            Some((existing, _)) => (existing, end),
-                            None => (start, end),
-                        });
-                    }
-                    terminal.advance(&mut self.parser, &bytes);
-                },
-                VividChunk::Marker { raw, marker, pass_to_terminal: _pass_to_terminal } => {
-                    processed += raw.len();
-                    #[cfg(not(windows))]
-                    if _pass_to_terminal {
-                        terminal.advance(&mut self.parser, &raw);
-                    }
-                    terminal.vivid_marker(marker);
-                },
-            }
-        }
+        // The scanner moves out of `self` so its spans can borrow the read buffer while the
+        // parser and output range are still mutated for each one.
+        let mut scanner = mem::take(&mut self.vivid_markers);
+        let parser = &mut self.parser;
+        #[cfg(any(unix, windows))]
+        let output_range = &mut self.output_range;
+        scanner.push(bytes, &mut |chunk| match chunk {
+            VividChunk::Bytes(bytes) => {
+                processed += bytes.len();
+                #[cfg(any(unix, windows))]
+                {
+                    let (start, end) = transcript.lock().unwrap().append(bytes);
+                    *output_range = Some(match *output_range {
+                        Some((existing, _)) => (existing, end),
+                        None => (start, end),
+                    });
+                }
+                terminal.advance(parser, bytes);
+            },
+            VividChunk::Marker { raw, marker, pass_to_terminal: _pass_to_terminal } => {
+                processed += raw.len();
+                #[cfg(not(windows))]
+                if _pass_to_terminal {
+                    terminal.advance(parser, raw);
+                }
+                terminal.vivid_marker(marker.to_owned());
+            },
+        });
+        self.vivid_markers = scanner;
         processed
     }
 
@@ -576,9 +583,13 @@ const CONPTY_VIVID_MARKER: VividMarkerEnvelope = VividMarkerEnvelope {
 };
 const VIVID_MARKER_ENVELOPES: [VividMarkerEnvelope; 2] = [APC_VIVID_MARKER, CONPTY_VIVID_MARKER];
 
-enum VividChunk {
-    Bytes(Vec<u8>),
-    Marker { raw: Vec<u8>, marker: String, pass_to_terminal: bool },
+/// One span of scanned PTY bytes: ordinary terminal data, or one authenticated anchor marker.
+///
+/// Spans borrow either the caller's read buffer or the scanner's own bounded `pending` buffer, so
+/// ordinary output reaches the terminal without being copied.
+enum VividChunk<'a> {
+    Bytes(&'a [u8]),
+    Marker { raw: &'a [u8], marker: &'a str, pass_to_terminal: bool },
 }
 
 #[derive(Default)]
@@ -587,63 +598,78 @@ struct VividMarkerScanner {
 }
 
 impl VividMarkerScanner {
-    fn push(&mut self, bytes: &[u8]) -> Vec<VividChunk> {
-        self.pending.extend_from_slice(bytes);
-        let mut chunks = Vec::new();
-        let mut cursor = 0;
+    /// Separate authenticated anchor markers from ordinary terminal bytes.
+    ///
+    /// A read holding no marker is forwarded as a borrowed slice of the caller's buffer; only the
+    /// tail of a marker split across two reads is ever copied into `pending`, which stays bounded
+    /// by [`MAX_VIVID_MARKER_BYTES`].
+    fn push<F>(&mut self, bytes: &[u8], emit: &mut F)
+    where
+        F: FnMut(VividChunk<'_>),
+    {
+        if self.pending.is_empty() {
+            let consumed = scan_markers(bytes, emit);
+            self.pending.extend_from_slice(&bytes[consumed..]);
+        } else {
+            self.pending.extend_from_slice(bytes);
+            let consumed = scan_markers(&self.pending, emit);
+            self.pending.drain(..consumed);
+        }
+    }
+}
 
-        loop {
-            let Some((relative_start, envelope)) = find_marker_envelope(&self.pending[cursor..])
-            else {
-                let keep = VIVID_MARKER_ENVELOPES
-                    .iter()
-                    .map(|envelope| partial_prefix_len(&self.pending[cursor..], envelope.prefix))
-                    .max()
-                    .unwrap_or(0);
-                let end = self.pending.len().saturating_sub(keep);
-                push_bytes(&mut chunks, &self.pending[cursor..end]);
-                cursor = end;
-                break;
-            };
-            let start = cursor + relative_start;
-            push_bytes(&mut chunks, &self.pending[cursor..start]);
-            let payload_start = start + envelope.payload_skip;
-            let terminator_search = start + envelope.prefix.len();
+/// Emit every complete chunk in `buf`, returning how many leading bytes were consumed.
+///
+/// The unconsumed tail is a partial prefix or an unterminated marker still short enough to
+/// complete in a later read.
+fn scan_markers<F>(buf: &[u8], emit: &mut F) -> usize
+where
+    F: FnMut(VividChunk<'_>),
+{
+    let mut cursor = 0;
 
-            let Some(relative_end) =
-                find_bytes(&self.pending[terminator_search..], envelope.terminator)
-            else {
-                if self.pending.len() - start > MAX_VIVID_MARKER_BYTES {
-                    push_bytes(&mut chunks, &self.pending[start..start + envelope.prefix.len()]);
-                    cursor = start + envelope.prefix.len();
-                    continue;
-                }
-                cursor = start;
-                break;
-            };
+    loop {
+        let Some((relative_start, envelope)) = find_marker_envelope(&buf[cursor..]) else {
+            let keep = VIVID_MARKER_ENVELOPES
+                .iter()
+                .map(|envelope| partial_prefix_len(&buf[cursor..], envelope.prefix))
+                .max()
+                .unwrap_or(0);
+            let end = buf.len().saturating_sub(keep);
+            emit_bytes(emit, &buf[cursor..end]);
+            return end;
+        };
+        let start = cursor + relative_start;
+        emit_bytes(emit, &buf[cursor..start]);
+        let payload_start = start + envelope.payload_skip;
+        let terminator_search = start + envelope.prefix.len();
 
-            let terminator = terminator_search + relative_end;
-            let end = terminator + envelope.terminator.len();
-            if end - start > MAX_VIVID_MARKER_BYTES {
-                push_bytes(&mut chunks, &self.pending[start..start + envelope.prefix.len()]);
+        let Some(relative_end) = find_bytes(&buf[terminator_search..], envelope.terminator) else {
+            if buf.len() - start > MAX_VIVID_MARKER_BYTES {
+                emit_bytes(emit, &buf[start..start + envelope.prefix.len()]);
                 cursor = start + envelope.prefix.len();
                 continue;
             }
+            return start;
+        };
 
-            let raw = self.pending[start..end].to_vec();
-            match std::str::from_utf8(&self.pending[payload_start..terminator]) {
-                Ok(marker) => chunks.push(VividChunk::Marker {
-                    raw,
-                    marker: marker.to_owned(),
-                    pass_to_terminal: envelope.pass_to_terminal,
-                }),
-                Err(_) => push_bytes(&mut chunks, &raw),
-            }
-            cursor = end;
+        let terminator = terminator_search + relative_end;
+        let end = terminator + envelope.terminator.len();
+        if end - start > MAX_VIVID_MARKER_BYTES {
+            emit_bytes(emit, &buf[start..start + envelope.prefix.len()]);
+            cursor = start + envelope.prefix.len();
+            continue;
         }
 
-        self.pending.drain(..cursor);
-        chunks
+        match std::str::from_utf8(&buf[payload_start..terminator]) {
+            Ok(marker) => emit(VividChunk::Marker {
+                raw: &buf[start..end],
+                marker,
+                pass_to_terminal: envelope.pass_to_terminal,
+            }),
+            Err(_) => emit_bytes(emit, &buf[start..end]),
+        }
+        cursor = end;
     }
 }
 
@@ -654,19 +680,21 @@ fn find_marker_envelope(bytes: &[u8]) -> Option<(usize, VividMarkerEnvelope)> {
         .min_by_key(|(start, _)| *start)
 }
 
-fn push_bytes(chunks: &mut Vec<VividChunk>, bytes: &[u8]) {
-    if bytes.is_empty() {
-        return;
-    }
-    if let Some(VividChunk::Bytes(previous)) = chunks.last_mut() {
-        previous.extend_from_slice(bytes);
-    } else {
-        chunks.push(VividChunk::Bytes(bytes.to_vec()));
+fn emit_bytes<F>(emit: &mut F, bytes: &[u8])
+where
+    F: FnMut(VividChunk<'_>),
+{
+    if !bytes.is_empty() {
+        emit(VividChunk::Bytes(bytes));
     }
 }
 
+/// Substring search over PTY output.
+///
+/// `memmem` selects rare bytes and vectorizes; comparing every offset in software instead showed up
+/// directly in the throughput of ordinary terminal traffic.
 fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack.windows(needle.len()).position(|window| window == needle)
+    memmem::find(haystack, needle)
 }
 
 fn partial_prefix_len(bytes: &[u8], prefix: &[u8]) -> usize {
@@ -756,15 +784,13 @@ mod vivid_marker_tests {
         let mut markers = Vec::new();
 
         for byte in &input {
-            for chunk in scanner.push(std::slice::from_ref(byte)) {
-                match chunk {
-                    VividChunk::Bytes(bytes) => text.extend(bytes),
-                    VividChunk::Marker { raw, marker, pass_to_terminal } => {
-                        assert!(raw.starts_with(envelope.prefix));
-                        markers.push((marker, pass_to_terminal));
-                    },
-                }
-            }
+            scanner.push(std::slice::from_ref(byte), &mut |chunk| match chunk {
+                VividChunk::Bytes(bytes) => text.extend_from_slice(bytes),
+                VividChunk::Marker { raw, marker, pass_to_terminal } => {
+                    assert!(raw.starts_with(envelope.prefix));
+                    markers.push((marker.to_owned(), pass_to_terminal));
+                },
+            });
         }
 
         assert_eq!(text, b"beforeafter");
@@ -777,9 +803,17 @@ mod vivid_marker_tests {
         let mut input = CONPTY_VIVID_MARKER.prefix.to_vec();
         input.extend_from_slice(MARKER_PAYLOAD);
         input.extend_from_slice(CONPTY_VIVID_MARKER.terminator);
-        let chunks = VividMarkerScanner::default().push(&input);
+        let mut printable = 0;
+        let mut markers = 0;
+        VividMarkerScanner::default().push(&input, &mut |chunk| match chunk {
+            VividChunk::Bytes(_) => printable += 1,
+            VividChunk::Marker { pass_to_terminal, .. } => {
+                assert!(!pass_to_terminal);
+                markers += 1;
+            },
+        });
 
-        assert!(matches!(chunks.as_slice(), [VividChunk::Marker { pass_to_terminal: false, .. }]));
+        assert_eq!((printable, markers), (0, 1));
     }
 
     #[test]
@@ -789,8 +823,9 @@ mod vivid_marker_tests {
             input.extend(std::iter::repeat_n(b'x', MAX_VIVID_MARKER_BYTES));
             input.extend_from_slice(envelope.terminator);
             let mut scanner = VividMarkerScanner::default();
-            let chunks = scanner.push(&input);
-            assert!(chunks.iter().all(|chunk| matches!(chunk, VividChunk::Bytes(_))));
+            scanner.push(&input, &mut |chunk| {
+                assert!(matches!(chunk, VividChunk::Bytes(_)));
+            });
         }
     }
 }

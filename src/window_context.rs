@@ -1532,6 +1532,11 @@ impl WindowContext {
     }
 
     /// Coalesce terminal-model mutations into one semantic screen sequence change.
+    ///
+    /// This runs on every event-loop turn, so it hashes cells directly out of the grid. Feeding the
+    /// hasher through `format!` instead cost three heap allocations per cell, which during heavy
+    /// output meant tens of thousands of allocations per turn while holding the terminal lock
+    /// against the PTY reader.
     #[cfg(any(unix, windows))]
     pub fn sync_automation_screen(&mut self) -> Option<(u64, Option<Vec<u16>>)> {
         let terminal = self.terminal.lock();
@@ -1559,9 +1564,9 @@ impl WindowContext {
                 let cell = &grid[point];
                 cell.c.hash(&mut hasher);
                 cell.flags.bits().hash(&mut hasher);
-                format!("{:?}", cell.fg).hash(&mut hasher);
-                format!("{:?}", cell.bg).hash(&mut hasher);
-                format!("{:?}", cell.underline_color()).hash(&mut hasher);
+                hash_color(Some(cell.fg), &mut hasher);
+                hash_color(Some(cell.bg), &mut hasher);
+                hash_color(cell.underline_color(), &mut hasher);
                 cell.zerowidth().unwrap_or_default().hash(&mut hasher);
                 if let Some(link) = cell.hyperlink() {
                     link.id().hash(&mut hasher);
@@ -2716,6 +2721,31 @@ fn append_legacy_mouse_coordinate(output: &mut Vec<u8>, coordinate: usize, utf8:
         output.push((0x80 + (encoded & 63)) as u8);
     } else {
         output.push(encoded as u8);
+    }
+}
+
+/// Feed one cell color into a screen-change hash.
+///
+/// The hash only has to separate colors that differ within a single run, so the variant tag plus
+/// the variant's own bytes is enough; it never leaves the process and is never persisted.
+#[cfg(any(unix, windows))]
+fn hash_color<H: Hasher>(color: Option<Color>, hasher: &mut H) {
+    match color {
+        None => 0u8.hash(hasher),
+        Some(Color::Named(named)) => {
+            1u8.hash(hasher);
+            (named as u16).hash(hasher);
+        },
+        Some(Color::Spec(rgb)) => {
+            2u8.hash(hasher);
+            rgb.r.hash(hasher);
+            rgb.g.hash(hasher);
+            rgb.b.hash(hasher);
+        },
+        Some(Color::Indexed(index)) => {
+            3u8.hash(hasher);
+            index.hash(hasher);
+        },
     }
 }
 

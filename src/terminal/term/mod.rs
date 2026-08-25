@@ -11,6 +11,7 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as Base64;
 use bitflags::bitflags;
 use log::{debug, trace};
+use memchr::memchr;
 use unicode_width::UnicodeWidthChar;
 
 use crate::osc_notification::OscWorkingDirectory;
@@ -61,7 +62,7 @@ struct DcsScanner {
     raw: Vec<u8>,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 enum DcsState {
     #[default]
     Ground,
@@ -72,70 +73,112 @@ enum DcsState {
     DiscardingEscape,
 }
 
-#[derive(Debug)]
-enum DcsChunk {
-    Bytes(Vec<u8>),
-    Request(DcsRequest),
-}
-
-#[derive(Debug)]
-enum DcsRequest {
-    Decrqss(Vec<u8>),
-    Xtgettcap(Vec<u8>),
-    Xtsettcap(Vec<u8>),
+/// One span of scanned PTY bytes: terminal data, or a DCS request the emulator answers itself.
+///
+/// Spans borrow either the caller's read buffer or the scanner's own bounded body buffer, so
+/// ordinary output is never copied on its way to the parser.
+enum DcsChunk<'a> {
+    Bytes(&'a [u8]),
+    Decrqss(&'a [u8]),
+    Xtgettcap(&'a [u8]),
+    Xtsettcap(&'a [u8]),
 }
 
 impl DcsScanner {
-    fn push(&mut self, bytes: &[u8]) -> Vec<DcsChunk> {
-        let mut chunks = Vec::new();
-        for &byte in bytes {
+    /// Split PTY bytes into terminal data and the DCS requests handled here.
+    ///
+    /// Ground, body, and discard runs advance with `memchr` instead of one byte at a time. Ordinary
+    /// output never leaves the ground state, so a whole read is forwarded as a single borrowed
+    /// slice rather than being rebuilt byte by byte into a fresh allocation.
+    fn push<F>(&mut self, mut bytes: &[u8], emit: &mut F)
+    where
+        F: FnMut(DcsChunk<'_>),
+    {
+        while !bytes.is_empty() {
             match self.state {
-                DcsState::Ground if byte == 0x1b => self.state = DcsState::Escape,
-                DcsState::Ground => push_dcs_bytes(&mut chunks, &[byte]),
-                DcsState::Escape if byte == b'P' => {
-                    self.body.clear();
-                    self.raw.clear();
-                    self.raw.extend_from_slice(b"\x1bP");
-                    self.state = DcsState::Body;
+                DcsState::Ground => match memchr(0x1b, bytes) {
+                    Some(index) => {
+                        if index > 0 {
+                            emit(DcsChunk::Bytes(&bytes[..index]));
+                        }
+                        self.state = DcsState::Escape;
+                        bytes = &bytes[index + 1..];
+                    },
+                    None => {
+                        emit(DcsChunk::Bytes(bytes));
+                        return;
+                    },
                 },
-                DcsState::Escape if byte == 0x1b => push_dcs_bytes(&mut chunks, b"\x1b"),
                 DcsState::Escape => {
-                    push_dcs_bytes(&mut chunks, &[0x1b, byte]);
-                    self.state = DcsState::Ground;
-                },
-                DcsState::Body if byte == 0x1b => {
-                    self.state = DcsState::BodyEscape;
-                },
-                DcsState::Body => self.push_body(byte),
-                DcsState::BodyEscape if byte == b'\\' => {
-                    self.raw.extend_from_slice(b"\x1b\\");
-                    self.finish(&mut chunks);
-                },
-                DcsState::BodyEscape => {
-                    self.push_body(0x1b);
-                    if matches!(self.state, DcsState::Body) {
-                        self.push_body(byte);
+                    let byte = bytes[0];
+                    bytes = &bytes[1..];
+                    match byte {
+                        b'P' => {
+                            self.body.clear();
+                            self.raw.clear();
+                            self.raw.extend_from_slice(b"\x1bP");
+                            self.state = DcsState::Body;
+                        },
+                        0x1b => emit(DcsChunk::Bytes(b"\x1b")),
+                        _ => {
+                            emit(DcsChunk::Bytes(&[0x1b, byte]));
+                            self.state = DcsState::Ground;
+                        },
                     }
                 },
-                DcsState::Discarding if byte == 0x1b => {
-                    self.state = DcsState::DiscardingEscape;
+                DcsState::Body => {
+                    let limit = memchr(0x1b, bytes).unwrap_or(bytes.len());
+                    if limit == 0 {
+                        self.state = DcsState::BodyEscape;
+                        bytes = &bytes[1..];
+                    } else {
+                        // Buffer at most the one byte past the cap needed to observe the overflow,
+                        // so a long body cannot grow the scanner beyond its bound.
+                        let take = limit.min(DCS_MAX_BYTES + 1 - self.body.len());
+                        self.push_body(&bytes[..take]);
+                        bytes = &bytes[take..];
+                    }
                 },
-                DcsState::Discarding => {},
-                DcsState::DiscardingEscape if byte == b'\\' => {
-                    self.body.clear();
-                    self.raw.clear();
-                    self.state = DcsState::Ground;
+                DcsState::BodyEscape => {
+                    let byte = bytes[0];
+                    bytes = &bytes[1..];
+                    if byte == b'\\' {
+                        self.raw.extend_from_slice(b"\x1b\\");
+                        self.finish(emit);
+                    } else {
+                        self.push_body(&[0x1b]);
+                        if self.state == DcsState::Body {
+                            self.push_body(&[byte]);
+                        }
+                    }
                 },
-                DcsState::DiscardingEscape if byte == 0x1b => {},
-                DcsState::DiscardingEscape => self.state = DcsState::Discarding,
+                DcsState::Discarding => match memchr(0x1b, bytes) {
+                    Some(index) => {
+                        self.state = DcsState::DiscardingEscape;
+                        bytes = &bytes[index + 1..];
+                    },
+                    None => return,
+                },
+                DcsState::DiscardingEscape => {
+                    let byte = bytes[0];
+                    bytes = &bytes[1..];
+                    match byte {
+                        b'\\' => {
+                            self.body.clear();
+                            self.raw.clear();
+                            self.state = DcsState::Ground;
+                        },
+                        0x1b => (),
+                        _ => self.state = DcsState::Discarding,
+                    }
+                },
             }
         }
-        chunks
     }
 
-    fn push_body(&mut self, byte: u8) {
-        self.body.push(byte);
-        self.raw.push(byte);
+    fn push_body(&mut self, chunk: &[u8]) {
+        self.body.extend_from_slice(chunk);
+        self.raw.extend_from_slice(chunk);
         self.state = if self.body.len() > DCS_MAX_BYTES {
             self.body.clear();
             self.raw.clear();
@@ -145,32 +188,22 @@ impl DcsScanner {
         };
     }
 
-    fn finish(&mut self, chunks: &mut Vec<DcsChunk>) {
-        let request = self
-            .body
-            .strip_prefix(b"$q")
-            .map(|body| DcsRequest::Decrqss(body.to_vec()))
-            .or_else(|| {
-                self.body.strip_prefix(b"+q").map(|body| DcsRequest::Xtgettcap(body.to_vec()))
-            })
-            .or_else(|| {
-                self.body.strip_prefix(b"+p").map(|body| DcsRequest::Xtsettcap(body.to_vec()))
-            });
-        chunks.push(match request {
-            Some(request) => DcsChunk::Request(request),
-            None => DcsChunk::Bytes(mem::take(&mut self.raw)),
-        });
+    fn finish<F>(&mut self, emit: &mut F)
+    where
+        F: FnMut(DcsChunk<'_>),
+    {
+        if let Some(body) = self.body.strip_prefix(b"$q") {
+            emit(DcsChunk::Decrqss(body));
+        } else if let Some(body) = self.body.strip_prefix(b"+q") {
+            emit(DcsChunk::Xtgettcap(body));
+        } else if let Some(body) = self.body.strip_prefix(b"+p") {
+            emit(DcsChunk::Xtsettcap(body));
+        } else {
+            emit(DcsChunk::Bytes(&self.raw));
+        }
         self.body.clear();
         self.raw.clear();
         self.state = DcsState::Ground;
-    }
-}
-
-fn push_dcs_bytes(chunks: &mut Vec<DcsChunk>, bytes: &[u8]) {
-    if let Some(DcsChunk::Bytes(previous)) = chunks.last_mut() {
-        previous.extend_from_slice(bytes);
-    } else {
-        chunks.push(DcsChunk::Bytes(bytes.to_vec()));
     }
 }
 
@@ -638,24 +671,22 @@ impl<T> Term<T> {
     where
         T: EventListener,
     {
-        for chunk in self.dcs_scanner.push(bytes) {
-            match chunk {
-                DcsChunk::Bytes(bytes) => processor.advance(self, &bytes),
-                DcsChunk::Request(DcsRequest::Decrqss(request)) => {
-                    self.report_status_string(&request);
-                },
-                DcsChunk::Request(DcsRequest::Xtgettcap(request)) => {
-                    self.report_termcap(&request);
-                },
-                DcsChunk::Request(DcsRequest::Xtsettcap(request)) => {
-                    // Parse and ignore. Applications cannot mutate the emulator's identity or
-                    // capability set, and no payload is logged.
-                    let _valid = request
-                        .split(|byte| *byte == b';')
-                        .all(|item| !item.is_empty() && decode_hex(item).is_some());
-                },
-            }
-        }
+        // The scanner moves out of `self` so its borrowed spans can be handed straight to the
+        // parser, which needs `&mut self` for the same terminal.
+        let mut scanner = mem::take(&mut self.dcs_scanner);
+        scanner.push(bytes, &mut |chunk| match chunk {
+            DcsChunk::Bytes(bytes) => processor.advance(self, bytes),
+            DcsChunk::Decrqss(request) => self.report_status_string(request),
+            DcsChunk::Xtgettcap(request) => self.report_termcap(request),
+            DcsChunk::Xtsettcap(request) => {
+                // Parse and ignore. Applications cannot mutate the emulator's identity or
+                // capability set, and no payload is logged.
+                let _valid = request
+                    .split(|byte| *byte == b';')
+                    .all(|item| !item.is_empty() && decode_hex(item).is_some());
+            },
+        });
+        self.dcs_scanner = scanner;
 
         self.flush_grid_scroll();
     }
@@ -4354,6 +4385,39 @@ mod tests {
                 "\x1bP0+r\x1b\\".to_owned(),
             ]
         );
+    }
+
+    /// The DCS scanner forwards ground-state runs in bulk instead of one byte at a time, so the
+    /// bytes handed to the parser must not depend on where a PTY read happened to end.
+    #[test]
+    fn dcs_scanning_is_independent_of_read_boundaries() {
+        const INPUT: &[u8] =
+            b"ab\x1b[31mcd\x1bP$qm\x1b\\ef\x1b_VIVID\x1b\\gh\x1bPnope\x1b\\ij\x1b[0mkl";
+
+        fn feed(cuts: &[usize]) -> String {
+            let size = TermSize::new(40, 10);
+            let mut term = Term::new(Config::default(), &size, VoidListener);
+            let mut parser: ansi::Processor = ansi::Processor::new();
+            let mut start = 0;
+            for &cut in cuts {
+                term.advance(&mut parser, &INPUT[start..cut]);
+                start = cut;
+            }
+            let row: String =
+                (0..term.columns()).map(|column| term.grid()[Line(0)][Column(column)].c).collect();
+            row.trim_end().to_owned()
+        }
+
+        let whole = feed(&[INPUT.len()]);
+        assert_eq!(whole, "abcdefghijkl");
+
+        for split in 1..INPUT.len() {
+            assert_eq!(feed(&[split, INPUT.len()]), whole, "read split after {split} bytes");
+        }
+
+        // One byte at a time is the worst case for any buffered scanner state.
+        let single: Vec<usize> = (1..=INPUT.len()).collect();
+        assert_eq!(feed(&single), whole);
     }
 
     /// Producers that draw into their own pixels ask whether mode 1016 took effect before they map
