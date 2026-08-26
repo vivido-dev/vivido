@@ -1999,6 +1999,11 @@ impl WindowContext {
             "hold": self.display.window.hold,
             "grid": {"columns": size.columns(), "rows": size.screen_lines()},
             "pixels": {"width": pixels.width, "height": pixels.height},
+            // Where the grid starts inside the client area. Not derivable from the values above:
+            // with `dynamic_padding` off (the default) the sub-cell remainder collects at the
+            // right and bottom rather than being split, so the obvious
+            // `(width - columns * cell_width) / 2` over-estimates it by half the remainder.
+            "padding": {"x": size.padding_x(), "y": size.padding_y()},
             "position": position.map(|position| json_value!({"x": position.x, "y": position.y})),
             "process": exit_status_json(self.automation.exit_status.as_ref()),
             "sequences": {
@@ -2532,6 +2537,9 @@ impl WindowContext {
             "height": pixels.height,
             "scale_factor": self.display.window.scale_factor,
             "cell": {"width": size.cell_width(), "height": size.cell_height()},
+            // Origin of the terminal grid within this capture. See the note in
+            // `automation_summary_with_terminal`: it cannot be derived from width/height/cell.
+            "padding": {"x": size.padding_x(), "y": size.padding_y()},
         });
         self.screenshot = Some(PendingScreenshot { readback, connection, request_id, metadata });
         self.screenshot_busy = true;

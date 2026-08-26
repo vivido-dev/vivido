@@ -98,6 +98,10 @@ struct PacedGesture {
     next_action: usize,
     interval: Duration,
     next_due: Instant,
+    /// Wall-clock cap for the whole gesture. Without one, a gesture whose tick is cancelled has
+    /// nothing to expire it: the `WaitKind::Gesture` waiter that carries `path.timeout` is only
+    /// created once the gesture finishes, so a stranded gesture waits forever.
+    deadline: Instant,
     before_frame: u64,
     written_bytes: usize,
 }
@@ -1977,6 +1981,10 @@ impl Processor {
         let intervals = path.points.len() as f64;
         let interval = Duration::from_secs_f64(duration as f64 / 1_000.0 / intervals);
         let before_frame = self.windows[&target].automation.frame_sequence;
+        // The pacing itself plus whatever the caller is prepared to wait for afterwards.
+        let wait_ms = if path.wait_frame { path.timeout } else { 5_000 };
+        let deadline =
+            Instant::now() + Duration::from_millis(duration) + Duration::from_millis(wait_ms);
         self.paced_gestures.insert(
             target,
             PacedGesture {
@@ -1986,11 +1994,13 @@ impl Processor {
                 next_action: 0,
                 interval,
                 next_due: Instant::now(),
+                deadline,
                 before_frame,
                 written_bytes: 0,
             },
         );
         self.advance_paced_gesture(event_loop, target);
+        self.schedule_automation_timer(target);
     }
 
     #[cfg(any(unix, windows))]
@@ -1998,15 +2008,19 @@ impl Processor {
         let Some(mut gesture) = self.paced_gestures.remove(&target) else {
             return;
         };
-        if Instant::now() < gesture.next_due {
-            let remaining = gesture.next_due.saturating_duration_since(Instant::now());
-            self.paced_gestures.insert(target, gesture);
-            self.scheduler.schedule(
-                Event::new(EventType::AutomationTick, target),
-                remaining,
-                false,
-                TimerId::new(Topic::Automation, target),
+        if Instant::now() >= gesture.deadline {
+            self.release_paced_gesture(event_loop, target, &gesture);
+            gesture.connection.error(
+                gesture.request_id,
+                IpcError::new("timeout", "paced mouse gesture did not complete in time"),
             );
+            return;
+        }
+        if Instant::now() < gesture.next_due {
+            // Not due yet. `schedule_automation_timer` owns the timer for this window and accounts
+            // for `next_due`, so scheduling one here too would leave two entries on one TimerId,
+            // of which `unschedule` only ever removes the first.
+            self.paced_gestures.insert(target, gesture);
             return;
         }
         let Some(window_id) = self.windows.get(&target).map(WindowContext::ipc_window_id) else {
@@ -2054,14 +2068,7 @@ impl Processor {
         }
         gesture.next_action = gesture.next_action.saturating_add(1);
         gesture.next_due += gesture.interval;
-        let interval = gesture.interval;
         self.paced_gestures.insert(target, gesture);
-        self.scheduler.schedule(
-            Event::new(EventType::AutomationTick, target),
-            interval,
-            false,
-            TimerId::new(Topic::Automation, target),
-        );
     }
 
     #[cfg(any(unix, windows))]
@@ -2115,6 +2122,7 @@ impl Processor {
             next_action: gesture.path.points.len(),
             interval: gesture.interval,
             next_due: Instant::now(),
+            deadline: gesture.deadline,
             before_frame: gesture.before_frame,
             written_bytes: gesture.written_bytes,
         };
@@ -2270,6 +2278,14 @@ impl Processor {
     fn schedule_automation_timer(&mut self, window_id: WindowId) {
         let timer_id = TimerId::new(Topic::Automation, window_id);
         self.scheduler.unschedule(timer_id);
+        // A paced gesture drives itself off this same timer, so it has to be part of the deadline.
+        // It is not held in `waiters` until it finishes, and this function runs on essentially
+        // every window and PTY event; leaving it out meant any unrelated terminal output cancelled
+        // the gesture's next tick and stranded the request with nothing left to expire it.
+        let gesture_due = self
+            .paced_gestures
+            .get(&window_id)
+            .map(|gesture| gesture.next_due.min(gesture.deadline));
         let Some(window) = self.windows.get(&window_id) else {
             return;
         };
@@ -2279,6 +2295,7 @@ impl Processor {
             .iter()
             .map(|pending| pending.deadline)
             .chain(window.automation.waiters.iter().map(|waiter| waiter.deadline))
+            .chain(gesture_due)
             .min();
         for waiter in &window.automation.waiters {
             if let WaitKind::ScreenStable { quiet, after_screen } = &waiter.kind {
