@@ -13,7 +13,8 @@ use winit::window::WindowLevel;
 #[cfg(any(target_os = "linux", windows))]
 use crate::Processor;
 #[cfg(any(target_os = "linux", windows))]
-use crate::cli::{TerminalOptions, WindowOptions};
+use crate::cli::TerminalOptions;
+use crate::cli::WindowOptions;
 
 /// Maximum number of shell actions retained between event-loop turns.
 pub const MAX_PENDING_SHELL_ACTIONS: usize = 64;
@@ -21,7 +22,7 @@ pub const MAX_PENDING_SHELL_ACTIONS: usize = 64;
 /// A window-management operation which must be performed by an embedding chrome.
 #[derive(Clone, Debug)]
 pub enum ShellAction {
-    CreateTab(WindowOptions),
+    CreateTab(Box<WindowOptions>),
     SelectNextTab,
     SelectPreviousTab,
     SelectTab(usize),

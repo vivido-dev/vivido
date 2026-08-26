@@ -4070,13 +4070,13 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
         self.spawn_daemon(&program, &args);
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    #[cfg(any(target_os = "linux", windows))]
     fn shell_action(&mut self, action: crate::shell::ShellAction) {
         let window_id = self.display.window.id();
         let _ = self.event_proxy.send_event(Event::new(EventType::ShellAction(action), window_id));
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    #[cfg(any(target_os = "linux", windows))]
     fn create_new_tab(&mut self) {
         let mut options = WindowOptions::default();
         options.terminal_options.working_directory =
@@ -4086,7 +4086,7 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
             options.terminal_options.working_directory =
                 foreground_process_path(self.master_fd, self.shell_pid).ok();
         }
-        self.shell_action(crate::shell::ShellAction::CreateTab(options));
+        self.shell_action(crate::shell::ShellAction::CreateTab(Box::new(options)));
     }
 
     #[cfg(not(windows))]
