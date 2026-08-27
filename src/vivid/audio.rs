@@ -301,7 +301,19 @@ impl AudioOutput {
 
     pub fn configure_play(&self, start_pts_us: i64, minimum_buffer_us: u64) {
         self.shared.requested_start_pts_us.store(start_pts_us, Ordering::SeqCst);
-        self.shared.timeline_origin_us.store(start_pts_us, Ordering::SeqCst);
+        // `rendered_samples` is lifetime accounting for this channel generation. A PLAY after
+        // PAUSE names the PTS that should leave the device next, so compensate for samples that
+        // were rendered before the pause instead of counting their duration a second time.
+        let rendered_samples = self.shared.rendered_samples.load(Ordering::SeqCst);
+        self.shared.timeline_origin_us.store(
+            timeline_origin_for_rendered_pts(
+                start_pts_us,
+                rendered_samples,
+                self.sample_rate,
+                self.channels,
+            ),
+            Ordering::SeqCst,
+        );
         self.shared.prebuffer_samples.store(
             u64::from(self.sample_rate)
                 .saturating_mul(u64::from(self.channels))
@@ -1161,6 +1173,20 @@ fn rendered_pts_us(origin_us: i64, samples: u64, sample_rate: u32, channels: u16
     origin_us.saturating_add(i64::try_from(elapsed_us).unwrap_or(i64::MAX))
 }
 
+fn timeline_origin_for_rendered_pts(
+    pts_us: i64,
+    samples: u64,
+    sample_rate: u32,
+    channels: u16,
+) -> i64 {
+    if sample_rate == 0 || channels == 0 {
+        return pts_us;
+    }
+    let frames = samples / u64::from(channels);
+    let elapsed_us = frames.saturating_mul(1_000_000) / u64::from(sample_rate);
+    pts_us.saturating_sub(i64::try_from(elapsed_us).unwrap_or(i64::MAX))
+}
+
 fn converted_trim_samples(
     input_samples: u32,
     input_rate: c_int,
@@ -1374,14 +1400,18 @@ mod tests {
     }
 
     #[test]
-    fn a_running_clock_keeps_its_anchor_when_play_moves_the_start() {
-        // A relay that re-issues PLAY without flushing has already rendered part of this timeline.
-        // Re-anchoring there would rewrite time the device has presented, so the origin stands.
+    fn resumed_clock_does_not_count_pre_pause_samples_twice() {
+        // A relay that issues PLAY after PAUSE reuses the output and its lifetime sample counter.
+        // The new start is the next media PTS, not a new origin to add that old counter onto.
         let output = AudioOutput::test_output();
         output.observe_audio_pts(1_000_000);
         output.shared.rendered_samples.store(96_000, Ordering::SeqCst);
         output.configure_play(7_000_000, 1);
-        assert_eq!(output.shared.timeline_origin_us.load(Ordering::SeqCst), 7_000_000);
+        output.start();
+        output.shared.prebuffered.store(true, Ordering::SeqCst);
+
+        assert_eq!(output.shared.timeline_origin_us.load(Ordering::SeqCst), 6_000_000);
+        assert_eq!(output.rendered_pts(), Some(7_000_000));
         assert_eq!(output.shared.first_audio_pts_us.load(Ordering::SeqCst), 1_000_000);
     }
 
