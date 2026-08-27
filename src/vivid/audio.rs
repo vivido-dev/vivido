@@ -88,6 +88,14 @@ struct Shared {
     /// The delay the hold is currently implementing, so it can be measured and adjusted.
     live_delay_us: AtomicU64,
     prebuffer_samples: AtomicU64,
+    /// Queued-sample count observed at a resume PLAY.
+    ///
+    /// Control and realtime media may use independent transports. Retained audio alone must not
+    /// restart the device before the realtime path has caught up with PLAY, or that tail can drain
+    /// into an underrun and stop the clock that paces linked video.
+    resume_queued_samples: AtomicU64,
+    resume_waiting_for_audio: AtomicBool,
+    ring_capacity_samples: u64,
     requested_start_pts_us: AtomicI64,
     gain_bits: AtomicU32,
     play_configured_at: Mutex<Option<Instant>>,
@@ -132,6 +140,8 @@ impl AudioOutput {
         })?;
         let format = supported.sample_format();
         let config: StreamConfig = supported.into();
+        let ring_capacity_samples =
+            (config.sample_rate as usize * config.channels as usize * RING_BUFFER_SECONDS).max(1);
         let shared = Arc::new(Shared {
             channel_generation: AtomicU64::new(channel_generation),
             generation_transition: Mutex::new(()),
@@ -157,6 +167,9 @@ impl AudioOutput {
                     .saturating_mul(PREBUFFER_MILLISECONDS)
                     / 1_000,
             ),
+            resume_queued_samples: AtomicU64::new(0),
+            resume_waiting_for_audio: AtomicBool::new(false),
+            ring_capacity_samples: u64::try_from(ring_capacity_samples).unwrap_or(u64::MAX),
             requested_start_pts_us: AtomicI64::new(UNSET_PTS),
             gain_bits: AtomicU32::new(1.0_f32.to_bits()),
             play_configured_at: Mutex::new(None),
@@ -166,9 +179,7 @@ impl AudioOutput {
             }),
             error: Mutex::new(None),
         });
-        let ring = HeapRb::<f32>::new(
-            (config.sample_rate as usize * config.channels as usize * RING_BUFFER_SECONDS).max(1),
-        );
+        let ring = HeapRb::<f32>::new(ring_capacity_samples);
         let (producer, consumer) = ring.split();
         let stream = match format {
             SampleFormat::I8 => build_stream::<i8, _>(&device, &config, consumer, shared.clone()),
@@ -222,6 +233,9 @@ impl AudioOutput {
             gap_silence_samples: AtomicU64::new(0),
             live_delay_us: AtomicU64::new(0),
             prebuffer_samples: AtomicU64::new(0),
+            resume_queued_samples: AtomicU64::new(0),
+            resume_waiting_for_audio: AtomicBool::new(false),
+            ring_capacity_samples: 32,
             requested_start_pts_us: AtomicI64::new(UNSET_PTS),
             gain_bits: AtomicU32::new(1.0_f32.to_bits()),
             play_configured_at: Mutex::new(None),
@@ -306,9 +320,19 @@ impl AudioOutput {
         // origin: doing so makes the retained audio tail disagree with linked video and creates a
         // second jump when newly submitted audio reaches the device. Before the first rendered
         // sample, PLAY and the first packet may still arrive in either order, so realign below.
-        if self.shared.rendered_samples.load(Ordering::SeqCst) == 0 {
+        let rendered_samples = self.shared.rendered_samples.load(Ordering::SeqCst);
+        if rendered_samples == 0 {
             self.shared.timeline_origin_us.store(start_pts_us, Ordering::SeqCst);
         }
+        // PLAY and the first post-pause audio packet are deliberately independent protocol paths.
+        // Snapshot the accepted-audio watermark before enabling the device. A resume does not
+        // prebuffer from the retained tail alone: at least one new decoded sample proves the
+        // realtime path has crossed the same boundary. A full ring is already safe and must be
+        // allowed to drain, because its producer may be blocked waiting for capacity.
+        self.shared
+            .resume_queued_samples
+            .store(self.shared.queued_samples.load(Ordering::SeqCst), Ordering::SeqCst);
+        self.shared.resume_waiting_for_audio.store(rendered_samples != 0, Ordering::SeqCst);
         self.shared.prebuffer_samples.store(
             u64::from(self.sample_rate)
                 .saturating_mul(u64::from(self.channels))
@@ -340,6 +364,8 @@ impl AudioOutput {
         self.shared.gap_silence_samples.store(0, Ordering::SeqCst);
         self.shared.live_delay_us.store(0, Ordering::SeqCst);
         self.shared.prebuffered.store(false, Ordering::SeqCst);
+        self.shared.resume_queued_samples.store(0, Ordering::SeqCst);
+        self.shared.resume_waiting_for_audio.store(false, Ordering::SeqCst);
         self.shared.decode_done.store(false, Ordering::SeqCst);
         self.shared.eos_observed.store(false, Ordering::SeqCst);
         self.shared.rendered_samples.store(0, Ordering::SeqCst);
@@ -744,6 +770,18 @@ fn discard_stale_samples<C: Consumer<Item = f32>>(shared: &Shared, consumer: &mu
     discarded
 }
 
+fn audio_prebuffer_ready(shared: &Shared) -> bool {
+    let queued = shared.queued_samples.load(Ordering::SeqCst);
+    let buffered = queued.saturating_sub(shared.played_samples.load(Ordering::SeqCst));
+    let decode_done = shared.decode_done.load(Ordering::SeqCst);
+    let minimum_ready = buffered >= shared.prebuffer_samples.load(Ordering::SeqCst) || decode_done;
+    let resume_ready = !shared.resume_waiting_for_audio.load(Ordering::SeqCst)
+        || queued > shared.resume_queued_samples.load(Ordering::SeqCst)
+        || buffered >= shared.ring_capacity_samples
+        || decode_done;
+    minimum_ready && resume_ready
+}
+
 fn build_stream<T, C>(
     device: &cpal::Device,
     config: &StreamConfig,
@@ -768,16 +806,11 @@ where
                     return;
                 }
                 if !shared.prebuffered.load(Ordering::SeqCst) {
-                    let buffered = shared
-                        .queued_samples
-                        .load(Ordering::SeqCst)
-                        .saturating_sub(shared.played_samples.load(Ordering::SeqCst));
-                    if buffered < shared.prebuffer_samples.load(Ordering::SeqCst)
-                        && !shared.decode_done.load(Ordering::SeqCst)
-                    {
+                    if !audio_prebuffer_ready(&shared) {
                         output.fill_with(|| T::from_sample(0.0));
                         return;
                     }
+                    shared.resume_waiting_for_audio.store(false, Ordering::SeqCst);
                     shared.prebuffered.store(true, Ordering::SeqCst);
                 }
                 let mut played = 0_u64;
@@ -1400,6 +1433,46 @@ mod tests {
         assert_eq!(output.shared.queued_samples.load(Ordering::SeqCst), 192_000);
         assert_eq!(output.shared.played_samples.load(Ordering::SeqCst), 96_000);
         assert_eq!(output.shared.discard_through_samples.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn resume_waits_for_audio_accepted_after_play() {
+        // Over vvssh, PLAY uses the control connection while audio uses the realtime connection.
+        // The retained tail predates PLAY and cannot prove that the realtime path has caught up.
+        let output = AudioOutput::test_output();
+        output.observe_audio_pts(1_000_000);
+        output.shared.queued_samples.store(20, Ordering::SeqCst);
+        output.shared.played_samples.store(10, Ordering::SeqCst);
+        output.shared.rendered_samples.store(10, Ordering::SeqCst);
+
+        output.configure_play(1_000_104, 1);
+
+        assert!(!audio_prebuffer_ready(&output.shared));
+        output.shared.queued_samples.fetch_add(1, Ordering::SeqCst);
+        assert!(audio_prebuffer_ready(&output.shared));
+    }
+
+    #[test]
+    fn resume_can_drain_a_full_ring_without_waiting_on_its_blocked_producer() {
+        let output = AudioOutput::test_output();
+        output.observe_audio_pts(1_000_000);
+        output.shared.queued_samples.store(42, Ordering::SeqCst);
+        output.shared.played_samples.store(10, Ordering::SeqCst);
+        output.shared.rendered_samples.store(10, Ordering::SeqCst);
+
+        output.configure_play(1_000_104, 1);
+
+        assert_eq!(output.shared.ring_capacity_samples, 32);
+        assert!(audio_prebuffer_ready(&output.shared));
+    }
+
+    #[test]
+    fn initial_play_does_not_require_a_post_play_audio_write() {
+        let output = AudioOutput::test_output();
+        output.configure_play(1_000_000, 0);
+
+        assert!(!output.shared.resume_waiting_for_audio.load(Ordering::SeqCst));
+        assert!(audio_prebuffer_ready(&output.shared));
     }
 
     #[test]

@@ -5,7 +5,7 @@ use std::ffi::{OsStr, OsString};
 use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
-use std::process::{ExitCode, Stdio};
+use std::process::{Child, ExitCode, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
@@ -15,13 +15,16 @@ mod askpass;
 
 use askpass::CredentialBroker;
 
+const REALTIME_READY: &[u8; 16] = b"VIVID-REAL-READY";
+const BULK_READY: &[u8; 16] = b"VIVID-BULK-READY";
+
 const HELP: &str = r#"Forward the current Vivido window's Vivid endpoint over SSH.
 
 Usage: vvssh [SSH_OPTIONS] DESTINATION [REMOTE_SHELL [ARGUMENTS...]]
 
 vvssh option:
   --shared-media-transport    Carry media on the interactive SSH TCP connection (legacy mode).
-  --separate-media-transport  Explicitly select the default independent media connection.
+  --separate-media-transport  Use independent realtime and bulk SSH connections (default).
   --no-receive-drops          Do not start the optional remote vvreceive helper.
 
 SSH connection options are passed through and can also be placed in ~/.ssh/config. vvssh opens an
@@ -45,6 +48,22 @@ enum RemotePlatform {
 struct SshInvocation {
     connection: Vec<OsString>,
     remote_shell: Vec<OsString>,
+}
+
+#[derive(Debug)]
+struct MediaForward {
+    lane: &'static str,
+    arguments: Vec<OsString>,
+    ready_marker: &'static [u8; 16],
+    cleanup_path: Option<String>,
+}
+
+#[derive(Debug)]
+struct BuiltSshArguments {
+    setup: Vec<OsString>,
+    interactive: Vec<OsString>,
+    secret_path: String,
+    media: Vec<MediaForward>,
 }
 
 fn main() -> ExitCode {
@@ -95,19 +114,20 @@ fn run() -> Result<u8, String> {
     let credential_broker = CredentialBroker::new(std::process::id(), nonce)
         .map_err(|error| format!("could not initialize SSH credential broker: {error}"))?;
     let remote_platform = detect_remote_platform(&credential_broker, &ssh, &invocation.connection)?;
-    let (setup_arguments, ssh_arguments, secret_file, bulk_arguments, bulk_socket) =
-        build_ssh_arguments(
-            invocation,
-            &endpoint,
-            std::process::id(),
-            nonce,
-            separate_media,
-            receive_drops,
-            remote_platform,
-        )?;
+    let built = build_ssh_arguments(
+        invocation,
+        &endpoint,
+        std::process::id(),
+        nonce,
+        separate_media,
+        receive_drops,
+        remote_platform,
+    )?;
+    let media_paths =
+        built.media.iter().filter_map(|forward| forward.cleanup_path.clone()).collect::<Vec<_>>();
     let mut setup_command = credential_broker.command(&ssh, "setup");
     let mut setup = setup_command
-        .args(&setup_arguments)
+        .args(&built.setup)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .spawn()
@@ -123,8 +143,8 @@ fn run() -> Result<u8, String> {
         let _ = cleanup_remote_secret(
             &credential_broker,
             &ssh,
-            &setup_arguments,
-            &secret_file,
+            &built.setup,
+            &built.secret_path,
             remote_platform,
         );
         return Err(format!("could not transfer Vivid root secret: {error}"));
@@ -133,101 +153,107 @@ fn run() -> Result<u8, String> {
         let _ = cleanup_remote_secret(
             &credential_broker,
             &ssh,
-            &setup_arguments,
-            &secret_file,
+            &built.setup,
+            &built.secret_path,
             remote_platform,
         );
         return Err("remote host rejected the protected Vivid root-secret setup channel".into());
     }
-    let mut bulk = if let Some(arguments) = bulk_arguments {
-        let mut bulk_command = credential_broker.command(&ssh, "media");
-        let mut child =
-            match bulk_command.args(arguments).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn()
-            {
-                Ok(child) => child,
-                Err(error) => {
-                    let _ = cleanup_remote_paths(
-                        &credential_broker,
-                        &ssh,
-                        &setup_arguments,
-                        &secret_file,
-                        bulk_socket.as_deref(),
-                        remote_platform,
-                    );
-                    return Err(format!("could not start separate media transport: {error}"));
-                },
-            };
-        let mut ready = [0_u8; 16];
-        let readiness = match child.stdout.as_mut() {
-            Some(stdout) => stdout
-                .read_exact(&mut ready)
-                .map_err(|error| format!("separate media transport did not become ready: {error}")),
-            None => Err("separate media transport has no readiness channel".to_owned()),
-        };
-        if let Err(error) = readiness {
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = cleanup_remote_paths(
-                &credential_broker,
-                &ssh,
-                &setup_arguments,
-                &secret_file,
-                bulk_socket.as_deref(),
-                remote_platform,
-            );
-            return Err(error);
+    let mut media = Vec::with_capacity(built.media.len());
+    for forward in built.media {
+        match start_media_forward(&credential_broker, &ssh, forward) {
+            Ok(child) => media.push(child),
+            Err(error) => {
+                stop_media_forwards(&mut media);
+                let _ = cleanup_remote_paths(
+                    &credential_broker,
+                    &ssh,
+                    &built.setup,
+                    &built.secret_path,
+                    &media_paths,
+                    remote_platform,
+                );
+                return Err(error);
+            },
         }
-        if &ready != b"VIVID-BULK-READY" {
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = cleanup_remote_paths(
-                &credential_broker,
-                &ssh,
-                &setup_arguments,
-                &secret_file,
-                bulk_socket.as_deref(),
-                remote_platform,
-            );
-            return Err("separate media transport returned an invalid readiness marker".into());
-        }
-        Some(child)
-    } else {
-        None
-    };
-    let status = match credential_broker.command(&ssh, "interactive").args(&ssh_arguments).status()
-    {
-        Ok(status) => status,
-        Err(error) => {
-            if let Some(child) = bulk.as_mut() {
-                let _ = child.kill();
-                let _ = child.wait();
-            }
-            let _ = cleanup_remote_paths(
-                &credential_broker,
-                &ssh,
-                &setup_arguments,
-                &secret_file,
-                bulk_socket.as_deref(),
-                remote_platform,
-            );
-            return Err(format!("could not run {}: {error}", Path::new(&ssh).display()));
-        },
-    };
-
-    if let Some(child) = bulk.as_mut() {
-        let _ = child.kill();
-        let _ = child.wait();
     }
+    let status =
+        match credential_broker.command(&ssh, "interactive").args(&built.interactive).status() {
+            Ok(status) => status,
+            Err(error) => {
+                stop_media_forwards(&mut media);
+                let _ = cleanup_remote_paths(
+                    &credential_broker,
+                    &ssh,
+                    &built.setup,
+                    &built.secret_path,
+                    &media_paths,
+                    remote_platform,
+                );
+                return Err(format!("could not run {}: {error}", Path::new(&ssh).display()));
+            },
+        };
+
+    stop_media_forwards(&mut media);
     let _ = cleanup_remote_paths(
         &credential_broker,
         &ssh,
-        &setup_arguments,
-        &secret_file,
-        bulk_socket.as_deref(),
+        &built.setup,
+        &built.secret_path,
+        &media_paths,
         remote_platform,
     );
 
     Ok(status.code().and_then(|code| u8::try_from(code).ok()).unwrap_or(1))
+}
+
+fn start_media_forward(
+    credential_broker: &CredentialBroker,
+    ssh: &OsStr,
+    forward: MediaForward,
+) -> Result<Child, String> {
+    let mut command = credential_broker.command(ssh, forward.lane);
+    let mut child = command
+        .args(forward.arguments)
+        // The POSIX helper waits on this pipe. Keeping it owned by the child handle binds the
+        // remote listener to this vvssh invocation without placing media on stdin.
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .map_err(|error| {
+            format!("could not start separate {} transport: {error}", forward.lane)
+        })?;
+    let mut ready = [0_u8; 16];
+    let readiness = child
+        .stdout
+        .as_mut()
+        .ok_or_else(|| format!("separate {} transport has no readiness channel", forward.lane))
+        .and_then(|stdout| {
+            stdout.read_exact(&mut ready).map_err(|error| {
+                format!("separate {} transport did not become ready: {error}", forward.lane)
+            })
+        });
+    if let Err(error) = readiness {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error);
+    }
+    if &ready != forward.ready_marker {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(format!(
+            "separate {} transport returned an invalid readiness marker",
+            forward.lane
+        ));
+    }
+    Ok(child)
+}
+
+fn stop_media_forwards(children: &mut [Child]) {
+    for child in children {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
 }
 
 fn take_media_transport_flags(arguments: &mut Vec<OsString>) -> Result<bool, String> {
@@ -371,9 +397,6 @@ fn remote_probe_status(
         .map_err(|error| format!("could not probe remote SSH platform: {error}"))
 }
 
-type BuiltSshArguments =
-    (Vec<OsString>, Vec<OsString>, String, Option<Vec<OsString>>, Option<String>);
-
 fn build_ssh_arguments(
     invocation: SshInvocation,
     endpoint: &str,
@@ -410,17 +433,21 @@ fn build_posix_ssh_arguments(
     let remote_socket = format!("/tmp/vivido-vivid-{process_id}-{nonce}.sock");
     let secret_file = format!("/tmp/vivido-vivid-{process_id}-{nonce}.secret");
     let remote_endpoint = format!("unix:{remote_socket}");
+    let realtime_socket =
+        separate_media.then(|| format!("/tmp/vivido-vivid-{process_id}-{nonce}-realtime.sock"));
     let bulk_socket =
         separate_media.then(|| format!("/tmp/vivido-vivid-{process_id}-{nonce}-bulk.sock"));
     #[cfg(windows)]
     let anchor_transport = " VIVID_ANCHOR_TRANSPORT=conpty";
     #[cfg(not(windows))]
     let anchor_transport = "";
-    let media_environment = bulk_socket
+    let media_environment = realtime_socket
         .as_ref()
-        .map(|socket| {
-            let endpoint = shell_quote(&format!("unix:{socket}"));
-            format!(" VIVID_ENDPOINT_REALTIME={endpoint} VIVID_ENDPOINT_BULK={endpoint}")
+        .zip(bulk_socket.as_ref())
+        .map(|(realtime, bulk)| {
+            let realtime = shell_quote(&format!("unix:{realtime}"));
+            let bulk = shell_quote(&format!("unix:{bulk}"));
+            format!(" VIVID_ENDPOINT_REALTIME={realtime} VIVID_ENDPOINT_BULK={bulk}")
         })
         .unwrap_or_default();
     let receiver = if receive_drops {
@@ -433,6 +460,7 @@ fn build_posix_ssh_arguments(
     // otherwise select the compatible system entry before the login shell starts.
     let remote_term = "case \"${TERM-}\" in vivido|vivido-direct) if ! command -v infocmp >/dev/null 2>&1 || ! infocmp \"$TERM\" >/dev/null 2>&1; then TERM=xterm-256color; export TERM; fi;; esac; ";
     let login_shell = posix_login_shell(&invocation.remote_shell)?;
+    let connection = invocation.connection;
     let remote_command = format!(
         "VIVID_ROOT_SECRET=$(cat {}) && rm -f {} && export VIVID_ROOT_SECRET && export VIVID_REMOTE=1{anchor_transport} VIVID_ENDPOINT_CONTROL={}{media_environment}; {remote_term}{receiver}{login_shell}",
         shell_quote(&secret_file),
@@ -441,7 +469,7 @@ fn build_posix_ssh_arguments(
     );
     let remote_forward = format!("{remote_socket}:{local_target}");
 
-    let mut setup = invocation.connection.clone();
+    let mut setup = connection.clone();
     setup.push(OsString::from(format!("umask 077 && cat > {}", shell_quote(&secret_file))));
     let mut arguments = vec![
         OsString::from("-tt"),
@@ -454,30 +482,59 @@ fn build_posix_ssh_arguments(
         OsString::from("-R"),
         OsString::from(remote_forward),
     ];
-    arguments.extend(invocation.connection);
+    arguments.extend(connection.iter().cloned());
     arguments.push(OsString::from(remote_command));
-    let bulk_arguments = bulk_socket.as_ref().map(|socket| {
-        let remote_forward = format!("{socket}:{local_target}");
-        let mut arguments = vec![
-            OsString::from("-T"),
-            OsString::from("-o"),
-            OsString::from("ControlMaster=no"),
-            OsString::from("-o"),
-            OsString::from("ControlPath=none"),
-            OsString::from("-o"),
-            OsString::from("ExitOnForwardFailure=yes"),
-            OsString::from("-o"),
-            OsString::from("StreamLocalBindMask=0177"),
-            OsString::from("-o"),
-            OsString::from("StreamLocalBindUnlink=yes"),
-            OsString::from("-R"),
-            OsString::from(remote_forward),
-        ];
-        arguments.extend(setup[..setup.len().saturating_sub(1)].iter().cloned());
-        arguments.push(OsString::from("printf VIVID-BULK-READY; cat >/dev/null"));
-        arguments
-    });
-    Ok((setup, arguments, secret_file, bulk_arguments, bulk_socket))
+    let mut media = Vec::new();
+    if let Some(socket) = realtime_socket {
+        media.push(posix_media_forward(
+            &connection,
+            &local_target,
+            "realtime",
+            socket,
+            "VIVID-REAL-READY",
+            REALTIME_READY,
+        ));
+    }
+    if let Some(socket) = bulk_socket {
+        media.push(posix_media_forward(
+            &connection,
+            &local_target,
+            "bulk",
+            socket,
+            "VIVID-BULK-READY",
+            BULK_READY,
+        ));
+    }
+    Ok(BuiltSshArguments { setup, interactive: arguments, secret_path: secret_file, media })
+}
+
+fn posix_media_forward(
+    connection: &[OsString],
+    local_target: &str,
+    lane: &'static str,
+    remote_socket: String,
+    ready_text: &str,
+    ready_marker: &'static [u8; 16],
+) -> MediaForward {
+    let remote_forward = format!("{remote_socket}:{local_target}");
+    let mut arguments = vec![
+        OsString::from("-T"),
+        OsString::from("-o"),
+        OsString::from("ControlMaster=no"),
+        OsString::from("-o"),
+        OsString::from("ControlPath=none"),
+        OsString::from("-o"),
+        OsString::from("ExitOnForwardFailure=yes"),
+        OsString::from("-o"),
+        OsString::from("StreamLocalBindMask=0177"),
+        OsString::from("-o"),
+        OsString::from("StreamLocalBindUnlink=yes"),
+        OsString::from("-R"),
+        OsString::from(remote_forward),
+    ];
+    arguments.extend(connection.iter().cloned());
+    arguments.push(OsString::from(format!("printf {ready_text}; cat >/dev/null")));
+    MediaForward { lane, arguments, ready_marker, cleanup_path: Some(remote_socket) }
 }
 
 fn build_windows_ssh_arguments(
@@ -488,18 +545,21 @@ fn build_windows_ssh_arguments(
     separate_media: bool,
 ) -> Result<BuiltSshArguments, String> {
     let secret_directory = format!("vivido-vivid-{process_id}-{nonce}");
-    let (control_port, bulk_port) = windows_remote_ports(process_id, nonce);
+    let (control_port, realtime_port, bulk_port) = windows_remote_ports(process_id, nonce);
     let remote_endpoint = format!("tcp:127.0.0.1:{control_port}");
+    let realtime_endpoint = separate_media.then(|| format!("tcp:127.0.0.1:{realtime_port}"));
     let bulk_endpoint = separate_media.then(|| format!("tcp:127.0.0.1:{bulk_port}"));
     let setup_script = windows_setup_script(&secret_directory);
     let remote_script = windows_login_script(
         &secret_directory,
         &remote_endpoint,
+        realtime_endpoint.as_deref(),
         bulk_endpoint.as_deref(),
         &invocation.remote_shell,
     )?;
+    let connection = invocation.connection;
 
-    let mut setup = invocation.connection.clone();
+    let mut setup = connection.clone();
     setup.push(powershell_encoded_command(&setup_script));
 
     let remote_forward = format!("127.0.0.1:{control_port}:{local_target}");
@@ -510,33 +570,62 @@ fn build_windows_ssh_arguments(
         OsString::from("-R"),
         OsString::from(remote_forward),
     ];
-    arguments.extend(invocation.connection.clone());
+    arguments.extend(connection.iter().cloned());
     arguments.push(powershell_encoded_command(&remote_script));
 
-    let bulk_arguments = bulk_endpoint.as_ref().map(|_| {
-        let remote_forward = format!("127.0.0.1:{bulk_port}:{local_target}");
-        let mut arguments = vec![
-            OsString::from("-T"),
-            OsString::from("-o"),
-            OsString::from("ControlMaster=no"),
-            OsString::from("-o"),
-            OsString::from("ControlPath=none"),
-            OsString::from("-o"),
-            OsString::from("ExitOnForwardFailure=yes"),
-            OsString::from("-R"),
-            OsString::from(remote_forward),
-        ];
-        arguments.extend(invocation.connection);
-        // The SSH session owns this helper's lifetime. Waiting on stdin made the Windows forward
-        // disappear when that incidental stream reached EOF even though the interactive session
-        // was still live; the next track generation then saw WSAECONNREFUSED.
-        arguments.push(powershell_encoded_command(
-            "$output=[Console]::OpenStandardOutput(); $marker=[Text.Encoding]::ASCII.GetBytes('VIVID-BULK-READY'); $output.Write($marker,0,$marker.Length); $output.Flush(); [Threading.Thread]::Sleep([Threading.Timeout]::Infinite)",
+    let mut media = Vec::new();
+    if realtime_endpoint.is_some() {
+        media.push(windows_media_forward(
+            &connection,
+            &local_target,
+            "realtime",
+            realtime_port,
+            "VIVID-REAL-READY",
+            REALTIME_READY,
         ));
-        arguments
-    });
+    }
+    if bulk_endpoint.is_some() {
+        media.push(windows_media_forward(
+            &connection,
+            &local_target,
+            "bulk",
+            bulk_port,
+            "VIVID-BULK-READY",
+            BULK_READY,
+        ));
+    }
 
-    Ok((setup, arguments, secret_directory, bulk_arguments, bulk_endpoint))
+    Ok(BuiltSshArguments { setup, interactive: arguments, secret_path: secret_directory, media })
+}
+
+fn windows_media_forward(
+    connection: &[OsString],
+    local_target: &str,
+    lane: &'static str,
+    remote_port: u16,
+    ready_text: &str,
+    ready_marker: &'static [u8; 16],
+) -> MediaForward {
+    let remote_forward = format!("127.0.0.1:{remote_port}:{local_target}");
+    let mut arguments = vec![
+        OsString::from("-T"),
+        OsString::from("-o"),
+        OsString::from("ControlMaster=no"),
+        OsString::from("-o"),
+        OsString::from("ControlPath=none"),
+        OsString::from("-o"),
+        OsString::from("ExitOnForwardFailure=yes"),
+        OsString::from("-R"),
+        OsString::from(remote_forward),
+    ];
+    arguments.extend(connection.iter().cloned());
+    // The SSH session owns this helper's lifetime. Waiting on stdin made the Windows forward
+    // disappear when that incidental stream reached EOF even though the interactive session was
+    // still live; the next track generation then saw WSAECONNREFUSED.
+    arguments.push(powershell_encoded_command(&format!(
+        "$output=[Console]::OpenStandardOutput(); $marker=[Text.Encoding]::ASCII.GetBytes('{ready_text}'); $output.Write($marker,0,$marker.Length); $output.Flush(); [Threading.Thread]::Sleep([Threading.Timeout]::Infinite)"
+    )));
+    MediaForward { lane, arguments, ready_marker, cleanup_path: None }
 }
 
 fn posix_login_shell(remote_shell: &[OsString]) -> Result<String, String> {
@@ -555,18 +644,28 @@ fn posix_login_shell(remote_shell: &[OsString]) -> Result<String, String> {
     Ok(format!("exec {}", arguments.join(" ")))
 }
 
-fn windows_remote_ports(process_id: u32, nonce: u128) -> (u16, u16) {
+fn windows_remote_ports(process_id: u32, nonce: u128) -> (u16, u16, u16) {
     const DYNAMIC_PORT_FIRST: u16 = 49_152;
     const DYNAMIC_PORT_COUNT: u16 = 16_384;
     let mixed = nonce ^ u128::from(process_id).rotate_left(31);
-    let control_offset = u16::try_from(mixed % u128::from(DYNAMIC_PORT_COUNT))
-        .expect("dynamic port offset is bounded to u16");
-    let mut bulk_offset = u16::try_from((mixed >> 14) % u128::from(DYNAMIC_PORT_COUNT))
-        .expect("dynamic port offset is bounded to u16");
-    if bulk_offset == control_offset {
-        bulk_offset = (bulk_offset + 1) % DYNAMIC_PORT_COUNT;
+    let mut offsets = [
+        u16::try_from(mixed % u128::from(DYNAMIC_PORT_COUNT))
+            .expect("dynamic port offset is bounded to u16"),
+        u16::try_from((mixed >> 14) % u128::from(DYNAMIC_PORT_COUNT))
+            .expect("dynamic port offset is bounded to u16"),
+        u16::try_from((mixed >> 28) % u128::from(DYNAMIC_PORT_COUNT))
+            .expect("dynamic port offset is bounded to u16"),
+    ];
+    for index in 1..offsets.len() {
+        while offsets[..index].contains(&offsets[index]) {
+            offsets[index] = (offsets[index] + 1) % DYNAMIC_PORT_COUNT;
+        }
     }
-    (DYNAMIC_PORT_FIRST + control_offset, DYNAMIC_PORT_FIRST + bulk_offset)
+    (
+        DYNAMIC_PORT_FIRST + offsets[0],
+        DYNAMIC_PORT_FIRST + offsets[1],
+        DYNAMIC_PORT_FIRST + offsets[2],
+    )
 }
 
 fn windows_setup_script(secret_directory: &str) -> String {
@@ -587,17 +686,18 @@ fn windows_setup_script(secret_directory: &str) -> String {
 fn windows_login_script(
     secret_directory: &str,
     control_endpoint: &str,
+    realtime_endpoint: Option<&str>,
     bulk_endpoint: Option<&str>,
     remote_shell: &[OsString],
 ) -> Result<String, String> {
     let directory = powershell_quote(secret_directory);
     let control_endpoint = powershell_quote(control_endpoint);
-    let media_environment = bulk_endpoint
-        .map(|endpoint| {
-            let endpoint = powershell_quote(endpoint);
-            format!(
-                "$env:VIVID_ENDPOINT_REALTIME={endpoint}; $env:VIVID_ENDPOINT_BULK={endpoint}; "
-            )
+    let media_environment = realtime_endpoint
+        .zip(bulk_endpoint)
+        .map(|(realtime, bulk)| {
+            let realtime = powershell_quote(realtime);
+            let bulk = powershell_quote(bulk);
+            format!("$env:VIVID_ENDPOINT_REALTIME={realtime}; $env:VIVID_ENDPOINT_BULK={bulk}; ")
         })
         .unwrap_or_default();
     let launch = if remote_shell.is_empty() {
@@ -675,7 +775,7 @@ fn cleanup_remote_secret(
     remote_platform: RemotePlatform,
 ) -> Result<(), String> {
     let mut arguments = setup_arguments[..setup_arguments.len().saturating_sub(1)].to_vec();
-    arguments.push(cleanup_remote_command(secret_file, None, remote_platform));
+    arguments.push(cleanup_remote_command(secret_file, &[], remote_platform));
     credential_broker
         .command(ssh, "cleanup")
         .args(arguments)
@@ -689,11 +789,11 @@ fn cleanup_remote_paths(
     ssh: &OsStr,
     setup_arguments: &[OsString],
     secret_file: &str,
-    bulk_socket: Option<&str>,
+    media_paths: &[String],
     remote_platform: RemotePlatform,
 ) -> Result<(), String> {
     let mut arguments = setup_arguments[..setup_arguments.len().saturating_sub(1)].to_vec();
-    arguments.push(cleanup_remote_command(secret_file, bulk_socket, remote_platform));
+    arguments.push(cleanup_remote_command(secret_file, media_paths, remote_platform));
     credential_broker
         .command(ssh, "cleanup")
         .args(arguments)
@@ -704,14 +804,15 @@ fn cleanup_remote_paths(
 
 fn cleanup_remote_command(
     secret_file: &str,
-    bulk_socket: Option<&str>,
+    media_paths: &[String],
     remote_platform: RemotePlatform,
 ) -> OsString {
     match remote_platform {
         RemotePlatform::Posix => {
-            let bulk =
-                bulk_socket.map(|socket| format!(" {}", shell_quote(socket))).unwrap_or_default();
-            OsString::from(format!("rm -f {}{bulk}", shell_quote(secret_file)))
+            let mut paths = Vec::with_capacity(media_paths.len() + 1);
+            paths.push(shell_quote(secret_file));
+            paths.extend(media_paths.iter().map(|path| shell_quote(path)));
+            OsString::from(format!("rm -f {}", paths.join(" ")))
         },
         RemotePlatform::Windows => {
             let directory = powershell_quote(secret_file);
@@ -744,7 +845,9 @@ mod tests {
         let encoded = command.split_whitespace().last().unwrap();
         let bytes = base64::engine::general_purpose::STANDARD.decode(encoded).unwrap();
         let utf16 = bytes
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
             .collect::<Vec<_>>();
         String::from_utf16(&utf16).unwrap()
@@ -753,7 +856,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn builds_private_stream_local_forward() {
-        let (_, arguments, secret_file, _, _) = build_ssh_arguments(
+        let built = build_ssh_arguments(
             invocation(&["-p", "2222", "user@host"], &[]),
             "unix:/private/tmp/vivido/endpoint.sock",
             42,
@@ -764,7 +867,7 @@ mod tests {
         )
         .unwrap();
         let arguments =
-            arguments.iter().map(|argument| argument.to_string_lossy()).collect::<Vec<_>>();
+            built.interactive.iter().map(|argument| argument.to_string_lossy()).collect::<Vec<_>>();
 
         assert_eq!(arguments[0], "-tt");
         assert!(arguments.contains(&"ExitOnForwardFailure=yes".into()));
@@ -775,7 +878,7 @@ mod tests {
                 .contains(&"/tmp/vivido-vivid-42-99.sock:/private/tmp/vivido/endpoint.sock".into())
         );
         assert_eq!(&arguments[9..12], &["-p", "2222", "user@host"]);
-        assert!(arguments[12].contains(&secret_file));
+        assert!(arguments[12].contains(&built.secret_path));
         assert!(arguments[12].contains("VIVID_ROOT_SECRET"));
         assert!(arguments[12].contains("VIVID_ENDPOINT_CONTROL"));
         assert!(!arguments[12].contains("VIVID_ANCHOR_TRANSPORT"));
@@ -784,7 +887,7 @@ mod tests {
 
     #[test]
     fn builds_posix_forward_to_local_windows_loopback_destination() {
-        let (_, arguments, _, _, _) = build_ssh_arguments(
+        let built = build_ssh_arguments(
             invocation(&["host"], &[]),
             "tcp:127.0.0.1:1234",
             1,
@@ -795,7 +898,7 @@ mod tests {
         )
         .unwrap();
         let arguments =
-            arguments.iter().map(|argument| argument.to_string_lossy()).collect::<Vec<_>>();
+            built.interactive.iter().map(|argument| argument.to_string_lossy()).collect::<Vec<_>>();
         assert!(arguments.contains(&"/tmp/vivido-vivid-1-2.sock:127.0.0.1:1234".into()));
         assert!(arguments.last().unwrap().contains("VIVID_REMOTE=1"));
         #[cfg(windows)]
@@ -849,8 +952,8 @@ mod tests {
     }
 
     #[test]
-    fn posix_separate_media_transport_is_distinct_and_exported() {
-        let (_, interactive, _, bulk, bulk_socket) = build_ssh_arguments(
+    fn posix_realtime_and_bulk_use_distinct_ssh_transports() {
+        let built = build_ssh_arguments(
             invocation(&["user@host"], &[]),
             "tcp:127.0.0.1:4321",
             7,
@@ -860,16 +963,24 @@ mod tests {
             RemotePlatform::Posix,
         )
         .unwrap();
-        let interactive =
-            interactive.iter().map(|argument| argument.to_string_lossy()).collect::<Vec<_>>();
-        assert!(interactive.last().unwrap().contains("VIVID_ENDPOINT_BULK="));
-        assert!(interactive.last().unwrap().contains("VIVID_ENDPOINT_REALTIME="));
-        let bulk = bulk.unwrap();
-        assert!(bulk.iter().any(|argument| argument == "ControlMaster=no"));
-        assert!(bulk.iter().any(|argument| argument == "ControlPath=none"));
-        assert!(bulk.iter().any(|argument| {
-            argument.to_string_lossy().contains(bulk_socket.as_deref().unwrap())
-        }));
+        let command = built.interactive.last().unwrap().to_string_lossy();
+        assert!(command.contains("VIVID_ENDPOINT_BULK='unix:"));
+        assert!(command.contains("VIVID_ENDPOINT_REALTIME='unix:"));
+        assert_eq!(built.media.len(), 2);
+        let realtime = &built.media[0];
+        let bulk = &built.media[1];
+        assert_eq!(realtime.lane, "realtime");
+        assert_eq!(bulk.lane, "bulk");
+        assert_ne!(realtime.cleanup_path, bulk.cleanup_path);
+        for forward in &built.media {
+            assert!(forward.arguments.iter().any(|argument| argument == "ControlMaster=no"));
+            assert!(forward.arguments.iter().any(|argument| argument == "ControlPath=none"));
+            assert!(forward.arguments.iter().any(|argument| {
+                argument.to_string_lossy().contains(forward.cleanup_path.as_deref().unwrap())
+            }));
+        }
+        assert!(realtime.arguments.last().unwrap().to_string_lossy().contains("VIVID-REAL-READY"));
+        assert!(bulk.arguments.last().unwrap().to_string_lossy().contains("VIVID-BULK-READY"));
     }
 
     #[test]
@@ -892,7 +1003,7 @@ mod tests {
 
     #[test]
     fn receiver_is_backgrounded_before_exec_and_can_be_disabled() {
-        let (_, enabled, _, _, _) = build_ssh_arguments(
+        let enabled = build_ssh_arguments(
             invocation(&["host"], &[]),
             "tcp:127.0.0.1:4321",
             7,
@@ -902,7 +1013,7 @@ mod tests {
             RemotePlatform::Posix,
         )
         .unwrap();
-        let command = enabled.last().unwrap().to_string_lossy();
+        let command = enabled.interactive.last().unwrap().to_string_lossy();
         assert!(
             command
                 .contains("vvreceive --shell-pid $$ --signal-ready </dev/null >/dev/null 2>&1 &")
@@ -910,7 +1021,7 @@ mod tests {
         assert!(command.contains("trap '_vvreceive_ready=1' USR1"));
         assert!(command.ends_with("exec \"$SHELL\" -l"));
 
-        let (_, disabled, _, _, _) = build_ssh_arguments(
+        let disabled = build_ssh_arguments(
             invocation(&["host"], &[]),
             "tcp:127.0.0.1:4321",
             7,
@@ -920,7 +1031,7 @@ mod tests {
             RemotePlatform::Posix,
         )
         .unwrap();
-        assert!(!disabled.last().unwrap().to_string_lossy().contains("vvreceive"));
+        assert!(!disabled.interactive.last().unwrap().to_string_lossy().contains("vvreceive"));
 
         let mut arguments = vec![OsString::from("--no-receive-drops"), OsString::from("host")];
         assert!(!take_receive_drop_flag(&mut arguments));
@@ -929,7 +1040,7 @@ mod tests {
 
     #[test]
     fn remote_shell_falls_back_when_vivido_terminfo_is_unavailable() {
-        let (_, arguments, _, _, _) = build_ssh_arguments(
+        let built = build_ssh_arguments(
             invocation(&["host"], &[]),
             "tcp:127.0.0.1:4321",
             7,
@@ -939,7 +1050,7 @@ mod tests {
             RemotePlatform::Posix,
         )
         .unwrap();
-        let command = arguments.last().unwrap().to_string_lossy();
+        let command = built.interactive.last().unwrap().to_string_lossy();
         assert!(command.contains("case \"${TERM-}\" in vivido|vivido-direct)"));
         assert!(command.contains("infocmp \"$TERM\""));
         assert!(command.contains("TERM=xterm-256color; export TERM"));
@@ -948,7 +1059,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn windows_server_uses_loopback_tcp_forward_and_powershell_bootstrap() {
-        let (setup, interactive, secret_directory, bulk, bulk_endpoint) = build_ssh_arguments(
+        let built = build_ssh_arguments(
             invocation(&["wensh@192.168.2.246"], &["pwsh.exe"]),
             "unix:/private/tmp/vivido/endpoint.sock",
             42,
@@ -958,39 +1069,55 @@ mod tests {
             RemotePlatform::Windows,
         )
         .unwrap();
-        let (control_port, bulk_port) = windows_remote_ports(42, 99);
+        let (control_port, realtime_port, bulk_port) = windows_remote_ports(42, 99);
+        assert_ne!(control_port, realtime_port);
+        assert_ne!(control_port, bulk_port);
+        assert_ne!(realtime_port, bulk_port);
 
-        assert!(interactive.iter().any(|argument| {
+        assert!(built.interactive.iter().any(|argument| {
             argument
                 .to_string_lossy()
                 .contains(&format!("127.0.0.1:{control_port}:/private/tmp/vivido/endpoint.sock"))
         }));
         assert!(
-            !interactive
+            !built
+                .interactive
                 .iter()
                 .any(|argument| { argument.to_string_lossy().contains("StreamLocalBind") })
         );
-        let setup_script = decoded_powershell_script(setup.last().unwrap());
+        let setup_script = decoded_powershell_script(built.setup.last().unwrap());
         assert!(setup_script.contains("icacls.exe"));
         assert!(setup_script.contains("/inheritance:r"));
         assert!(setup_script.contains("OpenStandardInput"));
-        assert!(setup_script.contains(&secret_directory));
+        assert!(setup_script.contains(&built.secret_path));
 
-        let login_script = decoded_powershell_script(interactive.last().unwrap());
+        let login_script = decoded_powershell_script(built.interactive.last().unwrap());
         assert!(login_script.contains(&format!("tcp:127.0.0.1:{control_port}")));
+        assert!(login_script.contains(&format!("tcp:127.0.0.1:{realtime_port}")));
+        assert!(login_script.contains(&format!("tcp:127.0.0.1:{bulk_port}")));
         assert!(login_script.contains("$env:VIVID_ROOT_SECRET=$secret"));
         assert!(login_script.contains("$env:VIVID_ANCHOR_TRANSPORT='conpty'"));
         assert!(login_script.contains("& 'pwsh.exe'"));
         assert!(!login_script.contains("0123abcd"));
 
-        let bulk = bulk.unwrap();
-        assert!(bulk.iter().any(|argument| {
+        assert_eq!(built.media.len(), 2);
+        let realtime = &built.media[0];
+        let bulk = &built.media[1];
+        assert!(realtime.arguments.iter().any(|argument| {
+            argument
+                .to_string_lossy()
+                .contains(&format!("127.0.0.1:{realtime_port}:/private/tmp/vivido/endpoint.sock"))
+        }));
+        assert!(bulk.arguments.iter().any(|argument| {
             argument
                 .to_string_lossy()
                 .contains(&format!("127.0.0.1:{bulk_port}:/private/tmp/vivido/endpoint.sock"))
         }));
-        assert_eq!(bulk_endpoint.unwrap(), format!("tcp:127.0.0.1:{bulk_port}"));
-        let bulk_script = decoded_powershell_script(bulk.last().unwrap());
+        let realtime_script = decoded_powershell_script(realtime.arguments.last().unwrap());
+        assert!(realtime_script.contains("VIVID-REAL-READY"));
+        assert!(realtime_script.contains("Sleep([Threading.Timeout]::Infinite)"));
+        assert!(!realtime_script.contains("OpenStandardInput"));
+        let bulk_script = decoded_powershell_script(bulk.arguments.last().unwrap());
         assert!(bulk_script.contains("VIVID-BULK-READY"));
         assert!(bulk_script.contains("Sleep([Threading.Timeout]::Infinite)"));
         assert!(!bulk_script.contains("OpenStandardInput"));

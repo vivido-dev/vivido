@@ -583,8 +583,9 @@ What you interact with instead is the environment Vivido sets for programs it la
   pass as a command argument, or commit it. Treat it like a password.
 - `VIVID_ENDPOINT_REALTIME` — optional realtime-track discovery. If absent, producers use the
   bulk endpoint and then the control endpoint according to the 1.5 fallback order.
-- `VIVID_ENDPOINT_BULK` — the separate media transport advertised by default by `vvssh` for remote
-  sessions. The same private media socket is also exported as `VIVID_ENDPOINT_REALTIME`; control
+- `VIVID_ENDPOINT_BULK` — the bulk-track transport advertised by default by `vvssh` for remote
+  sessions. `vvssh` exports a different private endpoint for `VIVID_ENDPOINT_REALTIME`, and gives
+  each lane its own SSH TCP connection so bulk video cannot head-of-line block audio. Control
   always stays on `VIVID_ENDPOINT_CONTROL`. `vvssh --shared-media-transport` is the legacy opt-out.
 
 For remote display, use the bundled `vvssh` wrapper rather than plain `ssh`, which does not forward
