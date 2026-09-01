@@ -12,7 +12,7 @@
 use std::error::Error;
 use std::fmt::Write as _;
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::{env, fs};
 
 use base64::Engine;
@@ -448,6 +448,9 @@ fn vivido(mut options: Options) -> Result<(), Box<dyn Error>> {
     let ipc_endpoint =
         IoListener::spawn(&config, &options, EventSink::Winit(window_event_loop.create_proxy()))?
             .ipc_socket_path;
+    if let Some(export) = daemon_endpoint_export(&options, ipc_endpoint.as_deref()) {
+        println!("{export}");
+    }
 
     // Setup automatic RAII cleanup for our files.
     let log_cleanup = log_file.filter(|_| !config.debug.persistent_logging);
@@ -496,6 +499,12 @@ fn vivido(mut options: Options) -> Result<(), Box<dyn Error>> {
     result
 }
 
+/// Build the standalone daemon's opt-in shell export without making the reusable listener noisy.
+fn daemon_endpoint_export(options: &Options, endpoint: Option<&Path>) -> Option<String> {
+    let endpoint = endpoint.filter(|_| options.daemon)?;
+    Some(format!("VIVIDO_SOCKET={}; export VIVIDO_SOCKET", endpoint.display()))
+}
+
 fn log_config_path(config: &UiConfig) {
     if config.config_paths.is_empty() {
         return;
@@ -507,4 +516,23 @@ fn log_config_path(config: &UiConfig) {
     }
 
     info!("{msg}");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_a_standalone_daemon_formats_the_socket_export() {
+        let endpoint = Path::new(r"\\.\pipe\vivido-session");
+        let mut options = Options::default();
+
+        assert_eq!(daemon_endpoint_export(&options, Some(endpoint)), None);
+        options.daemon = true;
+        assert_eq!(
+            daemon_endpoint_export(&options, Some(endpoint)).as_deref(),
+            Some(r"VIVIDO_SOCKET=\\.\pipe\vivido-session; export VIVIDO_SOCKET")
+        );
+        assert_eq!(daemon_endpoint_export(&options, None), None);
+    }
 }

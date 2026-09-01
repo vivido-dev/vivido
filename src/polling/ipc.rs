@@ -539,9 +539,6 @@ impl IpcListener {
             session: options.session.clone(),
             automation_name: options.automation_name.clone().or_else(|| options.session.clone()),
         });
-        if options.daemon {
-            println!("VIVIDO_SOCKET={}; export VIVIDO_SOCKET", path.display());
-        }
 
         Ok(Self {
             socket,
