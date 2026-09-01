@@ -21,6 +21,7 @@ pub fn configure() {
     } else {
         link_vcpkg_ffmpeg()
     };
+    println!("cargo:ffmpeg_delay_load={}", runtime_dlls.join(","));
     configure_ffmpeg_delay_load(&runtime_dlls);
     stage_dxc_runtime();
 

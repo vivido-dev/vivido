@@ -1,6 +1,6 @@
 [package]
 name = "vivido"
-version = "0.4.4"
+version = "0.4.5"
 authors = ["Wensheng Wang <wenshengwang@gmail.com>"]
 license = "Apache-2.0"
 description = "A fast cross-platform terminal emulator with protocol-neutral media hooks"
@@ -9,6 +9,7 @@ homepage = "https://vivido.dev"
 repository = "https://github.com/vivido-dev/vivido"
 edition = "2024"
 rust-version = "1.88.0"
+links = "vivido_runtime"
 exclude = ["src/terminal/ref_tests.rs", "tests/ref"]
 
 [lib]
