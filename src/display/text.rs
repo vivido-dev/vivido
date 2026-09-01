@@ -131,6 +131,7 @@ pub struct TextSystem {
     checked_fallbacks: AHashSet<(FallbackKey, char)>,
     pua_fallback_family_names: Arc<[FontFamilyName<'static>]>,
     family_stacks: [FontFamily<'static>; 4],
+    pua_family_stacks: [FontFamily<'static>; 4],
     variant_styles: [(ParleyFontStyle, FontWeight); 4],
     cache: AHashMap<LayoutKey, CachedLayout>,
     cache_clock: u64,
@@ -145,6 +146,7 @@ impl TextSystem {
         let pua_fallback_family_names = pua_fallback_family_names(&mut font_cx);
         let mut text_system = Self {
             family_stacks: family_stacks_for_font(&font, &pua_fallback_family_names),
+            pua_family_stacks: pua_family_stacks_for_font(&font, &pua_fallback_family_names),
             variant_styles: variant_styles_for_font(&font),
             font,
             font_cx,
@@ -176,6 +178,8 @@ impl TextSystem {
     pub fn update_font(&mut self, font: Font) {
         self.font = font;
         self.family_stacks = family_stacks_for_font(&self.font, &self.pua_fallback_family_names);
+        self.pua_family_stacks =
+            pua_family_stacks_for_font(&self.font, &self.pua_fallback_family_names);
         self.variant_styles = variant_styles_for_font(&self.font);
         self.metrics = self.measure_metrics();
         self.checked_fallbacks.clear();
@@ -422,6 +426,10 @@ impl TextSystem {
         builder.push_default(StyleProperty::FontWeight(font_weight));
         builder.push_default(StyleProperty::Locale(self.locale));
         builder.push_default(LineHeight::Absolute(self.metrics.cell_height));
+        let pua_family = self.pua_family_stacks[variant.as_index()].clone();
+        for range in private_use_ranges(text, 0) {
+            builder.push(pua_family.clone(), range);
+        }
 
         let mut layout = builder.build(text);
         layout.break_all_lines(None);
@@ -456,6 +464,11 @@ impl TextSystem {
             ));
         }
 
+        let normal_pua_family = self.pua_family_stacks[FontVariant::Normal.as_index()].clone();
+        for range in private_use_ranges(text, 0) {
+            builder.push(normal_pua_family.clone(), range);
+        }
+
         for style in styles {
             let variant = font_variant(style.flags);
             let (font_style, font_weight) = self.variant_styles[variant.as_index()];
@@ -463,6 +476,12 @@ impl TextSystem {
             builder.push(StyleProperty::FontStyle(font_style), style.range.clone());
             builder.push(StyleProperty::FontWeight(font_weight), style.range.clone());
             builder.push(StyleProperty::Brush(style.color), style.range.clone());
+            let pua_family = self.pua_family_stacks[variant.as_index()].clone();
+            if let Some(styled_text) = text.get(style.range.clone()) {
+                for range in private_use_ranges(styled_text, style.range.start) {
+                    builder.push(pua_family.clone(), range);
+                }
+            }
         }
 
         let mut layout = builder.build(text);
@@ -758,6 +777,29 @@ fn family_stacks_for_font(
     })
 }
 
+fn pua_family_stacks_for_font(
+    font: &Font,
+    pua_fallbacks: &[FontFamilyName<'static>],
+) -> [FontFamily<'static>; 4] {
+    array::from_fn(|index| {
+        let variant = match index {
+            0 => FontVariant::Normal,
+            1 => FontVariant::Bold,
+            2 => FontVariant::Italic,
+            3 => FontVariant::BoldItalic,
+            _ => unreachable!("font variant index out of range"),
+        };
+        let mut families = Vec::new();
+        for family in pua_fallbacks {
+            push_family_name(&mut families, family.clone());
+        }
+        for family in font_family_stack(font, variant, pua_fallbacks) {
+            push_family_name(&mut families, family);
+        }
+        FontFamily::List(Cow::Owned(families))
+    })
+}
+
 fn font_family_stack(
     font: &Font,
     variant: FontVariant,
@@ -913,6 +955,17 @@ fn fontique_script_for_char(character: char) -> Option<parley::fontique::Script>
 
 fn is_private_use(character: char) -> bool {
     matches!(character as u32, 0xE000..=0xF8FF | 0xF0000..=0xFFFFD | 0x100000..=0x10FFFD)
+}
+
+fn private_use_ranges(text: &str, base: usize) -> impl Iterator<Item = Range<usize>> + '_ {
+    text.char_indices().filter_map(move |(relative_offset, character)| {
+        if !is_private_use(character) {
+            return None;
+        }
+        let start = base.checked_add(relative_offset)?;
+        let end = start.checked_add(character.len_utf8())?;
+        Some(start..end)
+    })
 }
 
 #[cfg(test)]

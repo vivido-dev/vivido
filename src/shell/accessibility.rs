@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use accesskit::{
     Action, ActionHandler, ActionRequest, ActivationHandler, DeactivationHandler, Node, NodeId,
-    Rect, Role, Tree, TreeId, TreeUpdate,
+    Rect, Role, TreeId, TreeInfo, TreeUpdate,
 };
 #[cfg(target_os = "linux")]
 use accesskit::{TextPosition, TextSelection};
@@ -154,7 +154,7 @@ fn empty_tree(title: &str) -> TreeUpdate {
     root.set_label(title);
     TreeUpdate {
         nodes: vec![(WINDOW_ID, root)],
-        tree: Some(Tree::new(WINDOW_ID)),
+        tree: Some(TreeInfo::new(WINDOW_ID)),
         tree_id: TreeId::ROOT,
         focus: WINDOW_ID,
     }
@@ -266,7 +266,7 @@ fn build_tree(
     };
     #[cfg(windows)]
     let focus = tabs.active_index().map(tab_id).unwrap_or(WINDOW_ID);
-    TreeUpdate { nodes, tree: Some(Tree::new(WINDOW_ID)), tree_id: TreeId::ROOT, focus }
+    TreeUpdate { nodes, tree: Some(TreeInfo::new(WINDOW_ID)), tree_id: TreeId::ROOT, focus }
 }
 
 #[cfg(target_os = "linux")]

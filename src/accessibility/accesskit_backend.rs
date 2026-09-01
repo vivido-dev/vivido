@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 
 use accesskit::{
     ActionHandler, ActionRequest, ActivationHandler, DeactivationHandler, Node, NodeId, Rect, Role,
-    TextPosition, TextSelection, Tree, TreeId, TreeUpdate,
+    TextPosition, TextSelection, TreeId, TreeInfo, TreeUpdate,
 };
 use accesskit_winit::Adapter;
 use winit::event::WindowEvent;
@@ -171,7 +171,7 @@ fn build_tree(snapshot: &AccessibilitySnapshot, target: VividTarget) -> TreeUpda
     }
 
     nodes.push((WINDOW_ID, root));
-    TreeUpdate { nodes, tree: Some(Tree::new(WINDOW_ID)), tree_id: TreeId::ROOT, focus }
+    TreeUpdate { nodes, tree: Some(TreeInfo::new(WINDOW_ID)), tree_id: TreeId::ROOT, focus }
 }
 
 fn text_selection(snapshot: &AccessibilitySnapshot) -> TextSelection {
