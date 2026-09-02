@@ -1,31 +1,33 @@
-//! Versioned, owner-only Unix socket automation protocol.
+//! Versioned, owner-only local automation protocol.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
+#[cfg(unix)]
 use std::ffi::OsStr;
 use std::fmt;
 use std::fs;
-use std::io::{self, BufRead, BufReader, Error as IoError, ErrorKind, Write};
-use std::os::unix::fs::PermissionsExt;
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::io::{self, BufRead, BufReader, Error as IoError, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, SyncSender, TrySendError};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use base64::Engine;
 use log::{error, warn};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use winit::event_loop::EventLoopProxy;
 
-use crate::cli::{IpcMouseAction, IpcWaitCondition, MessageOptions, Options, SocketMessage};
-use crate::event::{Event, EventType};
+use crate::cli::{
+    IpcAutomationPlan, IpcAutomationPlanStep, IpcCapture, IpcMouseAction, IpcPlanErrorPolicy,
+    IpcRunPlan, IpcVividCommand, IpcWait, IpcWaitCondition, MessageOptions, Options, SocketMessage,
+};
+use crate::event::{Event, EventSink, EventType};
+use crate::polling::transport::{LocalListener, LocalStream};
 use crate::terminal::thread;
 
 /// Formal Vivido automation protocol version.
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 
 /// Maximum request frame size.
 pub const MAX_REQUEST_FRAME_BYTES: usize = 1024 * 1024;
@@ -54,6 +56,22 @@ pub const MAX_INPUT_BYTES: usize = 1024 * 1024;
 /// Environment variable name for the IPC socket path.
 const VIVIDO_SOCKET_ENV: &str = "VIVIDO_SOCKET";
 
+/// Environment variable naming the headless session a client should reach.
+const VIVIDO_SESSION_ENV: &str = "VIVIDO_SESSION";
+
+/// How this instance describes itself in the `hello` capability document.
+///
+/// Whether a process is headless, and which session it serves, is fixed at startup, so it is
+/// recorded once rather than threaded through every connection.
+static INSTANCE: std::sync::OnceLock<Instance> = std::sync::OnceLock::new();
+
+#[derive(Debug, Default)]
+struct Instance {
+    headless: bool,
+    session: Option<String>,
+    automation_name: Option<String>,
+}
+
 /// Number of serialized frames buffered for one connection.
 const OUTPUT_QUEUE_FRAMES: usize = MAX_SUBSCRIBER_EVENTS + MAX_IN_FLIGHT_REQUESTS;
 
@@ -75,10 +93,22 @@ pub const METHODS: &[&str] = &[
     "paste",
     "mouse",
     "resize",
+    "set_geometry",
+    "set_geometry_batch",
+    "set_visible",
+    "set_level",
     "focus",
     "signal",
     "list_windows",
     "inspect",
+    "diagnose",
+    "vivid_sessions",
+    "vivid_surfaces",
+    "vivid_surface_status",
+    "vivid_tracks",
+    "vivid_track_status",
+    "vivid_scene_status",
+    "vivid_trace",
     "get_grid",
     "wait_text",
     "wait_output",
@@ -86,9 +116,145 @@ pub const METHODS: &[&str] = &[
     "wait_screen_stable",
     "wait_frame",
     "wait_exit",
+    "quit",
+    "wait_vivid_track",
     "transcript",
     "subscribe",
 ];
+
+/// Additional methods an in-process host has claimed, advertised alongside [`METHODS`].
+///
+/// The handshake is answered on the listener thread, while claiming happens on the main loop, so
+/// the claimed set lives here rather than on the processor that owns it.
+static HOST_METHODS: RwLock<Vec<String>> = RwLock::new(Vec::new());
+
+/// Descriptors supplied by an embedding host for its claimed methods.
+static HOST_METHOD_CAPABILITIES: RwLock<Vec<MethodCapability>> = RwLock::new(Vec::new());
+
+/// Stable high-level effect class for one automation method.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MethodClass {
+    Observe,
+    Input,
+    Window,
+    Config,
+    Process,
+    Lifecycle,
+    Extension,
+}
+
+/// Additive method metadata advertised by the version-2 handshake.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct MethodCapability {
+    pub name: String,
+    pub class: MethodClass,
+    pub mutating: bool,
+    pub host_claimed: bool,
+}
+
+impl MethodCapability {
+    pub fn host(name: impl Into<String>, class: MethodClass, mutating: bool) -> Self {
+        Self { name: name.into(), class, mutating, host_claimed: true }
+    }
+}
+
+/// Publish the host's claimed method names for the handshake to advertise.
+pub(crate) fn publish_host_methods<'a>(methods: impl IntoIterator<Item = &'a String>) {
+    let claimed = methods.into_iter().cloned().collect::<Vec<_>>();
+    match HOST_METHODS.write() {
+        Ok(mut host_methods) => *host_methods = claimed,
+        Err(poisoned) => *poisoned.into_inner() = claimed,
+    }
+}
+
+/// Publish effect metadata for methods claimed by an embedding host.
+pub(crate) fn publish_host_method_capabilities(capabilities: &[MethodCapability]) {
+    match HOST_METHOD_CAPABILITIES.write() {
+        Ok(mut published) => *published = capabilities.to_vec(),
+        Err(poisoned) => *poisoned.into_inner() = capabilities.to_vec(),
+    }
+}
+
+/// Every method the handshake advertises: Vivido's own plus the host's claimed names.
+fn advertised_methods() -> Vec<String> {
+    let mut methods = METHODS.iter().map(|method| (*method).to_owned()).collect::<Vec<_>>();
+    let host_methods = match HOST_METHODS.read() {
+        Ok(host_methods) => host_methods,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    for method in host_methods.iter() {
+        if !methods.iter().any(|advertised| advertised == method) {
+            methods.push(method.clone());
+        }
+    }
+    methods
+}
+
+fn method_class(name: &str) -> (MethodClass, bool) {
+    match name {
+        "hello"
+        | "ping"
+        | "get_config"
+        | "get_text"
+        | "screenshot"
+        | "list_windows"
+        | "inspect"
+        | "diagnose"
+        | "vivid_sessions"
+        | "vivid_surfaces"
+        | "vivid_surface_status"
+        | "vivid_tracks"
+        | "vivid_track_status"
+        | "vivid_scene_status"
+        | "vivid_trace"
+        | "get_grid"
+        | "wait_text"
+        | "wait_output"
+        | "wait_screen_change"
+        | "wait_screen_stable"
+        | "wait_frame"
+        | "wait_exit"
+        | "wait_vivid_track"
+        | "transcript"
+        | "subscribe"
+        | "unsubscribe" => (MethodClass::Observe, false),
+        "typing" | "key" | "paste" | "mouse" => (MethodClass::Input, true),
+        "create_window" | "resize" | "set_geometry" | "set_geometry_batch" | "set_visible"
+        | "set_level" => (MethodClass::Window, true),
+        "config" => (MethodClass::Config, true),
+        "focus" | "signal" => (MethodClass::Process, true),
+        "quit" => (MethodClass::Lifecycle, true),
+        _ => (MethodClass::Extension, true),
+    }
+}
+
+fn advertised_method_capabilities() -> Vec<MethodCapability> {
+    let methods = advertised_methods();
+    let host = match HOST_METHOD_CAPABILITIES.read() {
+        Ok(host) => host,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let host_methods = match HOST_METHODS.read() {
+        Ok(methods) => methods,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    methods
+        .into_iter()
+        .map(|name| {
+            if let Some(capability) = host.iter().find(|capability| capability.name == name) {
+                return capability.clone();
+            }
+            let (class, mutating) = method_class(&name);
+            MethodCapability {
+                host_claimed: host_methods.iter().any(|method| method == &name),
+                name,
+                class,
+                mutating,
+            }
+        })
+        .collect()
+}
 
 /// Event kinds advertised by the protocol handshake.
 pub const EVENT_KINDS: &[&str] = &[
@@ -98,6 +264,7 @@ pub const EVENT_KINDS: &[&str] = &[
     "title_changed",
     "focus_changed",
     "resized",
+    "moved",
     "bell",
     "child_exit",
     "window_created",
@@ -200,7 +367,7 @@ struct ConnectionInner {
     output: SyncSender<OutputFrame>,
     in_flight: Mutex<HashSet<u64>>,
     alive: AtomicBool,
-    shutdown: Mutex<Option<UnixStream>>,
+    shutdown: Mutex<Option<LocalStream>>,
 }
 
 impl fmt::Debug for IpcConnection {
@@ -221,7 +388,7 @@ impl IpcConnection {
     fn close(&self) {
         self.inner.alive.store(false, Ordering::Release);
         if let Some(stream) = self.inner.shutdown.lock().unwrap().take() {
-            let _ = stream.shutdown(std::net::Shutdown::Both);
+            let _ = stream.shutdown();
         }
     }
 
@@ -304,7 +471,7 @@ impl IpcConnection {
     }
 }
 
-struct OutputFrame {
+pub(crate) struct OutputFrame {
     bytes: Vec<u8>,
     _event_slot: Option<EventQueueSlot>,
 }
@@ -357,23 +524,21 @@ impl Drop for ConnectionGuard {
 
 /// IPC socket listener.
 pub struct IpcListener {
-    pub socket: UnixListener,
-    event_proxy: EventLoopProxy<Event>,
+    pub socket: LocalListener,
+    event_proxy: EventSink,
     connection_count: Arc<AtomicUsize>,
     next_connection_id: AtomicU64,
 }
 
 impl IpcListener {
-    pub fn new(
-        options: &Options,
-        event_proxy: EventLoopProxy<Event>,
-        path: &Path,
-    ) -> Result<Self, IoError> {
+    pub fn new(options: &Options, event_proxy: EventSink, path: &Path) -> Result<Self, IoError> {
         let socket = bind_socket(path)?;
         unsafe { env::set_var(VIVIDO_SOCKET_ENV, path.as_os_str()) };
-        if options.daemon {
-            println!("VIVIDO_SOCKET={}; export VIVIDO_SOCKET", path.display());
-        }
+        let _ = INSTANCE.set(Instance {
+            headless: options.headless,
+            session: options.session.clone(),
+            automation_name: options.automation_name.clone().or_else(|| options.session.clone()),
+        });
 
         Ok(Self {
             socket,
@@ -385,7 +550,9 @@ impl IpcListener {
 
     /// Accept and start one persistent full-duplex IPC session.
     pub fn process_message(&mut self) -> Result<(), IoError> {
-        let (stream, _) = self.socket.accept()?;
+        // `accept` verifies the peer's process owner in addition to the endpoint ACL/mode.
+        let stream = self.socket.accept()?;
+
         let previous = self.connection_count.fetch_add(1, Ordering::AcqRel);
         if previous >= MAX_CONNECTIONS {
             self.connection_count.fetch_sub(1, Ordering::AcqRel);
@@ -409,9 +576,9 @@ impl IpcListener {
 }
 
 fn spawn_connection(
-    stream: UnixStream,
+    stream: LocalStream,
     connection_id: u64,
-    event_proxy: EventLoopProxy<Event>,
+    event_proxy: EventSink,
     guard: ConnectionGuard,
 ) {
     // The listener is nonblocking for the polling thread. Accepted sockets inherit that flag on
@@ -449,7 +616,7 @@ fn spawn_connection(
         let _ = writer.set_write_timeout(Some(IPC_WRITE_TIMEOUT));
         while let Ok(frame) = output_rx.recv() {
             if writer.write_all(&frame.bytes).and_then(|()| writer.flush()).is_err() {
-                let _ = writer.shutdown(std::net::Shutdown::Both);
+                let _ = writer.shutdown();
                 break;
             }
         }
@@ -467,15 +634,11 @@ fn spawn_connection(
     });
 }
 
-fn configure_connection(stream: &UnixStream) -> io::Result<()> {
+fn configure_connection(stream: &LocalStream) -> io::Result<()> {
     stream.set_nonblocking(false)
 }
 
-fn run_connection(
-    stream: UnixStream,
-    connection: IpcConnection,
-    event_proxy: &EventLoopProxy<Event>,
-) {
+fn run_connection(stream: LocalStream, connection: IpcConnection, event_proxy: &EventSink) {
     let mut reader = BufReader::new(stream);
     let Some(first) = read_request_frame(&mut reader, &connection) else {
         return;
@@ -491,7 +654,7 @@ fn run_connection(
     if first.version != PROTOCOL_VERSION {
         connection.error(
             first.id,
-            IpcError::new("unsupported_version", "Vivido IPC requires protocol version 1")
+            IpcError::new("unsupported_version", "Vivido IPC requires protocol version 2")
                 .with_data(json!({"supported_versions": [PROTOCOL_VERSION]})),
         );
         return;
@@ -522,7 +685,7 @@ fn run_connection(
         if request.version != PROTOCOL_VERSION {
             connection.error(
                 request.id,
-                IpcError::new("unsupported_version", "Vivido IPC requires protocol version 1"),
+                IpcError::new("unsupported_version", "Vivido IPC requires protocol version 2"),
             );
             continue;
         }
@@ -606,10 +769,17 @@ fn decode_request(frame: &[u8]) -> Result<RequestEnvelope, IpcError> {
 }
 
 fn hello_result() -> Value {
+    let instance = INSTANCE.get();
     json!({
         "server_version": env!("CARGO_PKG_VERSION"),
         "protocol_version": PROTOCOL_VERSION,
-        "methods": METHODS,
+        // Lets an automation client tell a windowless instance from a windowed one without
+        // inferring it from a failed `focus`.
+        "headless": instance.is_some_and(|instance| instance.headless),
+        "session": instance.and_then(|instance| instance.session.clone()),
+        "automation_name": instance.and_then(|instance| instance.automation_name.clone()),
+        "methods": advertised_methods(),
+        "method_capabilities": advertised_method_capabilities(),
         "event_kinds": EVENT_KINDS,
         "error_codes": [
             "unsupported_version", "invalid_request", "invalid_params",
@@ -632,7 +802,7 @@ fn hello_result() -> Value {
     })
 }
 
-fn send_direct_error(mut stream: UnixStream, id: u64, error: IpcError) {
+fn send_direct_error(mut stream: LocalStream, id: u64, error: IpcError) {
     let response = ResponseEnvelope::error(id, error);
     if let Ok(mut frame) = serde_json::to_vec(&response) {
         frame.push(b'\n');
@@ -641,29 +811,498 @@ fn send_direct_error(mut stream: UnixStream, id: u64, error: IpcError) {
 }
 
 /// Bind and secure the Vivido IPC socket.
-fn bind_socket(path: &Path) -> io::Result<UnixListener> {
-    let socket = UnixListener::bind(path)?;
-    let result = fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-        .and_then(|()| socket.set_nonblocking(true));
-    if let Err(err) = result {
-        drop(socket);
-        let _ = fs::remove_file(path);
-        return Err(err);
-    }
+fn bind_socket(path: &Path) -> io::Result<LocalListener> {
+    let socket = LocalListener::bind(path)?;
+    socket.set_nonblocking(true)?;
     Ok(socket)
+}
+
+const AUTOMATION_PLAN_VERSION: u16 = 1;
+const MAX_AUTOMATION_PLAN_STEPS: usize = 256;
+const MAX_PLAN_NAME_BYTES: usize = 64;
+
+struct AutomationClient {
+    stream: LocalStream,
+    reader: BufReader<LocalStream>,
+    hello: Value,
+    next_request_id: u64,
+}
+
+impl AutomationClient {
+    fn connect(socket: Option<PathBuf>, target: Option<&str>) -> io::Result<Self> {
+        let mut stream = find_socket(socket, target)?;
+        stream.set_nonblocking(false)?;
+        let mut reader = BufReader::new(stream.try_clone()?);
+        send_client_request(&mut stream, 1, "hello", json!({}))?;
+        let hello = read_client_response(&mut reader, 1)?;
+        Ok(Self { stream, reader, hello, next_request_id: 2 })
+    }
+
+    fn request(&mut self, method: &str, params: Value) -> io::Result<Value> {
+        validate_method_name(method)?;
+        grant_focus_activation_for_method(&self.stream, method);
+        let id = self.next_request_id;
+        self.next_request_id = self
+            .next_request_id
+            .checked_add(1)
+            .ok_or_else(|| IoError::other("IPC request ID exhausted"))?;
+        send_client_request(&mut self.stream, id, method, params)?;
+        read_client_response(&mut self.reader, id)
+    }
+}
+
+fn validate_method_name(method: &str) -> io::Result<()> {
+    if method.is_empty()
+        || method.len() > 128
+        || !method.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    {
+        return Err(IoError::new(
+            ErrorKind::InvalidInput,
+            "IPC method must contain 1-128 ASCII letters, digits, or underscores",
+        ));
+    }
+    Ok(())
+}
+
+fn read_plan(options: &IpcRunPlan) -> io::Result<IpcAutomationPlan> {
+    let mut bytes = Vec::new();
+    match options.file.as_deref() {
+        Some(path) if path != Path::new("-") => {
+            fs::File::open(path)?
+                .take((MAX_REQUEST_FRAME_BYTES + 1) as u64)
+                .read_to_end(&mut bytes)?;
+        },
+        _ => {
+            io::stdin().take((MAX_REQUEST_FRAME_BYTES + 1) as u64).read_to_end(&mut bytes)?;
+        },
+    };
+    if bytes.len() > MAX_REQUEST_FRAME_BYTES {
+        return Err(IoError::new(ErrorKind::InvalidInput, "automation plan exceeds 1 MiB"));
+    }
+    serde_json::from_slice(&bytes).map_err(|error| {
+        IoError::new(ErrorKind::InvalidInput, format!("invalid plan JSON: {error}"))
+    })
+}
+
+fn valid_plan_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_PLAN_NAME_BYTES
+        && name.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
+fn collect_references(value: &Value, references: &mut Vec<String>) -> io::Result<()> {
+    match value {
+        Value::Array(values) => {
+            for value in values {
+                collect_references(value, references)?;
+            }
+        },
+        Value::Object(map) if map.len() == 1 && map.contains_key("$ref") => {
+            let reference = map["$ref"].as_str().ok_or_else(|| {
+                IoError::new(ErrorKind::InvalidInput, "$ref value must be a string")
+            })?;
+            references.push(reference.to_owned());
+        },
+        Value::Object(map) => {
+            for value in map.values() {
+                collect_references(value, references)?;
+            }
+        },
+        _ => (),
+    }
+    Ok(())
+}
+
+fn validate_plan(plan: &IpcAutomationPlan, methods: &HashSet<String>) -> io::Result<()> {
+    if plan.version != AUTOMATION_PLAN_VERSION {
+        return Err(IoError::new(
+            ErrorKind::InvalidInput,
+            format!("unsupported automation plan version {}", plan.version),
+        ));
+    }
+    if plan.steps.is_empty() || plan.steps.len() > MAX_AUTOMATION_PLAN_STEPS {
+        return Err(IoError::new(
+            ErrorKind::InvalidInput,
+            format!("automation plan must contain 1 through {MAX_AUTOMATION_PLAN_STEPS} steps"),
+        ));
+    }
+
+    let mut ids = HashSet::new();
+    let mut aliases = HashSet::new();
+    for step in &plan.steps {
+        if !valid_plan_name(&step.id) || !ids.insert(step.id.clone()) {
+            return Err(IoError::new(
+                ErrorKind::InvalidInput,
+                format!("invalid or duplicate plan step ID {:?}", step.id),
+            ));
+        }
+        validate_method_name(&step.method)?;
+        if step.method == "hello" || !methods.contains(&step.method) {
+            return Err(IoError::new(
+                ErrorKind::InvalidInput,
+                format!("plan step {:?} uses unsupported method {:?}", step.id, step.method),
+            ));
+        }
+        if !step.params.is_object() {
+            return Err(IoError::new(
+                ErrorKind::InvalidInput,
+                format!("plan step {:?} params must be a JSON object", step.id),
+            ));
+        }
+        let mut references = Vec::new();
+        collect_references(&step.params, &mut references)?;
+        if let Some(verification) = &step.verify {
+            collect_references(&verification.window_id, &mut references)?;
+            if !(1..=86_400_000).contains(&verification.timeout) {
+                return Err(IoError::new(
+                    ErrorKind::InvalidInput,
+                    format!("plan step {:?} verification timeout is invalid", step.id),
+                ));
+            }
+        }
+        if let Some(condition) = &step.when {
+            references.push(condition.reference.clone());
+        }
+        if let Some(reference) = references.iter().find(|reference| !aliases.contains(*reference)) {
+            return Err(IoError::new(
+                ErrorKind::InvalidInput,
+                format!("plan step {:?} has unavailable reference {:?}", step.id, reference),
+            ));
+        }
+        for (alias, pointer) in &step.bind {
+            if !valid_plan_name(alias) || !aliases.insert(alias.clone()) {
+                return Err(IoError::new(
+                    ErrorKind::InvalidInput,
+                    format!("invalid or duplicate plan alias {alias:?}"),
+                ));
+            }
+            if !pointer.is_empty() && !pointer.starts_with('/') {
+                return Err(IoError::new(
+                    ErrorKind::InvalidInput,
+                    format!("binding {alias:?} must use a JSON Pointer"),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn resolve_plan_references(value: &Value, aliases: &BTreeMap<String, Value>) -> io::Result<Value> {
+    match value {
+        Value::Array(values) => values
+            .iter()
+            .map(|value| resolve_plan_references(value, aliases))
+            .collect::<io::Result<Vec<_>>>()
+            .map(Value::Array),
+        Value::Object(map) if map.len() == 1 && map.contains_key("$ref") => {
+            let reference = map["$ref"].as_str().ok_or_else(|| {
+                IoError::new(ErrorKind::InvalidInput, "$ref value must be a string")
+            })?;
+            aliases.get(reference).cloned().ok_or_else(|| {
+                IoError::new(
+                    ErrorKind::InvalidInput,
+                    format!("plan reference {reference:?} is unavailable"),
+                )
+            })
+        },
+        Value::Object(map) => map
+            .iter()
+            .map(|(key, value)| Ok((key.clone(), resolve_plan_references(value, aliases)?)))
+            .collect::<io::Result<serde_json::Map<_, _>>>()
+            .map(Value::Object),
+        _ => Ok(value.clone()),
+    }
+}
+
+fn plan_capabilities(hello: &Value) -> io::Result<Vec<MethodCapability>> {
+    if let Some(capabilities) = hello.get("method_capabilities") {
+        return serde_json::from_value(capabilities.clone()).map_err(|error| {
+            IoError::new(ErrorKind::InvalidData, format!("invalid method capabilities: {error}"))
+        });
+    }
+    Ok(hello
+        .get("methods")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(|name| {
+            let (class, mutating) = method_class(name);
+            MethodCapability { name: name.to_owned(), class, mutating, host_claimed: false }
+        })
+        .collect())
+}
+
+fn write_plan_event(output: &mut impl Write, value: Value) -> io::Result<()> {
+    write_json_to(output, &value)?;
+    output.flush()
+}
+
+fn resolve_verification_window(
+    step: &IpcAutomationPlanStep,
+    aliases: &BTreeMap<String, Value>,
+) -> io::Result<Option<(u64, u64, bool)>> {
+    let Some(verification) = &step.verify else {
+        return Ok(None);
+    };
+    let window_id =
+        resolve_plan_references(&verification.window_id, aliases)?.as_u64().ok_or_else(|| {
+            IoError::new(ErrorKind::InvalidInput, "verification window_id is not u64")
+        })?;
+    Ok(Some((window_id, verification.timeout, verification.screenshot)))
+}
+
+fn run_plan(socket: Option<PathBuf>, target: Option<&str>, options: &IpcRunPlan) -> io::Result<()> {
+    let plan = read_plan(options)?;
+    let mut client = AutomationClient::connect(socket, target)?;
+    let capabilities = plan_capabilities(&client.hello)?;
+    let methods =
+        capabilities.iter().map(|capability| capability.name.clone()).collect::<HashSet<_>>();
+    validate_plan(&plan, &methods)?;
+    let classes = capabilities
+        .iter()
+        .map(|capability| (capability.name.as_str(), capability))
+        .collect::<HashMap<_, _>>();
+    let mut output = io::stdout().lock();
+    write_plan_event(
+        &mut output,
+        json!({"type":"plan_started","version":plan.version,"steps":plan.steps.len(),"mode":if options.dry_run {"dry_run"} else if options.preflight {"preflight"} else {"execute"}}),
+    )?;
+
+    let mut aliases = BTreeMap::new();
+    let mut failures = 0_u64;
+    for step in &plan.steps {
+        let capability = classes[step.method.as_str()];
+        if options.dry_run {
+            write_plan_event(
+                &mut output,
+                json!({"type":"step","id":step.id,"method":step.method,"class":capability.class,"mutating":capability.mutating,"status":"planned"}),
+            )?;
+            continue;
+        }
+        if options.preflight && capability.mutating {
+            write_plan_event(
+                &mut output,
+                json!({"type":"step","id":step.id,"method":step.method,"class":capability.class,"mutating":true,"status":"skipped","reason":"preflight_mutation"}),
+            )?;
+            continue;
+        }
+        if options.preflight {
+            let mut references = Vec::new();
+            collect_references(&step.params, &mut references)?;
+            if let Some(verification) = &step.verify {
+                collect_references(&verification.window_id, &mut references)?;
+            }
+            if let Some(condition) = &step.when {
+                references.push(condition.reference.clone());
+            }
+            if references.iter().any(|reference| !aliases.contains_key(reference)) {
+                write_plan_event(
+                    &mut output,
+                    json!({"type":"step","id":step.id,"method":step.method,"status":"skipped","reason":"dependency_unavailable"}),
+                )?;
+                continue;
+            }
+        }
+        if let Some(condition) = &step.when
+            && aliases.get(&condition.reference) != Some(&condition.equals)
+        {
+            write_plan_event(
+                &mut output,
+                json!({"type":"step","id":step.id,"method":step.method,"status":"skipped","reason":"condition_false"}),
+            )?;
+            continue;
+        }
+
+        let execution = (|| -> io::Result<Value> {
+            let params = resolve_plan_references(&step.params, &aliases)?;
+            if serde_json::to_vec(&params).map_err(IoError::other)?.len() > MAX_REQUEST_FRAME_BYTES
+            {
+                return Err(IoError::new(
+                    ErrorKind::InvalidInput,
+                    format!("resolved params for step {:?} exceed 1 MiB", step.id),
+                ));
+            }
+            let verification = resolve_verification_window(step, &aliases)?;
+            let before_frame = if let Some((window_id, _, _)) = verification {
+                Some(
+                    client
+                        .request("inspect", json!({"window_id":window_id}))?
+                        .pointer("/window/sequences/frame")
+                        .and_then(Value::as_u64)
+                        .ok_or_else(|| {
+                            IoError::new(
+                                ErrorKind::InvalidData,
+                                "inspect reply is missing frame sequence",
+                            )
+                        })?,
+                )
+            } else {
+                None
+            };
+            let action = client.request(&step.method, params)?;
+            let mut result = json!({"action":action});
+            if let Some((window_id, timeout, screenshot)) = verification {
+                let mut verification_result = serde_json::Map::new();
+                if step.verify.as_ref().is_some_and(|verification| verification.frame_changed) {
+                    let frame = client.request(
+                        "wait_frame",
+                        json!({"after_frame":before_frame,"common":{"timeout":timeout,"target":{"window_id":window_id}}}),
+                    )?;
+                    verification_result.insert("frame".into(), frame);
+                }
+                if screenshot {
+                    let screenshot =
+                        client.request("screenshot", json!({"window_id":window_id}))?;
+                    verification_result.insert("screenshot".into(), screenshot);
+                }
+                result["verification"] = Value::Object(verification_result);
+            }
+            Ok(result)
+        })();
+
+        match execution {
+            Ok(result) => {
+                let binding_source = result.get("action").unwrap_or(&result);
+                let binding_result = step.bind.iter().try_for_each(|(alias, pointer)| {
+                    let value = if pointer.is_empty() {
+                        Some(binding_source)
+                    } else {
+                        binding_source.pointer(pointer)
+                    }
+                    .ok_or_else(|| {
+                        IoError::new(
+                            ErrorKind::InvalidData,
+                            format!("step {:?} result has no binding pointer {pointer:?}", step.id),
+                        )
+                    })?;
+                    aliases.insert(alias.clone(), value.clone());
+                    Ok::<_, io::Error>(())
+                });
+                match binding_result {
+                    Ok(()) => write_plan_event(
+                        &mut output,
+                        json!({"type":"step","id":step.id,"method":step.method,"class":capability.class,"mutating":capability.mutating,"status":"ok","result":result}),
+                    )?,
+                    Err(error) => {
+                        failures = failures.saturating_add(1);
+                        write_plan_event(
+                            &mut output,
+                            json!({"type":"step","id":step.id,"method":step.method,"status":"error","error":error.to_string()}),
+                        )?;
+                        if step.on_error == IpcPlanErrorPolicy::Abort {
+                            write_plan_event(
+                                &mut output,
+                                json!({"type":"plan_completed","status":"failed","failures":failures}),
+                            )?;
+                            return Err(IoError::other(format!(
+                                "automation plan failed while binding step {:?}",
+                                step.id
+                            )));
+                        }
+                    },
+                }
+            },
+            Err(error) => {
+                failures = failures.saturating_add(1);
+                write_plan_event(
+                    &mut output,
+                    json!({"type":"step","id":step.id,"method":step.method,"status":"error","error":error.to_string()}),
+                )?;
+                if step.on_error == IpcPlanErrorPolicy::Abort {
+                    write_plan_event(
+                        &mut output,
+                        json!({"type":"plan_completed","status":"failed","failures":failures}),
+                    )?;
+                    return Err(IoError::other(format!(
+                        "automation plan failed at step {:?}",
+                        step.id
+                    )));
+                }
+            },
+        }
+    }
+
+    write_plan_event(
+        &mut output,
+        json!({"type":"plan_completed","status":if failures == 0 {"ok"} else {"completed_with_errors"},"failures":failures}),
+    )?;
+    if failures == 0 {
+        Ok(())
+    } else {
+        Err(IoError::other("automation plan completed with errors"))
+    }
+}
+
+fn run_capture(
+    socket: Option<PathBuf>,
+    target: Option<&str>,
+    options: &IpcCapture,
+) -> io::Result<()> {
+    if !(1..=86_400_000).contains(&options.timeout) {
+        return Err(IoError::new(ErrorKind::InvalidInput, "timeout must be 1 ms through 24 hours"));
+    }
+    let mut client = AutomationClient::connect(socket, target)?;
+    let methods = client
+        .hello
+        .get("methods")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect::<HashSet<_>>();
+    if options.activate {
+        let window_id = options.window_id.ok_or_else(|| {
+            IoError::new(ErrorKind::InvalidInput, "--activate requires --window-id")
+        })?;
+        if !methods.contains("vivida_activate_pane") {
+            return Err(IoError::new(
+                ErrorKind::Unsupported,
+                "target does not advertise pane activation",
+            ));
+        }
+        client.request("vivida_activate_pane", json!({"window_id":window_id}))?;
+    }
+    if let Some(after_frame) = options.after_frame {
+        client.request(
+            "wait_frame",
+            json!({"after_frame":after_frame,"common":{"timeout":options.timeout,"target":{"window_id":options.window_id}}}),
+        )?;
+    }
+    if let Some(quiet) = options.stable {
+        client.request(
+            "wait_screen_stable",
+            json!({"quiet":quiet,"after_screen":null,"common":{"timeout":options.timeout,"target":{"window_id":options.window_id}}}),
+        )?;
+    }
+    let screenshot = client.request("screenshot", json!({"window_id":options.window_id}))?;
+    write_json(&screenshot)
 }
 
 /// Send one CLI command using a versioned protocol session.
 pub fn send_message(options: MessageOptions) -> io::Result<()> {
+    if let SocketMessage::RunPlan(params) = &options.message {
+        return run_plan(options.socket, options.target.as_deref(), params);
+    }
+    if let SocketMessage::Capture(params) = &options.message {
+        return run_capture(options.socket, options.target.as_deref(), params);
+    }
     validate_message(&options.message)?;
-    let mut stream = find_socket(options.socket)?;
+    let mut stream = find_socket(options.socket, options.target.as_deref())?;
     stream.set_nonblocking(false)?;
+    grant_focus_activation_if_requested(&stream, &options.message);
     let mut reader = BufReader::new(stream.try_clone()?);
 
     send_client_request(&mut stream, 1, "hello", json!({}))?;
     let hello = read_client_response(&mut reader, 1)?;
     if matches!(options.message, SocketMessage::Capabilities) {
         return write_json(&hello);
+    }
+
+    if let SocketMessage::Vivid { command: IpcVividCommand::Trace(params) } = &options.message
+        && params.follow
+    {
+        return run_vivid_trace_follow(&mut stream, &mut reader, params.clone());
     }
 
     let (method, params) = message_request(&options.message)?;
@@ -688,8 +1327,114 @@ pub fn send_message(options: MessageOptions) -> io::Result<()> {
     Ok(())
 }
 
+/// Issue one bounded automation request without rendering CLI output.
+pub fn request_once(
+    socket: Option<PathBuf>,
+    target: Option<&str>,
+    message: &SocketMessage,
+) -> io::Result<(Value, Value)> {
+    validate_message(message)?;
+    let mut stream = find_socket(socket, target)?;
+    stream.set_nonblocking(false)?;
+    grant_focus_activation_if_requested(&stream, message);
+    let mut reader = BufReader::new(stream.try_clone()?);
+    send_client_request(&mut stream, 1, "hello", json!({}))?;
+    let hello = read_client_response(&mut reader, 1)?;
+    if matches!(message, SocketMessage::Capabilities) {
+        return Ok((hello.clone(), hello));
+    }
+    let (method, params) = message_request(message)?;
+    send_client_request(&mut stream, 2, method, params)?;
+    let result = read_client_response(&mut reader, 2)?;
+    Ok((hello, result))
+}
+
+#[cfg(windows)]
+fn grant_focus_activation_if_requested(stream: &LocalStream, message: &SocketMessage) {
+    if !matches!(message, SocketMessage::Focus(_)) {
+        return;
+    }
+    let Ok(server_pid) = stream.server_process_id() else {
+        return;
+    };
+    // Windows accepts this grant only when the caller is itself foreground-eligible. Failure is
+    // deliberately non-fatal: the server may already be foreground and still confirm focus.
+    unsafe {
+        windows_sys::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow(server_pid);
+    }
+}
+
+#[cfg(not(windows))]
+fn grant_focus_activation_if_requested(_stream: &LocalStream, _message: &SocketMessage) {}
+
+#[cfg(windows)]
+fn grant_focus_activation_for_method(stream: &LocalStream, method: &str) {
+    if method != "focus" {
+        return;
+    }
+    let Ok(server_pid) = stream.server_process_id() else {
+        return;
+    };
+    // SAFETY: This only grants the owner-verified local server process permission to request
+    // foreground activation; Windows still applies its normal foreground policy.
+    unsafe {
+        windows_sys::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow(server_pid);
+    }
+}
+
+#[cfg(not(windows))]
+fn grant_focus_activation_for_method(_stream: &LocalStream, _method: &str) {}
+
+/// Issue one bounded automation request by wire method name.
+///
+/// This is the extension point for an embedding host which adds methods beyond
+/// [`SocketMessage`]. It performs the same endpoint discovery, owner checks, handshake, framing,
+/// and response validation as [`send_message`].
+pub fn request_method(
+    socket: Option<PathBuf>,
+    target: Option<&str>,
+    method: &str,
+    params: Value,
+) -> io::Result<(Value, Value)> {
+    validate_method_name(method)?;
+    let mut stream = find_socket(socket, target)?;
+    stream.set_nonblocking(false)?;
+    let mut reader = BufReader::new(stream.try_clone()?);
+    send_client_request(&mut stream, 1, "hello", json!({}))?;
+    let hello = read_client_response(&mut reader, 1)?;
+    send_client_request(&mut stream, 2, method, params)?;
+    let result = read_client_response(&mut reader, 2)?;
+    Ok((hello, result))
+}
+
+fn run_vivid_trace_follow(
+    stream: &mut LocalStream,
+    reader: &mut BufReader<LocalStream>,
+    mut params: crate::cli::IpcVividTrace,
+) -> io::Result<()> {
+    let mut request_id = 2_u64;
+    let mut stdout = io::stdout().lock();
+    loop {
+        send_client_request(stream, request_id, "vivid_trace", vivid_trace_params(&params)?)?;
+        let batch = read_client_response(reader, request_id)?;
+        if let Some(gap) = batch.get("gap") {
+            write_json_to(&mut stdout, &json!({"type": "gap", "gap": gap}))?;
+        }
+        if let Some(events) = batch.get("events").and_then(Value::as_array) {
+            for event in events {
+                write_json_to(&mut stdout, event)?;
+            }
+        }
+        stdout.flush()?;
+        params.after = batch.get("current_sequence").and_then(Value::as_u64);
+        request_id = request_id
+            .checked_add(1)
+            .ok_or_else(|| IoError::other("Vivid trace request ID exhausted"))?;
+    }
+}
+
 fn send_client_request(
-    stream: &mut UnixStream,
+    stream: &mut LocalStream,
     id: u64,
     method: &str,
     params: Value,
@@ -709,7 +1454,16 @@ fn read_client_response<R: BufRead>(reader: &mut R, expected_id: u64) -> io::Res
         let Some(frame) = read_client_frame(reader)? else {
             return Err(IoError::new(ErrorKind::UnexpectedEof, "Vivido closed the IPC connection"));
         };
-        let response: ResponseEnvelope = serde_json::from_slice(&frame)
+        let value: Value = serde_json::from_slice(&frame)
+            .map_err(|err| IoError::new(ErrorKind::InvalidData, err))?;
+        // Subscription events can be interleaved with later responses on a plan's long-lived
+        // connection. They have no request ID, so leave them out of the synchronous reply path.
+        if value.get("id").is_none() {
+            serde_json::from_value::<SubscriptionEventEnvelope>(value)
+                .map_err(|err| IoError::new(ErrorKind::InvalidData, err))?;
+            continue;
+        }
+        let response: ResponseEnvelope = serde_json::from_value(value)
             .map_err(|err| IoError::new(ErrorKind::InvalidData, err))?;
         if response.version != PROTOCOL_VERSION || response.id != expected_id {
             continue;
@@ -748,20 +1502,57 @@ fn read_client_frame<R: BufRead>(reader: &mut R) -> io::Result<Option<Vec<u8>>> 
 fn message_request(message: &SocketMessage) -> io::Result<(&'static str, Value)> {
     match message {
         SocketMessage::CreateWindow(params) => Ok(("create_window", serialize_params(params)?)),
+        SocketMessage::Quit => Ok(("quit", Value::Object(Default::default()))),
+        SocketMessage::Ping => Ok(("ping", json!({}))),
         SocketMessage::Config(params) => Ok(("config", serialize_params(params)?)),
         SocketMessage::GetConfig(params) => Ok(("get_config", serialize_params(params)?)),
         SocketMessage::Typing(params) => Ok(("typing", serialize_params(params)?)),
         SocketMessage::GetText(params) => Ok(("get_text", serialize_params(params)?)),
         SocketMessage::Screenshot(params) => Ok(("screenshot", serialize_params(params)?)),
-        SocketMessage::Capabilities => unreachable!(),
+        SocketMessage::Capabilities | SocketMessage::RunPlan(_) | SocketMessage::Capture(_) => {
+            unreachable!("client-only automation command")
+        },
         SocketMessage::Key(params) => Ok(("key", serialize_params(params)?)),
         SocketMessage::Paste(params) => Ok(("paste", serialize_params(params)?)),
         SocketMessage::Mouse(params) => Ok(("mouse", serialize_params(params)?)),
         SocketMessage::Resize(params) => Ok(("resize", serialize_params(params)?)),
+        SocketMessage::SetGeometry(params) => Ok(("set_geometry", serialize_params(params)?)),
+        SocketMessage::SetVisible(params) => Ok(("set_visible", serialize_params(params)?)),
+        SocketMessage::SetLevel(params) => Ok(("set_level", serialize_params(params)?)),
         SocketMessage::Focus(params) => Ok(("focus", serialize_params(params)?)),
         SocketMessage::Signal(params) => Ok(("signal", serialize_params(params)?)),
         SocketMessage::ListWindows => Ok(("list_windows", json!({}))),
         SocketMessage::Inspect(params) => Ok(("inspect", serialize_params(params)?)),
+        SocketMessage::Diagnose(params) => Ok(("diagnose", serialize_params(params)?)),
+        SocketMessage::Vivid { command } => match command {
+            IpcVividCommand::Sessions(target) => Ok(("vivid_sessions", serialize_params(target)?)),
+            IpcVividCommand::Surfaces(target) => Ok(("vivid_surfaces", serialize_params(target)?)),
+            IpcVividCommand::SurfaceStatus { identity, target } => Ok((
+                "vivid_surface_status",
+                json!({
+                    "window_id": target.window_id,
+                    "session_id": identity.session_id,
+                    "context_id": identity.context_id,
+                    "surface_id": identity.surface_id,
+                }),
+            )),
+            IpcVividCommand::Tracks(target) => Ok(("vivid_tracks", serialize_params(target)?)),
+            IpcVividCommand::TrackStatus { identity, target } => Ok((
+                "vivid_track_status",
+                json!({
+                    "window_id": target.window_id,
+                    "session_id": identity.session_id,
+                    "context_id": identity.context_id,
+                    "surface_id": identity.surface_id,
+                    "track_id": identity.track_id,
+                }),
+            )),
+            IpcVividCommand::SceneStatus { session_id, target } => Ok((
+                "vivid_scene_status",
+                json!({"window_id": target.window_id, "session_id": session_id}),
+            )),
+            IpcVividCommand::Trace(params) => Ok(("vivid_trace", vivid_trace_params(params)?)),
+        },
         SocketMessage::GetGrid(params) => Ok(("get_grid", serialize_params(params)?)),
         SocketMessage::Transcript(params) => Ok(("transcript", serialize_params(params)?)),
         SocketMessage::Subscribe(params) => Ok(("subscribe", serialize_params(params)?)),
@@ -775,6 +1566,20 @@ fn message_request(message: &SocketMessage) -> io::Result<(&'static str, Value)>
                 Ok(("wait_screen_stable", serialize_params(params)?))
             },
             IpcWaitCondition::Frame(params) => Ok(("wait_frame", serialize_params(params)?)),
+            IpcWaitCondition::VividTrack(params) => Ok((
+                "wait_vivid_track",
+                json!({
+                    "window_id": params.target.window_id,
+                    "session_id": params.identity.session_id,
+                    "context_id": params.identity.context_id,
+                    "surface_id": params.identity.surface_id,
+                    "track_id": params.identity.track_id,
+                    "channel_generation": params.channel_generation,
+                    "condition": params.condition.wire_value(),
+                    "value": params.value,
+                    "timeout": params.timeout,
+                }),
+            )),
             IpcWaitCondition::Exit(params) => Ok(("wait_exit", serialize_params(params)?)),
         },
     }
@@ -782,6 +1587,24 @@ fn message_request(message: &SocketMessage) -> io::Result<(&'static str, Value)>
 
 fn serialize_params<T: Serialize>(params: &T) -> io::Result<Value> {
     serde_json::to_value(params).map_err(IoError::other)
+}
+
+fn vivid_trace_params(params: &crate::cli::IpcVividTrace) -> io::Result<Value> {
+    let mut value = serialize_params(params)?;
+    if let Some(sequence) = params.around {
+        value
+            .as_object_mut()
+            .ok_or_else(|| IoError::new(ErrorKind::InvalidData, "trace params are not an object"))?
+            .insert(
+                "around".into(),
+                json!({
+                    "sequence": sequence,
+                    "preceding": params.preceding,
+                    "following": params.following,
+                }),
+            );
+    }
+    Ok(value)
 }
 
 fn validate_message(message: &SocketMessage) -> io::Result<()> {
@@ -812,6 +1635,22 @@ fn validate_message(message: &SocketMessage) -> io::Result<()> {
             "resize requires either --columns/--rows or --width/--height",
         ));
     }
+    if let SocketMessage::SetGeometry(params) = message {
+        if params.x.is_none() && params.width.is_none() {
+            return Err(IoError::new(
+                ErrorKind::InvalidInput,
+                "set-geometry requires --x/--y, --width/--height, or both",
+            ));
+        }
+        if params.x.is_some() != params.y.is_some()
+            || params.width.is_some() != params.height.is_some()
+        {
+            return Err(IoError::new(
+                ErrorKind::InvalidInput,
+                "set-geometry coordinate and size pairs must be complete",
+            ));
+        }
+    }
     if let SocketMessage::Mouse(params) = message {
         let position = match &params.action {
             IpcMouseAction::Move(position) => position,
@@ -820,14 +1659,80 @@ fn validate_message(message: &SocketMessage) -> io::Result<()> {
             | IpcMouseAction::Down(action)
             | IpcMouseAction::Up(action)
             | IpcMouseAction::Drag(action) => &action.position,
+            IpcMouseAction::Path(path) => {
+                if !(2..=1000).contains(&path.points.len())
+                    || path.points.iter().any(|point| !point.x.is_finite() || !point.y.is_finite())
+                {
+                    return Err(IoError::new(
+                        ErrorKind::InvalidInput,
+                        "mouse path requires 2 through 1000 finite physical-pixel points",
+                    ));
+                }
+                if path.duration.is_some_and(|duration| !(1..=30_000).contains(&duration)) {
+                    return Err(IoError::new(
+                        ErrorKind::InvalidInput,
+                        "paced mouse path duration must be 1 ms through 30 seconds",
+                    ));
+                }
+                if path.wait_frame && !(1..=86_400_000).contains(&path.timeout) {
+                    return Err(IoError::new(
+                        ErrorKind::InvalidInput,
+                        "mouse path timeout must be 1 ms through 24 hours",
+                    ));
+                }
+                return Ok(());
+            },
             IpcMouseAction::Scroll(action) => &action.position,
         };
         let cell = position.cell_column.is_some() && position.cell_row.is_some();
         let pixel = position.x.is_some() && position.y.is_some();
-        if cell == pixel {
+        let relative = position.relative_x.is_some() && position.relative_y.is_some();
+        if usize::from(cell) + usize::from(pixel) + usize::from(relative) != 1 {
             return Err(IoError::new(
                 ErrorKind::InvalidInput,
-                "mouse requires exactly one complete cell or pixel coordinate pair",
+                "mouse requires exactly one complete cell, pixel, or relative coordinate pair",
+            ));
+        }
+        if relative
+            && [position.relative_x, position.relative_y]
+                .into_iter()
+                .flatten()
+                .any(|coordinate| !coordinate.is_finite() || !(0.0..=1.0).contains(&coordinate))
+        {
+            return Err(IoError::new(
+                ErrorKind::InvalidInput,
+                "relative mouse coordinates must be finite values from 0 through 1",
+            ));
+        }
+    }
+    if let SocketMessage::Wait(IpcWait { condition: IpcWaitCondition::VividTrack(params) }) =
+        message
+        && params.condition.requires_value() != params.value.is_some()
+    {
+        return Err(IoError::new(
+            ErrorKind::InvalidInput,
+            if params.condition.requires_value() {
+                "this Vivid track wait condition requires --value"
+            } else {
+                "this Vivid track wait condition does not accept --value"
+            },
+        ));
+    }
+    if let SocketMessage::Vivid { command: IpcVividCommand::Trace(params) } = message {
+        let selectors = usize::from(params.after.is_some())
+            + usize::from(params.tail)
+            + usize::from(params.before.is_some())
+            + usize::from(params.around.is_some());
+        let around_count = u32::from(params.preceding) + u32::from(params.following);
+        if selectors > 1
+            || (params.follow
+                && (params.tail || params.before.is_some() || params.around.is_some()))
+            || (params.around.is_some()
+                && !(1..=u32::from(crate::vivid::trace::MAX_QUERY_EVENTS)).contains(&around_count))
+        {
+            return Err(IoError::new(
+                ErrorKind::InvalidInput,
+                "invalid Vivid trace selector, follow mode, or around count",
             ));
         }
     }
@@ -839,6 +1744,7 @@ fn write_cli_result(message: &SocketMessage, result: &Value) -> io::Result<()> {
     match message {
         SocketMessage::GetText(_) => stdout
             .write_all(result.get("text").and_then(Value::as_str).unwrap_or_default().as_bytes()),
+        SocketMessage::Screenshot(params) if params.json => write_json_to(&mut stdout, result),
         SocketMessage::Screenshot(_) => {
             let path = result.get("path").and_then(Value::as_str).ok_or_else(|| {
                 IoError::new(ErrorKind::InvalidData, "screenshot reply is missing path")
@@ -851,6 +1757,8 @@ fn write_cli_result(message: &SocketMessage, result: &Value) -> io::Result<()> {
             })?;
             writeln!(stdout, "{window_id}")
         },
+        // The instance is shutting down; acknowledging it on stdout would be noise in a script.
+        SocketMessage::Quit => Ok(()),
         SocketMessage::GetConfig(_) => {
             let config = result.get("config").unwrap_or(result);
             serde_json::to_writer(&mut stdout, config).map_err(IoError::other)?;
@@ -866,18 +1774,29 @@ fn write_cli_result(message: &SocketMessage, result: &Value) -> io::Result<()> {
             stdout.write_all(&bytes)
         },
         SocketMessage::Capabilities
+        | SocketMessage::RunPlan(_)
+        | SocketMessage::Capture(_)
+        | SocketMessage::Ping
         | SocketMessage::ListWindows
         | SocketMessage::Inspect(_)
+        | SocketMessage::Diagnose(_)
+        | SocketMessage::Vivid { .. }
         | SocketMessage::GetGrid(_)
         | SocketMessage::Wait(_)
         | SocketMessage::Transcript(_)
         | SocketMessage::Subscribe(_) => write_json_to(&mut stdout, result),
+        SocketMessage::Typing(params) if params.report => write_json_to(&mut stdout, result),
+        SocketMessage::Key(params) if params.report => write_json_to(&mut stdout, result),
+        SocketMessage::Paste(params) if params.report => write_json_to(&mut stdout, result),
         SocketMessage::Config(_)
         | SocketMessage::Typing(_)
         | SocketMessage::Key(_)
         | SocketMessage::Paste(_)
         | SocketMessage::Mouse(_)
         | SocketMessage::Resize(_)
+        | SocketMessage::SetGeometry(_)
+        | SocketMessage::SetVisible(_)
+        | SocketMessage::SetLevel(_)
         | SocketMessage::Focus(_)
         | SocketMessage::Signal(_) => Ok(()),
     }
@@ -893,14 +1812,49 @@ fn write_json_to<W: Write>(output: &mut W, value: &Value) -> io::Result<()> {
 }
 
 /// Directory for the IPC socket file.
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(unix, not(target_os = "macos")))]
 pub fn socket_dir() -> PathBuf {
     xdg::BaseDirectories::with_prefix("vivido")
         .get_runtime_directory()
         .map(ToOwned::to_owned)
         .ok()
-        .and_then(|path| fs::create_dir_all(&path).map(|_| path).ok())
+        .and_then(private_socket_dir)
         .unwrap_or_else(env::temp_dir)
+}
+
+/// Hold the socket directory to the same standard `crate::session` holds a runtime root to.
+///
+/// The socket inside it injects input and reads screen content, so the 0600 mode `bind_socket`
+/// sets is not the whole defence: a directory another user can write to lets the socket be
+/// replaced wholesale rather than read. A directory Vivido has to create is therefore created
+/// owner-only rather than at the umask's discretion, and one that already exists is used only if
+/// it is this user's and closed to everyone else — otherwise discovery falls back to the temporary
+/// directory, where the socket mode and the peer check still stand. A path Vivido does not own is
+/// never modified, only declined.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn private_socket_dir(path: PathBuf) -> Option<PathBuf> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    if !path.exists() {
+        fs::create_dir_all(&path).ok()?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).ok()?;
+    }
+    let metadata = fs::symlink_metadata(&path).ok()?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_dir()
+        || metadata.uid() != effective_uid()
+        || metadata.mode() & 0o077 != 0
+    {
+        warn!("declining IPC socket directory {}: it is not owner-only", path.display());
+        return None;
+    }
+    Some(path)
+}
+
+#[cfg(unix)]
+fn effective_uid() -> u32 {
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    unsafe { libc::geteuid() }
 }
 
 /// Directory for the IPC socket file.
@@ -909,21 +1863,80 @@ pub fn socket_dir() -> PathBuf {
     env::temp_dir()
 }
 
+/// Default endpoint for a windowed instance.
+#[cfg(unix)]
+pub fn default_endpoint() -> PathBuf {
+    let mut path = socket_dir();
+    path.push(format!("{}-{}.sock", socket_prefix(), std::process::id()));
+    path
+}
+
+/// Default endpoint for a windowed Windows instance.
+#[cfg(windows)]
+pub fn default_endpoint() -> PathBuf {
+    PathBuf::from(format!(r"\\.\pipe\Vivido-{}", std::process::id()))
+}
+
+/// Connect, refusing a socket that belongs to another user.
+///
+/// The transport authenticates the peer's uid from both ends once a connection exists, so this is
+/// the check that runs *before* one does: a socket another user planted where Vivido looks — macOS
+/// still discovers them in the shared `env::temp_dir()` — is declined without a byte being written
+/// to it, and reported as what it is rather than as a protocol failure.
+fn connect_checked(path: &Path) -> io::Result<LocalStream> {
+    #[cfg(unix)]
+    require_socket_owner(path)?;
+    LocalStream::connect(path)
+}
+
+#[cfg(unix)]
+fn require_socket_owner(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = fs::symlink_metadata(path)?;
+    let owner = effective_uid();
+    if metadata.file_type().is_symlink() || metadata.uid() != owner {
+        return Err(IoError::new(
+            ErrorKind::PermissionDenied,
+            format!("IPC socket {} is not owned by uid {owner}", path.display()),
+        ));
+    }
+    Ok(())
+}
+
 /// Find a socket using an override, inherited endpoint, or current display discovery.
-fn find_socket(socket_path: Option<PathBuf>) -> io::Result<UnixStream> {
+fn find_socket(socket_path: Option<PathBuf>, target: Option<&str>) -> io::Result<LocalStream> {
     if let Some(socket_path) = socket_path {
-        return UnixStream::connect(&socket_path).map_err(|err| {
+        return connect_checked(&socket_path).map_err(|err| {
             IoError::new(err.kind(), format!("invalid socket path {socket_path:?}"))
         });
     }
 
+    // An explicitly named session must never silently fall through to a different instance.
+    if let Some(target) = target.map(str::to_owned).or_else(|| env::var(VIVIDO_SESSION_ENV).ok()) {
+        let registry = crate::session::registered_instance(&target)?;
+        return connect_checked(&registry.socket).map_err(|err| {
+            IoError::new(err.kind(), format!("no running Vivido instance named {target:?}"))
+        });
+    }
+
     if let Ok(path) = env::var(VIVIDO_SOCKET_ENV)
-        && let Ok(socket) = UnixStream::connect(path)
+        && let Ok(socket) = connect_checked(Path::new(&path))
     {
         return Ok(socket);
     }
 
+    // A single live headless session is unambiguous, so an unqualified `msg` should reach it.
+    if let Ok(sessions) = crate::session::list_registries()
+        && let [session] = sessions.as_slice()
+        && let Ok(socket) = connect_checked(&session.socket)
+    {
+        return Ok(socket);
+    }
+
+    #[cfg(unix)]
     let mut candidates = Vec::new();
+    #[cfg(unix)]
     for entry in fs::read_dir(socket_dir())?.filter_map(Result::ok) {
         let path = entry.path();
         let prefix = socket_prefix();
@@ -935,10 +1948,13 @@ fn find_socket(socket_path: Option<PathBuf>) -> io::Result<UnixStream> {
             candidates.push(path);
         }
     }
+    #[cfg(unix)]
     candidates.sort();
+    #[cfg(unix)]
     candidates.reverse();
+    #[cfg(unix)]
     for path in candidates {
-        match UnixStream::connect(&path) {
+        match connect_checked(&path) {
             Ok(socket) => return Ok(socket),
             Err(error) if error.kind() == ErrorKind::ConnectionRefused => {
                 let _ = fs::remove_file(path);
@@ -951,7 +1967,7 @@ fn find_socket(socket_path: Option<PathBuf>) -> io::Result<UnixStream> {
 }
 
 /// File prefix matching sockets on the current display server.
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(unix, not(target_os = "macos")))]
 pub fn socket_prefix() -> String {
     let display = env::var("WAYLAND_DISPLAY").or_else(|_| env::var("DISPLAY")).unwrap_or_default();
     format!("Vivido-{}", display.replace('/', "-"))
@@ -963,29 +1979,111 @@ pub fn socket_prefix() -> String {
     String::from("Vivido")
 }
 
+/// A connection whose frames land in the returned channel, for tests in this and other modules.
+#[cfg(test)]
+pub(crate) fn test_connection() -> (IpcConnection, mpsc::Receiver<OutputFrame>) {
+    let (output, receiver) = mpsc::sync_channel(OUTPUT_QUEUE_FRAMES);
+    let connection = IpcConnection {
+        inner: Arc::new(ConnectionInner {
+            id: 1,
+            output,
+            in_flight: Mutex::new(HashSet::new()),
+            alive: AtomicBool::new(true),
+            shutdown: Mutex::new(None),
+        }),
+    };
+    (connection, receiver)
+}
+
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    use std::io::Read;
     use std::io::{BufReader, Write};
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+    #[cfg(unix)]
     use std::os::unix::io::AsRawFd;
-    use std::os::unix::net::UnixStream;
 
     use serde_json::json;
 
     use super::*;
 
-    fn test_connection() -> (IpcConnection, mpsc::Receiver<OutputFrame>) {
-        let (output, receiver) = mpsc::sync_channel(OUTPUT_QUEUE_FRAMES);
-        let connection = IpcConnection {
-            inner: Arc::new(ConnectionInner {
-                id: 1,
-                output,
-                in_flight: Mutex::new(HashSet::new()),
-                alive: AtomicBool::new(true),
-                shutdown: Mutex::new(None),
-            }),
-        };
-        (connection, receiver)
+    #[test]
+    fn bounded_plan_accepts_backward_only_alias_references() {
+        let plan: IpcAutomationPlan = serde_json::from_value(json!({
+            "version": 1,
+            "steps": [
+                {
+                    "id": "resolve",
+                    "method": "inspect",
+                    "params": {"window_id": 42},
+                    "bind": {"target": "/window/window_id"}
+                },
+                {
+                    "id": "capture",
+                    "method": "screenshot",
+                    "params": {"window_id": {"$ref": "target"}},
+                    "when": {"reference": "target", "equals": 42}
+                }
+            ]
+        }))
+        .unwrap();
+        let methods = ["inspect".to_owned(), "screenshot".to_owned()].into_iter().collect();
+        validate_plan(&plan, &methods).unwrap();
+
+        let aliases = BTreeMap::from([(String::from("target"), json!(42))]);
+        assert_eq!(
+            resolve_plan_references(&plan.steps[1].params, &aliases).unwrap(),
+            json!({"window_id": 42})
+        );
+
+        let no_params: IpcAutomationPlan = serde_json::from_value(json!({
+            "version": 1,
+            "steps": [{"id": "windows", "method": "list_windows"}]
+        }))
+        .unwrap();
+        let methods = ["list_windows".to_owned()].into_iter().collect();
+        validate_plan(&no_params, &methods).unwrap();
+        assert_eq!(no_params.steps[0].params, json!({}));
+    }
+
+    #[test]
+    fn plan_rejects_forward_alias_references_and_unbounded_steps() {
+        let forward: IpcAutomationPlan = serde_json::from_value(json!({
+            "version": 1,
+            "steps": [{
+                "id": "capture",
+                "method": "screenshot",
+                "params": {"window_id": {"$ref": "later"}},
+                "bind": {"later": "/window_id"}
+            }]
+        }))
+        .unwrap();
+        let methods = ["screenshot".to_owned()].into_iter().collect();
+        assert!(validate_plan(&forward, &methods).is_err());
+
+        let step = forward.steps[0].clone();
+        let oversized =
+            IpcAutomationPlan { version: 1, steps: vec![step; MAX_AUTOMATION_PLAN_STEPS + 1] };
+        assert!(validate_plan(&oversized, &methods).is_err());
+    }
+
+    #[test]
+    fn handshake_classifies_standard_and_host_methods() {
+        let descriptors = [MethodCapability::host("vivida_layout", MethodClass::Observe, false)];
+        publish_host_methods([String::from("vivida_layout")].iter());
+        publish_host_method_capabilities(&descriptors);
+        let capabilities = advertised_method_capabilities();
+        assert!(capabilities.iter().any(|capability| {
+            capability.name == "mouse"
+                && capability.class == MethodClass::Input
+                && capability.mutating
+                && !capability.host_claimed
+        }));
+        assert!(capabilities.iter().any(|capability| capability == &descriptors[0]));
+        publish_host_methods([].iter());
+        publish_host_method_capabilities(&[]);
     }
 
     #[test]
@@ -1001,6 +2099,50 @@ mod tests {
         assert_eq!(decoded.version, 1);
         assert_eq!(decoded.id, 17);
         assert_eq!(decoded.method, "inspect");
+    }
+
+    #[test]
+    fn synchronous_response_reader_skips_interleaved_events() {
+        let frames = concat!(
+            "{\"version\":2,\"subscription_id\":3,\"event_sequence\":8,\"event\":{}}\n",
+            "{\"version\":2,\"id\":17,\"ok\":true,\"result\":{\"pong\":true}}\n"
+        );
+        let mut reader = BufReader::new(frames.as_bytes());
+        assert_eq!(read_client_response(&mut reader, 17).unwrap(), json!({"pong": true}));
+    }
+
+    #[test]
+    fn vivid_trace_around_is_structured_and_bounded() {
+        let params = crate::cli::IpcVividTrace {
+            target: crate::cli::IpcTarget::default(),
+            after: None,
+            tail: false,
+            before: None,
+            around: Some(420),
+            preceding: 64,
+            following: 16,
+            limit: 128,
+            timeout: 30_000,
+            follow: false,
+            session_id: None,
+            context_id: None,
+            surface_id: None,
+            track_id: None,
+            category: None,
+            recovery_only: false,
+        };
+        let value = vivid_trace_params(&params).unwrap();
+        assert_eq!(value["around"], json!({"sequence": 420, "preceding": 64, "following": 16}));
+        assert!(value.get("preceding").is_none());
+        assert!(value.get("following").is_none());
+
+        let mut invalid = params.clone();
+        invalid.preceding = 0;
+        invalid.following = 0;
+        assert!(
+            validate_message(&SocketMessage::Vivid { command: IpcVividCommand::Trace(invalid) })
+                .is_err()
+        );
     }
 
     #[test]
@@ -1077,7 +2219,7 @@ mod tests {
 
     #[test]
     fn partial_frame_is_read_until_newline() {
-        let (mut client, server) = UnixStream::pair().unwrap();
+        let (mut client, server) = LocalStream::pair().unwrap();
         let writer = std::thread::spawn(move || {
             client.write_all(br#"{"version":1,"id":1,"method":"hello","params":{}"#).unwrap();
             client.write_all(b"}\n").unwrap();
@@ -1099,7 +2241,7 @@ mod tests {
 
     #[test]
     fn rejects_oversized_frame() {
-        let (mut client, server) = UnixStream::pair().unwrap();
+        let (mut client, server) = LocalStream::pair().unwrap();
         let writer = std::thread::spawn(move || {
             client.write_all(&vec![b'x'; MAX_REQUEST_FRAME_BYTES + 1]).unwrap();
         });
@@ -1117,17 +2259,92 @@ mod tests {
         writer.join().unwrap();
     }
 
+    /// The IPC surface injects input and reads screen content, so its socket is owner-only —
+    /// stated outright rather than inherited from whatever umask the shell happened to have.
     #[test]
-    fn socket_is_owner_only() {
+    #[cfg(unix)]
+    fn socket_is_owner_only_regardless_of_umask() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("vivido.sock");
-        let _socket = bind_socket(&path).unwrap();
+
+        // SAFETY: umask has no preconditions. It is process-wide, so it is restored immediately
+        // and held for no longer than the bind.
+        let previous = unsafe { libc::umask(0) };
+        let bound = bind_socket(&path);
+        unsafe { libc::umask(previous) };
+
+        let Some(_socket) = bound_socket_or_skip(bound) else {
+            return;
+        };
         assert_eq!(path.metadata().unwrap().permissions().mode() & 0o777, 0o600);
     }
 
+    /// A socket belonging to somebody else is declined before a byte is written to it.
+    ///
+    /// On macOS the sockets are discovered in a shared `env::temp_dir()`, so a path where Vivido
+    /// looks is not proof of who put it there.
     #[test]
+    #[cfg(unix)]
+    fn a_socket_owned_by_another_user_is_refused_before_connecting() {
+        use std::os::unix::fs::MetadataExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let ours = directory.path().join("ours.sock");
+        std::fs::File::create(&ours).unwrap();
+        require_socket_owner(&ours).expect("a path this user owns is accepted");
+
+        // Faking a peer uid needs privileges this runner may not have; an existing path owned by
+        // another user proves the same predicate without them.
+        let Some(theirs) =
+            ["/etc/hosts", "/bin/sh", "/usr/bin/env"].into_iter().map(Path::new).find(|path| {
+                fs::symlink_metadata(path).is_ok_and(|metadata| metadata.uid() != effective_uid())
+            })
+        else {
+            eprintln!("skipping foreign-owner test: this runner owns every candidate path");
+            return;
+        };
+        let error =
+            require_socket_owner(theirs).expect_err("a socket owned by another user is refused");
+        assert_eq!(error.kind(), ErrorKind::PermissionDenied);
+    }
+
+    /// A directory Vivido has to create for its sockets is owner-only whatever the umask says.
+    #[test]
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn the_socket_directory_vivido_creates_is_owner_only() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("runtime");
+
+        // SAFETY: umask has no preconditions. It is process-wide, so it is restored at once.
+        let previous = unsafe { libc::umask(0) };
+        let created = private_socket_dir(path.clone());
+        unsafe { libc::umask(previous) };
+
+        assert_eq!(created, Some(path.clone()));
+        assert_eq!(path.metadata().unwrap().permissions().mode() & 0o777, 0o700);
+    }
+
+    /// One that anybody else can write to is declined rather than trusted or rewritten.
+    #[test]
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn a_socket_directory_open_to_others_is_declined() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("shared");
+        fs::create_dir(&path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o777)).unwrap();
+
+        assert_eq!(private_socket_dir(path.clone()), None);
+        assert_eq!(
+            path.metadata().unwrap().permissions().mode() & 0o777,
+            0o777,
+            "a directory Vivido does not own is left exactly as it was found"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn accepted_connections_are_restored_to_blocking_mode() {
-        let (_client, server) = UnixStream::pair().unwrap();
+        let (_client, server) = LocalStream::pair().unwrap();
         server.set_nonblocking(true).unwrap();
         configure_connection(&server).unwrap();
 
@@ -1139,8 +2356,135 @@ mod tests {
     #[test]
     fn hello_advertises_required_limits() {
         let hello = hello_result();
-        assert_eq!(hello["protocol_version"], 1);
+        assert_eq!(hello["protocol_version"], 2);
         assert_eq!(hello["limits"]["connections"], 32);
         assert!(hello["methods"].as_array().unwrap().iter().any(|value| value == "get_grid"));
+        for method in [
+            "vivid_sessions",
+            "vivid_surfaces",
+            "vivid_surface_status",
+            "vivid_tracks",
+            "vivid_track_status",
+            "vivid_scene_status",
+            "wait_vivid_track",
+            "set_geometry",
+            "set_visible",
+            "set_level",
+        ] {
+            assert!(hello["methods"].as_array().unwrap().iter().any(|value| value == method));
+        }
+        assert!(hello["event_kinds"].as_array().unwrap().iter().any(|value| value == "moved"));
+        for retired in
+            ["vivid_sources", "vivid_source_status", "vivid_milestones", "wait_vivid_source"]
+        {
+            assert!(!hello["methods"].as_array().unwrap().iter().any(|value| value == retired));
+        }
+    }
+
+    #[test]
+    fn hello_advertises_host_claimed_methods_beside_vivido_own() {
+        let claimed = [String::from("vvbox_list_tabs"), String::from("create_window")];
+        publish_host_methods(claimed.iter());
+
+        let methods = advertised_methods();
+        // A host name is added once, and re-claiming a built-in never duplicates it.
+        assert_eq!(methods.iter().filter(|method| *method == "vvbox_list_tabs").count(), 1);
+        assert_eq!(methods.iter().filter(|method| *method == "create_window").count(), 1);
+        // Claiming does not withdraw anything Vivido still answers itself.
+        assert!(methods.iter().any(|method| method == "get_grid"));
+
+        publish_host_methods([].iter());
+        assert!(!advertised_methods().iter().any(|method| method == "vvbox_list_tabs"));
+    }
+
+    /// A connection from this very process is by definition the owner, so it must be accepted.
+    #[test]
+    #[cfg(unix)]
+    fn the_owner_is_accepted_on_both_ends_of_a_socket() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("owner.sock");
+        let Some(listener) = bound_socket_or_skip(LocalListener::bind(&path)) else {
+            return;
+        };
+        let client = std::thread::spawn({
+            let path = path.clone();
+            move || LocalStream::connect(&path).expect("client accepts server owner")
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        let _server = loop {
+            match listener.accept() {
+                Ok(server) => break server,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "owner connection was not accepted"
+                    );
+                    std::thread::yield_now();
+                },
+                Err(error) => panic!("server accepts client owner: {error}"),
+            }
+        };
+        let _client = client.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    fn bound_socket_or_skip<T>(result: io::Result<T>) -> Option<T> {
+        match result {
+            Ok(socket) => Some(socket),
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                eprintln!("skipping socket test: this runner forbids local socket binds");
+                None
+            },
+            Err(error) => panic!("could not bind test socket: {error}"),
+        }
+    }
+
+    /// Owner authentication runs on both pipe ends, and a blocked reader must not stall writes.
+    #[test]
+    #[cfg(windows)]
+    fn the_owner_is_accepted_by_a_full_duplex_named_pipe() {
+        let path = PathBuf::from(format!(r"\\.\pipe\vivido-owner-test-{}", std::process::id()));
+        let listener = LocalListener::bind(&path).expect("bind");
+        let client = std::thread::spawn({
+            let path = path.clone();
+            move || LocalStream::connect(&path).expect("client accepts server owner")
+        });
+        let mut server = listener.accept().expect("server accepts client owner");
+        let mut client = client.join().unwrap();
+
+        let mut server_reader = server.try_clone().unwrap();
+        let mut client_reader = client.try_clone().unwrap();
+        let server_read = std::thread::spawn(move || {
+            let mut bytes = [0; 6];
+            server_reader.read_exact(&mut bytes).unwrap();
+            bytes
+        });
+        let client_read = std::thread::spawn(move || {
+            let mut bytes = [0; 6];
+            client_reader.read_exact(&mut bytes).unwrap();
+            bytes
+        });
+        std::thread::sleep(Duration::from_millis(10));
+        server.write_all(b"server").unwrap();
+        client.write_all(b"client").unwrap();
+        assert_eq!(&server_read.join().unwrap(), b"client");
+        assert_eq!(&client_read.join().unwrap(), b"server");
+    }
+
+    /// The capability document tells a client whether it reached a windowless instance.
+    #[test]
+    fn hello_reports_whether_this_instance_is_headless() {
+        let hello = hello_result();
+
+        // `INSTANCE` is unset in tests, which must read as "windowed" rather than panic.
+        assert_eq!(hello["headless"], serde_json::json!(false));
+        assert_eq!(hello["session"], Value::Null);
+        assert!(hello["methods"].as_array().unwrap().iter().any(|value| value == "quit"));
+    }
+
+    #[test]
+    fn extension_method_names_are_validated_before_endpoint_discovery() {
+        let error = request_method(None, None, "invalid-method", json!({})).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
     }
 }

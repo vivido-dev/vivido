@@ -2,21 +2,8 @@
 //!
 //! Used to track rendering times and provide moving averages.
 //!
-//! # Examples
-//!
-//! ```rust
-//! // create a meter
-//! let mut meter = crate::terminal::meter::Meter::new();
-//!
-//! // Sample something.
-//! {
-//!     let _sampler = meter.sampler();
-//! }
-//!
-//! // Get the moving average. The meter tracks a fixed number of samples, and
-//! // the average won't mean much until it's filled up at least once.
-//! println!("Average time: {}", meter.average());
-//! ```
+//! This is an internal display utility; callers record durations with [`Meter::record`] and read
+//! the moving average with [`Meter::average`].
 
 use std::time::Duration;
 

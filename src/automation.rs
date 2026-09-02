@@ -88,7 +88,19 @@ impl Transcript {
         let relative = usize::try_from(start.saturating_sub(self.oldest_offset))
             .unwrap_or(usize::MAX)
             .min(self.bytes.len());
-        Ok(self.bytes.iter().skip(relative).take(max_bytes).copied().collect())
+        let end = relative.saturating_add(max_bytes).min(self.bytes.len());
+
+        // Copy by run rather than by byte: this reads back every byte of PTY output, so an
+        // iterator over the ring shows up directly in the cost of ordinary terminal traffic.
+        let (front, back) = self.bytes.as_slices();
+        let mut data = Vec::with_capacity(end - relative);
+        if relative < front.len() {
+            data.extend_from_slice(&front[relative..end.min(front.len())]);
+        }
+        if end > front.len() {
+            data.extend_from_slice(&back[relative.saturating_sub(front.len())..end - front.len()]);
+        }
+        Ok(data)
     }
 
     /// Read the newest bytes, or bytes after an explicit absolute offset.
@@ -239,6 +251,20 @@ pub enum WaitKind {
     Frame {
         after: u64,
     },
+    VividTrack {
+        session_id: u64,
+        context_id: u64,
+        surface_id: u64,
+        track_id: u64,
+        channel_generation: u64,
+        condition: u64,
+        value: Option<u64>,
+    },
+    VividTrace {
+        after_sequence: u64,
+        limit: u16,
+        filter: crate::vivid::trace::TraceFilter,
+    },
     Exit,
     Resize {
         columns: Option<u16>,
@@ -248,6 +274,14 @@ pub enum WaitKind {
         after_resize: u64,
         pty_token: Option<u64>,
         pty_complete: bool,
+    },
+    Gesture {
+        after_frame: Option<u64>,
+        pty_token: Option<u64>,
+        pty_complete: bool,
+        written_bytes: usize,
+        points: usize,
+        duration_ms: u64,
     },
     Focus {
         after_focus: u64,
@@ -259,8 +293,41 @@ struct StoredEvent {
     sequence: u64,
     window_id: Option<u64>,
     kind: String,
-    data: Value,
+    payload: StoredPayload,
     encoded_size: usize,
+}
+
+/// The body of a retained event.
+///
+/// Output keeps its raw bytes and is encoded only for a subscriber that actually receives it.
+/// Nearly all retained output is never read by anyone, and base64 both costs a pass over every
+/// byte and stores a third more than the bytes it describes.
+#[derive(Clone, Debug)]
+enum StoredPayload {
+    Json(Value),
+    Output { start_offset: u64, end_offset: u64, bytes: Vec<u8> },
+}
+
+impl StoredPayload {
+    fn to_value(&self) -> Value {
+        match self {
+            Self::Json(value) => value.clone(),
+            Self::Output { start_offset, end_offset, bytes } => json!({
+                "start_offset": start_offset,
+                "end_offset": end_offset,
+                "data": base64::engine::general_purpose::STANDARD.encode(bytes),
+            }),
+        }
+    }
+
+    /// Contribution to the replay ring's byte budget, which bounds retained memory.
+    fn encoded_size(&self) -> usize {
+        match self {
+            Self::Json(value) => serde_json::to_vec(value).map_or(0, |value| value.len()),
+            // Charge what a subscriber would receive: base64 emits four bytes per three.
+            Self::Output { bytes, .. } => bytes.len().div_ceil(3) * 4,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -310,7 +377,7 @@ impl Subscriber {
             subscription_id: self.id,
             event_sequence: event.sequence,
             window_id: event.window_id,
-            event: json!({"type": event.kind, "data": event.data}),
+            event: json!({"type": event.kind, "data": event.payload.to_value()}),
         };
         if self.connection.event(envelope, &self.queued_events).is_err() {
             self.overflow = Some(match self.overflow {
@@ -349,45 +416,52 @@ impl AutomationHub {
     }
 
     pub fn emit(&mut self, window_id: Option<u64>, kind: &str, data: Value) -> u64 {
+        self.emit_payload(window_id, kind, StoredPayload::Json(data))
+    }
+
+    pub fn emit_output(&mut self, window_id: u64, start: u64, bytes: &[u8]) {
+        for (chunk_index, chunk) in bytes.chunks(OUTPUT_EVENT_CHUNK).enumerate() {
+            let chunk_start = start.saturating_add((chunk_index * OUTPUT_EVENT_CHUNK) as u64);
+            self.emit_payload(
+                Some(window_id),
+                "output",
+                StoredPayload::Output {
+                    start_offset: chunk_start,
+                    end_offset: chunk_start.saturating_add(chunk.len() as u64),
+                    bytes: chunk.to_vec(),
+                },
+            );
+        }
+    }
+
+    fn emit_payload(&mut self, window_id: Option<u64>, kind: &str, payload: StoredPayload) -> u64 {
         self.event_sequence = self.event_sequence.saturating_add(1);
-        let encoded_size =
-            serde_json::to_vec(&data).map_or(0, |data| data.len()) + kind.len() + 128;
+        let encoded_size = payload.encoded_size() + kind.len() + 128;
         let event = StoredEvent {
             sequence: self.event_sequence,
             window_id,
             kind: kind.to_owned(),
-            data,
+            payload,
             encoded_size,
         };
-        self.replay_bytes = self.replay_bytes.saturating_add(encoded_size);
-        self.replay.push_back(event.clone());
-        while self.replay.len() > EVENT_REPLAY_COUNT || self.replay_bytes > EVENT_REPLAY_BYTES {
-            if let Some(oldest) = self.replay.pop_front() {
-                self.replay_bytes = self.replay_bytes.saturating_sub(oldest.encoded_size);
-            }
-        }
+
         for subscriber in &mut self.subscribers {
             if subscriber.matches(&event) {
                 subscriber.send(&event);
             }
         }
         self.subscribers.retain(|subscriber| subscriber.connection.is_alive());
-        self.event_sequence
-    }
 
-    pub fn emit_output(&mut self, window_id: u64, start: u64, bytes: &[u8]) {
-        for (chunk_index, chunk) in bytes.chunks(OUTPUT_EVENT_CHUNK).enumerate() {
-            let chunk_start = start.saturating_add((chunk_index * OUTPUT_EVENT_CHUNK) as u64);
-            self.emit(
-                Some(window_id),
-                "output",
-                json!({
-                    "start_offset": chunk_start,
-                    "end_offset": chunk_start.saturating_add(chunk.len() as u64),
-                    "data": base64::engine::general_purpose::STANDARD.encode(chunk),
-                }),
-            );
+        // Retain after delivery so the event moves into the ring rather than being cloned into it.
+        self.replay_bytes = self.replay_bytes.saturating_add(encoded_size);
+        self.replay.push_back(event);
+        while self.replay.len() > EVENT_REPLAY_COUNT || self.replay_bytes > EVENT_REPLAY_BYTES {
+            if let Some(oldest) = self.replay.pop_front() {
+                self.replay_bytes = self.replay_bytes.saturating_sub(oldest.encoded_size);
+            }
         }
+
+        self.event_sequence
     }
 
     pub fn subscribe(
@@ -443,12 +517,12 @@ impl AutomationHub {
                     sequence: self.event_sequence,
                     window_id: request.target,
                     kind: String::from("overflow"),
-                    data: json!({
+                    payload: StoredPayload::Json(json!({
                         "requested_sequence": since,
                         "oldest_sequence": oldest,
                         "current_event_sequence": self.event_sequence,
                         "current_sequences": request.current_sequences,
-                    }),
+                    })),
                     encoded_size: 0,
                 };
                 subscriber.send(&gap);
@@ -512,6 +586,80 @@ mod tests {
         transcript.append(b"rea");
         transcript.append(b"dy> ");
         assert_eq!(transcript.range(0, 64).unwrap(), b"ready> ");
+    }
+
+    #[test]
+    fn transcript_reads_back_every_byte_once_the_ring_wraps() {
+        let mut transcript = Transcript::default();
+        let byte_at = |offset: u64| (offset % 251) as u8;
+
+        // Append past capacity in uneven chunks so the ring wraps and its storage is two runs.
+        let mut written = 0u64;
+        while written < TRANSCRIPT_CAPACITY as u64 * 2 {
+            let length = 7000 + (written % 13) as usize;
+            let chunk =
+                (0..length).map(|index| byte_at(written + index as u64)).collect::<Vec<_>>();
+            transcript.append(&chunk);
+            written += length as u64;
+        }
+        assert!(!transcript.bytes.as_slices().1.is_empty(), "expected a wrapped ring");
+
+        let oldest = transcript.oldest_offset();
+        let end = transcript.end_offset();
+        for start in [oldest, oldest + 1, oldest + 12345, end - 4096] {
+            let data = transcript.range(start, 5000).unwrap();
+            assert!(!data.is_empty());
+            for (index, &byte) in data.iter().enumerate() {
+                let offset = start + index as u64;
+                assert_eq!(byte, byte_at(offset), "wrong byte at offset {offset}");
+            }
+        }
+
+        // A read running past the end returns exactly the retained remainder.
+        assert_eq!(transcript.range(end - 3, 1000).unwrap().len(), 3);
+        assert!(transcript.range(end, 1000).unwrap().is_empty());
+    }
+
+    #[test]
+    fn output_is_retained_unencoded_but_reads_back_in_the_wire_shape() {
+        let mut hub = AutomationHub::default();
+        hub.emit_output(7, 100, b"hello");
+
+        let event = hub.replay.back().expect("the event is retained for replay");
+        assert_eq!(event.kind, "output");
+        assert_eq!(event.window_id, Some(7));
+        assert!(
+            matches!(&event.payload, StoredPayload::Output { bytes, .. } if bytes == b"hello"),
+            "raw bytes are retained rather than base64",
+        );
+        assert_eq!(
+            event.payload.to_value(),
+            json!({"start_offset": 100, "end_offset": 105, "data": "aGVsbG8="}),
+        );
+    }
+
+    #[test]
+    fn long_output_is_split_into_contiguous_chunks() {
+        let mut hub = AutomationHub::default();
+        hub.emit_output(1, 40, &vec![b'x'; OUTPUT_EVENT_CHUNK + 5]);
+
+        let offsets = hub
+            .replay
+            .iter()
+            .map(|event| match &event.payload {
+                StoredPayload::Output { start_offset, end_offset, .. } => {
+                    (*start_offset, *end_offset)
+                },
+                other => panic!("expected output, got {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            offsets,
+            [
+                (40, 40 + OUTPUT_EVENT_CHUNK as u64),
+                (40 + OUTPUT_EVENT_CHUNK as u64, 45 + OUTPUT_EVENT_CHUNK as u64),
+            ]
+        );
     }
 
     #[test]

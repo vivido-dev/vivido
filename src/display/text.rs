@@ -1,4 +1,6 @@
 use std::borrow::Cow;
+use std::cell::RefCell;
+use std::ops::Range;
 use std::sync::Arc;
 use std::{array, env};
 
@@ -11,7 +13,9 @@ use parley::{
     StyleProperty,
 };
 use unicode_script::UnicodeScript as _;
-use vello::peniko::Color;
+use vello::kurbo::Affine;
+use vello::peniko::{Brush, Color, Fill};
+use vello::{Glyph, Scene};
 
 use crate::terminal::term::cell::Flags;
 
@@ -54,34 +58,109 @@ struct LayoutKey {
     font_size_bits: u32,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct TerminalLayoutKey {
+    text: Box<str>,
+    spans: Box<[TerminalStyleKey]>,
+    ligatures: bool,
+    font_size_bits: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct TerminalStyleKey {
+    end: usize,
+    variant: FontVariant,
+    color: (u8, u8, u8),
+}
+
+/// One contiguous presentation span in a terminal row shaping run.
+#[derive(Clone, Debug)]
+pub(crate) struct TerminalTextStyle {
+    pub range: Range<usize>,
+    pub flags: Flags,
+    pub color: Rgb,
+}
+
+/// Shaped layouts kept alive at once.
+///
+/// The cache is keyed partly by the cluster's text, so a program emitting many distinct
+/// multi-character clusters — emoji sequences, combining marks, a fuzzer — grew it without bound;
+/// only a font change ever cleared it. A terminal's real working set is a few hundred distinct
+/// clusters, so four thousand keeps every ordinary session entirely cached and still bounds the
+/// pathological one.
+const MAX_CACHED_LAYOUTS: usize = 4096;
+
+/// How much of the cache one eviction reclaims.
+///
+/// Reclaiming a batch rather than a single entry is what keeps the scan amortized: one pass over
+/// the cache buys the next thousand insertions, so a flood of distinct clusters pays a constant
+/// amount each instead of a full scan apiece.
+const LAYOUT_EVICTION_BATCH: usize = MAX_CACHED_LAYOUTS / 4;
+
+thread_local! {
+    /// Parley designs its font context as one application/thread resource. Keep a pristine
+    /// per-thread template so every pane and the integrated chrome share the same DirectWrite
+    /// system collection while retaining independent query, source, and layout caches.
+    static FONT_CONTEXT: RefCell<Option<FontContext>> = const { RefCell::new(None) };
+
+    #[cfg(test)]
+    static FONT_CONTEXT_INITIALIZATIONS: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+}
+
+struct CachedLayout {
+    layout: Arc<Layout<()>>,
+    /// The value of `cache_clock` when this layout was last handed out.
+    used: u64,
+}
+
+struct CachedTerminalLayout {
+    layout: Arc<Layout<Rgb>>,
+    used: u64,
+}
+
 pub struct TextSystem {
     font: Font,
     font_cx: FontContext,
     layout_cx: LayoutContext<()>,
+    terminal_layout_cx: LayoutContext<Rgb>,
     metrics: TextMetrics,
     locale: Option<Language>,
     fallback_search_families: Arc<[FamilyId]>,
     checked_fallbacks: AHashSet<(FallbackKey, char)>,
+    pua_fallback_family_names: Arc<[FontFamilyName<'static>]>,
     family_stacks: [FontFamily<'static>; 4],
+    pua_family_stacks: [FontFamily<'static>; 4],
     variant_styles: [(ParleyFontStyle, FontWeight); 4],
-    cache: AHashMap<LayoutKey, Arc<Layout<()>>>,
+    cache: AHashMap<LayoutKey, CachedLayout>,
+    cache_clock: u64,
+    terminal_cache: AHashMap<TerminalLayoutKey, CachedTerminalLayout>,
+    terminal_cache_clock: u64,
 }
 
 impl TextSystem {
     pub fn new(font: Font) -> Self {
-        let mut font_cx = FontContext::default();
+        let mut font_cx = shared_font_context();
         let fallback_search_families = fallback_search_families(&mut font_cx);
+        let pua_fallback_family_names = pua_fallback_family_names(&mut font_cx);
         let mut text_system = Self {
-            family_stacks: family_stacks_for_font(&font),
+            family_stacks: family_stacks_for_font(&font, &pua_fallback_family_names),
+            pua_family_stacks: pua_family_stacks_for_font(&font, &pua_fallback_family_names),
             variant_styles: variant_styles_for_font(&font),
             font,
             font_cx,
             layout_cx: LayoutContext::default(),
+            terminal_layout_cx: LayoutContext::default(),
             metrics: TextMetrics::default(),
             locale: text_locale(),
             fallback_search_families,
             checked_fallbacks: AHashSet::default(),
+            pua_fallback_family_names,
             cache: AHashMap::new(),
+            cache_clock: 0,
+            terminal_cache: AHashMap::new(),
+            terminal_cache_clock: 0,
         };
         text_system.metrics = text_system.measure_metrics();
         text_system
@@ -91,13 +170,21 @@ impl TextSystem {
         self.metrics
     }
 
+    /// Whether compatible terminal cells should be shaped as ligature runs.
+    pub fn ligatures(&self) -> bool {
+        self.font.ligatures()
+    }
+
     pub fn update_font(&mut self, font: Font) {
         self.font = font;
-        self.family_stacks = family_stacks_for_font(&self.font);
+        self.family_stacks = family_stacks_for_font(&self.font, &self.pua_fallback_family_names);
+        self.pua_family_stacks =
+            pua_family_stacks_for_font(&self.font, &self.pua_fallback_family_names);
         self.variant_styles = variant_styles_for_font(&self.font);
         self.metrics = self.measure_metrics();
         self.checked_fallbacks.clear();
         self.cache.clear();
+        self.terminal_cache.clear();
     }
 
     pub fn shape_cell(&mut self, cell: &RenderableCell) -> Option<Arc<Layout<()>>> {
@@ -120,6 +207,37 @@ impl TextSystem {
         } else {
             Some(self.shape_char(cell.character, variant))
         }
+    }
+
+    /// Shape a complete terminal row run so contextual shaping and the Unicode BiDi algorithm
+    /// see the neighboring cells they require.
+    pub(crate) fn shape_terminal_run(
+        &mut self,
+        text: String,
+        styles: &[TerminalTextStyle],
+        ligatures: bool,
+    ) -> Arc<Layout<Rgb>> {
+        self.ensure_fontique_fallbacks(&text);
+
+        let style_keys = styles
+            .iter()
+            .map(|style| TerminalStyleKey {
+                end: style.range.end,
+                variant: font_variant(style.flags),
+                color: style.color.as_tuple(),
+            })
+            .collect::<Box<[_]>>();
+        let key = TerminalLayoutKey {
+            text: text.clone().into_boxed_str(),
+            spans: style_keys,
+            ligatures,
+            font_size_bits: self.font.size().as_px().to_bits(),
+        };
+        if let Some(layout) = self.cached_terminal_layout(&key) {
+            return layout;
+        }
+
+        self.build_and_cache_terminal_layout(key, &text, styles, ligatures)
     }
 
     #[cfg(test)]
@@ -151,6 +269,72 @@ impl TextSystem {
         self.shape_char(character, font_variant_from_style(bold, italic))
     }
 
+    /// Measure one UI text run without painting it.
+    ///
+    /// Chrome which sizes itself around a label — a menu panel, a button — needs the advance before
+    /// it has a scene to paint into, and shaping goes through the same cache `paint_text` uses.
+    pub fn measure_text(&mut self, text: &str, bold: bool) -> f32 {
+        if text.is_empty() {
+            return 0.0;
+        }
+
+        self.shape_text(text.to_owned(), font_variant_from_style(bold, false)).full_width()
+    }
+
+    /// Shape and paint one UI text run at a physical-pixel origin.
+    ///
+    /// This uses the same font fallback, named-style, and glyph positioning path as terminal text,
+    /// allowing an embedding shell to draw chrome without maintaining a second text stack.
+    pub fn paint_text(
+        &mut self,
+        scene: &mut Scene,
+        text: &str,
+        origin: (f32, f32),
+        color: Rgb,
+        bold: bool,
+    ) -> f32 {
+        if text.is_empty() {
+            return 0.0;
+        }
+
+        let layout = self.shape_text(text.to_owned(), font_variant_from_style(bold, false));
+        let transform = Affine::translate((f64::from(origin.0), f64::from(origin.1)));
+        let brush = Brush::Solid(color_from_rgb(color));
+
+        for line in layout.lines() {
+            for item in line.items() {
+                let PositionedLayoutItem::GlyphRun(glyph_run) = item else {
+                    continue;
+                };
+
+                let run = glyph_run.run();
+                let mut cursor_x = glyph_run.offset();
+                let baseline = glyph_run.baseline();
+                scene
+                    .draw_glyphs(run.font())
+                    .brush(&brush)
+                    .hint(false)
+                    .transform(transform)
+                    .font_size(run.font_size())
+                    .normalized_coords(run.normalized_coords())
+                    .draw(
+                        Fill::NonZero,
+                        glyph_run.glyphs().map(|glyph| {
+                            let positioned = Glyph {
+                                id: glyph.id,
+                                x: cursor_x + glyph.x,
+                                y: baseline - glyph.y,
+                            };
+                            cursor_x += glyph.advance;
+                            positioned
+                        }),
+                    );
+            }
+        }
+
+        layout.full_width()
+    }
+
     fn shape_char(&mut self, character: char, variant: FontVariant) -> Arc<Layout<()>> {
         let mut buffer = [0; 4];
         let text = character.encode_utf8(&mut buffer);
@@ -161,8 +345,8 @@ impl TextSystem {
             variant,
             font_size_bits: self.font.size().as_px().to_bits(),
         };
-        if let Some(layout) = self.cache.get(&key) {
-            return Arc::clone(layout);
+        if let Some(layout) = self.cached_layout(&key) {
+            return layout;
         }
 
         self.build_and_cache_layout(key, text, variant)
@@ -176,11 +360,54 @@ impl TextSystem {
             variant,
             font_size_bits: self.font.size().as_px().to_bits(),
         };
-        if let Some(layout) = self.cache.get(&key) {
-            return Arc::clone(layout);
+        if let Some(layout) = self.cached_layout(&key) {
+            return layout;
         }
 
         self.build_and_cache_layout(key, &text, variant)
+    }
+
+    /// Take a layout out of the cache, recording that it is the most recently wanted one.
+    fn cached_layout(&mut self, key: &LayoutKey) -> Option<Arc<Layout<()>>> {
+        let clock = self.cache_clock.saturating_add(1);
+        let entry = self.cache.get_mut(key)?;
+        entry.used = clock;
+        self.cache_clock = clock;
+        Some(Arc::clone(&entry.layout))
+    }
+
+    fn cached_terminal_layout(&mut self, key: &TerminalLayoutKey) -> Option<Arc<Layout<Rgb>>> {
+        let clock = self.terminal_cache_clock.saturating_add(1);
+        let entry = self.terminal_cache.get_mut(key)?;
+        entry.used = clock;
+        self.terminal_cache_clock = clock;
+        Some(Arc::clone(&entry.layout))
+    }
+
+    /// Drop the least recently used part of the cache once it reaches its bound.
+    ///
+    /// The eviction is by recency rather than by insertion order, so the handful of clusters a
+    /// session actually repeats survives any flood of one-off ones passing through around it.
+    fn evict_cached_layouts(&mut self) {
+        if self.cache.len() < MAX_CACHED_LAYOUTS {
+            return;
+        }
+        let mut used = self.cache.values().map(|entry| entry.used).collect::<Vec<_>>();
+        // Every entry's clock value is distinct, so this is the exact recency of the
+        // `LAYOUT_EVICTION_BATCH`th oldest, and everything at or below it goes.
+        let (_, threshold, _) = used.select_nth_unstable(LAYOUT_EVICTION_BATCH);
+        let threshold = *threshold;
+        self.cache.retain(|_, entry| entry.used > threshold);
+    }
+
+    fn evict_cached_terminal_layouts(&mut self) {
+        if self.terminal_cache.len() < MAX_CACHED_LAYOUTS {
+            return;
+        }
+        let mut used = self.terminal_cache.values().map(|entry| entry.used).collect::<Vec<_>>();
+        let (_, threshold, _) = used.select_nth_unstable(LAYOUT_EVICTION_BATCH);
+        let threshold = *threshold;
+        self.terminal_cache.retain(|_, entry| entry.used > threshold);
     }
 
     fn build_and_cache_layout(
@@ -199,13 +426,75 @@ impl TextSystem {
         builder.push_default(StyleProperty::FontWeight(font_weight));
         builder.push_default(StyleProperty::Locale(self.locale));
         builder.push_default(LineHeight::Absolute(self.metrics.cell_height));
+        let pua_family = self.pua_family_stacks[variant.as_index()].clone();
+        for range in private_use_ranges(text, 0) {
+            builder.push(pua_family.clone(), range);
+        }
 
         let mut layout = builder.build(text);
         layout.break_all_lines(None);
         layout.align(Alignment::Start, AlignmentOptions::default());
 
         let layout = Arc::new(layout);
-        self.cache.insert(key, Arc::clone(&layout));
+        self.evict_cached_layouts();
+        self.cache_clock = self.cache_clock.saturating_add(1);
+        self.cache
+            .insert(key, CachedLayout { layout: Arc::clone(&layout), used: self.cache_clock });
+        layout
+    }
+
+    fn build_and_cache_terminal_layout(
+        &mut self,
+        key: TerminalLayoutKey,
+        text: &str,
+        styles: &[TerminalTextStyle],
+        ligatures: bool,
+    ) -> Arc<Layout<Rgb>> {
+        let mut builder =
+            self.terminal_layout_cx.ranged_builder(&mut self.font_cx, text, 1.0, true);
+        builder.push_default(self.family_stacks[FontVariant::Normal.as_index()].clone());
+        builder.push_default(StyleProperty::FontSize(self.font.size().as_px()));
+        builder.push_default(StyleProperty::Locale(self.locale));
+        builder.push_default(LineHeight::Absolute(self.metrics.cell_height));
+        if !ligatures {
+            // Keep the features required for cursive scripts, but honor the terminal option for
+            // discretionary Latin/code ligatures inside a row that also contains complex text.
+            builder.push_default(parley::FontFeatures::from(
+                "\"liga\" 0, \"clig\" 0, \"dlig\" 0, \"calt\" 0",
+            ));
+        }
+
+        let normal_pua_family = self.pua_family_stacks[FontVariant::Normal.as_index()].clone();
+        for range in private_use_ranges(text, 0) {
+            builder.push(normal_pua_family.clone(), range);
+        }
+
+        for style in styles {
+            let variant = font_variant(style.flags);
+            let (font_style, font_weight) = self.variant_styles[variant.as_index()];
+            builder.push(self.family_stacks[variant.as_index()].clone(), style.range.clone());
+            builder.push(StyleProperty::FontStyle(font_style), style.range.clone());
+            builder.push(StyleProperty::FontWeight(font_weight), style.range.clone());
+            builder.push(StyleProperty::Brush(style.color), style.range.clone());
+            let pua_family = self.pua_family_stacks[variant.as_index()].clone();
+            if let Some(styled_text) = text.get(style.range.clone()) {
+                for range in private_use_ranges(styled_text, style.range.start) {
+                    builder.push(pua_family.clone(), range);
+                }
+            }
+        }
+
+        let mut layout = builder.build(text);
+        layout.break_all_lines(None);
+        layout.align(Alignment::Start, AlignmentOptions::default());
+
+        let layout = Arc::new(layout);
+        self.evict_cached_terminal_layouts();
+        self.terminal_cache_clock = self.terminal_cache_clock.saturating_add(1);
+        self.terminal_cache.insert(
+            key,
+            CachedTerminalLayout { layout: Arc::clone(&layout), used: self.terminal_cache_clock },
+        );
         layout
     }
 
@@ -274,6 +563,7 @@ impl TextSystem {
         if changed {
             self.checked_fallbacks.clear();
             self.cache.clear();
+            self.terminal_cache.clear();
         }
     }
 
@@ -350,6 +640,18 @@ impl TextSystem {
                 .all(|character| charmap.map(character).is_some_and(|glyph_id| glyph_id != 0))
         })
     }
+}
+
+fn shared_font_context() -> FontContext {
+    FONT_CONTEXT.with_borrow_mut(|shared| {
+        shared
+            .get_or_insert_with(|| {
+                #[cfg(test)]
+                FONT_CONTEXT_INITIALIZATIONS.with(|count| count.set(count.get() + 1));
+                FontContext::default()
+            })
+            .clone()
+    })
 }
 
 impl FontVariant {
@@ -459,7 +761,10 @@ pub fn color_from_rgb(color: Rgb) -> Color {
     Color::from_rgb8(color.r, color.g, color.b)
 }
 
-fn family_stacks_for_font(font: &Font) -> [FontFamily<'static>; 4] {
+fn family_stacks_for_font(
+    font: &Font,
+    pua_fallbacks: &[FontFamilyName<'static>],
+) -> [FontFamily<'static>; 4] {
     array::from_fn(|index| {
         let variant = match index {
             0 => FontVariant::Normal,
@@ -468,11 +773,38 @@ fn family_stacks_for_font(font: &Font) -> [FontFamily<'static>; 4] {
             3 => FontVariant::BoldItalic,
             _ => unreachable!("font variant index out of range"),
         };
-        FontFamily::List(Cow::Owned(font_family_stack(font, variant)))
+        FontFamily::List(Cow::Owned(font_family_stack(font, variant, pua_fallbacks)))
     })
 }
 
-fn font_family_stack(font: &Font, variant: FontVariant) -> Vec<FontFamilyName<'static>> {
+fn pua_family_stacks_for_font(
+    font: &Font,
+    pua_fallbacks: &[FontFamilyName<'static>],
+) -> [FontFamily<'static>; 4] {
+    array::from_fn(|index| {
+        let variant = match index {
+            0 => FontVariant::Normal,
+            1 => FontVariant::Bold,
+            2 => FontVariant::Italic,
+            3 => FontVariant::BoldItalic,
+            _ => unreachable!("font variant index out of range"),
+        };
+        let mut families = Vec::new();
+        for family in pua_fallbacks {
+            push_family_name(&mut families, family.clone());
+        }
+        for family in font_family_stack(font, variant, pua_fallbacks) {
+            push_family_name(&mut families, family);
+        }
+        FontFamily::List(Cow::Owned(families))
+    })
+}
+
+fn font_family_stack(
+    font: &Font,
+    variant: FontVariant,
+    pua_fallbacks: &[FontFamilyName<'static>],
+) -> Vec<FontFamilyName<'static>> {
     let mut families = Vec::new();
     push_configured_family_names(&mut families, variant_family_spec(font, variant));
 
@@ -485,7 +817,26 @@ fn font_family_stack(font: &Font, variant: FontVariant) -> Vec<FontFamilyName<'s
     push_family_name(&mut families, GenericFamily::SystemUi.into());
     push_family_name(&mut families, GenericFamily::Emoji.into());
 
+    for family in pua_fallbacks {
+        push_family_name(&mut families, family.clone());
+    }
+
     families
+}
+
+fn pua_fallback_family_names(font_cx: &mut FontContext) -> Arc<[FontFamilyName<'static>]> {
+    let mut names = font_cx
+        .collection
+        .family_names()
+        .filter(|name| name.to_ascii_lowercase().contains("nerd font"))
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    names.sort_unstable_by_key(|name| {
+        let lowercase = name.to_ascii_lowercase();
+        (!lowercase.starts_with("symbols nerd font"), lowercase)
+    });
+    names.dedup();
+    names.into_iter().map(named_family).collect::<Vec<_>>().into()
 }
 
 fn variant_family_spec(font: &Font, variant: FontVariant) -> Cow<'_, str> {
@@ -590,11 +941,36 @@ fn normalize_locale(locale: &str) -> Option<String> {
 fn fontique_script_for_char(character: char) -> Option<parley::fontique::Script> {
     let script = character.script();
     let name = script.short_name();
+    // Private-use characters have the Unknown script, but terminal icon fonts intentionally map
+    // them. Keeping the Zzzz key gives Fontique a fallback bucket matching the shaped run; generic
+    // Common/Inherited punctuation still uses the neighboring run's normal fallback behavior.
+    if name == "Zzzz" && is_private_use(character) {
+        return parley::fontique::Script::parse(name).ok();
+    }
     if matches!(name, "Zyyy" | "Zinh" | "Zzzz") {
         return None;
     }
     parley::fontique::Script::parse(name).ok()
 }
+
+fn is_private_use(character: char) -> bool {
+    matches!(character as u32, 0xE000..=0xF8FF | 0xF0000..=0xFFFFD | 0x100000..=0x10FFFD)
+}
+
+fn private_use_ranges(text: &str, base: usize) -> impl Iterator<Item = Range<usize>> + '_ {
+    text.char_indices().filter_map(move |(relative_offset, character)| {
+        if !is_private_use(character) {
+            return None;
+        }
+        let start = base.checked_add(relative_offset)?;
+        let end = start.checked_add(character.len_utf8())?;
+        Some(start..end)
+    })
+}
+
+#[cfg(test)]
+#[path = "glyph_corpus.rs"]
+mod glyph_corpus;
 
 #[cfg(test)]
 mod tests {
@@ -608,12 +984,26 @@ mod tests {
     use parley::{FontFamilyName, GenericFamily};
 
     use super::{
-        FontVariant, TextSystem, family_name_sort_key, font_family_stack, fontique_script_for_char,
-        normalize_locale, parse_named_style, push_configured_family_names,
+        FONT_CONTEXT_INITIALIZATIONS, FontVariant, LAYOUT_EVICTION_BATCH, MAX_CACHED_LAYOUTS,
+        TerminalTextStyle, TextSystem, family_name_sort_key, font_family_stack,
+        fontique_script_for_char, glyph_corpus::GLYPH_CORPUS, is_private_use, normalize_locale,
+        parse_named_style, push_configured_family_names,
     };
     use crate::config::font::Font;
     use crate::display::color::Rgb;
     use crate::display::content::RenderableCell;
+
+    #[test]
+    fn text_systems_reuse_the_thread_font_collection() {
+        let before = FONT_CONTEXT_INITIALIZATIONS.with(std::cell::Cell::get);
+        let _first = TextSystem::new(Font::default());
+        let after_first = FONT_CONTEXT_INITIALIZATIONS.with(std::cell::Cell::get);
+        let _second = TextSystem::new(Font::default());
+        let after_second = FONT_CONTEXT_INITIALIZATIONS.with(std::cell::Cell::get);
+
+        assert!(after_first == before || after_first == before + 1);
+        assert_eq!(after_second, after_first);
+    }
 
     #[test]
     fn font_update_recomputes_metrics() {
@@ -648,6 +1038,77 @@ mod tests {
 
         assert!(Arc::ptr_eq(&first, &second));
         assert_eq!(text.cache_len(), 1);
+    }
+
+    #[test]
+    fn terminal_arabic_is_contextually_shaped_as_one_rtl_run() {
+        let mut text = TextSystem::new(Font::default());
+        let content = "بب";
+        let styles = [
+            TerminalTextStyle {
+                range: 0..'ب'.len_utf8(),
+                flags: Flags::empty(),
+                color: Rgb::new(255, 255, 255),
+            },
+            TerminalTextStyle {
+                range: 'ب'.len_utf8()..content.len(),
+                flags: Flags::empty(),
+                color: Rgb::new(255, 0, 0),
+            },
+        ];
+
+        let layout = text.shape_terminal_run(content.to_owned(), &styles, true);
+        let isolated = text.shape_character('ب', false, false);
+        let isolated_glyph = isolated
+            .lines()
+            .flat_map(|line| line.items())
+            .find_map(|item| match item {
+                PositionedLayoutItem::GlyphRun(run) => run.glyphs().next().map(|glyph| glyph.id),
+                _ => None,
+            })
+            .expect("isolated Arabic glyph");
+        let glyphs = layout
+            .lines()
+            .flat_map(|line| line.items())
+            .filter_map(|item| match item {
+                PositionedLayoutItem::GlyphRun(run) => {
+                    Some(run.glyphs().map(|glyph| glyph.id).collect::<Vec<_>>())
+                },
+                _ => None,
+            })
+            .flatten()
+            .collect::<Vec<_>>();
+
+        assert!(layout.is_rtl());
+        assert!(
+            glyphs.iter().any(|glyph| *glyph != isolated_glyph),
+            "at least one Arabic letter must select a contextual form"
+        );
+    }
+
+    #[test]
+    fn terminal_mixed_direction_text_exposes_visual_rtl_cluster_order() {
+        let mut text = TextSystem::new(Font::default());
+        let content = "abc אבג";
+        let styles = [TerminalTextStyle {
+            range: 0..content.len(),
+            flags: Flags::empty(),
+            color: Rgb::new(255, 255, 255),
+        }];
+
+        let layout = text.shape_terminal_run(content.to_owned(), &styles, true);
+        let line = layout.lines().next().expect("mixed-direction line");
+        let rtl_clusters = line
+            .runs()
+            .find(|run| run.is_rtl())
+            .expect("RTL run")
+            .visual_clusters()
+            .map(|cluster| cluster.text_range().start)
+            .collect::<Vec<_>>();
+
+        assert!(!layout.is_rtl(), "the first strong character establishes an LTR paragraph");
+        assert!(rtl_clusters.len() >= 3);
+        assert!(rtl_clusters.windows(2).all(|pair| pair[0] > pair[1]));
     }
 
     #[test]
@@ -703,6 +1164,32 @@ mod tests {
         assert_eq!(text.cache_len(), 0);
     }
 
+    /// The cache was cleared only on a font change, so a program printing distinct clusters — an
+    /// emoji or combining-mark flood — grew it for as long as the session lived.
+    #[test]
+    fn the_shape_cache_stays_bounded_under_a_cluster_flood() {
+        let mut text = TextSystem::new(Font::default());
+        let hot = "hot";
+        text.shape_string(hot, false, false).unwrap();
+
+        for index in 0..MAX_CACHED_LAYOUTS * 2 {
+            text.shape_string(format!("flood-{index}"), false, false).unwrap();
+            // Kept in use throughout, so recency — not insertion order — decides what survives.
+            text.shape_string(hot, false, false).unwrap();
+            assert!(
+                text.cache_len() <= MAX_CACHED_LAYOUTS,
+                "cache grew to {} entries",
+                text.cache_len()
+            );
+        }
+
+        assert!(text.cache_len() >= LAYOUT_EVICTION_BATCH, "eviction must not empty the cache");
+        let before = text.cache_len();
+        let cached = text.shape_string(hot, false, false).unwrap();
+        assert_eq!(text.cache_len(), before, "the cluster in constant use survived the flood");
+        assert!(Arc::ptr_eq(&cached, &text.shape_string(hot, false, false).unwrap()));
+    }
+
     #[test]
     fn css_family_lists_are_preserved_before_terminal_fallbacks() {
         let mut families = Vec::new();
@@ -735,6 +1222,76 @@ mod tests {
         assert_eq!(fontique_script_for_char('あ'), Some(Script::from_str_unchecked("Hira")));
         assert_eq!(fontique_script_for_char('한'), Some(Script::from_str_unchecked("Hang")));
         assert_eq!(fontique_script_for_char('!'), None);
+        assert_eq!(fontique_script_for_char('\u{f026}'), Some(Script::from_str_unchecked("Zzzz")));
+        assert!(is_private_use('\u{f0001}'));
+    }
+
+    #[test]
+    fn glyph_corpus_shapes_real_glyphs_with_nerd_font_fallback_when_available() {
+        let mut text = TextSystem::new(Font::default());
+        let nerd_text = GLYPH_CORPUS
+            .iter()
+            .filter(|entry| entry.requires_nerd_font)
+            .map(|entry| entry.codepoint)
+            .collect::<String>();
+        let family_names = text
+            .font_cx
+            .collection
+            .family_names()
+            .filter(|name| name.to_ascii_lowercase().contains("nerd font"))
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let nerd_family = family_names.into_iter().find(|family_name| {
+            let Some(family_id) = text.font_cx.collection.family_id(family_name) else {
+                return false;
+            };
+            text.family_supports_text(family_id, &nerd_text)
+        });
+        let Some(nerd_family) = nerd_family else {
+            eprintln!("skipping Nerd Font PUA corpus: no installed Nerd Font covers every fixture");
+            return;
+        };
+
+        for entry in GLYPH_CORPUS {
+            let content = entry.codepoint.to_string();
+            let glyph_id = first_layout_glyph_id(&mut text, &content);
+            assert!(
+                glyph_id.is_some_and(|glyph_id| glyph_id != 0),
+                "missing U+{:04X} group={} expected={} note={} installed_reference={nerd_family}",
+                entry.codepoint as u32,
+                entry.group,
+                entry.expected_family,
+                entry.note,
+            );
+            if entry.requires_nerd_font {
+                let selected = selected_family_name(&mut text, &content);
+                assert!(
+                    selected
+                        .as_deref()
+                        .is_some_and(|name| name.to_ascii_lowercase().contains("nerd font")),
+                    "U+{:04X} resolved through unexpected family {selected:?}",
+                    entry.codepoint as u32,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fallback_checks_are_memoized_and_font_updates_clear_them() {
+        let mut text = TextSystem::new(Font::default());
+        let character = '\u{f026}';
+
+        // The first PUA shape may seed Fontique and clear the probe set. The second records the
+        // now-satisfied check; the third must reuse it without growing the set.
+        text.shape_character(character, false, false);
+        text.shape_character(character, false, false);
+        let checked = text.checked_fallbacks.len();
+        text.shape_character(character, false, false);
+        assert_eq!(text.checked_fallbacks.len(), checked);
+        assert!(checked <= 1);
+
+        text.update_font(Font::default());
+        assert!(text.checked_fallbacks.is_empty());
     }
 
     #[test]
@@ -756,7 +1313,7 @@ mod tests {
 
     #[test]
     fn variant_family_stack_deduplicates_configured_and_generic_fallbacks() {
-        let families = font_family_stack(&Font::default(), FontVariant::Bold);
+        let families = font_family_stack(&Font::default(), FontVariant::Bold, &[]);
 
         assert_eq!(
             families.iter().filter(|family| **family == GenericFamily::Monospace.into()).count(),

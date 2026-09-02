@@ -4,13 +4,11 @@ use std::path::PathBuf;
 
 use serde::Serialize;
 
-use vivido_config_derive::ConfigDeserialize;
-
 /// General config section.
 ///
 /// This section is for fields which can not be easily categorized,
 /// to avoid common TOML issues with root-level fields.
-#[derive(ConfigDeserialize, Serialize, Clone, PartialEq, Debug)]
+#[derive(Serialize, Clone, PartialEq, Debug)]
 pub struct General {
     /// Configuration file imports.
     ///
@@ -39,3 +37,10 @@ impl Default for General {
         }
     }
 }
+
+impl_config_deserialize!(General {
+    import,
+    working_directory: option,
+    live_config_reload,
+    ipc_socket,
+});

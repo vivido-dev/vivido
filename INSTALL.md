@@ -22,19 +22,16 @@ cargo install --path .
 This installs both `vivido` and its `vvssh` companion command. Do not select only the `vivido`
 binary with `--bin` if remote Vivid forwarding is needed.
 
+Vivido carries its own terminfo entry and makes it available to ordinary child applications when
+no system entry is installed. Linux users should also install it system-wide so it remains
+available across environment boundaries such as `sudo`; see the Linux guide below.
+
 ### Linux
 
-Linux builds are Wayland-only. Install the development packages for Wayland, xkbcommon,
-fontconfig, FreeType, CMake, and pkg-config. For example, on Debian or Ubuntu:
-
-```sh
-sudo apt install cmake g++ pkg-config libfontconfig1-dev libfreetype6-dev \
-  libwayland-dev libxkbcommon-dev libasound2-dev \
-  libavcodec-dev libavdevice-dev libavformat-dev libavutil-dev libswscale-dev libswresample-dev
-cargo build --release
-```
-
-There is intentionally no X11 feature or fallback. Run Vivido inside a Wayland session.
+Linux builds are Wayland-only, and there is currently no Linux package or installer. See
+[Installing and setting up Vivido on Linux](docs/linux.md) for build dependencies, Cargo
+installation, the required system terminfo setup, desktop integration, configuration, shell
+completions, and manual pages.
 
 ### macOS
 
@@ -47,9 +44,9 @@ and Intel Rust targets are installed.
 
 ### Windows
 
-The signed Windows suite installer writes the user configuration to
-`%USERPROFILE%\vivido\vivido.toml`. Vivido still reads the former
-`%APPDATA%\vivido\vivido.toml` location when the new path does not exist.
+Vivido first reads `%USERPROFILE%\.config\vivido\vivido.toml`. The signed Windows suite installer
+writes its default to `%USERPROFILE%\vivido\vivido.toml` when no dot-config file exists, and Vivido
+still reads the former `%APPDATA%\vivido\vivido.toml` location as a final fallback.
 The consumer EXE also installs PowerShell 7 LTS when absent and provisions WSL with Ubuntu; the
 standalone MSI is intended for managed systems where those prerequisites already exist. See
 [`windows/README.md`](windows/README.md) for signing, packaging, silent-install, and release steps.

@@ -280,7 +280,16 @@ impl GridCell for Cell {
 
     #[inline]
     fn reset(&mut self, template: &Self) {
-        *self = Cell { bg: template.bg, ..Cell::default() };
+        // `extra` is the only field that owns an allocation, and it is unset for all but a handful
+        // of cells. Releasing it under its own branch leaves the rest of the reset a straight-line
+        // store, so clearing a scrolled-in row does not run drop glue over every cell.
+        if self.extra.is_some() {
+            self.extra = None;
+        }
+        self.c = ' ';
+        self.fg = Color::Named(NamedColor::Foreground);
+        self.bg = template.bg;
+        self.flags = Flags::empty();
     }
 }
 

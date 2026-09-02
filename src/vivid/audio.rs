@@ -1,7 +1,7 @@
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::io;
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -11,84 +11,39 @@ use cpal::{FromSample, I24, SampleFormat, SizedSample, Stream, StreamConfig, U24
 use ringbuf::traits::{Consumer, Producer, Split};
 use ringbuf::{HeapProd, HeapRb};
 use vivid_protocol::media::ParsedAudioPacket;
-use vivid_protocol::messages::ParsedAudioSourceConfig;
+use vivid_protocol::track::{AudioConfiguration, AudioGain};
+
+use crate::vivid::ffmpeg::{self, AVPacket, AVRational, ParameterValues};
 
 const AVMEDIA_TYPE_AUDIO: c_int = 1;
 const AV_INPUT_BUFFER_PADDING_SIZE: usize = 64;
 const AV_SAMPLE_FMT_FLT: c_int = 3;
 const AVERROR_EOF: c_int = -541_478_725;
 const PACKET_TIME_BASE: AVRational = AVRational { num: 1, den: 1_000_000 };
+// Remote audio commonly arrives in bursts after SSH scheduling or network jitter. Keep a bounded
+// reserve large enough to bridge those stalls; linked video is discarded when it falls behind.
 const RING_BUFFER_SECONDS: usize = 2;
 const PREBUFFER_MILLISECONDS: u64 = 100;
-const POLL_INTERVAL: Duration = Duration::from_millis(2);
+/// The most a live stream will be delayed to line sound up with picture. Past this the session is
+/// no longer interactive, and the honest answer is a lower encoder target, not more buffering.
+///
+/// Held audio accumulates in the device ring, so this must stay comfortably under
+/// [`RING_BUFFER_SECONDS`]: steady-state ring occupancy is the delay itself, and a delay that
+/// could reach the ring's capacity would block the decoder thread pushing into it.
+const MAXIMUM_LIVE_DELAY_US: u64 = 1_000_000;
+/// Delay changes smaller than this are transport jitter, not skew worth re-buffering for.
+const LIVE_DELAY_STEP_US: u64 = 20_000;
 const LINKED_AUDIO_STALL_FALLBACK: Duration = Duration::from_secs(2);
+/// How much of a full ring buffer to wait for the device to drain before retrying a push.
+const RING_WAIT_SAMPLES: u64 = 512;
+/// A floor on that wait, so a very high sample rate cannot turn it back into a spin.
+const MINIMUM_RING_WAIT: Duration = Duration::from_micros(500);
+/// How often to re-check an output that is not draining, so `stop` and errors are still noticed.
+const STOPPED_OUTPUT_RECHECK: Duration = Duration::from_millis(5);
 const UNSET_PTS: i64 = i64::MIN;
 
-pub fn supports(config: &ParsedAudioSourceConfig) -> bool {
-    AudioDecoder::new(config, config.sample_rate, config.channels).is_ok()
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct AVRational {
-    num: c_int,
-    den: c_int,
-}
-
-#[repr(C)]
-struct AVCodecPrefix {
-    name: *const c_char,
-    long_name: *const c_char,
-    media_type: c_int,
-    id: c_int,
-}
-
-#[repr(C)]
-struct AVCodecParametersPrefix {
-    codec_type: c_int,
-    codec_id: c_int,
-    codec_tag: u32,
-    extradata: *mut u8,
-    extradata_size: c_int,
-    coded_side_data: *mut c_void,
-    nb_coded_side_data: c_int,
-    format: c_int,
-    bit_rate: i64,
-    bits_per_coded_sample: c_int,
-    bits_per_raw_sample: c_int,
-    profile: c_int,
-    level: c_int,
-    width: c_int,
-    height: c_int,
-}
-
-#[repr(C)]
-struct AVPacketPrefix {
-    buf: *mut c_void,
-    pts: i64,
-    dts: i64,
-    data: *mut u8,
-    size: c_int,
-    stream_index: c_int,
-    flags: c_int,
-    side_data: *mut c_void,
-    side_data_elems: c_int,
-    duration: i64,
-    pos: i64,
-    opaque: *mut c_void,
-    opaque_ref: *mut c_void,
-    time_base: AVRational,
-}
-
-#[repr(C)]
-struct AVFramePrefix {
-    data: [*mut u8; 8],
-    linesize: [c_int; 8],
-    extended_data: *mut *mut u8,
-    width: c_int,
-    height: c_int,
-    nb_samples: c_int,
-    format: c_int,
+pub fn supports(config: &AudioConfiguration) -> bool {
+    AudioDecoder::new(config, config.sample_rate, u16::from(config.channels)).is_ok()
 }
 
 #[repr(C)]
@@ -101,23 +56,56 @@ struct AVChannelLayout {
 }
 
 struct Shared {
+    channel_generation: AtomicU64,
+    generation_transition: Mutex<()>,
     enabled: AtomicBool,
     prebuffered: AtomicBool,
-    received_samples: AtomicBool,
     stopped: AtomicBool,
     decode_done: AtomicBool,
     eos_observed: AtomicBool,
     queued_samples: AtomicU64,
     played_samples: AtomicU64,
+    /// Absolute queued-sample watermark that a timeline reset must discard through.
+    ///
+    /// A relative outstanding count races the realtime callback: it can snapshot a sample after
+    /// the callback popped it but before `played_samples` was published, then discard one sample
+    /// from the replacement timeline. An absolute watermark cannot cross that boundary.
+    discard_through_samples: AtomicU64,
     discard_samples: AtomicU64,
     rendered_samples: AtomicU64,
     timeline_origin_us: AtomicI64,
     first_audio_pts_us: AtomicI64,
     leading_silence_samples: AtomicU64,
+    /// Silence the device emits *without* advancing the media clock or consuming the ring.
+    ///
+    /// This is the live audio/video presentation delay. Leading silence is the opposite tool: it
+    /// covers timeline that has already elapsed and therefore does advance the clock.
+    hold_silence_samples: AtomicU64,
+    /// Silence covering timeline the producer dropped. It advances the media clock, like leading
+    /// silence, but has its own counter because `observe_timeline_pts` recomputes and *stores*
+    /// leading silence on every packet and would otherwise erase a bridge before it played out.
+    gap_silence_samples: AtomicU64,
+    /// The delay the hold is currently implementing, so it can be measured and adjusted.
+    live_delay_us: AtomicU64,
     prebuffer_samples: AtomicU64,
+    /// Queued-sample count observed at a resume PLAY.
+    ///
+    /// Control and realtime media may use independent transports. Retained audio alone must not
+    /// restart the device before the realtime path has caught up with PLAY, or that tail can drain
+    /// into an underrun and stop the clock that paces linked video.
+    resume_queued_samples: AtomicU64,
+    resume_waiting_for_audio: AtomicBool,
+    ring_capacity_samples: u64,
     requested_start_pts_us: AtomicI64,
+    gain_bits: AtomicU32,
     play_configured_at: Mutex<Option<Instant>>,
+    clock_progress: Mutex<ClockProgress>,
     error: Mutex<Option<String>>,
+}
+
+struct ClockProgress {
+    rendered_samples: u64,
+    observed_at: Instant,
 }
 
 impl Shared {
@@ -142,7 +130,7 @@ pub struct AudioOutput {
 }
 
 impl AudioOutput {
-    pub fn open() -> io::Result<Arc<Self>> {
+    pub fn open(channel_generation: u64) -> io::Result<Arc<Self>> {
         let host = cpal::default_host();
         let device = host.default_output_device().ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotFound, "no default audio output device")
@@ -152,33 +140,46 @@ impl AudioOutput {
         })?;
         let format = supported.sample_format();
         let config: StreamConfig = supported.into();
+        let ring_capacity_samples =
+            (config.sample_rate as usize * config.channels as usize * RING_BUFFER_SECONDS).max(1);
         let shared = Arc::new(Shared {
+            channel_generation: AtomicU64::new(channel_generation),
+            generation_transition: Mutex::new(()),
             enabled: AtomicBool::new(false),
             prebuffered: AtomicBool::new(false),
-            received_samples: AtomicBool::new(false),
             stopped: AtomicBool::new(false),
             decode_done: AtomicBool::new(false),
             eos_observed: AtomicBool::new(false),
             queued_samples: AtomicU64::new(0),
             played_samples: AtomicU64::new(0),
+            discard_through_samples: AtomicU64::new(0),
             discard_samples: AtomicU64::new(0),
             rendered_samples: AtomicU64::new(0),
             timeline_origin_us: AtomicI64::new(UNSET_PTS),
             first_audio_pts_us: AtomicI64::new(UNSET_PTS),
             leading_silence_samples: AtomicU64::new(0),
+            hold_silence_samples: AtomicU64::new(0),
+            gap_silence_samples: AtomicU64::new(0),
+            live_delay_us: AtomicU64::new(0),
             prebuffer_samples: AtomicU64::new(
                 u64::from(config.sample_rate)
                     .saturating_mul(u64::from(config.channels))
                     .saturating_mul(PREBUFFER_MILLISECONDS)
                     / 1_000,
             ),
+            resume_queued_samples: AtomicU64::new(0),
+            resume_waiting_for_audio: AtomicBool::new(false),
+            ring_capacity_samples: u64::try_from(ring_capacity_samples).unwrap_or(u64::MAX),
             requested_start_pts_us: AtomicI64::new(UNSET_PTS),
+            gain_bits: AtomicU32::new(1.0_f32.to_bits()),
             play_configured_at: Mutex::new(None),
+            clock_progress: Mutex::new(ClockProgress {
+                rendered_samples: 0,
+                observed_at: Instant::now(),
+            }),
             error: Mutex::new(None),
         });
-        let ring = HeapRb::<f32>::new(
-            (config.sample_rate as usize * config.channels as usize * RING_BUFFER_SECONDS).max(1),
-        );
+        let ring = HeapRb::<f32>::new(ring_capacity_samples);
         let (producer, consumer) = ring.split();
         let stream = match format {
             SampleFormat::I8 => build_stream::<i8, _>(&device, &config, consumer, shared.clone()),
@@ -213,22 +214,35 @@ impl AudioOutput {
     #[cfg(test)]
     pub(super) fn test_output() -> Arc<Self> {
         let shared = Arc::new(Shared {
+            channel_generation: AtomicU64::new(1),
+            generation_transition: Mutex::new(()),
             enabled: AtomicBool::new(false),
             prebuffered: AtomicBool::new(false),
-            received_samples: AtomicBool::new(false),
             stopped: AtomicBool::new(false),
             decode_done: AtomicBool::new(false),
             eos_observed: AtomicBool::new(false),
             queued_samples: AtomicU64::new(0),
             played_samples: AtomicU64::new(0),
+            discard_through_samples: AtomicU64::new(0),
             discard_samples: AtomicU64::new(0),
             rendered_samples: AtomicU64::new(0),
             timeline_origin_us: AtomicI64::new(UNSET_PTS),
             first_audio_pts_us: AtomicI64::new(UNSET_PTS),
             leading_silence_samples: AtomicU64::new(0),
+            hold_silence_samples: AtomicU64::new(0),
+            gap_silence_samples: AtomicU64::new(0),
+            live_delay_us: AtomicU64::new(0),
             prebuffer_samples: AtomicU64::new(0),
+            resume_queued_samples: AtomicU64::new(0),
+            resume_waiting_for_audio: AtomicBool::new(false),
+            ring_capacity_samples: 32,
             requested_start_pts_us: AtomicI64::new(UNSET_PTS),
+            gain_bits: AtomicU32::new(1.0_f32.to_bits()),
             play_configured_at: Mutex::new(None),
+            clock_progress: Mutex::new(ClockProgress {
+                rendered_samples: 0,
+                observed_at: Instant::now(),
+            }),
             error: Mutex::new(None),
         });
         let (producer, _consumer) = HeapRb::<f32>::new(32).split();
@@ -242,22 +256,83 @@ impl AudioOutput {
     }
 
     #[cfg(test)]
+    #[allow(dead_code)]
     pub(super) fn force_video_gate_stall_for_test(&self) {
         *self.shared.play_configured_at.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
             Some(Instant::now() - LINKED_AUDIO_STALL_FALLBACK - Duration::from_millis(1));
+        self.shared
+            .clock_progress
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .observed_at = Instant::now() - LINKED_AUDIO_STALL_FALLBACK - Duration::from_millis(1);
     }
 
-    pub fn decoder(&self, config: &ParsedAudioSourceConfig) -> io::Result<AudioDecoder> {
+    pub fn decoder(&self, config: &AudioConfiguration) -> io::Result<AudioDecoder> {
         AudioDecoder::new(config, self.sample_rate, self.channels)
+    }
+
+    pub fn channel_generation(&self) -> u64 {
+        self.shared.channel_generation.load(Ordering::SeqCst)
+    }
+
+    /// Retain the device stream while making every operation from the retired channel stale.
+    ///
+    /// The generation is published before waiting for an in-flight push. A producer blocked on a
+    /// full, paused ring therefore observes retirement and releases the transition lock; once the
+    /// lock is acquired, flushing is a barrier after every mutation from the old channel.
+    pub fn advance_channel(&self, current: u64, next: u64) -> bool {
+        if self
+            .shared
+            .channel_generation
+            .compare_exchange(current, next, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return false;
+        }
+        let _transition = self
+            .shared
+            .generation_transition
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.flush();
+        true
+    }
+
+    pub fn channel(self: &Arc<Self>, generation: u64) -> io::Result<ChannelAudioOutput> {
+        if self.channel_generation() != generation {
+            return Err(retired_channel());
+        }
+        Ok(ChannelAudioOutput { output: self.clone(), generation })
     }
 
     pub fn start(&self) {
         self.shared.enabled.store(true, Ordering::SeqCst);
     }
 
+    pub fn set_gain(&self, gain: AudioGain) {
+        self.shared.gain_bits.store(gain.as_f32().to_bits(), Ordering::SeqCst);
+    }
+
     pub fn configure_play(&self, start_pts_us: i64, minimum_buffer_us: u64) {
         self.shared.requested_start_pts_us.store(start_pts_us, Ordering::SeqCst);
-        self.shared.timeline_origin_us.store(start_pts_us, Ordering::SeqCst);
+        // `rendered_samples` and the samples retained in the ring both belong to this channel's
+        // existing timeline. A PLAY after PAUSE must not re-label either of them with a new
+        // origin: doing so makes the retained audio tail disagree with linked video and creates a
+        // second jump when newly submitted audio reaches the device. Before the first rendered
+        // sample, PLAY and the first packet may still arrive in either order, so realign below.
+        let rendered_samples = self.shared.rendered_samples.load(Ordering::SeqCst);
+        if rendered_samples == 0 {
+            self.shared.timeline_origin_us.store(start_pts_us, Ordering::SeqCst);
+        }
+        // PLAY and the first post-pause audio packet are deliberately independent protocol paths.
+        // Snapshot the accepted-audio watermark before enabling the device. A resume does not
+        // prebuffer from the retained tail alone: at least one new decoded sample proves the
+        // realtime path has crossed the same boundary. A full ring is already safe and must be
+        // allowed to drain, because its producer may be blocked waiting for capacity.
+        self.shared
+            .resume_queued_samples
+            .store(self.shared.queued_samples.load(Ordering::SeqCst), Ordering::SeqCst);
+        self.shared.resume_waiting_for_audio.store(rendered_samples != 0, Ordering::SeqCst);
         self.shared.prebuffer_samples.store(
             u64::from(self.sample_rate)
                 .saturating_mul(u64::from(self.channels))
@@ -268,6 +343,12 @@ impl AudioOutput {
         self.shared.prebuffered.store(false, Ordering::SeqCst);
         *self.shared.play_configured_at.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
             Some(Instant::now());
+        *self.shared.clock_progress.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            ClockProgress {
+                rendered_samples: self.shared.rendered_samples.load(Ordering::SeqCst),
+                observed_at: Instant::now(),
+            };
+        self.realign_timeline();
     }
 
     pub fn pause(&self) {
@@ -276,14 +357,15 @@ impl AudioOutput {
 
     pub fn flush(&self) {
         self.pause();
-        let outstanding = self
-            .shared
-            .queued_samples
-            .load(Ordering::SeqCst)
-            .saturating_sub(self.shared.played_samples.load(Ordering::SeqCst));
-        self.shared.discard_samples.store(outstanding, Ordering::SeqCst);
+        let queued = self.shared.queued_samples.load(Ordering::SeqCst);
+        self.shared.discard_through_samples.fetch_max(queued, Ordering::SeqCst);
+        self.shared.discard_samples.store(0, Ordering::SeqCst);
+        self.shared.hold_silence_samples.store(0, Ordering::SeqCst);
+        self.shared.gap_silence_samples.store(0, Ordering::SeqCst);
+        self.shared.live_delay_us.store(0, Ordering::SeqCst);
         self.shared.prebuffered.store(false, Ordering::SeqCst);
-        self.shared.received_samples.store(false, Ordering::SeqCst);
+        self.shared.resume_queued_samples.store(0, Ordering::SeqCst);
+        self.shared.resume_waiting_for_audio.store(false, Ordering::SeqCst);
         self.shared.decode_done.store(false, Ordering::SeqCst);
         self.shared.eos_observed.store(false, Ordering::SeqCst);
         self.shared.rendered_samples.store(0, Ordering::SeqCst);
@@ -293,49 +375,60 @@ impl AudioOutput {
         self.shared.leading_silence_samples.store(0, Ordering::SeqCst);
         *self.shared.play_configured_at.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
             None;
+        *self.shared.clock_progress.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            ClockProgress { rendered_samples: 0, observed_at: Instant::now() };
     }
 
-    fn observe_timeline_pts(&self, pts_us: i64) {
-        if pts_us == UNSET_PTS {
+    /// Anchor the media clock on the audio this timeline will actually render.
+    ///
+    /// The clock is `origin + rendered/rate`, so the anchor only means anything while nothing has
+    /// been rendered against it: once samples have left the device, moving the origin rewrites
+    /// time that has already been presented. Within that window PLAY and the first packet may
+    /// arrive in either order and both have to agree, so the origin is the earlier of the
+    /// requested start and the audio actually queued, and the distance between them is leading
+    /// silence rather than clock the device would otherwise run early.
+    fn realign_timeline(&self) {
+        if self.shared.rendered_samples.load(Ordering::SeqCst) != 0 {
             return;
         }
-        if self.shared.requested_start_pts_us.load(Ordering::SeqCst) != UNSET_PTS {
-            return;
-        }
-        let mut current = self.shared.timeline_origin_us.load(Ordering::SeqCst);
-        while current == UNSET_PTS || pts_us < current {
-            match self.shared.timeline_origin_us.compare_exchange(
-                current,
-                pts_us,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            ) {
-                Ok(_) => break,
-                Err(actual) => current = actual,
-            }
-        }
-        let origin = self.shared.timeline_origin_us.load(Ordering::SeqCst);
+        let requested = self.shared.requested_start_pts_us.load(Ordering::SeqCst);
         let audio_pts = self.shared.first_audio_pts_us.load(Ordering::SeqCst);
-        if origin != UNSET_PTS && audio_pts != UNSET_PTS {
-            let desired_samples =
-                leading_silence_sample_count(origin, audio_pts, self.sample_rate, self.channels);
-            let rendered = self.shared.rendered_samples.load(Ordering::SeqCst);
-            self.shared
-                .leading_silence_samples
-                .store(desired_samples.saturating_sub(rendered), Ordering::SeqCst);
-        }
+        let origin = match (requested, audio_pts) {
+            (UNSET_PTS, UNSET_PTS) => return,
+            (UNSET_PTS, audio) => audio,
+            (start, UNSET_PTS) => start,
+            (start, audio) => start.min(audio),
+        };
+        self.shared.timeline_origin_us.store(origin, Ordering::SeqCst);
+        let leading_silence = if audio_pts == UNSET_PTS {
+            0
+        } else {
+            leading_silence_sample_count(origin, audio_pts, self.sample_rate, self.channels)
+        };
+        self.shared.leading_silence_samples.store(leading_silence, Ordering::SeqCst);
     }
 
     pub fn observe_audio_pts(&self, pts_us: i64) {
         if pts_us != UNSET_PTS {
-            let _ = self.shared.first_audio_pts_us.compare_exchange(
-                UNSET_PTS,
-                pts_us,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            );
+            // A packet straddling an already requested start is trimmed to that start before it is
+            // pushed, so the first sample the device will render is the later of the two. Anchor
+            // on that rather than on the packet header, which would run the clock a packet slow.
+            let requested = self.shared.requested_start_pts_us.load(Ordering::SeqCst);
+            let queued_pts = if requested == UNSET_PTS { pts_us } else { pts_us.max(requested) };
+            let mut current = self.shared.first_audio_pts_us.load(Ordering::SeqCst);
+            while current == UNSET_PTS || queued_pts < current {
+                match self.shared.first_audio_pts_us.compare_exchange(
+                    current,
+                    queued_pts,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                ) {
+                    Ok(_) => break,
+                    Err(actual) => current = actual,
+                }
+            }
         }
-        self.observe_timeline_pts(pts_us);
+        self.realign_timeline();
     }
 
     pub fn trim_before_start(&self, pts_us: i64, duration_us: u64, samples: &mut Vec<f32>) {
@@ -374,43 +467,177 @@ impl AudioOutput {
                 )
     }
 
+    /// The media PTS currently leaving the device, or `None` before playback is running.
+    pub fn rendered_pts(&self) -> Option<i64> {
+        if !self.shared.enabled.load(Ordering::SeqCst)
+            || !self.shared.prebuffered.load(Ordering::SeqCst)
+        {
+            return None;
+        }
+        let origin = self.shared.timeline_origin_us.load(Ordering::SeqCst);
+        (origin != UNSET_PTS).then(|| {
+            rendered_pts_us(
+                origin,
+                self.shared.rendered_samples.load(Ordering::SeqCst),
+                self.sample_rate,
+                self.channels,
+            )
+        })
+    }
+
+    /// Oldest video PTS worth converting for a linked live stream. Frames before this threshold
+    /// are still decoded as references, but their pixels need not be allocated or uploaded.
+    ///
+    /// The threshold is measured against the clock *after* the live presentation delay, so it means
+    /// "older than the picture that belongs with the sound coming out of the speaker" rather than
+    /// "slower to arrive than audio". Those are the same thing only on a link with no video
+    /// queueing delay, and treating them as the same discarded every frame of a congested session.
+    pub fn discard_video_before(&self, maximum_latency_us: u64) -> Option<i64> {
+        self.rendered_pts()
+            .map(|pts| pts.saturating_sub(i64::try_from(maximum_latency_us).unwrap_or(i64::MAX)))
+    }
+
+    /// How far behind capture this output is deliberately playing, in microseconds.
+    pub fn live_delay_us(&self) -> u64 {
+        self.shared.live_delay_us.load(Ordering::SeqCst)
+    }
+
+    /// Hold audio back so it reaches the speaker when the picture it belongs with reaches the
+    /// screen.
+    ///
+    /// Audio and video are captured on one clock but do not arrive on one: video is two orders of
+    /// magnitude larger and queues behind itself in the transport. Playing audio the moment it
+    /// arrives therefore runs sound ahead of picture by exactly that difference. The device holds
+    /// the difference as silence that does not advance the media clock, which is the only way the
+    /// two can be presented together. Returns the delay now in force.
+    pub fn request_live_delay(&self, target_us: u64) -> u64 {
+        let target_us = target_us.min(MAXIMUM_LIVE_DELAY_US);
+        let current = self.shared.live_delay_us.load(Ordering::SeqCst);
+        if target_us.abs_diff(current) < LIVE_DELAY_STEP_US {
+            return current;
+        }
+        if target_us > current {
+            let added = target_us - current;
+            self.shared.hold_silence_samples.fetch_add(self.samples_for(added), Ordering::SeqCst);
+            self.shared.live_delay_us.store(target_us, Ordering::SeqCst);
+            return target_us;
+        }
+        // Shrinking the delay means throwing away audio that has already been buffered, so it is
+        // only worth doing when the saving is audible-scale and the excess is durable.
+        let removed = current - target_us;
+        self.shared.discard_samples.fetch_add(self.samples_for(removed), Ordering::SeqCst);
+        self.shared.live_delay_us.store(target_us, Ordering::SeqCst);
+        target_us
+    }
+
+    /// How long until the media clock reaches `pts_us`, or `None` when it already has.
+    ///
+    /// The device renders at a fixed rate, so the remaining time is arithmetic rather than
+    /// something to poll for. `None` is also returned when the clock is not running: the caller
+    /// has its own fallback for that and must not wait on a clock that is not advancing.
+    pub fn time_until_pts(&self, pts_us: i64) -> Option<Duration> {
+        let rendered = self.rendered_pts()?;
+        let remaining = pts_us.checked_sub(rendered).filter(|remaining| *remaining > 0)?;
+        Some(Duration::from_micros(u64::try_from(remaining).unwrap_or(u64::MAX)))
+    }
+
+    /// How long until the device has consumed `samples` from the ring.
+    ///
+    /// Used to wait out a full ring buffer without polling it. The device only drains while it is
+    /// enabled, so a stopped or paused output reports nothing and the caller re-checks its own
+    /// exit conditions instead.
+    fn time_to_drain(&self, samples: u64) -> Option<Duration> {
+        if !self.shared.enabled.load(Ordering::SeqCst) {
+            return None;
+        }
+        let rate = u64::from(self.sample_rate).saturating_mul(u64::from(self.channels));
+        (rate > 0)
+            .then(|| Duration::from_micros(samples.saturating_mul(1_000_000).div_ceil(rate.max(1))))
+    }
+
+    fn samples_for(&self, duration_us: u64) -> u64 {
+        u64::from(self.sample_rate)
+            .saturating_mul(u64::from(self.channels))
+            .saturating_mul(duration_us)
+            / 1_000_000
+    }
+
+    /// Cover a gap in the encoded audio timeline without interrupting playback.
+    ///
+    /// A producer that dropped packets leaves a hole. Silence of exactly the hole's length keeps
+    /// the media clock honest — the alternative, restarting the timeline, discards every buffered
+    /// sample and is audible every time transport jitter is mistaken for a discontinuity.
+    pub fn bridge_live_gap(&self, gap_us: u64) {
+        self.shared.gap_silence_samples.fetch_add(self.samples_for(gap_us), Ordering::SeqCst);
+    }
+
+    /// Drop queued device samples and restart a live timeline. Reserved for a producer that
+    /// genuinely restarted its clock, which is the only case a continuous timeline cannot express.
+    pub fn rebase_live(&self, pts_us: i64) {
+        self.flush();
+        self.observe_audio_pts(pts_us);
+        self.start();
+    }
+
     pub fn video_gate_stalled(&self) -> bool {
-        self.shared.enabled.load(Ordering::SeqCst)
-            && !self.shared.prebuffered.load(Ordering::SeqCst)
-            && !self.shared.received_samples.load(Ordering::SeqCst)
-            && self
+        if !self.shared.enabled.load(Ordering::SeqCst)
+            || !self
                 .shared
                 .play_configured_at
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .is_some_and(|configured| configured.elapsed() > LINKED_AUDIO_STALL_FALLBACK)
+        {
+            return false;
+        }
+        let rendered_samples = self.shared.rendered_samples.load(Ordering::SeqCst);
+        let mut progress =
+            self.shared.clock_progress.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if rendered_samples != progress.rendered_samples {
+            progress.rendered_samples = rendered_samples;
+            progress.observed_at = Instant::now();
+            return false;
+        }
+        if progress.observed_at.elapsed() <= LINKED_AUDIO_STALL_FALLBACK {
+            return false;
+        }
+        drop(progress);
+        self.shared.set_error("linked audio output clock stalled");
+        true
     }
 
+    #[cfg(test)]
     pub fn push(&self, samples: &[f32]) -> io::Result<()> {
-        if !samples.is_empty() {
-            self.shared.received_samples.store(true, Ordering::SeqCst);
-        }
+        self.push_while(samples, || true)
+    }
+
+    fn push_while(&self, samples: &[f32], current: impl Fn() -> bool) -> io::Result<()> {
         let mut producer = self.producer.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        for &sample in samples {
-            let mut sample = sample;
-            loop {
-                if self.shared.stopped.load(Ordering::SeqCst) {
-                    return Ok(());
-                }
-                if let Some(error) = self.shared.error() {
-                    return Err(io::Error::other(error));
-                }
-                match producer.try_push(sample) {
-                    Ok(()) => {
-                        self.shared.queued_samples.fetch_add(1, Ordering::SeqCst);
-                        break;
-                    },
-                    Err(value) => {
-                        sample = value;
-                        thread::sleep(Duration::from_micros(500));
-                    },
-                }
+        let mut offset = 0;
+        while offset < samples.len() {
+            if !current() {
+                return Err(retired_channel());
             }
+            if self.shared.stopped.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+            if let Some(error) = self.shared.error() {
+                return Err(io::Error::new(io::ErrorKind::NotConnected, error));
+            }
+            let accepted = producer.push_slice(&samples[offset..]);
+            if accepted != 0 {
+                self.shared.queued_samples.fetch_add(accepted as u64, Ordering::SeqCst);
+                offset += accepted;
+                continue;
+            }
+            // The ring is full. It drains at the device's fixed rate, so wait for the device to
+            // consume a chunk rather than polling it. Signalling from the audio callback instead
+            // would put a lock on the realtime thread.
+            let wait = self
+                .time_to_drain(RING_WAIT_SAMPLES)
+                .unwrap_or(STOPPED_OUTPUT_RECHECK)
+                .clamp(MINIMUM_RING_WAIT, STOPPED_OUTPUT_RECHECK);
+            thread::sleep(wait);
         }
         Ok(())
     }
@@ -423,30 +650,136 @@ impl AudioOutput {
         self.shared.eos_observed.store(true, Ordering::SeqCst);
     }
 
-    pub fn wait_drained(&self) -> io::Result<()> {
-        while !self.shared.eos_observed.load(Ordering::SeqCst)
-            || !self.shared.decode_done.load(Ordering::SeqCst)
-            || self.shared.played_samples.load(Ordering::SeqCst)
-                < self.shared.queued_samples.load(Ordering::SeqCst)
-        {
-            if self.shared.stopped.load(Ordering::SeqCst) {
-                return Err(io::Error::new(io::ErrorKind::BrokenPipe, "audio output stopped"));
-            }
-            if let Some(error) = self.shared.error() {
-                return Err(io::Error::other(error));
-            }
-            thread::sleep(POLL_INTERVAL);
+    /// One non-blocking drain check.
+    ///
+    /// `None` means still draining. Media §15 makes `DRAIN` bounded pending state that must not
+    /// block control, so the session actor polls this instead of parking a thread on
+    /// [`Self::wait_drained`].
+    pub fn poll_drained(&self) -> Option<io::Result<()>> {
+        if self.shared.stopped.load(Ordering::SeqCst) {
+            return Some(Err(io::Error::new(io::ErrorKind::BrokenPipe, "audio output stopped")));
         }
-        Ok(())
+        if let Some(error) = self.shared.error() {
+            return Some(Err(io::Error::new(io::ErrorKind::NotConnected, error)));
+        }
+        let drained = self.shared.eos_observed.load(Ordering::SeqCst)
+            && self.shared.decode_done.load(Ordering::SeqCst)
+            && self.shared.played_samples.load(Ordering::SeqCst)
+                >= self.shared.queued_samples.load(Ordering::SeqCst);
+        drained.then_some(Ok(()))
     }
 
     pub fn stop(&self) {
         self.shared.stopped.store(true, Ordering::SeqCst);
         // Session teardown must silence the device immediately. The stopped flag unblocks
         // decoders and waiters; leaving enabled set would let the callback continue draining
-        // already queued samples after the source and its nodes had been removed.
+        // already queued samples after the track and its surface nodes had been removed.
         self.shared.enabled.store(false, Ordering::SeqCst);
     }
+}
+
+pub struct ChannelAudioOutput {
+    output: Arc<AudioOutput>,
+    generation: u64,
+}
+
+impl ChannelAudioOutput {
+    fn with_current<T>(&self, operation: impl FnOnce(&AudioOutput) -> T) -> io::Result<T> {
+        let _transition = self
+            .output
+            .shared
+            .generation_transition
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.output.channel_generation() != self.generation {
+            return Err(retired_channel());
+        }
+        Ok(operation(&self.output))
+    }
+
+    pub fn observe_audio_pts(&self, pts_us: i64) -> io::Result<()> {
+        self.with_current(|output| output.observe_audio_pts(pts_us))
+    }
+
+    pub fn bridge_live_gap(&self, gap_us: u64) -> io::Result<()> {
+        self.with_current(|output| output.bridge_live_gap(gap_us))
+    }
+
+    pub fn rebase_live(&self, pts_us: i64) -> io::Result<()> {
+        self.with_current(|output| output.rebase_live(pts_us))
+    }
+
+    pub fn trim_before_start(
+        &self,
+        pts_us: i64,
+        duration_us: u64,
+        samples: &mut Vec<f32>,
+    ) -> io::Result<()> {
+        self.with_current(|output| output.trim_before_start(pts_us, duration_us, samples))
+    }
+
+    pub fn push(&self, samples: &[f32]) -> io::Result<()> {
+        self.with_current(|output| {
+            output.push_while(samples, || output.channel_generation() == self.generation)
+        })?
+    }
+
+    pub fn finish_decode(&self) -> io::Result<()> {
+        self.with_current(AudioOutput::finish_decode)
+    }
+
+    pub fn signal_eos(&self) -> io::Result<()> {
+        self.with_current(AudioOutput::signal_eos)
+    }
+}
+
+fn retired_channel() -> io::Error {
+    io::Error::new(io::ErrorKind::Interrupted, "retired audio channel generation")
+}
+
+/// Drop everything a timeline reset or a shrinking live delay asked for, in one callback.
+///
+/// Both are index arithmetic on the ring rather than work proportional to a device period, so
+/// there is nothing to pace. Pacing them anyway is what made a seek cost the whole buffered
+/// reserve: the output stayed silent, `rendered_samples` stood still, and every linked video frame
+/// paced by this clock stalled with it for as long as the ring was deep. Returns how many samples
+/// were dropped, which is media the caller must not also render.
+fn discard_stale_samples<C: Consumer<Item = f32>>(shared: &Shared, consumer: &mut C) -> u64 {
+    let mut discarded = 0_u64;
+    let discard_through = shared.discard_through_samples.load(Ordering::SeqCst);
+    let played = shared.played_samples.load(Ordering::SeqCst);
+    if played < discard_through {
+        let outstanding = usize::try_from(discard_through - played).unwrap_or(usize::MAX);
+        discarded += consumer.skip(outstanding) as u64;
+    }
+    let requested = shared.discard_samples.load(Ordering::SeqCst);
+    if requested != 0 {
+        let removed = consumer.skip(usize::try_from(requested).unwrap_or(usize::MAX)) as u64;
+        if removed != 0 {
+            let _ = shared.discard_samples.fetch_update(
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+                |remaining| Some(remaining.saturating_sub(removed)),
+            );
+            discarded += removed;
+        }
+    }
+    if discarded > 0 {
+        shared.played_samples.fetch_add(discarded, Ordering::SeqCst);
+    }
+    discarded
+}
+
+fn audio_prebuffer_ready(shared: &Shared) -> bool {
+    let queued = shared.queued_samples.load(Ordering::SeqCst);
+    let buffered = queued.saturating_sub(shared.played_samples.load(Ordering::SeqCst));
+    let decode_done = shared.decode_done.load(Ordering::SeqCst);
+    let minimum_ready = buffered >= shared.prebuffer_samples.load(Ordering::SeqCst) || decode_done;
+    let resume_ready = !shared.resume_waiting_for_audio.load(Ordering::SeqCst)
+        || queued > shared.resume_queued_samples.load(Ordering::SeqCst)
+        || buffered >= shared.ring_capacity_samples
+        || decode_done;
+    minimum_ready && resume_ready
 }
 
 fn build_stream<T, C>(
@@ -464,23 +797,7 @@ where
         .build_output_stream(
             *config,
             move |output: &mut [T], _| {
-                let mut discarded = 0_u64;
-                while discarded < output.len() as u64 {
-                    if shared.discard_samples.load(Ordering::SeqCst) == 0 {
-                        break;
-                    }
-                    if consumer.try_pop().is_none() {
-                        break;
-                    }
-                    let _ = shared.discard_samples.fetch_update(
-                        Ordering::SeqCst,
-                        Ordering::SeqCst,
-                        |remaining| remaining.checked_sub(1),
-                    );
-                    discarded += 1;
-                }
-                if discarded > 0 {
-                    shared.played_samples.fetch_add(discarded, Ordering::SeqCst);
+                if discard_stale_samples(&shared, &mut consumer) > 0 {
                     output.fill_with(|| T::from_sample(0.0));
                     return;
                 }
@@ -489,32 +806,51 @@ where
                     return;
                 }
                 if !shared.prebuffered.load(Ordering::SeqCst) {
-                    let buffered = shared
-                        .queued_samples
-                        .load(Ordering::SeqCst)
-                        .saturating_sub(shared.played_samples.load(Ordering::SeqCst));
-                    if buffered < shared.prebuffer_samples.load(Ordering::SeqCst)
-                        && !shared.decode_done.load(Ordering::SeqCst)
-                    {
+                    if !audio_prebuffer_ready(&shared) {
                         output.fill_with(|| T::from_sample(0.0));
                         return;
                     }
+                    shared.resume_waiting_for_audio.store(false, Ordering::SeqCst);
                     shared.prebuffered.store(true, Ordering::SeqCst);
                 }
-                let rendered = output.len() as u64;
                 let mut played = 0_u64;
+                // Media time only advances for samples that actually carried the timeline: real
+                // audio, and the leading silence that stands in for timeline before the first
+                // packet. An underrun renders silence the producer never sent, and a hold is delay
+                // that has not happened yet — counting either would run the clock ahead of the
+                // media and make every linked video frame look late for the rest of the session.
+                let mut rendered = 0_u64;
+                let gain = f32::from_bits(shared.gain_bits.load(Ordering::SeqCst));
                 for sample in output {
-                    let emit_silence = shared
-                        .leading_silence_samples
+                    if shared
+                        .hold_silence_samples
                         .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
                             remaining.checked_sub(1)
                         })
-                        .is_ok();
+                        .is_ok()
+                    {
+                        *sample = T::from_sample(0.0);
+                        continue;
+                    }
+                    let emit_silence = shared
+                        .gap_silence_samples
+                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                            remaining.checked_sub(1)
+                        })
+                        .is_ok()
+                        || shared
+                            .leading_silence_samples
+                            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                                remaining.checked_sub(1)
+                            })
+                            .is_ok();
                     if emit_silence {
                         *sample = T::from_sample(0.0);
+                        rendered += 1;
                     } else if let Some(value) = consumer.try_pop() {
-                        *sample = T::from_sample(value);
+                        *sample = T::from_sample((value * gain).clamp(-1.0, 1.0));
                         played += 1;
+                        rendered += 1;
                     } else {
                         *sample = T::from_sample(0.0);
                     }
@@ -529,6 +865,8 @@ where
 }
 
 pub struct AudioDecoder {
+    /// The verified layout of the FFmpeg this decoder reads structures from.
+    abi: &'static ffmpeg::Abi,
     context: *mut c_void,
     packet: *mut c_void,
     frame: *mut c_void,
@@ -543,10 +881,12 @@ pub struct AudioDecoder {
 
 impl AudioDecoder {
     fn new(
-        config: &ParsedAudioSourceConfig,
+        config: &AudioConfiguration,
         output_rate: u32,
         output_channels: u16,
     ) -> io::Result<Self> {
+        // Verify the linked FFmpeg's structure layout before touching any of it.
+        let abi = ffmpeg::abi()?;
         let name =
             CString::new(config.codec.as_str()).map_err(|_| invalid("audio codec has NUL"))?;
         let codec = unsafe { avcodec_find_decoder_by_name(name.as_ptr()) };
@@ -557,42 +897,51 @@ impl AudioDecoder {
             ));
         }
         let mut context = unsafe { avcodec_alloc_context3(codec) };
-        let mut parameters = unsafe { avcodec_parameters_alloc() };
-        if context.is_null() || parameters.is_null() {
-            unsafe {
-                avcodec_parameters_free(&mut parameters);
-                avcodec_free_context(&mut context);
-            }
+        let mut parameters = match ffmpeg::allocate_parameters() {
+            Ok(parameters) => parameters,
+            Err(error) => {
+                unsafe { avcodec_free_context(&mut context) };
+                return Err(error);
+            },
+        };
+        if context.is_null() {
+            ffmpeg::free_parameters(&mut parameters);
             return Err(io::Error::other("FFmpeg could not allocate audio decoder state"));
         }
         let result = (|| {
-            let codec = unsafe { &*(codec as *const AVCodecPrefix) };
-            let parameters = unsafe { &mut *(parameters as *mut AVCodecParametersPrefix) };
-            parameters.codec_type = AVMEDIA_TYPE_AUDIO;
-            parameters.codec_id = codec.id;
-            parameters.bit_rate = i64::try_from(config.bitrate).unwrap_or(i64::MAX);
-            if !config.extradata.is_empty() {
+            let extradata = if config.extradata.is_empty() {
+                None
+            } else {
                 let size = config
                     .extradata
                     .len()
                     .checked_add(AV_INPUT_BUFFER_PADDING_SIZE)
                     .ok_or_else(|| invalid("audio extradata size overflows"))?;
-                parameters.extradata = unsafe { av_mallocz(size) }.cast();
-                if parameters.extradata.is_null() {
+                let extradata: *mut u8 = unsafe { av_mallocz(size) }.cast();
+                if extradata.is_null() {
                     return Err(io::Error::other("FFmpeg could not allocate audio extradata"));
                 }
                 unsafe {
                     ptr::copy_nonoverlapping(
                         config.extradata.as_ptr(),
-                        parameters.extradata,
+                        extradata,
                         config.extradata.len(),
                     )
                 };
-                parameters.extradata_size = c_int::try_from(config.extradata.len())
+                let length = c_int::try_from(config.extradata.len())
                     .map_err(|_| invalid("audio extradata exceeds i32"))?;
+                Some((extradata, length))
+            };
+            unsafe {
+                abi.set_parameters(
+                    parameters,
+                    AVMEDIA_TYPE_AUDIO,
+                    ffmpeg::codec_id(codec),
+                    ParameterValues { extradata, ..Default::default() },
+                );
             }
             check_ffmpeg("could not configure audio decoder", unsafe {
-                avcodec_parameters_to_context(context, parameters as *const _ as *const c_void)
+                avcodec_parameters_to_context(context, parameters)
             })?;
             check_ffmpeg("could not set audio packet time base", unsafe {
                 av_opt_set_q(context, c"pkt_timebase".as_ptr(), PACKET_TIME_BASE, 0)
@@ -614,10 +963,10 @@ impl AudioDecoder {
             unsafe { av_channel_layout_uninit(&mut layout) };
             check_ffmpeg("could not set audio channel layout", layout_result)?;
             check_ffmpeg("could not open audio decoder", unsafe {
-                avcodec_open2(context, codec as *const _ as *const c_void, ptr::null_mut())
+                avcodec_open2(context, codec, ptr::null_mut())
             })
         })();
-        unsafe { avcodec_parameters_free(&mut parameters) };
+        ffmpeg::free_parameters(&mut parameters);
         if let Err(error) = result {
             unsafe { avcodec_free_context(&mut context) };
             return Err(error);
@@ -635,6 +984,7 @@ impl AudioDecoder {
             return Err(io::Error::other("FFmpeg could not allocate audio decode buffers"));
         }
         Ok(Self {
+            abi,
             context,
             packet,
             frame,
@@ -657,7 +1007,7 @@ impl AudioDecoder {
         check_ffmpeg("could not allocate audio packet", unsafe {
             av_new_packet(self.packet, size)
         })?;
-        let av_packet = unsafe { &mut *(self.packet as *mut AVPacketPrefix) };
+        let av_packet = unsafe { &mut *(self.packet as *mut AVPacket) };
         unsafe {
             ptr::copy_nonoverlapping(packet.data.as_ptr(), av_packet.data, packet.data.len())
         };
@@ -726,7 +1076,7 @@ impl AudioDecoder {
                 break;
             }
             check_ffmpeg("could not receive decoded audio", result)?;
-            let frame = unsafe { &*(self.frame as *const AVFramePrefix) };
+            let frame = unsafe { self.abi.frame(self.frame) };
             if frame.nb_samples <= 0 {
                 unsafe { av_frame_unref(self.frame) };
                 continue;
@@ -883,7 +1233,7 @@ fn check_ffmpeg(context: &str, result: c_int) -> io::Result<()> {
 }
 
 fn ffmpeg_error(context: &str, code: c_int) -> io::Error {
-    let mut buffer = [0_i8; 256];
+    let mut buffer: [c_char; 256] = [0; 256];
     let description = if unsafe { av_strerror(code, buffer.as_mut_ptr(), buffer.len()) } == 0 {
         unsafe { CStr::from_ptr(buffer.as_ptr()) }.to_string_lossy().into_owned()
     } else {
@@ -907,8 +1257,6 @@ unsafe extern "C" {
     fn avcodec_find_decoder_by_name(name: *const c_char) -> *const c_void;
     fn avcodec_alloc_context3(codec: *const c_void) -> *mut c_void;
     fn avcodec_free_context(context: *mut *mut c_void);
-    fn avcodec_parameters_alloc() -> *mut c_void;
-    fn avcodec_parameters_free(parameters: *mut *mut c_void);
     fn avcodec_parameters_to_context(context: *mut c_void, parameters: *const c_void) -> c_int;
     fn avcodec_open2(
         context: *mut c_void,
@@ -975,27 +1323,24 @@ unsafe extern "C" {
 mod tests {
     use super::*;
     use vivid_protocol::media::ParsedAudioPacket;
-    use vivid_protocol::messages::ParsedAudioSourceConfig;
+    use vivid_protocol::track::AudioConfiguration;
 
     #[test]
-    fn video_gate_stall_requires_enabled_and_empty_ingress() {
+    fn video_gate_stall_requires_enabled_and_absent_clock_progress() {
         let output = AudioOutput::test_output();
         assert!(!output.video_gate_stalled());
 
         output.configure_play(0, 100_000);
         output.start();
         assert!(!output.video_gate_stalled());
-        *output.shared.play_configured_at.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
-            Some(Instant::now() - LINKED_AUDIO_STALL_FALLBACK - Duration::from_millis(1));
+        output.force_video_gate_stall_for_test();
         assert!(output.video_gate_stalled());
+        assert_eq!(output.shared.error().as_deref(), Some("linked audio output clock stalled"));
 
-        output.push(&[0.0, 0.0]).unwrap();
-        assert!(!output.video_gate_stalled());
         output.pause();
         assert!(!output.video_gate_stalled());
         output.flush();
         assert!(!output.video_gate_stalled());
-        assert!(!output.shared.received_samples.load(Ordering::SeqCst));
         assert!(
             output
                 .shared
@@ -1004,6 +1349,171 @@ mod tests {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .is_none()
         );
+    }
+
+    #[test]
+    fn producer_push_accounts_an_accepted_slice_once() {
+        let output = AudioOutput::test_output();
+        let samples = [0.0, 0.25, -0.5, 1.0, -1.0, 0.75];
+        output.push(&samples).unwrap();
+        assert_eq!(output.shared.queued_samples.load(Ordering::SeqCst), samples.len() as u64);
+    }
+
+    #[test]
+    fn a_timeline_reset_frees_the_whole_reserve_in_one_callback() {
+        let output = AudioOutput::test_output();
+        let (mut producer, mut consumer) = HeapRb::<f32>::new(4_096).split();
+        // A seek arrives with the device reserve full, which is the steady state of timed audio.
+        let buffered = producer.push_slice(&[0.5; 4_096]) as u64;
+        assert_eq!(buffered, 4_096);
+        output.shared.queued_samples.store(buffered, Ordering::SeqCst);
+        output.flush();
+
+        // One device period is a few hundred samples. Draining the reserve at that rate silenced
+        // the output, and every video frame paced by its clock, for the whole two-second reserve.
+        assert_eq!(discard_stale_samples(&output.shared, &mut consumer), buffered);
+        assert_eq!(output.shared.played_samples.load(Ordering::SeqCst), buffered);
+        assert_eq!(consumer.try_pop(), None);
+
+        // The replacement timeline pushed behind the watermark survives untouched.
+        assert_eq!(producer.push_slice(&[0.25; 8]), 8);
+        output.shared.queued_samples.fetch_add(8, Ordering::SeqCst);
+        assert_eq!(discard_stale_samples(&output.shared, &mut consumer), 0);
+        assert_eq!(consumer.try_pop(), Some(0.25));
+    }
+
+    #[test]
+    fn play_anchors_the_clock_on_the_audio_already_queued_for_the_new_timeline() {
+        let output = AudioOutput::test_output();
+        // The replacement channel can push before PLAY is dispatched: control and media travel on
+        // independent connections. Its first packet straddles the seek target and is not trimmed,
+        // so the clock has to start where that sample does or every frame is shown a packet early.
+        output.observe_audio_pts(6_980_000);
+        output.push(&[0.5; 8]).unwrap();
+        output.configure_play(7_000_000, 0);
+
+        assert_eq!(output.shared.timeline_origin_us.load(Ordering::SeqCst), 6_980_000);
+        assert_eq!(output.shared.leading_silence_samples.load(Ordering::SeqCst), 0);
+
+        // Audio that starts after the requested target is leading silence, not a head start.
+        let later = AudioOutput::test_output();
+        later.configure_play(7_000_000, 0);
+        later.observe_audio_pts(7_010_000);
+        assert_eq!(later.shared.timeline_origin_us.load(Ordering::SeqCst), 7_000_000);
+        assert_eq!(
+            later.shared.leading_silence_samples.load(Ordering::SeqCst),
+            leading_silence_sample_count(7_000_000, 7_010_000, 48_000, 2)
+        );
+
+        // A packet straddling an already published start is trimmed to it before it is pushed.
+        let trimmed = AudioOutput::test_output();
+        trimmed.configure_play(7_000_000, 0);
+        trimmed.observe_audio_pts(6_980_000);
+        assert_eq!(trimmed.shared.timeline_origin_us.load(Ordering::SeqCst), 7_000_000);
+        assert_eq!(trimmed.shared.leading_silence_samples.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn resume_preserves_the_clock_of_rendered_and_buffered_audio() {
+        // The physical audio clock can be slightly ahead of a nested PLAY by the time that control
+        // edge crosses the bridge. Its retained samples still continue the physical timeline, so
+        // the nested request must not rewrite their PTS or the linked video will jump twice.
+        let output = AudioOutput::test_output();
+        output.observe_audio_pts(1_000_000);
+        output.shared.queued_samples.store(192_000, Ordering::SeqCst);
+        output.shared.played_samples.store(96_000, Ordering::SeqCst);
+        output.shared.rendered_samples.store(96_000, Ordering::SeqCst);
+        output.configure_play(1_950_000, 1);
+        output.start();
+        output.shared.prebuffered.store(true, Ordering::SeqCst);
+
+        assert_eq!(output.shared.timeline_origin_us.load(Ordering::SeqCst), 1_000_000);
+        assert_eq!(output.rendered_pts(), Some(2_000_000));
+        assert_eq!(output.shared.first_audio_pts_us.load(Ordering::SeqCst), 1_000_000);
+        assert_eq!(output.shared.queued_samples.load(Ordering::SeqCst), 192_000);
+        assert_eq!(output.shared.played_samples.load(Ordering::SeqCst), 96_000);
+        assert_eq!(output.shared.discard_through_samples.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn resume_waits_for_audio_accepted_after_play() {
+        // Over vvssh, PLAY uses the control connection while audio uses the realtime connection.
+        // The retained tail predates PLAY and cannot prove that the realtime path has caught up.
+        let output = AudioOutput::test_output();
+        output.observe_audio_pts(1_000_000);
+        output.shared.queued_samples.store(20, Ordering::SeqCst);
+        output.shared.played_samples.store(10, Ordering::SeqCst);
+        output.shared.rendered_samples.store(10, Ordering::SeqCst);
+
+        output.configure_play(1_000_104, 1);
+
+        assert!(!audio_prebuffer_ready(&output.shared));
+        output.shared.queued_samples.fetch_add(1, Ordering::SeqCst);
+        assert!(audio_prebuffer_ready(&output.shared));
+    }
+
+    #[test]
+    fn resume_can_drain_a_full_ring_without_waiting_on_its_blocked_producer() {
+        let output = AudioOutput::test_output();
+        output.observe_audio_pts(1_000_000);
+        output.shared.queued_samples.store(42, Ordering::SeqCst);
+        output.shared.played_samples.store(10, Ordering::SeqCst);
+        output.shared.rendered_samples.store(10, Ordering::SeqCst);
+
+        output.configure_play(1_000_104, 1);
+
+        assert_eq!(output.shared.ring_capacity_samples, 32);
+        assert!(audio_prebuffer_ready(&output.shared));
+    }
+
+    #[test]
+    fn initial_play_does_not_require_a_post_play_audio_write() {
+        let output = AudioOutput::test_output();
+        output.configure_play(1_000_000, 0);
+
+        assert!(!output.shared.resume_waiting_for_audio.load(Ordering::SeqCst));
+        assert!(audio_prebuffer_ready(&output.shared));
+    }
+
+    #[test]
+    fn channel_advance_reuses_the_output_but_retires_every_old_generation_write() {
+        let output = AudioOutput::test_output();
+        let retired = output.channel(1).unwrap();
+        retired.observe_audio_pts(1_000_000).unwrap();
+        retired.push(&[0.25; 8]).unwrap();
+        output.configure_play(1_000_000, 1);
+        output.start();
+
+        assert!(output.advance_channel(1, 2));
+        assert_eq!(output.channel_generation(), 2);
+        assert!(!output.shared.enabled.load(Ordering::SeqCst));
+        assert_eq!(output.shared.timeline_origin_us.load(Ordering::SeqCst), UNSET_PTS);
+        assert_eq!(output.shared.discard_through_samples.load(Ordering::SeqCst), 8);
+        assert_eq!(output.shared.discard_samples.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            retired.push(&[0.5]).unwrap_err().kind(),
+            io::ErrorKind::Interrupted,
+            "the retired decoder must not contaminate the replacement clock"
+        );
+
+        let replacement = output.channel(2).unwrap();
+        replacement.observe_audio_pts(7_000_000).unwrap();
+        replacement.push(&[0.75; 4]).unwrap();
+        assert_eq!(output.shared.timeline_origin_us.load(Ordering::SeqCst), 7_000_000);
+        assert_eq!(output.shared.queued_samples.load(Ordering::SeqCst), 12);
+        assert!(!output.advance_channel(1, 3));
+        assert_eq!(output.channel_generation(), 2);
+    }
+
+    #[test]
+    fn video_gate_observes_audio_clock_progress_before_declaring_a_stall() {
+        let output = AudioOutput::test_output();
+        output.configure_play(0, 100_000);
+        output.start();
+        output.force_video_gate_stall_for_test();
+        output.shared.rendered_samples.store(256, Ordering::SeqCst);
+        assert!(!output.video_gate_stalled());
+        assert!(output.shared.error().is_none());
     }
 
     #[test]
@@ -1035,18 +1545,107 @@ mod tests {
     }
 
     #[test]
+    fn live_video_discard_threshold_tracks_rendered_audio() {
+        let output = AudioOutput::test_output();
+        output.observe_audio_pts(1_000_000);
+        output.start();
+        output.shared.prebuffered.store(true, Ordering::SeqCst);
+        output.shared.rendered_samples.store(48_000 * 2, Ordering::SeqCst);
+
+        assert_eq!(output.discard_video_before(100_000), Some(1_900_000));
+    }
+
+    #[test]
+    fn a_live_delay_holds_audio_back_without_moving_the_media_clock() {
+        // Regression: audio played on arrival runs ahead of the picture it belongs with by the
+        // transport's video delay. The hold is what puts them back together, and it must not be
+        // mistaken for elapsed media time — a delay that advanced the clock would leave the video
+        // exactly as late as it was before, and be discarded for it.
+        let output = AudioOutput::test_output();
+        output.observe_audio_pts(1_000_000);
+        output.start();
+        output.shared.prebuffered.store(true, Ordering::SeqCst);
+        let before = output.rendered_pts();
+
+        assert_eq!(output.request_live_delay(300_000), 300_000);
+        assert_eq!(output.live_delay_us(), 300_000);
+        assert_eq!(output.shared.hold_silence_samples.load(Ordering::SeqCst), 48_000 * 2 * 3 / 10);
+        assert_eq!(output.rendered_pts(), before, "a hold is not elapsed media time");
+
+        // Jitter-sized changes are ignored, and the hold is bounded.
+        assert_eq!(output.request_live_delay(310_000), 300_000);
+        assert_eq!(output.request_live_delay(u64::MAX), MAXIMUM_LIVE_DELAY_US);
+    }
+
+    #[test]
+    fn shrinking_a_live_delay_discards_the_samples_it_no_longer_holds() {
+        let output = AudioOutput::test_output();
+        output.request_live_delay(500_000);
+
+        assert_eq!(output.request_live_delay(200_000), 200_000);
+        assert_eq!(output.live_delay_us(), 200_000);
+        assert_eq!(output.shared.discard_samples.load(Ordering::SeqCst), 48_000 * 2 * 3 / 10);
+    }
+
+    #[test]
+    fn bridging_a_gap_advances_the_clock_and_keeps_every_buffered_sample() {
+        // The producer dropped 120 ms. The timeline is intact, so the clock must move over the
+        // hole while the audio already buffered behind it survives; restarting the timeline for
+        // this is audible and used to happen for any step over 2 ms.
+        let output = AudioOutput::test_output();
+        output.observe_audio_pts(1_000_000);
+        output.start();
+        output.shared.prebuffered.store(true, Ordering::SeqCst);
+        output.shared.queued_samples.store(9_600, Ordering::SeqCst);
+
+        output.bridge_live_gap(120_000);
+        // The packet that follows the gap is observed like any other. Leading silence is
+        // recomputed and *stored* on every observation, so a bridge kept there would be erased
+        // before a single sample of it reached the device.
+        output.observe_audio_pts(1_200_000);
+
+        assert_eq!(output.shared.gap_silence_samples.load(Ordering::SeqCst), 48_000 * 2 * 12 / 100);
+        assert_eq!(
+            output.shared.leading_silence_samples.load(Ordering::SeqCst),
+            0,
+            "the observation really does clear leading silence, which is why the bridge is separate"
+        );
+        assert_eq!(output.shared.discard_samples.load(Ordering::SeqCst), 0);
+        assert_eq!(output.shared.queued_samples.load(Ordering::SeqCst), 9_600);
+        assert_eq!(
+            output.shared.timeline_origin_us.load(Ordering::SeqCst),
+            1_000_000,
+            "a gap does not restart the timeline"
+        );
+    }
+
+    #[test]
+    fn live_rebase_discards_old_samples_and_restarts_the_clock() {
+        let output = AudioOutput::test_output();
+        output.observe_audio_pts(1_000_000);
+        output.start();
+        output.shared.queued_samples.store(960, Ordering::SeqCst);
+        output.shared.played_samples.store(480, Ordering::SeqCst);
+
+        output.rebase_live(2_000_000);
+
+        assert!(output.shared.enabled.load(Ordering::SeqCst));
+        assert_eq!(output.shared.timeline_origin_us.load(Ordering::SeqCst), 2_000_000);
+        assert_eq!(output.shared.discard_through_samples.load(Ordering::SeqCst), 960);
+        assert_eq!(output.shared.discard_samples.load(Ordering::SeqCst), 0);
+        assert!(!output.shared.prebuffered.load(Ordering::SeqCst));
+    }
+
+    #[test]
     fn ffmpeg_decodes_pcm_access_units_without_an_output_device() {
-        let config = ParsedAudioSourceConfig {
-            source_id: 1,
-            linked_video_source_id: None,
+        let config = AudioConfiguration {
             codec: "pcm_s16le".into(),
             packetization: "pcm-packet-v1".into(),
             extradata: Vec::new(),
             sample_rate: 48_000,
             channels: 2,
             channel_mask: 3,
-            bitrate: 1_536_000,
-            max_access_unit_bytes: 4_096,
+            maximum_access_unit_bytes: 4_096,
             codec_string: None,
         };
         let encoded = vec![0_u8; 480 * 2 * 2];
@@ -1068,5 +1667,74 @@ mod tests {
         samples.extend(decoder.finish().unwrap());
         assert_eq!(samples.len(), 480 * 2);
         assert!(samples.iter().all(|sample| *sample == 0.0));
+    }
+
+    #[test]
+    fn ffmpeg_decodes_vvdoom_float_pcm_access_units() {
+        let config = AudioConfiguration {
+            codec: "pcm_f32le".into(),
+            packetization: "pcm-packet-v1".into(),
+            extradata: Vec::new(),
+            sample_rate: 48_000,
+            channels: 2,
+            channel_mask: 3,
+            maximum_access_unit_bytes: (960 * 2 * size_of::<f32>()) as u32,
+            codec_string: Some("pcm-f32".into()),
+        };
+        let source = (0..960 * 2)
+            .map(|sample| if sample % 2 == 0 { 0.5_f32 } else { -0.25_f32 })
+            .collect::<Vec<_>>();
+        let encoded = source.iter().flat_map(|sample| sample.to_le_bytes()).collect::<Vec<_>>();
+        assert!(supports(&config));
+        let mut decoder = AudioDecoder::new(&config, 48_000, 2).unwrap();
+        let mut samples = decoder
+            .push(ParsedAudioPacket {
+                epoch: 1,
+                packet_id: 1,
+                pts_us: 0,
+                dts_us: 0,
+                duration_us: 20_000,
+                trim_start_samples: 0,
+                trim_end_samples: 0,
+                data: &encoded,
+            })
+            .unwrap();
+        samples.extend(decoder.finish().unwrap());
+        assert_eq!(samples, source);
+    }
+
+    #[test]
+    #[ignore = "requires the machine's default audio output device"]
+    fn default_audio_device_renders_vvdoom_float_pcm() {
+        let output = AudioOutput::open(1).unwrap();
+        let sample_rate = output.sample_rate;
+        let channels = usize::from(output.channels);
+        let frame_count = sample_rate as usize / 2;
+        let samples = (0..frame_count)
+            .flat_map(|frame| {
+                let phase = frame as f32 * 440.0 * std::f32::consts::TAU / sample_rate as f32;
+                std::iter::repeat_n(phase.sin() * 0.2, channels)
+            })
+            .collect::<Vec<_>>();
+        output.observe_audio_pts(0);
+        output.start();
+        output.push(&samples).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while output.shared.played_samples.load(Ordering::SeqCst) == 0 && Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+        output.stop();
+        assert!(output.shared.played_samples.load(Ordering::SeqCst) > 0);
+        assert!(output.shared.error().is_none());
+    }
+
+    #[test]
+    fn gain_updates_without_changing_audio_clock_state() {
+        let output = AudioOutput::test_output();
+        output.shared.rendered_samples.store(42, Ordering::SeqCst);
+        output.set_gain(AudioGain::from_percent(175).unwrap());
+        assert_eq!(f32::from_bits(output.shared.gain_bits.load(Ordering::SeqCst)), 1.75);
+        assert_eq!(output.shared.rendered_samples.load(Ordering::SeqCst), 42);
     }
 }

@@ -3,6 +3,8 @@ use std::fmt::{self, Debug, Formatter};
 use std::process::ExitStatus;
 use std::sync::Arc;
 
+use crate::osc_notification::OscNotification;
+use crate::terminal::event_loop::EventLoopSendError;
 use crate::terminal::graphics::GraphicsCommand;
 use crate::terminal::term::ClipboardType;
 use crate::terminal::vte::ansi::Rgb;
@@ -21,6 +23,9 @@ pub enum Event {
 
     /// Reset to the default window title.
     ResetTitle,
+
+    /// Local working directory reported with OSC 7.
+    WorkingDirectory(String),
 
     /// Request to store a text string in the clipboard.
     ClipboardStore(ClipboardType, String),
@@ -50,19 +55,22 @@ pub enum Event {
     Wakeup,
 
     /// Sanitized PTY bytes were retained at this absolute transcript range.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     PtyOutput { start: u64, end: u64 },
 
     /// A tagged IPC input buffer was completely written to the PTY master.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     PtyWriteComplete(u64),
 
     /// A tagged IPC resize was applied to the PTY master.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     PtyResizeComplete(u64),
 
     /// Terminal bell ring.
     Bell,
+
+    /// A bounded OSC 9 or OSC 99 desktop-notification request.
+    DesktopNotification(OscNotification),
 
     /// Protocol-neutral image, animation, or video operation.
     Graphics(GraphicsCommand),
@@ -95,17 +103,19 @@ impl Debug for Event {
             Event::ColorRequest(index, _) => write!(f, "ColorRequest({index})"),
             Event::PtyWrite(text) => write!(f, "PtyWrite({text})"),
             Event::Title(title) => write!(f, "Title({title})"),
+            Event::WorkingDirectory(path) => write!(f, "WorkingDirectory({path})"),
             Event::CursorBlinkingChange => write!(f, "CursorBlinkingChange"),
             Event::MouseCursorDirty => write!(f, "MouseCursorDirty"),
             Event::ResetTitle => write!(f, "ResetTitle"),
             Event::Wakeup => write!(f, "Wakeup"),
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             Event::PtyOutput { start, end } => write!(f, "PtyOutput({start}..{end})"),
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             Event::PtyWriteComplete(token) => write!(f, "PtyWriteComplete({token})"),
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             Event::PtyResizeComplete(token) => write!(f, "PtyResizeComplete({token})"),
             Event::Bell => write!(f, "Bell"),
+            Event::DesktopNotification(_) => write!(f, "DesktopNotification"),
             Event::Graphics(command) => write!(f, "Graphics({command:?})"),
             Event::VividMarker { marker, line, column, alternate } => {
                 write!(f, "VividMarker({marker:?}, {line}, {column}, alternate={alternate})")
@@ -127,8 +137,10 @@ impl Debug for Event {
 pub trait Notify {
     /// Notify that an escape sequence should be written to the PTY.
     ///
-    /// TODO this needs to be able to error somehow.
-    fn notify<B: Into<Cow<'static, [u8]>>>(&self, _: B);
+    /// Fails when the response cannot be delivered, e.g. because the PTY event loop has
+    /// already shut down. Callers log and continue; a failed response must not disrupt the
+    /// event processing that triggered it.
+    fn notify<B: Into<Cow<'static, [u8]>>>(&self, _: B) -> Result<(), EventLoopSendError>;
 }
 
 #[derive(Copy, Clone, Debug)]

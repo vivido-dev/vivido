@@ -127,34 +127,21 @@ impl ShellUser {
     /// look for shell, username, longname, and home dir in the respective environment variables
     /// before falling back on looking into `passwd`.
     fn from_env() -> Result<Self> {
-        let mut buf = [0; 1024];
-        let pw = get_pw_entry(&mut buf);
-
-        let user = match env::var("USER") {
-            Ok(user) => user,
-            Err(_) => match pw {
-                Ok(ref pw) => pw.name.to_owned(),
-                Err(err) => return Err(err),
+        let user = env::var("USER");
+        let home = env::var("HOME");
+        let shell = env::var("SHELL");
+        match (user, home, shell) {
+            (Ok(user), Ok(home), Ok(shell)) => Ok(Self { user, home, shell }),
+            (user, home, shell) => {
+                let mut buf = [0; 1024];
+                let pw = get_pw_entry(&mut buf)?;
+                Ok(Self {
+                    user: user.unwrap_or_else(|_| pw.name.to_owned()),
+                    home: home.unwrap_or_else(|_| pw.dir.to_owned()),
+                    shell: shell.unwrap_or_else(|_| pw.shell.to_owned()),
+                })
             },
-        };
-
-        let home = match env::var("HOME") {
-            Ok(home) => home,
-            Err(_) => match pw {
-                Ok(ref pw) => pw.dir.to_owned(),
-                Err(err) => return Err(err),
-            },
-        };
-
-        let shell = match env::var("SHELL") {
-            Ok(shell) => shell,
-            Err(_) => match pw {
-                Ok(ref pw) => pw.shell.to_owned(),
-                Err(err) => return Err(err),
-            },
-        };
-
-        Ok(Self { user, home, shell })
+        }
     }
 }
 
@@ -180,15 +167,27 @@ fn default_shell_command(shell: &str, user: &str, home: &str) -> Command {
     // ourselves and passing `-q`
     let has_home_hushlogin = Path::new(home).join(".hushlogin").exists();
 
+    // `exec -a` needs a shell that supports it; the user's own shell does when it is zsh
+    // or bash, otherwise fall back to zsh so the exec line still works.
+    let interpreter = login_interpreter(shell);
+
     // -f: Bypasses authentication for the already-logged-in user.
     // -l: Skips changing directory to $HOME and prepending '-' to argv[0].
     // -p: Preserves the environment.
     // -q: Act as if `.hushlogin` exists.
-    //
-    // XXX: we use zsh here over sh due to `exec -a`.
     let flags = if has_home_hushlogin { "-qflp" } else { "-flp" };
-    login_command.args([flags, user, "/bin/zsh", "-fc", &exec]);
+    login_command.args([flags, user, interpreter, "-fc", &exec]);
     login_command
+}
+
+/// The interpreter for the macOS `exec -a` login line: the user's own shell when it supports
+/// `exec -a`, zsh otherwise.
+#[cfg(target_os = "macos")]
+fn login_interpreter(shell: &str) -> &str {
+    match shell.rsplit('/').next().unwrap() {
+        "zsh" | "bash" => shell,
+        _ => "/bin/zsh",
+    }
 }
 
 /// Create a new TTY and return a handle to interact with it.
@@ -443,4 +442,13 @@ unsafe fn set_nonblocking(fd: c_int) -> Result<()> {
 fn test_get_pw_entry() {
     let mut buf: [i8; 1024] = [0; 1024];
     let _pw = get_pw_entry(&mut buf).unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn login_interpreter_runs_compatible_shells_themselves() {
+    assert_eq!(login_interpreter("/bin/zsh"), "/bin/zsh");
+    assert_eq!(login_interpreter("/bin/bash"), "/bin/bash");
+    assert_eq!(login_interpreter("/usr/local/bin/fish"), "/bin/zsh");
+    assert_eq!(login_interpreter("/bin/sh"), "/bin/zsh");
 }

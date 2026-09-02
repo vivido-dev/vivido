@@ -8,15 +8,13 @@ use serde::{Deserialize, Deserializer, Serialize};
 use winit::platform::macos::OptionAsAlt as WinitOptionAsAlt;
 use winit::window::{Fullscreen, Theme as WinitTheme, WindowLevel as WinitWindowLevel};
 
-use vivido_config_derive::{ConfigDeserialize, SerdeReplace};
-
 use crate::config::LOG_TARGET_CONFIG;
 use crate::config::ui_config::{Delta, Percentage};
 
 /// Default Vivido name, used for window title and class.
 pub const DEFAULT_NAME: &str = "Vivido";
 
-#[derive(ConfigDeserialize, Serialize, Debug, Clone, PartialEq)]
+#[derive(Serialize, Debug, Clone, PartialEq)]
 pub struct WindowConfig {
     /// Initial position.
     pub position: Option<Delta<i32>>,
@@ -34,7 +32,6 @@ pub struct WindowConfig {
     pub dynamic_title: bool,
 
     /// Information to identify a particular window.
-    #[config(flatten)]
     pub identity: Identity,
 
     /// Background opacity from 0.0 to 1.0.
@@ -149,7 +146,7 @@ impl WindowConfig {
     }
 }
 
-#[derive(ConfigDeserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Debug, Clone, PartialEq, Eq)]
 pub struct Identity {
     /// Window title.
     pub title: String,
@@ -164,7 +161,7 @@ impl Default for Identity {
     }
 }
 
-#[derive(ConfigDeserialize, Serialize, Default, Debug, Copy, Clone, PartialEq, Eq)]
+#[derive(Serialize, Default, Debug, Copy, Clone, PartialEq, Eq)]
 pub enum StartupMode {
     #[default]
     Windowed,
@@ -173,7 +170,7 @@ pub enum StartupMode {
     SimpleFullscreen,
 }
 
-#[derive(ConfigDeserialize, Serialize, Default, Debug, Copy, Clone, PartialEq, Eq)]
+#[derive(Serialize, Default, Debug, Copy, Clone, PartialEq, Eq)]
 pub enum Decorations {
     #[default]
     Full,
@@ -185,7 +182,7 @@ pub enum Decorations {
 /// Window Dimensions.
 ///
 /// Newtype to avoid passing values incorrectly.
-#[derive(ConfigDeserialize, Serialize, Default, Debug, Copy, Clone, PartialEq, Eq)]
+#[derive(Serialize, Default, Debug, Copy, Clone, PartialEq, Eq)]
 pub struct Dimensions {
     /// Window width in character columns.
     pub columns: usize,
@@ -195,7 +192,7 @@ pub struct Dimensions {
 }
 
 /// Window class hint.
-#[derive(SerdeReplace, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Debug, Clone, PartialEq, Eq)]
 pub struct Class {
     pub general: String,
     pub instance: String,
@@ -271,7 +268,7 @@ impl<'de> Deserialize<'de> for Class {
     }
 }
 
-#[derive(ConfigDeserialize, Serialize, Default, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Serialize, Default, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OptionAsAlt {
     /// The left `Option` key is treated as `Alt`.
     OnlyLeft,
@@ -288,7 +285,7 @@ pub enum OptionAsAlt {
 }
 
 /// System decorations theme variant.
-#[derive(ConfigDeserialize, Serialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Serialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Theme {
     Light,
     Dark,
@@ -303,7 +300,7 @@ impl From<Theme> for WinitTheme {
     }
 }
 
-#[derive(ConfigDeserialize, Serialize, Default, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Serialize, Default, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WindowLevel {
     #[default]
     Normal,
@@ -318,3 +315,28 @@ impl From<WindowLevel> for WinitWindowLevel {
         }
     }
 }
+
+impl_config_deserialize!(WindowConfig {
+    position: option,
+    decorations,
+    startup_mode,
+    dynamic_padding,
+    dynamic_title,
+    identity: flatten,
+    opacity,
+    blur,
+    option_as_alt,
+    resize_increments,
+    padding,
+    dimensions,
+    decorations_theme_variant: option,
+    level,
+});
+impl_config_deserialize!(Identity { title, class });
+impl_config_deserialize_enum!(StartupMode { Windowed, Maximized, Fullscreen, SimpleFullscreen });
+impl_config_deserialize_enum!(Decorations { Full, Transparent, Buttonless, None });
+impl_config_deserialize!(Dimensions { columns, lines });
+impl_serde_replace!(Class);
+impl_config_deserialize_enum!(OptionAsAlt { OnlyLeft, OnlyRight, Both, None });
+impl_config_deserialize_enum!(Theme { Light, Dark });
+impl_config_deserialize_enum!(WindowLevel { Normal, AlwaysOnTop });

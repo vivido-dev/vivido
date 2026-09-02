@@ -13,8 +13,6 @@ use winit::keyboard::{
 };
 use winit::platform::scancode::PhysicalKeyExtScancode;
 
-use vivido_config_derive::{ConfigDeserialize, SerdeReplace};
-
 use crate::config::ui_config::{Hint, Program};
 use crate::terminal::term::TermMode;
 
@@ -83,22 +81,18 @@ impl<T: Eq> Binding<T> {
     }
 }
 
-#[derive(ConfigDeserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     /// Write an escape sequence.
-    #[config(skip)]
     Esc(String),
 
     /// Run given command.
-    #[config(skip)]
     Command(Program),
 
     /// Regex keyboard hints.
-    #[config(skip)]
     Hint(Rc<Hint>),
 
     /// Perform search mode action.
-    #[config(skip)]
     Search(SearchAction),
 
     /// Paste contents of system clipboard.
@@ -255,7 +249,7 @@ impl Display for Action {
 
 /// Search mode specific actions.
 #[allow(clippy::enum_variant_names)]
-#[derive(ConfigDeserialize, Debug, Copy, Clone, PartialEq, Eq)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum SearchAction {
     /// Move the focus to the next search match.
     SearchFocusNext,
@@ -407,6 +401,19 @@ fn common_keybindings() -> Vec<KeyBinding> {
         "v",    ModifiersState::CONTROL | ModifiersState::SHIFT;                                         Action::Paste;
         "f",    ModifiersState::CONTROL | ModifiersState::SHIFT, ~BindingMode::SEARCH;                   Action::SearchForward;
         "b",    ModifiersState::CONTROL | ModifiersState::SHIFT, ~BindingMode::SEARCH;                   Action::SearchBackward;
+        "t",    ModifiersState::CONTROL | ModifiersState::SHIFT;                                         Action::CreateNewTab;
+        "w",    ModifiersState::CONTROL | ModifiersState::SHIFT;                                         Action::Quit;
+        Tab,    ModifiersState::CONTROL;                                                                  Action::SelectNextTab;
+        Tab,    ModifiersState::CONTROL | ModifiersState::SHIFT;                                          Action::SelectPreviousTab;
+        "1",    ModifiersState::ALT;                                                                     Action::SelectTab1;
+        "2",    ModifiersState::ALT;                                                                     Action::SelectTab2;
+        "3",    ModifiersState::ALT;                                                                     Action::SelectTab3;
+        "4",    ModifiersState::ALT;                                                                     Action::SelectTab4;
+        "5",    ModifiersState::ALT;                                                                     Action::SelectTab5;
+        "6",    ModifiersState::ALT;                                                                     Action::SelectTab6;
+        "7",    ModifiersState::ALT;                                                                     Action::SelectTab7;
+        "8",    ModifiersState::ALT;                                                                     Action::SelectTab8;
+        "9",    ModifiersState::ALT;                                                                     Action::SelectLastTab;
         Insert, ModifiersState::SHIFT;                       Action::PasteSelection;
         "c",    ModifiersState::CONTROL | ModifiersState::SHIFT;                                         Action::Copy;
         "0",    ModifiersState::CONTROL;                                                                 Action::ResetFontSize;
@@ -441,6 +448,11 @@ fn windows_keybindings() -> Vec<KeyBinding> {
 
 #[cfg(all(target_os = "macos", not(test)))]
 pub fn platform_key_bindings() -> Vec<KeyBinding> {
+    macos_keybindings()
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn macos_keybindings() -> Vec<KeyBinding> {
     bindings!(
         KeyBinding;
         Insert, ModifiersState::SHIFT, ~BindingMode::SEARCH; Action::Esc("\x1b[2;2~".into());
@@ -1021,7 +1033,7 @@ impl<'a> Deserialize<'a> for KeyBinding {
 ///
 /// Our deserialize impl wouldn't be covered by a derive(Deserialize); see the
 /// impl below.
-#[derive(SerdeReplace, Debug, Copy, Clone, Hash, Default, Eq, PartialEq)]
+#[derive(Debug, Copy, Clone, Hash, Default, Eq, PartialEq)]
 pub struct ModsWrapper(pub ModifiersState);
 
 impl ModsWrapper {
@@ -1067,6 +1079,64 @@ impl<'a> de::Deserialize<'a> for ModsWrapper {
         deserializer.deserialize_str(ModsVisitor)
     }
 }
+
+impl_config_deserialize_enum!(Action {
+    Paste,
+    Copy,
+    CopySelection,
+    PasteSelection,
+    IncreaseFontSize,
+    DecreaseFontSize,
+    ResetFontSize,
+    ScrollPageUp,
+    ScrollPageDown,
+    ScrollHalfPageUp,
+    ScrollHalfPageDown,
+    ScrollLineUp,
+    ScrollLineDown,
+    ScrollToTop,
+    ScrollToBottom,
+    ClearHistory,
+    Hide,
+    HideOtherApplications,
+    Minimize,
+    Quit,
+    ClearLogNotice,
+    SpawnNewInstance,
+    SelectNextTab,
+    SelectPreviousTab,
+    SelectTab1,
+    SelectTab2,
+    SelectTab3,
+    SelectTab4,
+    SelectTab5,
+    SelectTab6,
+    SelectTab7,
+    SelectTab8,
+    SelectTab9,
+    SelectLastTab,
+    CreateNewWindow,
+    CreateNewTab,
+    ToggleFullscreen,
+    ToggleMaximized,
+    ToggleSimpleFullscreen,
+    ClearSelection,
+    ReceiveChar,
+    SearchForward,
+    SearchBackward,
+    None,
+});
+impl_config_deserialize_enum!(SearchAction {
+    SearchFocusNext,
+    SearchFocusPrevious,
+    SearchConfirm,
+    SearchCancel,
+    SearchClear,
+    SearchDeleteWord,
+    SearchHistoryPrevious,
+    SearchHistoryNext,
+});
+impl_serde_replace!(ModsWrapper);
 
 #[cfg(test)]
 mod tests {
@@ -1275,6 +1345,32 @@ mod tests {
     }
 
     #[test]
+    fn macos_number_shortcuts_select_matching_tabs_and_last_tab() {
+        let expected = [
+            ("1", Action::SelectTab1),
+            ("2", Action::SelectTab2),
+            ("3", Action::SelectTab3),
+            ("4", Action::SelectTab4),
+            ("5", Action::SelectTab5),
+            ("6", Action::SelectTab6),
+            ("7", Action::SelectTab7),
+            ("8", Action::SelectTab8),
+            ("9", Action::SelectLastTab),
+        ];
+        let bindings = macos_keybindings();
+
+        for (key, action) in expected {
+            let trigger =
+                BindingKey::Keycode { key: Key::Character(key.into()), location: KeyLocation::Any };
+            assert!(bindings.iter().any(|binding| {
+                binding.trigger == trigger
+                    && binding.mods == ModifiersState::SUPER
+                    && binding.action == action
+            }));
+        }
+    }
+
+    #[test]
     fn windows_paste_defaults_use_system_clipboard() {
         let key =
             BindingKey::Keycode { key: Key::Character("v".into()), location: KeyLocation::Any };
@@ -1312,6 +1408,51 @@ mod tests {
             notmode: BindingMode::empty(),
         };
 
+        defaults.retain(|binding| !binding.triggers_match(&custom));
+        assert!(!defaults.iter().any(|binding| binding.triggers_match(&custom)));
+    }
+
+    #[test]
+    fn non_macos_tab_shortcuts_cover_creation_navigation_and_positions() {
+        let bindings = common_keybindings();
+        let expected = [
+            ("t", ModifiersState::CONTROL | ModifiersState::SHIFT, Action::CreateNewTab),
+            ("1", ModifiersState::ALT, Action::SelectTab1),
+            ("8", ModifiersState::ALT, Action::SelectTab8),
+            ("9", ModifiersState::ALT, Action::SelectLastTab),
+        ];
+        for (key, mods, action) in expected {
+            let trigger =
+                BindingKey::Keycode { key: Key::Character(key.into()), location: KeyLocation::Any };
+            assert!(bindings.iter().any(|binding| {
+                binding.trigger == trigger && binding.mods == mods && binding.action == action
+            }));
+        }
+        for (mods, action) in [
+            (ModifiersState::CONTROL, Action::SelectNextTab),
+            (ModifiersState::CONTROL | ModifiersState::SHIFT, Action::SelectPreviousTab),
+        ] {
+            let trigger =
+                BindingKey::Keycode { key: Key::Named(NamedKey::Tab), location: KeyLocation::Any };
+            assert!(bindings.iter().any(|binding| {
+                binding.trigger == trigger && binding.mods == mods && binding.action == action
+            }));
+        }
+    }
+
+    #[test]
+    fn custom_new_tab_binding_replaces_the_default_trigger() {
+        let mut defaults = common_keybindings();
+        let custom = KeyBinding {
+            trigger: BindingKey::Keycode {
+                key: Key::Character("t".into()),
+                location: KeyLocation::Any,
+            },
+            mods: ModifiersState::CONTROL | ModifiersState::SHIFT,
+            action: Action::ReceiveChar,
+            mode: BindingMode::empty(),
+            notmode: BindingMode::empty(),
+        };
         defaults.retain(|binding| !binding.triggers_match(&custom));
         assert!(!defaults.iter().any(|binding| binding.triggers_match(&custom)));
     }

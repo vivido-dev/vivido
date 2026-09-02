@@ -1,9 +1,11 @@
 use std::borrow::Cow;
 
+use vivid_protocol::input::{InputEvent, InputTuple};
+use vivid_protocol::revision::{GrantGeneration, InputEpoch, SurfaceGeneration};
 use winit::event::{ElementState, KeyEvent};
 #[cfg(target_os = "macos")]
 use winit::keyboard::ModifiersKeyState;
-use winit::keyboard::{Key, KeyLocation, ModifiersState, NamedKey};
+use winit::keyboard::{Key, KeyLocation, ModifiersState, NamedKey, PhysicalKey};
 #[cfg(target_os = "macos")]
 use winit::platform::macos::OptionAsAlt;
 
@@ -19,6 +21,13 @@ use crate::scheduler::{TimerId, Topic};
 impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
     /// Process key input.
     pub fn key_input(&mut self, key: KeyEvent) {
+        // A desktop-input grant takes the key first: desktop §7 wants physical transitions with
+        // synthetic repeat suppressed, and a terminal target never holds a grant, so this is
+        // inert for an ordinary window.
+        if self.forward_desktop_key(&key) {
+            return;
+        }
+
         // IME input will be applied on commit and shouldn't trigger key bindings.
         if self.ctx.display().ime.preedit().is_some() {
             return;
@@ -84,6 +93,35 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
             }
             self.ctx.write_to_pty(bytes);
         }
+    }
+
+    /// Send one physical key transition to a producer holding a desktop-input grant.
+    ///
+    /// Returns whether the key was consumed. Synthetic repeat is suppressed because desktop §7
+    /// makes repeat the producer's policy, applied under its own layout.
+    fn forward_desktop_key(&mut self, key: &KeyEvent) -> bool {
+        if key.repeat {
+            return false;
+        }
+        let PhysicalKey::Code(code) = key.physical_key else {
+            return false;
+        };
+        let Some(usage) = crate::vivid::hid::usage(code) else {
+            return false;
+        };
+        // The binding tuple is stamped by the session that actually holds the grant, so the
+        // placeholder here is never what reaches the wire.
+        self.ctx.send_desktop_input(InputEvent::Key {
+            binding: InputTuple {
+                producer_epoch: InputEpoch::ZERO,
+                grant_generation: GrantGeneration::ZERO,
+                context_id: 0,
+                surface_id: 0,
+                surface_generation: SurfaceGeneration::ZERO,
+            },
+            usage,
+            pressed: key.state == ElementState::Pressed,
+        })
     }
 
     fn alt_send_esc(&mut self, key: &KeyEvent, text: &str) -> bool {
@@ -273,7 +311,7 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
     /// Process a neutral IPC key through Vivido bindings/search/hints without mutating the
     /// persistent physical modifier state. Bytes that fall through are returned for tagged PTY
     /// delivery by the automation layer.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub fn ipc_key_input(
         &mut self,
         key: &str,
@@ -771,7 +809,7 @@ fn is_control_character(text: &str) -> bool {
 }
 
 /// Encode a protocol-neutral IPC key for the current terminal keyboard modes.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub fn encode_ipc_key_event(
     key: &str,
     modifiers: &[String],
@@ -988,7 +1026,7 @@ pub fn encode_ipc_key_event(
     Err(crate::polling::ipc::IpcError::new("invalid_params", format!("unknown key {key:?}")))
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn kitty_modifiers(modifier_parameter: u8, mode: TermMode, repeated: bool) -> String {
     if repeated && mode.contains(TermMode::REPORT_EVENT_TYPES) {
         format!("{modifier_parameter}:2")
@@ -997,7 +1035,7 @@ fn kitty_modifiers(modifier_parameter: u8, mode: TermMode, repeated: bool) -> St
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn ipc_modifiers(modifiers: &[String]) -> Result<SequenceModifiers, crate::polling::ipc::IpcError> {
     let mut result = SequenceModifiers::empty();
     for modifier in modifiers {
@@ -1017,7 +1055,7 @@ fn ipc_modifiers(modifiers: &[String]) -> Result<SequenceModifiers, crate::polli
     Ok(result)
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub fn ipc_modifier_state(
     modifiers: &[String],
 ) -> Result<ModifiersState, crate::polling::ipc::IpcError> {
@@ -1039,7 +1077,7 @@ pub fn ipc_modifier_state(
     Ok(result)
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn ipc_logical_key(key: &str) -> Result<(Key, KeyLocation), crate::polling::ipc::IpcError> {
     let mut characters = key.chars();
     if let (Some(character), None) = (characters.next(), characters.next()) {

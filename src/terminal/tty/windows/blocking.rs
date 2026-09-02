@@ -274,3 +274,47 @@ impl Wake for Registration {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::io::{Cursor, Read};
+    use std::num::NonZeroUsize;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use polling::{Event, Events, PollMode, Poller};
+
+    use super::UnblockedReader;
+
+    #[test]
+    fn a_buffered_level_reader_makes_progress_when_rearmed_after_each_fair_slice() {
+        const SLICE: usize = u16::MAX as usize;
+        const TOTAL: usize = 4 * SLICE;
+        const WAKE_TIMEOUT: Duration = Duration::from_secs(5);
+
+        let source = (0..TOTAL).map(|offset| offset as u8).collect::<Vec<_>>();
+        let mut reader = UnblockedReader::new(Cursor::new(source.clone()), 2 * SLICE);
+        let poller = Arc::new(Poller::new().unwrap());
+        let event = Event::readable(7);
+        reader.register(&poller, event, PollMode::Level);
+
+        let mut events = Events::with_capacity(NonZeroUsize::new(8).unwrap());
+        let mut received = Vec::with_capacity(TOTAL);
+        let mut slice = vec![0; SLICE];
+        while received.len() < TOTAL {
+            events.clear();
+            poller.wait(&mut events, Some(WAKE_TIMEOUT)).unwrap();
+            assert!(events.iter().any(|ready| ready.key == event.key));
+
+            let count = reader.read(&mut slice).unwrap();
+            received.extend_from_slice(&slice[..count]);
+
+            // Windows' posted completion is one wake, even though this wrapper advertises level
+            // mode. The PTY loop repeats this registration after its own equally-sized fairness
+            // slice so buffered output cannot lose the next readable notification.
+            reader.register(&poller, event, PollMode::Level);
+        }
+
+        assert_eq!(received, source);
+    }
+}

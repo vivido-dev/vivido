@@ -2,7 +2,10 @@
 
 use crate::ConfigMonitor;
 use std::borrow::Cow;
+use std::cell::Cell;
 use std::cmp::min;
+#[cfg(any(unix, windows))]
+use std::collections::BTreeSet;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::error::Error;
@@ -12,14 +15,20 @@ use std::fmt::Debug;
 use std::os::unix::io::RawFd;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::Arc;
+#[cfg(windows)]
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 use std::{env, f32, mem};
 
 use ahash::RandomState;
 use log::{debug, error, info, warn};
-#[cfg(unix)]
+use parking_lot::Mutex;
+#[cfg(any(unix, windows))]
 use serde::de::DeserializeOwned;
 use winit::application::ApplicationHandler;
+use winit::dpi::PhysicalSize;
 use winit::event::{
     ElementState, Event as WinitEvent, Ime, Modifiers, MouseButton, StartCause,
     Touch as TouchEvent, WindowEvent,
@@ -37,14 +46,16 @@ use crate::terminal::term::search::{Match, RegexSearch};
 use crate::terminal::term::{self, ClipboardType, Term, TermMode};
 use crate::terminal::vte::ansi::NamedColor;
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use crate::automation::{AutomationHub, SubscriptionRequest};
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use crate::automation::{PendingWrite, WaitKind, Waiter};
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use crate::cli::ParsedOptions;
 use crate::cli::{Options as CliOptions, WindowOptions};
 use crate::clipboard::Clipboard;
+#[cfg(target_os = "macos")]
+use crate::config::Action;
 use crate::config::font::FontSize;
 use crate::config::ui_config::{HintAction, HintInternalAction};
 use crate::config::{self, UiConfig};
@@ -57,14 +68,18 @@ use crate::display::window::{ImeInhibitor, Window};
 use crate::display::{Display, Preedit, SizeInfo};
 use crate::input::{self, ActionContext as _, FONT_SIZE_STEP};
 use crate::logging::{LOG_TARGET_CONFIG, LOG_TARGET_WINIT};
-use crate::message_bar::{Message, MessageBuffer};
-#[cfg(unix)]
-use crate::polling::ipc::IpcRequest;
-#[cfg(unix)]
-use crate::polling::ipc::{IpcError, MAX_INPUT_BYTES, MAX_IPC_TEXT_BYTES};
+#[cfg(target_os = "macos")]
+use crate::macos::{self, menu::MenuCommand};
+use crate::message_bar::{Message, MessageBuffer, MessageType};
+#[cfg(any(unix, windows))]
+use crate::polling::ipc::{IpcConnection, IpcRequest};
+#[cfg(any(unix, windows))]
+use crate::polling::ipc::{IpcError, MAX_INPUT_BYTES, MAX_IPC_TEXT_BYTES, MethodCapability};
 use crate::scheduler::{Scheduler, TimerId, Topic};
 use crate::vivid::VividService;
-use crate::window_context::WindowContext;
+#[cfg(windows)]
+use crate::window_context::is_latency_sensitive_window_event;
+use crate::window_context::{WindowContext, reported_working_directory};
 
 /// Duration after the last user input until an unlimited search is performed.
 pub const TYPING_SEARCH_DELAY: Duration = Duration::from_millis(500);
@@ -75,11 +90,124 @@ const MAX_SEARCH_WHILE_TYPING: Option<usize> = Some(1000);
 /// Maximum number of search terms stored in the history.
 const MAX_SEARCH_HISTORY_SIZE: usize = 255;
 
+#[cfg(any(unix, windows))]
+struct PacedGesture {
+    path: crate::cli::IpcMousePath,
+    connection: IpcConnection,
+    request_id: u64,
+    next_action: usize,
+    interval: Duration,
+    next_due: Instant,
+    /// Wall-clock cap for the whole gesture. Without one, a gesture whose tick is cancelled has
+    /// nothing to expire it: the `WaitKind::Gesture` waiter that carries `path.timeout` is only
+    /// created once the gesture finishes, so a stranded gesture waits forever.
+    deadline: Instant,
+    before_frame: u64,
+    written_bytes: usize,
+}
+
+#[cfg(any(unix, windows))]
+fn paced_mouse_action(gesture: &PacedGesture, window_id: u64) -> crate::cli::IpcMouse {
+    use crate::cli::{IpcMouse, IpcMouseAction, IpcMouseButtonAction, IpcMousePosition, IpcTarget};
+
+    let point_index = gesture.next_action.min(gesture.path.points.len().saturating_sub(1));
+    let point = gesture.path.points[point_index];
+    let position = IpcMousePosition {
+        x: Some(point.x),
+        y: Some(point.y),
+        mods: gesture.path.mods.clone(),
+        route: gesture.path.route,
+        target: IpcTarget { window_id: Some(window_id) },
+        ..IpcMousePosition::default()
+    };
+    let action = if gesture.next_action == 0 {
+        IpcMouseAction::Down(IpcMouseButtonAction { button: gesture.path.button, position })
+    } else if gesture.next_action == gesture.path.points.len() {
+        IpcMouseAction::Up(IpcMouseButtonAction { button: gesture.path.button, position })
+    } else if gesture.path.route == crate::cli::IpcInputRoute::Ui {
+        IpcMouseAction::Move(position)
+    } else {
+        IpcMouseAction::Drag(IpcMouseButtonAction { button: gesture.path.button, position })
+    };
+    IpcMouse { action }
+}
+
 /// Touch zoom speed.
 const TOUCH_ZOOM_FACTOR: f32 = 0.01;
 
 /// Cooldown between invocations of the bell command.
 const BELL_CMD_COOLDOWN: Duration = Duration::from_millis(100);
+
+/// Shortest interval between headless draws.
+///
+/// A headless renderer has no vsync to pace against, so without a cap a chatty PTY would spend the
+/// whole loop rendering frames nobody reads. 60 Hz matches a typical display.
+const HEADLESS_MIN_FRAME_INTERVAL: Duration = Duration::from_millis(16);
+
+/// How long the headless loop blocks when nothing is scheduled.
+///
+/// Any real work arrives as an event and wakes the loop immediately; this only bounds how long a
+/// shutdown request can sit unnoticed.
+const HEADLESS_IDLE_WAIT: Duration = Duration::from_millis(100);
+
+/// Message-bar target used to replace transient file-drop hover and state messages.
+const FILE_DROP_MESSAGE_TARGET: &str = "vivid-file-drop";
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, PartialEq, Eq)]
+enum MenuEffect {
+    Action(Action),
+    Clear,
+}
+
+#[cfg(target_os = "macos")]
+fn menu_effect(command: MenuCommand) -> MenuEffect {
+    match command {
+        MenuCommand::NewWindow => MenuEffect::Action(Action::CreateNewWindow),
+        MenuCommand::NewTab => MenuEffect::Action(Action::CreateNewTab),
+        MenuCommand::Copy => MenuEffect::Action(Action::Copy),
+        MenuCommand::Paste => MenuEffect::Action(Action::Paste),
+        MenuCommand::Find => MenuEffect::Action(Action::SearchForward),
+        MenuCommand::Clear => MenuEffect::Clear,
+    }
+}
+
+fn file_drop_message(text: String, ty: MessageType) -> Message {
+    let mut message = Message::new(text, ty);
+    message.set_target(FILE_DROP_MESSAGE_TARGET.into());
+    message
+}
+
+fn replace_file_drop_message(buffer: &mut MessageBuffer, text: String, ty: MessageType) {
+    buffer.remove_target(FILE_DROP_MESSAGE_TARGET);
+    buffer.push(file_drop_message(text, ty));
+}
+
+fn schedule_message_timeout(
+    buffer: &MessageBuffer,
+    config: &UiConfig,
+    scheduler: &mut Scheduler,
+    window_id: WindowId,
+) {
+    let timer_id = TimerId::new(Topic::MessageTimeout, window_id);
+    scheduler.unschedule(timer_id);
+
+    let Some(message) = buffer.message().filter(|message| message.ty() == MessageType::Warning)
+    else {
+        return;
+    };
+    let timeout = config.message_bar.warning_timeout();
+    if timeout.is_zero() {
+        return;
+    }
+
+    scheduler.schedule(
+        Event::new(EventType::MessageTimeout(message.clone()), window_id),
+        timeout,
+        false,
+        timer_id,
+    );
+}
 
 /// The event processor.
 ///
@@ -93,13 +221,27 @@ pub struct Processor {
     initial_window_options: Option<WindowOptions>,
     initial_window_error: Option<Box<dyn Error>>,
     windows: HashMap<WindowId, WindowContext, RandomState>,
-    proxy: EventLoopProxy<Event>,
-    #[cfg(unix)]
+    proxy: EventSink,
+    #[cfg(any(unix, windows))]
     global_ipc_options: ParsedOptions,
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     automation: AutomationHub,
+    /// Automation methods the embedding host answers instead of Vivido.
+    #[cfg(any(unix, windows))]
+    host_methods: BTreeSet<String>,
+    /// Claimed requests waiting for the host to drain them.
+    #[cfg(any(unix, windows))]
+    host_requests: Vec<IpcRequest>,
+    /// One scheduled pointer gesture per target window.
+    #[cfg(any(unix, windows))]
+    paced_gestures: HashMap<WindowId, PacedGesture, RandomState>,
+    /// Bounded window-management requests waiting for an embedding chrome.
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    shell_actions: VecDeque<crate::shell::ShellActionRequest>,
     cli_options: CliOptions,
     config: Rc<UiConfig>,
+    /// Earliest time the headless loop may draw again. Unused in windowed mode.
+    next_headless_draw: Instant,
 }
 
 impl Processor {
@@ -109,9 +251,7 @@ impl Processor {
         cli_options: CliOptions,
         event_loop: &EventLoop<Event>,
     ) -> Processor {
-        let proxy = event_loop.create_proxy();
-        let scheduler = Scheduler::new(proxy.clone());
-        let initial_window_options = Some(cli_options.window_options.clone());
+        let proxy = EventSink::Winit(event_loop.create_proxy());
 
         // Disable all device events, since we don't care about them.
         event_loop.listen_device_events(DeviceEvents::Never);
@@ -120,14 +260,41 @@ impl Processor {
         // which is done in `loop_exiting`.
         let clipboard = unsafe { Clipboard::new(event_loop.display_handle().unwrap().as_raw()) };
 
+        Self::with_sink(config, cli_options, proxy, clipboard)
+    }
+
+    /// Transfer startup-window ownership to an embedding application.
+    #[cfg(any(target_os = "linux", windows))]
+    pub fn take_initial_window_options(&mut self) -> Option<WindowOptions> {
+        self.initial_window_options.take()
+    }
+
+    /// Create an event processor with no windowing system behind it.
+    ///
+    /// Events arrive over the channel paired with `proxy` rather than from a compositor, and are
+    /// drained by [`Processor::run_headless`].
+    pub fn new_headless(config: UiConfig, cli_options: CliOptions, proxy: EventSink) -> Processor {
+        // There is no windowing-system display to hold a selection, so copy and paste stay
+        // process-local: escape-sequence clipboard access still works between panes.
+        Self::with_sink(config, cli_options, proxy, Clipboard::new_nop())
+    }
+
+    fn with_sink(
+        config: UiConfig,
+        cli_options: CliOptions,
+        proxy: EventSink,
+        clipboard: Clipboard,
+    ) -> Processor {
+        let scheduler = Scheduler::new(proxy.clone());
+        let initial_window_options = Some(cli_options.window_options.clone());
+
         // Create a config monitor.
         //
         // The monitor watches the config file for changes and reloads it. Pending
         // config changes are processed in the main loop.
         let mut config_monitor = None;
         if config.live_config_reload() {
-            config_monitor =
-                ConfigMonitor::new(config.config_paths.clone(), event_loop.create_proxy());
+            config_monitor = ConfigMonitor::new(config.config_paths.clone(), proxy.clone());
         }
 
         Processor {
@@ -139,39 +306,50 @@ impl Processor {
             config: Rc::new(config),
             clipboard,
             windows: Default::default(),
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             global_ipc_options: Default::default(),
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             automation: Default::default(),
+            #[cfg(any(unix, windows))]
+            host_methods: BTreeSet::new(),
+            #[cfg(any(unix, windows))]
+            host_requests: Vec::new(),
+            #[cfg(any(unix, windows))]
+            paced_gestures: Default::default(),
+            #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+            shell_actions: VecDeque::new(),
             config_monitor,
+            next_headless_draw: Instant::now(),
         }
     }
 
     /// Create the initial window and its Vello/wgpu surface.
     pub fn create_initial_window(
         &mut self,
-        event_loop: &ActiveEventLoop,
+        event_loop: LoopHandle<'_>,
         window_options: WindowOptions,
     ) -> Result<u64, Box<dyn Error>> {
-        let mut window_context = WindowContext::initial(
+        let window_context = WindowContext::initial(
             event_loop,
             self.proxy.clone(),
             self.config.clone(),
             window_options,
         )?;
+        #[cfg(any(unix, windows))]
+        let mut window_context = window_context;
 
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         {
             window_context.automation.creation_index = self.automation.next_creation_index();
         }
         let platform_id = window_context.id();
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         let ipc_window_id = window_context.ipc_window_id();
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         let ipc_window_id = u64::from(platform_id);
         self.windows.insert(platform_id, window_context);
 
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         self.automation.emit(
             Some(ipc_window_id),
             "window_created",
@@ -184,10 +362,10 @@ impl Processor {
     /// Create a new terminal window.
     pub fn create_window(
         &mut self,
-        event_loop: &ActiveEventLoop,
+        event_loop: LoopHandle<'_>,
         options: WindowOptions,
     ) -> Result<u64, Box<dyn Error>> {
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         if let Some(ipc_window_id) = options.ipc_window_id
             && self
                 .windows
@@ -202,20 +380,22 @@ impl Processor {
 
         // Override config with CLI/IPC options.
         let mut config_overrides = options.config_overrides();
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         config_overrides.extend_from_slice(&self.global_ipc_options);
         let mut config = self.config.clone();
         config = config_overrides.override_config_rc(config);
 
-        let mut window_context = WindowContext::additional(
+        let window_context = WindowContext::additional(
             event_loop,
             self.proxy.clone(),
             config,
             options,
             config_overrides,
         )?;
+        #[cfg(any(unix, windows))]
+        let mut window_context = window_context;
 
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         if self
             .windows
             .values()
@@ -228,23 +408,33 @@ impl Processor {
             .into());
         }
 
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         {
             window_context.automation.creation_index = self.automation.next_creation_index();
         }
         let platform_id = window_context.id();
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         let ipc_window_id = window_context.ipc_window_id();
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         let ipc_window_id = u64::from(platform_id);
         self.windows.insert(platform_id, window_context);
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         self.automation.emit(
             Some(ipc_window_id),
             "window_created",
             serde_json::json!({"window_id": ipc_window_id}),
         );
         Ok(ipc_window_id)
+    }
+
+    /// Look up one terminal window without exposing the processor's window map.
+    pub fn window(&self, window_id: WindowId) -> Option<&WindowContext> {
+        self.windows.get(&window_id)
+    }
+
+    /// Mutably look up one terminal window without exposing the processor's window map.
+    pub fn window_mut(&mut self, window_id: WindowId) -> Option<&mut WindowContext> {
+        self.windows.get_mut(&window_id)
     }
 
     /// Run the event loop.
@@ -255,6 +445,123 @@ impl Processor {
         match self.initial_window_error.take() {
             Some(initial_window_error) => Err(initial_window_error),
             _ => result.map_err(Into::into),
+        }
+    }
+
+    /// Run the event loop with no windowing system.
+    ///
+    /// This stands in for `EventLoop::run_app`: events arrive over `events` instead of from a
+    /// compositor, and redraws are driven from `requested_redraw` rather than delivered as
+    /// `RedrawRequested`. Everything else — dispatch, scheduling, automation bookkeeping — runs
+    /// through the same code the windowed loop uses.
+    /// Build the initial headless window, reporting the grid size it ended up with.
+    ///
+    /// Split out of [`Processor::run_headless`] so a caller can publish a session's real geometry
+    /// before it starts serving.
+    pub fn start_headless(
+        &mut self,
+        headless: &HeadlessLoop,
+    ) -> Result<(u16, u16), Box<dyn Error>> {
+        self.on_init(LoopHandle::Headless(headless));
+        if let Some(err) = self.initial_window_error.take() {
+            self.on_exiting();
+            return Err(err);
+        }
+
+        let Some(window_context) = self.windows.values().next() else {
+            self.on_exiting();
+            return Err(std::io::Error::other("headless startup produced no window").into());
+        };
+
+        let size_info = &window_context.display.size_info;
+        Ok((
+            size_info.columns().try_into().unwrap_or(u16::MAX),
+            size_info.screen_lines().try_into().unwrap_or(u16::MAX),
+        ))
+    }
+
+    pub fn run_headless(
+        &mut self,
+        events: &mpsc::Receiver<Event>,
+        headless: &HeadlessLoop,
+    ) -> Result<(), Box<dyn Error>> {
+        let handle = LoopHandle::Headless(headless);
+
+        while !headless.exiting() {
+            // Block until the scheduler's next deadline, then drain everything already queued so
+            // a burst of PTY output costs one pass rather than one pass per event.
+            match events.recv_timeout(self.headless_wait()) {
+                Ok(event) => self.on_user_event(handle, event),
+                Err(mpsc::RecvTimeoutError::Timeout) => (),
+                // Every sender is gone, so nothing can wake this loop again.
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+            while !headless.exiting()
+                && let Ok(event) = events.try_recv()
+            {
+                self.on_user_event(handle, event);
+            }
+
+            if headless.exiting() {
+                break;
+            }
+
+            // Same per-iteration bookkeeping winit drives through `AboutToWait`.
+            self.on_about_to_wait(handle);
+
+            self.draw_headless(handle);
+        }
+
+        self.on_exiting();
+        Ok(())
+    }
+
+    /// How long the headless loop may block before it must run again.
+    fn headless_wait(&mut self) -> Duration {
+        let scheduled = self.scheduler.update();
+
+        // A window waiting to draw must not be held up by an idle scheduler. Wake at the frame
+        // cap rather than immediately, so a pending redraw cannot spin the loop.
+        let redraw_pending = self
+            .windows
+            .values()
+            .any(|window_context| window_context.display.window.requested_redraw);
+        let draw_deadline = redraw_pending.then_some(self.next_headless_draw);
+
+        let deadline = match (scheduled, draw_deadline) {
+            (Some(scheduled), Some(draw)) => Some(scheduled.min(draw)),
+            (scheduled, draw) => scheduled.or(draw),
+        };
+
+        match deadline {
+            Some(deadline) => deadline.saturating_duration_since(Instant::now()),
+            None => HEADLESS_IDLE_WAIT,
+        }
+    }
+
+    /// Draw every window that asked to be redrawn.
+    ///
+    /// With no compositor there is no vsync to pace against, so draws are capped. A screenshot
+    /// never observes a stale frame despite the cap: `request_screenshot` paints on demand when
+    /// the window is headless and dirty.
+    fn draw_headless(&mut self, event_loop: LoopHandle<'_>) {
+        if self.next_headless_draw > Instant::now() {
+            return;
+        }
+
+        let window_ids: Vec<_> = self
+            .windows
+            .iter()
+            .filter(|(_, window_context)| window_context.display.window.requested_redraw)
+            .map(|(window_id, _)| *window_id)
+            .collect();
+        if window_ids.is_empty() {
+            return;
+        }
+
+        self.next_headless_draw = Instant::now() + HEADLESS_MIN_FRAME_INTERVAL;
+        for window_id in window_ids {
+            self.on_window_event(event_loop, window_id, WindowEvent::RedrawRequested);
         }
     }
 
@@ -271,16 +578,13 @@ impl Processor {
                 | WindowEvent::PinchGesture { .. }
                 | WindowEvent::AxisMotion { .. }
                 | WindowEvent::PanGesture { .. }
-                | WindowEvent::HoveredFileCancelled
                 | WindowEvent::Destroyed
                 | WindowEvent::ThemeChanged(_)
-                | WindowEvent::HoveredFile(_)
-                | WindowEvent::Moved(_)
         )
     }
 
     /// Resolve the public stable window ID or focused-window fallback.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn resolve_ipc_target(&self, requested: Option<u64>) -> Result<WindowId, IpcError> {
         match requested {
             Some(requested) => self
@@ -297,22 +601,55 @@ impl Processor {
                 .windows
                 .iter()
                 .find_map(|(id, window)| window.is_focused().then_some(*id))
-                .ok_or_else(|| IpcError::new("no_focused_window", "no focused Vivido window")),
+                // A headless window is never focused: no compositor ever sends it `Focused`. Fall
+                // back to the only window when there is exactly one, so an unqualified request is
+                // unambiguous rather than unanswerable. With several windows focus is still the
+                // only way to pick one implicitly, and the caller must name a window instead.
+                .or_else(|| match self.windows.len() {
+                    1 => self.windows.keys().next().copied(),
+                    _ => None,
+                })
+                .ok_or_else(|| {
+                    IpcError::new(
+                        "no_focused_window",
+                        match self.windows.len() {
+                            0 => String::from("this Vivido instance has no windows"),
+                            count => format!(
+                                "no focused Vivido window; pass --window-id to choose one of the \
+                                 {count} open windows"
+                            ),
+                        },
+                    )
+                }),
         }
     }
 
-    #[cfg(unix)]
-    fn handle_ipc_request(&mut self, event_loop: &ActiveEventLoop, request: IpcRequest) {
+    #[cfg(any(unix, windows))]
+    fn handle_ipc_request(&mut self, event_loop: LoopHandle<'_>, request: IpcRequest) {
+        // A claimed method belongs to the embedding host, which answers it from its own state.
+        // Queue it verbatim rather than dispatching: the host owns the reply.
+        if self.host_methods.contains(&request.method) {
+            self.host_requests.push(request);
+            return;
+        }
+
         use crate::cli::{
             IpcConfig, IpcGetConfig, IpcGetGrid, IpcGetText, IpcInputRoute, IpcKey, IpcMouse,
-            IpcPaste, IpcResize, IpcScreenshot, IpcSignal, IpcSubscribe, IpcTarget, IpcTranscript,
-            IpcTyping, IpcWaitCommon, IpcWaitFrame, IpcWaitOutput, IpcWaitSequence, IpcWaitStable,
+            IpcPaste, IpcResize, IpcScreenshot, IpcSetGeometry, IpcSetGeometryBatch, IpcSetLevel,
+            IpcSetVisible, IpcSignal, IpcSubscribe, IpcTarget, IpcTranscript, IpcTyping,
+            IpcWaitCommon, IpcWaitFrame, IpcWaitOutput, IpcWaitSequence, IpcWaitStable,
             IpcWaitText, WindowOptions,
         };
 
         let result = match request.method.as_str() {
             "ping" => {
                 request.connection.reply(request.id, serde_json::json!({"pong": true}));
+                return;
+            },
+            // A headless instance outlives its last window, so it needs an explicit way to stop.
+            "quit" => {
+                request.connection.reply(request.id, serde_json::json!({"quitting": true}));
+                event_loop.exit();
                 return;
             },
             "unsubscribe" => {
@@ -398,6 +735,12 @@ impl Processor {
                     } else {
                         window.add_window_config(self.config.clone(), &options);
                     }
+                    schedule_message_timeout(
+                        &window.message_buffer,
+                        window.config(),
+                        &mut self.scheduler,
+                        window.id(),
+                    );
                 }
                 if matched {
                     if requested.is_none() {
@@ -507,7 +850,7 @@ impl Processor {
                             &params,
                             repeat_index > 0,
                             #[cfg(target_os = "macos")]
-                            event_loop,
+                            event_loop.winit(),
                             &self.proxy,
                             &mut self.clipboard,
                             &mut self.scheduler,
@@ -554,7 +897,7 @@ impl Processor {
                         IpcInputRoute::Ui => self.windows.get_mut(&target).unwrap().ui_paste(
                             &params.text,
                             #[cfg(target_os = "macos")]
-                            event_loop,
+                            event_loop.winit(),
                             &self.proxy,
                             &mut self.clipboard,
                             &mut self.scheduler,
@@ -577,48 +920,97 @@ impl Processor {
                         return;
                     },
                 };
-                let position = match &params.action {
-                    crate::cli::IpcMouseAction::Move(position) => position,
+                let (requested, route) = match &params.action {
+                    crate::cli::IpcMouseAction::Move(position) => {
+                        (position.target.window_id, position.route)
+                    },
                     crate::cli::IpcMouseAction::Click(action)
                     | crate::cli::IpcMouseAction::DoubleClick(action)
                     | crate::cli::IpcMouseAction::Down(action)
                     | crate::cli::IpcMouseAction::Up(action)
-                    | crate::cli::IpcMouseAction::Drag(action) => &action.position,
-                    crate::cli::IpcMouseAction::Scroll(action) => &action.position,
+                    | crate::cli::IpcMouseAction::Drag(action) => {
+                        (action.position.target.window_id, action.position.route)
+                    },
+                    crate::cli::IpcMouseAction::Path(path) => (path.target.window_id, path.route),
+                    crate::cli::IpcMouseAction::Scroll(action) => {
+                        (action.position.target.window_id, action.position.route)
+                    },
                 };
-                let target = match self.resolve_ipc_target(position.target.window_id) {
+                let target = match self.resolve_ipc_target(requested) {
                     Ok(target) => target,
                     Err(error) => {
                         request.connection.error(request.id, error);
                         return;
                     },
                 };
-                match position.route {
+                if let crate::cli::IpcMouseAction::Path(path) = &params.action
+                    && path.duration.is_some()
+                {
+                    self.start_paced_gesture(event_loop, target, path.clone(), request);
+                    return;
+                }
+                match route {
                     IpcInputRoute::Application => {
-                        match self.windows[&target].application_mouse(&params) {
+                        let result = match &params.action {
+                            crate::cli::IpcMouseAction::Path(path) => {
+                                self.windows[&target].application_mouse_path(path)
+                            },
+                            _ => self.windows[&target].application_mouse(&params),
+                        };
+                        match result {
                             Ok(bytes) => {
                                 let window_id = self.windows[&target].ipc_window_id();
-                                self.queue_ipc_input(Some(window_id), bytes, &request);
+                                if let crate::cli::IpcMouseAction::Path(path) = &params.action
+                                    && path.wait_frame
+                                {
+                                    self.queue_gesture_input(target, bytes, path, &request);
+                                } else {
+                                    self.queue_ipc_input(Some(window_id), bytes, &request);
+                                }
                             },
                             Err(error) => request.connection.error(request.id, error),
                         }
                     },
                     IpcInputRoute::Ui => {
-                        let result = self.windows.get_mut(&target).unwrap().ui_mouse(
-                            &params,
-                            #[cfg(target_os = "macos")]
-                            event_loop,
-                            &self.proxy,
-                            &mut self.clipboard,
-                            &mut self.scheduler,
-                        );
+                        let result = match &params.action {
+                            crate::cli::IpcMouseAction::Path(path) => {
+                                self.windows.get_mut(&target).unwrap().ui_mouse_path(
+                                    path,
+                                    #[cfg(target_os = "macos")]
+                                    event_loop.winit(),
+                                    &self.proxy,
+                                    &mut self.clipboard,
+                                    &mut self.scheduler,
+                                )
+                            },
+                            _ => self.windows.get_mut(&target).unwrap().ui_mouse(
+                                &params,
+                                #[cfg(target_os = "macos")]
+                                event_loop.winit(),
+                                &self.proxy,
+                                &mut self.clipboard,
+                                &mut self.scheduler,
+                            ),
+                        };
                         match result {
                             Ok(bytes) if bytes.is_empty() => {
-                                request.connection.reply(request.id, serde_json::json!({}));
+                                if let crate::cli::IpcMouseAction::Path(path) = &params.action
+                                    && path.wait_frame
+                                {
+                                    self.queue_gesture_input(target, bytes, path, &request);
+                                } else {
+                                    request.connection.reply(request.id, serde_json::json!({}));
+                                }
                             },
                             Ok(bytes) => {
                                 let window_id = self.windows[&target].ipc_window_id();
-                                self.queue_ipc_input(Some(window_id), bytes, &request);
+                                if let crate::cli::IpcMouseAction::Path(path) = &params.action
+                                    && path.wait_frame
+                                {
+                                    self.queue_gesture_input(target, bytes, path, &request);
+                                } else {
+                                    self.queue_ipc_input(Some(window_id), bytes, &request);
+                                }
                             },
                             Err(error) => request.connection.error(request.id, error),
                         }
@@ -676,11 +1068,139 @@ impl Processor {
                                 },
                                 &request,
                             );
+
+                            // A compositor would answer the size request with `Resized`, which is
+                            // what confirms the wait. Nothing will do that for a headless window,
+                            // whose size already changed, so deliver the same event ourselves.
+                            if self.windows[&target].display.window.is_headless() {
+                                self.on_window_event(
+                                    event_loop,
+                                    target,
+                                    WindowEvent::Resized(PhysicalSize::new(width, height)),
+                                );
+                            }
                             return;
                         },
                         Err(error) => Err(error),
                     }
                 }
+            },
+            "set_geometry" => {
+                let params: IpcSetGeometry = match decode_ipc_params(&request) {
+                    Ok(params) => params,
+                    Err(error) => {
+                        request.connection.error(request.id, error);
+                        return;
+                    },
+                };
+                match self.resolve_ipc_target(params.target.window_id) {
+                    Ok(target) => {
+                        let result = self.windows[&target].request_automation_geometry(
+                            params.x,
+                            params.y,
+                            params.width,
+                            params.height,
+                        );
+
+                        // A compositor answers a size request with `Resized`, which is what
+                        // reflows the grid and the PTY. Nothing will do that for a headless
+                        // window, whose size already changed, so deliver the same event here.
+                        if result.is_ok()
+                            && self.windows[&target].display.window.is_headless()
+                            && let (Some(width), Some(height)) = (params.width, params.height)
+                        {
+                            self.on_window_event(
+                                event_loop,
+                                target,
+                                WindowEvent::Resized(PhysicalSize::new(width, height)),
+                            );
+                        }
+
+                        result
+                    },
+                    Err(error) => Err(error),
+                }
+            },
+            "set_geometry_batch" => {
+                let params: IpcSetGeometryBatch = match decode_ipc_params(&request) {
+                    Ok(params) => params,
+                    Err(error) => {
+                        request.connection.error(request.id, error);
+                        return;
+                    },
+                };
+
+                // Apply every window's geometry within this one request so the moves land in a
+                // single pass and the window server presents them together, instead of one window
+                // trailing the next as a per-window round trip would. A window that closed mid-drag
+                // is skipped rather than aborting its neighbours: the next sync no longer names it.
+                let mut applied = Vec::with_capacity(params.items.len());
+                let mut headless_resizes = Vec::new();
+                for item in &params.items {
+                    let Ok(target) = self.resolve_ipc_target(item.target.window_id) else {
+                        continue;
+                    };
+                    let Ok(mut value) = self.windows[&target].request_automation_geometry(
+                        item.x,
+                        item.y,
+                        item.width,
+                        item.height,
+                    ) else {
+                        continue;
+                    };
+                    if let Some(map) = value.as_object_mut() {
+                        map.insert(
+                            "window_id".to_string(),
+                            serde_json::json!(self.windows[&target].ipc_window_id()),
+                        );
+                    }
+                    applied.push(value);
+                    if self.windows[&target].display.window.is_headless()
+                        && let (Some(width), Some(height)) = (item.width, item.height)
+                    {
+                        headless_resizes.push((target, width, height));
+                    }
+                }
+
+                // A compositor answers each size request with `Resized`; nothing does for a
+                // headless window, so deliver those here as the single-window path does.
+                for (target, width, height) in headless_resizes {
+                    self.on_window_event(
+                        event_loop,
+                        target,
+                        WindowEvent::Resized(PhysicalSize::new(width, height)),
+                    );
+                }
+
+                Ok(serde_json::json!({ "items": applied }))
+            },
+            "set_visible" => {
+                let params: IpcSetVisible = match decode_ipc_params(&request) {
+                    Ok(params) => params,
+                    Err(error) => {
+                        request.connection.error(request.id, error);
+                        return;
+                    },
+                };
+                self.resolve_ipc_target(params.target.window_id).map(|target| {
+                    if let Some(window) = self.windows.get_mut(&target) {
+                        window.request_automation_visible(params.visible);
+                    }
+                    serde_json::json!({"visible": params.visible})
+                })
+            },
+            "set_level" => {
+                let params: IpcSetLevel = match decode_ipc_params(&request) {
+                    Ok(params) => params,
+                    Err(error) => {
+                        request.connection.error(request.id, error);
+                        return;
+                    },
+                };
+                self.resolve_ipc_target(params.target.window_id).map(|target| {
+                    self.windows[&target].set_automation_level(params.level);
+                    serde_json::json!({"level": params.level})
+                })
             },
             "signal" => {
                 let params: IpcSignal = match decode_ipc_params(&request) {
@@ -758,6 +1278,257 @@ impl Processor {
                 self.resolve_ipc_target(params.window_id).map(|target| {
                     self.windows[&target].automation_inspect(self.automation.event_sequence())
                 })
+            },
+            "diagnose" => {
+                #[derive(serde::Deserialize)]
+                struct Params {
+                    window_id: Option<u64>,
+                    #[serde(default = "default_vivid_trace_limit")]
+                    trace_limit: u16,
+                }
+                let params: Params = match decode_ipc_params(&request) {
+                    Ok(params) => params,
+                    Err(error) => {
+                        request.connection.error(request.id, error);
+                        return;
+                    },
+                };
+                if params.trace_limit == 0
+                    || params.trace_limit > crate::vivid::trace::MAX_QUERY_EVENTS
+                {
+                    Err(IpcError::new("invalid_params", "trace_limit must be 1 through 512"))
+                } else {
+                    self.resolve_ipc_target(params.window_id).map(|target| {
+                        self.windows[&target].automation_diagnose(
+                            self.automation.event_sequence(),
+                            params.trace_limit,
+                        )
+                    })
+                }
+            },
+            "vivid_sessions" => {
+                let params: IpcTarget = match decode_ipc_params(&request) {
+                    Ok(params) => params,
+                    Err(error) => {
+                        request.connection.error(request.id, error);
+                        return;
+                    },
+                };
+                self.resolve_ipc_target(params.window_id)
+                    .map(|target| self.windows[&target].automation_vivid_sessions())
+            },
+            "vivid_surfaces" => {
+                let params: IpcTarget = match decode_ipc_params(&request) {
+                    Ok(params) => params,
+                    Err(error) => {
+                        request.connection.error(request.id, error);
+                        return;
+                    },
+                };
+                self.resolve_ipc_target(params.window_id)
+                    .map(|target| self.windows[&target].automation_vivid_surfaces())
+            },
+            "vivid_surface_status" => {
+                #[derive(serde::Deserialize)]
+                struct Params {
+                    window_id: Option<u64>,
+                    session_id: u64,
+                    context_id: u64,
+                    surface_id: u64,
+                }
+                let params: Params = match decode_ipc_params(&request) {
+                    Ok(params) => params,
+                    Err(error) => {
+                        request.connection.error(request.id, error);
+                        return;
+                    },
+                };
+                self.resolve_ipc_target(params.window_id).and_then(|target| {
+                    self.windows[&target].automation_vivid_surface(
+                        params.session_id,
+                        params.context_id,
+                        params.surface_id,
+                    )
+                })
+            },
+            "vivid_tracks" => {
+                let params: IpcTarget = match decode_ipc_params(&request) {
+                    Ok(params) => params,
+                    Err(error) => {
+                        request.connection.error(request.id, error);
+                        return;
+                    },
+                };
+                self.resolve_ipc_target(params.window_id)
+                    .map(|target| self.windows[&target].automation_vivid_tracks())
+            },
+            "vivid_track_status" => {
+                #[derive(serde::Deserialize)]
+                struct Params {
+                    window_id: Option<u64>,
+                    session_id: u64,
+                    context_id: u64,
+                    surface_id: u64,
+                    track_id: u64,
+                }
+                let params: Params = match decode_ipc_params(&request) {
+                    Ok(params) => params,
+                    Err(error) => {
+                        request.connection.error(request.id, error);
+                        return;
+                    },
+                };
+                self.resolve_ipc_target(params.window_id).and_then(|target| {
+                    self.windows[&target].automation_vivid_track(
+                        params.session_id,
+                        params.context_id,
+                        params.surface_id,
+                        params.track_id,
+                    )
+                })
+            },
+            "vivid_scene_status" => {
+                #[derive(serde::Deserialize)]
+                struct Params {
+                    window_id: Option<u64>,
+                    session_id: u64,
+                    #[serde(default = "default_vivid_scene_nodes")]
+                    maximum_nodes: u64,
+                }
+                let params: Params = match decode_ipc_params(&request) {
+                    Ok(params) => params,
+                    Err(error) => {
+                        request.connection.error(request.id, error);
+                        return;
+                    },
+                };
+                self.resolve_ipc_target(params.window_id).and_then(|target| {
+                    self.windows[&target]
+                        .automation_vivid_scene(params.session_id, params.maximum_nodes)
+                })
+            },
+            "vivid_trace" => {
+                #[derive(serde::Deserialize)]
+                struct Around {
+                    sequence: u64,
+                    #[serde(default = "default_vivid_trace_around_count")]
+                    preceding: u16,
+                    #[serde(default = "default_vivid_trace_around_count")]
+                    following: u16,
+                }
+
+                #[derive(serde::Deserialize)]
+                struct Params {
+                    window_id: Option<u64>,
+                    after: Option<u64>,
+                    #[serde(default)]
+                    tail: bool,
+                    before: Option<u64>,
+                    around: Option<Around>,
+                    #[serde(default = "default_vivid_trace_limit")]
+                    limit: u16,
+                    #[serde(default)]
+                    timeout: u64,
+                    #[serde(default)]
+                    follow: bool,
+                    session_id: Option<u64>,
+                    context_id: Option<u64>,
+                    surface_id: Option<u64>,
+                    track_id: Option<u64>,
+                    category: Option<crate::vivid::trace::TraceCategory>,
+                    #[serde(default)]
+                    recovery_only: bool,
+                }
+                let params: Params = match decode_ipc_params(&request) {
+                    Ok(params) => params,
+                    Err(error) => {
+                        request.connection.error(request.id, error);
+                        return;
+                    },
+                };
+                let identity_valid = params.context_id.is_none() || params.session_id.is_some();
+                let identity_valid = identity_valid
+                    && (params.surface_id.is_none() || params.context_id.is_some())
+                    && (params.track_id.is_none() || params.surface_id.is_some());
+                let selector_count = [
+                    params.after.is_some(),
+                    params.tail,
+                    params.before.is_some(),
+                    params.around.is_some(),
+                ]
+                .into_iter()
+                .filter(|selected| *selected)
+                .count();
+                let around_count = params
+                    .around
+                    .as_ref()
+                    .map(|around| u32::from(around.preceding) + u32::from(around.following));
+                let non_forward = params.tail || params.before.is_some() || params.around.is_some();
+                if params.limit == 0
+                    || params.limit > crate::vivid::trace::MAX_QUERY_EVENTS
+                    || !identity_valid
+                    || selector_count > 1
+                    || (params.follow && non_forward)
+                    || around_count.is_some_and(|count| {
+                        !(1..=u32::from(crate::vivid::trace::MAX_QUERY_EVENTS)).contains(&count)
+                    })
+                    || (params.follow && !(1..=24 * 60 * 60 * 1000).contains(&params.timeout))
+                {
+                    Err(IpcError::new(
+                        "invalid_params",
+                        "invalid Vivid trace limit, timeout, or identity filter",
+                    ))
+                } else {
+                    let target = match self.resolve_ipc_target(params.window_id) {
+                        Ok(target) => target,
+                        Err(error) => {
+                            request.connection.error(request.id, error);
+                            return;
+                        },
+                    };
+                    let filter = crate::vivid::trace::TraceFilter {
+                        session_id: params.session_id,
+                        context_id: params.context_id,
+                        surface_id: params.surface_id,
+                        track_id: params.track_id,
+                        category: params.category,
+                        recovery_only: params.recovery_only,
+                    };
+                    let selection = if let Some(sequence) = params.after {
+                        crate::vivid::trace::TraceSelection::After { sequence }
+                    } else if params.tail {
+                        crate::vivid::trace::TraceSelection::Tail
+                    } else if let Some(sequence) = params.before {
+                        crate::vivid::trace::TraceSelection::Before { sequence }
+                    } else if let Some(around) = params.around {
+                        crate::vivid::trace::TraceSelection::Around {
+                            sequence: around.sequence,
+                            preceding: around.preceding,
+                            following: around.following,
+                        }
+                    } else {
+                        crate::vivid::trace::TraceSelection::FromOldest
+                    };
+                    let batch = self.windows[&target].automation_vivid_trace(
+                        selection,
+                        params.limit,
+                        filter,
+                    );
+                    let has_events =
+                        batch["events"].as_array().is_some_and(|events| !events.is_empty());
+                    if !params.follow || has_events || batch.get("gap").is_some() {
+                        Ok(batch)
+                    } else {
+                        let after_sequence = batch["current_sequence"].as_u64().unwrap_or(0);
+                        self.register_wait_for_target(
+                            target,
+                            params.timeout,
+                            WaitKind::VividTrace { after_sequence, limit: params.limit, filter },
+                            &request,
+                        );
+                        return;
+                    }
+                }
             },
             "get_grid" => {
                 let params: IpcGetGrid = match decode_ipc_params(&request) {
@@ -1049,6 +1820,54 @@ impl Processor {
                 );
                 return;
             },
+            "wait_vivid_track" => {
+                #[derive(serde::Deserialize)]
+                struct Params {
+                    window_id: Option<u64>,
+                    session_id: u64,
+                    context_id: u64,
+                    surface_id: u64,
+                    track_id: u64,
+                    channel_generation: u64,
+                    condition: u64,
+                    value: Option<u64>,
+                    timeout: u64,
+                }
+                let params: Params = match decode_ipc_params(&request) {
+                    Ok(params) => params,
+                    Err(error) => {
+                        request.connection.error(request.id, error);
+                        return;
+                    },
+                };
+                let value_is_valid = match params.condition {
+                    1..=4 => params.value.is_some(),
+                    5..=9 => params.value.is_none(),
+                    _ => false,
+                };
+                if params.channel_generation == 0 || params.timeout == 0 || !value_is_valid {
+                    Err(IpcError::new(
+                        "invalid_params",
+                        "invalid Vivid track wait identity, generation, condition, value, or timeout",
+                    ))
+                } else {
+                    self.register_wait(
+                        params.window_id,
+                        params.timeout,
+                        WaitKind::VividTrack {
+                            session_id: params.session_id,
+                            context_id: params.context_id,
+                            surface_id: params.surface_id,
+                            track_id: params.track_id,
+                            channel_generation: params.channel_generation,
+                            condition: params.condition,
+                            value: params.value,
+                        },
+                        &request,
+                    );
+                    return;
+                }
+            },
             "focus" => {
                 let params: IpcTarget = match decode_ipc_params(&request) {
                     Ok(params) => params,
@@ -1096,7 +1915,237 @@ impl Processor {
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
+    fn queue_gesture_input(
+        &mut self,
+        target: WindowId,
+        bytes: Vec<u8>,
+        path: &crate::cli::IpcMousePath,
+        request: &IpcRequest,
+    ) {
+        let written_bytes = bytes.len();
+        let before_frame = self.windows[&target].automation.frame_sequence;
+        let token = (!bytes.is_empty()).then(|| self.automation.next_write_token());
+        if let Some(token) = token
+            && let Err(error) = self.windows[&target].write_to_pty_with_completion(bytes, token)
+        {
+            request.connection.error(
+                request.id,
+                IpcError::new("pty_closed", format!("failed to queue mouse gesture: {error}")),
+            );
+            return;
+        }
+        self.windows.get_mut(&target).unwrap().automation.waiters.push(Waiter {
+            connection: request.connection.clone(),
+            request_id: request.id,
+            deadline: Instant::now() + Duration::from_millis(path.timeout),
+            kind: WaitKind::Gesture {
+                after_frame: Some(before_frame),
+                pty_token: token,
+                pty_complete: token.is_none(),
+                written_bytes,
+                points: path.points.len(),
+                duration_ms: 0,
+            },
+        });
+        self.evaluate_waiters(target);
+        self.schedule_automation_timer(target);
+    }
+
+    #[cfg(any(unix, windows))]
+    fn start_paced_gesture(
+        &mut self,
+        event_loop: LoopHandle<'_>,
+        target: WindowId,
+        path: crate::cli::IpcMousePath,
+        request: IpcRequest,
+    ) {
+        if !(2..=1000).contains(&path.points.len())
+            || path.points.iter().any(|point| !point.x.is_finite() || !point.y.is_finite())
+            || path.duration.is_none_or(|duration| !(1..=30_000).contains(&duration))
+            || (path.wait_frame && !(1..=86_400_000).contains(&path.timeout))
+        {
+            request
+                .connection
+                .error(request.id, IpcError::new("invalid_params", "invalid paced mouse gesture"));
+            return;
+        }
+        if self.paced_gestures.contains_key(&target) {
+            request.connection.error(
+                request.id,
+                IpcError::new("limit_exceeded", "a paced mouse gesture is already active"),
+            );
+            return;
+        }
+        let duration = path.duration.expect("paced gesture has a duration");
+        let intervals = path.points.len() as f64;
+        let interval = Duration::from_secs_f64(duration as f64 / 1_000.0 / intervals);
+        let before_frame = self.windows[&target].automation.frame_sequence;
+        // The pacing itself plus whatever the caller is prepared to wait for afterwards.
+        let wait_ms = if path.wait_frame { path.timeout } else { 5_000 };
+        let deadline =
+            Instant::now() + Duration::from_millis(duration) + Duration::from_millis(wait_ms);
+        self.paced_gestures.insert(
+            target,
+            PacedGesture {
+                path,
+                connection: request.connection,
+                request_id: request.id,
+                next_action: 0,
+                interval,
+                next_due: Instant::now(),
+                deadline,
+                before_frame,
+                written_bytes: 0,
+            },
+        );
+        self.advance_paced_gesture(event_loop, target);
+        self.schedule_automation_timer(target);
+    }
+
+    #[cfg(any(unix, windows))]
+    fn advance_paced_gesture(&mut self, event_loop: LoopHandle<'_>, target: WindowId) {
+        let Some(mut gesture) = self.paced_gestures.remove(&target) else {
+            return;
+        };
+        if Instant::now() >= gesture.deadline {
+            self.release_paced_gesture(event_loop, target, &gesture);
+            gesture.connection.error(
+                gesture.request_id,
+                IpcError::new("timeout", "paced mouse gesture did not complete in time"),
+            );
+            return;
+        }
+        if Instant::now() < gesture.next_due {
+            // Not due yet. `schedule_automation_timer` owns the timer for this window and accounts
+            // for `next_due`, so scheduling one here too would leave two entries on one TimerId,
+            // of which `unschedule` only ever removes the first.
+            self.paced_gestures.insert(target, gesture);
+            return;
+        }
+        let Some(window_id) = self.windows.get(&target).map(WindowContext::ipc_window_id) else {
+            gesture.connection.error(
+                gesture.request_id,
+                IpcError::new("window_not_found", "paced gesture target closed"),
+            );
+            return;
+        };
+        let mouse = paced_mouse_action(&gesture, window_id);
+        let bytes = match gesture.path.route {
+            crate::cli::IpcInputRoute::Application => {
+                self.windows[&target].application_mouse(&mouse)
+            },
+            crate::cli::IpcInputRoute::Ui => self.windows.get_mut(&target).unwrap().ui_mouse(
+                &mouse,
+                #[cfg(target_os = "macos")]
+                event_loop.winit(),
+                &self.proxy,
+                &mut self.clipboard,
+                &mut self.scheduler,
+            ),
+        };
+        let bytes = match bytes {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.release_paced_gesture(event_loop, target, &gesture);
+                gesture.connection.error(gesture.request_id, error);
+                return;
+            },
+        };
+        gesture.written_bytes = gesture.written_bytes.saturating_add(bytes.len());
+        let final_action = gesture.next_action == gesture.path.points.len();
+        if final_action {
+            self.finish_paced_gesture(target, gesture, bytes);
+            return;
+        }
+        if let Err(error) = self.windows[&target].write_automation_bytes(bytes) {
+            self.release_paced_gesture(event_loop, target, &gesture);
+            gesture.connection.error(
+                gesture.request_id,
+                IpcError::new("pty_closed", format!("failed to queue paced mouse input: {error}")),
+            );
+            return;
+        }
+        gesture.next_action = gesture.next_action.saturating_add(1);
+        gesture.next_due += gesture.interval;
+        self.paced_gestures.insert(target, gesture);
+    }
+
+    #[cfg(any(unix, windows))]
+    fn finish_paced_gesture(&mut self, target: WindowId, gesture: PacedGesture, bytes: Vec<u8>) {
+        let token = (!bytes.is_empty()).then(|| self.automation.next_write_token());
+        let pty_complete = token.is_none();
+        if let Some(token) = token
+            && let Err(error) = self.windows[&target].write_to_pty_with_completion(bytes, token)
+        {
+            gesture.connection.error(
+                gesture.request_id,
+                IpcError::new("pty_closed", format!("failed to finish paced gesture: {error}")),
+            );
+            return;
+        }
+        let after_frame = gesture.path.wait_frame.then_some(gesture.before_frame);
+        let timeout = if gesture.path.wait_frame { gesture.path.timeout } else { 5_000 };
+        self.windows.get_mut(&target).unwrap().automation.waiters.push(Waiter {
+            connection: gesture.connection,
+            request_id: gesture.request_id,
+            deadline: Instant::now() + Duration::from_millis(timeout),
+            kind: WaitKind::Gesture {
+                after_frame,
+                pty_token: token,
+                pty_complete,
+                written_bytes: gesture.written_bytes,
+                points: gesture.path.points.len(),
+                duration_ms: gesture.path.duration.unwrap_or_default(),
+            },
+        });
+        self.evaluate_waiters(target);
+        self.schedule_automation_timer(target);
+    }
+
+    #[cfg(any(unix, windows))]
+    fn release_paced_gesture(
+        &mut self,
+        event_loop: LoopHandle<'_>,
+        target: WindowId,
+        gesture: &PacedGesture,
+    ) {
+        #[cfg(not(target_os = "macos"))]
+        let _ = event_loop;
+        if gesture.next_action == 0 || !self.windows.contains_key(&target) {
+            return;
+        }
+        let release = PacedGesture {
+            path: gesture.path.clone(),
+            connection: gesture.connection.clone(),
+            request_id: gesture.request_id,
+            next_action: gesture.path.points.len(),
+            interval: gesture.interval,
+            next_due: Instant::now(),
+            deadline: gesture.deadline,
+            before_frame: gesture.before_frame,
+            written_bytes: gesture.written_bytes,
+        };
+        let mouse = paced_mouse_action(&release, self.windows[&target].ipc_window_id());
+        let bytes = match release.path.route {
+            crate::cli::IpcInputRoute::Application => {
+                self.windows[&target].application_mouse(&mouse)
+            },
+            crate::cli::IpcInputRoute::Ui => self.windows.get_mut(&target).unwrap().ui_mouse(
+                &mouse,
+                #[cfg(target_os = "macos")]
+                event_loop.winit(),
+                &self.proxy,
+                &mut self.clipboard,
+                &mut self.scheduler,
+            ),
+        };
+        if let Ok(bytes) = bytes {
+            let _ = self.windows[&target].write_automation_bytes(bytes);
+        }
+    }
+
+    #[cfg(any(unix, windows))]
     fn queue_ipc_input(&mut self, requested: Option<u64>, bytes: Vec<u8>, request: &IpcRequest) {
         if bytes.len() > MAX_INPUT_BYTES + 16 {
             request
@@ -1135,8 +2184,20 @@ impl Processor {
         self.schedule_automation_timer(target);
     }
 
-    #[cfg(unix)]
-    fn handle_ipc_disconnect(&mut self, connection_id: u64) {
+    #[cfg(any(unix, windows))]
+    fn handle_ipc_disconnect(&mut self, event_loop: LoopHandle<'_>, connection_id: u64) {
+        let targets = self
+            .paced_gestures
+            .iter()
+            .filter_map(|(target, gesture)| {
+                (gesture.connection.id() == connection_id).then_some(*target)
+            })
+            .collect::<Vec<_>>();
+        for target in targets {
+            if let Some(gesture) = self.paced_gestures.remove(&target) {
+                self.release_paced_gesture(event_loop, target, &gesture);
+            }
+        }
         self.automation.disconnect(connection_id);
         for window in self.windows.values_mut() {
             if window.cancel_automation_connection(connection_id) {
@@ -1149,7 +2210,7 @@ impl Processor {
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn register_wait(
         &mut self,
         requested: Option<u64>,
@@ -1163,7 +2224,7 @@ impl Processor {
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn register_wait_for_target(
         &mut self,
         target: WindowId,
@@ -1188,8 +2249,9 @@ impl Processor {
         self.schedule_automation_timer(target);
     }
 
-    #[cfg(unix)]
-    fn automation_tick(&mut self, window_id: WindowId) {
+    #[cfg(any(unix, windows))]
+    fn automation_tick(&mut self, event_loop: LoopHandle<'_>, window_id: WindowId) {
+        self.advance_paced_gesture(event_loop, window_id);
         let Some(window) = self.windows.get_mut(&window_id) else {
             return;
         };
@@ -1212,10 +2274,18 @@ impl Processor {
     }
 
     /// Keep exactly one timer at the nearest automation deadline for this window.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn schedule_automation_timer(&mut self, window_id: WindowId) {
         let timer_id = TimerId::new(Topic::Automation, window_id);
         self.scheduler.unschedule(timer_id);
+        // A paced gesture drives itself off this same timer, so it has to be part of the deadline.
+        // It is not held in `waiters` until it finishes, and this function runs on essentially
+        // every window and PTY event; leaving it out meant any unrelated terminal output cancelled
+        // the gesture's next tick and stranded the request with nothing left to expire it.
+        let gesture_due = self
+            .paced_gestures
+            .get(&window_id)
+            .map(|gesture| gesture.next_due.min(gesture.deadline));
         let Some(window) = self.windows.get(&window_id) else {
             return;
         };
@@ -1225,6 +2295,7 @@ impl Processor {
             .iter()
             .map(|pending| pending.deadline)
             .chain(window.automation.waiters.iter().map(|waiter| waiter.deadline))
+            .chain(gesture_due)
             .min();
         for waiter in &window.automation.waiters {
             if let WaitKind::ScreenStable { quiet, after_screen } = &waiter.kind {
@@ -1248,7 +2319,7 @@ impl Processor {
     }
 
     /// Apply focus/resize confirmations after batched winit events have updated window state.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn apply_automation_confirmations(&mut self, window_id: WindowId) {
         let Some(window) = self.windows.get_mut(&window_id) else {
             return;
@@ -1316,16 +2387,21 @@ impl Processor {
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn evaluate_waiters(&mut self, window_id: WindowId) {
-        use std::os::unix::process::ExitStatusExt;
-
         let Some(window) = self.windows.get_mut(&window_id) else {
             return;
         };
-        let now = Instant::now();
         let waiters = std::mem::take(&mut window.automation.waiters);
-        let visible_text = window.text(None);
+        if waiters.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+
+        // Only `WaitKind::Text` reads the screen, and reading it locks the terminal against the
+        // PTY reader. Snapshot on first use, then share it so every text waiter in this pass
+        // matches against the same frame.
+        let mut visible_text: Option<String> = None;
         let screen_sequence = window.automation.screen_sequence;
         let frame_sequence = window.automation.frame_sequence;
         let last_screen_change = window.automation.last_screen_change;
@@ -1362,7 +2438,12 @@ impl Processor {
                     WaitKind::Focus { .. } => IpcError::new(
                         "focus_denied",
                         "window system did not confirm focus within two seconds",
-                    ),
+                    )
+                    .with_data(serde_json::json!({
+                        "reason": "operating_system_activation_not_confirmed",
+                        "timeout_ms": 2_000,
+                        "background_input_available": true,
+                    })),
                     _ => IpcError::new("timeout", "IPC wait timed out"),
                 };
                 waiter.connection.error(waiter.request_id, error);
@@ -1373,8 +2454,12 @@ impl Processor {
                 WaitKind::Text { pattern, regex, after_screen } => {
                     let eligible = after_screen.is_none_or(|after| screen_sequence > after);
                     if eligible
-                        && pattern_find(visible_text.as_bytes(), pattern.as_bytes(), *regex)
-                            .is_some()
+                        && pattern_find(
+                            visible_text.get_or_insert_with(|| window.text(None)).as_bytes(),
+                            pattern.as_bytes(),
+                            *regex,
+                        )
+                        .is_some()
                     {
                         Some(Ok(serde_json::json!({
                             "matched": true,
@@ -1411,12 +2496,72 @@ impl Processor {
                 },
                 WaitKind::Frame { after } => (frame_sequence > *after)
                     .then(|| Ok(serde_json::json!({"frame_sequence": frame_sequence}))),
+                WaitKind::VividTrack {
+                    session_id,
+                    context_id,
+                    surface_id,
+                    track_id,
+                    channel_generation,
+                    condition,
+                    value,
+                } => match window.automation_vivid_wait(
+                    *session_id,
+                    *context_id,
+                    *surface_id,
+                    *track_id,
+                    *channel_generation,
+                    *condition,
+                    *value,
+                ) {
+                    crate::vivid::scene::TrackWaitEvaluation::Satisfied(satisfied) => {
+                        Some(Ok(serde_json::json!({
+                            "session_id": session_id,
+                            "context_id": context_id,
+                            "surface_id": surface_id,
+                            "track_id": track_id,
+                            "track_revision": satisfied.revision.get(),
+                            "channel_generation": satisfied.channel_generation.get(),
+                            "condition": condition,
+                            "observed_value": satisfied.observed_value,
+                        })))
+                    },
+                    crate::vivid::scene::TrackWaitEvaluation::Pending => None,
+                    crate::vivid::scene::TrackWaitEvaluation::Lost => {
+                        Some(Err(IpcError::new("track_lost", "Vivid track was lost")))
+                    },
+                    crate::vivid::scene::TrackWaitEvaluation::NotVisible => {
+                        Some(Err(IpcError::new(
+                            "not_visible",
+                            "Vivid track has no eligible visible surface placement",
+                        )))
+                    },
+                    crate::vivid::scene::TrackWaitEvaluation::NotFound => {
+                        Some(Err(IpcError::new("track_not_found", "Vivid track does not exist")))
+                    },
+                    crate::vivid::scene::TrackWaitEvaluation::StaleGeneration => {
+                        Some(Err(IpcError::new(
+                            "stale_channel_generation",
+                            "Vivid track wait names a stale channel generation",
+                        )))
+                    },
+                },
+                WaitKind::VividTrace { after_sequence, limit, filter } => {
+                    let batch = window.automation_vivid_trace(
+                        crate::vivid::trace::TraceSelection::After { sequence: *after_sequence },
+                        *limit,
+                        *filter,
+                    );
+                    batch["events"]
+                        .as_array()
+                        .is_some_and(|events| !events.is_empty())
+                        .then_some(Ok(batch))
+                },
                 WaitKind::Exit => exit_status.map(|status| {
                     Ok(serde_json::json!({
                         "exited": true,
                         "code": status.code(),
-                        "signal": status.signal(),
-                        "core_dumped": status.core_dumped(),
+                        "signal": exit_signal(&status),
+                        "core_dumped": exit_core_dumped(&status),
                     }))
                 }),
                 WaitKind::Resize {
@@ -1448,6 +2593,26 @@ impl Processor {
                             }))
                         })
                 },
+                WaitKind::Gesture {
+                    after_frame,
+                    pty_complete,
+                    written_bytes,
+                    points,
+                    duration_ms,
+                    ..
+                } => (*pty_complete
+                    && after_frame.is_none_or(|after| window.automation.frame_sequence > after))
+                .then(|| {
+                    Ok(serde_json::json!({
+                        "window_id": window.ipc_window_id(),
+                        "written_bytes": written_bytes,
+                        "points": points,
+                        "duration_ms": duration_ms,
+                        "pty_write_completed": true,
+                        "frame_sequence": after_frame.map(|_| window.automation.frame_sequence),
+                        "application_consumption_observed": false,
+                    }))
+                }),
                 WaitKind::Focus { after_focus } => {
                     (window.automation.focus_confirmation > *after_focus && window.is_focused())
                         .then(|| Ok(serde_json::json!({"focused": true})))
@@ -1463,21 +2628,35 @@ impl Processor {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn decode_ipc_params<T: DeserializeOwned>(request: &IpcRequest) -> Result<T, IpcError> {
     serde_json::from_value(request.params.clone()).map_err(|error| {
         IpcError::new("invalid_params", format!("invalid {} parameters: {error}", request.method))
     })
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
+fn default_vivid_scene_nodes() -> u64 {
+    64
+}
+
+#[cfg(any(unix, windows))]
+fn default_vivid_trace_limit() -> u16 {
+    128
+}
+
+fn default_vivid_trace_around_count() -> u16 {
+    64
+}
+
+#[cfg(any(unix, windows))]
 fn compile_regex(pattern: &str) -> Result<(), IpcError> {
     regex_automata::meta::Regex::new(pattern)
         .map(|_| ())
         .map_err(|error| IpcError::new("regex_invalid", error.to_string()))
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn pattern_find(haystack: &[u8], needle: &[u8], regex: bool) -> Option<(usize, usize)> {
     if regex {
         let pattern = std::str::from_utf8(needle).ok()?;
@@ -1493,11 +2672,23 @@ fn pattern_find(haystack: &[u8], needle: &[u8], regex: bool) -> Option<(usize, u
     }
 }
 
-impl ApplicationHandler<Event> for Processor {
-    fn resumed(&mut self, _event_loop: &ActiveEventLoop) {}
+impl Processor {
+    /// Whether this instance keeps serving after its last window closes.
+    ///
+    /// A daemon has no window to begin with, and a headless session must outlive the shell it was
+    /// started to run so a client can open another window into it.
+    fn persists_without_windows(&self) -> bool {
+        self.cli_options.daemon || self.cli_options.headless
+    }
 
-    fn new_events(&mut self, event_loop: &ActiveEventLoop, cause: StartCause) {
-        if cause != StartCause::Init || self.cli_options.daemon {
+    /// Create the startup window, if this invocation is meant to have one.
+    fn on_init(&mut self, event_loop: LoopHandle<'_>) {
+        #[cfg(target_os = "macos")]
+        if !self.cli_options.accessory {
+            macos::menu::install(self.proxy.clone());
+        }
+
+        if self.cli_options.daemon {
             return;
         }
 
@@ -1512,9 +2703,190 @@ impl ApplicationHandler<Event> for Processor {
         info!("Initialisation complete");
     }
 
+    /// Claim automation methods for the embedding host.
+    ///
+    /// A request naming a claimed method is queued instead of dispatched, so a host can answer it
+    /// from state Vivido does not have — its own tabs, splits, or panels — and can take over a
+    /// built-in method such as `create_window` to place the new window itself. Claimed names are
+    /// advertised by the `hello` handshake alongside Vivido's own.
+    ///
+    /// The host must drain [`Processor::take_host_requests`] and reply to or error on every request
+    /// it takes; an unanswered request leaves its automation client waiting until it disconnects.
+    #[cfg(any(unix, windows))]
+    pub fn claim_ipc_methods(&mut self, methods: &[&str]) {
+        self.host_methods = methods.iter().map(|method| (*method).to_owned()).collect();
+        crate::polling::ipc::publish_host_methods(&self.host_methods);
+        crate::polling::ipc::publish_host_method_capabilities(&[]);
+    }
+
+    /// Claim host automation methods and advertise their effect classifications.
+    #[cfg(any(unix, windows))]
+    pub fn claim_ipc_method_capabilities(&mut self, capabilities: &[MethodCapability]) {
+        self.host_methods = capabilities.iter().map(|capability| capability.name.clone()).collect();
+        crate::polling::ipc::publish_host_methods(&self.host_methods);
+        crate::polling::ipc::publish_host_method_capabilities(capabilities);
+    }
+
+    /// Take the claimed automation requests received so far, oldest first.
+    #[cfg(any(unix, windows))]
+    pub fn take_host_requests(&mut self) -> Vec<IpcRequest> {
+        std::mem::take(&mut self.host_requests)
+    }
+
+    /// Take shell actions accumulated since the previous embedding-host turn.
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    pub fn take_shell_actions(&mut self) -> Vec<crate::shell::ShellActionRequest> {
+        self.shell_actions.drain(..).collect()
+    }
+
+    /// Route one winit event through Vivido's embedded event processor.
+    ///
+    /// An in-process host can use this instead of exposing the processor's window map, clipboard,
+    /// scheduler, or individual lifecycle handlers.
+    pub fn handle_winit_event(&mut self, event_loop: &ActiveEventLoop, event: WinitEvent<Event>) {
+        let event_loop = LoopHandle::Winit(event_loop);
+        match event {
+            WinitEvent::NewEvents(StartCause::Init) => self.on_init(event_loop),
+            WinitEvent::WindowEvent { window_id, event } => {
+                self.on_window_event(event_loop, window_id, event);
+            },
+            WinitEvent::UserEvent(event) => self.on_user_event(event_loop, event),
+            WinitEvent::AboutToWait => self.on_about_to_wait(event_loop),
+            WinitEvent::LoopExiting => self.on_exiting(),
+            _ => (),
+        }
+    }
+
+    /// Create a terminal whose GPU frame is retained for composition by an in-process host.
+    pub fn create_embedded_window(
+        &mut self,
+        size: PhysicalSize<u32>,
+        scale_factor: f64,
+        options: WindowOptions,
+    ) -> Result<u64, Box<dyn Error>> {
+        self.create_window(LoopHandle::Embedded { size, scale_factor }, options)
+    }
+
+    /// Deliver one host-translated event to an embedded terminal.
+    pub fn handle_embedded_window_event(&mut self, window_id: WindowId, event: WindowEvent) {
+        self.on_window_event(
+            LoopHandle::Embedded { size: PhysicalSize::new(1, 1), scale_factor: 1.0 },
+            window_id,
+            event,
+        );
+    }
+
+    /// Resize an embedded terminal and immediately update its grid and render target.
+    pub fn resize_embedded_window(&mut self, window_id: WindowId, size: PhysicalSize<u32>) {
+        let Some(window) = self.windows.get_mut(&window_id) else {
+            return;
+        };
+        if !window.display.window.is_embedded() || window.display.window.inner_size() == size {
+            return;
+        }
+        window.display.window.request_inner_size(size);
+        self.handle_embedded_window_event(window_id, WindowEvent::Resized(size));
+    }
+
+    /// Show or hide an embedded terminal without changing any other window's lifecycle state.
+    pub fn set_embedded_window_visible(&mut self, window_id: WindowId, visible: bool) {
+        let Some(window) = self.windows.get_mut(&window_id) else {
+            return;
+        };
+        if !window.display.window.is_embedded() {
+            return;
+        }
+        window.set_automation_visible(visible);
+        if visible {
+            window.display.window.request_redraw();
+        }
+    }
+
+    /// Update the focus state observed by one embedded terminal.
+    pub fn set_embedded_window_focused(&mut self, window_id: WindowId, focused: bool) {
+        if self.windows.get(&window_id).is_some_and(|window| window.display.window.is_embedded()) {
+            self.handle_embedded_window_event(window_id, WindowEvent::Focused(focused));
+        }
+    }
+
+    /// Draw embedded terminals which requested a frame.
+    pub fn draw_pending_embedded_windows(&mut self) -> bool {
+        let pending = self
+            .windows
+            .iter()
+            .filter(|(_, window)| {
+                window.display.window.is_embedded()
+                    && window.display.window.requested_redraw
+                    && window.display.window.is_visible() != Some(false)
+            })
+            .map(|(window_id, _)| *window_id)
+            .collect::<Vec<_>>();
+        for window_id in &pending {
+            self.handle_embedded_window_event(*window_id, WindowEvent::RedrawRequested);
+        }
+        !pending.is_empty()
+    }
+
+    pub fn has_pending_embedded_redraw(&self) -> bool {
+        self.windows.values().any(|window| {
+            window.display.window.is_embedded() && window.display.window.requested_redraw
+        })
+    }
+
+    pub fn embedded_frame(
+        &self,
+        window_id: WindowId,
+    ) -> Option<crate::display::renderer::EmbeddedFrame<'_>> {
+        self.windows.get(&window_id)?.display.embedded_frame()
+    }
+
+    pub fn embedded_input_state(
+        &self,
+        window_id: WindowId,
+    ) -> Option<crate::display::window::EmbeddedInputState> {
+        self.windows.get(&window_id)?.display.window.embedded_input_state()
+    }
+}
+
+impl ApplicationHandler<Event> for Processor {
+    fn resumed(&mut self, _event_loop: &ActiveEventLoop) {}
+
+    fn new_events(&mut self, event_loop: &ActiveEventLoop, cause: StartCause) {
+        if cause != StartCause::Init {
+            return;
+        }
+
+        self.on_init(LoopHandle::Winit(event_loop));
+    }
+
     fn window_event(
         &mut self,
-        _event_loop: &ActiveEventLoop,
+        event_loop: &ActiveEventLoop,
+        window_id: WindowId,
+        event: WindowEvent,
+    ) {
+        self.on_window_event(LoopHandle::Winit(event_loop), window_id, event);
+    }
+
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: Event) {
+        self.on_user_event(LoopHandle::Winit(event_loop), event);
+    }
+
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        self.on_about_to_wait(LoopHandle::Winit(event_loop));
+    }
+
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        self.on_exiting();
+    }
+}
+
+impl Processor {
+    // `event_loop` reaches the action layer only on macOS, whose application-level actions need it.
+    #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
+    fn on_window_event(
+        &mut self,
+        event_loop: LoopHandle<'_>,
         window_id: WindowId,
         event: WindowEvent,
     ) {
@@ -1533,11 +2905,13 @@ impl ApplicationHandler<Event> for Processor {
         };
 
         let is_redraw = matches!(event, WindowEvent::RedrawRequested);
-        #[cfg(unix)]
+        #[cfg(windows)]
+        let is_latency_sensitive = is_latency_sensitive_window_event(&event);
+        #[cfg(any(unix, windows))]
         let focus_confirmed = matches!(&event, WindowEvent::Focused(true));
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         let resize_confirmed = matches!(&event, WindowEvent::Resized(_));
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         let automation_event = match &event {
             WindowEvent::Focused(focused) => {
                 Some(("focus_changed", serde_json::json!({"focused": focused})))
@@ -1545,50 +2919,62 @@ impl ApplicationHandler<Event> for Processor {
             WindowEvent::Resized(size) => {
                 Some(("resized", serde_json::json!({"width": size.width, "height": size.height})))
             },
+            WindowEvent::Moved(position) => {
+                Some(("moved", serde_json::json!({"x": position.x, "y": position.y})))
+            },
             _ => None,
         };
 
         window_context.handle_event(
             #[cfg(target_os = "macos")]
-            _event_loop,
+            event_loop.winit(),
             &self.proxy,
             &mut self.clipboard,
             &mut self.scheduler,
             WinitEvent::WindowEvent { window_id, event },
         );
 
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         if focus_confirmed {
             window_context.automation.pending_focus_confirmations =
                 window_context.automation.pending_focus_confirmations.saturating_add(1);
         }
 
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         if resize_confirmed {
             window_context.automation.pending_resize_confirmations =
                 window_context.automation.pending_resize_confirmations.saturating_add(1);
         }
 
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         if let Some((kind, data)) = automation_event {
             self.automation.emit(Some(window_context.ipc_window_id()), kind, data);
         }
 
-        if is_redraw {
-            let presented = window_context.draw(&mut self.scheduler);
-            #[cfg(unix)]
-            if presented {
-                let ipc_window_id = window_context.ipc_window_id();
-                let frame_sequence = window_context.automation.record_frame();
-                self.automation.emit(
-                    Some(ipc_window_id),
-                    "frame_presented",
-                    serde_json::json!({"frame_sequence": frame_sequence}),
-                );
+        let _presented = if is_redraw {
+            Some(window_context.draw(&mut self.scheduler))
+        } else {
+            #[cfg(windows)]
+            {
+                is_latency_sensitive
+                    .then(|| window_context.draw_latency_sensitive(&mut self.scheduler))
+                    .flatten()
             }
+            #[cfg(not(windows))]
+            None
+        };
+        #[cfg(any(unix, windows))]
+        if _presented == Some(true) {
+            let ipc_window_id = window_context.ipc_window_id();
+            let frame_sequence = window_context.automation.record_frame();
+            self.automation.emit(
+                Some(ipc_window_id),
+                "frame_presented",
+                serde_json::json!({"frame_sequence": frame_sequence}),
+            );
         }
 
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         {
             let _ = window_context;
             self.evaluate_waiters(window_id);
@@ -1596,33 +2982,37 @@ impl ApplicationHandler<Event> for Processor {
         }
     }
 
-    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: Event) {
+    fn on_user_event(&mut self, event_loop: LoopHandle<'_>, event: Event) {
         if self.config.debug.print_events {
             info!(target: LOG_TARGET_WINIT, "{event:?}");
         }
 
         // Handle events which don't mandate the WindowId.
         match (event.payload, event.window_id.as_ref()) {
-            #[cfg(unix)]
+            // The host woke the loop for its own reasons; delivering the event is the whole effect.
+            (EventType::HostWakeup, _) => (),
+            #[cfg(any(unix, windows))]
             (EventType::IpcRequest(request), _) => self.handle_ipc_request(event_loop, request),
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             (EventType::IpcDisconnect(connection_id), _) => {
-                self.handle_ipc_disconnect(connection_id);
+                self.handle_ipc_disconnect(event_loop, connection_id);
             },
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             (EventType::ScreenshotReadback, Some(window_id)) => {
                 if let Some(window_context) = self.windows.get_mut(window_id) {
                     window_context.poll_screenshot(&mut self.scheduler, &self.proxy);
                 }
             },
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             (EventType::ScreenshotComplete, Some(window_id)) => {
                 if let Some(window_context) = self.windows.get_mut(window_id) {
                     window_context.complete_screenshot();
                 }
             },
-            #[cfg(unix)]
-            (EventType::AutomationTick, Some(window_id)) => self.automation_tick(*window_id),
+            #[cfg(any(unix, windows))]
+            (EventType::AutomationTick, Some(window_id)) => {
+                self.automation_tick(event_loop, *window_id);
+            },
             (EventType::ConfigReload(path), _) => {
                 // Clear config logs from message bar for all terminals.
                 for window_context in self.windows.values_mut() {
@@ -1649,8 +3039,41 @@ impl ApplicationHandler<Event> for Processor {
 
                     for window_context in self.windows.values_mut() {
                         window_context.update_config(self.config.clone());
+                        schedule_message_timeout(
+                            &window_context.message_buffer,
+                            window_context.config(),
+                            &mut self.scheduler,
+                            window_context.id(),
+                        );
                     }
                 }
+            },
+            #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+            (EventType::ShellAction(action), Some(source)) => {
+                use crate::shell::{MAX_PENDING_SHELL_ACTIONS, ShellActionRequest};
+
+                if matches!(
+                    action,
+                    crate::shell::ShellAction::Activate | crate::shell::ShellAction::Resize { .. }
+                ) {
+                    self.shell_actions.retain(|pending| {
+                        pending.source != *source
+                            || !matches!(
+                                (&pending.action, &action),
+                                (
+                                    crate::shell::ShellAction::Activate,
+                                    crate::shell::ShellAction::Activate
+                                ) | (
+                                    crate::shell::ShellAction::Resize { .. },
+                                    crate::shell::ShellAction::Resize { .. }
+                                )
+                            )
+                    });
+                }
+                if self.shell_actions.len() == MAX_PENDING_SHELL_ACTIONS {
+                    self.shell_actions.pop_front();
+                }
+                self.shell_actions.push_back(ShellActionRequest { source: *source, action });
             },
             // Create a new terminal window.
             (EventType::CreateWindow(options), _) => {
@@ -1664,8 +3087,33 @@ impl ApplicationHandler<Event> for Processor {
                     error!("Could not open window: {err:?}");
                 }
             },
+            #[cfg(target_os = "macos")]
+            (EventType::MacOsMenu(command), _) => {
+                let target = self
+                    .windows
+                    .iter()
+                    .find_map(|(id, window)| window.is_focused().then_some(*id))
+                    .or_else(|| {
+                        if self.windows.len() == 1 {
+                            self.windows.keys().next().copied()
+                        } else {
+                            None
+                        }
+                    });
+                if let Some(window_id) = target
+                    && let Some(window_context) = self.windows.get_mut(&window_id)
+                {
+                    window_context.handle_event(
+                        event_loop.winit(),
+                        &self.proxy,
+                        &mut self.clipboard,
+                        &mut self.scheduler,
+                        WinitEvent::UserEvent(Event::new(EventType::MacOsMenu(command), window_id)),
+                    );
+                }
+            },
             // Shutdown all windows.
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             (EventType::Shutdown, _) => event_loop.exit(),
             // Process events affecting all windows.
             (payload, None) => {
@@ -1673,7 +3121,7 @@ impl ApplicationHandler<Event> for Processor {
                 for window_context in self.windows.values_mut() {
                     window_context.handle_event(
                         #[cfg(target_os = "macos")]
-                        event_loop,
+                        event_loop.winit(),
                         &self.proxy,
                         &mut self.clipboard,
                         &mut self.scheduler,
@@ -1681,7 +3129,7 @@ impl ApplicationHandler<Event> for Processor {
                     );
                 }
             },
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             (EventType::Terminal(TerminalEvent::Title(title)), Some(window_id)) => {
                 self.automation.emit(
                     self.windows.get(window_id).map(WindowContext::ipc_window_id),
@@ -1691,7 +3139,7 @@ impl ApplicationHandler<Event> for Processor {
                 if let Some(window_context) = self.windows.get_mut(window_id) {
                     window_context.handle_event(
                         #[cfg(target_os = "macos")]
-                        event_loop,
+                        event_loop.winit(),
                         &self.proxy,
                         &mut self.clipboard,
                         &mut self.scheduler,
@@ -1702,7 +3150,7 @@ impl ApplicationHandler<Event> for Processor {
                     );
                 }
             },
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             (EventType::Terminal(TerminalEvent::ResetTitle), Some(window_id)) => {
                 let title = self
                     .windows
@@ -1716,7 +3164,7 @@ impl ApplicationHandler<Event> for Processor {
                 if let Some(window_context) = self.windows.get_mut(window_id) {
                     window_context.handle_event(
                         #[cfg(target_os = "macos")]
-                        event_loop,
+                        event_loop.winit(),
                         &self.proxy,
                         &mut self.clipboard,
                         &mut self.scheduler,
@@ -1727,7 +3175,17 @@ impl ApplicationHandler<Event> for Processor {
                     );
                 }
             },
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
+            (EventType::Terminal(TerminalEvent::WorkingDirectory(directory)), Some(window_id)) => {
+                self.automation.emit(
+                    self.windows.get(window_id).map(WindowContext::ipc_window_id),
+                    "directory_changed",
+                    serde_json::json!({"directory": directory}),
+                );
+                // The terminal itself holds the reported directory; there is no window state
+                // to update.
+            },
+            #[cfg(any(unix, windows))]
             (EventType::Terminal(TerminalEvent::Bell), Some(window_id)) => {
                 self.automation.emit(
                     self.windows.get(window_id).map(WindowContext::ipc_window_id),
@@ -1737,7 +3195,7 @@ impl ApplicationHandler<Event> for Processor {
                 if let Some(window_context) = self.windows.get_mut(window_id) {
                     window_context.handle_event(
                         #[cfg(target_os = "macos")]
-                        event_loop,
+                        event_loop.winit(),
                         &self.proxy,
                         &mut self.clipboard,
                         &mut self.scheduler,
@@ -1748,17 +3206,54 @@ impl ApplicationHandler<Event> for Processor {
                     );
                 }
             },
+            (
+                EventType::Terminal(TerminalEvent::DesktopNotification(notification)),
+                Some(window_id),
+            ) => {
+                if let Some(window_context) = self.windows.get_mut(window_id) {
+                    window_context.handle_desktop_notification(notification);
+                }
+            },
+            (EventType::NotificationActivated, Some(window_id)) => {
+                if let Some(window_context) = self.windows.get(window_id) {
+                    window_context.activate_desktop_notification();
+                }
+            },
             (EventType::Terminal(TerminalEvent::Wakeup), Some(window_id)) => {
                 if let Some(window_context) = self.windows.get_mut(window_id) {
+                    #[cfg(windows)]
+                    window_context.acknowledge_terminal_wakeup();
                     window_context.dirty = true;
-                    if window_context.display.window.has_frame {
+
+                    // Posted PTY events can keep Windows' higher-priority message queues busy
+                    // long enough to starve both WM_PAINT and AboutToWait. Present through the
+                    // same bounded direct path as continuous wheel input so output remains live.
+                    #[cfg(windows)]
+                    let presented = window_context.draw_latency_sensitive(&mut self.scheduler);
+                    #[cfg(not(windows))]
+                    let presented = None::<bool>;
+
+                    if presented.is_none() && window_context.display.window.has_frame {
                         window_context.display.window.request_redraw();
+                    }
+
+                    #[cfg(any(unix, windows))]
+                    if presented == Some(true) {
+                        let ipc_window_id = window_context.ipc_window_id();
+                        let frame_sequence = window_context.automation.record_frame();
+                        self.automation.emit(
+                            Some(ipc_window_id),
+                            "frame_presented",
+                            serde_json::json!({"frame_sequence": frame_sequence}),
+                        );
                     }
                 }
             },
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             (EventType::Terminal(TerminalEvent::PtyOutput { start, end }), Some(window_id)) => {
                 if let Some(window) = self.windows.get(window_id) {
+                    #[cfg(windows)]
+                    let (start, end) = window.take_pty_output((start, end));
                     let transcript = window.automation.transcript.lock().unwrap();
                     if let Ok(bytes) = transcript.range(start, end.saturating_sub(start) as usize) {
                         self.automation.emit_output(window.ipc_window_id(), start, &bytes);
@@ -1767,7 +3262,7 @@ impl ApplicationHandler<Event> for Processor {
                 self.evaluate_waiters(*window_id);
                 self.schedule_automation_timer(*window_id);
             },
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             (EventType::Terminal(TerminalEvent::PtyWriteComplete(token)), Some(window_id)) => {
                 if let Some(window) = self.windows.get_mut(window_id)
                     && let Some(index) = window
@@ -1779,12 +3274,30 @@ impl ApplicationHandler<Event> for Processor {
                     let pending = window.automation.pending_writes.swap_remove(index);
                     pending.connection.reply(
                         pending.request_id,
-                        serde_json::json!({"written_bytes": pending.bytes}),
+                        serde_json::json!({
+                            "window_id": window.ipc_window_id(),
+                            "input_sequence": pending.token,
+                            "written_bytes": pending.bytes,
+                            "pty_write_completed": true,
+                            "application_consumption_observed": false,
+                        }),
                     );
                 }
+                if let Some(window) = self.windows.get_mut(window_id)
+                    && let Some(waiter) = window.automation.waiters.iter_mut().find(|waiter| {
+                        matches!(
+                            waiter.kind,
+                            WaitKind::Gesture { pty_token: Some(expected), .. } if expected == token
+                        )
+                    })
+                    && let WaitKind::Gesture { pty_complete, .. } = &mut waiter.kind
+                {
+                    *pty_complete = true;
+                }
+                self.evaluate_waiters(*window_id);
                 self.schedule_automation_timer(*window_id);
             },
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             (EventType::Terminal(TerminalEvent::PtyResizeComplete(token)), Some(window_id)) => {
                 if let Some(window) = self.windows.get_mut(window_id)
                     && let Some(waiter) = window.automation.waiters.iter_mut().find(|waiter| {
@@ -1802,26 +3315,29 @@ impl ApplicationHandler<Event> for Processor {
             },
             (EventType::VividFrame, Some(window_id)) => {
                 if let Some(window_context) = self.windows.get_mut(window_id) {
+                    window_context.acknowledge_vivid_frame();
                     window_context.dirty = true;
-                    window_context.display.damage_tracker.frame().mark_fully_damaged();
                     if window_context.display.window.has_frame {
                         window_context.display.window.request_redraw();
                     }
                 }
+                #[cfg(any(unix, windows))]
+                {
+                    self.evaluate_waiters(*window_id);
+                    self.schedule_automation_timer(*window_id);
+                }
             },
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             (EventType::Terminal(TerminalEvent::ChildExit(status)), Some(window_id)) => {
                 if let Some(window) = self.windows.get_mut(window_id) {
-                    use std::os::unix::process::ExitStatusExt;
-
                     window.automation.exit_status = Some(status);
                     self.automation.emit(
                         Some(window.ipc_window_id()),
                         "child_exit",
                         serde_json::json!({
                             "code": status.code(),
-                            "signal": status.signal(),
-                            "core_dumped": status.core_dumped(),
+                            "signal": exit_signal(&status),
+                            "core_dumped": exit_core_dumped(&status),
                         }),
                     );
                     self.evaluate_waiters(*window_id);
@@ -1830,7 +3346,7 @@ impl ApplicationHandler<Event> for Processor {
             },
             (EventType::Terminal(TerminalEvent::Exit), Some(window_id)) => {
                 // Remove the closed terminal.
-                let mut window_context = match self.windows.entry(*window_id) {
+                let window_context = match self.windows.entry(*window_id) {
                     // Don't exit when terminal exits if user asked to hold the window.
                     Entry::Occupied(window_context)
                         if !window_context.get().display.window.hold =>
@@ -1839,8 +3355,10 @@ impl ApplicationHandler<Event> for Processor {
                     },
                     _ => return,
                 };
+                #[cfg(any(unix, windows))]
+                let mut window_context = window_context;
 
-                #[cfg(unix)]
+                #[cfg(any(unix, windows))]
                 {
                     let ipc_window_id = window_context.ipc_window_id();
                     window_context.fail_automation_requests("pty_closed", "terminal window closed");
@@ -1855,7 +3373,7 @@ impl ApplicationHandler<Event> for Processor {
                 self.scheduler.unschedule_window(window_context.id());
 
                 // Shutdown if no more terminals are open.
-                if self.windows.is_empty() && !self.cli_options.daemon {
+                if self.windows.is_empty() && !self.persists_without_windows() {
                     // Write ref tests of last window to disk.
                     if self.config.debug.ref_test {
                         window_context.write_ref_test_results();
@@ -1868,16 +3386,93 @@ impl ApplicationHandler<Event> for Processor {
             (EventType::Frame, Some(window_id)) => {
                 if let Some(window_context) = self.windows.get_mut(window_id) {
                     window_context.display.window.has_frame = true;
-                    if window_context.dirty {
+
+                    // A latency-sensitive Windows draw accumulates updates until this timer. End
+                    // the interval with a direct presentation instead of returning to WM_PAINT,
+                    // which can remain starved behind ConPTY and keyboard messages.
+                    #[cfg(windows)]
+                    let presented = window_context.draw_scheduled_frame(&mut self.scheduler);
+                    #[cfg(not(windows))]
+                    let presented = None::<bool>;
+
+                    if presented.is_none() && window_context.dirty {
                         window_context.display.window.request_redraw();
                     }
+
+                    #[cfg(any(unix, windows))]
+                    if presented == Some(true) {
+                        let ipc_window_id = window_context.ipc_window_id();
+                        let frame_sequence = window_context.automation.record_frame();
+                        self.automation.emit(
+                            Some(ipc_window_id),
+                            "frame_presented",
+                            serde_json::json!({"frame_sequence": frame_sequence}),
+                        );
+                    }
+                }
+            },
+            #[cfg(windows)]
+            (EventType::LatencySensitiveFrame, Some(window_id)) => {
+                if let Some(window_context) = self.windows.get_mut(window_id) {
+                    window_context.acknowledge_latency_sensitive_frame();
+                    let presented = window_context.draw_latency_sensitive(&mut self.scheduler);
+
+                    if presented == Some(true) {
+                        let ipc_window_id = window_context.ipc_window_id();
+                        let frame_sequence = window_context.automation.record_frame();
+                        self.automation.emit(
+                            Some(ipc_window_id),
+                            "frame_presented",
+                            serde_json::json!({"frame_sequence": frame_sequence}),
+                        );
+                    }
+                }
+            },
+            #[cfg(windows)]
+            (EventType::TerminalVividBatch, Some(window_id)) => {
+                if let Some(window_context) = self.windows.get_mut(window_id) {
+                    let events = window_context.take_pending_vivid_terminal_events();
+                    if events.is_empty() {
+                        return;
+                    }
+
+                    for event in events {
+                        window_context.handle_event(
+                            &self.proxy,
+                            &mut self.clipboard,
+                            &mut self.scheduler,
+                            WinitEvent::UserEvent(Event::new(
+                                EventType::Terminal(event),
+                                *window_id,
+                            )),
+                        );
+                    }
+
+                    // These events normally use WindowContext's batching path. Flush the complete
+                    // coalesced batch now so another PTY batch cannot accumulate behind it.
+                    window_context.handle_event(
+                        &self.proxy,
+                        &mut self.clipboard,
+                        &mut self.scheduler,
+                        WinitEvent::AboutToWait,
+                    );
+                }
+            },
+            (EventType::RendererRecovery, Some(window_id)) => {
+                if let Some(window_context) = self.windows.get_mut(window_id) {
+                    window_context.retry_renderer(&mut self.scheduler);
+                }
+            },
+            (EventType::VividResizeSettled(generation), Some(window_id)) => {
+                if let Some(window_context) = self.windows.get_mut(window_id) {
+                    window_context.settle_vivid_resize(generation);
                 }
             },
             (payload, Some(window_id)) => {
                 if let Some(window_context) = self.windows.get_mut(window_id) {
                     window_context.handle_event(
                         #[cfg(target_os = "macos")]
-                        event_loop,
+                        event_loop.winit(),
                         &self.proxy,
                         &mut self.clipboard,
                         &mut self.scheduler,
@@ -1888,7 +3483,7 @@ impl ApplicationHandler<Event> for Processor {
         };
     }
 
-    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+    fn on_about_to_wait(&mut self, event_loop: LoopHandle<'_>) {
         if self.config.debug.print_events {
             info!(target: LOG_TARGET_WINIT, "About to wait");
         }
@@ -1897,7 +3492,7 @@ impl ApplicationHandler<Event> for Processor {
         for window_context in self.windows.values_mut() {
             window_context.handle_event(
                 #[cfg(target_os = "macos")]
-                event_loop,
+                event_loop.winit(),
                 &self.proxy,
                 &mut self.clipboard,
                 &mut self.scheduler,
@@ -1905,7 +3500,17 @@ impl ApplicationHandler<Event> for Processor {
             );
         }
 
-        #[cfg(unix)]
+        #[cfg(target_os = "macos")]
+        for window_context in self.windows.values_mut() {
+            window_context.display.window.refresh_tab_shortcut_badge();
+        }
+
+        #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+        for window_context in self.windows.values_mut() {
+            window_context.sync_accessibility();
+        }
+
+        #[cfg(any(unix, windows))]
         {
             let window_ids: Vec<_> = self.windows.keys().copied().collect();
             for window_id in &window_ids {
@@ -1954,16 +3559,17 @@ impl ApplicationHandler<Event> for Processor {
         event_loop.set_control_flow(control_flow);
     }
 
-    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+    fn on_exiting(&mut self) {
         if self.config.debug.print_events {
             info!("Exiting the event loop");
         }
 
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         for window in self.windows.values_mut() {
             window.fail_automation_requests("pty_closed", "Vivido event loop is shutting down");
         }
         self.windows.clear();
+        crate::display::renderer::shutdown_window_render_context();
 
         // SAFETY: The clipboard must be dropped before the event loop, so use the nop clipboard
         // as a safe placeholder.
@@ -1993,6 +3599,122 @@ impl From<Event> for WinitEvent<Event> {
     }
 }
 
+/// The sink was destroyed, so the main loop can no longer be reached.
+#[derive(Debug)]
+pub struct EventSinkClosed;
+
+/// State owned by [`Processor::run_headless`] in place of winit's `ActiveEventLoop`.
+pub struct HeadlessLoop {
+    exiting: Cell<bool>,
+    /// Geometry every headless window is created at.
+    size: PhysicalSize<u32>,
+    scale_factor: f64,
+}
+
+impl HeadlessLoop {
+    pub fn new(size: PhysicalSize<u32>, scale_factor: f64) -> Self {
+        Self { exiting: Cell::new(false), size, scale_factor }
+    }
+
+    pub fn exiting(&self) -> bool {
+        self.exiting.get()
+    }
+}
+
+/// Handle to whichever loop is driving the process.
+///
+/// Only three windowing-system operations are reachable from the processor — creating a window,
+/// exiting, and setting the wake deadline — so headless mode supplies its own for each.
+#[derive(Clone, Copy)]
+pub enum LoopHandle<'a> {
+    Winit(&'a ActiveEventLoop),
+    Headless(&'a HeadlessLoop),
+    Embedded { size: PhysicalSize<u32>, scale_factor: f64 },
+}
+
+impl<'a> LoopHandle<'a> {
+    /// Ask the loop to stop.
+    pub fn exit(&self) {
+        match self {
+            Self::Winit(event_loop) => event_loop.exit(),
+            Self::Headless(headless) => headless.exiting.set(true),
+            Self::Embedded { .. } => (),
+        }
+    }
+
+    /// Set the next wake deadline.
+    ///
+    /// Headless mode derives its own deadline from the scheduler each iteration, so this is a
+    /// no-op there rather than stored state that could drift.
+    pub fn set_control_flow(&self, control_flow: ControlFlow) {
+        if let Self::Winit(event_loop) = self {
+            event_loop.set_control_flow(control_flow);
+        }
+    }
+
+    /// The winit loop, when there is one.
+    ///
+    /// Only macOS reaches for this, to run application-level actions that have no headless
+    /// equivalent; every other platform drives windows entirely through this handle.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub fn winit(&self) -> Option<&'a ActiveEventLoop> {
+        match self {
+            Self::Winit(event_loop) => Some(event_loop),
+            Self::Headless(_) | Self::Embedded { .. } => None,
+        }
+    }
+
+    /// Build the window this loop can present.
+    pub fn create_window(
+        &self,
+        config: &UiConfig,
+        identity: &crate::config::window::Identity,
+        options: &mut WindowOptions,
+    ) -> Result<Window, crate::display::window::Error> {
+        match self {
+            Self::Winit(event_loop) => Window::new(event_loop, config, identity, options),
+            Self::Headless(headless) => Ok(Window::headless(
+                config,
+                identity,
+                options,
+                headless.size,
+                headless.scale_factor,
+            )),
+            Self::Embedded { size, scale_factor } => {
+                Ok(Window::embedded(config, identity, options, *size, *scale_factor))
+            },
+        }
+    }
+}
+
+/// Sink for events destined for the main loop.
+///
+/// A windowed Vivido wakes winit's event loop through its proxy. A headless one has no windowing
+/// system to wake, so it pushes onto a channel that [`Processor::run_headless`] drains.
+///
+/// The sender is behind a mutex because this is cloned into worker threads and captured by the
+/// Vivid service's `Fn() + Send + Sync` wake closure, while `mpsc::Sender` is `!Sync`.
+#[derive(Debug, Clone)]
+pub enum EventSink {
+    Winit(EventLoopProxy<Event>),
+    Headless(Arc<Mutex<mpsc::Sender<Event>>>),
+}
+
+impl EventSink {
+    /// Create a headless sink together with the receiver the main loop drains.
+    pub fn headless() -> (Self, mpsc::Receiver<Event>) {
+        let (sender, receiver) = mpsc::channel();
+        (Self::Headless(Arc::new(Mutex::new(sender))), receiver)
+    }
+
+    pub fn send_event(&self, event: Event) -> Result<(), EventSinkClosed> {
+        match self {
+            Self::Winit(proxy) => proxy.send_event(event).map_err(|_| EventSinkClosed),
+            Self::Headless(sender) => sender.lock().send(event).map_err(|_| EventSinkClosed),
+        }
+    }
+}
+
 /// Vivido events.
 #[derive(Debug, Clone)]
 pub enum EventType {
@@ -2002,22 +3724,44 @@ pub enum EventType {
     Message(Message),
     Scroll(Scroll),
     CreateWindow(WindowOptions),
-    #[cfg(unix)]
+    #[cfg(target_os = "macos")]
+    #[allow(private_interfaces)]
+    MacOsMenu(MenuCommand),
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    ShellAction(crate::shell::ShellAction),
+    #[cfg(any(unix, windows))]
     IpcRequest(IpcRequest),
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     IpcDisconnect(u64),
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     ScreenshotReadback,
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     ScreenshotComplete,
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     AutomationTick,
     BlinkCursor,
     BlinkCursorTimeout,
     SearchNext,
-    #[cfg(unix)]
+    NotificationActivated,
+    #[cfg(any(unix, windows))]
     Shutdown,
     Frame,
+    #[cfg(windows)]
+    LatencySensitiveFrame,
+    /// Drain the bounded, ordered terminal-position updates accumulated by a Windows PTY.
+    #[cfg(windows)]
+    TerminalVividBatch,
+    RendererRecovery,
+    VividResizeSettled(u64),
+    /// Dismiss the warning that was visible when this timer was scheduled.
+    MessageTimeout(Message),
+    /// A remote receiver committed a dropped file; type its committed path into the PTY.
+    ///
+    /// This deliberately has no outer-`Processor` arm: the catch-all forwards it into
+    /// `WindowContext::handle_event`, which is the only place an `ActionContext` exists.
+    VividFileDropPaste,
+    /// Wake the loop on behalf of an in-process host. Vivido itself does nothing with it.
+    HostWakeup,
 }
 
 impl From<TerminalEvent> for EventType {
@@ -2114,8 +3858,8 @@ pub struct ActionContext<'a, N, T> {
     pub cursor_blink_timed_out: &'a mut bool,
     pub prev_bell_cmd: &'a mut Option<Instant>,
     #[cfg(target_os = "macos")]
-    pub event_loop: &'a ActiveEventLoop,
-    pub event_proxy: &'a EventLoopProxy<Event>,
+    pub event_loop: Option<&'a ActiveEventLoop>,
+    pub event_proxy: &'a EventSink,
     pub scheduler: &'a mut Scheduler,
     pub search_state: &'a mut SearchState,
     pub dirty: &'a mut bool,
@@ -2129,9 +3873,80 @@ pub struct ActionContext<'a, N, T> {
 }
 
 impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionContext<'a, N, T> {
+    fn send_desktop_input(&self, event: vivid_protocol::input::InputEvent) -> bool {
+        self.vivid_service.send_input(event)
+    }
+
+    fn paste_clipboard_media(&mut self) -> bool {
+        use crate::clipboard::ClipboardMedia;
+        use crate::vivid::file_drop::LocalDropDisposition;
+
+        let Some(media) = self.clipboard.load_media() else {
+            return false;
+        };
+        self.message_buffer.remove_target(FILE_DROP_MESSAGE_TARGET);
+        match media {
+            ClipboardMedia::Files(paths) => {
+                for path in &paths {
+                    match self.vivid_service.handle_pasted_file(path) {
+                        LocalDropDisposition::NoBinding => {
+                            self.paste(&crate::vivid::file_drop::local_paste_text(path), true);
+                        },
+                        LocalDropDisposition::Offered => {
+                            replace_file_drop_message(
+                                self.message_buffer,
+                                "Copying file to the remote receiver".into(),
+                                MessageType::Warning,
+                            );
+                        },
+                        LocalDropDisposition::Rejected(reason) => {
+                            replace_file_drop_message(
+                                self.message_buffer,
+                                reason.into(),
+                                MessageType::Error,
+                            );
+                        },
+                    }
+                }
+                self.message_buffer_changed();
+                true
+            },
+            ClipboardMedia::Image { name, png } => {
+                match self.vivid_service.handle_pasted_bytes(name, png) {
+                    // Without a binding there is nothing to copy the pixels to, so the paste falls
+                    // back to whatever text the clipboard also carries.
+                    LocalDropDisposition::NoBinding => {
+                        self.message_buffer_changed();
+                        false
+                    },
+                    LocalDropDisposition::Offered => {
+                        replace_file_drop_message(
+                            self.message_buffer,
+                            "Copying the pasted image to the remote receiver".into(),
+                            MessageType::Warning,
+                        );
+                        self.message_buffer_changed();
+                        true
+                    },
+                    LocalDropDisposition::Rejected(reason) => {
+                        replace_file_drop_message(
+                            self.message_buffer,
+                            reason.into(),
+                            MessageType::Error,
+                        );
+                        self.message_buffer_changed();
+                        true
+                    },
+                }
+            },
+        }
+    }
+
     #[inline]
     fn write_to_pty<B: Into<Cow<'static, [u8]>>>(&self, val: B) {
-        self.notifier.notify(val);
+        if let Err(error) = self.notifier.notify(val) {
+            debug!("Failed to queue PTY write: {error}");
+        }
     }
 
     /// Request a redraw.
@@ -2267,35 +4082,38 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
     fn spawn_new_instance(&mut self) {
         let mut env_args = env::args();
         let program = env_args.next().unwrap();
-
-        let mut args: Vec<String> = Vec::new();
-
-        // Reuse the arguments passed to Vivido for the new instance.
-        #[allow(clippy::while_let_on_iterator)]
-        while let Some(arg) = env_args.next() {
-            // New instances shouldn't inherit command.
-            if arg == "-e" || arg == "--command" {
-                break;
-            }
-
-            // On unix, the working directory of the foreground shell is used by `start_daemon`.
-            #[cfg(not(windows))]
-            if arg == "--working-directory" {
-                let _ = env_args.next();
-                continue;
-            }
-
-            args.push(arg);
-        }
+        let args = crate::daemon::relaunch_arguments(env_args);
 
         self.spawn_daemon(&program, &args);
+    }
+
+    #[cfg(any(target_os = "linux", windows))]
+    fn shell_action(&mut self, action: crate::shell::ShellAction) {
+        let window_id = self.display.window.id();
+        let _ = self.event_proxy.send_event(Event::new(EventType::ShellAction(action), window_id));
+    }
+
+    #[cfg(any(target_os = "linux", windows))]
+    fn create_new_tab(&mut self) {
+        let mut options = WindowOptions::default();
+        options.terminal_options.working_directory =
+            self.terminal.working_directory().and_then(reported_working_directory);
+        #[cfg(not(windows))]
+        if options.terminal_options.working_directory.is_none() {
+            options.terminal_options.working_directory =
+                foreground_process_path(self.master_fd, self.shell_pid).ok();
+        }
+        self.shell_action(crate::shell::ShellAction::CreateTab(Box::new(options)));
     }
 
     #[cfg(not(windows))]
     fn create_new_window(&mut self, #[cfg(target_os = "macos")] tabbing_id: Option<String>) {
         let mut options = WindowOptions::default();
-        options.terminal_options.working_directory =
-            foreground_process_path(self.master_fd, self.shell_pid).ok();
+        options.terminal_options.working_directory = self
+            .terminal
+            .working_directory()
+            .and_then(reported_working_directory)
+            .or_else(|| foreground_process_path(self.master_fd, self.shell_pid).ok());
 
         #[cfg(target_os = "macos")]
         {
@@ -2307,9 +4125,11 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
 
     #[cfg(windows)]
     fn create_new_window(&mut self) {
-        let _ = self
-            .event_proxy
-            .send_event(Event::new(EventType::CreateWindow(WindowOptions::default()), None));
+        let mut options = WindowOptions::default();
+        options.terminal_options.working_directory =
+            self.terminal.working_directory().and_then(reported_working_directory);
+
+        let _ = self.event_proxy.send_event(Event::new(EventType::CreateWindow(options), None));
     }
 
     fn spawn_daemon<I, S>(&self, program: &str, args: I)
@@ -2318,7 +4138,11 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
         S: AsRef<OsStr>,
     {
         #[cfg(not(windows))]
-        let result = spawn_daemon(program, args, self.master_fd, self.shell_pid);
+        let result = spawn_daemon(
+            program,
+            args,
+            crate::daemon::foreground_process_path(self.master_fd, self.shell_pid).ok(),
+        );
         #[cfg(windows)]
         let result = spawn_daemon(program, args);
 
@@ -2347,8 +4171,8 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
     #[inline]
     fn pop_message(&mut self) {
         if !self.message_buffer.is_empty() {
-            self.display.pending_update.dirty = true;
             self.message_buffer.pop();
+            self.message_buffer_changed();
         }
     }
 
@@ -2653,7 +4477,7 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
     }
 
     #[cfg(target_os = "macos")]
-    fn event_loop(&self) -> &ActiveEventLoop {
+    fn event_loop(&self) -> Option<&ActiveEventLoop> {
         self.event_loop
     }
 
@@ -2667,6 +4491,18 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
 }
 
 impl<'a, N: Notify + 'a, T: EventListener> ActionContext<'a, N, T> {
+    /// Recalculate the footer geometry and restart any warning dismissal timer.
+    fn message_buffer_changed(&mut self) {
+        self.display.pending_update.dirty = true;
+        *self.dirty = true;
+        schedule_message_timeout(
+            self.message_buffer,
+            self.config,
+            self.scheduler,
+            self.display.window.id(),
+        );
+    }
+
     fn update_search(&mut self) {
         let regex = match self.search_state.regex() {
             Some(regex) => regex,
@@ -2915,6 +4751,7 @@ pub enum ClickState {
     None,
     Click,
     DoubleClick,
+    TripleClick,
 }
 
 impl Mouse {
@@ -2949,6 +4786,27 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
     pub fn handle_event(&mut self, event: WinitEvent<Event>) {
         match event {
             WinitEvent::UserEvent(Event { payload, .. }) => match payload {
+                #[cfg(target_os = "macos")]
+                EventType::MacOsMenu(command) => match menu_effect(command) {
+                    MenuEffect::Action(action) => self.execute_action(&action),
+                    MenuEffect::Clear => {
+                        self.execute_action(&Action::Esc("\x0c".into()));
+                        self.execute_action(&Action::ClearHistory);
+                    },
+                },
+                EventType::VividFileDropPaste => {
+                    let pastes = self.ctx.vivid_service.take_file_drop_pastes();
+                    if !pastes.is_empty() {
+                        // The typed path is the completion feedback, so retire the transfer
+                        // notice rather than leaving it to expire on its own.
+                        self.ctx.message_buffer.remove_target(FILE_DROP_MESSAGE_TARGET);
+                        self.ctx.message_buffer_changed();
+                    }
+                    for text in &pastes {
+                        // Bracketed, exactly like the local no-binding drop fallback.
+                        self.ctx.paste(text, true);
+                    }
+                },
                 EventType::SearchNext => self.ctx.goto_match(None),
                 EventType::Scroll(scroll) => self.ctx.scroll(scroll),
                 EventType::BlinkCursor => {
@@ -2970,7 +4828,14 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                 // Add message only if it's not already queued.
                 EventType::Message(message) if !self.ctx.message_buffer.is_queued(&message) => {
                     self.ctx.message_buffer.push(message);
-                    self.ctx.display.pending_update.dirty = true;
+                    self.ctx.message_buffer_changed();
+                },
+                EventType::MessageTimeout(message)
+                    if message.ty() == MessageType::Warning
+                        && self.ctx.message_buffer.message() == Some(&message) =>
+                {
+                    self.ctx.message_buffer.pop();
+                    self.ctx.message_buffer_changed();
                 },
                 EventType::Terminal(event) => match event {
                     TerminalEvent::Title(title) => {
@@ -2984,6 +4849,9 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                             self.ctx.display.window.set_title(window_config.identity.title.clone());
                         }
                     },
+                    // The reported directory lives on the terminal; the IPC processor already
+                    // emitted `directory_changed` before dropping the event.
+                    TerminalEvent::WorkingDirectory(_) => (),
                     TerminalEvent::Bell => {
                         // Set window urgency hint when window is not focused.
                         let focused = self.ctx.terminal.is_focused;
@@ -3006,6 +4874,7 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                             *self.ctx.prev_bell_cmd = Some(Instant::now());
                         }
                     },
+                    TerminalEvent::DesktopNotification(_) => (),
                     TerminalEvent::Graphics(command) => {
                         self.ctx.display.submit_graphics(command);
                         self.ctx.mark_dirty();
@@ -3060,12 +4929,12 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                     TerminalEvent::MouseCursorDirty => self.reset_mouse_cursor(),
                     TerminalEvent::CursorBlinkingChange => self.ctx.update_cursor_blinking(),
                     TerminalEvent::Exit | TerminalEvent::ChildExit(_) | TerminalEvent::Wakeup => (),
-                    #[cfg(unix)]
+                    #[cfg(any(unix, windows))]
                     TerminalEvent::PtyOutput { .. }
                     | TerminalEvent::PtyWriteComplete(_)
                     | TerminalEvent::PtyResizeComplete(_) => (),
                 },
-                #[cfg(unix)]
+                #[cfg(any(unix, windows))]
                 EventType::IpcRequest(_)
                 | EventType::IpcDisconnect(_)
                 | EventType::ScreenshotReadback
@@ -3073,9 +4942,18 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                 | EventType::AutomationTick
                 | EventType::Shutdown => (),
                 EventType::Message(_)
+                | EventType::MessageTimeout(_)
                 | EventType::ConfigReload(_)
                 | EventType::CreateWindow(_)
-                | EventType::Frame => (),
+                | EventType::NotificationActivated
+                | EventType::Frame
+                | EventType::RendererRecovery
+                | EventType::HostWakeup
+                | EventType::VividResizeSettled(_) => (),
+                #[cfg(windows)]
+                EventType::LatencySensitiveFrame | EventType::TerminalVividBatch => (),
+                #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+                EventType::ShellAction(_) => (),
                 EventType::VividFrame => (),
             },
             WinitEvent::WindowEvent { event, .. } => {
@@ -3092,8 +4970,11 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                         let display_update_pending = &mut self.ctx.display.pending_update;
 
                         // Rescale font size for the new factor.
-                        let font_scale = scale_factor as f32 / old_scale_factor as f32;
-                        self.ctx.display.font_size = self.ctx.display.font_size.scale(font_scale);
+                        self.ctx.display.font_size = crate::display::rescale_font_size(
+                            self.ctx.display.font_size,
+                            old_scale_factor,
+                            scale_factor,
+                        );
 
                         let font = self.ctx.config.font.clone();
                         display_update_pending.set_font(font.with_size(self.ctx.display.font_size));
@@ -3102,7 +4983,7 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                         // Ignore resize events to zero in any dimension, to avoid issues with Winit
                         // and the ConPTY. A 0x0 resize will also occur when the window is minimized
                         // on Windows.
-                        if size.width == 0 || size.height == 0 {
+                        if !is_renderable_resize(size) {
                             return;
                         }
 
@@ -3152,8 +5033,62 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                         );
                     },
                     WindowEvent::DroppedFile(path) => {
-                        let path: String = path.to_string_lossy().into();
-                        self.ctx.paste(&(path + " "), true);
+                        // A drop supersedes the hover overlay. Leaving it at the front of the
+                        // queue hides transfer and rejection state behind stale text.
+                        self.ctx.message_buffer.remove_target(FILE_DROP_MESSAGE_TARGET);
+                        let size = self.ctx.size_info();
+                        let display_offset = self.ctx.terminal.grid().display_offset();
+                        match self.ctx.vivid_service.handle_file_drop(
+                            &path,
+                            self.ctx.mouse.x,
+                            self.ctx.mouse.y,
+                            &size,
+                            display_offset,
+                        ) {
+                            crate::vivid::file_drop::LocalDropDisposition::NoBinding => {
+                                self.ctx
+                                    .paste(&crate::vivid::file_drop::local_paste_text(&path), true);
+                            },
+                            crate::vivid::file_drop::LocalDropDisposition::Offered => {
+                                replace_file_drop_message(
+                                    self.ctx.message_buffer,
+                                    "Copying file to the remote receiver".into(),
+                                    MessageType::Warning,
+                                );
+                            },
+                            crate::vivid::file_drop::LocalDropDisposition::Rejected(reason) => {
+                                replace_file_drop_message(
+                                    self.ctx.message_buffer,
+                                    reason.into(),
+                                    MessageType::Error,
+                                );
+                            },
+                        }
+                        self.ctx.message_buffer_changed();
+                    },
+                    WindowEvent::HoveredFile(_) => {
+                        let size = self.ctx.size_info();
+                        let display_offset = self.ctx.terminal.grid().display_offset();
+                        if let Some(label) = self.ctx.vivid_service.file_drop_hover_label(
+                            self.ctx.mouse.x,
+                            self.ctx.mouse.y,
+                            &size,
+                            display_offset,
+                        ) {
+                            let message = file_drop_message(label.into(), MessageType::Warning);
+                            if !self.ctx.message_buffer.is_queued(&message) {
+                                replace_file_drop_message(
+                                    self.ctx.message_buffer,
+                                    label.into(),
+                                    MessageType::Warning,
+                                );
+                                self.ctx.message_buffer_changed();
+                            }
+                        }
+                    },
+                    WindowEvent::HoveredFileCancelled => {
+                        self.ctx.message_buffer.remove_target(FILE_DROP_MESSAGE_TARGET);
+                        self.ctx.message_buffer_changed();
                     },
                     WindowEvent::CursorLeft { .. } => {
                         self.ctx.mouse.inside_text_area = false;
@@ -3197,10 +5132,8 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                     | WindowEvent::PinchGesture { .. }
                     | WindowEvent::AxisMotion { .. }
                     | WindowEvent::PanGesture { .. }
-                    | WindowEvent::HoveredFileCancelled
                     | WindowEvent::Destroyed
                     | WindowEvent::ThemeChanged(_)
-                    | WindowEvent::HoveredFile(_)
                     | WindowEvent::RedrawRequested
                     | WindowEvent::Moved(_) => (),
                 }
@@ -3216,27 +5149,372 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
     }
 }
 
+fn is_renderable_resize(size: PhysicalSize<u32>) -> bool {
+    size.width != 0 && size.height != 0
+}
+
 #[derive(Debug, Clone)]
 pub struct EventProxy {
-    proxy: EventLoopProxy<Event>,
+    proxy: EventSink,
     window_id: WindowId,
+    #[cfg(windows)]
+    pending_terminal_events: Arc<PendingTerminalEvents>,
 }
 
 impl EventProxy {
-    pub fn new(proxy: EventLoopProxy<Event>, window_id: WindowId) -> Self {
-        Self { proxy, window_id }
+    pub fn new(proxy: EventSink, window_id: WindowId) -> Self {
+        Self {
+            proxy,
+            window_id,
+            #[cfg(windows)]
+            pending_terminal_events: Arc::default(),
+        }
     }
 
     /// Send an event to the event loop.
     pub fn send_event(&self, event: EventType) {
         let _ = self.proxy.send_event(Event::new(event, self.window_id));
     }
+
+    /// Permit the next terminal-model wake after the UI has started handling this one.
+    #[cfg(windows)]
+    pub fn acknowledge_terminal_wakeup(&self) {
+        self.pending_terminal_events.wakeup.store(false, Ordering::Release);
+    }
+
+    /// Take every transcript span represented by this coalesced PTY-output notification.
+    #[cfg(windows)]
+    pub fn take_pty_output(&self, fallback: (u64, u64)) -> (u64, u64) {
+        self.pending_terminal_events.output.lock().take().unwrap_or(fallback)
+    }
+
+    /// Take the complete ordered Vivid terminal-position batch behind one Windows notification.
+    #[cfg(windows)]
+    pub fn take_pending_vivid_terminal_events(&self) -> VecDeque<TerminalEvent> {
+        self.pending_terminal_events.take_vivid_events()
+    }
 }
 
 impl EventListener for EventProxy {
     fn send_event(&self, event: TerminalEvent) {
+        #[cfg(windows)]
+        match event {
+            TerminalEvent::Wakeup => {
+                // WSL commonly exposes `cat` output to ConPTY in very small chunks. Posting a
+                // winit user event for every chunk can fill Windows' 10,000-message queue. Winit
+                // ignores `PostMessageW` failure after first enqueueing the Rust-side event, so
+                // the unpaired tail then remains invisible until unrelated native input arrives.
+                if self.pending_terminal_events.wakeup.swap(true, Ordering::AcqRel) {
+                    return;
+                }
+
+                if self
+                    .proxy
+                    .send_event(Event::new(
+                        EventType::Terminal(TerminalEvent::Wakeup),
+                        self.window_id,
+                    ))
+                    .is_err()
+                {
+                    self.pending_terminal_events.wakeup.store(false, Ordering::Release);
+                }
+                return;
+            },
+            TerminalEvent::PtyOutput { start, end } => {
+                let mut output = self.pending_terminal_events.output.lock();
+                if let Some((pending_start, pending_end)) = output.as_mut() {
+                    *pending_start = (*pending_start).min(start);
+                    *pending_end = (*pending_end).max(end);
+                    return;
+                }
+                *output = Some((start, end));
+                drop(output);
+
+                let _ = self.proxy.send_event(Event::new(
+                    EventType::Terminal(TerminalEvent::PtyOutput { start, end }),
+                    self.window_id,
+                ));
+                return;
+            },
+            event @ (TerminalEvent::VividGridScroll { .. }
+            | TerminalEvent::VividMarker { .. }
+            | TerminalEvent::VividClear
+            | TerminalEvent::VividScreenSwap { .. }) => {
+                if self.pending_terminal_events.push_vivid_event(event) {
+                    let _ = self
+                        .proxy
+                        .send_event(Event::new(EventType::TerminalVividBatch, self.window_id));
+                }
+                return;
+            },
+            _ => (),
+        }
+
         let _ = self.proxy.send_event(Event::new(event.into(), self.window_id));
     }
+}
+
+#[cfg(windows)]
+#[derive(Debug, Default)]
+struct PendingTerminalEvents {
+    wakeup: AtomicBool,
+    output: Mutex<Option<(u64, u64)>>,
+    vivid: Mutex<PendingVividEvents>,
+}
+
+/// Maximum ordered Vivid terminal events retained behind one Windows UI notification.
+///
+/// Authenticated anchors are independently capped at 4,096. Twice that limit leaves room for
+/// their ordering barriers while keeping a hostile terminal stream from creating an unbounded
+/// producer-to-UI queue.
+#[cfg(windows)]
+const MAX_PENDING_VIVID_EVENTS: usize = 8_192;
+
+#[cfg(windows)]
+#[derive(Debug, Default)]
+struct PendingVividEvents {
+    events: VecDeque<TerminalEvent>,
+    notification_pending: bool,
+    overflowed: bool,
+}
+
+#[cfg(windows)]
+impl PendingTerminalEvents {
+    /// Queue one ordered terminal-position update and report whether the UI needs one notification.
+    fn push_vivid_event(&self, event: TerminalEvent) -> bool {
+        let mut pending = self.vivid.lock();
+
+        if pending.events.len() >= MAX_PENDING_VIVID_EVENTS {
+            pending.events.clear();
+            pending.events.push_back(TerminalEvent::VividClear);
+            if !pending.overflowed {
+                warn!(
+                    "dropping saturated Windows terminal-position detail and clearing Vivid anchors"
+                );
+                pending.overflowed = true;
+            }
+        }
+
+        let merged = match (pending.events.back_mut(), &event) {
+            (
+                Some(TerminalEvent::VividGridScroll {
+                    origin: pending_origin,
+                    end: pending_end,
+                    lines: pending_lines,
+                    history_size: pending_history_size,
+                }),
+                TerminalEvent::VividGridScroll { origin, end, lines, history_size },
+            ) if *pending_origin == *origin
+                && *pending_end == *end
+                && pending_lines.signum() == lines.signum() =>
+            {
+                *pending_lines = pending_lines.saturating_add(*lines);
+                *pending_history_size = *history_size;
+                true
+            },
+            _ => false,
+        };
+
+        if !merged {
+            pending.events.push_back(event);
+        }
+
+        if pending.notification_pending {
+            false
+        } else {
+            pending.notification_pending = true;
+            true
+        }
+    }
+
+    fn take_vivid_events(&self) -> VecDeque<TerminalEvent> {
+        let mut pending = self.vivid.lock();
+        pending.notification_pending = false;
+        pending.overflowed = false;
+        mem::take(&mut pending.events)
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_event_proxy_tests {
+    use super::*;
+
+    #[test]
+    fn terminal_wakeups_are_coalesced_until_acknowledged() {
+        let (sink, receiver) = EventSink::headless();
+        let proxy = EventProxy::new(sink, WindowId::dummy());
+
+        for _ in 0..20_000 {
+            EventListener::send_event(&proxy, TerminalEvent::Wakeup);
+        }
+
+        assert!(matches!(
+            receiver.recv().unwrap().payload,
+            EventType::Terminal(TerminalEvent::Wakeup)
+        ));
+        assert!(receiver.try_recv().is_err());
+
+        proxy.acknowledge_terminal_wakeup();
+        EventListener::send_event(&proxy, TerminalEvent::Wakeup);
+        assert!(matches!(
+            receiver.recv().unwrap().payload,
+            EventType::Terminal(TerminalEvent::Wakeup)
+        ));
+    }
+
+    #[test]
+    fn transcript_ranges_are_coalesced_without_losing_bytes() {
+        let (sink, receiver) = EventSink::headless();
+        let proxy = EventProxy::new(sink, WindowId::dummy());
+
+        for offset in 0..20_000 {
+            EventListener::send_event(
+                &proxy,
+                TerminalEvent::PtyOutput { start: 10 + offset, end: 11 + offset },
+            );
+        }
+
+        assert!(matches!(
+            receiver.recv().unwrap().payload,
+            EventType::Terminal(TerminalEvent::PtyOutput { .. })
+        ));
+        assert!(receiver.try_recv().is_err());
+        assert_eq!(proxy.take_pty_output((0, 0)), (10, 20_010));
+
+        EventListener::send_event(&proxy, TerminalEvent::PtyOutput { start: 20_010, end: 20_015 });
+        assert!(matches!(
+            receiver.recv().unwrap().payload,
+            EventType::Terminal(TerminalEvent::PtyOutput { .. })
+        ));
+        assert_eq!(proxy.take_pty_output((0, 0)), (20_010, 20_015));
+    }
+
+    #[test]
+    fn wsl_sized_scroll_output_keeps_exit_notification_reachable() {
+        let (sink, receiver) = EventSink::headless();
+        let proxy = EventProxy::new(sink, WindowId::dummy());
+
+        for offset in 0..20_000_u64 {
+            EventListener::send_event(
+                &proxy,
+                TerminalEvent::VividGridScroll {
+                    origin: 0,
+                    end: 25,
+                    lines: 1,
+                    history_size: offset as usize,
+                },
+            );
+            EventListener::send_event(&proxy, TerminalEvent::Wakeup);
+            EventListener::send_event(
+                &proxy,
+                TerminalEvent::PtyOutput { start: offset, end: offset + 1 },
+            );
+        }
+        EventListener::send_event(&proxy, TerminalEvent::Exit);
+
+        let events = receiver.try_iter().map(|event| event.payload).collect::<Vec<_>>();
+        assert_eq!(events.len(), 4);
+        assert!(matches!(events[0], EventType::TerminalVividBatch));
+        assert!(matches!(events[1], EventType::Terminal(TerminalEvent::Wakeup)));
+        assert!(matches!(events[2], EventType::Terminal(TerminalEvent::PtyOutput { .. })));
+        assert!(matches!(events[3], EventType::Terminal(TerminalEvent::Exit)));
+
+        let vivid_events = proxy.take_pending_vivid_terminal_events();
+        assert!(matches!(
+            vivid_events.front(),
+            Some(TerminalEvent::VividGridScroll {
+                origin: 0,
+                end: 25,
+                lines: 20_000,
+                history_size: 19_999,
+            })
+        ));
+        assert_eq!(vivid_events.len(), 1);
+    }
+
+    #[test]
+    fn vivid_terminal_batch_preserves_marker_and_screen_order() {
+        let (sink, receiver) = EventSink::headless();
+        let proxy = EventProxy::new(sink, WindowId::dummy());
+
+        EventListener::send_event(
+            &proxy,
+            TerminalEvent::VividGridScroll { origin: 0, end: 25, lines: 3, history_size: 3 },
+        );
+        EventListener::send_event(
+            &proxy,
+            TerminalEvent::VividMarker {
+                marker: "anchor".into(),
+                line: 4,
+                column: 5,
+                alternate: false,
+            },
+        );
+        EventListener::send_event(
+            &proxy,
+            TerminalEvent::VividGridScroll { origin: 0, end: 25, lines: 2, history_size: 5 },
+        );
+        EventListener::send_event(&proxy, TerminalEvent::VividScreenSwap { alternate: true });
+
+        assert!(matches!(receiver.recv().unwrap().payload, EventType::TerminalVividBatch));
+        assert!(receiver.try_recv().is_err());
+
+        let events = proxy.take_pending_vivid_terminal_events().into_iter().collect::<Vec<_>>();
+        assert!(matches!(events[0], TerminalEvent::VividGridScroll { lines: 3, .. }));
+        assert!(matches!(
+            &events[1],
+            TerminalEvent::VividMarker { marker, line: 4, column: 5, alternate: false }
+                if marker == "anchor"
+        ));
+        assert!(matches!(events[2], TerminalEvent::VividGridScroll { lines: 2, .. }));
+        assert!(matches!(events[3], TerminalEvent::VividScreenSwap { alternate: true }));
+    }
+
+    #[test]
+    fn saturated_vivid_terminal_batch_is_bounded_and_clears_anchor_state() {
+        let (sink, receiver) = EventSink::headless();
+        let proxy = EventProxy::new(sink, WindowId::dummy());
+
+        for index in 0..=MAX_PENDING_VIVID_EVENTS {
+            EventListener::send_event(
+                &proxy,
+                TerminalEvent::VividGridScroll {
+                    origin: (index % 2) as i32,
+                    end: 25,
+                    lines: 1,
+                    history_size: index,
+                },
+            );
+        }
+
+        assert!(matches!(receiver.recv().unwrap().payload, EventType::TerminalVividBatch));
+        assert!(receiver.try_recv().is_err());
+        let events = proxy.take_pending_vivid_terminal_events();
+        assert!(events.len() <= MAX_PENDING_VIVID_EVENTS);
+        assert!(matches!(events.front(), Some(TerminalEvent::VividClear)));
+    }
+}
+
+#[cfg(unix)]
+fn exit_signal(status: &std::process::ExitStatus) -> Option<i32> {
+    use std::os::unix::process::ExitStatusExt;
+    status.signal()
+}
+
+#[cfg(windows)]
+fn exit_signal(_status: &std::process::ExitStatus) -> Option<i32> {
+    None
+}
+
+#[cfg(unix)]
+fn exit_core_dumped(status: &std::process::ExitStatus) -> bool {
+    use std::os::unix::process::ExitStatusExt;
+    status.core_dumped()
+}
+
+#[cfg(windows)]
+fn exit_core_dumped(_status: &std::process::ExitStatus) -> bool {
+    false
 }
 
 #[cfg(all(test, unix))]
@@ -3248,5 +5526,133 @@ mod ipc_wait_tests {
         assert_eq!(pattern_find(b"before ready> after", b"ready>", false), Some((7, 13)));
         assert_eq!(pattern_find(b"status=1234", br"status=\d+", true), Some((0, 11)));
         assert_eq!(pattern_find("界面 ready".as_bytes(), "界面".as_bytes(), false), Some((0, 6)));
+    }
+}
+
+#[cfg(test)]
+mod file_drop_message_tests {
+    use super::{FILE_DROP_MESSAGE_TARGET, file_drop_message, replace_file_drop_message};
+    use crate::message_bar::{MessageBuffer, MessageType};
+
+    #[test]
+    fn latest_file_drop_state_replaces_the_hover_message() {
+        let mut buffer = MessageBuffer::default();
+        replace_file_drop_message(&mut buffer, "Copy to remote shell".into(), MessageType::Warning);
+        replace_file_drop_message(
+            &mut buffer,
+            "Copying file to the remote receiver".into(),
+            MessageType::Warning,
+        );
+
+        let expected =
+            file_drop_message("Copying file to the remote receiver".into(), MessageType::Warning);
+        assert_eq!(buffer.message(), Some(&expected));
+        assert_eq!(
+            buffer.message().and_then(|message| message.target()).map(String::as_str),
+            Some(FILE_DROP_MESSAGE_TARGET)
+        );
+    }
+}
+
+#[cfg(test)]
+mod window_resize_tests {
+    use super::is_renderable_resize;
+    use winit::dpi::PhysicalSize;
+
+    #[test]
+    fn monitor_move_resize_sequence_accepts_physical_size_and_ignores_zero_axes() {
+        assert!(is_renderable_resize(PhysicalSize::new(2560, 1600)));
+        assert!(!is_renderable_resize(PhysicalSize::new(0, 1600)));
+        assert!(!is_renderable_resize(PhysicalSize::new(2560, 0)));
+        assert!(!is_renderable_resize(PhysicalSize::new(0, 0)));
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod macos_menu_tests {
+    use super::*;
+
+    #[test]
+    fn terminal_menu_commands_reuse_existing_actions() {
+        let expected = [
+            (MenuCommand::NewWindow, Action::CreateNewWindow),
+            (MenuCommand::NewTab, Action::CreateNewTab),
+            (MenuCommand::Copy, Action::Copy),
+            (MenuCommand::Paste, Action::Paste),
+            (MenuCommand::Find, Action::SearchForward),
+        ];
+
+        for (command, action) in expected {
+            assert_eq!(menu_effect(command), MenuEffect::Action(action));
+        }
+        assert_eq!(menu_effect(MenuCommand::Clear), MenuEffect::Clear);
+    }
+}
+
+#[cfg(all(test, any(unix, windows)))]
+mod host_claim_tests {
+    use serde_json::json;
+
+    use super::*;
+    use crate::polling::ipc::test_connection;
+
+    fn headless_processor() -> Processor {
+        let (proxy, _receiver) = EventSink::headless();
+        // The receiver is dropped, so any event the processor emits is discarded rather than
+        // steering this test; only the claim decision is under examination.
+        Processor::new_headless(UiConfig::default(), CliOptions::default(), proxy)
+    }
+
+    fn request(
+        connection: &crate::polling::ipc::IpcConnection,
+        id: u64,
+        method: &str,
+    ) -> IpcRequest {
+        IpcRequest {
+            connection: connection.clone(),
+            id,
+            method: String::from(method),
+            params: json!({}),
+        }
+    }
+
+    /// A claimed method is the host's to answer: Vivido must neither dispatch nor reply to it.
+    #[test]
+    fn a_claimed_method_is_queued_for_the_host_instead_of_dispatched() {
+        let mut processor = headless_processor();
+        processor.claim_ipc_methods(&["vvbox_list_tabs", "create_window"]);
+        let (connection, frames) = test_connection();
+        let loop_handle =
+            LoopHandle::Embedded { size: PhysicalSize::new(80, 24), scale_factor: 1.0 };
+
+        processor.handle_ipc_request(loop_handle, request(&connection, 7, "vvbox_list_tabs"));
+        processor.handle_ipc_request(loop_handle, request(&connection, 8, "create_window"));
+
+        assert!(frames.try_recv().is_err(), "Vivido answered a request the host claimed");
+        let taken = processor.take_host_requests();
+        assert_eq!(
+            taken.iter().map(|request| (request.id, request.method.as_str())).collect::<Vec<_>>(),
+            [(7, "vvbox_list_tabs"), (8, "create_window")],
+        );
+        assert!(processor.take_host_requests().is_empty(), "draining did not consume the queue");
+
+        crate::polling::ipc::publish_host_methods([].iter());
+    }
+
+    /// Claiming one method must not silently capture the rest of the automation surface.
+    #[test]
+    fn an_unclaimed_method_still_reaches_vivido() {
+        let mut processor = headless_processor();
+        processor.claim_ipc_methods(&["vvbox_list_tabs"]);
+        let (connection, frames) = test_connection();
+        let loop_handle =
+            LoopHandle::Embedded { size: PhysicalSize::new(80, 24), scale_factor: 1.0 };
+
+        processor.handle_ipc_request(loop_handle, request(&connection, 9, "ping"));
+
+        assert!(frames.try_recv().is_ok(), "Vivido did not answer an unclaimed request");
+        assert!(processor.take_host_requests().is_empty());
+
+        crate::polling::ipc::publish_host_methods([].iter());
     }
 }

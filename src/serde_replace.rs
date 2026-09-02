@@ -68,16 +68,16 @@ impl<'de, T: Deserialize<'de>> SerdeReplace for HashMap<String, T> {
 
 #[cfg(test)]
 mod tests {
-    use vivido_config_derive::ConfigDeserialize;
+    #[derive(Default, PartialEq, Eq, Debug)]
+    struct ReplaceOption {
+        a: usize,
+        b: usize,
+    }
+
+    impl_config_deserialize!(ReplaceOption { a, b });
 
     #[test]
     fn replace_option_merges_nested_fields() {
-        #[derive(ConfigDeserialize, Default, PartialEq, Eq, Debug)]
-        struct ReplaceOption {
-            a: usize,
-            b: usize,
-        }
-
         let mut subject: Option<ReplaceOption> = None;
         crate::SerdeReplace::replace(&mut subject, toml::from_str("a=1").unwrap()).unwrap();
         crate::SerdeReplace::replace(&mut subject, toml::from_str("b=2").unwrap()).unwrap();

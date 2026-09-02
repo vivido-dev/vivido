@@ -10,7 +10,11 @@ The Windows release produces two x64 artifacts for Windows 11 build 22000 or new
 Both packages install `vivido`, `vivi`, `vvmux`, and `vvssh` below
 `%LOCALAPPDATA%\Programs\Vivido`. The MSI adds that directory to the user PATH and creates the
 `Vivido PowerShell` (`-e pwsh.exe`) and `Vivido WSL` (`-e wsl.exe`) Start Menu shortcuts. It does
-not create desktop shortcuts or taskbar pins.
+not create desktop shortcuts or taskbar pins. A WSL shell inherits the per-window Vivid endpoint,
+root secret, and ConPTY anchor transport through one-way `WSLENV` entries, so a Linux build of
+`vivi` can submit media to the native Windows Vivido window. Vivido removes stale optional-lane
+entries from inherited `WSLENV`; otherwise WSL can materialize an unavailable endpoint as an
+invalid empty variable instead of allowing the protocol's missing-lane fallback.
 
 For a start-to-finish developer-machine procedure, including unsigned builds, installation,
 repair, uninstall, bundle prerequisite testing, and signed-artifact verification, see
@@ -19,8 +23,11 @@ repair, uninstall, bundle prerequisite testing, and signed-artifact verification
 ## Reproducible inputs
 
 `release.json` pins Rust, vcpkg, WiX, and the unmodified Microsoft PowerShell MSI. `vcpkg.json`
-selects only FFmpeg `avcodec`, `avformat`, `swresample`, and `swscale` with default features
-disabled. Do not add `gpl`, `all-gpl`, `nonfree`, or `fdk-aac` features to the public build.
+selects the modern DirectX Shader Compiler plus only FFmpeg `avcodec`, `avformat`, `dav1d`,
+`swresample`, and `swscale` with default features disabled. DXC avoids wgpu's multi-second legacy
+FXC shader-compilation fallback during startup. The BSD-licensed dav1d dependency provides the
+software AV1 fallback required on systems without AV1 hardware decoding. Do not add `gpl`,
+`all-gpl`, `nonfree`, or `fdk-aac` features to the public build.
 
 The release workflow runs Cargo independently in `vivid_protocol`, `vivi`, `vivido`, and `vvmux`;
 the repository root is not a Cargo workspace. `scripts/prepare-release.ps1` rejects mismatched
@@ -38,7 +45,9 @@ To reproduce an unsigned build in a Visual Studio Developer PowerShell:
 ```powershell
 $env:VCPKG_ROOT = 'C:\src\vcpkg'
 $env:VCPKG_DEFAULT_TRIPLET = 'x64-windows'
-& $env:VCPKG_ROOT\vcpkg.exe install --triplet x64-windows --x-manifest-root="$PWD\vivido\windows"
+& $env:VCPKG_ROOT\vcpkg.exe install --triplet x64-windows `
+    --x-manifest-root="$PWD\vivido\windows" `
+    --x-install-root="$env:VCPKG_ROOT\installed"
 
 foreach ($project in @('vivido', 'vivi', 'vvmux')) {
     Push-Location $project
@@ -67,12 +76,13 @@ acknowledgement is absent; the repository does not record acceptance automatical
 
 ## Configuration ownership and upgrades
 
-Vivido now looks first for `%USERPROFILE%\vivido\vivido.toml`, then falls back to the former
-`%APPDATA%\vivido` TOML location. On a first MSI install the signed setup helper:
+Vivido looks first for `%USERPROFILE%\.config\vivido\vivido.toml`, then for the installer-managed
+`%USERPROFILE%\vivido\vivido.toml`, and finally for the former `%APPDATA%\vivido` TOML location.
+On a first MSI install the signed setup helper:
 
-1. leaves an existing new-path TOML untouched;
+1. leaves an existing dot-config or installer-managed TOML untouched;
 2. copies the legacy roaming TOML when only that file exists; or
-3. writes the default PowerShell configuration when neither exists.
+3. writes the default PowerShell configuration to the installer-managed path when none exists.
 
 The config is user-owned rather than an MSI file component, so repair, major upgrade, and uninstall
 do not remove or overwrite it. Uninstall and upgrade also call `vvmux list` and refuse to continue

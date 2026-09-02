@@ -11,8 +11,10 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as Base64;
 use bitflags::bitflags;
 use log::{debug, trace};
+use memchr::memchr;
 use unicode_width::UnicodeWidthChar;
 
+use crate::osc_notification::OscWorkingDirectory;
 use crate::terminal::event::{Event, EventListener};
 use crate::terminal::graphics::GraphicsCommand;
 use crate::terminal::grid::{Dimensions, Grid, GridIterator, Scroll};
@@ -25,6 +27,8 @@ use crate::terminal::vte::ansi::{
     KeyboardModesApplyBehavior, NamedColor, NamedMode, NamedPrivateMode, PrivateMode, Rgb,
     StandardCharset,
 };
+// The same `cursor-icon` type winit re-exports, keeping this module winit-free.
+use crate::terminal::vte::ansi::cursor_icon::CursorIcon;
 
 pub mod cell;
 pub mod color;
@@ -49,6 +53,159 @@ const KEYBOARD_MODE_STACK_MAX_DEPTH: usize = TITLE_STACK_MAX_DEPTH;
 
 /// Default tab interval, corresponding to terminfo `it` value.
 const INITIAL_TABSTOPS: usize = 8;
+const DCS_MAX_BYTES: usize = 4096;
+
+#[derive(Debug, Default)]
+struct DcsScanner {
+    state: DcsState,
+    body: Vec<u8>,
+    raw: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum DcsState {
+    #[default]
+    Ground,
+    Escape,
+    Body,
+    BodyEscape,
+    Discarding,
+    DiscardingEscape,
+}
+
+/// One span of scanned PTY bytes: terminal data, or a DCS request the emulator answers itself.
+///
+/// Spans borrow either the caller's read buffer or the scanner's own bounded body buffer, so
+/// ordinary output is never copied on its way to the parser.
+enum DcsChunk<'a> {
+    Bytes(&'a [u8]),
+    Decrqss(&'a [u8]),
+    Xtgettcap(&'a [u8]),
+    Xtsettcap(&'a [u8]),
+}
+
+impl DcsScanner {
+    /// Split PTY bytes into terminal data and the DCS requests handled here.
+    ///
+    /// Ground, body, and discard runs advance with `memchr` instead of one byte at a time. Ordinary
+    /// output never leaves the ground state, so a whole read is forwarded as a single borrowed
+    /// slice rather than being rebuilt byte by byte into a fresh allocation.
+    fn push<F>(&mut self, mut bytes: &[u8], emit: &mut F)
+    where
+        F: FnMut(DcsChunk<'_>),
+    {
+        while !bytes.is_empty() {
+            match self.state {
+                DcsState::Ground => match memchr(0x1b, bytes) {
+                    Some(index) => {
+                        if index > 0 {
+                            emit(DcsChunk::Bytes(&bytes[..index]));
+                        }
+                        self.state = DcsState::Escape;
+                        bytes = &bytes[index + 1..];
+                    },
+                    None => {
+                        emit(DcsChunk::Bytes(bytes));
+                        return;
+                    },
+                },
+                DcsState::Escape => {
+                    let byte = bytes[0];
+                    bytes = &bytes[1..];
+                    match byte {
+                        b'P' => {
+                            self.body.clear();
+                            self.raw.clear();
+                            self.raw.extend_from_slice(b"\x1bP");
+                            self.state = DcsState::Body;
+                        },
+                        0x1b => emit(DcsChunk::Bytes(b"\x1b")),
+                        _ => {
+                            emit(DcsChunk::Bytes(&[0x1b, byte]));
+                            self.state = DcsState::Ground;
+                        },
+                    }
+                },
+                DcsState::Body => {
+                    let limit = memchr(0x1b, bytes).unwrap_or(bytes.len());
+                    if limit == 0 {
+                        self.state = DcsState::BodyEscape;
+                        bytes = &bytes[1..];
+                    } else {
+                        // Buffer at most the one byte past the cap needed to observe the overflow,
+                        // so a long body cannot grow the scanner beyond its bound.
+                        let take = limit.min(DCS_MAX_BYTES + 1 - self.body.len());
+                        self.push_body(&bytes[..take]);
+                        bytes = &bytes[take..];
+                    }
+                },
+                DcsState::BodyEscape => {
+                    let byte = bytes[0];
+                    bytes = &bytes[1..];
+                    if byte == b'\\' {
+                        self.raw.extend_from_slice(b"\x1b\\");
+                        self.finish(emit);
+                    } else {
+                        self.push_body(&[0x1b]);
+                        if self.state == DcsState::Body {
+                            self.push_body(&[byte]);
+                        }
+                    }
+                },
+                DcsState::Discarding => match memchr(0x1b, bytes) {
+                    Some(index) => {
+                        self.state = DcsState::DiscardingEscape;
+                        bytes = &bytes[index + 1..];
+                    },
+                    None => return,
+                },
+                DcsState::DiscardingEscape => {
+                    let byte = bytes[0];
+                    bytes = &bytes[1..];
+                    match byte {
+                        b'\\' => {
+                            self.body.clear();
+                            self.raw.clear();
+                            self.state = DcsState::Ground;
+                        },
+                        0x1b => (),
+                        _ => self.state = DcsState::Discarding,
+                    }
+                },
+            }
+        }
+    }
+
+    fn push_body(&mut self, chunk: &[u8]) {
+        self.body.extend_from_slice(chunk);
+        self.raw.extend_from_slice(chunk);
+        self.state = if self.body.len() > DCS_MAX_BYTES {
+            self.body.clear();
+            self.raw.clear();
+            DcsState::Discarding
+        } else {
+            DcsState::Body
+        };
+    }
+
+    fn finish<F>(&mut self, emit: &mut F)
+    where
+        F: FnMut(DcsChunk<'_>),
+    {
+        if let Some(body) = self.body.strip_prefix(b"$q") {
+            emit(DcsChunk::Decrqss(body));
+        } else if let Some(body) = self.body.strip_prefix(b"+q") {
+            emit(DcsChunk::Xtgettcap(body));
+        } else if let Some(body) = self.body.strip_prefix(b"+p") {
+            emit(DcsChunk::Xtsettcap(body));
+        } else {
+            emit(DcsChunk::Bytes(&self.raw));
+        }
+        self.body.clear();
+        self.raw.clear();
+        self.state = DcsState::Ground;
+    }
+}
 
 bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -70,6 +227,8 @@ bitflags! {
         const MOUSE_DRAG              = 1 << 13;
         const UTF8_MOUSE              = 1 << 14;
         const ALTERNATE_SCROLL        = 1 << 15;
+        /// DECSET 1016: report SGR mouse coordinates in physical pixels.
+        const SGR_PIXEL_MOUSE         = 1 << 16;
         const URGENCY_HINTS           = 1 << 17;
         const DISAMBIGUATE_ESC_CODES  = 1 << 18;
         const REPORT_EVENT_TYPES      = 1 << 19;
@@ -302,6 +461,9 @@ pub struct Term<T> {
     /// Current style of the cursor.
     cursor_style: Option<CursorStyle>,
 
+    /// Pointer shape requested with OSC 22; `None` until the application sets one.
+    mouse_cursor_icon: Option<CursorIcon>,
+
     /// Proxy for sending events to the event loop.
     event_proxy: T,
 
@@ -311,6 +473,9 @@ pub struct Term<T> {
     /// Stack of saved window titles. When a title is popped from this stack, the `title` for the
     /// term is set.
     title_stack: Vec<Option<String>>,
+
+    /// Working directory reported with OSC 7 by the local shell.
+    working_directory: Option<String>,
 
     /// The stack for the keyboard modes.
     keyboard_mode_stack: Vec<KeyboardModes>,
@@ -323,6 +488,30 @@ pub struct Term<T> {
 
     /// Config directly for the terminal.
     config: Config,
+
+    /// Fragment-safe DCS interception for requests upstream vte intentionally discards.
+    dcs_scanner: DcsScanner,
+
+    /// Grid scroll accumulated since the last delivery. See [`PendingGridScroll`].
+    pending_grid_scroll: Option<PendingGridScroll>,
+}
+
+/// A grid scroll awaiting delivery to the Vivid scene.
+///
+/// Scrolling text produces one scroll per line, and every delivery is a cross-thread wakeup that
+/// costs a run-loop syscall, so sending them individually dominates the parse loop. Merging
+/// consecutive scrolls that share a region and a direction is exactly equivalent to applying them
+/// one at a time: an anchor survives `n` single-line scrolls of `origin..end` precisely when it
+/// survives one `n`-line scroll of the same region.
+///
+/// Direction and region must both match to merge. An anchor scrolled out of a region is removed
+/// for good, so folding a later scroll back over it would revive an anchor that should be gone.
+#[derive(Debug, Clone, Copy)]
+struct PendingGridScroll {
+    origin: i32,
+    end: i32,
+    lines: i32,
+    history_size: usize,
 }
 
 /// A semantic terminal position carried through one grid resize/reflow.
@@ -420,13 +609,138 @@ impl<T> Term<T> {
             keyboard_mode_stack: Default::default(),
             active_charset: Default::default(),
             cursor_style: Default::default(),
+            mouse_cursor_icon: Default::default(),
             colors: color::Colors::default(),
             title_stack: Default::default(),
+            working_directory: Default::default(),
             is_focused: Default::default(),
             selection: Default::default(),
             title: Default::default(),
             mode: Default::default(),
+            dcs_scanner: Default::default(),
+            pending_grid_scroll: None,
         }
+    }
+
+    /// Accumulate a grid scroll instead of delivering it immediately.
+    ///
+    /// Merges into the pending scroll when that is equivalent, and otherwise delivers the pending
+    /// one first so scrolls reach the scene in order.
+    fn queue_grid_scroll(&mut self, origin: i32, end: i32, lines: i32, history_size: usize)
+    where
+        T: EventListener,
+    {
+        match &mut self.pending_grid_scroll {
+            Some(pending)
+                if pending.origin == origin
+                    && pending.end == end
+                    && pending.lines.signum() == lines.signum() =>
+            {
+                pending.lines = pending.lines.saturating_add(lines);
+                pending.history_size = history_size;
+            },
+            _ => {
+                self.flush_grid_scroll();
+                self.pending_grid_scroll =
+                    Some(PendingGridScroll { origin, end, lines, history_size });
+            },
+        }
+    }
+
+    /// Deliver the accumulated grid scroll.
+    ///
+    /// Must run at the end of every parsed chunk and before any other event that reads or places
+    /// anchors, so the scene never observes an anchor against a grid it has not been scrolled to.
+    fn flush_grid_scroll(&mut self)
+    where
+        T: EventListener,
+    {
+        if let Some(pending) = self.pending_grid_scroll.take() {
+            self.event_proxy.send_event(Event::VividGridScroll {
+                origin: pending.origin,
+                end: pending.end,
+                lines: pending.lines,
+                history_size: pending.history_size,
+            });
+        }
+    }
+
+    /// Advance terminal input while intercepting the bounded DCS queries that vte's ANSI adapter
+    /// otherwise discards before they reach [`Handler`].
+    pub fn advance(&mut self, processor: &mut ansi::Processor, bytes: &[u8])
+    where
+        T: EventListener,
+    {
+        // The scanner moves out of `self` so its borrowed spans can be handed straight to the
+        // parser, which needs `&mut self` for the same terminal.
+        let mut scanner = mem::take(&mut self.dcs_scanner);
+        scanner.push(bytes, &mut |chunk| match chunk {
+            DcsChunk::Bytes(bytes) => processor.advance(self, bytes),
+            DcsChunk::Decrqss(request) => self.report_status_string(request),
+            DcsChunk::Xtgettcap(request) => self.report_termcap(request),
+            DcsChunk::Xtsettcap(request) => {
+                // Parse and ignore. Applications cannot mutate the emulator's identity or
+                // capability set, and no payload is logged.
+                let _valid = request
+                    .split(|byte| *byte == b';')
+                    .all(|item| !item.is_empty() && decode_hex(item).is_some());
+            },
+        });
+        self.dcs_scanner = scanner;
+
+        self.flush_grid_scroll();
+    }
+
+    fn report_status_string(&self, request: &[u8])
+    where
+        T: EventListener,
+    {
+        let status = match request {
+            b"m" => sgr_status(&self.grid.cursor.template),
+            b"r" => format!("{};{}r", self.scroll_region.start.0 + 1, self.scroll_region.end.0),
+            b"\"p" => "61;1\"p".to_owned(),
+            b"\"q" => "0\"q".to_owned(),
+            _ => {
+                self.event_proxy.send_event(Event::PtyWrite("\x1bP0$r\x1b\\".to_owned()));
+                return;
+            },
+        };
+        self.event_proxy.send_event(Event::PtyWrite(format!("\x1bP1$r{status}\x1b\\")));
+    }
+
+    fn report_termcap(&self, request: &[u8])
+    where
+        T: EventListener,
+    {
+        let mut values = Vec::new();
+        for encoded_name in request.split(|byte| *byte == b';') {
+            let Some(name) = decode_hex(encoded_name) else { continue };
+            let value = match name.as_slice() {
+                b"TN" => Some(Some(b"xterm-vivido".as_slice())),
+                b"Co" => Some(Some(b"256".as_slice())),
+                b"RGB" => Some(Some(b"8".as_slice())),
+                b"Tc" => Some(None),
+                _ => None,
+            };
+            let Some(value) = value else { continue };
+            let mut entry = encoded_name.to_vec();
+            if let Some(value) = value {
+                entry.push(b'=');
+                entry.extend_from_slice(encode_hex(value).as_bytes());
+            }
+            values.push(entry);
+        }
+        let reply = if values.is_empty() {
+            "\x1bP0+r\x1b\\".to_owned()
+        } else {
+            let values = values
+                .iter()
+                .map(|value| String::from_utf8_lossy(value))
+                .collect::<Vec<_>>()
+                .join(";");
+            format!("\x1bP1+r{values}\x1b\\")
+        };
+        self.event_proxy.send_event(Event::PtyWrite(reply));
     }
 
     /// Collect the information about the changes in the lines, which
@@ -527,6 +841,12 @@ impl<T> Term<T> {
                 }
 
                 res += self.line_to_string(end.line, start.column..end.column, true).trim_end();
+            },
+            // A line selection is a whole logical line, so it carries the terminating newline
+            // that distinguishes it from a drag covering the same cells. `bounds_to_string`
+            // strips at most one, so exactly one survives.
+            Some(Selection { ty: SelectionType::Lines, .. }) => {
+                res = self.bounds_to_string(start, end) + "\n";
             },
             _ => {
                 res = self.bounds_to_string(start, end);
@@ -650,6 +970,13 @@ impl<T> Term<T> {
     /// Access to the raw grid data structure.
     pub fn grid(&self) -> &Grid<Cell> {
         &self.grid
+    }
+
+    /// Whether `column` is currently configured as a horizontal tab stop.
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+    #[inline]
+    pub(crate) fn is_tab_stop(&self, column: Column) -> bool {
+        self.tabs[column]
     }
 
     /// Mutable access to the raw grid data structure.
@@ -789,6 +1116,7 @@ impl<T> Term<T> {
         mem::swap(&mut self.grid, &mut self.inactive_grid);
         self.mode ^= TermMode::ALT_SCREEN;
         self.selection = None;
+        self.flush_grid_scroll();
         self.event_proxy.send_event(Event::VividScreenSwap {
             alternate: self.mode.contains(TermMode::ALT_SCREEN),
         });
@@ -818,12 +1146,8 @@ impl<T> Term<T> {
         // Scroll between origin and bottom
         self.grid.scroll_down(&region, lines);
         if lines > 0 {
-            self.event_proxy.send_event(Event::VividGridScroll {
-                origin: origin.0,
-                end: self.scroll_region.end.0,
-                lines: -(lines as i32),
-                history_size: self.history_size(),
-            });
+            let (end, history_size) = (self.scroll_region.end.0, self.history_size());
+            self.queue_grid_scroll(origin.0, end, -(lines as i32), history_size);
         }
         self.mark_fully_damaged();
     }
@@ -849,12 +1173,8 @@ impl<T> Term<T> {
         self.grid.scroll_up(&region, lines);
 
         if lines > 0 {
-            self.event_proxy.send_event(Event::VividGridScroll {
-                origin: origin.0,
-                end: self.scroll_region.end.0,
-                lines: lines as i32,
-                history_size: self.history_size(),
-            });
+            let (end, history_size) = (self.scroll_region.end.0, self.history_size());
+            self.queue_grid_scroll(origin.0, end, lines as i32, history_size);
         }
 
         self.mark_fully_damaged();
@@ -883,10 +1203,12 @@ impl<T> Term<T> {
 
     /// Attach an authenticated Vivid marker to the cursor position after all preceding PTY bytes
     /// have been interpreted.
-    pub(crate) fn vivid_marker(&self, marker: String)
+    pub(crate) fn vivid_marker(&mut self, marker: String)
     where
         T: EventListener,
     {
+        // An anchor is placed at a grid line, so it must not overtake a scroll of that grid.
+        self.flush_grid_scroll();
         let point = self.grid.cursor.point;
         self.event_proxy.send_event(Event::VividMarker {
             marker,
@@ -894,6 +1216,36 @@ impl<T> Term<T> {
             column: point.column.0,
             alternate: self.mode.contains(TermMode::ALT_SCREEN),
         });
+    }
+
+    /// Forward a parsed OSC desktop-notification request to the owning window.
+    pub(crate) fn desktop_notification(
+        &self,
+        notification: crate::osc_notification::OscNotification,
+    ) where
+        T: EventListener,
+    {
+        self.event_proxy.send_event(Event::DesktopNotification(notification));
+    }
+
+    /// Apply an OSC 7 working-directory report from the shell.
+    ///
+    /// Reports naming another host — a shell behind `vvssh` or plain `ssh` — are ignored so a
+    /// remote path never becomes a local spawn directory. The event fires only when the directory
+    /// changes, since shells re-emit OSC 7 at every prompt.
+    pub(crate) fn working_directory_report(&mut self, report: OscWorkingDirectory)
+    where
+        T: EventListener,
+    {
+        if !crate::daemon::is_local_host(&report.host) {
+            trace!("Ignoring OSC 7 for foreign host {:?}", report.host);
+            return;
+        }
+
+        if self.working_directory.as_deref() != Some(report.path.as_str()) {
+            self.working_directory = Some(report.path.clone());
+            self.event_proxy.send_event(Event::WorkingDirectory(report.path));
+        }
     }
 
     /// Forward a decoded graphics/media command to the UI renderer.
@@ -956,6 +1308,18 @@ impl<T> Term<T> {
     #[inline]
     pub fn cursor_style(&self) -> CursorStyle {
         self.cursor_style.unwrap_or(self.config.default_cursor_style)
+    }
+
+    /// Pointer shape requested with OSC 22, if the application set one.
+    #[inline]
+    pub fn mouse_cursor_icon(&self) -> Option<CursorIcon> {
+        self.mouse_cursor_icon
+    }
+
+    /// Working directory reported with OSC 7 by the local shell.
+    #[inline]
+    pub fn working_directory(&self) -> Option<&str> {
+        self.working_directory.as_deref()
     }
 
     pub fn colors(&self) -> &Colors {
@@ -1276,6 +1640,11 @@ impl<T: EventListener> Handler for Term<T> {
                 let text = format!("\x1b[>0;{version};1c");
                 self.event_proxy.send_event(Event::PtyWrite(text));
             },
+            Some('=') => {
+                trace!("Reporting tertiary device attributes");
+                let text = String::from("\x1bP!|00000000\x1b\\");
+                self.event_proxy.send_event(Event::PtyWrite(text));
+            },
             _ => debug!("Unsupported device attributes intermediate"),
         }
     }
@@ -1302,7 +1671,7 @@ impl<T: EventListener> Handler for Term<T> {
         trace!("Pushing `{mode:?}` keyboard mode into the stack");
 
         if self.keyboard_mode_stack.len() >= KEYBOARD_MODE_STACK_MAX_DEPTH {
-            let removed = self.title_stack.remove(0);
+            let removed = self.keyboard_mode_stack.remove(0);
             trace!(
                 "Removing '{removed:?}' from bottom of keyboard mode stack that exceeds its \
                  maximum depth"
@@ -1448,10 +1817,14 @@ impl<T: EventListener> Handler for Term<T> {
         self.event_proxy.send_event(Event::Bell);
     }
 
+    /// C0 SUB (0x1A) in ground state.
+    ///
+    /// Deliberately ignored, for parity with Alacritty and Kitty: xterm displays a
+    /// replacement glyph here, but the VT100 parity-error semantic vte documents ("substitute
+    /// char under cursor") is obsolete. vte's state machine still cancels any in-progress
+    /// escape sequence on SUB before this is reached.
     #[inline]
-    fn substitute(&mut self) {
-        trace!("[unimplemented] Substitute");
-    }
+    fn substitute(&mut self) {}
 
     /// Run LF/NL.
     ///
@@ -1821,6 +2194,7 @@ impl<T: EventListener> Handler for Term<T> {
         }
 
         if clears_vivid_scene {
+            self.flush_grid_scroll();
             self.event_proxy.send_event(Event::VividClear);
         }
 
@@ -1854,6 +2228,8 @@ impl<T: EventListener> Handler for Term<T> {
         self.tabs = TabStops::new(self.columns());
         self.title_stack = Vec::new();
         self.title = None;
+        self.working_directory = None;
+        self.mouse_cursor_icon = None;
         self.selection = None;
         self.keyboard_mode_stack = Default::default();
         self.inactive_keyboard_mode_stack = Default::default();
@@ -1861,6 +2237,9 @@ impl<T: EventListener> Handler for Term<T> {
         self.mode = TermMode::default();
 
         self.event_proxy.send_event(Event::CursorBlinkingChange);
+        // Resetting the modes above includes the mouse-reporting modes, so the pointer shape
+        // must be re-resolved alongside the cursor style.
+        self.event_proxy.send_event(Event::MouseCursorDirty);
         self.mark_fully_damaged();
     }
 
@@ -1941,6 +2320,10 @@ impl<T: EventListener> Handler for Term<T> {
     fn set_private_mode(&mut self, mode: PrivateMode) {
         let mode = match mode {
             PrivateMode::Named(mode) => mode,
+            PrivateMode::Unknown(1016) => {
+                self.mode.insert(TermMode::SGR_PIXEL_MOUSE);
+                return;
+            },
             PrivateMode::Unknown(mode) => {
                 debug!("Ignoring unknown mode {mode} in set_private_mode");
                 return;
@@ -2004,6 +2387,10 @@ impl<T: EventListener> Handler for Term<T> {
     fn unset_private_mode(&mut self, mode: PrivateMode) {
         let mode = match mode {
             PrivateMode::Named(mode) => mode,
+            PrivateMode::Unknown(1016) => {
+                self.mode.remove(TermMode::SGR_PIXEL_MOUSE);
+                return;
+            },
             PrivateMode::Unknown(mode) => {
                 debug!("Ignoring unknown mode {mode} in unset_private_mode");
                 return;
@@ -2091,6 +2478,7 @@ impl<T: EventListener> Handler for Term<T> {
                 NamedPrivateMode::SyncUpdate => ModeState::Reset,
                 NamedPrivateMode::ColumnMode => ModeState::NotSupported,
             },
+            PrivateMode::Unknown(1016) => self.mode.contains(TermMode::SGR_PIXEL_MOUSE).into(),
             PrivateMode::Unknown(_) => ModeState::NotSupported,
         };
 
@@ -2238,6 +2626,17 @@ impl<T: EventListener> Handler for Term<T> {
         self.event_proxy.send_event(title_event);
     }
 
+    /// OSC 22: pointer shape requested by the application.
+    #[inline]
+    fn set_mouse_cursor_icon(&mut self, icon: CursorIcon) {
+        trace!("Setting mouse cursor icon {icon:?}");
+
+        self.mouse_cursor_icon = Some(icon);
+
+        // The pointer shape depends on this state, so the UI must re-resolve it.
+        self.event_proxy.send_event(Event::MouseCursorDirty);
+    }
+
     #[inline]
     fn push_title(&mut self) {
         trace!("Pushing '{:?}' onto title stack", self.title);
@@ -2315,6 +2714,91 @@ fn version_number(mut version: &str) -> usize {
     }
 
     version_number
+}
+
+fn decode_hex(value: &[u8]) -> Option<Vec<u8>> {
+    if !value.len().is_multiple_of(2) {
+        return None;
+    }
+    value
+        .chunks_exact(2)
+        .map(|pair| {
+            let high = (pair[0] as char).to_digit(16)?;
+            let low = (pair[1] as char).to_digit(16)?;
+            Some(((high << 4) | low) as u8)
+        })
+        .collect()
+}
+
+fn encode_hex(value: &[u8]) -> String {
+    use std::fmt::Write;
+
+    let mut encoded = String::with_capacity(value.len() * 2);
+    for byte in value {
+        write!(encoded, "{byte:02x}").unwrap();
+    }
+    encoded
+}
+
+fn sgr_status(cell: &Cell) -> String {
+    let mut params = Vec::new();
+    if cell.flags.contains(Flags::BOLD) {
+        params.push("1".to_owned());
+    }
+    if cell.flags.contains(Flags::DIM) {
+        params.push("2".to_owned());
+    }
+    if cell.flags.contains(Flags::ITALIC) {
+        params.push("3".to_owned());
+    }
+    for (flag, value) in [
+        (Flags::UNDERLINE, "4"),
+        (Flags::DOUBLE_UNDERLINE, "4:2"),
+        (Flags::UNDERCURL, "4:3"),
+        (Flags::DOTTED_UNDERLINE, "4:4"),
+        (Flags::DASHED_UNDERLINE, "4:5"),
+    ] {
+        if cell.flags.contains(flag) {
+            params.push(value.to_owned());
+            break;
+        }
+    }
+    if cell.flags.contains(Flags::INVERSE) {
+        params.push("7".to_owned());
+    }
+    if cell.flags.contains(Flags::HIDDEN) {
+        params.push("8".to_owned());
+    }
+    if cell.flags.contains(Flags::STRIKEOUT) {
+        params.push("9".to_owned());
+    }
+    push_sgr_color(&mut params, cell.fg, true);
+    push_sgr_color(&mut params, cell.bg, false);
+    if params.is_empty() {
+        params.push("0".to_owned());
+    }
+    format!("{}m", params.join(";"))
+}
+
+fn push_sgr_color(params: &mut Vec<String>, color: Color, foreground: bool) {
+    let base = if foreground { 30_u8 } else { 40_u8 };
+    match color {
+        Color::Named(named) if (named as usize) < 8 => {
+            params.push((base + named as u8).to_string());
+        },
+        Color::Named(named) if (named as usize) < 16 => {
+            params.push((base + 60 + named as u8 - 8).to_string());
+        },
+        Color::Named(_) => {},
+        Color::Indexed(index @ 0..=7) => params.push((base + index).to_string()),
+        Color::Indexed(index @ 8..=15) => params.push((base + 60 + index - 8).to_string()),
+        Color::Indexed(index) => {
+            params.push(format!("{};5;{index}", if foreground { 38 } else { 48 }));
+        },
+        Color::Spec(Rgb { r, g, b }) => {
+            params.push(format!("{};2;{r};{g};{b}", if foreground { 38 } else { 48 }))
+        },
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2460,7 +2944,7 @@ pub mod test {
     /// # Examples
     ///
     /// ```rust
-    /// use crate::terminal::term::test::mock_term;
+    /// use vivido::terminal::term::test::mock_term;
     ///
     /// // Create a terminal with the following cells:
     /// //
@@ -2514,8 +2998,8 @@ pub mod test {
 mod tests {
     use super::*;
 
-    #[cfg(windows)]
     use std::sync::Arc;
+    use std::sync::Mutex;
     #[cfg(windows)]
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -2524,7 +3008,7 @@ mod tests {
     use crate::terminal::grid::Grid;
     use crate::terminal::grid::Scroll;
     use crate::terminal::index::{Column, Point, Side};
-    use crate::terminal::selection::{Selection, SelectionType};
+    use crate::terminal::selection::{Selection, SelectionRange, SelectionType};
     #[cfg(feature = "serde")]
     use crate::terminal::term::cell::Cell;
     use crate::terminal::term::cell::Flags;
@@ -2585,6 +3069,125 @@ mod tests {
         parser.advance(&mut term, b"\x1b[3J\x1b[H");
 
         assert_eq!(clear_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[derive(Clone, Default)]
+    struct VividSceneListener(Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl EventListener for VividSceneListener {
+        fn send_event(&self, event: Event) {
+            let recorded = match event {
+                Event::VividGridScroll { origin, end, lines, .. } => {
+                    format!("scroll({origin}..{end}, {lines})")
+                },
+                Event::VividMarker { marker, .. } => format!("marker({marker})"),
+                Event::VividClear => "clear".to_owned(),
+                Event::VividScreenSwap { alternate } => format!("swap({alternate})"),
+                _ => return,
+            };
+            self.0.lock().unwrap().push(recorded);
+        }
+    }
+
+    fn scene_term(lines: u16) -> (Term<VividSceneListener>, Arc<std::sync::Mutex<Vec<String>>>) {
+        let size = TermSize::new(10, usize::from(lines));
+        let listener = VividSceneListener::default();
+        let events = listener.0.clone();
+        (Term::new(Config::default(), &size, listener), events)
+    }
+
+    #[test]
+    fn scrolls_sharing_a_region_and_direction_are_delivered_once() {
+        let (mut term, events) = scene_term(3);
+        let mut parser: ansi::Processor = ansi::Processor::new();
+
+        // Two linefeeds reach the last line, the next three each scroll one line.
+        term.advance(&mut parser, b"\n\n\n\n\n");
+
+        assert_eq!(*events.lock().unwrap(), ["scroll(0..3, 3)"]);
+    }
+
+    #[test]
+    fn a_reversed_scroll_is_not_folded_into_the_pending_one() {
+        let (mut term, events) = scene_term(6);
+        let mut parser: ansi::Processor = ansi::Processor::new();
+
+        // An anchor scrolled out of a region stays gone, so scrolling back must be its own event.
+        term.advance(&mut parser, b"\x1b[2S\x1b[1T\x1b[1S");
+
+        assert_eq!(
+            *events.lock().unwrap(),
+            ["scroll(0..6, 2)", "scroll(0..6, -1)", "scroll(0..6, 1)"]
+        );
+    }
+
+    #[test]
+    fn scrolls_of_different_regions_are_not_folded_together() {
+        let (mut term, events) = scene_term(6);
+        let mut parser: ansi::Processor = ansi::Processor::new();
+
+        // `delete_lines` scrolls from the cursor, so each origin is a distinct region.
+        term.advance(&mut parser, b"\x1b[3;1H\x1b[1M\x1b[2;1H\x1b[1M");
+
+        assert_eq!(*events.lock().unwrap(), ["scroll(2..6, 1)", "scroll(1..6, 1)"]);
+    }
+
+    #[test]
+    fn a_pending_scroll_is_delivered_before_the_anchor_it_moves() {
+        let (mut term, events) = scene_term(3);
+        let mut parser: ansi::Processor = ansi::Processor::new();
+
+        // Drive the handler without `Term::advance`, so only the ordering rule can flush.
+        parser.advance(&mut term, b"\n\n\n\n\n");
+        term.vivid_marker("anchor".into());
+
+        assert_eq!(*events.lock().unwrap(), ["scroll(0..3, 3)", "marker(anchor)"]);
+    }
+
+    #[test]
+    fn a_pending_scroll_is_delivered_before_the_scene_is_cleared() {
+        let (mut term, events) = scene_term(3);
+        let mut parser: ansi::Processor = ansi::Processor::new();
+
+        parser.advance(&mut term, b"\n\n\n\n\n\x1b[2J");
+
+        assert_eq!(*events.lock().unwrap(), ["scroll(0..3, 3)", "clear"]);
+    }
+
+    #[test]
+    fn a_pending_scroll_is_delivered_before_the_screen_is_swapped() {
+        let (mut term, events) = scene_term(3);
+        let mut parser: ansi::Processor = ansi::Processor::new();
+
+        parser.advance(&mut term, b"\n\n\n\n\n\x1b[?1049h");
+
+        assert_eq!(*events.lock().unwrap(), ["scroll(0..3, 3)", "swap(true)"]);
+    }
+
+    #[test]
+    fn sgr_undercurl_is_distinct_and_cancellable() {
+        let size = TermSize::new(5, 1);
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+        let mut parser: ansi::Processor = ansi::Processor::new();
+
+        parser.advance(
+            &mut term,
+            b"\x1b[4:3;58:2::255:0:0mA\x1b[4mB\x1b[4:3mC\x1b[4:0mD\x1b[4:3m\x1b[24mE",
+        );
+
+        let cells = &term.grid()[Line(0)];
+        assert!(cells[Column(0)].flags.contains(Flags::UNDERCURL));
+        assert!(!cells[Column(0)].flags.contains(Flags::UNDERLINE));
+        assert_eq!(
+            cells[Column(0)].underline_color(),
+            Some(ansi::Color::Spec(ansi::Rgb { r: 255, g: 0, b: 0 }))
+        );
+
+        assert!(cells[Column(1)].flags.contains(Flags::UNDERLINE));
+        assert!(!cells[Column(1)].flags.contains(Flags::UNDERCURL));
+        assert!(cells[Column(2)].flags.contains(Flags::UNDERCURL));
+        assert!(!cells[Column(3)].flags.intersects(Flags::ALL_UNDERLINES));
+        assert!(!cells[Column(4)].flags.intersects(Flags::ALL_UNDERLINES));
     }
 
     #[test]
@@ -2744,6 +3347,32 @@ mod tests {
     }
 
     #[test]
+    fn line_selection_joins_wrapped_rows_and_terminates_with_a_newline() {
+        // `mock_term` treats "\n" as a soft wrap, so this is one logical line across two rows.
+        let mut wrapped = mock_term("abc\ndef");
+        wrapped.selection =
+            Some(Selection::new(SelectionType::Lines, Point::new(Line(1), Column(1)), Side::Left));
+        assert_eq!(wrapped.selection_to_string().as_deref(), Some("abcdef\n"));
+    }
+
+    #[test]
+    fn line_selection_stops_at_a_hard_line_break() {
+        let mut hard_break = mock_term("abc\r\ndef");
+        hard_break.selection =
+            Some(Selection::new(SelectionType::Lines, Point::new(Line(1), Column(1)), Side::Left));
+        assert_eq!(hard_break.selection_to_string().as_deref(), Some("def\n"));
+    }
+
+    #[test]
+    fn line_selection_ignores_the_anchor_side_and_column() {
+        // Anchoring on the far edge with the opposite side must select the same line.
+        let mut term = mock_term("abc\r\ndef");
+        term.selection =
+            Some(Selection::new(SelectionType::Lines, Point::new(Line(0), Column(2)), Side::Right));
+        assert_eq!(term.selection_to_string().as_deref(), Some("abc\n"));
+    }
+
+    #[test]
     fn semantic_selection_keeps_wide_characters_intact() {
         let mut term = mock_term("foo🦇bar baz");
         term.selection = Some(Selection::new(
@@ -2796,6 +3425,190 @@ mod tests {
             s.update(Point { line: Line(3), column: Column(4) }, Side::Right);
         }
         assert_eq!(term.selection_to_string(), Some(String::from("\na\"\na\"\na")));
+    }
+
+    /// A selection is grid coordinates, not cell content: rewriting the selected cells — the
+    /// identical rewrite a TUI full redraw performs, and even a rewrite with different values —
+    /// must never clear or move it. This locks the WezTerm #7984 bug class out of vivido.
+    #[test]
+    fn selection_survives_rewrite_of_selected_cells() {
+        let size = TermSize::new(20, 5);
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+        {
+            let grid = term.grid_mut();
+            for (i, text) in ["htop redraw", "cpu 42%", "mem 13%"].iter().enumerate() {
+                for (j, c) in text.chars().enumerate() {
+                    grid[Line(i as i32)][Column(j)].c = c;
+                }
+            }
+        }
+        term.selection = Some(Selection::new(
+            SelectionType::Simple,
+            Point { line: Line(1), column: Column(0) },
+            Side::Left,
+        ));
+        if let Some(s) = term.selection.as_mut() {
+            s.update(Point { line: Line(1), column: Column(6) }, Side::Right);
+        }
+        // An identical redraw of the selected cells keeps both the selection and its text.
+        {
+            let grid = term.grid_mut();
+            for (j, c) in "cpu 42%".chars().enumerate() {
+                grid[Line(1)][Column(j)].c = c;
+            }
+        }
+        assert_eq!(term.selection_to_string().as_deref(), Some("cpu 42%"));
+        assert_eq!(
+            term.selection.as_ref().and_then(|s| s.to_range(&term)),
+            Some(SelectionRange {
+                start: Point { line: Line(1), column: Column(0) },
+                end: Point { line: Line(1), column: Column(6) },
+                is_block: false,
+            })
+        );
+
+        // Even a redraw that changes the selected values keeps the selection on the same
+        // coordinates; the extracted text tracks the new content, the range does not move.
+        {
+            let grid = term.grid_mut();
+            for (j, c) in "cpu 99%".chars().enumerate() {
+                grid[Line(1)][Column(j)].c = c;
+            }
+            grid[Line(4)][Column(0)].c = 'x';
+        }
+        assert_eq!(term.selection_to_string().as_deref(), Some("cpu 99%"));
+        assert_eq!(
+            term.selection.as_ref().and_then(|s| s.to_range(&term)),
+            Some(SelectionRange {
+                start: Point { line: Line(1), column: Column(0) },
+                end: Point { line: Line(1), column: Column(6) },
+                is_block: false,
+            })
+        );
+    }
+
+    /// The intentional clears must stay intentional: swapping to the alternate screen, clearing
+    /// the whole screen, erasing the selected line, a full reset, and a column-changing resize
+    /// all drop the selection — while clears that miss the selection keep it.
+    #[test]
+    fn selection_clears_only_on_intentional_operations() {
+        let select = |term: &mut Term<VoidListener>, line: i32| {
+            term.selection = Some(Selection::new(
+                SelectionType::Simple,
+                Point { line: Line(line), column: Column(0) },
+                Side::Left,
+            ));
+            if let Some(s) = term.selection.as_mut() {
+                s.update(Point { line: Line(line), column: Column(3) }, Side::Right);
+            }
+        };
+
+        // Alt-screen swap clears.
+        let size = TermSize::new(20, 5);
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+        select(&mut term, 1);
+        term.swap_alt();
+        assert!(term.selection.is_none());
+
+        // Erasing the whole screen clears; erasing above a selection below the cursor keeps it.
+        select(&mut term, 3);
+        term.clear_screen(ansi::ClearMode::All);
+        assert!(term.selection.is_none());
+        select(&mut term, 3);
+        term.clear_screen(ansi::ClearMode::Above);
+        assert!(term.selection.is_some());
+
+        // Erasing the cursor's line clears only a selection on that line.
+        term.clear_line(ansi::LineClearMode::All);
+        assert!(term.selection.is_some(), "EL on line 0 must keep a line-3 selection");
+        select(&mut term, 0);
+        term.clear_line(ansi::LineClearMode::All);
+        assert!(term.selection.is_none());
+
+        // A full reset clears.
+        select(&mut term, 2);
+        term.reset_state();
+        assert!(term.selection.is_none());
+
+        // A column-changing resize clears; a rows-only resize keeps (rotates) the selection.
+        select(&mut term, 2);
+        term.resize(TermSize::new(10, 5));
+        assert!(term.selection.is_none());
+        select(&mut term, 2);
+        term.resize(TermSize::new(10, 7));
+        assert!(term.selection.is_some());
+    }
+
+    /// Content scrolling rotates the selection with the text instead of clearing it: the
+    /// selected text stays selected as lines move up, including when it recedes into scrollback.
+    #[test]
+    fn selection_rotates_with_content_scroll() {
+        let size = TermSize::new(20, 5);
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+        let mut parser: ansi::Processor = ansi::Processor::new();
+        parser.advance(&mut term, b"alpha\r\nbravo\r\ncharlie\r\ndelta\r\necho");
+
+        term.selection = Some(Selection::new(
+            SelectionType::Simple,
+            Point { line: Line(2), column: Column(0) },
+            Side::Left,
+        ));
+        if let Some(s) = term.selection.as_mut() {
+            s.update(Point { line: Line(3), column: Column(4) }, Side::Right);
+        }
+        let selected = term.selection_to_string();
+        assert_eq!(selected.as_deref(), Some("charlie\ndelta"));
+
+        // Newline at the bottom scrolls the grid up by one; the selection must follow the text.
+        term.newline();
+        assert_eq!(term.selection_to_string(), selected);
+        assert_eq!(
+            term.selection.as_ref().and_then(|s| s.to_range(&term)),
+            Some(SelectionRange {
+                start: Point { line: Line(1), column: Column(0) },
+                end: Point { line: Line(2), column: Column(4) },
+                is_block: false,
+            })
+        );
+
+        // Keep scrolling: the selected text recedes into scrollback but stays selected.
+        for _ in 0..3 {
+            term.newline();
+            assert_eq!(term.selection_to_string(), selected);
+        }
+        assert!(term.selection.is_some());
+    }
+
+    /// Display-offset scrolling is a pure viewport change: it must not move or clear a
+    /// selection anchored in grid coordinates.
+    #[test]
+    fn selection_ignores_display_offset_scroll() {
+        let size = TermSize::new(20, 5);
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+        let mut parser: ansi::Processor = ansi::Processor::new();
+        parser.advance(&mut term, b"alpha\r\nbravo\r\ncharlie\r\ndelta\r\necho");
+        for _ in 0..10 {
+            term.newline();
+        }
+
+        term.selection = Some(Selection::new(
+            SelectionType::Simple,
+            Point { line: Line(1), column: Column(0) },
+            Side::Left,
+        ));
+        if let Some(s) = term.selection.as_mut() {
+            s.update(Point { line: Line(1), column: Column(5) }, Side::Right);
+        }
+        let before = term.selection.as_ref().and_then(|s| s.to_range(&term));
+
+        term.scroll_display(Scroll::PageUp);
+        assert_eq!(term.grid.display_offset(), 5);
+        assert_eq!(term.selection.as_ref().and_then(|s| s.to_range(&term)), before);
+
+        term.scroll_display(Scroll::Delta(2));
+        assert_eq!(term.grid.display_offset(), 7);
+        assert_eq!(term.selection.as_ref().and_then(|s| s.to_range(&term)), before);
+        assert!(term.selection.is_some());
     }
 
     /// Check that the grid can be serialized back and forth losslessly.
@@ -2931,6 +3744,18 @@ mod tests {
 
         assert_eq!(term.history_size(), 0);
         assert_eq!(term.grid.cursor.point, Point::new(Line(19), Column(0)));
+    }
+
+    #[test]
+    fn decset_1016_toggles_sgr_pixel_mouse_mode() {
+        let size = TermSize::new(80, 24);
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+
+        term.set_private_mode(PrivateMode::Unknown(1016));
+        assert!(term.mode().contains(TermMode::SGR_PIXEL_MOUSE));
+
+        term.unset_private_mode(PrivateMode::Unknown(1016));
+        assert!(!term.mode().contains(TermMode::SGR_PIXEL_MOUSE));
     }
 
     #[test]
@@ -3320,6 +4145,62 @@ mod tests {
         assert!(term.damage.full);
     }
 
+    #[derive(Clone, Default)]
+    struct DirectoryListener(Arc<Mutex<Vec<String>>>);
+
+    impl EventListener for DirectoryListener {
+        fn send_event(&self, event: Event) {
+            let Event::WorkingDirectory(directory) = event else { return };
+            self.0.lock().unwrap().push(directory);
+        }
+    }
+
+    fn directory_report(host: &str, path: &str) -> OscWorkingDirectory {
+        OscWorkingDirectory { host: host.to_owned(), path: path.to_owned() }
+    }
+
+    #[test]
+    fn osc7_working_directory() {
+        let size = TermSize::new(7, 17);
+        let listener = DirectoryListener::default();
+        let directories = listener.0.clone();
+        let mut term = Term::new(Config::default(), &size, listener);
+
+        // Any local host form is accepted.
+        term.working_directory_report(directory_report("", "/tmp"));
+        term.working_directory_report(directory_report("LoCaLhOsT", "/var"));
+        // Shells re-emit OSC 7 at every prompt; only a change notifies.
+        term.working_directory_report(directory_report("", "/var"));
+        // A report naming another host — a shell behind vvssh — never applies.
+        term.working_directory_report(directory_report("-foreign-", "/remote"));
+
+        assert_eq!(term.working_directory(), Some("/var"));
+        assert_eq!(*directories.lock().unwrap(), vec!["/tmp".to_owned(), "/var".to_owned()]);
+
+        // The report is forgotten when the terminal state is reset.
+        term.reset_state();
+        assert_eq!(term.working_directory(), None);
+    }
+
+    #[test]
+    fn osc22_mouse_cursor_icon() {
+        let size = TermSize::new(7, 17);
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+        let mut parser: ansi::Processor = ansi::Processor::new();
+
+        assert_eq!(term.mouse_cursor_icon(), None);
+
+        parser.advance(&mut term, b"\x1b]22;progress\x07");
+        assert_eq!(term.mouse_cursor_icon(), Some(CursorIcon::Progress));
+
+        parser.advance(&mut term, b"\x1b]22;text\x07");
+        assert_eq!(term.mouse_cursor_icon(), Some(CursorIcon::Text));
+
+        // The requested shape is forgotten when the terminal state is reset.
+        term.reset_state();
+        assert_eq!(term.mouse_cursor_icon(), None);
+    }
+
     #[test]
     fn window_title() {
         let size = TermSize::new(7, 17);
@@ -3369,11 +4250,198 @@ mod tests {
     }
 
     #[test]
+    fn keyboard_mode_stack_bounded() {
+        let size = TermSize::new(7, 17);
+        let config = Config { kitty_keyboard: true, ..Config::default() };
+        let mut term = Term::new(config, &size, VoidListener);
+
+        // Keyboard mode stack doesn't grow infinitely and trims the correct stack.
+        for _ in 0..KEYBOARD_MODE_STACK_MAX_DEPTH + 1 {
+            term.push_keyboard_mode(KeyboardModes::DISAMBIGUATE_ESC_CODES);
+        }
+        assert_eq!(term.keyboard_mode_stack.len(), KEYBOARD_MODE_STACK_MAX_DEPTH);
+        assert!(term.title_stack.is_empty());
+
+        // Modes can still be popped after trimming.
+        term.pop_keyboard_modes(u16::MAX);
+        assert!(term.keyboard_mode_stack.is_empty());
+    }
+
+    #[test]
     fn parse_cargo_version() {
-        assert_eq!(version_number(env!("CARGO_PKG_VERSION")), 2_01);
+        assert_eq!(version_number(env!("CARGO_PKG_VERSION")), 4_05);
         assert_eq!(version_number("0.0.1-dev"), 1);
         assert_eq!(version_number("0.1.2-dev"), 1_02);
         assert_eq!(version_number("1.2.3-dev"), 1_02_03);
         assert_eq!(version_number("999.99.99"), 9_99_99_99);
+    }
+
+    #[derive(Clone, Default)]
+    struct PtyWriteListener(Arc<Mutex<Vec<String>>>);
+
+    impl EventListener for PtyWriteListener {
+        fn send_event(&self, event: Event) {
+            if let Event::PtyWrite(text) = event {
+                self.0.lock().unwrap().push(text);
+            }
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct ClipboardStoreListener(Arc<Mutex<Vec<(ClipboardType, String)>>>);
+
+    impl EventListener for ClipboardStoreListener {
+        fn send_event(&self, event: Event) {
+            if let Event::ClipboardStore(ty, text) = event {
+                self.0.lock().unwrap().push((ty, text));
+            }
+        }
+    }
+
+    #[test]
+    fn osc52_store_obeys_copy_policy() {
+        for (osc52, expected) in [
+            (Osc52::OnlyCopy, true),
+            (Osc52::CopyPaste, true),
+            (Osc52::Disabled, false),
+            (Osc52::OnlyPaste, false),
+        ] {
+            let size = TermSize::new(25, 80);
+            let listener = ClipboardStoreListener::default();
+            let stores = listener.0.clone();
+            let config = Config { osc52, ..Config::default() };
+            let mut term = Term::new(config, &size, listener);
+            let mut parser: ansi::Processor = ansi::Processor::new();
+
+            parser.advance(&mut term, b"\x1b]52;c;aMOpbGxvIPCfpoA=\x1b\\");
+
+            let stores = stores.lock().unwrap();
+            assert_eq!(!stores.is_empty(), expected, "policy={osc52:?}");
+            if expected {
+                assert_eq!(stores.as_slice(), &[(ClipboardType::Clipboard, "héllo 🦀".to_owned())]);
+            }
+        }
+    }
+
+    #[test]
+    fn tertiary_device_attributes_reply() {
+        let size = TermSize::new(25, 80);
+        let listener = PtyWriteListener::default();
+        let replies = listener.0.clone();
+        let mut term = Term::new(Config::default(), &size, listener);
+        let mut parser: ansi::Processor = ansi::Processor::new();
+
+        parser.advance(&mut term, b"\x1b[=c");
+
+        assert_eq!(*replies.lock().unwrap(), vec!["\x1bP!|00000000\x1b\\".to_owned()]);
+    }
+
+    #[test]
+    fn decrqss_reports_sgr_scroll_region_and_refuses_unknown_requests() {
+        let size = TermSize::new(10, 20);
+        let listener = PtyWriteListener::default();
+        let replies = listener.0.clone();
+        let mut term = Term::new(Config::default(), &size, listener);
+        let mut parser: ansi::Processor = ansi::Processor::new();
+
+        term.advance(&mut parser, b"\x1b[1;31m\x1b[3;7r");
+        term.advance(&mut parser, b"\x1bP$qm\x1b\\");
+        term.advance(&mut parser, b"\x1bP$qr\x1b\\");
+        term.advance(&mut parser, b"\x1bP$qz\x1b\\");
+
+        assert_eq!(
+            *replies.lock().unwrap(),
+            vec![
+                "\x1bP1$r1;31m\x1b\\".to_owned(),
+                "\x1bP1$r3;7r\x1b\\".to_owned(),
+                "\x1bP0$r\x1b\\".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn xtgettcap_is_fragment_safe_bounded_and_reports_honest_capabilities() {
+        let size = TermSize::new(10, 20);
+        let listener = PtyWriteListener::default();
+        let replies = listener.0.clone();
+        let mut term = Term::new(Config::default(), &size, listener);
+        let mut parser: ansi::Processor = ansi::Processor::new();
+
+        term.advance(&mut parser, b"\x1bP+q544e;524");
+        assert!(replies.lock().unwrap().is_empty());
+        term.advance(&mut parser, b"742;5463;756e6b6e6f776e\x1b\\");
+        term.advance(&mut parser, b"\x1bP+q756e6b6e6f776e\x1b\\");
+        term.advance(&mut parser, b"\x1bP+p544e=6576696c\x1b\\");
+
+        let mut oversized = b"\x1bP+q".to_vec();
+        oversized.extend(std::iter::repeat_n(b'a', DCS_MAX_BYTES + 1));
+        oversized.extend_from_slice(b"\x1b\\");
+        term.advance(&mut parser, &oversized);
+
+        assert_eq!(
+            *replies.lock().unwrap(),
+            vec![
+                "\x1bP1+r544e=787465726d2d76697669646f;524742=38;5463\x1b\\".to_owned(),
+                "\x1bP0+r\x1b\\".to_owned(),
+            ]
+        );
+    }
+
+    /// The DCS scanner forwards ground-state runs in bulk instead of one byte at a time, so the
+    /// bytes handed to the parser must not depend on where a PTY read happened to end.
+    #[test]
+    fn dcs_scanning_is_independent_of_read_boundaries() {
+        const INPUT: &[u8] =
+            b"ab\x1b[31mcd\x1bP$qm\x1b\\ef\x1b_VIVID\x1b\\gh\x1bPnope\x1b\\ij\x1b[0mkl";
+
+        fn feed(cuts: &[usize]) -> String {
+            let size = TermSize::new(40, 10);
+            let mut term = Term::new(Config::default(), &size, VoidListener);
+            let mut parser: ansi::Processor = ansi::Processor::new();
+            let mut start = 0;
+            for &cut in cuts {
+                term.advance(&mut parser, &INPUT[start..cut]);
+                start = cut;
+            }
+            let row: String =
+                (0..term.columns()).map(|column| term.grid()[Line(0)][Column(column)].c).collect();
+            row.trim_end().to_owned()
+        }
+
+        let whole = feed(&[INPUT.len()]);
+        assert_eq!(whole, "abcdefghijkl");
+
+        for split in 1..INPUT.len() {
+            assert_eq!(feed(&[split, INPUT.len()]), whole, "read split after {split} bytes");
+        }
+
+        // One byte at a time is the worst case for any buffered scanner state.
+        let single: Vec<usize> = (1..=INPUT.len()).collect();
+        assert_eq!(feed(&single), whole);
+    }
+
+    /// Producers that draw into their own pixels ask whether mode 1016 took effect before they map
+    /// mouse reports, and the reply is the only answer available to a producer running over a
+    /// forwarded session, where no per-window environment reaches the remote shell.
+    #[test]
+    fn sgr_pixel_mouse_mode_is_reported() {
+        let size = TermSize::new(25, 80);
+        let listener = PtyWriteListener::default();
+        let replies = listener.0.clone();
+        let mut term = Term::new(Config::default(), &size, listener);
+        let mut parser: ansi::Processor = ansi::Processor::new();
+
+        parser.advance(&mut term, b"\x1b[?1016$p");
+        parser.advance(&mut term, b"\x1b[?1016h\x1b[?1016$p");
+        parser.advance(&mut term, b"\x1b[?1016l\x1b[?1016$p");
+
+        assert_eq!(
+            *replies.lock().unwrap(),
+            vec![
+                "\x1b[?1016;2$y".to_owned(),
+                "\x1b[?1016;1$y".to_owned(),
+                "\x1b[?1016;2$y".to_owned(),
+            ]
+        );
     }
 }

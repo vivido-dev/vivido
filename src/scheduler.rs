@@ -3,10 +3,9 @@
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
-use winit::event_loop::EventLoopProxy;
 use winit::window::WindowId;
 
-use crate::event::Event;
+use crate::event::{Event, EventSink};
 
 /// ID uniquely identifying a timer.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -29,9 +28,12 @@ pub enum Topic {
     BlinkCursor,
     BlinkTimeout,
     Frame,
-    #[cfg(unix)]
+    RendererRecovery,
+    VividResizeSettled,
+    MessageTimeout,
+    #[cfg(any(unix, windows))]
     ScreenshotReadback,
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     Automation,
 }
 
@@ -47,11 +49,11 @@ pub struct Timer {
 /// Scheduler tracking all pending timers.
 pub struct Scheduler {
     timers: VecDeque<Timer>,
-    event_proxy: EventLoopProxy<Event>,
+    event_proxy: EventSink,
 }
 
 impl Scheduler {
-    pub fn new(event_proxy: EventLoopProxy<Event>) -> Self {
+    pub fn new(event_proxy: EventSink) -> Self {
         Self { timers: VecDeque::new(), event_proxy }
     }
 

@@ -25,6 +25,16 @@ set of features with high performance.
 
 	Do not spawn an initial window.
 
+*--accessory*
+
+	macOS only. Run without a Dock icon or menu bar, and never activate over the
+	frontmost application. This is the shape for an instance whose windows are
+	panes of another application.
+
+*--no-activate*
+
+	Map the window without taking keyboard focus from the active application.
+
 *--print-events*
 
 	Print all events to STDOUT.
@@ -76,6 +86,8 @@ set of features with high performance.
 
 	On Windows, the config file will be looked for in:
 
+		. _%USERPROFILE%\\.config\\vivido\\vivido.toml_
+		. _%USERPROFILE%\\vivido\\vivido.toml_
 		. _%APPDATA%\\vivido\\vivido.toml_
 
 *-o, --option* _<OPTION>..._

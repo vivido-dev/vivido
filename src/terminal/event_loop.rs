@@ -5,19 +5,22 @@ use std::collections::VecDeque;
 use std::fmt::{self, Display, Formatter};
 use std::fs::File;
 use std::io::{self, ErrorKind, Read, Write};
+use std::mem;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use std::sync::Mutex;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread::JoinHandle;
 use std::time::Instant;
 
 use log::error;
+use memchr::memmem;
 use polling::{Event as PollingEvent, Events, PollMode, Poller};
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use crate::automation::Transcript;
+use crate::osc_notification::{OscMessage, OscNotificationParser};
 use crate::terminal::event::{self, Event, EventListener, WindowSize};
 use crate::terminal::sync::FairMutex;
 use crate::terminal::term::Term;
@@ -34,13 +37,21 @@ const MAX_LOCKED_READ: usize = u16::MAX as usize;
 #[derive(Debug)]
 pub enum Msg {
     /// Data that should be written to the PTY.
-    Input { bytes: Cow<'static, [u8]>, completion: Option<u64> },
+    Input {
+        bytes: Cow<'static, [u8]>,
+        #[cfg(any(unix, windows))]
+        completion: Option<u64>,
+    },
 
     /// Indicates that the `EventLoop` should shut down, as Vivido is shutting down.
     Shutdown,
 
     /// Instruction to resize the PTY.
-    Resize { window_size: WindowSize, completion: Option<u64> },
+    Resize {
+        window_size: WindowSize,
+        #[cfg(any(unix, windows))]
+        completion: Option<u64>,
+    },
 }
 
 /// The main event loop.
@@ -56,7 +67,7 @@ pub struct EventLoop<T: tty::EventedPty, U: EventListener> {
     event_proxy: U,
     drain_on_exit: bool,
     ref_test: bool,
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     transcript: Arc<Mutex<Transcript>>,
 }
 
@@ -72,7 +83,7 @@ where
         pty: T,
         drain_on_exit: bool,
         ref_test: bool,
-        #[cfg(unix)] transcript: Arc<Mutex<Transcript>>,
+        #[cfg(any(unix, windows))] transcript: Arc<Mutex<Transcript>>,
     ) -> io::Result<EventLoop<T, U>> {
         let (tx, rx) = mpsc::channel();
         let poll = Poller::new()?.into();
@@ -85,7 +96,7 @@ where
             event_proxy,
             drain_on_exit,
             ref_test,
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             transcript,
         })
     }
@@ -100,11 +111,24 @@ where
     fn drain_recv_channel(&mut self, state: &mut State) -> bool {
         while let Some(msg) = self.rx.recv() {
             match msg {
-                Msg::Input { bytes, completion } => {
-                    state.write_list.push_back(PendingInput { bytes, completion });
+                Msg::Input {
+                    bytes,
+                    #[cfg(any(unix, windows))]
+                    completion,
+                } => {
+                    state.write_list.push_back(PendingInput {
+                        bytes,
+                        #[cfg(any(unix, windows))]
+                        completion,
+                    });
                 },
-                Msg::Resize { window_size, completion } => {
+                Msg::Resize {
+                    window_size,
+                    #[cfg(any(unix, windows))]
+                    completion,
+                } => {
                     self.pty.on_resize(window_size);
+                    #[cfg(any(unix, windows))]
                     if let Some(token) = completion {
                         self.event_proxy.send_event(Event::PtyResizeComplete(token));
                     }
@@ -171,10 +195,10 @@ where
             processed += state.advance(
                 &mut **terminal,
                 &buf[..unprocessed],
-                #[cfg(unix)]
+                #[cfg(any(unix, windows))]
                 &self.transcript,
             );
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             if let Some((start, end)) = state.take_output_range() {
                 self.event_proxy.send_event(Event::PtyOutput { start, end });
             }
@@ -208,6 +232,7 @@ where
                     Ok(n) => {
                         current.advance(n);
                         if current.finished() {
+                            #[cfg(any(unix, windows))]
                             if let Some(token) = current.completion {
                                 self.event_proxy.send_event(Event::PtyWriteComplete(token));
                             }
@@ -334,10 +359,18 @@ where
 
                 // Register write interest if necessary.
                 let needs_write = state.needs_write();
-                if needs_write != interest.writable {
+                let write_interest_changed = needs_write != interest.writable;
+                if write_interest_changed {
                     interest.writable = needs_write;
+                }
 
-                    // Re-register with new interest.
+                // Windows emulates readiness for its blocking ConPTY pipes by posting an IOCP
+                // packet. `pty_read` deliberately stops at `MAX_LOCKED_READ` for fairness, and
+                // when that leaves the intermediary pipe nonempty no empty-read occurs to install
+                // another waker. Re-registering posts the next packet for the still-readable pipe;
+                // native pollers remain level-triggered and only need updates when interest
+                // changes.
+                if write_interest_changed || cfg!(windows) {
                     self.pty.reregister(&self.poll, interest, poll_opts).unwrap();
                 }
             }
@@ -354,34 +387,44 @@ where
 struct Writing {
     source: Cow<'static, [u8]>,
     written: usize,
+    #[cfg(any(unix, windows))]
     completion: Option<u64>,
 }
 
 struct PendingInput {
     bytes: Cow<'static, [u8]>,
+    #[cfg(any(unix, windows))]
     completion: Option<u64>,
 }
 
 pub struct Notifier(pub EventLoopSender);
 
 impl event::Notify for Notifier {
-    fn notify<B>(&self, bytes: B)
+    fn notify<B>(&self, bytes: B) -> Result<(), EventLoopSendError>
     where
         B: Into<Cow<'static, [u8]>>,
     {
         let bytes = bytes.into();
         // Terminal hangs if we send 0 bytes through.
         if bytes.is_empty() {
-            return;
+            return Ok(());
         }
 
-        let _ = self.0.send(Msg::Input { bytes, completion: None });
+        self.0.send(Msg::Input {
+            bytes,
+            #[cfg(any(unix, windows))]
+            completion: None,
+        })
     }
 }
 
 impl event::OnResize for Notifier {
     fn on_resize(&mut self, window_size: WindowSize) {
-        let _ = self.0.send(Msg::Resize { window_size, completion: None });
+        let _ = self.0.send(Msg::Resize {
+            window_size,
+            #[cfg(any(unix, windows))]
+            completion: None,
+        });
     }
 }
 
@@ -434,8 +477,9 @@ pub struct State {
     write_list: VecDeque<PendingInput>,
     writing: Option<Writing>,
     parser: ansi::Processor,
+    osc_notifications: OscNotificationParser,
     vivid_markers: VividMarkerScanner,
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     output_range: Option<(u64, u64)>,
 }
 
@@ -444,35 +488,53 @@ impl State {
         &mut self,
         terminal: &mut Term<T>,
         bytes: &[u8],
-        #[cfg(unix)] transcript: &Arc<Mutex<Transcript>>,
+        #[cfg(any(unix, windows))] transcript: &Arc<Mutex<Transcript>>,
     ) -> usize {
-        let mut processed = 0;
-        for chunk in self.vivid_markers.push(bytes) {
-            match chunk {
-                VividChunk::Bytes(bytes) => {
-                    processed += bytes.len();
-                    #[cfg(unix)]
-                    {
-                        let (start, end) = transcript.lock().unwrap().append(&bytes);
-                        self.output_range = Some(match self.output_range {
-                            Some((existing, _)) => (existing, end),
-                            None => (start, end),
-                        });
-                    }
-                    self.parser.advance(terminal, &bytes);
+        for message in self.osc_notifications.advance(bytes) {
+            match message {
+                OscMessage::Notification(notification) => {
+                    terminal.desktop_notification(notification);
                 },
-                VividChunk::Marker { raw, marker } => {
-                    processed += raw.len();
-                    #[cfg(not(windows))]
-                    self.parser.advance(terminal, &raw);
-                    terminal.vivid_marker(marker);
+                OscMessage::WorkingDirectory(report) => {
+                    terminal.working_directory_report(report);
                 },
             }
         }
+
+        let mut processed = 0;
+        // The scanner moves out of `self` so its spans can borrow the read buffer while the
+        // parser and output range are still mutated for each one.
+        let mut scanner = mem::take(&mut self.vivid_markers);
+        let parser = &mut self.parser;
+        #[cfg(any(unix, windows))]
+        let output_range = &mut self.output_range;
+        scanner.push(bytes, &mut |chunk| match chunk {
+            VividChunk::Bytes(bytes) => {
+                processed += bytes.len();
+                #[cfg(any(unix, windows))]
+                {
+                    let (start, end) = transcript.lock().unwrap().append(bytes);
+                    *output_range = Some(match *output_range {
+                        Some((existing, _)) => (existing, end),
+                        None => (start, end),
+                    });
+                }
+                terminal.advance(parser, bytes);
+            },
+            VividChunk::Marker { raw, marker, pass_to_terminal: _pass_to_terminal } => {
+                processed += raw.len();
+                #[cfg(not(windows))]
+                if _pass_to_terminal {
+                    terminal.advance(parser, raw);
+                }
+                terminal.vivid_marker(marker.to_owned());
+            },
+        });
+        self.vivid_markers = scanner;
         processed
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn take_output_range(&mut self) -> Option<(u64, u64)> {
         self.output_range.take()
     }
@@ -505,26 +567,37 @@ impl State {
     }
 }
 
-#[cfg(not(windows))]
-const VIVID_MARKER_PREFIX: &[u8] = b"\x1b_VIVID;2;";
-#[cfg(windows)]
-const VIVID_MARKER_PREFIX: &[u8] = b"VIVID;2;";
-#[cfg(not(windows))]
-const VIVID_MARKER_TERMINATOR: &[u8] = b"\x1b\\";
-#[cfg(windows)]
-const VIVID_MARKER_TERMINATOR: &[u8] = b";VIVID-END";
-#[cfg(not(windows))]
-const VIVID_MARKER_PAYLOAD_SKIP: usize = 2;
-#[cfg(windows)]
-const VIVID_MARKER_PAYLOAD_SKIP: usize = 0;
-#[cfg(not(windows))]
-const MAX_VIVID_MARKER_BYTES: usize = 128;
-#[cfg(windows)]
-const MAX_VIVID_MARKER_BYTES: usize = 160;
+const MAX_VIVID_MARKER_BYTES: usize = vivid_protocol::anchor::MAX_MARKER_BYTES;
 
-enum VividChunk {
-    Bytes(Vec<u8>),
-    Marker { raw: Vec<u8>, marker: String },
+#[derive(Clone, Copy)]
+struct VividMarkerEnvelope {
+    prefix: &'static [u8],
+    terminator: &'static [u8],
+    payload_skip: usize,
+    pass_to_terminal: bool,
+}
+
+const APC_VIVID_MARKER: VividMarkerEnvelope = VividMarkerEnvelope {
+    prefix: b"\x1b_VIVID;3;",
+    terminator: b"\x1b\\",
+    payload_skip: 2,
+    pass_to_terminal: true,
+};
+const CONPTY_VIVID_MARKER: VividMarkerEnvelope = VividMarkerEnvelope {
+    prefix: b"VIVID;3;",
+    terminator: b";VIVID-END",
+    payload_skip: 0,
+    pass_to_terminal: false,
+};
+const VIVID_MARKER_ENVELOPES: [VividMarkerEnvelope; 2] = [APC_VIVID_MARKER, CONPTY_VIVID_MARKER];
+
+/// One span of scanned PTY bytes: ordinary terminal data, or one authenticated anchor marker.
+///
+/// Spans borrow either the caller's read buffer or the scanner's own bounded `pending` buffer, so
+/// ordinary output reaches the terminal without being copied.
+enum VividChunk<'a> {
+    Bytes(&'a [u8]),
+    Marker { raw: &'a [u8], marker: &'a str, pass_to_terminal: bool },
 }
 
 #[derive(Default)]
@@ -533,74 +606,103 @@ struct VividMarkerScanner {
 }
 
 impl VividMarkerScanner {
-    fn push(&mut self, bytes: &[u8]) -> Vec<VividChunk> {
-        self.pending.extend_from_slice(bytes);
-        let mut chunks = Vec::new();
-        let mut cursor = 0;
+    /// Separate authenticated anchor markers from ordinary terminal bytes.
+    ///
+    /// A read holding no marker is forwarded as a borrowed slice of the caller's buffer; only the
+    /// tail of a marker split across two reads is ever copied into `pending`, which stays bounded
+    /// by [`MAX_VIVID_MARKER_BYTES`].
+    fn push<F>(&mut self, bytes: &[u8], emit: &mut F)
+    where
+        F: FnMut(VividChunk<'_>),
+    {
+        if self.pending.is_empty() {
+            let consumed = scan_markers(bytes, emit);
+            self.pending.extend_from_slice(&bytes[consumed..]);
+        } else {
+            self.pending.extend_from_slice(bytes);
+            let consumed = scan_markers(&self.pending, emit);
+            self.pending.drain(..consumed);
+        }
+    }
+}
 
-        loop {
-            let Some(relative_start) = find_bytes(&self.pending[cursor..], VIVID_MARKER_PREFIX)
-            else {
-                let keep = partial_prefix_len(&self.pending[cursor..], VIVID_MARKER_PREFIX);
-                let end = self.pending.len().saturating_sub(keep);
-                push_bytes(&mut chunks, &self.pending[cursor..end]);
-                cursor = end;
-                break;
-            };
-            let start = cursor + relative_start;
-            push_bytes(&mut chunks, &self.pending[cursor..start]);
-            let payload_start = start + VIVID_MARKER_PAYLOAD_SKIP;
-            let terminator_search = start + VIVID_MARKER_PREFIX.len();
+/// Emit every complete chunk in `buf`, returning how many leading bytes were consumed.
+///
+/// The unconsumed tail is a partial prefix or an unterminated marker still short enough to
+/// complete in a later read.
+fn scan_markers<F>(buf: &[u8], emit: &mut F) -> usize
+where
+    F: FnMut(VividChunk<'_>),
+{
+    let mut cursor = 0;
 
-            let Some(relative_end) =
-                find_bytes(&self.pending[terminator_search..], VIVID_MARKER_TERMINATOR)
-            else {
-                if self.pending.len() - start > MAX_VIVID_MARKER_BYTES {
-                    push_bytes(
-                        &mut chunks,
-                        &self.pending[start..start + VIVID_MARKER_PREFIX.len()],
-                    );
-                    cursor = start + VIVID_MARKER_PREFIX.len();
-                    continue;
-                }
-                cursor = start;
-                break;
-            };
+    loop {
+        let Some((relative_start, envelope)) = find_marker_envelope(&buf[cursor..]) else {
+            let keep = VIVID_MARKER_ENVELOPES
+                .iter()
+                .map(|envelope| partial_prefix_len(&buf[cursor..], envelope.prefix))
+                .max()
+                .unwrap_or(0);
+            let end = buf.len().saturating_sub(keep);
+            emit_bytes(emit, &buf[cursor..end]);
+            return end;
+        };
+        let start = cursor + relative_start;
+        emit_bytes(emit, &buf[cursor..start]);
+        let payload_start = start + envelope.payload_skip;
+        let terminator_search = start + envelope.prefix.len();
 
-            let terminator = terminator_search + relative_end;
-            let end = terminator + VIVID_MARKER_TERMINATOR.len();
-            if end - start > MAX_VIVID_MARKER_BYTES {
-                push_bytes(&mut chunks, &self.pending[start..start + VIVID_MARKER_PREFIX.len()]);
-                cursor = start + VIVID_MARKER_PREFIX.len();
+        let Some(relative_end) = find_bytes(&buf[terminator_search..], envelope.terminator) else {
+            if buf.len() - start > MAX_VIVID_MARKER_BYTES {
+                emit_bytes(emit, &buf[start..start + envelope.prefix.len()]);
+                cursor = start + envelope.prefix.len();
                 continue;
             }
+            return start;
+        };
 
-            let raw = self.pending[start..end].to_vec();
-            match std::str::from_utf8(&self.pending[payload_start..terminator]) {
-                Ok(marker) => chunks.push(VividChunk::Marker { raw, marker: marker.to_owned() }),
-                Err(_) => push_bytes(&mut chunks, &raw),
-            }
-            cursor = end;
+        let terminator = terminator_search + relative_end;
+        let end = terminator + envelope.terminator.len();
+        if end - start > MAX_VIVID_MARKER_BYTES {
+            emit_bytes(emit, &buf[start..start + envelope.prefix.len()]);
+            cursor = start + envelope.prefix.len();
+            continue;
         }
 
-        self.pending.drain(..cursor);
-        chunks
+        match std::str::from_utf8(&buf[payload_start..terminator]) {
+            Ok(marker) => emit(VividChunk::Marker {
+                raw: &buf[start..end],
+                marker,
+                pass_to_terminal: envelope.pass_to_terminal,
+            }),
+            Err(_) => emit_bytes(emit, &buf[start..end]),
+        }
+        cursor = end;
     }
 }
 
-fn push_bytes(chunks: &mut Vec<VividChunk>, bytes: &[u8]) {
-    if bytes.is_empty() {
-        return;
-    }
-    if let Some(VividChunk::Bytes(previous)) = chunks.last_mut() {
-        previous.extend_from_slice(bytes);
-    } else {
-        chunks.push(VividChunk::Bytes(bytes.to_vec()));
+fn find_marker_envelope(bytes: &[u8]) -> Option<(usize, VividMarkerEnvelope)> {
+    VIVID_MARKER_ENVELOPES
+        .iter()
+        .filter_map(|envelope| find_bytes(bytes, envelope.prefix).map(|start| (start, *envelope)))
+        .min_by_key(|(start, _)| *start)
+}
+
+fn emit_bytes<F>(emit: &mut F, bytes: &[u8])
+where
+    F: FnMut(VividChunk<'_>),
+{
+    if !bytes.is_empty() {
+        emit(VividChunk::Bytes(bytes));
     }
 }
 
+/// Substring search over PTY output.
+///
+/// `memmem` selects rare bytes and vectorizes; comparing every offset in software instead showed up
+/// directly in the throughput of ordinary terminal traffic.
 fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack.windows(needle.len()).position(|window| window == needle)
+    memmem::find(haystack, needle)
 }
 
 fn partial_prefix_len(bytes: &[u8], prefix: &[u8]) -> usize {
@@ -610,7 +712,12 @@ fn partial_prefix_len(bytes: &[u8], prefix: &[u8]) -> usize {
 impl Writing {
     #[inline]
     fn new(input: PendingInput) -> Writing {
-        Writing { source: input.bytes, written: 0, completion: input.completion }
+        Writing {
+            source: input.bytes,
+            written: 0,
+            #[cfg(any(unix, windows))]
+            completion: input.completion,
+        }
     }
 
     #[inline]
@@ -663,43 +770,70 @@ impl<T> PeekableReceiver<T> {
 mod vivid_marker_tests {
     use super::*;
 
+    const MARKER_PAYLOAD: &[u8] =
+        b"A;AAAAAAAAAAAAAAAAAAAAAA;0000000000000003;0000000000000007;AAAAAAAAAAAAAAAAAAAAAA";
+    const MARKER_BODY: &str =
+        "VIVID;3;A;AAAAAAAAAAAAAAAAAAAAAA;0000000000000003;0000000000000007;AAAAAAAAAAAAAAAAAAAAAA";
+
     #[test]
-    fn marker_is_recognized_across_every_read_boundary() {
-        #[cfg(not(windows))]
-        let input = b"before\x1b_VIVID;2;A;AAAAAAAAAAAAAAAAAAAAAA;0000000000000007;AAAAAAAAAAAAAAAAAAAAAA\x1b\\after";
-        #[cfg(windows)]
-        let input = b"beforeVIVID;2;A;AAAAAAAAAAAAAAAAAAAAAA;0000000000000007;AAAAAAAAAAAAAAAAAAAAAA;VIVID-ENDafter";
+    fn both_marker_envelopes_are_recognized_across_every_read_boundary() {
+        assert_marker_envelope(APC_VIVID_MARKER);
+        assert_marker_envelope(CONPTY_VIVID_MARKER);
+    }
+
+    fn assert_marker_envelope(envelope: VividMarkerEnvelope) {
+        let mut input = b"before".to_vec();
+        input.extend_from_slice(envelope.prefix);
+        input.extend_from_slice(MARKER_PAYLOAD);
+        input.extend_from_slice(envelope.terminator);
+        input.extend_from_slice(b"after");
         let mut scanner = VividMarkerScanner::default();
         let mut text = Vec::new();
         let mut markers = Vec::new();
 
-        for byte in input {
-            for chunk in scanner.push(std::slice::from_ref(byte)) {
-                match chunk {
-                    VividChunk::Bytes(bytes) => text.extend(bytes),
-                    VividChunk::Marker { raw, marker } => {
-                        assert!(raw.starts_with(VIVID_MARKER_PREFIX));
-                        markers.push(marker);
-                    },
-                }
-            }
+        for byte in &input {
+            scanner.push(std::slice::from_ref(byte), &mut |chunk| match chunk {
+                VividChunk::Bytes(bytes) => text.extend_from_slice(bytes),
+                VividChunk::Marker { raw, marker, pass_to_terminal } => {
+                    assert!(raw.starts_with(envelope.prefix));
+                    markers.push((marker.to_owned(), pass_to_terminal));
+                },
+            });
         }
 
         assert_eq!(text, b"beforeafter");
-        assert_eq!(
-            markers,
-            ["VIVID;2;A;AAAAAAAAAAAAAAAAAAAAAA;0000000000000007;AAAAAAAAAAAAAAAAAAAAAA"]
-        );
+        assert_eq!(markers, [(MARKER_BODY.to_owned(), envelope.pass_to_terminal)]);
         assert!(scanner.pending.is_empty());
     }
 
     #[test]
-    fn oversized_candidate_is_left_to_the_terminal_parser() {
-        let mut input = VIVID_MARKER_PREFIX.to_vec();
-        input.extend(std::iter::repeat_n(b'x', MAX_VIVID_MARKER_BYTES));
-        input.extend_from_slice(VIVID_MARKER_TERMINATOR);
-        let mut scanner = VividMarkerScanner::default();
-        let chunks = scanner.push(&input);
-        assert!(chunks.iter().all(|chunk| matches!(chunk, VividChunk::Bytes(_))));
+    fn printable_conpty_envelope_is_removed_instead_of_reaching_terminal_text() {
+        let mut input = CONPTY_VIVID_MARKER.prefix.to_vec();
+        input.extend_from_slice(MARKER_PAYLOAD);
+        input.extend_from_slice(CONPTY_VIVID_MARKER.terminator);
+        let mut printable = 0;
+        let mut markers = 0;
+        VividMarkerScanner::default().push(&input, &mut |chunk| match chunk {
+            VividChunk::Bytes(_) => printable += 1,
+            VividChunk::Marker { pass_to_terminal, .. } => {
+                assert!(!pass_to_terminal);
+                markers += 1;
+            },
+        });
+
+        assert_eq!((printable, markers), (0, 1));
+    }
+
+    #[test]
+    fn oversized_candidates_are_left_to_the_terminal_parser() {
+        for envelope in VIVID_MARKER_ENVELOPES {
+            let mut input = envelope.prefix.to_vec();
+            input.extend(std::iter::repeat_n(b'x', MAX_VIVID_MARKER_BYTES));
+            input.extend_from_slice(envelope.terminator);
+            let mut scanner = VividMarkerScanner::default();
+            scanner.push(&input, &mut |chunk| {
+                assert!(matches!(chunk, VividChunk::Bytes(_)));
+            });
+        }
     }
 }

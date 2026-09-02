@@ -13,6 +13,7 @@ use std::os::windows::process::CommandExt;
 use std::process::{Command, Stdio};
 #[cfg(target_os = "openbsd")]
 use std::ptr;
+use std::sync::OnceLock;
 
 #[rustfmt::skip]
 #[cfg(not(windows))]
@@ -53,12 +54,15 @@ where
 }
 
 /// Start a new process in the background.
+///
+/// `working_directory` is the directory the daemon starts in; callers which have a PTY pass the
+/// foreground process' directory, and callers which do not — the tab chrome — pass whatever they
+/// know, or `None` to inherit this process' directory.
 #[cfg(not(windows))]
 pub fn spawn_daemon<I, S>(
     program: &str,
     args: I,
-    master_fd: RawFd,
-    shell_pid: u32,
+    working_directory: Option<PathBuf>,
 ) -> io::Result<()>
 where
     I: IntoIterator<Item = S> + Copy,
@@ -67,9 +71,8 @@ where
     let mut command = Command::new(program);
     command.args(args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
 
-    let working_directory = foreground_process_path(master_fd, shell_pid)
-        .ok()
-        .and_then(|path| CString::new(path.into_os_string().into_vec()).ok());
+    let working_directory =
+        working_directory.and_then(|path| CString::new(path.into_os_string().into_vec()).ok());
 
     unsafe {
         command
@@ -110,6 +113,41 @@ where
             .wait()
             .map(|_| ())
     }
+}
+
+/// Arguments for relaunching this executable as another top-level Vivido window.
+///
+/// A new window starts a fresh session, so it must not inherit the command the current one was
+/// asked to run, nor — off Windows, where [`spawn_daemon`] sets the directory itself — the working
+/// directory. `args` is this process' argv with the program name already removed.
+pub fn relaunch_arguments<I>(args: I) -> Vec<String>
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut relaunch = Vec::new();
+    #[cfg(not(windows))]
+    let mut skip_working_directory = false;
+    for argument in args {
+        #[cfg(not(windows))]
+        if skip_working_directory {
+            skip_working_directory = false;
+            continue;
+        }
+
+        if argument == "-e" || argument == "--command" {
+            // `--command` takes every remaining argument, so nothing after it can be kept.
+            break;
+        }
+
+        #[cfg(not(windows))]
+        if argument == "--working-directory" {
+            skip_working_directory = true;
+            continue;
+        }
+
+        relaunch.push(argument);
+    }
+    relaunch
 }
 
 /// Get working directory of controlling process.
@@ -163,5 +201,91 @@ pub fn foreground_process_path(
     } else {
         let foreground_path = unsafe { CStr::from_ptr(buf.as_ptr().cast()) }.to_str()?;
         Ok(PathBuf::from(foreground_path))
+    }
+}
+
+/// Whether an OSC 7 working-directory report's host refers to this machine.
+pub(crate) fn is_local_host(host: &str) -> bool {
+    host_matches(host, local_hostname())
+}
+
+/// Empty hosts and `localhost` always match; any other host must equal the local name.
+fn host_matches(host: &str, local: &str) -> bool {
+    host.is_empty() || host.eq_ignore_ascii_case("localhost") || host.eq_ignore_ascii_case(local)
+}
+
+/// This machine's hostname, cached for the process lifetime; empty when unavailable.
+fn local_hostname() -> &'static str {
+    static HOSTNAME: OnceLock<String> = OnceLock::new();
+    HOSTNAME.get_or_init(probe_hostname)
+}
+
+#[cfg(not(windows))]
+fn probe_hostname() -> String {
+    let mut buffer = [0u8; 256];
+    let result = unsafe { libc::gethostname(buffer.as_mut_ptr().cast(), buffer.len()) };
+    if result != 0 {
+        return String::new();
+    }
+    // The buffer is not guaranteed to be NUL-terminated when the name is truncated.
+    let end = buffer.iter().position(|&byte| byte == 0).unwrap_or(buffer.len());
+    String::from_utf8_lossy(&buffer[..end]).into_owned()
+}
+
+#[cfg(windows)]
+fn probe_hostname() -> String {
+    std::env::var("COMPUTERNAME").unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{host_matches, relaunch_arguments};
+
+    fn relaunch(args: &[&str]) -> Vec<String> {
+        relaunch_arguments(args.iter().map(|argument| (*argument).to_owned()))
+    }
+
+    #[test]
+    fn a_relaunch_keeps_the_window_arguments_it_was_started_with() {
+        assert_eq!(
+            relaunch(&["--title", "Vivido", "-o", "window.blur=true"]),
+            ["--title", "Vivido", "-o", "window.blur=true"]
+        );
+    }
+
+    #[test]
+    fn a_relaunch_never_inherits_the_command() {
+        assert_eq!(
+            relaunch(&["--title", "Vivido", "-e", "htop", "--sort", "cpu"]),
+            ["--title", "Vivido"]
+        );
+        assert_eq!(relaunch(&["--command", "htop"]), Vec::<String>::new());
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn a_unix_relaunch_drops_the_working_directory_the_daemon_sets_itself() {
+        assert_eq!(
+            relaunch(&["--working-directory", "/tmp", "--title", "Vivido"]),
+            ["--title", "Vivido"]
+        );
+    }
+
+    #[test]
+    fn local_host_forms_match() {
+        assert!(host_matches("", "machine"));
+        assert!(host_matches("localhost", "machine"));
+        assert!(host_matches("LOCALHOST", "machine"));
+        assert!(host_matches("machine", "machine"));
+        assert!(host_matches("MACHINE", "machine"));
+    }
+
+    #[test]
+    fn foreign_hosts_do_not_match() {
+        assert!(!host_matches("remote", "machine"));
+        assert!(!host_matches("machine-2", "machine"));
+        // With no local hostname only the implicit-local forms match.
+        assert!(!host_matches("remote", ""));
+        assert!(host_matches("", ""));
     }
 }

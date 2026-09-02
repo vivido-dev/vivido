@@ -68,12 +68,34 @@ pub fn cwd(pid: c_int) -> Result<PathBuf, Error> {
     Ok(CString::from(c_str).into_string().map(PathBuf::from)?)
 }
 
+/// Return a process's creation time as microseconds since the Unix epoch.
+pub fn start_time_micros(pid: c_int) -> io::Result<u64> {
+    let mut info = MaybeUninit::<sys::proc_bsdinfo>::uninit();
+    let size = mem::size_of::<sys::proc_bsdinfo>() as c_int;
+    let result =
+        unsafe { sys::proc_pidinfo(pid, sys::PROC_PIDTBSDINFO, 0, info.as_mut_ptr().cast(), size) };
+    if result != size {
+        return if result <= 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Err(io::Error::new(io::ErrorKind::InvalidData, "invalid proc_bsdinfo size"))
+        };
+    }
+    // SAFETY: `proc_pidinfo` reported that it initialized the complete structure.
+    let info = unsafe { info.assume_init() };
+    info.pbi_start_tvsec
+        .checked_mul(1_000_000)
+        .and_then(|seconds| seconds.checked_add(info.pbi_start_tvusec))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid process start time"))
+}
+
 /// Bindings for libproc.
 #[allow(non_camel_case_types)]
 mod sys {
     use std::os::raw::{c_char, c_int, c_longlong, c_void};
 
     pub const PROC_PIDVNODEPATHINFO: c_int = 9;
+    pub const PROC_PIDTBSDINFO: c_int = 3;
 
     type gid_t = c_int;
     type off_t = c_longlong;
@@ -135,6 +157,33 @@ mod sys {
         pub pvi_rdir: vnode_info_path,
     }
 
+    #[repr(C)]
+    #[derive(Debug, Copy, Clone)]
+    pub struct proc_bsdinfo {
+        pub pbi_flags: u32,
+        pub pbi_status: u32,
+        pub pbi_xstatus: u32,
+        pub pbi_pid: u32,
+        pub pbi_ppid: u32,
+        pub pbi_uid: u32,
+        pub pbi_gid: u32,
+        pub pbi_ruid: u32,
+        pub pbi_rgid: u32,
+        pub pbi_svuid: u32,
+        pub pbi_svgid: u32,
+        pub rfu_1: u32,
+        pub pbi_comm: [u8; 16],
+        pub pbi_name: [u8; 32],
+        pub pbi_nfiles: u32,
+        pub pbi_pgid: u32,
+        pub pbi_pjobc: u32,
+        pub e_tdev: u32,
+        pub e_tpgid: u32,
+        pub pbi_nice: i32,
+        pub pbi_start_tvsec: u64,
+        pub pbi_start_tvusec: u64,
+    }
+
     unsafe extern "C" {
         pub fn proc_pidinfo(
             pid: c_int,
@@ -155,5 +204,10 @@ mod tests {
     #[test]
     fn cwd_matches_current_dir() {
         assert_eq!(cwd(process::id() as i32).ok(), env::current_dir().ok());
+    }
+
+    #[test]
+    fn current_process_has_a_start_time() {
+        assert!(start_time_micros(process::id() as i32).is_ok());
     }
 }

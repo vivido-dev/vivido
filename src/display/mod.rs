@@ -2,6 +2,7 @@
 
 use std::cmp;
 use std::fmt::{self, Formatter};
+use std::ops::Range;
 use std::time::{Duration, Instant};
 
 use log::info;
@@ -33,14 +34,14 @@ use crate::config::window::Dimensions;
 use crate::config::window::StartupMode;
 use crate::display::bell::VisualBell;
 use crate::display::color::{List, Rgb};
-use crate::display::content::{RenderableContent, RenderableCursor};
+use crate::display::content::{RenderableCell, RenderableContent, RenderableCursor};
 use crate::display::cursor::IntoRects;
 use crate::display::damage::{DamageTracker, damage_y_to_viewport_y};
 use crate::display::hint::{HintMatch, HintState};
 use crate::display::meter::Meter;
 use crate::display::rects::{RenderLine, RenderLines, RenderRect, paint_rect, paint_rects};
-use crate::display::renderer::SceneRenderer;
-use crate::display::text::{TextMetrics, TextSystem, color_from_rgb};
+use crate::display::renderer::{EmbeddedFrame, SceneRenderer};
+use crate::display::text::{TerminalTextStyle, TextMetrics, TextSystem, color_from_rgb};
 use crate::display::window::Window;
 use crate::event::{Event, EventType, Mouse, SearchState};
 use crate::message_bar::{MessageBuffer, MessageType};
@@ -52,17 +53,21 @@ pub mod color;
 pub mod content;
 pub mod cursor;
 pub mod hint;
+pub mod rects;
+pub mod renderer;
+pub mod text;
 pub mod window;
 
 mod bell;
+mod corners;
 mod damage;
 mod media;
 mod meter;
-mod rects;
-mod renderer;
-mod text;
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
+#[cfg(test)]
+pub(crate) use media::CaptureRedaction;
+#[cfg(any(unix, windows))]
 pub(crate) use renderer::{ScreenshotError, ScreenshotPixels, ScreenshotReadback};
 
 /// Label for the forward terminal search bar.
@@ -76,6 +81,28 @@ const SHORTENER: char = '…';
 
 /// Color which is used to highlight damaged rects when debugging.
 const DAMAGE_RECT_COLOR: Rgb = Rgb::new(255, 0, 255);
+
+/// A consecutive slice of prepared terminal cells painted either independently or as one shaped
+/// ligature run.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TerminalTextSpan {
+    cells: Range<usize>,
+    shaped_run: bool,
+}
+
+/// Logical text and terminal-grid metadata for one shaped row fragment.
+struct TerminalShapingRun {
+    text: String,
+    styles: Vec<TerminalTextStyle>,
+    cells: Vec<TerminalShapingCell>,
+    origin_column: usize,
+}
+
+struct TerminalShapingCell {
+    text: Range<usize>,
+    width: usize,
+    hidden: bool,
+}
 
 #[derive(Debug)]
 pub enum Error {
@@ -303,26 +330,74 @@ pub struct Display {
 
     hint_mouse_point: Option<Point>,
     scene_renderer: SceneRenderer,
+    /// Kept so a renderer rebuilt after GPU device loss can be re-attached to the same scene.
+    vivid_scene: Option<crate::vivid::scene::SharedScene>,
+    renderer_unavailable: bool,
+    renderer_retry_delay: Duration,
+    cached_scene: Option<Scene>,
+    cached_media_generation: u64,
+    cached_base_color: Color,
+    vivid_frame_requested: bool,
+    text_scene_builds: u64,
+    cached_scene_frames: u64,
     text_system: TextSystem,
     meter: Meter,
 }
 
+const INITIAL_RENDERER_RETRY: Duration = Duration::from_millis(100);
+const MAX_RENDERER_RETRY: Duration = Duration::from_secs(5);
+
 impl Display {
+    pub(crate) fn mark_vivid_frame(&mut self) {
+        self.vivid_frame_requested = true;
+    }
+
+    pub(crate) fn optimization_metrics(&self) -> (u64, u64, media::SourceUploadMetrics) {
+        (self.text_scene_builds, self.cached_scene_frames, self.scene_renderer.media_metrics())
+    }
+
+    fn invalidate_cached_scene(&mut self) {
+        self.cached_scene = None;
+        self.vivid_frame_requested = false;
+    }
+
     pub fn set_vivid_scene(&mut self, scene: crate::vivid::scene::SharedScene) {
+        self.invalidate_cached_scene();
+        self.vivid_scene = Some(scene.clone());
         self.scene_renderer.set_vivid_scene(scene);
     }
 
     pub fn submit_graphics(&mut self, command: GraphicsCommand) {
+        self.invalidate_cached_scene();
         self.scene_renderer.submit_graphics(command);
         self.damage_tracker.frame().mark_fully_damaged();
     }
 
-    #[cfg(unix)]
+    pub fn embedded_frame(&self) -> Option<EmbeddedFrame<'_>> {
+        (!self.renderer_unavailable && self.display_window_is_embedded())
+            .then(|| self.scene_renderer.embedded_frame())
+            .flatten()
+    }
+
+    fn display_window_is_embedded(&self) -> bool {
+        self.window.is_embedded()
+    }
+
+    /// Whether the renderer holds a frame a screenshot could read.
+    #[cfg(any(unix, windows))]
+    pub fn has_rendered_frame(&self) -> bool {
+        !self.renderer_unavailable && self.scene_renderer.has_rendered_frame()
+    }
+
+    #[cfg(any(unix, windows))]
     pub fn begin_screenshot(&self) -> Result<ScreenshotReadback, ScreenshotError> {
+        if self.renderer_unavailable {
+            return Err(ScreenshotError::NoPresentedFrame);
+        }
         self.scene_renderer.begin_screenshot()
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub fn poll_screenshot(
         &self,
         readback: &ScreenshotReadback,
@@ -330,13 +405,14 @@ impl Display {
         self.scene_renderer.poll_screenshot(readback)
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub fn supports_render_size(&self, width: u32, height: u32) -> bool {
         self.scene_renderer.clamp_render_size(PhysicalSize::new(width, height))
             == PhysicalSize::new(width, height)
     }
 
-    pub fn new(window: Window, config: &UiConfig, _tabbed: bool) -> Result<Display, Error> {
+    /// Build the renderer for an initially hidden `window`.
+    pub fn new(window: Window, config: &UiConfig) -> Result<Display, Error> {
         let scale_factor = window.scale_factor as f32;
         let font_size = config.font.size().scale(scale_factor);
         let font = config.font.clone().with_size(font_size);
@@ -356,19 +432,17 @@ impl Display {
         }
 
         let scene_renderer = SceneRenderer::new(
-            window.winit_window(),
+            window.render_source(),
             viewport_size,
             config.window_opacity() < 1.0,
         )?;
         let viewport_size = scene_renderer.clamp_render_size(viewport_size);
-        let padding = config.window.padding(window.scale_factor as f32);
-        let size_info = SizeInfo::new(
-            viewport_size.width as f32,
-            viewport_size.height as f32,
+        let size_info = scaled_size_info(
+            viewport_size,
             metrics.cell_width,
             metrics.cell_height,
-            padding.0,
-            padding.1,
+            config.window.padding(1.0),
+            scale_factor,
             config.window.dynamic_padding && config.window.dimensions().is_none(),
         );
 
@@ -382,22 +456,6 @@ impl Display {
         if config.window.resize_increments {
             window
                 .set_resize_increments(PhysicalSize::new(metrics.cell_width, metrics.cell_height));
-        }
-
-        window.set_visible(true);
-
-        #[cfg(target_os = "macos")]
-        window.focus_window();
-
-        #[allow(clippy::single_match)]
-        #[cfg(not(windows))]
-        if !_tabbed {
-            match config.window.startup_mode {
-                #[cfg(target_os = "macos")]
-                StartupMode::SimpleFullscreen => window.set_simple_fullscreen(true),
-                StartupMode::Maximized => window.set_maximized(true),
-                _ => (),
-            }
         }
 
         let hint_state = HintState::new(config.hints.alphabet());
@@ -421,9 +479,49 @@ impl Display {
             font_size,
             hint_mouse_point: Default::default(),
             scene_renderer,
+            vivid_scene: None,
+            renderer_unavailable: false,
+            renderer_retry_delay: INITIAL_RENDERER_RETRY,
+            cached_scene: None,
+            cached_media_generation: 0,
+            cached_base_color: Color::BLACK,
+            vivid_frame_requested: false,
+            text_scene_builds: 0,
+            cached_scene_frames: 0,
             text_system,
             meter: Default::default(),
         })
+    }
+
+    /// Map the window after platform accessibility has been attached.
+    pub fn map_window(&self, config: &UiConfig, tabbed: bool, no_activate: bool) {
+        #[cfg(windows)]
+        let _ = (config, tabbed);
+
+        #[cfg(target_os = "macos")]
+        if no_activate {
+            self.window.order_front_without_focus();
+        } else {
+            self.window.set_visible(true);
+            self.window.focus_window();
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = no_activate;
+            self.window.set_visible(true);
+        }
+
+        #[allow(clippy::single_match)]
+        #[cfg(not(windows))]
+        if !tabbed {
+            match config.window.startup_mode {
+                #[cfg(target_os = "macos")]
+                StartupMode::SimpleFullscreen => self.window.set_simple_fullscreen(true),
+                StartupMode::Maximized => self.window.set_maximized(true),
+                _ => (),
+            }
+        }
     }
 
     pub fn handle_update<T>(
@@ -441,6 +539,7 @@ impl Display {
         let mut metrics = self.text_system.metrics();
 
         if let Some(font) = pending_update.font().cloned() {
+            self.invalidate_cached_scene();
             self.text_system.update_font(font);
             metrics = self.text_system.metrics();
             self.damage_tracker.frame().mark_fully_damaged();
@@ -453,14 +552,12 @@ impl Display {
             height = dimensions.height as f32;
         }
 
-        let padding = config.window.padding(self.window.scale_factor as f32);
-        let mut new_size = SizeInfo::new(
-            width,
-            height,
+        let mut new_size = scaled_size_info(
+            PhysicalSize::new(width as u32, height as u32),
             metrics.cell_width,
             metrics.cell_height,
-            padding.0,
-            padding.1,
+            config.window.padding(1.0),
+            self.window.scale_factor as f32,
             config.window.dynamic_padding,
         );
 
@@ -483,6 +580,7 @@ impl Display {
         }
 
         if new_size != self.size_info {
+            self.invalidate_cached_scene();
             let renderer_update = self.pending_renderer_update.get_or_insert(Default::default());
             renderer_update.resize = true;
             search_state.clear_focused_match();
@@ -498,6 +596,7 @@ impl Display {
         };
 
         if renderer_update.resize {
+            self.invalidate_cached_scene();
             self.scene_renderer.resize(PhysicalSize::new(
                 self.size_info.width() as u32,
                 self.size_info.height() as u32,
@@ -516,6 +615,56 @@ impl Display {
         config: &UiConfig,
         search_state: &mut SearchState,
     ) -> bool {
+        if self.renderer_unavailable {
+            return false;
+        }
+        match terminal.damage() {
+            TermDamage::Full => self.damage_tracker.frame().mark_fully_damaged(),
+            TermDamage::Partial(damaged_lines) => {
+                for damage in damaged_lines {
+                    self.damage_tracker.frame().damage_line(damage);
+                }
+            },
+        }
+        terminal.reset_damage();
+
+        let size_info = self.size_info;
+        let early_display_offset = terminal.grid().display_offset();
+        let prepared_media = self.scene_renderer.prepare_media(&size_info, early_display_offset);
+        let media_generation = prepared_media.as_ref().map_or(0, |media| media.image_generation);
+        let _media_changed = prepared_media.as_ref().is_some_and(|media| media.changed);
+        let can_reuse_scene = self.vivid_frame_requested
+            && self.cached_scene.is_some()
+            && self.cached_media_generation == media_generation
+            && self.damage_tracker.frame().is_empty()
+            && self.visual_bell.intensity() == 0.
+            && !self.hint_state.active()
+            && search_state.regex().is_none()
+            && !self.damage_tracker.debug;
+        if can_reuse_scene {
+            self.cached_scene_frames = self.cached_scene_frames.saturating_add(1);
+            drop(terminal);
+            self.window.pre_present_notify();
+            let result = {
+                let scene = self.cached_scene.as_ref().expect("cached scene checked above");
+                self.scene_renderer.render(scene, self.cached_base_color)
+            };
+            let presented = match result {
+                Ok(presented) => {
+                    self.renderer_retry_delay = INITIAL_RENDERER_RETRY;
+                    presented
+                },
+                Err(error) => {
+                    self.recover_from_render_error(&error, config, scheduler);
+                    false
+                },
+            };
+            self.vivid_frame_requested = false;
+            self.request_frame(scheduler);
+            self.damage_tracker.swap_damage();
+            return presented;
+        }
+
         let mut content = RenderableContent::new(config, self, &terminal, search_state);
         let mut grid_cells = Vec::new();
         for cell in &mut content {
@@ -530,22 +679,14 @@ impl Display {
 
         let cursor_point = terminal.grid().cursor.point;
         let total_lines = terminal.grid().total_lines();
-        let size_info = self.size_info;
         let metrics = self.text_system.metrics();
 
-        match terminal.damage() {
-            TermDamage::Full => self.damage_tracker.frame().mark_fully_damaged(),
-            TermDamage::Partial(damaged_lines) => {
-                for damage in damaged_lines {
-                    self.damage_tracker.frame().damage_line(damage);
-                }
-            },
-        }
-        terminal.reset_damage();
+        let app_cursor_icon = terminal.mouse_cursor_icon();
+        let mouse_reporting = terminal.mode().intersects(TermMode::MOUSE_MODE);
 
         drop(terminal);
 
-        self.validate_hint_highlights(display_offset);
+        self.validate_hint_highlights(display_offset, app_cursor_icon, mouse_reporting);
 
         let requires_full_damage = self.visual_bell.intensity() != 0.
             || self.hint_state.active()
@@ -580,6 +721,7 @@ impl Display {
         }
 
         let mut scene = Scene::new();
+        self.text_scene_builds = self.text_scene_builds.saturating_add(1);
 
         let render_start = Instant::now();
         {
@@ -589,12 +731,28 @@ impl Display {
                 Self::paint_cell_background(&mut scene, cell, size_info);
             }
 
-            if let Some(image) = self.scene_renderer.prepare_media(&size_info, display_offset) {
-                scene.draw_image(&image, Affine::IDENTITY);
+            if let Some(media) = &prepared_media {
+                scene.draw_image(&media.image, Affine::IDENTITY);
             }
 
-            for cell in &prepared_cells {
-                Self::paint_cell_text(&mut scene, text_system, size_info, cell);
+            for span in
+                terminal_text_spans(&prepared_cells, cursor.point(), text_system.ligatures())
+            {
+                if span.shaped_run {
+                    Self::paint_terminal_run(
+                        &mut scene,
+                        text_system,
+                        size_info,
+                        &prepared_cells[span.cells],
+                    );
+                } else {
+                    Self::paint_cell_text(
+                        &mut scene,
+                        text_system,
+                        size_info,
+                        &prepared_cells[span.cells.start],
+                    );
+                }
             }
 
             let mut rects = lines.rects(&metrics, &size_info);
@@ -716,10 +874,26 @@ impl Display {
             background_color.b,
             (config.window_opacity() * 255.) as u8,
         );
-        let presented = self
-            .scene_renderer
-            .render(&scene, base_color)
-            .unwrap_or_else(|err| panic!("renderer stopped after a fatal GPU error: {err}"));
+        let (presented, cacheable) = match self.scene_renderer.render(&scene, base_color) {
+            Ok(presented) => {
+                self.renderer_retry_delay = INITIAL_RENDERER_RETRY;
+                (presented, true)
+            },
+            Err(error) => {
+                // The GPU went away. Rebuild and let the next frame paint rather than taking the
+                // terminal down: the grid, the PTY, and every Vivid session are all still intact,
+                // and track textures re-upload from the scene's retained frames.
+                self.recover_from_render_error(&error, config, scheduler);
+                (false, false)
+            },
+        };
+
+        if cacheable {
+            self.cached_scene = Some(scene);
+            self.cached_media_generation = media_generation;
+            self.cached_base_color = base_color;
+        }
+        self.vivid_frame_requested = false;
 
         self.request_frame(scheduler);
         self.damage_tracker.swap_damage();
@@ -727,6 +901,7 @@ impl Display {
     }
 
     pub fn update_config(&mut self, config: &UiConfig) {
+        self.invalidate_cached_scene();
         self.damage_tracker.debug = config.debug.highlight_damage;
         self.visual_bell.update_config(&config.bell);
         self.colors = List::from(&config.colors);
@@ -761,11 +936,12 @@ impl Display {
             self.window.set_mouse_cursor(CursorIcon::Pointer);
         } else if self.highlighted_hint.is_some() {
             self.hint_mouse_point = None;
-            if term.mode().intersects(TermMode::MOUSE_MODE) {
-                self.window.set_mouse_cursor(CursorIcon::Default);
-            } else {
-                self.window.set_mouse_cursor(CursorIcon::Text);
-            }
+            self.window.set_mouse_cursor(resolve_mouse_cursor(
+                None,
+                false,
+                term.mouse_cursor_icon(),
+                term.mode().intersects(TermMode::MOUSE_MODE),
+            ));
         }
 
         let mouse_highlight_dirty = self.highlighted_hint != highlighted_hint;
@@ -821,6 +997,29 @@ impl Display {
         );
     }
 
+    fn paint_terminal_run(
+        scene: &mut Scene,
+        text_system: &mut TextSystem,
+        size: SizeInfo,
+        cells: &[RenderableCell],
+    ) {
+        let Some(first) = cells.first() else {
+            return;
+        };
+        let run = terminal_shaping_run(cells);
+        let layout =
+            text_system.shape_terminal_run(run.text.clone(), &run.styles, text_system.ligatures());
+        Self::paint_terminal_run_layout(
+            scene,
+            &layout,
+            &run.cells,
+            text_system.metrics(),
+            size,
+            first.point.line,
+            run.origin_column,
+        );
+    }
+
     fn paint_layout(
         scene: &mut Scene,
         layout: &parley::Layout<()>,
@@ -859,6 +1058,78 @@ impl Display {
                         Fill::NonZero,
                         glyph_run.glyphs().map(|glyph| scene_glyph_from_layout(&mut x, y, glyph)),
                     );
+            }
+        }
+    }
+
+    /// Paint a multi-cell layout while anchoring every shaped cluster to its terminal column.
+    ///
+    /// Parley represents a ligature as one start cluster followed by continuation clusters. The
+    /// start owns the combined glyph, while continuations must not paint it again. Resetting the
+    /// horizontal origin for every other cluster prevents proportional fallback glyphs or rounding
+    /// from shifting later terminal cells off the fixed grid.
+    fn paint_terminal_run_layout(
+        scene: &mut Scene,
+        layout: &parley::Layout<Rgb>,
+        cells: &[TerminalShapingCell],
+        metrics: TextMetrics,
+        size: SizeInfo,
+        line: usize,
+        column: usize,
+    ) {
+        let transform = Affine::translate((
+            (size.padding_x() + column as f32 * size.cell_width() + metrics.glyph_offset_x) as f64,
+            (size.padding_y() + line as f32 * size.cell_height() + metrics.glyph_offset_y) as f64,
+        ));
+        for line in layout.lines() {
+            let baseline = line.metrics().baseline;
+            let mut visual_x = 0.0;
+            for shaped_run in line.runs() {
+                let mut pending_rtl_ligature_x = None;
+                let mut glyphs_by_style = vec![Vec::new(); layout.styles().len()];
+                for cluster in shaped_run.visual_clusters() {
+                    let Some(cell) = terminal_cell_for_byte(cells, cluster.text_range().start)
+                    else {
+                        continue;
+                    };
+                    let cluster_x = visual_x;
+                    visual_x += cell.width as f32 * size.cell_width();
+
+                    if cluster.is_ligature_continuation() {
+                        pending_rtl_ligature_x.get_or_insert(cluster_x);
+                        continue;
+                    }
+                    if cell.hidden {
+                        pending_rtl_ligature_x = None;
+                        continue;
+                    }
+
+                    let mut x = if shaped_run.is_rtl() {
+                        pending_rtl_ligature_x.take().unwrap_or(cluster_x)
+                    } else {
+                        cluster_x
+                    };
+                    for glyph in cluster.glyphs() {
+                        let style_index = glyph.style_index as usize;
+                        glyphs_by_style[style_index]
+                            .push(scene_glyph_from_layout(&mut x, baseline, glyph));
+                    }
+                }
+
+                for (style, glyphs) in layout.styles().iter().zip(glyphs_by_style) {
+                    if glyphs.is_empty() {
+                        continue;
+                    }
+                    let brush = vello::peniko::Brush::Solid(color_from_rgb(style.brush));
+                    scene
+                        .draw_glyphs(shaped_run.font())
+                        .brush(&brush)
+                        .hint(false)
+                        .transform(transform)
+                        .font_size(shaped_run.font_size())
+                        .normalized_coords(shaped_run.normalized_coords())
+                        .draw(Fill::NonZero, glyphs.into_iter());
+                }
             }
         }
     }
@@ -1119,7 +1390,12 @@ impl Display {
         }
     }
 
-    fn validate_hint_highlights(&mut self, display_offset: usize) {
+    fn validate_hint_highlights(
+        &mut self,
+        display_offset: usize,
+        app_icon: Option<CursorIcon>,
+        mouse_reporting: bool,
+    ) {
         let frame = self.damage_tracker.frame();
         let hints = [(&mut self.highlighted_hint, &mut self.highlighted_hint_age, true)];
 
@@ -1144,7 +1420,12 @@ impl Display {
 
             if frame.intersects(start, end) {
                 if reset_mouse {
-                    self.window.set_mouse_cursor(CursorIcon::Default);
+                    self.window.set_mouse_cursor(resolve_mouse_cursor(
+                        None,
+                        false,
+                        app_icon,
+                        mouse_reporting,
+                    ));
                 }
                 frame.mark_fully_damaged();
                 *hint = None;
@@ -1152,8 +1433,83 @@ impl Display {
         }
     }
 
+    fn recover_from_render_error(
+        &mut self,
+        error: &renderer::Error,
+        config: &UiConfig,
+        scheduler: &mut Scheduler,
+    ) {
+        self.invalidate_cached_scene();
+        log::warn!("GPU render failed ({error}); rebuilding the renderer");
+        if let Err(rebuild) = self.rebuild_renderer(config) {
+            log::warn!(
+                "GPU renderer remains unavailable ({rebuild}); retrying in {:?}",
+                self.renderer_retry_delay
+            );
+            self.renderer_unavailable = true;
+            self.schedule_renderer_retry(scheduler);
+        }
+    }
+
+    pub(crate) fn retry_renderer(&mut self, config: &UiConfig, scheduler: &mut Scheduler) -> bool {
+        if !self.renderer_unavailable {
+            return true;
+        }
+        match self.rebuild_renderer(config) {
+            Ok(()) => true,
+            Err(error) => {
+                log::warn!(
+                    "GPU renderer recovery failed ({error}); retrying in {:?}",
+                    self.renderer_retry_delay
+                );
+                self.schedule_renderer_retry(scheduler);
+                false
+            },
+        }
+    }
+
+    fn rebuild_renderer(&mut self, config: &UiConfig) -> Result<(), renderer::Error> {
+        self.scene_renderer.rebuild(
+            self.window.render_source(),
+            self.window.inner_size(),
+            config.window_opacity() < 1.0,
+        )?;
+        self.renderer_unavailable = false;
+        self.invalidate_cached_scene();
+        if let Some(scene) = self.vivid_scene.clone() {
+            self.scene_renderer.set_vivid_scene(scene);
+        }
+        // Nothing on the new device has been painted, so the next frame must draw everything.
+        self.damage_tracker.frame().mark_fully_damaged();
+        self.damage_tracker.next_frame().mark_fully_damaged();
+        self.window.request_redraw();
+        Ok(())
+    }
+
+    fn schedule_renderer_retry(&mut self, scheduler: &mut Scheduler) {
+        let window_id = self.window.id();
+        let timer_id = TimerId::new(Topic::RendererRecovery, window_id);
+        scheduler.unschedule(timer_id);
+        scheduler.schedule(
+            Event::new(EventType::RendererRecovery, window_id),
+            self.renderer_retry_delay,
+            false,
+            timer_id,
+        );
+        self.renderer_retry_delay = next_renderer_retry_delay(self.renderer_retry_delay);
+    }
+
     fn request_frame(&mut self, scheduler: &mut Scheduler) {
         self.window.has_frame = false;
+
+        let window_id = self.window.id();
+        let timer_id = TimerId::new(Topic::Frame, window_id);
+        // OS redraws can bypass our frame gate. Preserve both the existing deadline and the frame
+        // timer's synchronization point when that happens: restarting either on every redraw can
+        // starve or jitter frames under continuous wheel input.
+        if scheduler.scheduled(timer_id) {
+            return;
+        }
 
         let monitor_vblank_interval = 1_000_000.
             / self
@@ -1165,11 +1521,38 @@ impl Display {
             Duration::from_micros((1000. * monitor_vblank_interval) as u64);
 
         let swap_timeout = self.frame_timer.compute_timeout(monitor_vblank_interval);
-        let window_id = self.window.id();
-        let timer_id = TimerId::new(Topic::Frame, window_id);
         let event = Event::new(EventType::Frame, window_id);
         scheduler.schedule(event, swap_timeout, false, timer_id);
     }
+}
+
+/// Resolve the visible mouse cursor from interaction state.
+///
+/// Precedence: message bar and highlighted hints are Vivido UI affordances; then the shape the
+/// application requested with OSC 22; then the arrow while the application reports mouse
+/// events; otherwise the text caret. Callers without modifier state pass mouse reporting
+/// without the shift exemption, matching the historical behavior of the display-side restores.
+pub(crate) fn resolve_mouse_cursor(
+    ui_icon: Option<CursorIcon>,
+    hint_highlighted: bool,
+    app_icon: Option<CursorIcon>,
+    mouse_reporting: bool,
+) -> CursorIcon {
+    if let Some(icon) = ui_icon {
+        icon
+    } else if hint_highlighted {
+        CursorIcon::Pointer
+    } else if let Some(icon) = app_icon {
+        icon
+    } else if mouse_reporting {
+        CursorIcon::Default
+    } else {
+        CursorIcon::Text
+    }
+}
+
+fn next_renderer_retry_delay(current: Duration) -> Duration {
+    current.saturating_mul(2).min(MAX_RENDERER_RETRY)
 }
 
 fn scene_glyph_from_layout(
@@ -1190,9 +1573,271 @@ fn text_cell_width(text: &str) -> usize {
     text.chars().map(char_cell_width).sum()
 }
 
+fn terminal_shaping_run(cells: &[RenderableCell]) -> TerminalShapingRun {
+    let first = cells.first().expect("terminal shaping runs are non-empty");
+    let mut run = TerminalShapingRun {
+        text: String::new(),
+        styles: Vec::new(),
+        cells: Vec::new(),
+        origin_column: first.point.column.0,
+    };
+    let mut next_column = run.origin_column;
+
+    for cell in cells {
+        debug_assert_eq!(cell.point.line, first.point.line);
+        while next_column < cell.point.column.0 {
+            push_terminal_shaping_cell(&mut run, " ", 1, false, Flags::empty(), first.fg);
+            next_column += 1;
+        }
+
+        if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+            next_column = next_column.max(cell.point.column.0.saturating_add(1));
+            continue;
+        }
+
+        let mut content = String::new();
+        let hidden = cell.flags.contains(Flags::HIDDEN);
+        content.push(if cell.character == '\t' || hidden { ' ' } else { cell.character });
+        if !hidden
+            && let Some(zerowidth) = cell.extra.as_ref().and_then(|extra| extra.zerowidth.as_ref())
+        {
+            content.extend(zerowidth.iter().copied());
+        }
+        let width =
+            if cell.flags.contains(Flags::WIDE_CHAR) { 2 } else { char_cell_width(cell.character) };
+        push_terminal_shaping_cell(&mut run, &content, width, hidden, cell.flags, cell.fg);
+        next_column = cell.point.column.0.saturating_add(width);
+    }
+
+    run
+}
+
+fn push_terminal_shaping_cell(
+    run: &mut TerminalShapingRun,
+    content: &str,
+    width: usize,
+    hidden: bool,
+    flags: Flags,
+    color: Rgb,
+) {
+    let start = run.text.len();
+    run.text.push_str(content);
+    let end = run.text.len();
+    run.cells.push(TerminalShapingCell { text: start..end, width, hidden });
+
+    if let Some(previous) = run.styles.last_mut()
+        && previous.range.end == start
+        && terminal_font_variant(previous.flags) == terminal_font_variant(flags)
+        && previous.color == color
+    {
+        previous.range.end = end;
+    } else {
+        run.styles.push(TerminalTextStyle { range: start..end, flags, color });
+    }
+}
+
+fn terminal_cell_for_byte(
+    cells: &[TerminalShapingCell],
+    byte_index: usize,
+) -> Option<&TerminalShapingCell> {
+    let index = cells.partition_point(|cell| cell.text.end <= byte_index);
+    cells.get(index).filter(|cell| cell.text.contains(&byte_index))
+}
+
+/// Split prepared terminal cells into independent cells and compatible multi-cell shaping runs.
+fn terminal_text_spans(
+    cells: &[RenderableCell],
+    cursor: Point<usize>,
+    ligatures: bool,
+) -> Vec<TerminalTextSpan> {
+    let mut spans = Vec::with_capacity(cells.len());
+    let mut start = 0;
+
+    while start < cells.len() {
+        let line = cells[start].point.line;
+        let line_end = cells[start..]
+            .iter()
+            .position(|cell| cell.point.line != line)
+            .map_or(cells.len(), |offset| start + offset);
+        if cells[start..line_end].iter().any(cell_needs_complex_shaping) {
+            let content_start = (start..line_end)
+                .find(|index| cell_has_shaping_content(&cells[*index]))
+                .expect("a complex row contains shaping content");
+            let content_end = (start..line_end)
+                .rfind(|index| cell_has_shaping_content(&cells[*index]))
+                .map(|index| index + 1)
+                .expect("a complex row contains shaping content");
+
+            spans.extend(
+                (start..content_start)
+                    .map(|index| TerminalTextSpan { cells: index..index + 1, shaped_run: false }),
+            );
+
+            let mut segment_start = content_start;
+            for (offset, cell) in cells[content_start..content_end].iter().enumerate() {
+                if cell.point != cursor {
+                    continue;
+                }
+                let index = content_start + offset;
+                if segment_start < index {
+                    spans.push(TerminalTextSpan { cells: segment_start..index, shaped_run: true });
+                }
+                spans.push(TerminalTextSpan { cells: index..index + 1, shaped_run: false });
+                segment_start = index + 1;
+            }
+            if segment_start < content_end {
+                spans
+                    .push(TerminalTextSpan { cells: segment_start..content_end, shaped_run: true });
+            }
+            spans.extend(
+                (content_end..line_end)
+                    .map(|index| TerminalTextSpan { cells: index..index + 1, shaped_run: false }),
+            );
+            start = line_end;
+            continue;
+        }
+
+        if !ligatures || !ligature_cell_is_eligible(&cells[start], cursor) {
+            spans.push(TerminalTextSpan { cells: start..start + 1, shaped_run: false });
+            start += 1;
+            continue;
+        }
+
+        let mut end = start + 1;
+        while end < cells.len()
+            && ligature_cell_is_eligible(&cells[end], cursor)
+            && ligature_cells_are_compatible(&cells[end - 1], &cells[end])
+        {
+            end += 1;
+        }
+
+        let shaped_run = end - start > 1;
+        spans.push(TerminalTextSpan {
+            cells: start..if shaped_run { end } else { start + 1 },
+            shaped_run,
+        });
+        start = if shaped_run { end } else { start + 1 };
+    }
+
+    spans
+}
+
+fn cell_needs_complex_shaping(cell: &RenderableCell) -> bool {
+    !cell.flags.contains(Flags::HIDDEN)
+        && (!cell.character.is_ascii()
+            || cell.extra.as_ref().is_some_and(|extra| {
+                extra.zerowidth.as_ref().is_some_and(|characters| {
+                    characters.iter().any(|character| !character.is_ascii())
+                })
+            }))
+}
+
+fn cell_has_shaping_content(cell: &RenderableCell) -> bool {
+    !cell.flags.contains(Flags::HIDDEN)
+        && (cell.character != ' '
+            || cell
+                .extra
+                .as_ref()
+                .and_then(|extra| extra.zerowidth.as_ref())
+                .is_some_and(|characters| !characters.is_empty()))
+}
+
+fn ligature_cell_is_eligible(cell: &RenderableCell, cursor: Point<usize>) -> bool {
+    cell.point != cursor
+        && cell.character.is_ascii_graphic()
+        && !cell.flags.intersects(Flags::HIDDEN | Flags::WIDE_CHAR | Flags::WIDE_CHAR_SPACER)
+        && cell
+            .extra
+            .as_ref()
+            .is_none_or(|extra| extra.zerowidth.as_ref().is_none_or(|chars| chars.is_empty()))
+}
+
+fn ligature_cells_are_compatible(left: &RenderableCell, right: &RenderableCell) -> bool {
+    left.point.line == right.point.line
+        && left.point.column.0.checked_add(1) == Some(right.point.column.0)
+        && terminal_font_variant(left.flags) == terminal_font_variant(right.flags)
+        && left.fg == right.fg
+        && left.bg == right.bg
+        && left.bg_alpha == right.bg_alpha
+}
+
+fn terminal_font_variant(flags: Flags) -> (bool, bool) {
+    (flags.intersects(Flags::BOLD | Flags::DIM_BOLD), flags.contains(Flags::ITALIC))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{scene_glyph_from_layout, text_cell_width};
+    use super::{
+        INITIAL_RENDERER_RETRY, MAX_RENDERER_RETRY, TerminalTextSpan, next_renderer_retry_delay,
+        rescale_font_size, resolve_mouse_cursor, scale_padding, scaled_size_info,
+        scene_glyph_from_layout, terminal_shaping_run, terminal_text_spans, text_cell_width,
+    };
+    use crate::config::font::FontSize;
+    use crate::display::color::Rgb;
+    use crate::display::content::RenderableCell;
+    use crate::terminal::grid::Dimensions as _;
+    use crate::terminal::index::{Column, Point};
+    use crate::terminal::term::cell::Flags;
+    use winit::dpi::PhysicalSize;
+    use winit::window::CursorIcon;
+
+    fn renderable_cell(line: usize, column: usize, character: char) -> RenderableCell {
+        RenderableCell {
+            character,
+            point: Point::new(line, Column(column)),
+            fg: Rgb::new(220, 220, 220),
+            bg: Rgb::new(10, 10, 10),
+            bg_alpha: 0.0,
+            underline: Rgb::new(220, 220, 220),
+            flags: Flags::empty(),
+            extra: None,
+        }
+    }
+
+    #[test]
+    fn mouse_cursor_resolution_precedence() {
+        // Each layer outranks the one below it.
+        assert_eq!(
+            resolve_mouse_cursor(
+                Some(CursorIcon::Crosshair),
+                true,
+                Some(CursorIcon::Progress),
+                true
+            ),
+            CursorIcon::Crosshair
+        );
+        assert_eq!(
+            resolve_mouse_cursor(None, true, Some(CursorIcon::Progress), true),
+            CursorIcon::Pointer
+        );
+        // An application shape outranks the mouse-reporting arrow.
+        assert_eq!(
+            resolve_mouse_cursor(None, false, Some(CursorIcon::Progress), true),
+            CursorIcon::Progress
+        );
+        assert_eq!(resolve_mouse_cursor(None, false, None, true), CursorIcon::Default);
+        assert_eq!(resolve_mouse_cursor(None, false, None, false), CursorIcon::Text);
+    }
+
+    #[test]
+    fn scale_math_handles_integer_fractional_and_repeated_factor_changes() {
+        let base = FontSize::new(12.0);
+        assert_eq!(rescale_font_size(base, 1.0, 2.0).as_pt(), 24.0);
+        assert_eq!(rescale_font_size(base, 1.0, 1.5).as_pt(), 18.0);
+        assert_eq!(rescale_font_size(base, 1.5, 1.5), base);
+        assert_eq!(scale_padding((3.0, 5.0), 1.5), (4.0, 7.0));
+    }
+
+    #[test]
+    fn proportionally_scaled_viewport_metrics_and_padding_preserve_the_grid() {
+        let one = scaled_size_info(PhysicalSize::new(800, 600), 10.0, 20.0, (4.0, 6.0), 1.0, false);
+        let two =
+            scaled_size_info(PhysicalSize::new(1600, 1200), 20.0, 40.0, (4.0, 6.0), 2.0, false);
+        assert_eq!(one.columns(), two.columns());
+        assert_eq!(one.screen_lines(), two.screen_lines());
+        assert_eq!(two.padding_x(), one.padding_x() * 2.0);
+        assert_eq!(two.padding_y(), one.padding_y() * 2.0);
+    }
 
     #[test]
     fn scene_glyphs_use_baseline_relative_y_coordinates() {
@@ -1212,6 +1857,168 @@ mod tests {
         assert_eq!(text_cell_width("abc"), 3);
         assert_eq!(text_cell_width("今a"), 3);
         assert_eq!(text_cell_width(""), 0);
+    }
+
+    #[test]
+    fn compatible_ascii_cells_form_a_ligature_run() {
+        let cells = [renderable_cell(0, 3, '='), renderable_cell(0, 4, '>')];
+
+        assert_eq!(
+            terminal_text_spans(&cells, Point::new(0, Column(0)), true),
+            vec![TerminalTextSpan { cells: 0..2, shaped_run: true }]
+        );
+    }
+
+    #[test]
+    fn disabling_ligatures_restores_independent_cells() {
+        let cells = [renderable_cell(0, 3, '='), renderable_cell(0, 4, '>')];
+
+        assert_eq!(
+            terminal_text_spans(&cells, Point::new(0, Column(0)), false),
+            vec![
+                TerminalTextSpan { cells: 0..1, shaped_run: false },
+                TerminalTextSpan { cells: 1..2, shaped_run: false },
+            ]
+        );
+    }
+
+    #[test]
+    fn cursor_and_presentation_boundaries_split_ligature_runs() {
+        let base =
+            [renderable_cell(0, 3, '='), renderable_cell(0, 4, '>'), renderable_cell(0, 5, '>')];
+        let spans = terminal_text_spans(&base, Point::new(0, Column(4)), true);
+        assert!(spans.iter().all(|span| !span.shaped_run));
+
+        let mut cases = Vec::new();
+
+        let mut gap = base.clone();
+        gap[1].point.column = Column(6);
+        cases.push(gap);
+
+        let mut next_line = base.clone();
+        next_line[1].point.line = 1;
+        cases.push(next_line);
+
+        let mut foreground = base.clone();
+        foreground[1].fg = Rgb::new(255, 0, 0);
+        cases.push(foreground);
+
+        let mut background = base.clone();
+        background[1].bg = Rgb::new(0, 0, 255);
+        cases.push(background);
+
+        let mut alpha = base.clone();
+        alpha[1].bg_alpha = 1.0;
+        cases.push(alpha);
+
+        let mut style = base.clone();
+        style[1].flags.insert(Flags::ITALIC);
+        cases.push(style);
+
+        for cells in cases {
+            let spans = terminal_text_spans(&cells, Point::new(9, Column(9)), true);
+            assert!(!spans[0].shaped_run, "unexpected run for {cells:?}");
+        }
+    }
+
+    #[test]
+    fn ineligible_cells_are_never_shaped_into_ligature_runs() {
+        for (character, flags) in [
+            ('\t', Flags::empty()),
+            (' ', Flags::empty()),
+            ('=', Flags::HIDDEN),
+            ('=', Flags::WIDE_CHAR),
+        ] {
+            let cells = [
+                renderable_cell(0, 0, '='),
+                RenderableCell { character, flags, ..renderable_cell(0, 1, character) },
+            ];
+            assert!(
+                terminal_text_spans(&cells, Point::new(9, Column(9)), true)
+                    .iter()
+                    .all(|span| !span.shaped_run),
+                "unexpected run for {character:?} with {flags:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn complex_text_is_shaped_as_a_row_even_when_ligatures_are_disabled() {
+        let cells = [
+            renderable_cell(0, 3, 'a'),
+            renderable_cell(0, 4, ' '),
+            renderable_cell(0, 5, 'م'),
+            renderable_cell(0, 6, 'ر'),
+        ];
+
+        assert_eq!(
+            terminal_text_spans(&cells, Point::new(9, Column(9)), false),
+            vec![TerminalTextSpan { cells: 0..4, shaped_run: true }]
+        );
+    }
+
+    #[test]
+    fn cursor_cell_does_not_extend_or_shift_an_rtl_shaping_run() {
+        let cells =
+            [renderable_cell(0, 0, 'م'), renderable_cell(0, 1, 'ر'), renderable_cell(0, 20, ' ')];
+
+        assert_eq!(
+            terminal_text_spans(&cells, Point::new(0, Column(20)), true),
+            vec![
+                TerminalTextSpan { cells: 0..2, shaped_run: true },
+                TerminalTextSpan { cells: 2..3, shaped_run: false },
+            ]
+        );
+        assert_eq!(terminal_shaping_run(&cells[..2]).text, "مر");
+    }
+
+    #[test]
+    fn presentation_only_edge_spaces_do_not_extend_an_rtl_shaping_run() {
+        let cells = [
+            renderable_cell(0, 0, ' '),
+            renderable_cell(0, 3, 'م'),
+            renderable_cell(0, 4, 'ر'),
+            renderable_cell(0, 10, ' '),
+        ];
+
+        assert_eq!(
+            terminal_text_spans(&cells, Point::new(9, Column(9)), true),
+            vec![
+                TerminalTextSpan { cells: 0..1, shaped_run: false },
+                TerminalTextSpan { cells: 1..3, shaped_run: true },
+                TerminalTextSpan { cells: 3..4, shaped_run: false },
+            ]
+        );
+        let run = terminal_shaping_run(&cells[1..3]);
+        assert_eq!(run.origin_column, 3);
+        assert_eq!(run.text, "مر");
+    }
+
+    #[test]
+    fn terminal_row_run_preserves_blank_columns_and_combining_marks() {
+        let mut first = renderable_cell(0, 2, 'ب');
+        first.extra = Some(Box::new(crate::display::content::RenderableCellExtra {
+            zerowidth: Some(vec!['َ']),
+            hyperlink: None,
+        }));
+        let second = renderable_cell(0, 5, 'ت');
+
+        let run = terminal_shaping_run(&[first, second]);
+
+        assert_eq!(run.origin_column, 2);
+        assert_eq!(run.text, "بَ  ت");
+        assert_eq!(run.cells.iter().map(|cell| cell.width).collect::<Vec<_>>(), [1, 1, 1, 1]);
+        assert_eq!(run.cells[0].text, 0..4);
+    }
+
+    #[test]
+    fn renderer_recovery_backoff_is_bounded() {
+        let mut delay = INITIAL_RENDERER_RETRY;
+        for _ in 0..16 {
+            delay = next_renderer_retry_delay(delay);
+        }
+        assert_eq!(delay, MAX_RENDERER_RETRY);
+        assert_eq!(next_renderer_retry_delay(delay), MAX_RENDERER_RETRY);
     }
 }
 
@@ -1281,6 +2088,12 @@ pub struct FrameTimer {
     refresh_interval: Duration,
 }
 
+impl Default for FrameTimer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl FrameTimer {
     pub fn new() -> Self {
         let now = Instant::now();
@@ -1318,10 +2131,45 @@ fn window_size(
     cell_height: f32,
     scale_factor: f32,
 ) -> PhysicalSize<u32> {
-    let padding = config.window.padding(scale_factor);
+    let padding = scale_padding(config.window.padding(1.0), scale_factor);
     let grid_width = cell_width * dimensions.columns.max(MIN_COLUMNS) as f32;
     let grid_height = cell_height * dimensions.lines.max(MIN_SCREEN_LINES) as f32;
     let width = padding.0.mul_add(2., grid_width).floor();
     let height = padding.1.mul_add(2., grid_height).floor();
     PhysicalSize::new(width as u32, height as u32)
+}
+
+pub(crate) fn rescale_font_size(
+    font_size: crate::config::font::FontSize,
+    old_factor: f64,
+    new_factor: f64,
+) -> crate::config::font::FontSize {
+    if old_factor <= 0.0 || new_factor <= 0.0 || old_factor == new_factor {
+        return font_size;
+    }
+    font_size.scale((new_factor / old_factor) as f32)
+}
+
+fn scale_padding(logical: (f32, f32), scale_factor: f32) -> (f32, f32) {
+    ((logical.0 * scale_factor).floor(), (logical.1 * scale_factor).floor())
+}
+
+fn scaled_size_info(
+    viewport: PhysicalSize<u32>,
+    cell_width: f32,
+    cell_height: f32,
+    logical_padding: (f32, f32),
+    scale_factor: f32,
+    dynamic_padding: bool,
+) -> SizeInfo {
+    let padding = scale_padding(logical_padding, scale_factor);
+    SizeInfo::new(
+        viewport.width as f32,
+        viewport.height as f32,
+        cell_width,
+        cell_height,
+        padding.0,
+        padding.1,
+        dynamic_padding,
+    )
 }

@@ -7,7 +7,7 @@ but Vivido has removed are listed under [Removed options](#removed-options) so a
 config does not surprise you.
 
 Vivido has no vi mode, no X11/OpenGL backends, and no built-in box-drawing shim. Those knobs are
-gone. In their place Vivido adds a GPU renderer (Vello/wgpu) and the Vivid Protocol 1.1 media side
+gone. In their place Vivido adds a GPU renderer (Vello/wgpu) and the Vivid Protocol 1.5 media side
 channel, which is configured through the environment rather than this file — see
 [Vivid media and the environment](#vivid-media-and-the-environment).
 
@@ -24,6 +24,8 @@ channel, which is configured through the environment rather than this file — s
 - [`selection`](#selection)
 - [`cursor`](#cursor)
 - [`terminal`](#terminal)
+- [`file_drop`](#file_drop)
+- [`message_bar`](#message_bar)
 - [`mouse`](#mouse)
 - [`hints`](#hints)
 - [`keyboard`](#keyboard)
@@ -39,7 +41,7 @@ Vivido looks for `vivido.toml` in the first of these locations that exists:
 |---|---|
 | Linux / BSD | `$XDG_CONFIG_HOME/vivido/vivido.toml`, then `$XDG_CONFIG_HOME/vivido.toml`, then `~/.config/vivido/vivido.toml`, then `~/.vivido.toml`, then `/etc/vivido/vivido.toml` |
 | macOS | `$XDG_CONFIG_HOME/vivido/vivido.toml`, then the same fallbacks as Linux |
-| Windows | `%APPDATA%\vivido\vivido.toml` |
+| Windows | `%USERPROFILE%\.config\vivido\vivido.toml`, then `%USERPROFILE%\vivido\vivido.toml`, then `%APPDATA%\vivido\vivido.toml` |
 
 TOML is the only supported configuration format. Point Vivido at an explicit file with
 `vivido --config-file <path>`.
@@ -77,12 +79,27 @@ key ordering pitfalls.
 | `import` | array of strings | `[]` | Additional config files to merge in. See [Imports](#imports). |
 | `working_directory` | string | *inherit* | Directory the shell starts in. Unset inherits Vivido's working directory. |
 | `live_config_reload` | bool | `true` | Reapply the config automatically when the file changes. |
-| `ipc_socket` | bool | `true` | Offer IPC over a Unix socket (`vivido msg …`). Unix only; ignored on Windows. |
+| `ipc_socket` | bool | `true` | Offer the automation IPC endpoint (`vivido msg …`). An owner-only Unix socket on Linux/macOS, an owner-only named pipe on Windows. `--socket` and `--headless` enable it regardless of this setting. |
 
 ```toml
 [general]
 live_config_reload = true
 working_directory = "~/work"
+```
+
+## `message_bar`
+
+Warnings and errors are shown in a footer that grows to fit the wrapped message text. Warnings are
+dismissed automatically; errors remain until the `[X]` button is clicked or the
+`ClearLogNotice` action is invoked.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `warning_timeout` | integer (s) | `5` | Seconds before a warning is dismissed. `0` keeps warnings visible until dismissed manually. |
+
+```toml
+[message_bar]
+warning_timeout = 5
 ```
 
 ## `env`
@@ -96,7 +113,9 @@ TERM = "vivido"
 WINIT_X11_SCALE_FACTOR = "1.0"
 ```
 
-Vivido uses the `vivido` terminfo entry when installed and falls back to `xterm-256color`.
+Vivido uses the `vivido` terminfo entry when installed and falls back to `xterm-256color`. When
+`vvssh` opens a remote login shell, it also falls back if the remote host does not have Vivido's
+terminfo entry; SSH forwards `TERM`, but not a locally materialized terminfo database.
 
 ## `window`
 
@@ -137,6 +156,12 @@ instance = "Vivido"
 > On Linux, Vivido is Wayland-only. `option_as_alt` applies to macOS; window class maps to the
 > Wayland `app_id`.
 
+> In [headless mode](headless.md) there is no window manager and no monitor. `dimensions` still
+> applies and still derives its pixel size from font metrics, and `padding` still affects the grid;
+> `position`, `decorations`, `opacity`, `blur`, `startup_mode`, `level`, and
+> `decorations_theme_variant` have nothing to act on. `--headless-size WIDTHxHEIGHTpx` bypasses
+> `dimensions` and sets the render surface directly; the scale factor is fixed at 1.0.
+
 ## `scrolling`
 
 | Field | Type | Default | Description |
@@ -162,12 +187,14 @@ family; omit `style` to let the system pick.
 | `italic` | `{ family, style }` | derived from `normal` | Italic face. |
 | `bold_italic` | `{ family, style }` | derived from `normal` | Bold-italic face. |
 | `size` | float | `11.25` | Font size in points. |
+| `ligatures` | boolean | `true` | Shape compatible neighboring terminal cells using ligatures supplied by the selected font. |
 | `offset` | `{ x, y }` | `{ 0, 0 }` | Extra spacing added around each cell. |
 | `glyph_offset` | `{ x, y }` | `{ 0, 0 }` | Shift the glyph within its cell. |
 
 ```toml
 [font]
 size = 12.0
+ligatures = true
 
 [font.normal]
 family = "JetBrains Mono"
@@ -299,12 +326,48 @@ blinking = "Off"
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `osc52` | enum | `onlycopy` | Clipboard access via OSC 52: `disabled`, `onlycopy`, `onlypaste`, `copypaste` (case-insensitive). |
+| `osc_notifications` | bool | `true` | Allow OSC 9 and OSC 99 desktop notifications. |
 | `shell` | string or `{ program, args }` | *system* | Shell to launch instead of the login shell. |
 
 ```toml
 [terminal]
 osc52 = "onlycopy"
+osc_notifications = true
 shell = { program = "/usr/bin/fish", args = ["--login"] }
+```
+
+## `file_drop`
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `paste_remote_path` | bool | `true` | After a remote receiver copies a dropped or pasted file, type its committed absolute remote path into the terminal. |
+
+```toml
+[file_drop]
+paste_remote_path = true
+```
+
+`paste_remote_path` applies only to a drop that a remote `vvreceive` accepted over `vvssh`. It
+makes the remote gesture end the way a local drag does — with the file's path typed at the
+prompt — so an AI-agent CLI running on the remote host sees an image path and attaches it. The
+path is shell-quoted only when it contains whitespace or shell metacharacters.
+
+With the option off, Vivido does not offer the `file-drop-path-v1` profile, so the receiver never
+sends a path and nothing is typed; the file is still copied. Turning it off takes effect
+immediately, while turning it on applies to sessions started afterwards, because profiles are
+negotiated once when a producer connects.
+
+Dropping several files at once queues one path per file. Files that finish within the same frame
+are typed in the order they were dropped; a slow transfer types its path whenever it lands.
+
+Vivido accepts legacy iTerm2 notifications (`OSC 9 ; message ST`) and the core Kitty OSC 99
+protocol for bounded title/body chunks, IDs, update/close, visibility policy, urgency, expiry,
+sound, focus-on-click, and capability queries. Platform-specific fields are advertised only when
+the desktop backend supports them. Icons, buttons, and callbacks into the PTY are not supported.
+
+```sh
+printf '\033]9;Build complete\007'
+printf '\033]99;;Build complete\033\\'
 ```
 
 ## `mouse`
@@ -390,7 +453,7 @@ Each binding needs a `key`, optional `mods` and `mode`, and one of `action`, `ch
 
 Window / app: `Quit`, `Hide`, `HideOtherApplications` (macOS), `Minimize`, `ToggleFullscreen`,
 `ToggleMaximized`, `ToggleSimpleFullscreen` (macOS), `SpawnNewInstance`, `CreateNewWindow`,
-`CreateNewTab` (macOS), `SelectNextTab`, `SelectPreviousTab`, `SelectTab1`…`SelectTab9`,
+`CreateNewTab`, `SelectNextTab`, `SelectPreviousTab`, `SelectTab1`…`SelectTab9`,
 `SelectLastTab`.
 
 Clipboard / selection: `Copy`, `Paste`, `CopySelection`, `PasteSelection`, `ClearSelection`.
@@ -407,6 +470,52 @@ Search: `SearchForward`, `SearchBackward`. Inside search mode: `SearchFocusNext`
 Misc: `ClearHistory`, `ClearLogNotice`, `ReceiveChar`, `None`.
 
 > There is no vi mode, so vi-motion, vi-cursor, and vi-selection actions do not exist in Vivido.
+
+### Default Windows/Linux tab bindings
+
+| Keys | Action |
+|---|---|
+| `Ctrl+Shift+T` | Create and activate a tab |
+| `Ctrl+Shift+W` | Close the active tab |
+| `Ctrl+Tab` / `Ctrl+Shift+Tab` | Select the next / previous tab, wrapping at either end |
+| `Alt+1`…`Alt+8` | Select the matching tab from the left |
+| `Alt+9` | Select the last tab |
+
+On Windows and Linux, `CreateNewWindow` also creates a tab in the current Vivido window.
+`SpawnNewInstance` is the action for another top-level OS window. Custom bindings replace these
+defaults by trigger in the normal way.
+
+### The tab strip's `+` menu
+
+Left-clicking `+` creates a tab immediately, running whatever the active tab runs. Right-clicking it
+opens a small menu of launch choices instead, which the pointer or the arrow keys select from,
+`Enter` runs, and `Esc` or a click elsewhere dismisses.
+
+What the menu offers depends on the platform:
+
+| Platform | Entries |
+|---|---|
+| Linux | `New Tab`, and `New Window` for another top-level Vivido |
+| Windows | `PowerShell` — `pwsh.exe` when it is installed, otherwise `powershell.exe` — and one `WSL: <distribution>` row per installed WSL distribution |
+
+Windows probes for those programs once per session, so a distribution installed while Vivido is
+running appears the next time it starts. A tab opened from the menu keeps its shell: clicking `+`
+from a WSL tab opens another WSL tab.
+
+macOS has no `+` button — it uses native window tabbing — so the menu does not apply there.
+
+### Default macOS tab bindings
+
+| Keys | Action |
+|---|---|
+| `Command+T` | Create a new tab |
+| `Command+Tab` / `Command+Shift+Tab` | Select the next / previous tab |
+| `Command+1`…`Command+8` | Select the matching tab from the left |
+| `Command+9` | Select the last tab |
+
+When the native tab bar is visible, each reachable tab shows its shortcut at the right edge. With
+more than nine tabs, the first eight show `⌘1`…`⌘8`, the last shows `⌘9`, and intervening tabs have
+no number badge. The badges follow the current tab order after tabs are created, closed, or moved.
 
 ### Default search bindings
 
@@ -456,24 +565,31 @@ render_timer = false
 
 ## Vivid media and the environment
 
-Vivido is the reference **Vivid Protocol 1.1** presenter: it decodes and composites images, video,
+Vivido is a **Vivid Protocol 1.5** terminal presenter: it decodes and composites images, video,
 and audio delivered over an authenticated per-window side channel (see the project `README.md` and
-`docs/vivid_protocol_spec.md`). This pathway is **not** configured through `vivido.toml`. There are
-no TOML knobs for codecs, buffering, credits, or endpoints — the presenter negotiates all of that at
+`../vivid_protocol/vivid-protocol-1.5-spec.md`). This pathway is **not** configured through
+`vivido.toml`. There are
+no TOML knobs for codecs, buffering, flow limits, or endpoints — the presenter negotiates that at
 runtime and keeps media bytes off the PTY.
 
 What you interact with instead is the environment Vivido sets for programs it launches:
 
-- `VIVID_ENDPOINT` — the private per-window control endpoint. Vivido exports this to its child
-  shell automatically; producers such as `vivi` read it.
-- `VIVID_TOKEN` — the per-window capability token. **Never** print, log, copy into shell history,
+- `SHELL` (Windows) — the shell program Vivido actually launched, including a `-e` override. This
+  lets nested terminal tools such as `vvmux` preserve the shell choice instead of falling back to
+  `%COMSPEC%` (`cmd.exe`).
+- `VIVID_ENDPOINT_CONTROL` — the private per-window control endpoint. Vivido exports this to its
+  child shell automatically; 1.5 producers read it.
+- `VIVID_ROOT_SECRET` — the per-window root authentication secret. **Never** print, log, copy into shell history,
   pass as a command argument, or commit it. Treat it like a password.
-- `VIVID_ENDPOINT_BULK` — an optional separate media transport advertised by `vvssh` for remote
-  sessions. It is transport discovery only; control always stays on `VIVID_ENDPOINT`.
+- `VIVID_ENDPOINT_REALTIME` — optional realtime-track discovery. If absent, producers use the
+  bulk endpoint and then the control endpoint according to the 1.5 fallback order.
+- `VIVID_ENDPOINT_BULK` — the bulk-track transport advertised by default by `vvssh` for remote
+  sessions. `vvssh` exports a different private endpoint for `VIVID_ENDPOINT_REALTIME`, and gives
+  each lane its own SSH TCP connection so bulk video cannot head-of-line block audio. Control
+  always stays on `VIVID_ENDPOINT_CONTROL`. `vvssh --shared-media-transport` is the legacy opt-out.
 
 For remote display, use the bundled `vvssh` wrapper rather than plain `ssh`, which does not forward
 the media endpoint. See `docs/vivi-over-ssh.md`.
 
 Rendering backend is fixed per platform and not configurable: Metal on macOS, DirectX 12 on
 Windows, Vulkan on Linux (Wayland only).
-

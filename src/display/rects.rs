@@ -19,6 +19,8 @@ pub struct RenderRect {
     pub y: f32,
     pub width: f32,
     pub height: f32,
+    /// Stroke width for path-backed decorations; filled rectangles use `height`.
+    pub stroke_width: f32,
     pub color: Rgb,
     pub alpha: f32,
     pub kind: RectKind,
@@ -26,7 +28,7 @@ pub struct RenderRect {
 
 impl RenderRect {
     pub fn new(x: f32, y: f32, width: f32, height: f32, color: Rgb, alpha: f32) -> Self {
-        Self { x, y, width, height, color, alpha, kind: RectKind::Normal }
+        Self { x, y, width, height, stroke_width: height, color, alpha, kind: RectKind::Normal }
     }
 }
 
@@ -104,6 +106,11 @@ impl RenderLine {
         let mut rect =
             Self::create_rect(size, metrics.descent, start, end, position, thickness, color);
         rect.kind = kind;
+        if kind == RectKind::Undercurl {
+            // The descent determines the curl's height, but its line weight should match the
+            // selected font's underline rather than filling most of the descent area.
+            rect.stroke_width = metrics.underline_thickness.max(1.0);
+        }
         rects.push(rect);
     }
 
@@ -272,5 +279,41 @@ fn paint_undercurl(scene: &mut Scene, rect: &RenderRect, brush: vello::peniko::C
         up = !up;
     }
 
-    scene.stroke(&Stroke::new(rect.height.max(1.0) as f64), Affine::IDENTITY, brush, None, &path);
+    scene.stroke(
+        &Stroke::new(rect.stroke_width.max(1.0) as f64),
+        Affine::IDENTITY,
+        brush,
+        None,
+        &path,
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RectKind, RenderLine};
+
+    use crate::display::SizeInfo;
+    use crate::display::color::Rgb;
+    use crate::display::text::TextMetrics;
+    use crate::terminal::index::{Column, Point};
+    use crate::terminal::term::cell::Flags;
+
+    #[test]
+    fn undercurl_uses_underline_weight_without_flattening_its_wave() {
+        let line = RenderLine {
+            start: Point::new(0, Column(0)),
+            end: Point::new(0, Column(1)),
+            color: Rgb::new(255, 0, 0),
+        };
+        let metrics =
+            TextMetrics { descent: -4.0, underline_thickness: 1.25, ..Default::default() };
+        let size = SizeInfo::new(100.0, 40.0, 10.0, 20.0, 0.0, 0.0, false);
+
+        let rects = line.rects(&metrics, &size, Flags::UNDERCURL);
+
+        assert_eq!(rects.len(), 1);
+        assert_eq!(rects[0].kind, RectKind::Undercurl);
+        assert_eq!(rects[0].height, 4.0);
+        assert_eq!(rects[0].stroke_width, 1.25);
+    }
 }

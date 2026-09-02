@@ -1,32 +1,41 @@
-//! Unix I/O event polling.
+//! Local IPC and shutdown event listeners.
 
+#[cfg(unix)]
 use polling::{Event as PollEvent, Events, Poller};
+#[cfg(windows)]
+use std::io;
 use std::io::Error as IoError;
 use std::path::PathBuf;
-use std::process;
 
 use log::error;
 use std::result::Result;
-use winit::event_loop::EventLoopProxy;
 
 use crate::terminal::thread;
 
 use crate::UiConfig;
 use crate::cli::Options;
-use crate::event::Event;
+use crate::event::EventSink;
+#[cfg(windows)]
+use crate::event::{Event, EventType};
 use crate::polling::ipc::IpcListener;
+#[cfg(unix)]
 use crate::polling::signal::SignalListener;
 
 pub mod ipc;
+#[cfg(unix)]
 mod signal;
+pub(crate) mod transport;
 
 /// Polling key for signal read events.
+#[cfg(unix)]
 const SIGNAL_READ_KEY: usize = 1;
 
 /// Polling key for IPC read events.
+#[cfg(unix)]
 const IPC_READ_KEY: usize = 0;
 
 /// Unix I/O event listener.
+#[cfg(unix)]
 pub struct IoListener {
     ipc_listener: Option<IpcListener>,
     signal_listener: SignalListener,
@@ -34,23 +43,20 @@ pub struct IoListener {
     poller: Poller,
 }
 
+#[cfg(unix)]
 impl IoListener {
     /// Create background thread to listen for I/O events.
     pub fn spawn(
         config: &UiConfig,
         options: &Options,
-        event_proxy: EventLoopProxy<Event>,
+        event_proxy: EventSink,
     ) -> Result<IoListenerHandle, IoError> {
         let poller = Poller::new()?;
         let events = Events::new();
 
         // Create socket listener for IPC messages.
         let (ipc_socket_path, ipc_listener) = if config.ipc_socket() {
-            let ipc_socket_path = options.socket.clone().unwrap_or_else(|| {
-                let mut path = ipc::socket_dir();
-                path.push(format!("{}-{}.sock", ipc::socket_prefix(), process::id()));
-                path
-            });
+            let ipc_socket_path = options.socket.clone().unwrap_or_else(ipc::default_endpoint);
             let ipc_listener = IpcListener::new(options, event_proxy.clone(), &ipc_socket_path)?;
             (Some(ipc_socket_path), Some(ipc_listener))
         } else {
@@ -105,6 +111,7 @@ impl IoListener {
     }
 }
 
+#[cfg(unix)]
 impl Drop for IoListener {
     fn drop(&mut self) {
         if let Err(err) = self.poller.delete(&self.signal_listener.pipe) {
@@ -116,6 +123,59 @@ impl Drop for IoListener {
             error!("Failed to remove IPC listener interest: {err}");
         }
     }
+}
+
+/// Windows uses a dedicated blocking named-pipe accept thread.
+#[cfg(windows)]
+pub struct IoListener;
+
+#[cfg(windows)]
+impl IoListener {
+    pub fn spawn(
+        config: &UiConfig,
+        options: &Options,
+        event_proxy: EventSink,
+    ) -> Result<IoListenerHandle, IoError> {
+        install_console_handler(event_proxy.clone())?;
+        if !config.ipc_socket() {
+            return Ok(IoListenerHandle { ipc_socket_path: None });
+        }
+
+        let endpoint = options.socket.clone().unwrap_or_else(ipc::default_endpoint);
+        let mut listener = IpcListener::new(options, event_proxy, &endpoint)?;
+        thread::spawn_named("IPC accept listener", move || {
+            loop {
+                if let Err(error) = listener.process_message() {
+                    error!("Failed to accept IPC connection: {error}");
+                }
+            }
+        });
+        Ok(IoListenerHandle { ipc_socket_path: Some(endpoint) })
+    }
+}
+
+#[cfg(windows)]
+static CONSOLE_EVENTS: std::sync::OnceLock<EventSink> = std::sync::OnceLock::new();
+
+#[cfg(windows)]
+fn install_console_handler(event_proxy: EventSink) -> io::Result<()> {
+    use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
+
+    let _ = CONSOLE_EVENTS.set(event_proxy);
+    // SAFETY: the callback is process-global, has the required ABI, and only accesses OnceLock.
+    if unsafe { SetConsoleCtrlHandler(Some(console_handler), 1) } == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+unsafe extern "system" fn console_handler(_event: u32) -> i32 {
+    if let Some(proxy) = CONSOLE_EVENTS.get() {
+        let _ = proxy.send_event(Event::new(EventType::Shutdown, None));
+    }
+    1
 }
 
 /// Public I/O event listener state.

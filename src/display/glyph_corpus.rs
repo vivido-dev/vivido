@@ -1,0 +1,102 @@
+#[derive(Clone, Copy, Debug)]
+pub(super) struct GlyphCorpusEntry {
+    pub codepoint: char,
+    pub group: &'static str,
+    pub expected_family: &'static str,
+    pub note: &'static str,
+    pub requires_nerd_font: bool,
+}
+
+pub(super) const GLYPH_CORPUS: &[GlyphCorpusEntry] = &[
+    GlyphCorpusEntry {
+        codepoint: '\u{e0a0}',
+        group: "powerline",
+        expected_family: "Nerd Font",
+        note: "branch symbol",
+        requires_nerd_font: true,
+    },
+    GlyphCorpusEntry {
+        codepoint: '\u{e0b0}',
+        group: "powerline",
+        expected_family: "Nerd Font",
+        note: "right hard divider",
+        requires_nerd_font: true,
+    },
+    GlyphCorpusEntry {
+        codepoint: '\u{e700}',
+        group: "devicons",
+        expected_family: "Nerd Font",
+        note: "legacy devicon range start",
+        requires_nerd_font: true,
+    },
+    GlyphCorpusEntry {
+        codepoint: '\u{e7c5}',
+        group: "devicons",
+        expected_family: "Nerd Font",
+        note: "legacy devicon range sample",
+        requires_nerd_font: true,
+    },
+    GlyphCorpusEntry {
+        codepoint: '\u{f026}',
+        group: "font-awesome",
+        expected_family: "Nerd Font",
+        note: "volume-off icon used by prompts and status lines",
+        requires_nerd_font: true,
+    },
+    GlyphCorpusEntry {
+        codepoint: '\u{f2b9}',
+        group: "octicons-and-font-awesome",
+        expected_family: "Nerd Font",
+        note: "BMP PUA upper-range sample",
+        requires_nerd_font: true,
+    },
+    GlyphCorpusEntry {
+        codepoint: '\u{f500}',
+        group: "material-and-extended-bmp",
+        expected_family: "Nerd Font",
+        note: "U+F500+ patched icon sample",
+        requires_nerd_font: true,
+    },
+    GlyphCorpusEntry {
+        codepoint: '\u{f0001}',
+        group: "material-design-extended",
+        expected_family: "Nerd Font",
+        note: "supplementary PUA range start sample",
+        requires_nerd_font: true,
+    },
+    GlyphCorpusEntry {
+        codepoint: '\u{f0131}',
+        group: "material-design-extended",
+        expected_family: "Nerd Font",
+        note: "supplementary PUA material icon sample",
+        requires_nerd_font: true,
+    },
+    GlyphCorpusEntry {
+        codepoint: '\u{f0a00}',
+        group: "nerd-font-extended",
+        expected_family: "Nerd Font",
+        note: "supplementary PUA high-range sample",
+        requires_nerd_font: true,
+    },
+    GlyphCorpusEntry {
+        codepoint: '今',
+        group: "cjk",
+        expected_family: "system CJK fallback",
+        note: "general fallback regression guard",
+        requires_nerd_font: false,
+    },
+    GlyphCorpusEntry {
+        codepoint: '🦀',
+        group: "emoji",
+        expected_family: "system emoji fallback",
+        note: "supplementary-plane emoji regression guard",
+        requires_nerd_font: false,
+    },
+    GlyphCorpusEntry {
+        codepoint: '\u{0301}',
+        group: "combining",
+        expected_family: "configured or system text font",
+        note: "combining acute accent regression guard",
+        requires_nerd_font: false,
+    },
+];

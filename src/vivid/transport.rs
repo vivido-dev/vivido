@@ -1,56 +1,190 @@
-use std::io::{self, Read, Write};
+//! Accepted-side Vivid 1.5 framing for the private presenter endpoint.
+
+use std::io::{self, IoSlice, Read, Write};
 #[cfg(windows)]
 use std::net::TcpStream as LocalStream;
 #[cfg(unix)]
-use std::os::fd::AsRawFd;
-#[cfg(unix)]
-use std::os::unix::net::UnixStream;
-use std::sync::Mutex;
-use std::time::Duration;
-
-#[cfg(unix)]
-type LocalStream = UnixStream;
+use std::os::unix::net::UnixStream as LocalStream;
+#[cfg(windows)]
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use vivid_protocol::wire::{
-    HEADER_SIZE, PREFACE_SIZE, Preface, RECORD_KNOWN_FLAGS, Record, RecordHeader,
+    ConnectionKind, HEADER_SIZE, PREFACE_SIZE, Preface, PrefaceClassification, RECORD_KNOWN_FLAGS,
+    Record, RecordHeader,
 };
-use vivid_protocol::{CONTROL_MAX_RECORD_BODY, HARD_MAX_RECORD_BODY, VIVID_MAJOR, VIVID_MINOR};
+use vivid_protocol::{CONTROL_MAX_RECORD_BODY, HARD_MAX_RECORD_BODY};
+
+/// How long an accepted connection has to get from its preface to an authenticated session.
+///
+/// Every connection holds a slot and an OS thread from the moment it is accepted, so the phase
+/// before the peer has proved anything is deadlined. Ten seconds is orders of magnitude above any
+/// real `HELLO`, `CHANNEL_OPEN` or `LANE_OPEN` round trip — a producer that is merely slow cannot
+/// reach it, and one that says nothing at all no longer holds its slot forever. The deadline is
+/// lifted by [`Reader::finish_handshake`] once the peer is authenticated, so a live session is
+/// never timed out for being idle.
+pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Windows does not reliably wake a blocking `recv` when another cloned `TcpStream` handle calls
+/// `shutdown`. Polling keeps both explicit reader cancellation and pre-handshake eviction bounded.
+#[cfg(windows)]
+const WINDOWS_READ_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// How much of a record body is made room for at a time.
+///
+/// Small enough that a declared length nobody intends to send costs almost nothing, large enough
+/// that a real 16 MiB key frame is a handful of amortized growths rather than a per-byte concern.
+const BODY_READ_CHUNK: usize = 64 * 1024;
 
 pub struct Reader {
-    stream: LocalStream,
+    stream: Arc<LocalStream>,
+    #[cfg(windows)]
+    cancelled: Arc<AtomicBool>,
     negotiated_maximum: u32,
     maximum: u32,
     sequence: u64,
+    first_record: bool,
+    handshake_deadline: Option<Instant>,
+    record_idle_timeout: Option<Duration>,
 }
 
 impl Reader {
-    pub fn new(mut stream: LocalStream) -> io::Result<(Self, Preface)> {
+    pub fn new(mut stream: LocalStream) -> io::Result<(Self, Preface, [u8; PREFACE_SIZE])> {
+        let handshake_deadline = Instant::now() + HANDSHAKE_TIMEOUT;
+        #[cfg(unix)]
+        stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
+        #[cfg(windows)]
+        stream.set_read_timeout(Some(WINDOWS_READ_POLL_INTERVAL))?;
+        #[cfg(windows)]
+        let cancelled = Arc::new(AtomicBool::new(false));
         let mut bytes = [0_u8; PREFACE_SIZE];
+        #[cfg(unix)]
         stream.read_exact(&mut bytes)?;
-        let preface = Preface::decode(bytes)?;
-        if preface.major != VIVID_MAJOR || preface.minor != VIVID_MINOR {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("unsupported Vivid major version {}", preface.major),
-            ));
-        }
+        #[cfg(windows)]
+        read_exact_interruptibly(
+            &stream,
+            cancelled.as_ref(),
+            Some(handshake_deadline),
+            &mut bytes,
+        )?;
+        let preface = match Preface::classify(bytes)? {
+            PrefaceClassification::Accepted(preface) => preface,
+            PrefaceClassification::UnsupportedVersion(_) => {
+                stream.write_all(&vivid_protocol::wire::unsupported_version_record())?;
+                stream.flush()?;
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "unsupported Vivid protocol version",
+                ));
+            },
+        };
+        let maximum = preface.initiator_tx_body_limit.min(HARD_MAX_RECORD_BODY);
         Ok((
             Self {
-                stream,
-                negotiated_maximum: preface.initiator_tx_body_limit.min(HARD_MAX_RECORD_BODY),
-                maximum: preface
-                    .initiator_tx_body_limit
-                    .min(HARD_MAX_RECORD_BODY)
-                    .min(CONTROL_MAX_RECORD_BODY),
+                stream: Arc::new(stream),
+                #[cfg(windows)]
+                cancelled,
+                negotiated_maximum: maximum,
+                maximum: if preface.kind == ConnectionKind::Control {
+                    maximum.min(CONTROL_MAX_RECORD_BODY)
+                } else {
+                    maximum
+                },
                 sequence: 0,
+                first_record: true,
+                handshake_deadline: Some(handshake_deadline),
+                record_idle_timeout: None,
             },
             preface,
+            bytes,
         ))
     }
 
-    pub fn read_record(&mut self) -> io::Result<Record> {
+    /// Lift the handshake deadline once this connection's peer has been authenticated.
+    ///
+    /// An established session may legitimately stay silent for hours, so the deadline covers only
+    /// the records before `HELLO`/`CHANNEL_OPEN`/`LANE_OPEN` has been accepted. On Windows the
+    /// short polling timeout stays in place: it is what makes [`ReadShutdown`] able to wake a
+    /// parked reader, not a deadline.
+    pub fn finish_handshake(&mut self) -> io::Result<()> {
+        self.handshake_deadline = None;
+        #[cfg(unix)]
+        self.stream.set_read_timeout(None)?;
+        Ok(())
+    }
+
+    /// Bound inactivity on a dedicated transfer connection after authentication.
+    ///
+    /// The deadline is refreshed only after a complete record is received, so byte-dribbling does
+    /// not keep a half-record alive. The write timeout applies to every clone of the same socket
+    /// and prevents a credited sender from blocking forever when the receiver stops reading.
+    pub fn set_record_idle_timeout(&mut self, timeout: Duration) -> io::Result<()> {
+        if timeout.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "record idle timeout must be nonzero",
+            ));
+        }
+        self.record_idle_timeout = Some(timeout);
+        self.handshake_deadline = Instant::now().checked_add(timeout);
+        #[cfg(unix)]
+        self.stream.set_read_timeout(Some(timeout))?;
+        self.stream.set_write_timeout(Some(timeout))?;
+        Ok(())
+    }
+
+    /// Shorten the handshake deadline so a test does not have to wait the production ten seconds.
+    #[cfg(test)]
+    pub fn set_handshake_deadline(&mut self, within: Duration) {
+        self.handshake_deadline = Some(Instant::now() + within);
+    }
+
+    /// A handle that can unblock a reader parked in [`Self::read_record`].
+    ///
+    /// The session actor uses it after a clean `GOODBYE`: core §6.3 has the presenter reply `OK`
+    /// and close the logical session, so the reader must stop rather than wait for a peer EOF that
+    /// a producer is not obliged to send promptly.
+    pub fn shutdown_handle(&self) -> io::Result<ReadShutdown> {
+        Ok(ReadShutdown {
+            stream: self.stream.clone(),
+            #[cfg(windows)]
+            cancelled: self.cancelled.clone(),
+        })
+    }
+
+    pub fn read_record(&mut self, kind: ConnectionKind) -> io::Result<Record> {
+        let mut body = Vec::new();
+        let header = self.read_record_into(kind, &mut body)?;
+        Ok(Record {
+            record_type: header.record_type,
+            flags: header.flags,
+            object_id: header.object_id,
+            sequence: header.sequence,
+            body,
+        })
+    }
+
+    /// Read one record, reusing `body` for its payload.
+    ///
+    /// A caller that parses and drops a record within one iteration — the media channel loop — can
+    /// hand the same buffer back every time and stop allocating per record entirely. `body` is
+    /// replaced, not appended to, and holds the record's payload when this returns.
+    pub fn read_record_into(
+        &mut self,
+        kind: ConnectionKind,
+        body: &mut Vec<u8>,
+    ) -> io::Result<RecordHeader> {
         let mut bytes = [0_u8; HEADER_SIZE];
-        self.stream.read_exact(&mut bytes)?;
+        #[cfg(unix)]
+        read_exact_interruptibly(self.stream.as_ref(), self.handshake_deadline, &mut bytes)?;
+        #[cfg(windows)]
+        read_exact_interruptibly(
+            self.stream.as_ref(),
+            &self.cancelled,
+            self.handshake_deadline,
+            &mut bytes,
+        )?;
         let header = RecordHeader::decode(bytes);
         if header.flags & !RECORD_KNOWN_FLAGS != 0 {
             return Err(io::Error::new(
@@ -61,7 +195,7 @@ impl Reader {
         if header.body_length > self.maximum || header.body_length > HARD_MAX_RECORD_BODY {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "Vivid record exceeds negotiated maximum",
+                "Vivid record exceeds the accepted body limit",
             ));
         }
         let expected = self.sequence.checked_add(1).ok_or_else(|| {
@@ -70,72 +204,163 @@ impl Reader {
         if header.sequence != expected {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("Vivid record sequence {} does not match {expected}", header.sequence),
+                "Vivid record sequence is not contiguous",
             ));
         }
+        if self.first_record {
+            kind.validate_first_record(&header)?;
+            self.first_record = false;
+        }
         self.sequence = header.sequence;
-        let mut body = vec![0_u8; header.body_length as usize];
-        self.stream.read_exact(&mut body)?;
-        Ok(Record {
-            record_type: header.record_type,
-            flags: header.flags,
-            object_id: header.object_id,
-            sequence: header.sequence,
-            body,
-        })
+        self.read_body_into(header.body_length as usize, body)?;
+        if let Some(timeout) = self.record_idle_timeout {
+            self.handshake_deadline = Instant::now().checked_add(timeout);
+        }
+        Ok(header)
     }
 
-    pub fn writer(&self) -> io::Result<Writer> {
+    /// Read `length` bytes of body, growing `body` as they arrive rather than up front.
+    ///
+    /// The declared length is a peer's claim, not a delivery. Sizing the buffer to it before
+    /// reading let anything that could reach the endpoint charge the presenter
+    /// `HARD_MAX_RECORD_BODY` — 64 MiB — per connection for the price of an eight-byte header, on
+    /// as many connections as it could open. Reading in bounded pieces means the memory a
+    /// connection holds tracks the bytes it has actually sent, so the claim costs nothing until it
+    /// is honoured. A peer that sends what it declared reaches the same buffer by the same total
+    /// amount of copying, since the growth stays amortized.
+    fn read_body_into(&mut self, length: usize, body: &mut Vec<u8>) -> io::Result<()> {
+        body.clear();
+        while body.len() < length {
+            let filled = body.len();
+            let next = length.min(filled.saturating_add(BODY_READ_CHUNK));
+            body.resize(next, 0);
+            #[cfg(unix)]
+            read_exact_interruptibly(
+                self.stream.as_ref(),
+                self.handshake_deadline,
+                &mut body[filled..],
+            )?;
+            #[cfg(windows)]
+            read_exact_interruptibly(
+                self.stream.as_ref(),
+                &self.cancelled,
+                self.handshake_deadline,
+                &mut body[filled..],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn writer(&self, kind: ConnectionKind) -> io::Result<Writer> {
         Ok(Writer {
             inner: Mutex::new(WriterInner {
-                stream: self.stream.try_clone()?,
-                maximum: CONTROL_MAX_RECORD_BODY,
+                stream: self.stream.clone(),
+                maximum: if kind == ConnectionKind::Control {
+                    CONTROL_MAX_RECORD_BODY
+                } else {
+                    HARD_MAX_RECORD_BODY
+                },
                 sequence: 0,
             }),
         })
     }
 
-    pub fn set_maximum(&mut self, maximum: u32) {
-        self.maximum = self.negotiated_maximum.min(maximum);
-    }
-
-    #[cfg(unix)]
-    pub fn wait_readable(&self, timeout: Duration) -> io::Result<bool> {
-        let mut descriptor =
-            libc::pollfd { fd: self.stream.as_raw_fd(), events: libc::POLLIN, revents: 0 };
-        let timeout_ms = timeout.as_millis().min(c_int_max() as u128) as libc::c_int;
-        let result = unsafe { libc::poll(&mut descriptor, 1, timeout_ms) };
-        if result < 0 {
-            let error = io::Error::last_os_error();
-            if error.kind() == io::ErrorKind::Interrupted {
-                return Ok(false);
-            }
-            return Err(error);
+    pub fn set_maximum(&mut self, maximum: u32) -> io::Result<()> {
+        if maximum == 0 || maximum > HARD_MAX_RECORD_BODY {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid incoming record limit",
+            ));
         }
-        Ok(result > 0)
-    }
-
-    #[cfg(windows)]
-    pub fn wait_readable(&self, timeout: Duration) -> io::Result<bool> {
-        self.stream.set_read_timeout(Some(timeout))?;
-        let mut byte = [0_u8; 1];
-        let result = match self.stream.peek(&mut byte) {
-            Ok(_) => Ok(true),
-            Err(error)
-                if matches!(error.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) =>
-            {
-                Ok(false)
-            },
-            Err(error) => Err(error),
-        };
-        self.stream.set_read_timeout(None)?;
-        result
+        self.maximum = self.negotiated_maximum.min(maximum);
+        Ok(())
     }
 }
 
+/// Unblocks a parked reader after the connection's egress has drained.
+#[derive(Clone)]
+pub struct ReadShutdown {
+    stream: Arc<LocalStream>,
+    #[cfg(windows)]
+    cancelled: Arc<AtomicBool>,
+}
+
+impl ReadShutdown {
+    pub fn stop(&self) {
+        #[cfg(windows)]
+        self.cancelled.store(true, Ordering::Release);
+        let _ = self.stream.shutdown(std::net::Shutdown::Both);
+    }
+}
+
+#[cfg(windows)]
+fn read_exact_interruptibly(
+    stream: &LocalStream,
+    cancelled: &AtomicBool,
+    deadline: Option<Instant>,
+    mut bytes: &mut [u8],
+) -> io::Result<()> {
+    while !bytes.is_empty() {
+        let mut stream = stream;
+        match stream.read(bytes) {
+            Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
+            Ok(read) => bytes = &mut bytes[read..],
+            Err(error)
+                if matches!(error.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock) =>
+            {
+                if cancelled.load(Ordering::Acquire) {
+                    return Err(io::Error::new(io::ErrorKind::Interrupted, "reader stopped"));
+                }
+                if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                    return Err(handshake_expired());
+                }
+            },
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
-const fn c_int_max() -> libc::c_int {
-    libc::c_int::MAX
+fn read_exact_interruptibly(
+    stream: &LocalStream,
+    deadline: Option<Instant>,
+    mut bytes: &mut [u8],
+) -> io::Result<()> {
+    let mut stream = stream;
+    let Some(deadline) = deadline else {
+        return stream.read_exact(bytes);
+    };
+    // Before the handshake completes the socket carries a receive timeout, and it is refreshed to
+    // what is left of the deadline so a peer that dribbles one byte at a time cannot extend it.
+    while !bytes.is_empty() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(handshake_expired());
+        }
+        // A peer that has already closed makes this fail on macOS; the timeout installed before
+        // the preface read still bounds the wait, so the read below decides the outcome.
+        let _ = stream.set_read_timeout(Some(remaining));
+        match stream.read(bytes) {
+            Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
+            Ok(read) => bytes = &mut bytes[read..],
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {},
+            Err(error)
+                if matches!(error.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock) =>
+            {
+                return Err(handshake_expired());
+            },
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+fn handshake_expired() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::TimedOut,
+        "Vivid connection did not complete its handshake before the deadline",
+    )
 }
 
 pub struct Writer {
@@ -143,7 +368,7 @@ pub struct Writer {
 }
 
 struct WriterInner {
-    stream: LocalStream,
+    stream: Arc<LocalStream>,
     maximum: u32,
     sequence: u64,
 }
@@ -153,26 +378,39 @@ impl Writer {
         if maximum == 0 || maximum > HARD_MAX_RECORD_BODY {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "invalid outgoing Vivid record limit",
+                "invalid outgoing record limit",
             ));
         }
-        self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).maximum =
-            maximum.min(CONTROL_MAX_RECORD_BODY);
+        self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).maximum = maximum;
         Ok(())
     }
 
     pub fn write_record(&self, record_type: u16, object_id: u64, body: &[u8]) -> io::Result<()> {
-        let body_length = u32::try_from(body.len())
+        self.write_record_parts(record_type, object_id, &[body])
+    }
+
+    pub fn write_record_parts(
+        &self,
+        record_type: u16,
+        object_id: u64,
+        parts: &[&[u8]],
+    ) -> io::Result<()> {
+        let body_length = parts.iter().try_fold(0_usize, |total, part| {
+            total.checked_add(part.len()).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "record body length overflows")
+            })
+        })?;
+        let body_length = u32::try_from(body_length)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "record body exceeds u32"))?;
         let mut inner = self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         if body_length > inner.maximum || body_length > HARD_MAX_RECORD_BODY {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "outgoing Vivid record exceeds negotiated maximum",
+                "outgoing Vivid record exceeds the accepted body limit",
             ));
         }
         inner.sequence = inner.sequence.checked_add(1).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "outgoing record sequence exhausted")
+            io::Error::new(io::ErrorKind::InvalidData, "outgoing sequence exhausted")
         })?;
         let header = RecordHeader {
             body_length,
@@ -181,10 +419,43 @@ impl Writer {
             object_id,
             sequence: inner.sequence,
         };
-        inner.stream.write_all(&header.encode())?;
-        inner.stream.write_all(body)?;
-        inner.stream.flush()
+        let mut stream = inner.stream.as_ref();
+        write_parts(&mut stream, &header.encode(), parts)?;
+        stream.flush()
     }
+}
+
+fn write_parts(stream: &mut &LocalStream, header: &[u8], parts: &[&[u8]]) -> io::Result<()> {
+    let mut buffers = Vec::with_capacity(parts.len() + 1);
+    buffers.push(IoSlice::new(header));
+    buffers.extend(parts.iter().map(|part| IoSlice::new(part)));
+    let mut index = 0;
+    let mut offset = 0;
+    while index < buffers.len() {
+        let current = &buffers[index..];
+        let mut adjusted = Vec::with_capacity(current.len());
+        adjusted.push(IoSlice::new(&current[0][offset..]));
+        adjusted.extend(current[1..].iter().map(|slice| IoSlice::new(slice)));
+        let written = stream.write_vectored(&adjusted)?;
+        if written == 0 {
+            return Err(io::Error::new(io::ErrorKind::WriteZero, "failed to write Vivid record"));
+        }
+        let mut remaining = written;
+        while index < buffers.len() {
+            let available = buffers[index].len() - offset;
+            if remaining < available {
+                offset += remaining;
+                break;
+            }
+            remaining -= available;
+            index += 1;
+            offset = 0;
+            if remaining == 0 {
+                break;
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -194,7 +465,7 @@ mod tests {
 
     #[cfg(unix)]
     fn stream_pair() -> (LocalStream, LocalStream) {
-        UnixStream::pair().unwrap()
+        LocalStream::pair().unwrap()
     }
 
     #[cfg(windows)]
@@ -202,78 +473,176 @@ mod tests {
         use std::net::{Ipv4Addr, TcpListener};
 
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let address = listener.local_addr().unwrap();
-        let client = LocalStream::connect(address).unwrap();
+        let client = LocalStream::connect(listener.local_addr().unwrap()).unwrap();
         let (server, _) = listener.accept().unwrap();
         (client, server)
     }
 
     #[test]
-    fn rejects_out_of_order_records_before_body_dispatch() {
+    fn validates_kind_specific_first_record() {
         let (mut client, server) = stream_pair();
-        client.write_all(&encode_preface(ConnectionKind::Control, 1024)).unwrap();
+        client.write_all(&encode_preface(ConnectionKind::Track, 1024)).unwrap();
         client
             .write_all(
                 &RecordHeader {
                     body_length: 0,
-                    record_type: 1,
+                    record_type: vivid_protocol::messages::HELLO,
                     flags: 0,
-                    object_id: 0,
-                    sequence: 2,
-                }
-                .encode(),
-            )
-            .unwrap();
-        let (mut reader, _) = Reader::new(server).unwrap();
-        assert!(reader.read_record().is_err());
-    }
-
-    #[test]
-    fn rejects_reserved_record_flags_before_body_dispatch() {
-        let (mut client, server) = stream_pair();
-        client.write_all(&encode_preface(ConnectionKind::Control, 1024)).unwrap();
-        client
-            .write_all(
-                &RecordHeader {
-                    body_length: 0,
-                    record_type: 1,
-                    flags: 2,
                     object_id: 0,
                     sequence: 1,
                 }
                 .encode(),
             )
             .unwrap();
-        let (mut reader, _) = Reader::new(server).unwrap();
-        assert!(reader.read_record().is_err());
+        let (mut reader, preface, _) = Reader::new(server).unwrap();
+        assert!(reader.read_record(preface.kind).is_err());
+    }
+
+    /// A peer that sends a preface and then goes silent must not park the reader forever.
+    #[test]
+    fn a_silent_peer_is_dropped_when_the_handshake_deadline_expires() {
+        let (mut client, server) = stream_pair();
+        client.write_all(&encode_preface(ConnectionKind::Control, 1024)).unwrap();
+        let (mut reader, preface, _) = Reader::new(server).unwrap();
+        reader.set_handshake_deadline(Duration::from_millis(50));
+
+        let started = Instant::now();
+        let Err(error) = reader.read_record(preface.kind) else {
+            panic!("a silent peer must not be served past the handshake deadline");
+        };
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < HANDSHAKE_TIMEOUT, "the deadline, not the socket, ended it");
+        drop(client);
+    }
+
+    /// The deadline covers the handshake only: an established session may idle indefinitely.
+    #[test]
+    fn finishing_the_handshake_lifts_the_deadline() {
+        let (mut client, server) = stream_pair();
+        client.write_all(&encode_preface(ConnectionKind::Control, 1024)).unwrap();
+        let (mut reader, preface, _) = Reader::new(server).unwrap();
+        reader.set_handshake_deadline(Duration::from_millis(50));
+        reader.finish_handshake().unwrap();
+
+        // Nothing arrives for longer than the deadline would have allowed; the record that then
+        // does arrive is still served.
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            write_hello(&mut client);
+            client
+        });
+        let record = reader.read_record(preface.kind).expect("an idle session stays open");
+        assert_eq!(record.record_type, vivid_protocol::messages::HELLO);
+        drop(writer.join().unwrap());
+    }
+
+    /// A body length is a claim until the bytes arrive, and must not be charged for before then.
+    ///
+    /// Sizing the buffer to the declared length let anything that could reach the endpoint charge
+    /// the presenter 64 MiB per connection for the price of an eight-byte header.
+    #[test]
+    fn a_declared_body_is_not_allocated_until_it_arrives() {
+        let (mut client, server) = stream_pair();
+        client.write_all(&encode_preface(ConnectionKind::Track, HARD_MAX_RECORD_BODY)).unwrap();
+        let (mut reader, preface, _) = Reader::new(server).unwrap();
+        reader.finish_handshake().unwrap();
+
+        // The largest body the protocol allows, of which a token amount is actually sent.
+        client
+            .write_all(
+                &RecordHeader {
+                    body_length: HARD_MAX_RECORD_BODY,
+                    record_type: vivid_protocol::messages::CHANNEL_OPEN,
+                    flags: 0,
+                    object_id: 0,
+                    sequence: 1,
+                }
+                .encode(),
+            )
+            .unwrap();
+        client.write_all(&[0_u8; 1024]).unwrap();
+        client.shutdown(std::net::Shutdown::Write).unwrap();
+
+        let mut body = Vec::new();
+        let Err(error) = reader.read_record_into(preface.kind, &mut body) else {
+            panic!("a body that was never sent must not be served");
+        };
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+        assert!(
+            body.capacity() <= 2 * BODY_READ_CHUNK,
+            "held {} bytes for a body of which 1 KiB arrived",
+            body.capacity()
+        );
+    }
+
+    /// The media path parses and drops each record within one iteration, so it reads into one
+    /// buffer for the life of the connection rather than allocating per record.
+    #[test]
+    fn a_reused_body_buffer_stops_reallocating_after_the_first_record() {
+        let length = 4 * BODY_READ_CHUNK;
+        let (mut client, server) = stream_pair();
+        client.write_all(&encode_preface(ConnectionKind::Track, HARD_MAX_RECORD_BODY)).unwrap();
+        // The pair's socket buffer is smaller than the records, so the writer cannot be this thread.
+        let writer = std::thread::spawn(move || {
+            for sequence in 1..=2 {
+                client
+                    .write_all(
+                        &RecordHeader {
+                            body_length: length as u32,
+                            record_type: vivid_protocol::messages::CHANNEL_OPEN,
+                            flags: 0,
+                            object_id: 0,
+                            sequence,
+                        }
+                        .encode(),
+                    )
+                    .unwrap();
+                client.write_all(&vec![sequence as u8; length]).unwrap();
+            }
+            client.flush().unwrap();
+            client
+        });
+        let (mut reader, preface, _) = Reader::new(server).unwrap();
+        reader.finish_handshake().unwrap();
+
+        let mut body = Vec::new();
+        reader.read_record_into(preface.kind, &mut body).unwrap();
+        assert_eq!(body.len(), length);
+        let (address, capacity) = (body.as_ptr(), body.capacity());
+
+        reader.read_record_into(preface.kind, &mut body).unwrap();
+        assert_eq!(body.len(), length);
+        assert_eq!(body[0], 2, "the second record replaces the first, it does not append");
+        assert_eq!(body.as_ptr(), address, "the second record reused the same allocation");
+        assert_eq!(body.capacity(), capacity);
+        drop(writer.join().unwrap());
+    }
+
+    fn write_hello(stream: &mut LocalStream) {
+        stream
+            .write_all(
+                &RecordHeader {
+                    body_length: 0,
+                    record_type: vivid_protocol::messages::HELLO,
+                    flags: 0,
+                    object_id: 0,
+                    sequence: 1,
+                }
+                .encode(),
+            )
+            .unwrap();
+        stream.flush().unwrap();
     }
 
     #[test]
-    fn accepts_split_writes_at_every_framing_boundary() {
-        let body = b"split-me";
-        let header = RecordHeader {
-            body_length: body.len() as u32,
-            record_type: 7,
-            flags: 0,
-            object_id: 9,
-            sequence: 1,
-        }
-        .encode();
-        let mut wire = encode_preface(ConnectionKind::Control, 1024).to_vec();
-        wire.extend_from_slice(&header);
-        wire.extend_from_slice(body);
-
-        for split in 0..=wire.len() {
-            let (mut client, server) = stream_pair();
-            let bytes = wire.clone();
-            let writer = std::thread::spawn(move || {
-                client.write_all(&bytes[..split]).unwrap();
-                client.write_all(&bytes[split..]).unwrap();
-            });
-            let (mut reader, _) = Reader::new(server).unwrap();
-            let record = reader.read_record().unwrap();
-            assert_eq!(record.body, body);
-            writer.join().unwrap();
-        }
+    fn emits_one_typed_error_for_a_well_formed_version_mismatch() {
+        let (mut client, server) = stream_pair();
+        let mut preface = encode_preface(ConnectionKind::Control, 1024);
+        preface[5] = preface[5].wrapping_add(1);
+        client.write_all(&preface).unwrap();
+        assert!(Reader::new(server).is_err());
+        let mut bytes = Vec::new();
+        client.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, vivid_protocol::wire::unsupported_version_record());
     }
 }

@@ -61,7 +61,7 @@ const SELECTION_SCROLLING_STEP: f64 = 20.;
 /// Distance before a touch input is considered a drag.
 const MAX_TAP_DISTANCE: f64 = 20.;
 
-/// Maximum delay between two clicks in a double-click sequence.
+/// Maximum delay between two clicks in a double-click or triple-click sequence.
 const CLICK_THRESHOLD: Duration = Duration::from_millis(400);
 
 const SELECTION_CLIPBOARDS: [ClipboardType; 2] =
@@ -73,6 +73,10 @@ fn next_click_state(mouse: &Mouse, button: MouseButton, point: Point, now: Insta
 
     match mouse.click_state {
         ClickState::Click if same_target && elapsed < CLICK_THRESHOLD => ClickState::DoubleClick,
+        ClickState::DoubleClick if same_target && elapsed < CLICK_THRESHOLD => {
+            ClickState::TripleClick
+        },
+        // A fourth click matches no arm and so restarts the sequence at a single click.
         _ => ClickState::Click,
     }
 }
@@ -82,6 +86,23 @@ fn selection_clipboards(button: MouseButton) -> &'static [ClipboardType] {
         MouseButton::Left | MouseButton::Right => &SELECTION_CLIPBOARDS,
         _ => &[],
     }
+}
+
+fn sgr_mouse_sequence(
+    point: Point,
+    pixel: Option<(usize, usize)>,
+    button: u8,
+    state: ElementState,
+) -> Vec<u8> {
+    let terminator = match state {
+        ElementState::Pressed => 'M',
+        ElementState::Released => 'm',
+    };
+    let (x, y) = pixel.map_or_else(
+        || (point.column.0.saturating_add(1), point.line.0.max(0) as usize + 1),
+        |(x, y)| (x.saturating_add(1), y.saturating_add(1)),
+    );
+    format!("\x1b[<{};{};{}{}", button, x, y, terminator).into_bytes()
 }
 
 fn report_mouse_to_application(mouse_mode: bool, shift: bool) -> bool {
@@ -107,6 +128,18 @@ pub trait ActionContext<T: EventListener> {
     fn update_selection(&mut self, _point: Point, _side: Side) {}
     fn clear_selection(&mut self) {}
     fn selection_is_empty(&self) -> bool;
+    /// Offer one desktop input event to a producer holding a grant, returning whether it took it.
+    ///
+    /// The default is "no grant", which is every context that is not a live window.
+    fn send_desktop_input(&self, _event: vivid_protocol::input::InputEvent) -> bool {
+        false
+    }
+    /// Route clipboard media to the live file-drop binding, returning whether it took the paste.
+    ///
+    /// The default is "no binding", which is every context that is not a live window.
+    fn paste_clipboard_media(&mut self) -> bool {
+        false
+    }
     fn mouse_mut(&mut self) -> &mut Mouse;
     fn mouse(&self) -> &Mouse;
     fn touch_purpose(&mut self) -> &mut TouchPurpose;
@@ -117,6 +150,10 @@ pub trait ActionContext<T: EventListener> {
     fn terminal(&self) -> &Term<T>;
     fn terminal_mut(&mut self) -> &mut Term<T>;
     fn spawn_new_instance(&mut self) {}
+    #[cfg(any(target_os = "linux", windows))]
+    fn shell_action(&mut self, _action: crate::shell::ShellAction) {}
+    #[cfg(any(target_os = "linux", windows))]
+    fn create_new_tab(&mut self) {}
     #[cfg(target_os = "macos")]
     fn create_new_window(&mut self, _tabbing_id: Option<String>) {}
     #[cfg(not(target_os = "macos"))]
@@ -127,7 +164,7 @@ pub trait ActionContext<T: EventListener> {
     fn message(&self) -> Option<&Message>;
     fn config(&self) -> &UiConfig;
     #[cfg(target_os = "macos")]
-    fn event_loop(&self) -> &ActiveEventLoop;
+    fn event_loop(&self) -> Option<&ActiveEventLoop>;
     fn mouse_mode(&self) -> bool;
     fn clipboard_mut(&mut self) -> &mut Clipboard;
     fn scheduler_mut(&mut self) -> &mut Scheduler;
@@ -194,24 +231,50 @@ impl<T: EventListener> Execute<T> for Action {
             #[cfg(not(any(target_os = "macos", windows)))]
             Action::CopySelection => ctx.copy_selection(ClipboardType::Selection),
             Action::ClearSelection => ctx.clear_selection(),
-            Action::Paste => {
+            Action::Paste if !ctx.paste_clipboard_media() => {
                 let text = ctx.clipboard_mut().load(ClipboardType::Clipboard);
                 ctx.paste(&text, true);
             },
+            // Clipboard media took the paste and routed it to a file-drop binding.
+            Action::Paste => {},
             Action::PasteSelection => {
                 let text = ctx.clipboard_mut().load(ClipboardType::Selection);
                 ctx.paste(&text, true);
             },
+            #[cfg(any(target_os = "linux", windows))]
+            Action::ToggleFullscreen if ctx.window().is_hosted() => {
+                ctx.shell_action(crate::shell::ShellAction::ToggleFullscreen);
+            },
             Action::ToggleFullscreen => ctx.window().toggle_fullscreen(),
+            #[cfg(any(target_os = "linux", windows))]
+            Action::ToggleMaximized if ctx.window().is_hosted() => {
+                ctx.shell_action(crate::shell::ShellAction::ToggleMaximized);
+            },
             Action::ToggleMaximized => ctx.window().toggle_maximized(),
             #[cfg(target_os = "macos")]
             Action::ToggleSimpleFullscreen => ctx.window().toggle_simple_fullscreen(),
             #[cfg(target_os = "macos")]
-            Action::Hide => ctx.event_loop().hide_application(),
+            Action::Hide => {
+                if let Some(event_loop) = ctx.event_loop() {
+                    event_loop.hide_application();
+                }
+            },
             #[cfg(target_os = "macos")]
-            Action::HideOtherApplications => ctx.event_loop().hide_other_applications(),
+            Action::HideOtherApplications => {
+                if let Some(event_loop) = ctx.event_loop() {
+                    event_loop.hide_other_applications();
+                }
+            },
+            #[cfg(any(target_os = "linux", windows))]
+            Action::Hide if ctx.window().is_hosted() => {
+                ctx.shell_action(crate::shell::ShellAction::Hide);
+            },
             #[cfg(not(target_os = "macos"))]
             Action::Hide => ctx.window().set_visible(false),
+            #[cfg(any(target_os = "linux", windows))]
+            Action::Minimize if ctx.window().is_hosted() => {
+                ctx.shell_action(crate::shell::ShellAction::Minimize);
+            },
             Action::Minimize => ctx.window().set_minimized(true),
             Action::Quit => {
                 ctx.window().hold = false;
@@ -240,6 +303,8 @@ impl<T: EventListener> Execute<T> for Action {
             Action::ScrollToBottom => ctx.scroll(Scroll::Bottom),
             Action::ClearHistory => ctx.terminal_mut().clear_screen(ClearMode::Saved),
             Action::ClearLogNotice => ctx.pop_message(),
+            #[cfg(any(target_os = "linux", windows))]
+            Action::CreateNewWindow if ctx.window().is_hosted() => ctx.create_new_tab(),
             #[cfg(not(target_os = "macos"))]
             Action::CreateNewWindow => ctx.create_new_window(),
             Action::SpawnNewInstance => ctx.spawn_new_instance(),
@@ -253,6 +318,58 @@ impl<T: EventListener> Execute<T> for Action {
             },
             #[cfg(target_os = "macos")]
             Action::CreateNewTab => (),
+            #[cfg(any(target_os = "linux", windows))]
+            Action::CreateNewTab if ctx.window().is_hosted() => ctx.create_new_tab(),
+            #[cfg(any(target_os = "linux", windows))]
+            Action::CreateNewTab => ctx.create_new_window(),
+            #[cfg(any(target_os = "linux", windows))]
+            Action::SelectNextTab if ctx.window().is_hosted() => {
+                ctx.shell_action(crate::shell::ShellAction::SelectNextTab);
+            },
+            #[cfg(any(target_os = "linux", windows))]
+            Action::SelectPreviousTab if ctx.window().is_hosted() => {
+                ctx.shell_action(crate::shell::ShellAction::SelectPreviousTab);
+            },
+            #[cfg(any(target_os = "linux", windows))]
+            Action::SelectTab1 if ctx.window().is_hosted() => {
+                ctx.shell_action(crate::shell::ShellAction::SelectTab(0));
+            },
+            #[cfg(any(target_os = "linux", windows))]
+            Action::SelectTab2 if ctx.window().is_hosted() => {
+                ctx.shell_action(crate::shell::ShellAction::SelectTab(1));
+            },
+            #[cfg(any(target_os = "linux", windows))]
+            Action::SelectTab3 if ctx.window().is_hosted() => {
+                ctx.shell_action(crate::shell::ShellAction::SelectTab(2));
+            },
+            #[cfg(any(target_os = "linux", windows))]
+            Action::SelectTab4 if ctx.window().is_hosted() => {
+                ctx.shell_action(crate::shell::ShellAction::SelectTab(3));
+            },
+            #[cfg(any(target_os = "linux", windows))]
+            Action::SelectTab5 if ctx.window().is_hosted() => {
+                ctx.shell_action(crate::shell::ShellAction::SelectTab(4));
+            },
+            #[cfg(any(target_os = "linux", windows))]
+            Action::SelectTab6 if ctx.window().is_hosted() => {
+                ctx.shell_action(crate::shell::ShellAction::SelectTab(5));
+            },
+            #[cfg(any(target_os = "linux", windows))]
+            Action::SelectTab7 if ctx.window().is_hosted() => {
+                ctx.shell_action(crate::shell::ShellAction::SelectTab(6));
+            },
+            #[cfg(any(target_os = "linux", windows))]
+            Action::SelectTab8 if ctx.window().is_hosted() => {
+                ctx.shell_action(crate::shell::ShellAction::SelectTab(7));
+            },
+            #[cfg(any(target_os = "linux", windows))]
+            Action::SelectTab9 if ctx.window().is_hosted() => {
+                ctx.shell_action(crate::shell::ShellAction::SelectTab(8));
+            },
+            #[cfg(any(target_os = "linux", windows))]
+            Action::SelectLastTab if ctx.window().is_hosted() => {
+                ctx.shell_action(crate::shell::ShellAction::SelectLastTab);
+            },
             #[cfg(target_os = "macos")]
             Action::SelectNextTab => ctx.window().select_next_tab(),
             #[cfg(target_os = "macos")]
@@ -287,8 +404,13 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
         Self { ctx, modifier_override: None, _phantom: Default::default() }
     }
 
+    #[cfg(target_os = "macos")]
+    pub(crate) fn execute_action(&mut self, action: &Action) {
+        action.execute(&mut self.ctx);
+    }
+
     /// Temporarily use a neutral automation modifier state without changing physical key state.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub fn set_modifier_override(&mut self, modifiers: ModifiersState) {
         self.modifier_override = Some(modifiers);
     }
@@ -302,6 +424,7 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
         let size_info = self.ctx.size_info();
 
         let (x, y) = position.into();
+        let old_pixel = (self.ctx.mouse().x, self.ctx.mouse().y);
 
         let lmb_pressed = self.ctx.mouse().left_button_state == ElementState::Pressed;
         let rmb_pressed = self.ctx.mouse().right_button_state == ElementState::Pressed;
@@ -322,9 +445,12 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
 
         let point = self.ctx.mouse().point(&size_info, display_offset);
         let cell_changed = old_point != point;
+        let pixel_mouse =
+            self.ctx.terminal().mode().contains(TermMode::SGR_MOUSE | TermMode::SGR_PIXEL_MOUSE);
+        let pixel_changed = old_pixel != (x, y);
 
         // If the mouse hasn't changed cells, do nothing.
-        if !cell_changed
+        if !(cell_changed || pixel_mouse && pixel_changed)
             && self.ctx.mouse().cell_side == cell_side
             && self.ctx.mouse().inside_text_area == inside_text_area
         {
@@ -348,7 +474,7 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
             && (self.modifiers_state().shift_key() || !self.ctx.mouse_mode())
         {
             self.ctx.update_selection(point, cell_side);
-        } else if cell_changed
+        } else if (cell_changed || pixel_mouse)
             && self.ctx.terminal().mode().intersects(TermMode::MOUSE_MOTION | TermMode::MOUSE_DRAG)
         {
             if lmb_pressed {
@@ -452,13 +578,13 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
     }
 
     fn sgr_mouse_report(&mut self, point: Point, button: u8, state: ElementState) {
-        let c = match state {
-            ElementState::Pressed => 'M',
-            ElementState::Released => 'm',
+        let mode = self.ctx.terminal().mode();
+        let pixel = if mode.contains(TermMode::SGR_PIXEL_MOUSE) {
+            Some((self.ctx.mouse().x, self.ctx.mouse().y))
+        } else {
+            None
         };
-
-        let msg = format!("\x1b[<{};{};{}{}", button, point.column + 1, point.line + 1, c);
-        self.ctx.write_to_pty(msg.into_bytes());
+        self.ctx.write_to_pty(sgr_mouse_sequence(point, pixel, button, state));
     }
 
     fn on_mouse_press(&mut self, button: MouseButton) {
@@ -518,7 +644,12 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
                 self.ctx.mouse_mut().block_hint_launcher = true;
                 self.ctx.start_selection(SelectionType::Semantic, point, side);
             },
-            ClickState::None | ClickState::DoubleClick => (),
+            ClickState::TripleClick if !control => {
+                self.ctx.mouse_mut().block_hint_launcher = true;
+                self.ctx.start_selection(SelectionType::Lines, point, side);
+            },
+            // Control is reserved for the block selection started on the first click.
+            ClickState::None | ClickState::DoubleClick | ClickState::TripleClick => (),
         }
     }
 
@@ -839,13 +970,12 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
             let new_icon = match current_lines.cmp(&new_lines) {
                 Ordering::Less => CursorIcon::Default,
                 Ordering::Equal => CursorIcon::Pointer,
-                Ordering::Greater => {
-                    if self.ctx.mouse_mode() {
-                        CursorIcon::Default
-                    } else {
-                        CursorIcon::Text
-                    }
-                },
+                Ordering::Greater => crate::display::resolve_mouse_cursor(
+                    None,
+                    false,
+                    self.ctx.terminal().mouse_cursor_icon(),
+                    self.ctx.mouse_mode(),
+                ),
             };
 
             self.ctx.window().set_mouse_cursor(new_icon);
@@ -930,15 +1060,12 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
         // Function to check if mouse is on top of a hint.
         let hint_highlighted = |hint: &HintMatch| hint.should_highlight(point, hyperlink.as_ref());
 
-        if let Some(mouse_state) = self.message_bar_cursor_state() {
-            mouse_state
-        } else if self.ctx.display().highlighted_hint.as_ref().is_some_and(hint_highlighted) {
-            CursorIcon::Pointer
-        } else if !self.modifiers_state().shift_key() && self.ctx.mouse_mode() {
-            CursorIcon::Default
-        } else {
-            CursorIcon::Text
-        }
+        crate::display::resolve_mouse_cursor(
+            self.message_bar_cursor_state(),
+            self.ctx.display().highlighted_hint.as_ref().is_some_and(hint_highlighted),
+            self.ctx.terminal().mouse_cursor_icon(),
+            !self.modifiers_state().shift_key() && self.ctx.mouse_mode(),
+        )
     }
 
     /// Handle automatic scrolling when selecting above/below the window.
@@ -1033,6 +1160,67 @@ mod tests {
     }
 
     #[test]
+    fn click_state_detects_same_cell_triple_click() {
+        let point = Point::new(Line(2), Column(3));
+        let now = Instant::now();
+        let mouse = Mouse {
+            click_state: ClickState::DoubleClick,
+            last_click_timestamp: now - Duration::from_millis(100),
+            last_click_button: MouseButton::Left,
+            last_click_point: Some(point),
+            ..Mouse::default()
+        };
+
+        assert_eq!(
+            next_click_state(&mouse, MouseButton::Left, point, now),
+            ClickState::TripleClick
+        );
+    }
+
+    #[test]
+    fn click_state_restarts_the_sequence_after_a_triple_click() {
+        let point = Point::new(Line(2), Column(3));
+        let now = Instant::now();
+        let mouse = Mouse {
+            click_state: ClickState::TripleClick,
+            last_click_timestamp: now - Duration::from_millis(100),
+            last_click_button: MouseButton::Left,
+            last_click_point: Some(point),
+            ..Mouse::default()
+        };
+
+        // A fourth rapid click wraps back around to a single click rather than staying on lines.
+        assert_eq!(next_click_state(&mouse, MouseButton::Left, point, now), ClickState::Click);
+    }
+
+    #[test]
+    fn click_state_rejects_triple_click_on_timeout_button_and_cell_changes() {
+        let point = Point::new(Line(2), Column(3));
+        let now = Instant::now();
+        let mut mouse = Mouse {
+            click_state: ClickState::DoubleClick,
+            last_click_timestamp: now - CLICK_THRESHOLD,
+            last_click_button: MouseButton::Left,
+            last_click_point: Some(point),
+            ..Mouse::default()
+        };
+
+        assert_eq!(next_click_state(&mouse, MouseButton::Left, point, now), ClickState::Click);
+
+        mouse.last_click_timestamp = now - Duration::from_millis(100);
+        assert_eq!(next_click_state(&mouse, MouseButton::Right, point, now), ClickState::Click);
+        assert_eq!(
+            next_click_state(
+                &mouse,
+                MouseButton::Left,
+                Point::new(point.line, point.column + 1),
+                now,
+            ),
+            ClickState::Click
+        );
+    }
+
+    #[test]
     fn mouse_release_targets_primary_and_system_clipboards() {
         assert_eq!(selection_clipboards(MouseButton::Left), &SELECTION_CLIPBOARDS);
         assert_eq!(selection_clipboards(MouseButton::Right), &SELECTION_CLIPBOARDS);
@@ -1044,6 +1232,25 @@ mod tests {
         assert!(report_mouse_to_application(true, false));
         assert!(!report_mouse_to_application(true, true));
         assert!(!report_mouse_to_application(false, false));
+    }
+
+    #[test]
+    fn sgr_pixels_reports_one_based_physical_coordinates() {
+        let point = Point::new(Line(2), Column(3));
+        assert_eq!(
+            sgr_mouse_sequence(point, Some((319, 199)), 32, ElementState::Pressed),
+            b"\x1b[<32;320;200M"
+        );
+        assert_eq!(
+            sgr_mouse_sequence(point, Some((0, 0)), 0, ElementState::Released),
+            b"\x1b[<0;1;1m"
+        );
+    }
+
+    #[test]
+    fn legacy_sgr_mouse_keeps_cell_coordinates() {
+        let point = Point::new(Line(2), Column(3));
+        assert_eq!(sgr_mouse_sequence(point, None, 64, ElementState::Pressed), b"\x1b[<64;4;3M");
     }
 
     macro_rules! test_process_binding {

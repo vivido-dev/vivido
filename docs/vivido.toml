@@ -3,7 +3,7 @@
 # Copy this to one of:
 #   Linux/BSD : ~/.config/vivido/vivido.toml
 #   macOS     : ~/.config/vivido/vivido.toml
-#   Windows   : %APPDATA%\vivido\vivido.toml
+#   Windows   : %USERPROFILE%\.config\vivido\vivido.toml
 #
 # Every value shown is the built-in DEFAULT. Uncomment and edit only what you
 # want to change; missing keys keep their defaults. See configuration.md for the
@@ -24,8 +24,18 @@ import = []
 # Reapply the config automatically when the file changes.
 live_config_reload = true
 
-# Offer IPC over a Unix socket (`vivido msg …`). Unix only; ignored on Windows.
+# Offer the automation IPC endpoint (`vivido msg …`): an owner-only Unix socket on Linux/macOS,
+# an owner-only named pipe on Windows. `--socket` and `--headless` turn it on regardless, since a
+# headless session exists to serve it.
 ipc_socket = true
+
+# ─────────────────────────────────────────────────────────────────────────────
+# message_bar
+# ─────────────────────────────────────────────────────────────────────────────
+[message_bar]
+# Seconds before warnings are dismissed automatically. 0 keeps them visible.
+# Errors always require manual dismissal.
+warning_timeout = 5
 
 # ─────────────────────────────────────────────────────────────────────────────
 # env — environment variables exported to spawned processes
@@ -102,6 +112,9 @@ multiplier = 3
 [font]
 # Font size in points.
 size = 11.25
+
+# Shape compatible neighboring terminal cells using ligatures supplied by the selected font.
+ligatures = true
 
 # Extra spacing added around each cell.
 offset = { x = 0, y = 0 }
@@ -253,8 +266,20 @@ blinking = "Off"
 # Clipboard access via OSC 52: disabled | onlycopy | onlypaste | copypaste
 osc52 = "onlycopy"
 
+# Allow terminal applications to create desktop notifications through OSC 9 and OSC 99.
+osc_notifications = true
+
 # Shell to launch instead of the login shell.
 # shell = { program = "/usr/bin/fish", args = ["--login"] }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# file_drop
+# ─────────────────────────────────────────────────────────────────────────────
+[file_drop]
+# After a remote vvreceive copies a dropped or pasted file over vvssh, type its committed
+# absolute remote path into the terminal, the way a local drag types a local path. Turn this
+# off to copy the file and type nothing.
+paste_remote_path = true
 
 # ─────────────────────────────────────────────────────────────────────────────
 # mouse
@@ -307,7 +332,8 @@ command = "xdg-open"          # Linux
 # Actions include: Copy, Paste, CopySelection, PasteSelection, ClearSelection,
 # IncreaseFontSize, DecreaseFontSize, ResetFontSize, Scroll*{LineUp,PageDown,ToTop,…},
 # SearchForward, SearchBackward, ToggleFullscreen, ToggleMaximized, SpawnNewInstance,
-# CreateNewWindow, Quit, Hide, Minimize, ClearHistory, ReceiveChar, None, …
+# CreateNewWindow, CreateNewTab, SelectNextTab, SelectPreviousTab, SelectTab1…SelectTab9,
+# SelectLastTab, Quit, Hide, Minimize, ClearHistory, ReceiveChar, None, …
 # (See configuration.md for the complete list. Vivido has no vi-mode actions.)
 
 # [[keyboard.bindings]]

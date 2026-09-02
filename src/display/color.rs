@@ -8,7 +8,6 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::terminal::term::color::COUNT;
 use crate::terminal::vte::ansi::{NamedColor, Rgb as VteRgb};
-use vivido_config_derive::SerdeReplace;
 
 use crate::config::color::Colors;
 
@@ -171,7 +170,7 @@ impl IndexMut<NamedColor> for List {
     }
 }
 
-#[derive(SerdeReplace, Debug, Eq, PartialEq, Copy, Clone, Default)]
+#[derive(Debug, Eq, PartialEq, Copy, Clone, Default)]
 pub struct Rgb(pub VteRgb);
 
 impl Rgb {
@@ -307,7 +306,7 @@ impl FromStr for Rgb {
 }
 
 /// RGB color optionally referencing the cell's foreground or background.
-#[derive(SerdeReplace, Serialize, Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Copy, Clone, Debug, PartialEq, Eq)]
 pub enum CellRgb {
     CellForeground,
     CellBackground,
@@ -366,3 +365,6 @@ impl<'de> Deserialize<'de> for CellRgb {
         deserializer.deserialize_str(CellRgbVisitor).map_err(D::Error::custom)
     }
 }
+
+impl_serde_replace!(Rgb);
+impl_serde_replace!(CellRgb);
