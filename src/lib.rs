@@ -11,6 +11,7 @@ compile_error!(r#"the "wayland" feature must be enabled on Linux and other Unix 
 mod accessibility;
 mod automation;
 pub mod cli;
+mod client_fault;
 mod clipboard;
 #[macro_use]
 mod config_derive;
@@ -42,6 +43,7 @@ pub mod window_context;
 #[cfg(any(target_os = "macos", windows))]
 pub use crate::cli::ParentWindowHandle;
 pub use crate::cli::WindowOptions;
+pub use crate::client_fault::{ClientFault, ClientFaultClass, ClientHealth};
 pub use crate::display::window::Window;
 pub use crate::event::{Event, EventSink, EventType, LoopHandle, Processor};
 pub use crate::serde_replace::SerdeReplace;

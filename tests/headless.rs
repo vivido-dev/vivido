@@ -273,6 +273,43 @@ fn typing_drives_the_shell_in_a_headless_session() {
     assert!(text.contains("RESULT-42"), "the shell never ran the typed command: {text}");
 }
 
+/// A misbehaving full-screen client can be recovered without replacing the host process.
+#[test]
+#[ignore = "spawns processes and needs a wgpu adapter"]
+fn terminal_recovery_preserves_host_liveness_and_window_identity() {
+    let session = Session::start("recovery", &shell_program());
+    let windows: serde_json::Value =
+        serde_json::from_str(&session.msg(&["list-windows"])).expect("window list JSON");
+    let window_id = windows["windows"][0]["window_id"].as_u64().expect("window ID");
+
+    #[cfg(unix)]
+    session.msg(&["typing", "printf '\\033[?1049h\\033[?1003h\\033[?1004h\\033[?2004hDIRTY'\n"]);
+    #[cfg(windows)]
+    session.msg(&[
+        "typing",
+        "$e=[char]27; [Console]::Write(\"$e[?1049h$e[?1003h$e[?1004h$e[?2004hDIRTY\")\r",
+    ]);
+    session.msg(&["wait", "text", "DIRTY"]);
+    let dirty = session.msg(&["inspect"]);
+    assert!(dirty.contains(r#""screen":"alternate""#), "dirty terminal state: {dirty}");
+
+    session.msg(&["reset-terminal", "--window-id", &window_id.to_string()]);
+    assert!(session.msg(&["ping"]).contains(r#""pong""#));
+    let reset = session.msg(&["inspect", "--window-id", &window_id.to_string()]);
+    assert!(reset.contains(r#""screen":"primary""#), "reset state: {reset}");
+    for mode in ["mouse_motion", "focus_in_out", "bracketed_paste"] {
+        assert!(!reset.contains(mode), "reset retained {mode}: {reset}");
+    }
+
+    session.msg(&["restart-terminal", "--window-id", &window_id.to_string()]);
+    assert!(session.msg(&["ping"]).contains(r#""pong""#));
+    let restarted = session.msg(&["list-windows"]);
+    assert!(
+        restarted.contains(&format!(r#""window_id":{window_id}"#)),
+        "restart changed the public identity: {restarted}"
+    );
+}
+
 /// A resize must retarget the renderer, not just the grid.
 #[test]
 #[ignore = "spawns processes and needs a wgpu adapter"]

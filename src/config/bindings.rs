@@ -116,6 +116,9 @@ pub enum Action {
     /// Reset font size to the config value.
     ResetFontSize,
 
+    /// Open the host-owned terminal recovery prompt.
+    TerminalRecovery,
+
     /// Scroll exactly one page up.
     ScrollPageUp,
 
@@ -387,6 +390,7 @@ pub fn default_key_bindings() -> Vec<KeyBinding> {
         Enter,                              +BindingMode::SEARCH; SearchAction::SearchConfirm;
         F3,                                 +BindingMode::SEARCH; SearchAction::SearchFocusNext;
         F3, ModifiersState::SHIFT,          +BindingMode::SEARCH; SearchAction::SearchFocusPrevious;
+        F12, ModifiersState::CONTROL | ModifiersState::SHIFT; Action::TerminalRecovery;
     );
 
     bindings.extend(platform_key_bindings());
@@ -1088,6 +1092,7 @@ impl_config_deserialize_enum!(Action {
     IncreaseFontSize,
     DecreaseFontSize,
     ResetFontSize,
+    TerminalRecovery,
     ScrollPageUp,
     ScrollPageDown,
     ScrollHalfPageUp,

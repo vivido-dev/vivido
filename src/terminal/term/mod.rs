@@ -1412,6 +1412,37 @@ impl<T> Term<T> {
     }
 }
 
+impl<T: EventListener> Term<T> {
+    /// Restore host input/display semantics after an application failed to tear them down.
+    ///
+    /// Unlike RIS, this preserves the primary grid and its scrollback so recovery does not erase
+    /// the user's shell history. Parser state is owned and reset by the PTY event loop.
+    pub(crate) fn reset_client_state(&mut self) {
+        let was_alternate = self.mode.contains(TermMode::ALT_SCREEN);
+        if was_alternate {
+            mem::swap(&mut self.grid, &mut self.inactive_grid);
+        }
+        self.inactive_grid.reset();
+        self.active_charset = Default::default();
+        self.cursor_style = None;
+        self.mouse_cursor_icon = None;
+        self.selection = None;
+        self.keyboard_mode_stack = Default::default();
+        self.inactive_keyboard_mode_stack = Default::default();
+        self.scroll_region = Line(0)..Line(self.screen_lines() as i32);
+        self.tabs = TabStops::new(self.columns());
+        self.mode = TermMode::default();
+
+        if was_alternate {
+            self.event_proxy.send_event(Event::VividScreenSwap { alternate: false });
+        }
+        self.event_proxy.send_event(Event::VividClear);
+        self.event_proxy.send_event(Event::CursorBlinkingChange);
+        self.event_proxy.send_event(Event::MouseCursorDirty);
+        self.mark_fully_damaged();
+    }
+}
+
 impl<T> Dimensions for Term<T> {
     #[inline]
     fn columns(&self) -> usize {
@@ -3756,6 +3787,37 @@ mod tests {
 
         term.unset_private_mode(PrivateMode::Unknown(1016));
         assert!(!term.mode().contains(TermMode::SGR_PIXEL_MOUSE));
+    }
+
+    #[test]
+    fn client_reset_restores_primary_input_modes_and_preserves_scrollback() {
+        let size = TermSize::new(20, 5);
+        let config = Config { kitty_keyboard: true, ..Config::default() };
+        let mut term = Term::new(config, &size, VoidListener);
+        for _ in 0..12 {
+            term.newline();
+        }
+        let history_size = term.history_size();
+        assert!(history_size > 0);
+
+        term.set_private_mode(NamedPrivateMode::SwapScreenAndSetRestoreCursor.into());
+        term.set_private_mode(NamedPrivateMode::ReportAllMouseMotion.into());
+        term.set_private_mode(NamedPrivateMode::SgrMouse.into());
+        term.set_private_mode(NamedPrivateMode::ReportFocusInOut.into());
+        term.set_private_mode(NamedPrivateMode::BracketedPaste.into());
+        term.set_private_mode(PrivateMode::Unknown(1016));
+        term.push_keyboard_mode(KeyboardModes::DISAMBIGUATE_ESC_CODES);
+
+        assert!(term.mode().contains(TermMode::ALT_SCREEN));
+        assert!(term.mode().intersects(TermMode::MOUSE_MODE));
+        assert!(term.mode().contains(TermMode::DISAMBIGUATE_ESC_CODES));
+
+        term.reset_client_state();
+
+        assert_eq!(*term.mode(), TermMode::default());
+        assert_eq!(term.history_size(), history_size);
+        assert!(term.keyboard_mode_stack.is_empty());
+        assert!(term.inactive_keyboard_mode_stack.is_empty());
     }
 
     #[test]

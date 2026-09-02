@@ -26,6 +26,7 @@ use vivid_protocol::identity::TrackIdentity;
 use vivid_protocol::messages;
 use vivid_protocol::revision::ChannelGeneration;
 
+use crate::client_fault::{self, ClientFaultClass};
 use crate::vivid::audio::AudioOutput;
 use crate::vivid::scene::{SharedScene, TrackWaitEvaluation};
 use crate::vivid::transport::{ReadShutdown, Writer};
@@ -83,7 +84,16 @@ impl Egress {
         });
         let worker = {
             let egress = egress.clone();
-            thread::Builder::new().name(name.into()).spawn(move || egress.run(writer))?
+            thread::Builder::new().name(name.into()).spawn(move || {
+                let result = client_fault::catch(
+                    ClientFaultClass::Vivid,
+                    "Vivid egress worker panicked",
+                    || egress.run(writer),
+                );
+                if let Err(fault) = result {
+                    log::error!("contained Vivid egress fault {}", fault.id);
+                }
+            })?
         };
         *egress.worker.lock().expect("egress worker") = Some(worker);
         Ok(egress)

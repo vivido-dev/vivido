@@ -23,6 +23,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(windows)]
 use std::sync::mpsc::{self, SyncSender, TrySendError};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 #[cfg(any(unix, windows))]
@@ -71,6 +72,7 @@ use crate::cli::{
     IpcMousePosition, IpcSignalName,
 };
 use crate::cli::{ParsedOptions, VividTarget, WindowOptions};
+use crate::client_fault::{ClientFault, ClientHealth};
 use crate::clipboard::Clipboard;
 use crate::config::UiConfig;
 use crate::display::Display;
@@ -100,6 +102,9 @@ use crate::vivid::scene::TrackWaitEvaluation;
 
 #[cfg(any(unix, windows))]
 type AutomationResize = (u32, u32, Option<(u16, u16)>);
+
+type PtyWorker =
+    JoinHandle<(PtyEventLoop<tty::Pty, EventProxy>, crate::terminal::event_loop::State)>;
 
 const VIVID_RESIZE_SETTLE_DELAY: Duration = Duration::from_millis(120);
 
@@ -157,6 +162,9 @@ pub struct WindowContext {
     window_config: ParsedOptions,
     config: Rc<UiConfig>,
     vivid_service: VividService,
+    vivid_target: VividTarget,
+    restart_pty_config: tty::Options,
+    io_thread: Option<PtyWorker>,
     vivid_resize_settled: Option<u64>,
     #[cfg(any(unix, windows))]
     ipc_window_id: u64,
@@ -166,6 +174,8 @@ pub struct WindowContext {
     screenshot_busy: bool,
     #[cfg(any(unix, windows))]
     pub automation: AutomationWindowState,
+    client_health: ClientHealth,
+    last_client_fault: Option<ClientFault>,
 }
 
 /// Active Windows wake for the final update accumulated by the direct-draw rate limiter.
@@ -360,6 +370,8 @@ impl WindowContext {
     ) -> Result<Self, Box<dyn Error>> {
         let mut pty_config = config.pty_config();
         options.terminal_options.override_pty_config(&mut pty_config);
+        let restart_pty_config = pty_config.clone();
+        let vivid_target = options.vivid_target;
 
         let preserve_title = options.window_identity.title.is_some();
         #[cfg(any(unix, windows))]
@@ -475,7 +487,7 @@ impl WindowContext {
         let loop_tx = event_loop.channel();
 
         // Kick off the I/O thread.
-        let _io_thread = event_loop.spawn();
+        let io_thread = event_loop.spawn();
 
         // Start cursor blinking, in case `Focused` isn't sent on startup.
         if config.cursor.style().blinking {
@@ -513,6 +525,9 @@ impl WindowContext {
             touch: Default::default(),
             dirty: Default::default(),
             vivid_service,
+            vivid_target,
+            restart_pty_config,
+            io_thread: Some(io_thread),
             vivid_resize_settled: None,
             #[cfg(any(unix, windows))]
             ipc_window_id,
@@ -522,6 +537,8 @@ impl WindowContext {
             screenshot_busy: false,
             #[cfg(any(unix, windows))]
             automation: AutomationWindowState::new(0, transcript),
+            client_health: ClientHealth::Healthy,
+            last_client_fault: None,
         })
     }
 
@@ -961,6 +978,12 @@ impl WindowContext {
         self.terminal.lock().is_focused
     }
 
+    /// Health of the untrusted client currently attached to this pane.
+    #[cfg(any(unix, windows))]
+    pub fn client_health(&self) -> ClientHealth {
+        self.client_health
+    }
+
     /// Write bytes and notify the main event loop after the PTY master accepted all of them.
     #[cfg(any(unix, windows))]
     pub fn write_to_pty_with_completion(
@@ -1074,6 +1097,98 @@ impl WindowContext {
     #[cfg(any(unix, windows))]
     pub fn terminal_mode(&self) -> TermMode {
         *self.terminal.lock().mode()
+    }
+
+    /// Queue a deterministic reset of parser and client-controlled terminal state.
+    #[cfg(any(unix, windows))]
+    pub fn reset_terminal_client(&mut self, completion: u64) -> Result<(), IpcError> {
+        if self.io_thread.as_ref().is_none_or(JoinHandle::is_finished) {
+            return Err(IpcError::new("pty_closed", "terminal PTY worker has exited"));
+        }
+        self.notifier.0.send(Msg::ResetClient { completion }).map_err(|error| {
+            IpcError::new("pty_closed", format!("failed to reset terminal: {error}"))
+        })?;
+        self.vivid_service.disconnect_clients();
+        self.client_health = ClientHealth::Recovering;
+        Ok(())
+    }
+
+    /// Replace this pane's PTY and Vivid service without changing its window or stable IPC ID.
+    #[cfg(any(unix, windows))]
+    pub fn restart_terminal_client(&mut self) -> Result<(), IpcError> {
+        let mut pty_config = self.restart_pty_config.clone();
+        let new_service = match self.vivid_target {
+            VividTarget::Terminal => VividService::start(
+                self.display.size_info.into(),
+                self.event_proxy.clone(),
+                self.config.file_drop.paste_remote_path,
+            ),
+            VividTarget::Desktop => {
+                VividService::start_desktop(self.display.size_info.into(), self.event_proxy.clone())
+            },
+        }
+        .map_err(|error| {
+            IpcError::new("invalid_state", format!("failed to restart Vivid service: {error}"))
+        })?;
+        configure_vivid_pty_environment(
+            &mut pty_config.env,
+            new_service.control_endpoint(),
+            new_service.root_secret(),
+            self.ipc_window_id,
+        );
+        let pty = tty::new(&pty_config, self.display.size_info.into(), self.ipc_window_id)
+            .map_err(|error| {
+                IpcError::new("invalid_state", format!("failed to restart PTY: {error}"))
+            })?;
+        #[cfg(not(windows))]
+        let master_fd = pty.file().as_raw_fd();
+        #[cfg(not(windows))]
+        let shell_pid = pty.child().id();
+        #[cfg(windows)]
+        let shell_pid = pty.child_watcher().pid().map_or(0, std::num::NonZeroU32::get);
+        let event_loop = PtyEventLoop::new(
+            Arc::clone(&self.terminal),
+            self.event_proxy.clone(),
+            pty,
+            pty_config.drain_on_exit,
+            self.config.debug.ref_test,
+            self.automation.transcript.clone(),
+        )
+        .map_err(|error| {
+            IpcError::new("invalid_state", format!("failed to restart PTY worker: {error}"))
+        })?;
+
+        let _ = self.notifier.0.send(Msg::Shutdown);
+        if let Some(worker) = self.io_thread.take() {
+            let _ = worker.join();
+        }
+        self.terminal.lock().reset_client_state();
+        self.display.set_vivid_scene(new_service.scene());
+        self.vivid_service = new_service;
+        #[cfg(not(windows))]
+        {
+            self.master_fd = master_fd;
+        }
+        self.shell_pid = shell_pid;
+        self.notifier = Notifier(event_loop.channel());
+        self.io_thread = Some(event_loop.spawn());
+        self.automation.exit_status = None;
+        self.complete_client_reset();
+        Ok(())
+    }
+
+    #[cfg(any(unix, windows))]
+    pub(crate) fn record_client_fault(&mut self, fault: ClientFault, quarantined: bool) {
+        if quarantined {
+            self.client_health = ClientHealth::Quarantined;
+        }
+        self.last_client_fault = Some(fault);
+    }
+
+    #[cfg(any(unix, windows))]
+    pub(crate) fn complete_client_reset(&mut self) {
+        self.client_health = ClientHealth::Healthy;
+        self.dirty = true;
     }
 
     /// Process a neutral key through Vivido's normal UI input processor.
@@ -2006,6 +2121,8 @@ impl WindowContext {
             "padding": {"x": size.padding_x(), "y": size.padding_y()},
             "position": position.map(|position| json_value!({"x": position.x, "y": position.y})),
             "process": exit_status_json(self.automation.exit_status.as_ref()),
+            "client_health": self.client_health.as_str(),
+            "last_client_fault": self.last_client_fault.as_ref().map(client_fault_json),
             "sequences": {
                 "screen": self.automation.screen_sequence,
                 "frame": self.automation.frame_sequence,
@@ -2069,6 +2186,8 @@ impl WindowContext {
             "echo": echo,
             "exit_status": exit_status_json(self.automation.exit_status.as_ref()),
             "event_sequence": event_sequence,
+            "client_health": self.client_health.as_str(),
+            "last_client_fault": self.last_client_fault.as_ref().map(client_fault_json),
             "vivid_streaming": self.vivid_service.automation_streaming_metrics(),
             "render_optimization": {
                 "text_scene_builds": text_scene_builds,
@@ -2692,6 +2811,10 @@ fn configure_vivid_pty_environment(
     environment.insert("VIVID_ENDPOINT_CONTROL".into(), control_endpoint.into());
     environment.insert("VIVID_ROOT_SECRET".into(), root_secret.into());
     environment.insert("VIVIDO_WINDOW_ID".into(), window_id.to_string());
+    environment.insert(
+        "VIVIDO_INPUT_TRANSPORT".into(),
+        if cfg!(windows) { "win32-console" } else { "pty-bytes" }.into(),
+    );
     // ConPTY strips APC control strings before they reach Vivido's terminal parser. Producers
     // must therefore emit the bounded printable marker form that the Windows PTY scanner removes
     // and authenticates before ordinary terminal parsing.
@@ -2721,7 +2844,7 @@ fn vivid_wslenv(inherited: &str) -> String {
     // WSLENV makes WSL create that variable with an empty value when this window does not offer
     // the lane. Producers correctly reject a present-but-empty endpoint as malformed instead of
     // applying the missing-lane fallback.
-    const MANAGED: [&str; 7] = [
+    const MANAGED: [&str; 8] = [
         "VIVID_ENDPOINT_CONTROL",
         "VIVID_ENDPOINT_INTERACTIVE",
         "VIVID_ENDPOINT_REALTIME",
@@ -2729,12 +2852,14 @@ fn vivid_wslenv(inherited: &str) -> String {
         "VIVID_ROOT_SECRET",
         "VIVID_ANCHOR_TRANSPORT",
         "VIVIDO_WINDOW_ID",
+        "VIVIDO_INPUT_TRANSPORT",
     ];
-    const EXPORTED: [&str; 4] = [
+    const EXPORTED: [&str; 5] = [
         "VIVID_ENDPOINT_CONTROL",
         "VIVID_ROOT_SECRET",
         "VIVID_ANCHOR_TRANSPORT",
         "VIVIDO_WINDOW_ID",
+        "VIVIDO_INPUT_TRANSPORT",
     ];
 
     let mut entries = inherited
@@ -2754,6 +2879,9 @@ impl Drop for WindowContext {
     fn drop(&mut self) {
         // Shutdown the terminal's PTY.
         let _ = self.notifier.0.send(Msg::Shutdown);
+        if let Some(worker) = self.io_thread.take() {
+            let _ = worker.join();
+        }
     }
 }
 
@@ -2777,6 +2905,15 @@ fn exit_status_json(status: Option<&std::process::ExitStatus>) -> Value {
         }),
         None => json_value!({"state": "running"}),
     }
+}
+
+#[cfg(any(unix, windows))]
+fn client_fault_json(fault: &ClientFault) -> Value {
+    json_value!({
+        "fault_id": fault.id,
+        "class": fault.class.as_str(),
+        "diagnostic": fault.diagnostic,
+    })
 }
 
 #[cfg(unix)]
@@ -3386,6 +3523,10 @@ mod vivid_environment_tests {
         );
         assert_eq!(environment.get("VIVID_ROOT_SECRET").map(String::as_str), Some("secret"));
         assert_eq!(environment.get("VIVIDO_WINDOW_ID").map(String::as_str), Some("42"));
+        assert_eq!(
+            environment.get("VIVIDO_INPUT_TRANSPORT").map(String::as_str),
+            Some(if cfg!(windows) { "win32-console" } else { "pty-bytes" })
+        );
         #[cfg(windows)]
         assert_eq!(environment.get("VIVID_ANCHOR_TRANSPORT").map(String::as_str), Some("conpty"));
         #[cfg(not(windows))]
@@ -3401,7 +3542,7 @@ mod vivid_environment_tests {
                  VIVID_ENDPOINT_CONTROL/l:VIVIDO_WINDOW_ID/w"
             ),
             "GOPATH/p:CARGO_HOME/p:VIVID_ENDPOINT_CONTROL/u:VIVID_ROOT_SECRET/u:\
-             VIVID_ANCHOR_TRANSPORT/u:VIVIDO_WINDOW_ID/u"
+             VIVID_ANCHOR_TRANSPORT/u:VIVIDO_WINDOW_ID/u:VIVIDO_INPUT_TRANSPORT/u"
         );
     }
 }

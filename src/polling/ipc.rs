@@ -22,6 +22,7 @@ use crate::cli::{
     IpcAutomationPlan, IpcAutomationPlanStep, IpcCapture, IpcMouseAction, IpcPlanErrorPolicy,
     IpcRunPlan, IpcVividCommand, IpcWait, IpcWaitCondition, MessageOptions, Options, SocketMessage,
 };
+use crate::client_fault::{self, ClientFaultClass};
 use crate::event::{Event, EventSink, EventType};
 use crate::polling::transport::{LocalListener, LocalStream};
 use crate::terminal::thread;
@@ -82,6 +83,8 @@ const IPC_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 pub const METHODS: &[&str] = &[
     "hello",
     "ping",
+    "reset_terminal",
+    "restart_terminal",
     "unsubscribe",
     "create_window",
     "config",
@@ -224,7 +227,7 @@ fn method_class(name: &str) -> (MethodClass, bool) {
         | "set_level" => (MethodClass::Window, true),
         "config" => (MethodClass::Config, true),
         "focus" | "signal" => (MethodClass::Process, true),
-        "quit" => (MethodClass::Lifecycle, true),
+        "quit" | "reset_terminal" | "restart_terminal" => (MethodClass::Lifecycle, true),
         _ => (MethodClass::Extension, true),
     }
 }
@@ -269,6 +272,8 @@ pub const EVENT_KINDS: &[&str] = &[
     "child_exit",
     "window_created",
     "window_closed",
+    "client_fault",
+    "client_recovered",
     "overflow",
 ];
 
@@ -612,13 +617,19 @@ fn spawn_connection(
     });
     let writer_inner = Arc::downgrade(&inner);
     thread::spawn_named("IPC writer", move || {
-        let mut writer = writer;
-        let _ = writer.set_write_timeout(Some(IPC_WRITE_TIMEOUT));
-        while let Ok(frame) = output_rx.recv() {
-            if writer.write_all(&frame.bytes).and_then(|()| writer.flush()).is_err() {
-                let _ = writer.shutdown();
-                break;
-            }
+        let result =
+            client_fault::catch(ClientFaultClass::Ipc, "IPC writer worker panicked", || {
+                let mut writer = writer;
+                let _ = writer.set_write_timeout(Some(IPC_WRITE_TIMEOUT));
+                while let Ok(frame) = output_rx.recv() {
+                    if writer.write_all(&frame.bytes).and_then(|()| writer.flush()).is_err() {
+                        let _ = writer.shutdown();
+                        break;
+                    }
+                }
+            });
+        if let Err(fault) = result {
+            error!("contained IPC writer fault {}", fault.id);
         }
         if let Some(writer_inner) = writer_inner.upgrade() {
             writer_inner.alive.store(false, Ordering::Release);
@@ -628,7 +639,13 @@ fn spawn_connection(
     thread::spawn_named("IPC reader", move || {
         let _guard = guard;
         let connection = IpcConnection { inner };
-        run_connection(stream, connection.clone(), &event_proxy);
+        let result =
+            client_fault::catch(ClientFaultClass::Ipc, "IPC reader worker panicked", || {
+                run_connection(stream, connection.clone(), &event_proxy)
+            });
+        if let Err(fault) = result {
+            error!("contained IPC reader fault {}", fault.id);
+        }
         connection.inner.alive.store(false, Ordering::Release);
         let _ = event_proxy.send_event(Event::new(EventType::IpcDisconnect(connection_id), None));
     });
@@ -786,7 +803,7 @@ fn hello_result() -> Value {
             "duplicate_request_id", "limit_exceeded", "window_not_found",
             "no_focused_window", "unsupported", "timeout", "sequence_gap", "pty_closed",
             "resize_mismatch", "focus_denied", "regex_invalid", "subscription_overflow",
-            "invalid_state"
+            "invalid_state", "client_fault"
         ],
         "limits": {
             "request_frame_bytes": MAX_REQUEST_FRAME_BYTES,
@@ -1504,6 +1521,10 @@ fn message_request(message: &SocketMessage) -> io::Result<(&'static str, Value)>
         SocketMessage::CreateWindow(params) => Ok(("create_window", serialize_params(params)?)),
         SocketMessage::Quit => Ok(("quit", Value::Object(Default::default()))),
         SocketMessage::Ping => Ok(("ping", json!({}))),
+        SocketMessage::ResetTerminal(params) => Ok(("reset_terminal", serialize_params(params)?)),
+        SocketMessage::RestartTerminal(params) => {
+            Ok(("restart_terminal", serialize_params(params)?))
+        },
         SocketMessage::Config(params) => Ok(("config", serialize_params(params)?)),
         SocketMessage::GetConfig(params) => Ok(("get_config", serialize_params(params)?)),
         SocketMessage::Typing(params) => Ok(("typing", serialize_params(params)?)),
@@ -1777,6 +1798,8 @@ fn write_cli_result(message: &SocketMessage, result: &Value) -> io::Result<()> {
         | SocketMessage::RunPlan(_)
         | SocketMessage::Capture(_)
         | SocketMessage::Ping
+        | SocketMessage::ResetTerminal(_)
+        | SocketMessage::RestartTerminal(_)
         | SocketMessage::ListWindows
         | SocketMessage::Inspect(_)
         | SocketMessage::Diagnose(_)

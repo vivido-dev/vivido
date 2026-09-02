@@ -24,7 +24,6 @@ use std::net::{Ipv4Addr, TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -64,6 +63,7 @@ use vivid_protocol::track::{
 };
 use vivid_protocol::wire::{ConnectionKind, RECORD_OPTIONAL, Record};
 
+use crate::client_fault::{self, ClientFault, ClientFaultClass};
 use crate::event::{EventProxy, EventType};
 use crate::terminal::event::EventListener;
 use crate::terminal::grid::Dimensions;
@@ -171,6 +171,8 @@ struct SessionRuntime {
     /// Wake the control actor when another connection introduces a deadline, notably an input
     /// binding arriving on the interactive lane.
     actor_ingress: Mutex<Option<mpsc::SyncSender<ActorMessage>>>,
+    /// Shutdown handle for the session's control reader, retained for host-owned recovery.
+    control_shutdown: Mutex<Option<ReadShutdown>>,
     contexts: Mutex<HashMap<u64, ContextState>>,
     seen_anchors: Mutex<HashSet<(u64, u64)>>,
     /// The lease this session was activated from, if it is a leased child rather than a root.
@@ -468,10 +470,11 @@ pub struct VividService {
 ///
 /// A committed file drop has to reach the loop that owns the PTY, and it must not ride the frame
 /// wake: that one coalesces on `wake_pending`, and a dropped paste is not recoverable.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PresenterWake {
     Frame,
     FileDropPaste,
+    ClientFault(ClientFault),
 }
 
 impl VividService {
@@ -486,6 +489,9 @@ impl VividService {
                 event_proxy.send_event(match kind {
                     PresenterWake::Frame => EventType::VividFrame,
                     PresenterWake::FileDropPaste => EventType::VividFileDropPaste,
+                    PresenterWake::ClientFault(fault) => {
+                        EventType::Terminal(crate::terminal::event::Event::ClientFault(fault))
+                    },
                 })
             }),
         )?;
@@ -589,6 +595,16 @@ impl VividService {
 
     pub fn scene(&self) -> SharedScene {
         self.scene.clone()
+    }
+
+    /// Disconnect every producer attached to this pane while keeping its endpoint and root secret.
+    pub fn disconnect_clients(&self) {
+        let sessions = lock(&self.shared.registry).sessions.values().cloned().collect::<Vec<_>>();
+        for session in sessions {
+            if let Some(shutdown) = lock(&session.control_shutdown).take() {
+                shutdown.stop();
+            }
+        }
     }
 
     /// Acknowledge the one coalesced frame event before consuming the latest retained scene.
@@ -1086,6 +1102,10 @@ impl ServiceShared {
         (self.wake)(PresenterWake::FileDropPaste);
     }
 
+    fn report_client_fault(&self, fault: ClientFault) {
+        (self.wake)(PresenterWake::ClientFault(fault));
+    }
+
     /// The profiles this target offers right now.
     ///
     /// The path sub-profile is config-gated, so a deployment with it turned off simply never
@@ -1120,6 +1140,7 @@ impl ServiceShared {
 
 impl Drop for VividService {
     fn drop(&mut self) {
+        self.disconnect_clients();
         self.shutdown.store(true, Ordering::Release);
         wake_listener(&self.control_endpoint);
         if let Some(thread) = self.listener_thread.take() {
@@ -1163,8 +1184,25 @@ fn listener_loop(listener: LocalListener, shared: Arc<ServiceShared>, shutdown: 
         let connection = shared.clone();
         let served = thread::Builder::new().name("vivid-1.5-connection".into()).spawn(move || {
             let _slot = slot;
-            if let Err(error) = handle_connection(stream, &connection, &pending) {
-                log::debug!("Vivid connection closed: {error}");
+            match client_fault::catch(
+                ClientFaultClass::Vivid,
+                "Vivid connection worker panicked",
+                || handle_connection(stream, &connection, &pending),
+            ) {
+                Ok(Ok(())) => {},
+                Ok(Err(error)) => {
+                    log::debug!("Vivid connection closed: {error}");
+                    if matches!(error.kind(), ErrorKind::InvalidData | ErrorKind::InvalidInput) {
+                        connection.report_client_fault(ClientFault::new(
+                            ClientFaultClass::Vivid,
+                            "Vivid client input was rejected",
+                        ));
+                    }
+                },
+                Err(fault) => {
+                    log::error!("contained Vivid connection fault {}", fault.id);
+                    connection.report_client_fault(fault);
+                },
             }
         });
         if let Err(error) = served {
@@ -1242,28 +1280,35 @@ fn handle_control(
     let (records, incoming) = mpsc::sync_channel::<ActorMessage>(actor::INGRESS_CAPACITY);
     *lock(&session.actor_ingress) = Some(records.clone());
     let shutdown = reader.shutdown_handle()?;
+    *lock(&session.control_shutdown) = Some(shutdown.clone());
     let actor = {
         let actor_shared = shared.clone();
         let actor_session = session.clone();
         let actor_egress = egress.clone();
         let panic_egress = egress.clone();
+        let panic_shared = shared.clone();
         let actor_clean_goodbye = clean_goodbye.clone();
         let panic_shutdown = shutdown.clone();
         let actor = thread::Builder::new().name("vivid-control-actor".into()).spawn(move || {
-            let result = panic::catch_unwind(AssertUnwindSafe(|| {
-                actor_loop(
-                    actor_shared,
-                    actor_session,
-                    incoming,
-                    actor_egress,
-                    actor_clean_goodbye,
-                    shutdown,
-                )
-            }));
-            if let Err(payload) = result {
+            let result = client_fault::catch(
+                ClientFaultClass::Vivid,
+                "Vivid control actor panicked",
+                || {
+                    actor_loop(
+                        actor_shared,
+                        actor_session,
+                        incoming,
+                        actor_egress,
+                        actor_clean_goodbye,
+                        shutdown,
+                    )
+                },
+            );
+            if let Err(fault) = result {
                 panic_egress.close();
                 panic_shutdown.stop();
-                panic::resume_unwind(payload);
+                log::error!("contained Vivid control actor fault {}", fault.id);
+                panic_shared.report_client_fault(fault);
             }
         });
         match actor {
@@ -2122,6 +2167,7 @@ fn establish_root_session(
         accepted_profiles: welcome.accepted_profiles.clone(),
         egress: Mutex::new(Some(egress)),
         actor_ingress: Mutex::new(None),
+        control_shutdown: Mutex::new(None),
         contexts: Mutex::new(HashMap::from([(
             root_context.context_id,
             ContextState::root(identity, root_context.context_id, classes, contract)

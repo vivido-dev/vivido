@@ -470,6 +470,12 @@ pub enum SocketMessage {
     /// Check IPC liveness.
     Ping,
 
+    /// Reset parser and client-controlled terminal state for one window.
+    ResetTerminal(IpcTarget),
+
+    /// Replace one terminal process while preserving its stable window identity.
+    RestartTerminal(IpcTarget),
+
     /// Update the Vivido configuration.
     Config(IpcConfig),
 

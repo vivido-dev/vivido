@@ -27,6 +27,8 @@ use crate::terminal::term::Term;
 use crate::terminal::{thread, tty};
 use vte::ansi;
 
+use crate::client_fault::{self, ClientFault, ClientFaultClass};
+
 /// Max bytes to read from the PTY before forced terminal synchronization.
 pub(crate) const READ_BUFFER_SIZE: usize = 0x10_0000;
 
@@ -52,6 +54,10 @@ pub enum Msg {
         #[cfg(any(unix, windows))]
         completion: Option<u64>,
     },
+
+    /// Reset parser and client-controlled terminal state, resuming a quarantined pane.
+    #[cfg(any(unix, windows))]
+    ResetClient { completion: u64 },
 }
 
 /// The main event loop.
@@ -108,7 +114,7 @@ where
     /// Drain the channel.
     ///
     /// Returns `false` when a shutdown message was received.
-    fn drain_recv_channel(&mut self, state: &mut State) -> bool {
+    fn drain_recv_channel(&mut self, state: &mut State, quarantined: &mut bool) -> bool {
         while let Some(msg) = self.rx.recv() {
             match msg {
                 Msg::Input {
@@ -116,11 +122,15 @@ where
                     #[cfg(any(unix, windows))]
                     completion,
                 } => {
-                    state.write_list.push_back(PendingInput {
-                        bytes,
-                        #[cfg(any(unix, windows))]
-                        completion,
-                    });
+                    // A quarantined pane retains its last safe frame, but client traffic must not
+                    // continue accumulating behind the fault boundary.
+                    if !*quarantined {
+                        state.write_list.push_back(PendingInput {
+                            bytes,
+                            #[cfg(any(unix, windows))]
+                            completion,
+                        });
+                    }
                 },
                 Msg::Resize {
                     window_size,
@@ -132,6 +142,14 @@ where
                     if let Some(token) = completion {
                         self.event_proxy.send_event(Event::PtyResizeComplete(token));
                     }
+                },
+                #[cfg(any(unix, windows))]
+                Msg::ResetClient { completion } => {
+                    state.reset_client_state();
+                    self.terminal.lock().reset_client_state();
+                    *quarantined = false;
+                    self.event_proxy.send_event(Event::ClientResetComplete(completion));
+                    self.event_proxy.send_event(Event::Wakeup);
                 },
                 Msg::Shutdown => return false,
             }
@@ -261,6 +279,8 @@ where
 
             let poll_opts = PollMode::Level;
             let mut interest = PollingEvent::readable(0);
+            let mut quarantined = false;
+            let mut registered = true;
 
             // Register TTY through EventedRW interface.
             if let Err(err) = unsafe { self.pty.register(&self.poll, interest, poll_opts) } {
@@ -301,8 +321,26 @@ where
                 }
 
                 // Handle channel events, if there are any.
-                if !self.drain_recv_channel(&mut state) {
+                if !self.drain_recv_channel(&mut state, &mut quarantined) {
                     break;
+                }
+
+                if !registered && !quarantined {
+                    match unsafe { self.pty.register(&self.poll, interest, poll_opts) } {
+                        Ok(()) => registered = true,
+                        Err(error) => {
+                            let fault = ClientFault::new(
+                                ClientFaultClass::PtyIo,
+                                "failed to resume quarantined PTY",
+                            );
+                            error!("contained client fault {}: {error}", fault.id);
+                            self.event_proxy.send_event(Event::ClientFault(fault));
+                            quarantined = true;
+                        },
+                    }
+                }
+                if quarantined {
+                    continue;
                 }
 
                 for event in events.iter() {
@@ -329,28 +367,83 @@ where
                                 continue;
                             }
 
-                            if event.readable
-                                && let Err(err) = self.pty_read(&mut state, &mut buf, pipe.as_mut())
-                            {
-                                // On Linux, a `read` on the master side of a PTY can fail
-                                // with `EIO` if the client side hangs up.  In that case,
-                                // just loop back round for the inevitable `Exited` event.
-                                // This sucks, but checking the process is either racy or
-                                // blocking.
-                                #[cfg(target_os = "linux")]
-                                if err.raw_os_error() == Some(libc::EIO) {
-                                    continue;
+                            if event.readable {
+                                let read = client_fault::catch(
+                                    ClientFaultClass::TerminalParser,
+                                    "terminal output parser panicked",
+                                    || self.pty_read(&mut state, &mut buf, pipe.as_mut()),
+                                );
+                                let failure = match read {
+                                    Ok(Ok(())) => None,
+                                    Ok(Err(err)) => Some((ClientFaultClass::PtyIo, err)),
+                                    Err(fault) => {
+                                        error!(
+                                            "contained client fault {} ({})",
+                                            fault.id,
+                                            fault.class.as_str()
+                                        );
+                                        self.event_proxy.send_event(Event::ClientFault(fault));
+                                        quarantined = true;
+                                        None
+                                    },
+                                };
+                                if quarantined {
+                                    let _ = self.pty.deregister(&self.poll);
+                                    registered = false;
+                                    break;
                                 }
+                                if let Some((class, err)) = failure {
+                                    // On Linux, a `read` on the master side of a PTY can fail
+                                    // with `EIO` if the client side hangs up.  In that case,
+                                    // just loop back round for the inevitable `Exited` event.
+                                    // This sucks, but checking the process is either racy or
+                                    // blocking.
+                                    #[cfg(target_os = "linux")]
+                                    if err.raw_os_error() == Some(libc::EIO) {
+                                        continue;
+                                    }
 
-                                error!("Error reading from PTY in event loop: {err}");
-                                break 'event_loop;
+                                    let fault = ClientFault::new(class, "terminal PTY read failed");
+                                    error!("contained client fault {}: {err}", fault.id);
+                                    self.event_proxy.send_event(Event::ClientFault(fault));
+                                    quarantined = true;
+                                    let _ = self.pty.deregister(&self.poll);
+                                    registered = false;
+                                    break;
+                                }
                             }
 
-                            if event.writable
-                                && let Err(err) = self.pty_write(&mut state)
-                            {
-                                error!("Error writing to PTY in event loop: {err}");
-                                break 'event_loop;
+                            if event.writable {
+                                match client_fault::catch(
+                                    ClientFaultClass::PtyIo,
+                                    "terminal PTY writer panicked",
+                                    || self.pty_write(&mut state),
+                                ) {
+                                    Ok(Ok(())) => {},
+                                    Ok(Err(err)) => {
+                                        let fault = ClientFault::new(
+                                            ClientFaultClass::PtyIo,
+                                            "terminal PTY write failed",
+                                        );
+                                        error!("contained client fault {}: {err}", fault.id);
+                                        self.event_proxy.send_event(Event::ClientFault(fault));
+                                        quarantined = true;
+                                    },
+                                    Err(fault) => {
+                                        error!(
+                                            "contained client fault {} ({})",
+                                            fault.id,
+                                            fault.class.as_str()
+                                        );
+                                        self.event_proxy.send_event(Event::ClientFault(fault));
+                                        quarantined = true;
+                                    },
+                                }
+                                if quarantined {
+                                    let _ = self.pty.deregister(&self.poll);
+                                    registered = false;
+                                    break;
+                                }
                             }
                         },
                         _ => (),
@@ -370,8 +463,18 @@ where
                 // another waker. Re-registering posts the next packet for the still-readable pipe;
                 // native pollers remain level-triggered and only need updates when interest
                 // changes.
-                if write_interest_changed || cfg!(windows) {
-                    self.pty.reregister(&self.poll, interest, poll_opts).unwrap();
+                if (write_interest_changed || cfg!(windows))
+                    && let Err(err) = self.pty.reregister(&self.poll, interest, poll_opts)
+                {
+                    let fault = ClientFault::new(
+                        ClientFaultClass::PtyIo,
+                        "terminal PTY registration failed",
+                    );
+                    error!("contained client fault {}: {err}", fault.id);
+                    self.event_proxy.send_event(Event::ClientFault(fault));
+                    quarantined = true;
+                    let _ = self.pty.deregister(&self.poll);
+                    registered = false;
                 }
             }
 
@@ -484,6 +587,18 @@ pub struct State {
 }
 
 impl State {
+    fn reset_client_state(&mut self) {
+        self.write_list.clear();
+        self.writing = None;
+        self.parser = Default::default();
+        self.osc_notifications = Default::default();
+        self.vivid_markers = Default::default();
+        #[cfg(any(unix, windows))]
+        {
+            self.output_range = None;
+        }
+    }
+
     fn advance<T: EventListener>(
         &mut self,
         terminal: &mut Term<T>,
@@ -835,5 +950,33 @@ mod vivid_marker_tests {
                 assert!(matches!(chunk, VividChunk::Bytes(_)));
             });
         }
+    }
+
+    #[test]
+    fn reset_discards_partial_parsers_and_pending_client_input() {
+        let mut state = State::default();
+        state.vivid_markers.push(b"\x1b_VIVID;3;partial", &mut |_| {});
+        state.write_list.push_back(PendingInput {
+            bytes: Cow::Borrowed(b"pending"),
+            #[cfg(any(unix, windows))]
+            completion: Some(7),
+        });
+        state.writing = Some(Writing::new(PendingInput {
+            bytes: Cow::Borrowed(b"writing"),
+            #[cfg(any(unix, windows))]
+            completion: Some(8),
+        }));
+        #[cfg(any(unix, windows))]
+        {
+            state.output_range = Some((1, 2));
+        }
+
+        state.reset_client_state();
+
+        assert!(state.vivid_markers.pending.is_empty());
+        assert!(state.write_list.is_empty());
+        assert!(state.writing.is_none());
+        #[cfg(any(unix, windows))]
+        assert!(state.output_range.is_none());
     }
 }

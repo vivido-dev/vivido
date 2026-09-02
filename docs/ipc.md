@@ -147,7 +147,7 @@ interleave. Programs must correlate responses by `id` and distinguish event fram
 Stable protocol errors are `unsupported_version`, `invalid_request`, `invalid_params`,
 `duplicate_request_id`, `limit_exceeded`, `window_not_found`, `no_focused_window`, `unsupported`,
 `invalid_state`, `timeout`, `sequence_gap`, `pty_closed`, `resize_mismatch`, `focus_denied`,
-`regex_invalid`, and `subscription_overflow`. Errors may include a `data` object with recovery
+`regex_invalid`, `subscription_overflow`, and `client_fault`. Errors may include a `data` object with recovery
 details.
 
 ## Common JSON conventions
@@ -168,6 +168,13 @@ physical modifiers pressed.
 
 - `hello {}`: required handshake. `vivido msg capabilities` prints its `result` as JSON.
 - `ping {}` / `vivido msg ping`: liveness request; returns `{"pong":true}`.
+- `reset_terminal {"window_id":ID}` / `vivido msg reset-terminal`: discards partial parser state,
+  returns to the primary screen, clears client-controlled input modes and the Vivid scene, and
+  resumes a quarantined PTY. Primary scrollback and the stable window ID are preserved.
+- `restart_terminal {"window_id":ID}` / `vivido msg restart-terminal`: transactionally creates a
+  replacement PTY and Vivid service from the pane's retained launch options. The window ID and any
+  embedding Vivida workspace/tab/split position remain stable; a failed replacement leaves the
+  existing quarantined pane available for another recovery attempt.
 - `quit {}`: shuts the whole instance down, closing every window. For a headless session this is
   the graceful stop, and it lets the daemon remove its own endpoint and registry; `vivido
   kill-session` is the forceful alternative.
@@ -300,6 +307,9 @@ waiting until it disconnects, the same as any unanswered request.
   capabilities. `current_directory` prefers the shell's OSC 7 report when its host is this
   machine and falls back to the foreground-process probe; over Windows OSC 7 is the only
   source.
+- `list_windows`, `inspect`, and `diagnose` include `client_health` (`healthy`, `quarantined`, or
+  `recovering`) and an optional bounded `last_client_fault` containing only an opaque fault ID,
+  fault class, and fixed diagnostic text.
 - `diagnose` captures window, renderer, presenter, track, flow, connection-health, and bounded
   recent-trace metadata in one event-loop turn. It does not wait for rendering or transport;
   asynchronous metrics carry an age.
@@ -434,7 +444,10 @@ Event frames have this shape:
 
 Kinds are `screen_changed`, `output`, `frame_presented`, `title_changed`, `directory_changed`,
 `focus_changed`, `resized`, `moved`, `bell`, `child_exit`, `window_created`, `window_closed`, and
-`overflow`. Output data is split into
+`overflow`, plus `client_fault` and `client_recovered`. A replayable `client_fault` contains the
+window ID in the envelope and only `fault_id`, `class`, and `quarantined`; client bytes, panic
+payloads, paths, and capability material are never included. `client_recovered` follows a completed
+reset. Output data is split into
 at most 64 KiB chunks with start/end offsets and base64 bytes. Screen-change data contains current
 row replacements. `directory_changed` fires when the local shell reports a new working directory
 through OSC 7 and carries `{"directory":"/path"}`. The process replay ring is bounded by both 4 MiB and 4,096 events.

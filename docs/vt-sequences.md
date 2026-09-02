@@ -27,6 +27,24 @@ is therefore decided in three places:
    OSC 7 working-directory reports, OSC 9/99 desktop notifications, DCS queries, and Vivid media
    anchors before `vte` sees them.
 
+## Client compatibility and recovery
+
+PTY applications are untrusted. On native Windows Vivido exports
+`VIVIDO_INPUT_TRANSPORT=win32-console`; on Unix it exports
+`VIVIDO_INPUT_TRANSPORT=pty-bytes`. A client must use this transport boundary when deciding how to
+enable enhanced keyboard input. In particular, Vivido understanding Kitty keyboard escape
+sequences does not imply that a Windows console library can enable or decode those sequences over
+ConPTY.
+
+If an application exits without leaving the alternate screen or disabling mouse, focus,
+bracketed-paste, Kitty-keyboard, or synchronized-output modes, press `Ctrl+Shift+F12`. The
+host-owned recovery prompt offers Reset Terminal, Restart Terminal, and Cancel. Reset discards
+partial parser state and client-controlled modes, returns to the primary screen, clears the Vivid
+scene, and preserves primary scrollback. Restart replaces the PTY while preserving the public
+window identity and an embedding Vivida layout position. Neither action is triggered automatically
+when a nested command exits, because ConPTY exposes the long-lived shell rather than a reliable
+foreground-process lifecycle.
+
 ## Control characters (C0)
 
 | Name | Code | Status | Notes |

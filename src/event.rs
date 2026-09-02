@@ -27,6 +27,10 @@ use log::{debug, error, info, warn};
 use parking_lot::Mutex;
 #[cfg(any(unix, windows))]
 use serde::de::DeserializeOwned;
+#[cfg(windows)]
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    IDNO, IDYES, MB_ICONWARNING, MB_SETFOREGROUND, MB_TASKMODAL, MB_YESNOCANCEL, MessageBoxW,
+};
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
 use winit::event::{
@@ -44,6 +48,8 @@ use crate::terminal::index::{Boundary, Column, Direction, Line, Point, Side};
 use crate::terminal::selection::{Selection, SelectionType};
 use crate::terminal::term::search::{Match, RegexSearch};
 use crate::terminal::term::{self, ClipboardType, Term, TermMode};
+#[cfg(windows)]
+use crate::terminal::tty::windows::win32_string;
 use crate::terminal::vte::ansi::NamedColor;
 
 #[cfg(any(unix, windows))]
@@ -427,6 +433,33 @@ impl Processor {
         Ok(ipc_window_id)
     }
 
+    /// Reset parser and client-controlled state for a stable IPC window ID.
+    #[cfg(any(unix, windows))]
+    pub fn reset_terminal(&mut self, ipc_window_id: u64) -> Result<u64, IpcError> {
+        let platform_id = self
+            .windows
+            .iter()
+            .find_map(|(id, window)| (window.ipc_window_id() == ipc_window_id).then_some(*id))
+            .ok_or_else(|| IpcError::new("window_not_found", "terminal window does not exist"))?;
+        let completion = self.automation.next_write_token();
+        self.windows
+            .get_mut(&platform_id)
+            .ok_or_else(|| IpcError::new("window_not_found", "terminal window disappeared"))?
+            .reset_terminal_client(completion)?;
+        Ok(completion)
+    }
+
+    /// Replace a pane's PTY and Vivid service while keeping its window and IPC identity.
+    #[cfg(any(unix, windows))]
+    pub fn restart_terminal(&mut self, ipc_window_id: u64) -> Result<(), IpcError> {
+        let window = self
+            .windows
+            .values_mut()
+            .find(|window| window.ipc_window_id() == ipc_window_id)
+            .ok_or_else(|| IpcError::new("window_not_found", "terminal window does not exist"))?;
+        window.restart_terminal_client()
+    }
+
     /// Look up one terminal window without exposing the processor's window map.
     pub fn window(&self, window_id: WindowId) -> Option<&WindowContext> {
         self.windows.get(&window_id)
@@ -645,6 +678,39 @@ impl Processor {
             "ping" => {
                 request.connection.reply(request.id, serde_json::json!({"pong": true}));
                 return;
+            },
+            "reset_terminal" => {
+                let params: IpcTarget = match decode_ipc_params(&request) {
+                    Ok(params) => params,
+                    Err(error) => {
+                        request.connection.error(request.id, error);
+                        return;
+                    },
+                };
+                self.resolve_ipc_target(params.window_id).and_then(|target| {
+                    let window_id = self.windows[&target].ipc_window_id();
+                    self.reset_terminal(window_id).map(|completion| {
+                        serde_json::json!({
+                            "window_id": window_id,
+                            "completion": completion,
+                            "accepted": true,
+                        })
+                    })
+                })
+            },
+            "restart_terminal" => {
+                let params: IpcTarget = match decode_ipc_params(&request) {
+                    Ok(params) => params,
+                    Err(error) => {
+                        request.connection.error(request.id, error);
+                        return;
+                    },
+                };
+                self.resolve_ipc_target(params.window_id).and_then(|target| {
+                    let window_id = self.windows[&target].ipc_window_id();
+                    self.restart_terminal(window_id)
+                        .map(|()| serde_json::json!({"window_id": window_id, "restarted": true}))
+                })
             },
             // A headless instance outlives its last window, so it needs an explicit way to stop.
             "quit" => {
@@ -2166,6 +2232,13 @@ impl Processor {
         };
         let token = self.automation.next_write_token();
         let window = self.windows.get_mut(&target).unwrap();
+        if window.client_health() != crate::ClientHealth::Healthy {
+            request.connection.error(
+                request.id,
+                IpcError::new("client_fault", "terminal client is quarantined or recovering"),
+            );
+            return;
+        }
         let length = bytes.len();
         if let Err(error) = window.write_to_pty_with_completion(bytes, token) {
             warn!("failed to queue IPC terminal input: {error}");
@@ -3313,6 +3386,100 @@ impl Processor {
                 self.evaluate_waiters(*window_id);
                 self.schedule_automation_timer(*window_id);
             },
+            #[cfg(any(unix, windows))]
+            (EventType::Terminal(TerminalEvent::RecoveryPrompt), Some(window_id)) => {
+                let Some(ipc_window_id) =
+                    self.windows.get(window_id).map(WindowContext::ipc_window_id)
+                else {
+                    return;
+                };
+                #[cfg(windows)]
+                {
+                    let message = win32_string(
+                        "Recover this terminal pane?\n\nYes: Reset Terminal\nNo: Restart Terminal\nCancel: Keep the pane unchanged",
+                    );
+                    let title = win32_string("Vivido Terminal Recovery");
+                    let choice = unsafe {
+                        MessageBoxW(
+                            std::ptr::null_mut(),
+                            message.as_ptr(),
+                            title.as_ptr(),
+                            MB_ICONWARNING | MB_YESNOCANCEL | MB_SETFOREGROUND | MB_TASKMODAL,
+                        )
+                    };
+                    let result = match choice {
+                        IDYES => self.reset_terminal(ipc_window_id).map(|_| ()),
+                        IDNO => self.restart_terminal(ipc_window_id),
+                        _ => Ok(()),
+                    };
+                    if let Err(error) = result
+                        && let Some(window) = self.windows.get_mut(window_id)
+                    {
+                        window.message_buffer.push(Message::new(error.message, MessageType::Error));
+                        window.dirty = true;
+                        window.display.window.request_redraw();
+                    }
+                }
+                #[cfg(not(windows))]
+                if let Some(window) = self.windows.get_mut(window_id) {
+                    window.message_buffer.push(Message::new(
+                        format!(
+                            "Terminal recovery: run `vivido msg reset-terminal --window-id {ipc_window_id}` or `vivido msg restart-terminal --window-id {ipc_window_id}`."
+                        ),
+                        MessageType::Warning,
+                    ));
+                    window.dirty = true;
+                    window.display.window.request_redraw();
+                }
+            },
+            #[cfg(any(unix, windows))]
+            (EventType::Terminal(TerminalEvent::ClientResetComplete(token)), Some(window_id)) => {
+                if let Some(window) = self.windows.get_mut(window_id) {
+                    window.complete_client_reset();
+                    self.automation.emit(
+                        Some(window.ipc_window_id()),
+                        "client_recovered",
+                        serde_json::json!({"completion": token}),
+                    );
+                    window.display.window.request_redraw();
+                }
+                self.evaluate_waiters(*window_id);
+            },
+            #[cfg(any(unix, windows))]
+            (EventType::Terminal(TerminalEvent::ClientFault(fault)), Some(window_id)) => {
+                if let Some(window) = self.windows.get_mut(window_id) {
+                    let ipc_window_id = window.ipc_window_id();
+                    let quarantined = matches!(
+                        fault.class,
+                        crate::ClientFaultClass::TerminalParser | crate::ClientFaultClass::PtyIo
+                    );
+                    window.record_client_fault(fault.clone(), quarantined);
+                    if quarantined {
+                        window.fail_automation_requests(
+                            "client_fault",
+                            "terminal client was quarantined after an internal fault",
+                        );
+                        window.message_buffer.push(Message::new(
+                            format!(
+                                "Terminal client quarantined (fault {}). Use `vivido msg reset-terminal --window-id {ipc_window_id}` to recover.",
+                                fault.id
+                            ),
+                            MessageType::Error,
+                        ));
+                        window.dirty = true;
+                        window.display.window.request_redraw();
+                    }
+                    self.automation.emit(
+                        Some(ipc_window_id),
+                        "client_fault",
+                        serde_json::json!({
+                            "fault_id": fault.id,
+                            "class": fault.class.as_str(),
+                            "quarantined": quarantined,
+                        }),
+                    );
+                }
+            },
             (EventType::VividFrame, Some(window_id)) => {
                 if let Some(window_context) = self.windows.get_mut(window_id) {
                     window_context.acknowledge_vivid_frame();
@@ -4168,6 +4335,12 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
             .set_font(self.config.font.clone().with_size(self.display.font_size));
     }
 
+    fn terminal_recovery(&mut self) {
+        let _ = self
+            .event_proxy
+            .send_event(Event::new(EventType::Terminal(TerminalEvent::RecoveryPrompt), None));
+    }
+
     #[inline]
     fn pop_message(&mut self) {
         if !self.message_buffer.is_empty() {
@@ -4932,7 +5105,10 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                     #[cfg(any(unix, windows))]
                     TerminalEvent::PtyOutput { .. }
                     | TerminalEvent::PtyWriteComplete(_)
-                    | TerminalEvent::PtyResizeComplete(_) => (),
+                    | TerminalEvent::PtyResizeComplete(_)
+                    | TerminalEvent::ClientResetComplete(_)
+                    | TerminalEvent::ClientFault(_)
+                    | TerminalEvent::RecoveryPrompt => (),
                 },
                 #[cfg(any(unix, windows))]
                 EventType::IpcRequest(_)
