@@ -279,7 +279,7 @@ impl Wake for Registration {
 mod tests {
     use std::io::{Cursor, Read};
     use std::num::NonZeroUsize;
-    use std::sync::Arc;
+    use std::sync::{Arc, mpsc};
     use std::time::Duration;
 
     use polling::{Event, Events, PollMode, Poller};
@@ -293,7 +293,13 @@ mod tests {
         const WAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
         let source = (0..TOTAL).map(|offset| offset as u8).collect::<Vec<_>>();
-        let mut reader = UnblockedReader::new(Cursor::new(source.clone()), 2 * SLICE);
+        let (buffered, buffering) = mpsc::channel();
+        let source_reader =
+            BufferedSource { inner: Cursor::new(source.clone()), buffered: Some(buffered) };
+        let mut reader = UnblockedReader::new(source_reader, TOTAL);
+        buffering
+            .recv_timeout(WAKE_TIMEOUT)
+            .expect("background reader did not establish the buffered test precondition");
         let poller = Arc::new(Poller::new().unwrap());
         let event = Event::readable(7);
         reader.register(&poller, event, PollMode::Level);
@@ -316,5 +322,25 @@ mod tests {
         }
 
         assert_eq!(received, source);
+    }
+
+    struct BufferedSource {
+        inner: Cursor<Vec<u8>>,
+        buffered: Option<mpsc::Sender<()>>,
+    }
+
+    impl Read for BufferedSource {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            let count = self.inner.read(buffer)?;
+            // Piper asks for one empty read after the preceding bytes fill the pipe. At that
+            // point they have been published to the reader, so the test can begin without racing
+            // this background thread's first fill.
+            if count == 0
+                && let Some(buffered) = self.buffered.take()
+            {
+                let _ = buffered.send(());
+            }
+            Ok(count)
+        }
     }
 }

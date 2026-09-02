@@ -5988,9 +5988,10 @@ mod tests {
         };
     }
     use vivid_sdk::{
-        CoordinateModel, Fit, MILESTONE_OUTPUT_READY, MILESTONE_PRESENTED, ProducerAuthentication,
-        ProducerConfig, RasterConfiguration, RequestMetadata, SceneNode, SessionEvent, SlotBinding,
-        SurfaceDefinition, SurfaceDescriptor, SurfaceRole, TrackWaitCondition,
+        CoordinateModel, Fit, MILESTONE_CHANNEL_DETACHED, MILESTONE_OUTPUT_READY,
+        MILESTONE_PRESENTED, ProducerAuthentication, ProducerConfig, RasterConfiguration,
+        RequestMetadata, SceneNode, SessionEvent, SlotBinding, SurfaceDefinition,
+        SurfaceDescriptor, SurfaceRole, TrackWaitCondition,
     };
 
     fn test_geometry() -> DisplayGeometry {
@@ -7694,13 +7695,24 @@ mod tests {
             .unwrap();
         let item = service.scene.snapshot().items[0].clone();
         assert_eq!((item.x, item.y), (3_i64 << 32, 4_i64 << 32));
+        // Finish the independent media transport through the protocol before closing control.
+        // Dropping both sockets back-to-back leaves their server workers deliberately unordered,
+        // which is unrelated to this SDK integration test's clean-GOODBYE assertion.
+        channel.eos().unwrap();
+        session
+            .wait_track(
+                &track,
+                TrackWaitCondition::MilestoneSet,
+                Some(MILESTONE_CHANNEL_DETACHED),
+                5_000_000,
+            )
+            .unwrap();
         drop(channel);
         session.close().unwrap();
-        let deadline = Instant::now() + Duration::from_secs(1);
-        while !service.scene.session_ids().is_empty() && Instant::now() < deadline {
-            thread::sleep(Duration::from_millis(1));
-        }
-        assert!(service.scene.session_ids().is_empty());
+        assert!(
+            wait_until(Duration::from_secs(5), || service.scene.session_ids().is_empty()),
+            "clean GOODBYE did not retire the live scene"
+        );
         assert_eq!(
             service.scene.snapshot().items.len(),
             1,
