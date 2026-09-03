@@ -1083,15 +1083,13 @@ impl TabbedApplication {
                 self.click_chrome(event_loop)
             },
             #[cfg(windows)]
-            WindowEvent::Focused(true) => {
+            WindowEvent::Focused(true) if self.menu.is_none() => {
                 // The integrated chrome is the top-level activation target, while keyboard input
                 // belongs to its active child pane. Windows can return focus to the chrome after
                 // an application-mode transition; hand it straight back so the next key is not
                 // discarded until a tab switch happens to call `SetFocus`. An open menu is the one
                 // exception: it holds the keyboard until it closes.
-                if self.menu.is_none() {
-                    self.focus_active_pane();
-                }
+                self.focus_active_pane();
             },
             #[cfg(windows)]
             WindowEvent::Focused(false) => {},
