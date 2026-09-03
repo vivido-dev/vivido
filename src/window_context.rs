@@ -2811,6 +2811,15 @@ fn configure_vivid_pty_environment(
     environment.insert("VIVID_ENDPOINT_CONTROL".into(), control_endpoint.into());
     environment.insert("VIVID_ROOT_SECRET".into(), root_secret.into());
     environment.insert("VIVIDO_WINDOW_ID".into(), window_id.to_string());
+    // Ambient agent-mesh coordinates, so an agent started in this window can address agents in
+    // other windows and other runtimes. Vivido links no mesh crate and opens no store; these three
+    // strings are the whole integration. A window id survives being moved, which is what makes it
+    // the addressable part (`w`) rather than any position in a tab strip.
+    environment.insert("AGENT_MESH_RUNTIME".into(), crate::session::runtime_kind().into());
+    if let Some(instance) = crate::session::instance_name() {
+        environment.insert("AGENT_MESH_INSTANCE".into(), instance.into());
+    }
+    environment.insert("AGENT_MESH_ADDRESS".into(), format!("w{window_id}"));
     environment.insert(
         "VIVIDO_INPUT_TRANSPORT".into(),
         if cfg!(windows) { "win32-console" } else { "pty-bytes" }.into(),

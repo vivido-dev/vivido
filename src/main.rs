@@ -366,6 +366,7 @@ fn vivido(mut options: Options) -> Result<(), Box<dyn Error>> {
     automation_paths.prepare_endpoint(&automation_name)?;
     options.automation_name = Some(automation_name.clone());
     options.socket = Some(automation_socket);
+    session::publish_instance_name(&automation_name);
 
     // Setup winit event loop.
     #[cfg(not(target_os = "macos"))]

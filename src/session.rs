@@ -22,6 +22,39 @@ use sha2::{Digest, Sha256};
 use crate::polling::ipc::PROTOCOL_VERSION;
 
 const REGISTRY_SCHEMA: u32 = 1;
+
+/// This process' automation instance name, published once at startup.
+///
+/// Windows need it to tell a child which Vivido instance it is in, and threading it through window
+/// construction would touch every call site for one string that never changes after startup.
+static INSTANCE_NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// The runtime kind this process presents to the agent mesh.
+///
+/// Vivido embedded in a host — Vivida, vvbox — is not addressed as Vivido: the host owns the
+/// spaces and tabs a window sits in, so it owns the identity too. The host publishes its own kind
+/// here and windows inherit it.
+static RUNTIME_KIND: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Record the name this process registered under. Called once, before any window exists.
+pub fn publish_instance_name(name: &str) {
+    let _ = INSTANCE_NAME.set(name.to_owned());
+}
+
+/// Record the runtime kind an embedding host presents. Defaults to Vivido when unset.
+pub fn publish_runtime_kind(kind: &str) {
+    let _ = RUNTIME_KIND.set(kind.to_owned());
+}
+
+/// The agent-mesh runtime kind for this process.
+pub fn runtime_kind() -> &'static str {
+    RUNTIME_KIND.get().map(String::as_str).unwrap_or("vivido")
+}
+
+/// The name `vivido msg --target` addresses this process by, if it has one.
+pub fn instance_name() -> Option<&'static str> {
+    INSTANCE_NAME.get().map(String::as_str)
+}
 const MAX_REGISTRY_BYTES: u64 = 16 * 1024;
 const MAX_SESSION_NAME: usize = 64;
 
