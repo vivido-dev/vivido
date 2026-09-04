@@ -51,7 +51,7 @@ impl PaneHost for NativePaneHost {
         options.no_activate = true;
         options.parent_window = Some(parent);
         options.terminal_options.working_directory = Some(cwd.to_owned());
-        Ok(WindowId::from(processor.create_window(crate::LoopHandle::Winit(event_loop), options)?))
+        processor.create_hosted_pane(crate::LoopHandle::Winit(event_loop), options)
     }
 
     fn create_pane_with_options(
@@ -64,7 +64,7 @@ impl PaneHost for NativePaneHost {
         let parent = unsafe { ParentWindowHandle::new(self.chrome.window_handle()?.as_raw()) };
         options.no_activate = true;
         options.parent_window = Some(parent);
-        Ok(WindowId::from(processor.create_window(crate::LoopHandle::Winit(event_loop), options)?))
+        processor.create_hosted_pane(crate::LoopHandle::Winit(event_loop), options)
     }
 
     fn move_pane(&self, processor: &mut Processor, pane: WindowId, rect: PhysicalRect) {

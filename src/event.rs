@@ -2840,6 +2840,46 @@ impl Processor {
         self.create_window(LoopHandle::Embedded { size, scale_factor }, options)
     }
 
+    /// The platform window a public window ID refers to.
+    ///
+    /// A public ID is assigned independently of the windowing system's ID. The two are not
+    /// interchangeable: casting one to the other names a window that does not exist, which a host
+    /// sees as a pane that was never attached.
+    #[cfg(any(unix, windows))]
+    pub fn platform_window_id(&self, ipc_window_id: u64) -> Option<WindowId> {
+        self.windows
+            .iter()
+            .find_map(|(id, window)| (window.ipc_window_id() == ipc_window_id).then_some(*id))
+    }
+
+    /// Create an embedded window and return the platform window it became.
+    ///
+    /// Hosts arrange panes by platform window, so returning the public ID here would hand every
+    /// caller a value it has to convert — which is where casting it crept in.
+    #[cfg(any(unix, windows))]
+    pub fn create_embedded_pane(
+        &mut self,
+        size: PhysicalSize<u32>,
+        scale_factor: f64,
+        options: WindowOptions,
+    ) -> Result<WindowId, Box<dyn Error>> {
+        let public = self.create_embedded_window(size, scale_factor, options)?;
+        self.platform_window_id(public)
+            .ok_or_else(|| String::from("new pane is missing from the window set").into())
+    }
+
+    /// Create a window through the event loop and return the platform window it became.
+    #[cfg(any(unix, windows))]
+    pub fn create_hosted_pane(
+        &mut self,
+        handle: LoopHandle<'_>,
+        options: WindowOptions,
+    ) -> Result<WindowId, Box<dyn Error>> {
+        let public = self.create_window(handle, options)?;
+        self.platform_window_id(public)
+            .ok_or_else(|| String::from("new pane is missing from the window set").into())
+    }
+
     /// Deliver one host-translated event to an embedded terminal.
     pub fn handle_embedded_window_event(&mut self, window_id: WindowId, event: WindowEvent) {
         self.on_window_event(

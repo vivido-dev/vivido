@@ -725,7 +725,10 @@ pub struct WindowOptions {
 
     /// Stable IPC ID assigned to this window.
     ///
-    /// When omitted, Vivido uses the platform window ID.
+    /// When omitted, Vivido assigns the next ID from a small monotonic per-process counter, which
+    /// is what lets a window ID also be an agent-mesh address segment. An ID named here is honored
+    /// and the counter steps past it; one outside a one-based `u32` works for automation but leaves
+    /// the window with no mesh address.
     #[cfg(any(unix, windows))]
     #[clap(short = 'w', long = "window-id", value_name = "WINDOW_ID")]
     pub ipc_window_id: Option<u64>,
@@ -2266,6 +2269,11 @@ mod tests {
     // clap_complete emits even hidden macOS/Windows re-exec options, so the checked-in public shell
     // completions are generated from Linux where those internal implementation details do not
     // exist.
+    //
+    // A new subcommand or flag makes this fail until the files are regenerated. That is the point,
+    // but the failure reads as a wall of shell script, so: rerun with
+    // `VIVIDO_GENERATE_COMPLETIONS=1` and commit `extra/completions/` with the change that caused
+    // it.
     #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     fn completions() {

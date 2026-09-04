@@ -20,7 +20,9 @@ use std::sync::Arc;
 #[cfg(any(unix, windows))]
 use std::sync::Mutex;
 #[cfg(windows)]
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
+#[cfg(any(unix, windows))]
+use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(windows)]
 use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::thread::JoinHandle;
@@ -176,6 +178,30 @@ pub struct WindowContext {
     pub automation: AutomationWindowState,
     client_health: ClientHealth,
     last_client_fault: Option<ClientFault>,
+}
+
+/// The next public window ID this process will hand out.
+///
+/// Small and monotonic, rather than the winit window ID this used to be. A public window ID is
+/// also an agent-mesh address segment, and an address index is a `u32`; winit IDs on Wayland start
+/// at 2^63, so every pane published an address that could not parse and no agent could bind from
+/// inside one. Nothing converts this value back into a `WindowId` — every lookup searches for it —
+/// so its only requirements are that it is unique within the process and never reused.
+#[cfg(any(unix, windows))]
+static NEXT_IPC_WINDOW_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Resolve a window's public ID, honoring one the caller named.
+#[cfg(any(unix, windows))]
+fn assign_ipc_window_id(requested: Option<u64>) -> u64 {
+    match requested {
+        // A caller that names its own ID keeps it, and the counter steps past it so a later
+        // automatic ID cannot collide with one that was claimed explicitly.
+        Some(id) => {
+            NEXT_IPC_WINDOW_ID.fetch_max(id.saturating_add(1), Ordering::Relaxed);
+            id
+        },
+        None => NEXT_IPC_WINDOW_ID.fetch_add(1, Ordering::Relaxed),
+    }
 }
 
 /// Active Windows wake for the final update accumulated by the direct-draw rate limiter.
@@ -375,7 +401,7 @@ impl WindowContext {
 
         let preserve_title = options.window_identity.title.is_some();
         #[cfg(any(unix, windows))]
-        let ipc_window_id = options.ipc_window_id.unwrap_or_else(|| display.window.id().into());
+        let ipc_window_id = assign_ipc_window_id(options.ipc_window_id);
 
         info!(
             "PTY dimensions: {:?} x {:?}",
@@ -2819,7 +2845,13 @@ fn configure_vivid_pty_environment(
     if let Some(instance) = crate::session::instance_name() {
         environment.insert("AGENT_MESH_INSTANCE".into(), instance.into());
     }
-    environment.insert("AGENT_MESH_ADDRESS".into(), format!("w{window_id}"));
+    // An address index is a one-based `u32`. Ids this process assigns always fit, but a caller may
+    // name any `u64` with `--ipc-window-id`. Publish nothing rather than an address that cannot
+    // parse: a window with no position still binds and is still reachable by alias, whereas an
+    // unparsable address fails the bind outright and takes the whole mailbox with it.
+    if (1..=u64::from(u32::MAX)).contains(&window_id) {
+        environment.insert("AGENT_MESH_ADDRESS".into(), format!("w{window_id}"));
+    }
     environment.insert(
         "VIVIDO_INPUT_TRANSPORT".into(),
         if cfg!(windows) { "win32-console" } else { "pty-bytes" }.into(),
@@ -3350,6 +3382,8 @@ fn hash_color<H: Hasher>(color: Option<Color>, hasher: &mut H) {
 
 #[cfg(test)]
 mod vivid_environment_tests {
+    #[cfg(any(unix, windows))]
+    use super::assign_ipc_window_id;
     use super::configure_vivid_pty_environment;
     #[cfg(windows)]
     use super::vivid_wslenv;
@@ -3540,6 +3574,61 @@ mod vivid_environment_tests {
         assert_eq!(environment.get("VIVID_ANCHOR_TRANSPORT").map(String::as_str), Some("conpty"));
         #[cfg(not(windows))]
         assert!(!environment.contains_key("VIVID_ANCHOR_TRANSPORT"));
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn public_window_ids_are_small_and_monotonic() {
+        // The counter is process-global and other tests share it, so compare, never assert values.
+        let first = assign_ipc_window_id(None);
+        let second = assign_ipc_window_id(None);
+
+        assert!(second > first, "ids advance: {first} then {second}");
+        assert!(
+            u32::try_from(second).is_ok(),
+            "an id must fit an agent-mesh address index, got {second}"
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn a_claimed_window_id_is_kept_and_never_handed_out_again() {
+        let claimed = assign_ipc_window_id(None) + 5_000;
+
+        assert_eq!(assign_ipc_window_id(Some(claimed)), claimed, "a named id is honored");
+        assert!(
+            assign_ipc_window_id(None) > claimed,
+            "the counter steps past a claimed id so it cannot be assigned twice"
+        );
+    }
+
+    #[test]
+    fn child_receives_a_mesh_address_only_when_the_id_can_be_one() {
+        let mut environment = HashMap::new();
+        configure_vivid_pty_environment(&mut environment, "tcp:127.0.0.1:1", "secret", 7);
+        assert_eq!(environment.get("AGENT_MESH_ADDRESS").map(String::as_str), Some("w7"));
+
+        // Winit ids used to land here, and an address index is a one-based `u32`. Publishing one
+        // that cannot parse failed `vvagent bind` outright rather than costing only the position.
+        for unaddressable in [0, u64::from(u32::MAX) + 1, 9_223_372_036_854_775_808] {
+            let mut environment = HashMap::new();
+            configure_vivid_pty_environment(
+                &mut environment,
+                "tcp:127.0.0.1:1",
+                "secret",
+                unaddressable,
+            );
+
+            assert_eq!(
+                environment.get("VIVIDO_WINDOW_ID").map(String::as_str),
+                Some(unaddressable.to_string().as_str()),
+                "the window stays addressable by automation"
+            );
+            assert!(
+                !environment.contains_key("AGENT_MESH_ADDRESS"),
+                "{unaddressable} cannot be an address index, so no address is published"
+            );
+        }
     }
 
     #[cfg(windows)]
