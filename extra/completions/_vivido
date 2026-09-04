@@ -105,6 +105,22 @@ _arguments "${_arguments_options[@]}" : \
 '--help[Print help]' \
 && ret=0
 ;;
+(reset-terminal)
+_arguments "${_arguments_options[@]}" : \
+'-w+[Window ID. The focused window is used when this is omitted]:WINDOW_ID:_default' \
+'--window-id=[Window ID. The focused window is used when this is omitted]:WINDOW_ID:_default' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(restart-terminal)
+_arguments "${_arguments_options[@]}" : \
+'-w+[Window ID. The focused window is used when this is omitted]:WINDOW_ID:_default' \
+'--window-id=[Window ID. The focused window is used when this is omitted]:WINDOW_ID:_default' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
 (config)
 _arguments "${_arguments_options[@]}" : \
 '-w+[Window ID for the new config]:WINDOW_ID:_default' \
@@ -850,6 +866,14 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
+(reset-terminal)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(restart-terminal)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
 (config)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
@@ -1157,6 +1181,14 @@ _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
 (ping)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(reset-terminal)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(restart-terminal)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
@@ -1482,6 +1514,8 @@ _vivido__help__msg_commands() {
 'create-window:Create a new window in the same Vivido process' \
 'quit:Shut down the Vivido instance, closing every window' \
 'ping:Check IPC liveness' \
+'reset-terminal:Reset parser and client-controlled terminal state for one window' \
+'restart-terminal:Replace one terminal process while preserving its stable window identity' \
 'config:Update the Vivido configuration' \
 'get-config:Read runtime Vivido configuration' \
 'typing:Type literal text into a terminal' \
@@ -1639,10 +1673,20 @@ _vivido__help__msg__quit_commands() {
     local commands; commands=()
     _describe -t commands 'vivido help msg quit commands' commands "$@"
 }
+(( $+functions[_vivido__help__msg__reset-terminal_commands] )) ||
+_vivido__help__msg__reset-terminal_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido help msg reset-terminal commands' commands "$@"
+}
 (( $+functions[_vivido__help__msg__resize_commands] )) ||
 _vivido__help__msg__resize_commands() {
     local commands; commands=()
     _describe -t commands 'vivido help msg resize commands' commands "$@"
+}
+(( $+functions[_vivido__help__msg__restart-terminal_commands] )) ||
+_vivido__help__msg__restart-terminal_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido help msg restart-terminal commands' commands "$@"
 }
 (( $+functions[_vivido__help__msg__run-plan_commands] )) ||
 _vivido__help__msg__run-plan_commands() {
@@ -1801,6 +1845,8 @@ _vivido__msg_commands() {
 'create-window:Create a new window in the same Vivido process' \
 'quit:Shut down the Vivido instance, closing every window' \
 'ping:Check IPC liveness' \
+'reset-terminal:Reset parser and client-controlled terminal state for one window' \
+'restart-terminal:Replace one terminal process while preserving its stable window identity' \
 'config:Update the Vivido configuration' \
 'get-config:Read runtime Vivido configuration' \
 'typing:Type literal text into a terminal' \
@@ -1881,6 +1927,8 @@ _vivido__msg__help_commands() {
 'create-window:Create a new window in the same Vivido process' \
 'quit:Shut down the Vivido instance, closing every window' \
 'ping:Check IPC liveness' \
+'reset-terminal:Reset parser and client-controlled terminal state for one window' \
+'restart-terminal:Replace one terminal process while preserving its stable window identity' \
 'config:Update the Vivido configuration' \
 'get-config:Read runtime Vivido configuration' \
 'typing:Type literal text into a terminal' \
@@ -2044,10 +2092,20 @@ _vivido__msg__help__quit_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg help quit commands' commands "$@"
 }
+(( $+functions[_vivido__msg__help__reset-terminal_commands] )) ||
+_vivido__msg__help__reset-terminal_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg help reset-terminal commands' commands "$@"
+}
 (( $+functions[_vivido__msg__help__resize_commands] )) ||
 _vivido__msg__help__resize_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg help resize commands' commands "$@"
+}
+(( $+functions[_vivido__msg__help__restart-terminal_commands] )) ||
+_vivido__msg__help__restart-terminal_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg help restart-terminal commands' commands "$@"
 }
 (( $+functions[_vivido__msg__help__run-plan_commands] )) ||
 _vivido__msg__help__run-plan_commands() {
@@ -2335,10 +2393,20 @@ _vivido__msg__quit_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg quit commands' commands "$@"
 }
+(( $+functions[_vivido__msg__reset-terminal_commands] )) ||
+_vivido__msg__reset-terminal_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg reset-terminal commands' commands "$@"
+}
 (( $+functions[_vivido__msg__resize_commands] )) ||
 _vivido__msg__resize_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg resize commands' commands "$@"
+}
+(( $+functions[_vivido__msg__restart-terminal_commands] )) ||
+_vivido__msg__restart-terminal_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg restart-terminal commands' commands "$@"
 }
 (( $+functions[_vivido__msg__run-plan_commands] )) ||
 _vivido__msg__run-plan_commands() {

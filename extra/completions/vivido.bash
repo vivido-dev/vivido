@@ -100,8 +100,14 @@ _vivido() {
             vivido__help__msg,quit)
                 cmd="vivido__help__msg__quit"
                 ;;
+            vivido__help__msg,reset-terminal)
+                cmd="vivido__help__msg__reset__terminal"
+                ;;
             vivido__help__msg,resize)
                 cmd="vivido__help__msg__resize"
+                ;;
+            vivido__help__msg,restart-terminal)
+                cmd="vivido__help__msg__restart__terminal"
                 ;;
             vivido__help__msg,run-plan)
                 cmd="vivido__help__msg__run__plan"
@@ -253,8 +259,14 @@ _vivido() {
             vivido__msg,quit)
                 cmd="vivido__msg__quit"
                 ;;
+            vivido__msg,reset-terminal)
+                cmd="vivido__msg__reset__terminal"
+                ;;
             vivido__msg,resize)
                 cmd="vivido__msg__resize"
+                ;;
+            vivido__msg,restart-terminal)
+                cmd="vivido__msg__restart__terminal"
                 ;;
             vivido__msg,run-plan)
                 cmd="vivido__msg__run__plan"
@@ -340,8 +352,14 @@ _vivido() {
             vivido__msg__help,quit)
                 cmd="vivido__msg__help__quit"
                 ;;
+            vivido__msg__help,reset-terminal)
+                cmd="vivido__msg__help__reset__terminal"
+                ;;
             vivido__msg__help,resize)
                 cmd="vivido__msg__help__resize"
+                ;;
+            vivido__msg__help,restart-terminal)
+                cmd="vivido__msg__help__restart__terminal"
                 ;;
             vivido__msg__help,run-plan)
                 cmd="vivido__msg__help__run__plan"
@@ -868,7 +886,7 @@ _vivido() {
             return 0
             ;;
         vivido__help__msg)
-            opts="create-window quit ping config get-config typing get-text screenshot capabilities run-plan capture key paste mouse resize set-geometry set-visible set-level focus signal list-windows inspect diagnose vivid get-grid wait transcript subscribe"
+            opts="create-window quit ping reset-terminal restart-terminal config get-config typing get-text screenshot capabilities run-plan capture key paste mouse resize set-geometry set-visible set-level focus signal list-windows inspect diagnose vivid get-grid wait transcript subscribe"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -1217,7 +1235,35 @@ _vivido() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
+        vivido__help__msg__reset__terminal)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
         vivido__help__msg__resize)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        vivido__help__msg__restart__terminal)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
@@ -1618,7 +1664,7 @@ _vivido() {
             return 0
             ;;
         vivido__msg)
-            opts="-s -t -h --socket --target --help create-window quit ping config get-config typing get-text screenshot capabilities run-plan capture key paste mouse resize set-geometry set-visible set-level focus signal list-windows inspect diagnose vivid get-grid wait transcript subscribe help"
+            opts="-s -t -h --socket --target --help create-window quit ping reset-terminal restart-terminal config get-config typing get-text screenshot capabilities run-plan capture key paste mouse resize set-geometry set-visible set-level focus signal list-windows inspect diagnose vivid get-grid wait transcript subscribe help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -1939,7 +1985,7 @@ _vivido() {
             return 0
             ;;
         vivido__msg__help)
-            opts="create-window quit ping config get-config typing get-text screenshot capabilities run-plan capture key paste mouse resize set-geometry set-visible set-level focus signal list-windows inspect diagnose vivid get-grid wait transcript subscribe help"
+            opts="create-window quit ping reset-terminal restart-terminal config get-config typing get-text screenshot capabilities run-plan capture key paste mouse resize set-geometry set-visible set-level focus signal list-windows inspect diagnose vivid get-grid wait transcript subscribe help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -2302,7 +2348,35 @@ _vivido() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
+        vivido__msg__help__reset__terminal)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
         vivido__msg__help__resize)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        vivido__msg__help__restart__terminal)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
@@ -3396,6 +3470,28 @@ _vivido() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
+        vivido__msg__reset__terminal)
+            opts="-w -h --window-id --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --window-id)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                -w)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
         vivido__msg__resize)
             opts="-w -h --columns --rows --width --height --window-id --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
@@ -3419,6 +3515,28 @@ _vivido() {
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
+                --window-id)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                -w)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        vivido__msg__restart__terminal)
+            opts="-w -h --window-id --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
                 --window-id)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
