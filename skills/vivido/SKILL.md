@@ -125,17 +125,10 @@ on no screen.
 
 ## Reaching another agent
 
-Inside a **headed** Vivido window this is ambient: the pane inherits `AGENT_MESH_RUNTIME`,
+This is ambient, headed or headless: the pane inherits `AGENT_MESH_RUNTIME`,
 `AGENT_MESH_INSTANCE`, and `AGENT_MESH_ADDRESS` (`w<window_id>` — Vivido has no space, and its tabs
-*are* windows), and Vivido starts the watcher itself when `vvagent` is on PATH.
-
-Neither half holds in a **headless** session today: the pane gets `AGENT_MESH_RUNTIME` and
-`AGENT_MESH_ADDRESS` but no `AGENT_MESH_INSTANCE`, and no watcher is started.
-
-> **Binding does not work on Linux today, headed or headless.** Vivido's window IDs are winit ids
-> near 2^63, and a mesh address index is a `u32`, so `vvagent bind` fails with
-> ``invalid_request: `92233…` does not fit an address index``. Verified live. Read
-> [references/agent-mesh.md](references/agent-mesh.md) before trying to use the mesh here.
+*are* windows), and Vivido starts the watcher itself when `vvagent` is on PATH. In a headless
+session the instance is the session name, so `vvagent bind --alias NAME` needs no other flags.
 
 ```sh
 vvagent whoami                                    # where am I, and am I bound

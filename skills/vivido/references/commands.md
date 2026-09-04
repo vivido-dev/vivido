@@ -284,15 +284,13 @@ vivido msg subscribe --all --since-event "$sequence"
 ```
 
 The handshake's `event_kinds` is also the `--events` allowlist, so take the list from
-`capabilities` rather than from prose. As of this build it is `screen_changed`, `output`,
-`frame_presented`, `title_changed`, `focus_changed`, `resized`, `moved`, `bell`, `child_exit`,
+`capabilities` rather than from prose: `screen_changed`, `output`, `frame_presented`,
+`title_changed`, `directory_changed`, `focus_changed`, `resized`, `moved`, `bell`, `child_exit`,
 `window_created`, `window_closed`, `client_fault`, `client_recovered`, `overflow`.
 
-`docs/ipc.md` additionally documents a `directory_changed` event carrying `{"directory":"/path"}`
-from OSC 7. The event loop emits it, but it is missing from the advertised kinds, and since that
-same list is the filter's allowlist, `--events directory_changed` is rejected with
-`invalid_params: unknown event kind`. Watch the working directory through `inspect`'s
-`current_directory` instead until that is reconciled.
+`directory_changed` carries `{"directory":"/path"}` when the shell reports a new working directory
+through OSC 7, which needs shell integration; `inspect`'s `current_directory` answers the same
+question by polling and needs none.
 
 Frames look like:
 

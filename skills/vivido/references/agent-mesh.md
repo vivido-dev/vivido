@@ -32,63 +32,35 @@ vvagent state --state busy
 
 ## Binding
 
-Inside a headed Vivido window, a Vivida pane, or a vvmux pane, position is ambient — the pane
-inherits `AGENT_MESH_RUNTIME`, `AGENT_MESH_INSTANCE`, and `AGENT_MESH_ADDRESS`:
+Inside a Vivido window, a Vivida pane, or a vvmux pane, position is ambient — the pane inherits
+`AGENT_MESH_RUNTIME`, `AGENT_MESH_INSTANCE`, and `AGENT_MESH_ADDRESS`:
 
 ```sh
 vvagent bind --alias builder
 ```
 
-### Binding does not work on Linux today
+A window id is small and monotonic — `1`, `2`, `3` — precisely so it can be an address segment,
+which is a one-based `u32`. It is not the winit window id, which on Wayland starts at 2^63 and used
+to be published here, failing every bind with ``invalid_request: `92233…` does not fit an address
+index``.
 
-A mesh address index is a `u32`. Vivido's public window ids are winit window ids, which on Wayland
-start at 2^63:
+A caller may still claim an arbitrary id with `create-window --window-id N`. One outside the `u32`
+range stays fully addressable by automation but gets **no** `AGENT_MESH_ADDRESS`: that pane binds
+and is reachable by alias, with no position on the mesh.
 
-```console
-$ vvagent bind --alias reviewer          # run inside a Vivido window
-{"error":{"candidates":[],"code":"invalid_request",
-          "message":"`9223372036854775808` does not fit an address index"}}
-```
-
-Verified live in a headed Vivido under Weston and in a headless session, and equally in Vivida,
-whose panes are hosted Vivido windows with ids from the same source. Two consequences:
-
-- **No agent can bind from inside a window.** `vvagent bind` refuses the inherited address outright,
-  so the endpoint is never created and nothing else in this document applies.
-- **Reconcile silently skips every pane**, since it reads each `window_id` through a `u32`
-  conversion and produces no placement.
-
-`--address` cannot rescue it: `resolve_address` parses `AGENT_MESH_ADDRESS` as a prefix *before*
-joining anything you pass, so the bad value fails first. The environment variable has to be gone:
+A headless session is a runtime instance like any other: its instance name is the session name, its
+windows are addressable, and it starts its own watcher.
 
 ```sh
-env -u AGENT_MESH_ADDRESS vvagent bind --alias reviewer --address s1t1w7
+eval "$(vivido --headless --session build)"
+# in a pane of that session:
+vvagent bind --alias builder        # → runtime vivido, instance build, address w1
 ```
 
-That works, but the address is now a number you invented rather than the pane's real position, so it
-is only safe when you assign every endpoint by hand. For alias-addressed messaging, which needs no
-position at all, prefer binding outside the pane entirely:
-
-```sh
-vvagent run --alias reviewer --runtime wrapper --instance dev -- codex
-```
-
-### Headless Vivido is not wired up yet
-
-A headless session exports `AGENT_MESH_RUNTIME` and `AGENT_MESH_ADDRESS`, but **not**
-`AGENT_MESH_INSTANCE`, and it starts **no** watcher. Both are done in Vivido's headed entrypoint and
-in Vivida's; the headless `serve()` path does neither. Verified against a live session: a pane's
-environment holds `AGENT_MESH_RUNTIME=vivido` and `AGENT_MESH_ADDRESS=w<id>` and nothing else.
-
-So in headless, name the instance yourself and run your own watcher:
-
-```sh
-vvagent bind --alias builder --runtime vivido --instance "$VIVIDO_SESSION"
-vvagent watch --runtime vivido --instance "$VIVIDO_SESSION" --parent-pid $$
-```
-
-Without `--instance`, the binding lands in a different runtime instance than the address implies,
-and nothing will activate an idle agent in that session.
+Vivido also clears any `AGENT_MESH_*` it inherited before building a window. A window writes its
+coordinates as *overrides*, so without that a Vivido launched from inside another pane would hand
+its own panes the launching pane's instance — a different runtime instance, which is worse than
+none.
 
 Elsewhere, bind and launch in one step, which also releases the binding when the child exits:
 

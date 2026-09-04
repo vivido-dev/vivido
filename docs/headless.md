@@ -63,6 +63,22 @@ fallback is 1280x720 physical pixels at scale factor 1.0.
 Headless windows can still be resized at runtime with `vivido msg resize`, in either grid or pixel
 units.
 
+## Agents in a headless session
+
+A headless session is a runtime instance like any other. Every pane inherits `AGENT_MESH_RUNTIME`,
+`AGENT_MESH_INSTANCE` — the session name — and `AGENT_MESH_ADDRESS`, and the session starts one
+`vvagent watch` for itself when `vvagent` is on `PATH`, leashed to the daemon so it exits with it.
+
+```sh
+eval "$(vivido --headless --session build)"
+# in a pane of that session:
+vvagent bind --alias builder        # runtime vivido, instance build, address w1
+```
+
+`AGENT_MESH_WATCH=off` opts out of the watcher; `AGENT_MESH_BIN` names the executable when it is not
+on `PATH`. Coordinates inherited from a pane this session was launched in are cleared at startup, so
+a pane sees this session's identity rather than the launcher's.
+
 ## Managing sessions
 
 ```sh

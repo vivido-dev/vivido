@@ -182,7 +182,12 @@ physical modifiers pressed.
   connection.
 - `create_window`: synchronously constructs a complete window and returns `{"window_id":ID}`.
   The CLI is `vivido msg create-window` with its existing window, command, directory, hold, title,
-  class, and config options. `ipc_window_id` is optional and must be unique. The response does not
+  class, and config options. `ipc_window_id` is optional and must be unique. Assigned IDs are small
+  and monotonic within a process, starting at 1, and are never reused; a caller that names its own
+  ID keeps it, and automatic assignment then steps past it. The value is opaque — discover it, never
+  predict it — but it is deliberately small enough to be an agent-mesh address segment, which is a
+  one-based `u32`. A window whose ID is outside that range works normally here and simply inherits
+  no `AGENT_MESH_ADDRESS`. The response does not
   wait for the first rendered frame. In a headed Windows/Linux process this method creates and
   activates a tab in the existing top-level window; each tab's returned window ID remains its
   stable public identity. macOS and headless sessions retain their existing window semantics.
@@ -442,9 +447,14 @@ Event frames have this shape:
 {"version":2,"subscription_id":7,"event_sequence":123,"window_id":42,"event":{"type":"screen_changed","data":{}}}
 ```
 
+An event frame carries the same protocol version as requests and responses. Distinguish it by the
+presence of `subscription_id`, not by `version`.
+
 Kinds are `screen_changed`, `output`, `frame_presented`, `title_changed`, `directory_changed`,
 `focus_changed`, `resized`, `moved`, `bell`, `child_exit`, `window_created`, `window_closed`, and
-`overflow`, plus `client_fault` and `client_recovered`. A replayable `client_fault` contains the
+`overflow`, plus `client_fault` and `client_recovered`. The handshake's `event_kinds` is the
+authority and is also the `--events` allowlist: a kind it does not list cannot be subscribed to by
+name. A replayable `client_fault` contains the
 window ID in the envelope and only `fault_id`, `class`, and `quarantined`; client bytes, panic
 payloads, paths, and capability material are never included. `client_recovered` follows a completed
 reset. Output data is split into
