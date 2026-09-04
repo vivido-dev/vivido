@@ -79,6 +79,7 @@ impl Drop for BoundaryGuard {
 }
 
 /// Whether the current panic is unwinding through an explicitly contained client boundary.
+#[cfg(any(windows, test))]
 pub(crate) fn is_contained() -> bool {
     CONTAINED_DEPTH.with(|depth| depth.get() != 0)
 }

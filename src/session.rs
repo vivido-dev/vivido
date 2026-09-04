@@ -41,6 +41,55 @@ pub fn publish_instance_name(name: &str) {
     let _ = INSTANCE_NAME.set(name.to_owned());
 }
 
+/// Start the optional mesh worker off the UI thread. Its parent leash owns its lifetime;
+/// this runtime never opens the mesh database or waits for provider control calls.
+pub fn start_mesh_watcher() {
+    if std::env::var("AGENT_MESH_WATCH").as_deref() == Ok("off") {
+        return;
+    }
+    let Some(instance) = instance_name() else { return };
+    let kind = runtime_kind();
+    let _ = std::thread::Builder::new().name("agent-mesh".into()).spawn(move || {
+        let program = std::env::var_os("AGENT_MESH_BIN").unwrap_or_else(|| "vvagent".into());
+        let mut command = std::process::Command::new(program);
+        command.args([
+            "watch",
+            "--runtime",
+            kind,
+            "--instance",
+            instance,
+            "--parent-pid",
+            &std::process::id().to_string(),
+        ]);
+        if kind == "vivida"
+            && let Ok(exe) = std::env::current_exe()
+        {
+            let executable = exe.to_string_lossy();
+            #[cfg(windows)]
+            let executable = format!("\"{executable}\"");
+            #[cfg(unix)]
+            let executable = format!("'{}'", executable.replace('\'', "'\\''"));
+            command.args(["--reconcile", &format!("{executable} msg --target {instance} layout")]);
+        }
+        command
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        }
+        match command.spawn() {
+            Ok(mut child) => {
+                let _ = child.wait();
+            },
+            Err(error) if error.kind() == io::ErrorKind::NotFound => (),
+            Err(error) => log::warn!("Could not start agent mesh watcher: {error}"),
+        }
+    });
+}
+
 /// Record the runtime kind an embedding host presents. Defaults to Vivido when unset.
 pub fn publish_runtime_kind(kind: &str) {
     let _ = RUNTIME_KIND.set(kind.to_owned());
