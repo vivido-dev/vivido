@@ -355,16 +355,15 @@ impl Subscriber {
 
     fn send(&mut self, event: &StoredEvent) {
         if let Some((start, end)) = self.overflow {
-            let overflow = SubscriptionEventEnvelope {
-                version: 1,
-                subscription_id: self.id,
-                event_sequence: end,
-                window_id: self.window_id,
-                event: json!({
+            let overflow = SubscriptionEventEnvelope::new(
+                self.id,
+                end,
+                self.window_id,
+                json!({
                     "type": "overflow",
                     "data": {"first_dropped_sequence": start, "last_dropped_sequence": end},
                 }),
-            };
+            );
             if self.connection.event(overflow, &self.queued_events).is_err() {
                 self.overflow = Some((start, event.sequence));
                 return;
@@ -372,13 +371,12 @@ impl Subscriber {
             self.overflow = None;
         }
 
-        let envelope = SubscriptionEventEnvelope {
-            version: 1,
-            subscription_id: self.id,
-            event_sequence: event.sequence,
-            window_id: event.window_id,
-            event: json!({"type": event.kind, "data": event.payload.to_value()}),
-        };
+        let envelope = SubscriptionEventEnvelope::new(
+            self.id,
+            event.sequence,
+            event.window_id,
+            json!({"type": event.kind, "data": event.payload.to_value()}),
+        );
         if self.connection.event(envelope, &self.queued_events).is_err() {
             self.overflow = Some(match self.overflow {
                 Some((start, _)) => (start, event.sequence),
@@ -435,6 +433,13 @@ impl AutomationHub {
     }
 
     fn emit_payload(&mut self, window_id: Option<u64>, kind: &str, payload: StoredPayload) -> u64 {
+        // An unadvertised kind is delivered to unfiltered subscriptions but cannot be named by
+        // `subscribe`, which validates against the same list. `directory_changed` sat in that state:
+        // emitted, documented, and impossible to ask for.
+        debug_assert!(
+            crate::polling::ipc::EVENT_KINDS.contains(&kind),
+            "event kind {kind:?} is emitted but not advertised in EVENT_KINDS"
+        );
         self.event_sequence = self.event_sequence.saturating_add(1);
         let encoded_size = payload.encoded_size() + kind.len() + 128;
         let event = StoredEvent {
@@ -556,6 +561,33 @@ impl AutomationHub {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_event_frame_carries_the_protocol_version() {
+        // It carried a literal `1`, written when the protocol was version 1 and left behind when
+        // the protocol moved to 2, so an event disagreed with every other frame on its connection.
+        let envelope = SubscriptionEventEnvelope::new(
+            1,
+            1,
+            Some(1),
+            serde_json::json!({"type": "bell", "data": {}}),
+        );
+
+        assert_eq!(
+            envelope.version,
+            crate::polling::ipc::PROTOCOL_VERSION,
+            "an event frame and a response frame must agree on the protocol version"
+        );
+        assert_ne!(envelope.version, 1, "the leftover value from protocol version 1");
+    }
+
+    #[test]
+    #[should_panic(expected = "not advertised in EVENT_KINDS")]
+    fn emitting_an_unadvertised_kind_is_caught_in_development() {
+        // The guard that would have caught `directory_changed`: emitting a kind `subscribe` will
+        // not accept means unfiltered subscribers see an event nobody can ask for by name.
+        AutomationHub::default().emit(Some(1), "not_a_real_kind", serde_json::json!({}));
+    }
 
     #[test]
     fn transcript_has_monotonic_offsets_and_eviction_gaps() {

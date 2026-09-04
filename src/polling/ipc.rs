@@ -260,11 +260,16 @@ fn advertised_method_capabilities() -> Vec<MethodCapability> {
 }
 
 /// Event kinds advertised by the protocol handshake.
+///
+/// This is also the `subscribe` allowlist, so a kind missing here is one no client can ask for even
+/// though the event loop still delivers it to unfiltered subscriptions. `AutomationHub::emit_payload`
+/// debug-asserts against this list to keep the two from drifting apart again.
 pub const EVENT_KINDS: &[&str] = &[
     "screen_changed",
     "output",
     "frame_presented",
     "title_changed",
+    "directory_changed",
     "focus_changed",
     "resized",
     "moved",
@@ -332,12 +337,29 @@ impl ResponseEnvelope {
 /// Subscription event envelope.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct SubscriptionEventEnvelope {
+    /// The protocol version, the same one requests and responses carry.
+    ///
+    /// This was a literal `1` written when the protocol was version 1, and it stayed behind when
+    /// the protocol moved to 2 — so an event frame disagreed with every other frame on the same
+    /// connection. [`SubscriptionEventEnvelope::new`] is the only place it is set.
     pub version: u16,
     pub subscription_id: u64,
     pub event_sequence: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub window_id: Option<u64>,
     pub event: Value,
+}
+
+impl SubscriptionEventEnvelope {
+    /// An event frame for the current protocol version.
+    pub fn new(
+        subscription_id: u64,
+        event_sequence: u64,
+        window_id: Option<u64>,
+        event: Value,
+    ) -> Self {
+        Self { version: PROTOCOL_VERSION, subscription_id, event_sequence, window_id, event }
+    }
 }
 
 /// A request delivered to the main UI event loop.
@@ -2020,6 +2042,26 @@ pub(crate) fn test_connection() -> (IpcConnection, mpsc::Receiver<OutputFrame>) 
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn every_emitted_event_kind_is_advertised() {
+        // `EVENT_KINDS` is both the handshake advertisement and the `subscribe` allowlist, so a
+        // kind missing from it is delivered to unfiltered subscriptions and rejected when asked for
+        // by name. `directory_changed` was in exactly that state: emitted on OSC 7, documented in
+        // `docs/ipc.md`, and unreachable. `AutomationHub::emit_payload` now debug-asserts against
+        // this list; this pins the kind that was missing and the list's shape.
+        assert!(
+            EVENT_KINDS.contains(&"directory_changed"),
+            "OSC 7 emits directory_changed, so a client must be able to subscribe to it"
+        );
+
+        let mut sorted = EVENT_KINDS.to_vec();
+        sorted.sort_unstable();
+        let unique = sorted.len();
+        sorted.dedup();
+        assert_eq!(sorted.len(), unique, "an advertised kind is listed twice");
+    }
+
     #[cfg(windows)]
     use std::io::Read;
     use std::io::{BufReader, Write};
