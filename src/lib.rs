@@ -109,7 +109,8 @@ pub mod binary {
     pub mod session {
         pub use crate::session::{
             RegistryGuard, SessionPaths, list_registries, print_sessions, publish_instance_name,
-            publish_runtime_kind, start_mesh_watcher, terminate_session,
+            publish_runtime_kind, scrub_inherited_mesh_environment, start_mesh_watcher,
+            terminate_session,
         };
     }
 }

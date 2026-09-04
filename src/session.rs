@@ -41,6 +41,22 @@ pub fn publish_instance_name(name: &str) {
     let _ = INSTANCE_NAME.set(name.to_owned());
 }
 
+/// Drop agent-mesh coordinates inherited from a pane this process was launched in.
+///
+/// A window writes its coordinates as *overrides* on the child's environment, so any key it does
+/// not write falls through from this process. Vivido started from inside another Vivido or Vivida
+/// pane would otherwise hand its own panes the launching pane's instance and address — not merely
+/// stale, but pointing at a different runtime instance, which is worse than having none.
+///
+/// # Safety
+///
+/// Call before any thread is started. Removing an environment variable is not thread-safe.
+pub unsafe fn scrub_inherited_mesh_environment() {
+    for key in ["AGENT_MESH_RUNTIME", "AGENT_MESH_INSTANCE", "AGENT_MESH_ADDRESS"] {
+        unsafe { std::env::remove_var(key) };
+    }
+}
+
 /// Start the optional mesh worker off the UI thread. Its parent leash owns its lifetime;
 /// this runtime never opens the mesh database or waits for provider control calls.
 pub fn start_mesh_watcher() {

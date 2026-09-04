@@ -29,6 +29,11 @@ struct Session {
 impl Session {
     /// Start a detached headless session running `program`.
     fn start(name: &str, program: &[String]) -> Session {
+        Session::start_with_env(name, program, &[])
+    }
+
+    /// Start a session with extra environment, for testing what a daemon inherits.
+    fn start_with_env(name: &str, program: &[String], environment: &[(&str, &str)]) -> Session {
         // Unix sockets cap the whole path at ~108 bytes, so the runtime root must stay short.
         let runtime = test_runtime(name);
         let _ = fs::remove_dir_all(&runtime);
@@ -36,6 +41,9 @@ impl Session {
         set_private(&runtime);
 
         let mut command = base_command(&runtime);
+        for (key, value) in environment {
+            command.env(key, value);
+        }
         command.args(["--headless", "--session", name, "--headless-size", "100x30"]);
         command.arg("-e").args(program);
 
@@ -181,6 +189,61 @@ fn shell_program() -> Vec<String> {
         .into_iter()
         .map(String::from)
         .collect()
+}
+
+/// Report the mesh coordinates a pane inherited, then keep the pane alive.
+#[cfg(unix)]
+fn mesh_report_program() -> Vec<String> {
+    ["sh", "-c", "echo \"MESH ${AGENT_MESH_INSTANCE-unset} ${AGENT_MESH_ADDRESS-unset}\"; exec sh"]
+        .into_iter()
+        .map(String::from)
+        .collect()
+}
+
+#[cfg(unix)]
+#[test]
+#[ignore = "spawns processes and needs a wgpu adapter"]
+fn a_pane_inherits_this_sessions_mesh_coordinates_and_not_the_launchers() {
+    // A window writes its coordinates as overrides, so anything it does not write falls through
+    // from the daemon. Started from inside another pane, a session used to hand its own panes the
+    // launching pane's instance and address — pointing at a different runtime instance entirely.
+    let session = Session::start_with_env(
+        "mesh",
+        &mesh_report_program(),
+        &[
+            ("AGENT_MESH_INSTANCE", "launching-pane"),
+            ("AGENT_MESH_ADDRESS", "w99"),
+            // The watcher is a separate concern and needs `vvagent` on PATH.
+            ("AGENT_MESH_WATCH", "off"),
+        ],
+    );
+
+    session.msg(&["wait", "text", "MESH ", "--window-id", "1"]);
+    let text = session.msg(&["get-text", "--window-id", "1"]);
+    assert!(
+        text.contains("MESH mesh w1"),
+        "a pane takes this session's name and its own window: {text:?}"
+    );
+    assert!(!text.contains("launching-pane"), "the launcher's instance must not leak: {text:?}");
+    assert!(!text.contains("w99"), "the launcher's address must not leak: {text:?}");
+
+    // An address index is a one-based `u32`. A claimed ID outside it has no mesh position, and
+    // publishing nothing must beat leaving the inherited value in place.
+    let mut create = vec![
+        String::from("create-window"),
+        String::from("--window-id"),
+        String::from("9223372036854775808"),
+        String::from("-e"),
+    ];
+    create.extend(mesh_report_program());
+    let claimed = session.msg(&create);
+    let claimed: u64 = claimed.trim().parse().expect("create-window returns a window id");
+    assert_eq!(claimed, 9_223_372_036_854_775_808);
+
+    let claimed = claimed.to_string();
+    session.msg(&["wait", "text", "MESH ", "--window-id", &claimed]);
+    let text = session.msg(&["get-text", "--window-id", &claimed]);
+    assert!(text.contains("MESH mesh unset"), "no address rather than a stale one: {text:?}");
 }
 
 fn marker_program(marker: &str) -> Vec<String> {

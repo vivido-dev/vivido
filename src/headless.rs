@@ -109,6 +109,13 @@ fn serve(
         unsafe { env::set_var(key, value) };
     }
 
+    // A headless session is a runtime instance like any other: its windows are addressable, and an
+    // agent in one can be woken. Publish the name before the first window is built, since that is
+    // where a pane reads it. SAFETY: no thread has been started yet.
+    unsafe { crate::session::scrub_inherited_mesh_environment() };
+    crate::session::publish_instance_name(&session);
+    crate::session::start_mesh_watcher();
+
     // Bind the IPC socket before publishing the registry: a client that finds a registry must find
     // a socket it can actually connect to.
     let handle = IoListener::spawn(&config, &options, proxy.clone())?;

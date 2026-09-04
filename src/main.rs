@@ -366,6 +366,8 @@ fn vivido(mut options: Options) -> Result<(), Box<dyn Error>> {
     automation_paths.prepare_endpoint(&automation_name)?;
     options.automation_name = Some(automation_name.clone());
     options.socket = Some(automation_socket);
+    // SAFETY: no thread has been started yet; the winit event loop is built below.
+    unsafe { session::scrub_inherited_mesh_environment() };
     session::publish_instance_name(&automation_name);
     session::start_mesh_watcher();
 
