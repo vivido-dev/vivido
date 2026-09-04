@@ -57,9 +57,11 @@ use vivid_protocol::revision::{
     ChannelGeneration, SceneRevision, SurfaceGeneration, SurfaceRevision, TargetGeneration,
 };
 use vivid_protocol::scene::SceneNode;
-use vivid_protocol::surface::{DesktopSurfaceParameters, SurfaceDefinition, SurfaceDescriptor};
+use vivid_protocol::surface::{
+    self, DesktopSurfaceParameters, SurfaceDefinition, SurfaceDescriptor,
+};
 use vivid_protocol::track::{
-    ChannelOpenDecision, ChannelOpenState, KindConfiguration, TrackConfiguration, TrackMode,
+    self, ChannelOpenDecision, ChannelOpenState, KindConfiguration, TrackConfiguration, TrackMode,
 };
 use vivid_protocol::wire::{ConnectionKind, RECORD_OPTIONAL, Record};
 
@@ -4169,6 +4171,15 @@ fn classify_audio_step(expected_pts_us: Option<i64>, pts_us: i64, live: bool) ->
     }
 }
 
+fn track_address(identity: TrackIdentity, generation: ChannelGeneration) -> track::TrackAddress {
+    track::TrackAddress {
+        context_id: identity.surface.context.context_id,
+        surface_id: identity.surface.surface_id,
+        track_id: identity.track_id,
+        channel_generation: generation,
+    }
+}
+
 /// Ask the producer for a random-access unit on this channel, media §13.
 fn request_keyframe(
     writer: &Writer,
@@ -4177,14 +4188,7 @@ fn request_keyframe(
     generation: ChannelGeneration,
     reason: u64,
 ) {
-    let payload = vec![
-        (0, Value::Unsigned(identity.surface.context.context_id)),
-        (1, Value::Unsigned(identity.surface.surface_id)),
-        (2, Value::Unsigned(identity.track_id)),
-        (3, Value::Unsigned(generation.get())),
-        (4, Value::Unsigned(0)),
-        (5, Value::Unsigned(reason)),
-    ];
+    let payload = track::need_keyframe_payload(track_address(identity, generation), 0, reason);
     if let Ok(body) = Envelope::new(0, payload).encode() {
         shared.trace(
             trace::TraceCategory::Recovery,
@@ -4218,13 +4222,7 @@ fn request_full_frame(
     generation: ChannelGeneration,
     reason: u64,
 ) {
-    let payload = vec![
-        (0, Value::Unsigned(identity.surface.context.context_id)),
-        (1, Value::Unsigned(identity.surface.surface_id)),
-        (2, Value::Unsigned(identity.track_id)),
-        (3, Value::Unsigned(generation.get())),
-        (4, Value::Unsigned(reason)),
-    ];
+    let payload = track::need_full_frame_payload(track_address(identity, generation), reason);
     if let Ok(body) = Envelope::new(0, payload).encode() {
         let _ = writer.write_record(messages::NEED_FULL_FRAME, identity.track_id, &body);
     }
@@ -4975,14 +4973,11 @@ fn channel_loop(
                 ChannelFailureKind::InternalState,
                 Envelope::new(
                     0,
-                    vec![
-                        (0, Value::Unsigned(identity.surface.context.context_id)),
-                        (1, Value::Unsigned(identity.surface.surface_id)),
-                        (2, Value::Unsigned(identity.track_id)),
-                        (3, Value::Unsigned(generation.get())),
-                        (4, Value::Unsigned(maximum_bytes)),
-                        (5, Value::Unsigned(maximum_records)),
-                    ],
+                    track::max_channel_data_payload(
+                        track_address(identity, generation),
+                        maximum_bytes,
+                        maximum_records,
+                    ),
                 )
                 .encode()
             );
@@ -5389,14 +5384,14 @@ fn serve_lane(
 }
 
 fn surface_ready_payload(status: &SurfaceStatus) -> Vec<(u64, Value)> {
-    vec![
-        (0, Value::Unsigned(status.identity.context.context_id)),
-        (1, Value::Unsigned(status.identity.surface_id)),
-        (2, Value::Unsigned(status.revision.get())),
-        (3, Value::Unsigned(status.generation.get())),
-        (4, Value::Unsigned(status.definition.policy)),
-        (5, Value::Map(status.definition.profile_parameters.clone())),
-    ]
+    surface::surface_ready_payload(
+        status.identity.context.context_id,
+        status.identity.surface_id,
+        status.revision,
+        status.generation,
+        status.definition.policy,
+        status.definition.profile_parameters.clone(),
+    )
 }
 
 fn surface_status_payload(status: &SurfaceStatus) -> Vec<(u64, Value)> {
