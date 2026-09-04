@@ -1,0 +1,4 @@
+interface:
+  display_name: "Vivido"
+  short_description: "Drive Vivido windows and reach agents in other panes"
+  default_prompt: "Use $vivido to control another Vivido window or message an agent in one."
