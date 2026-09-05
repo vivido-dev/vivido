@@ -57,10 +57,8 @@ pub use tabs::{Tab, Tabs, VisibleTabs};
 mod chrome;
 #[cfg(any(target_os = "linux", windows))]
 pub use chrome::{ChromeHitMap, ChromeLayout, ChromeRenderer, TAB_BAR_LOGICAL, compute_layout};
-#[cfg(any(target_os = "linux", windows))]
 mod launch;
-#[cfg(any(target_os = "linux", windows))]
-pub use launch::{LaunchAction, LaunchEntry};
+pub use launch::{LaunchAction, LaunchEntry, entries as launch_entries};
 #[cfg(any(target_os = "linux", windows))]
 mod menu;
 #[cfg(any(target_os = "linux", windows))]

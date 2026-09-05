@@ -32,7 +32,7 @@ impl LaunchEntry {
 ///
 /// Probing costs a process spawn on Windows, so callers build this once and keep the result rather
 /// than rebuilding it per menu open.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub fn entries() -> Vec<LaunchEntry> {
     vec![
         LaunchEntry::new("New Tab", LaunchAction::NewTab(None)),
@@ -177,9 +177,9 @@ mod tests {
         assert!(parse_wsl_distributions(&utf16le("\r\n \r\n")).is_empty());
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
-    fn linux_offers_a_tab_and_a_window() {
+    fn unix_desktop_offers_a_tab_and_a_window() {
         let entries = entries();
 
         assert_eq!(entries.len(), 2);
