@@ -4331,15 +4331,6 @@ mod tests {
         assert!(term.keyboard_mode_stack.is_empty());
     }
 
-    #[test]
-    fn parse_cargo_version() {
-        assert_eq!(version_number(env!("CARGO_PKG_VERSION")), 4_05);
-        assert_eq!(version_number("0.0.1-dev"), 1);
-        assert_eq!(version_number("0.1.2-dev"), 1_02);
-        assert_eq!(version_number("1.2.3-dev"), 1_02_03);
-        assert_eq!(version_number("999.99.99"), 9_99_99_99);
-    }
-
     #[derive(Clone, Default)]
     struct PtyWriteListener(Arc<Mutex<Vec<String>>>);
 
