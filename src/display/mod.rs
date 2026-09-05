@@ -335,6 +335,7 @@ pub struct Display {
     renderer_unavailable: bool,
     renderer_retry_delay: Duration,
     cached_scene: Option<Scene>,
+    cached_microphone_label: String,
     cached_media_generation: u64,
     cached_base_color: Color,
     vivid_frame_requested: bool,
@@ -483,6 +484,7 @@ impl Display {
             renderer_unavailable: false,
             renderer_retry_delay: INITIAL_RENDERER_RETRY,
             cached_scene: None,
+            cached_microphone_label: String::new(),
             cached_media_generation: 0,
             cached_base_color: Color::BLACK,
             vivid_frame_requested: false,
@@ -633,7 +635,10 @@ impl Display {
         let prepared_media = self.scene_renderer.prepare_media(&size_info, early_display_offset);
         let media_generation = prepared_media.as_ref().map_or(0, |media| media.image_generation);
         let _media_changed = prepared_media.as_ref().is_some_and(|media| media.changed);
-        let can_reuse_scene = self.vivid_frame_requested
+        let mic_label =
+            self.vivid_scene.as_ref().map(|s| s.microphone().label()).unwrap_or_default();
+        let can_reuse_scene = mic_label == self.cached_microphone_label
+            && self.vivid_frame_requested
             && self.cached_scene.is_some()
             && self.cached_media_generation == media_generation
             && self.damage_tracker.frame().is_empty()
@@ -850,6 +855,17 @@ impl Display {
                 paint_rects(&mut scene, rects);
             }
 
+            if !mic_label.is_empty() {
+                let label: String = mic_label.chars().take(size_info.columns()).collect();
+                self.paint_string_cells(
+                    &mut scene,
+                    Point::new(0, Column(0)),
+                    config.colors.primary.background,
+                    config.colors.normal.red,
+                    &label,
+                );
+                self.damage_tracker.frame().mark_fully_damaged();
+            }
             self.draw_render_timer(&mut scene, config);
 
             if has_highlighted_hint {
@@ -890,6 +906,7 @@ impl Display {
 
         if cacheable {
             self.cached_scene = Some(scene);
+            self.cached_microphone_label = mic_label;
             self.cached_media_generation = media_generation;
             self.cached_base_color = base_color;
         }

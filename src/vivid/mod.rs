@@ -9,6 +9,7 @@ pub(crate) mod file_drop;
 pub(crate) mod hid;
 mod lane;
 mod lease;
+mod mic;
 pub mod scene;
 pub mod target;
 pub(crate) mod trace;
@@ -597,6 +598,16 @@ impl VividService {
 
     pub fn scene(&self) -> SharedScene {
         self.scene.clone()
+    }
+
+    pub fn toggle_microphone(&self) {
+        self.scene.microphone().toggle();
+        self.shared.request_frame_wake();
+    }
+
+    pub fn next_microphone(&self) {
+        self.scene.microphone().next();
+        self.shared.request_frame_wake();
     }
 
     /// Disconnect every producer attached to this pane while keeping its endpoint and root secret.
@@ -2648,7 +2659,9 @@ fn dispatch_control(
         messages::PROBE_TRACK_CONFIG => {
             let configuration = TrackConfiguration::decode(0, &value, true)
                 .map_err(|_| ControlError::bad_message("invalid track probe"))?;
-            let supported = supports_track(&configuration);
+            let supported = supports_track(&configuration)
+                && (configuration.direction != vivid_protocol::track::TrackDirection::Uplink
+                    || session.supports(registry::AUDIO_INPUT));
             (
                 messages::TRACK_SUPPORT,
                 0,
@@ -2681,7 +2694,10 @@ fn dispatch_control(
                 configuration.surface_id,
                 configuration.track_id,
             )?;
-            if !supports_track(&configuration) {
+            if !supports_track(&configuration)
+                || (configuration.direction == vivid_protocol::track::TrackDirection::Uplink
+                    && !session.supports(registry::AUDIO_INPUT))
+            {
                 return Err(ControlError::unsupported("track configuration is unsupported")
                     .with_track(identity));
             }
@@ -3849,6 +3865,29 @@ fn handle_track_channel(
         return Err(error);
     }
     let generation = ChannelGeneration::new(open.channel_generation);
+    if status.configuration.direction == vivid_protocol::track::TrackDirection::Uplink {
+        let mut attachment =
+            TrackAttachmentCleanup { shared: shared.clone(), identity, generation, armed: true };
+        shared.scene.accept_uplink_channel(identity, generation).map_err(io::Error::other)?;
+        let body = Envelope::new(
+            request_id,
+            vec![
+                (0, Value::Unsigned(open.context_id)),
+                (1, Value::Unsigned(open.surface_id)),
+                (2, Value::Unsigned(open.track_id)),
+                (3, Value::Unsigned(open.channel_generation)),
+                (4, Value::Unsigned(0)),
+                (5, Value::Unsigned(0)),
+                (6, Value::Unsigned(u64::from(status.configuration.maximum_record_body))),
+                (7, Value::Unsigned(status.state.revision.advance()?.get())),
+            ],
+        )
+        .encode()?;
+        writer.write_record(messages::CHANNEL_ACCEPTED, open.track_id, &body)?;
+        let result = mic::serve(reader, &writer, shared, identity, generation);
+        attachment.detach();
+        return result;
+    }
     let (maximum_bytes, maximum_records) = live_channel_flow(&status.configuration);
     let acceptance = vec![
         (0, Value::Unsigned(open.context_id)),
@@ -5517,6 +5556,9 @@ fn wait_satisfied_payload(
 }
 
 fn supports_track(configuration: &TrackConfiguration) -> bool {
+    if configuration.direction == vivid_protocol::track::TrackDirection::Uplink {
+        return vivid_protocol::audio_input::supports(configuration);
+    }
     configuration.slot <= scene::SLOT_POSTER
         && configuration.slot != 0
         && match (&configuration.kind, configuration.slot) {
@@ -6389,6 +6431,7 @@ mod tests {
     fn timed_video_and_audio_deliver_ahead_of_their_own_timeline() {
         let shaped = |mode, kind| {
             shapes_ingress(&TrackConfiguration {
+                direction: Default::default(),
                 context_id: 1,
                 surface_id: 1,
                 track_id: 1,
@@ -6493,6 +6536,7 @@ mod tests {
     #[test]
     fn live_channel_allowance_matches_the_declared_latency_horizon() {
         let configuration = TrackConfiguration {
+            direction: Default::default(),
             context_id: 1,
             surface_id: 1,
             track_id: 1,
@@ -6522,6 +6566,7 @@ mod tests {
         assert_eq!(records, 4);
 
         let audio = TrackConfiguration {
+            direction: Default::default(),
             context_id: 1,
             surface_id: 1,
             track_id: 2,
@@ -6566,6 +6611,7 @@ mod tests {
         let track = session
             .create_track(
                 TrackConfiguration {
+                    direction: Default::default(),
                     context_id,
                     surface_id: surface.id(),
                     track_id: 2,
@@ -6801,6 +6847,7 @@ mod tests {
         let track = session
             .create_track(
                 TrackConfiguration {
+                    direction: Default::default(),
                     context_id,
                     surface_id: surface.id(),
                     track_id: 71,
@@ -6914,6 +6961,7 @@ mod tests {
         let track = session
             .create_track(
                 TrackConfiguration {
+                    direction: Default::default(),
                     context_id,
                     surface_id: surface.id(),
                     track_id: 75,
@@ -7070,6 +7118,7 @@ mod tests {
         let track = session
             .create_track(
                 TrackConfiguration {
+                    direction: Default::default(),
                     context_id,
                     surface_id: surface.id(),
                     track_id: 73,
@@ -7193,6 +7242,7 @@ mod tests {
 
         let track_configuration =
             |context_id: u64, surface_id: u64, track_id: u64| TrackConfiguration {
+                direction: Default::default(),
                 context_id,
                 surface_id,
                 track_id,
@@ -7638,6 +7688,7 @@ mod tests {
         let track = session
             .create_track(
                 TrackConfiguration {
+                    direction: Default::default(),
                     context_id: session.info().root_context_id,
                     surface_id: surface.id(),
                     track_id: 9,
@@ -7754,6 +7805,7 @@ mod tests {
         let track = session
             .create_track(
                 TrackConfiguration {
+                    direction: Default::default(),
                     context_id,
                     surface_id: surface.id(),
                     track_id: 4,
@@ -9462,6 +9514,7 @@ mod tests {
         let track = session
             .create_track(
                 TrackConfiguration {
+                    direction: Default::default(),
                     context_id,
                     surface_id: surface.id(),
                     track_id: 41,
@@ -9707,6 +9760,7 @@ mod tests {
         let track = session
             .create_track(
                 TrackConfiguration {
+                    direction: Default::default(),
                     context_id,
                     surface_id: surface.id(),
                     track_id: 12,

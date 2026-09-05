@@ -26,6 +26,7 @@ vvssh option:
   --shared-media-transport    Carry media on the interactive SSH TCP connection (legacy mode).
   --separate-media-transport  Use independent realtime and bulk SSH connections (default).
   --no-receive-drops          Do not start the optional remote vvreceive helper.
+  --mic                       Prepare a remote microphone (Linux/macOS; requires vvmic).
 
 SSH connection options are passed through and can also be placed in ~/.ssh/config. vvssh opens an
 interactive remote login shell. A shell command may follow DESTINATION, for example `pwsh.exe` on a
@@ -97,7 +98,8 @@ fn run() -> Result<u8, String> {
     }
     let separate_media = take_media_transport_flags(&mut arguments)?;
     let receive_drops = take_receive_drop_flag(&mut arguments);
-    let invocation = parse_ssh_invocation(arguments)?;
+    let microphone = take_microphone_flag(&mut arguments);
+    let mut invocation = parse_ssh_invocation(arguments)?;
 
     let endpoint = env::var("VIVID_ENDPOINT_CONTROL")
         .map_err(|_| "VIVID_ENDPOINT_CONTROL is not set; run vvssh inside Vivido".to_owned())?;
@@ -114,6 +116,24 @@ fn run() -> Result<u8, String> {
     let credential_broker = CredentialBroker::new(std::process::id(), nonce)
         .map_err(|error| format!("could not initialize SSH credential broker: {error}"))?;
     let remote_platform = detect_remote_platform(&credential_broker, &ssh, &invocation.connection)?;
+    if microphone {
+        if remote_platform == RemotePlatform::Windows {
+            return Err("--mic supports remote Linux and macOS only".into());
+        }
+        // Pass the intended shell as argv to the helper. The default shell is resolved remotely.
+        if invocation.remote_shell.is_empty() {
+            invocation.remote_shell = vec![
+                "vvmic".into(),
+                "run".into(),
+                "--".into(),
+                "sh".into(),
+                "-c".into(),
+                "exec \"$SHELL\" -l".into(),
+            ];
+        } else {
+            invocation.remote_shell.splice(0..0, ["vvmic".into(), "run".into(), "--".into()]);
+        }
+    }
     let built = build_ssh_arguments(
         invocation,
         &endpoint,
@@ -287,6 +307,37 @@ fn take_receive_drop_flag(arguments: &mut Vec<OsString>) -> bool {
         }
     });
     receive
+}
+
+fn take_microphone_flag(arguments: &mut Vec<OsString>) -> bool {
+    let mut index = 0;
+    let mut enabled = false;
+    while index < arguments.len() {
+        let argument = arguments[index].to_string_lossy();
+        if argument == "--mic" {
+            arguments.remove(index);
+            enabled = true;
+            continue;
+        }
+        if !argument.starts_with('-') || argument == "--" || argument == "-" {
+            break;
+        }
+        if ssh_option_takes_value(&argument) && argument.len() == 2 {
+            index += 1;
+        }
+        index += 1;
+    }
+    enabled
+}
+
+#[test]
+fn microphone_option_does_not_consume_remote_arguments_or_ssh_option_values() {
+    let mut args: Vec<OsString> =
+        ["-i", "--mic", "--mic", "host", "app", "--mic"].into_iter().map(Into::into).collect();
+    assert!(take_microphone_flag(&mut args));
+    assert_eq!(args, ["-i", "--mic", "host", "app", "--mic"].map(OsString::from));
+    let mut args: Vec<OsString> = ["host", "app", "--mic"].into_iter().map(Into::into).collect();
+    assert!(!take_microphone_flag(&mut args));
 }
 
 fn parse_ssh_invocation(arguments: Vec<OsString>) -> Result<SshInvocation, String> {

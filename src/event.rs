@@ -4080,6 +4080,12 @@ pub struct ActionContext<'a, N, T> {
 }
 
 impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionContext<'a, N, T> {
+    fn toggle_microphone(&self) {
+        self.vivid_service.toggle_microphone();
+    }
+    fn next_microphone(&self) {
+        self.vivid_service.next_microphone();
+    }
     fn send_desktop_input(&self, event: vivid_protocol::input::InputEvent) -> bool {
         self.vivid_service.send_input(event)
     }

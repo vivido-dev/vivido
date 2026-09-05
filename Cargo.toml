@@ -71,6 +71,7 @@ vte = { version = "0.15.0", default-features = false, features = [
   "serde",
 ] }
 zeroize = "1.8.1"
+vivid_sdk = { version = "1.5", path = "../vivid_sdk" }
 vello = { version = "0.10", default-features = false, features = ["wgpu"] }
 winit = { version = "0.30.9", default-features = false, features = [
   "rwh_06",
@@ -86,7 +87,6 @@ accesskit_winit = { version = "0.34", default-features = false, features = [
   "rwh_06",
 ] }
 clap_complete = "4.2.3"
-vivid_sdk = { version = "1.5", path = "../vivid_sdk" }
 
 [target.'cfg(not(windows))'.dependencies]
 xdg = "3.0.0"

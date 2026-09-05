@@ -83,6 +83,10 @@ impl<T: Eq> Binding<T> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
+    /// Enable or mute the selected remote microphone.
+    ToggleMicrophone,
+    /// Mute and select the next prepared remote microphone.
+    NextMicrophone,
     /// Write an escape sequence.
     Esc(String),
 
@@ -353,6 +357,8 @@ pub fn default_key_bindings() -> Vec<KeyBinding> {
     let mut bindings = bindings!(
         KeyBinding;
         Copy; Action::Copy;
+        "m", ModifiersState::CONTROL | ModifiersState::SHIFT; Action::ToggleMicrophone;
+        "n", ModifiersState::CONTROL | ModifiersState::SHIFT; Action::NextMicrophone;
         Paste; Action::Paste;
         "l",       ModifiersState::CONTROL; Action::ClearLogNotice;
         "l",       ModifiersState::CONTROL; Action::ReceiveChar;

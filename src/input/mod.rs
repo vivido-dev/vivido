@@ -120,6 +120,8 @@ pub struct Processor<T: EventListener, A: ActionContext<T>> {
 }
 
 pub trait ActionContext<T: EventListener> {
+    fn toggle_microphone(&self) {}
+    fn next_microphone(&self) {}
     fn write_to_pty<B: Into<Cow<'static, [u8]>>>(&self, _data: B) {}
     fn mark_dirty(&mut self) {}
     fn size_info(&self) -> SizeInfo;
@@ -247,6 +249,8 @@ impl<T: EventListener> Execute<T> for Action {
                 ctx.shell_action(crate::shell::ShellAction::ToggleFullscreen);
             },
             Action::ToggleFullscreen => ctx.window().toggle_fullscreen(),
+            Action::ToggleMicrophone => ctx.toggle_microphone(),
+            Action::NextMicrophone => ctx.next_microphone(),
             #[cfg(any(target_os = "linux", windows))]
             Action::ToggleMaximized if ctx.window().is_hosted() => {
                 ctx.shell_action(crate::shell::ShellAction::ToggleMaximized);

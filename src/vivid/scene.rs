@@ -397,6 +397,7 @@ impl State {
 }
 
 struct Inner {
+    microphone: super::mic::Microphone,
     state: Mutex<State>,
     changed: Condvar,
     target: Arc<dyn PresentationTarget>,
@@ -407,10 +408,35 @@ struct Inner {
 pub struct SharedScene(Arc<Inner>);
 
 impl SharedScene {
+    pub(crate) fn microphone(&self) -> &super::mic::Microphone {
+        &self.0.microphone
+    }
+
+    pub(super) fn accept_uplink_channel(
+        &self,
+        identity: TrackIdentity,
+        generation: ChannelGeneration,
+    ) -> Result<(), &'static str> {
+        let mut state = self.lock();
+        let track = state.tracks.get_mut(&identity).ok_or("track missing")?;
+        if track.configuration.direction != vivid_protocol::track::TrackDirection::Uplink
+            || track.state.channel_generation != generation
+            || track.lifecycle != 1
+            || track.state.milestones & vivid_protocol::track::MILESTONE_CHANNEL_ACCEPTED != 0
+        {
+            return Err("microphone generation already attached or stale");
+        }
+        track.state.revision =
+            track.state.revision.advance().map_err(|_| "track revision exhausted")?;
+        track.state.milestones = vivid_protocol::track::MILESTONE_CHANNEL_ACCEPTED;
+        Ok(())
+    }
+
     /// Build a scene for one presentation target. The target decides what node geometry means,
     /// so it is fixed for the scene's lifetime exactly as it is for a session (core §1).
     pub fn new(target: Arc<dyn PresentationTarget>) -> Self {
         Self(Arc::new(Inner {
+            microphone: super::mic::Microphone::default(),
             state: Mutex::new(State::default()),
             changed: Condvar::new(),
             target,
@@ -2286,6 +2312,7 @@ mod tests {
         scene.create_surface(first_surface, definition(1, 1)).unwrap();
         scene.create_surface(second_surface, definition(1, 1)).unwrap();
         let configuration = |track_id| TrackConfiguration {
+            direction: Default::default(),
             context_id: 1,
             surface_id: 1,
             track_id,
@@ -2341,6 +2368,7 @@ mod tests {
         scene.create_surface(first_surface, definition(1, 1)).unwrap();
         scene.create_surface(second_surface, definition(1, 1)).unwrap();
         let configuration = |track_id| TrackConfiguration {
+            direction: Default::default(),
             context_id: 1,
             surface_id: 1,
             track_id,
@@ -2392,6 +2420,7 @@ mod tests {
         scene.create_surface(first_surface, definition(1, 1)).unwrap();
         scene.create_surface(second_surface, definition(1, 1)).unwrap();
         let configuration = |track_id| TrackConfiguration {
+            direction: Default::default(),
             context_id: 1,
             surface_id: 1,
             track_id,
@@ -2519,6 +2548,7 @@ mod tests {
         scene.register_session(session, TargetGeneration::ONE).unwrap();
         scene.create_surface(surface_identity, definition(1, 1)).unwrap();
         let raster = |track_id: u64| TrackConfiguration {
+            direction: Default::default(),
             context_id: 1,
             surface_id: 1,
             track_id,
@@ -2600,6 +2630,7 @@ mod tests {
             .create_track(
                 track_identity,
                 TrackConfiguration {
+                    direction: Default::default(),
                     context_id: 1,
                     surface_id: 1,
                     track_id: 1,
@@ -2681,6 +2712,7 @@ mod tests {
             .create_track(
                 track_identity,
                 TrackConfiguration {
+                    direction: Default::default(),
                     context_id: 1,
                     surface_id: 1,
                     track_id: 1,
@@ -2807,6 +2839,7 @@ mod tests {
             .create_track(
                 track_identity,
                 TrackConfiguration {
+                    direction: Default::default(),
                     context_id: 1,
                     surface_id: 1,
                     track_id: 1,

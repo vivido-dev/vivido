@@ -161,6 +161,7 @@ pub struct TerminalTarget {
 impl TerminalTarget {
     const PROFILES: &'static [&'static str] = &[
         registry::AUDIO_GAIN,
+        registry::AUDIO_INPUT,
         registry::CORE_CONTROL,
         registry::FILE_DROP,
         // Offered only when the config option is on; see `ServiceShared::offered_profiles`.

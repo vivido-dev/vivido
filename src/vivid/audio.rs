@@ -1232,6 +1232,61 @@ fn check_ffmpeg(context: &str, result: c_int) -> io::Result<()> {
     if result < 0 { Err(ffmpeg_error(context, result)) } else { Ok(()) }
 }
 
+/// Worker-owned mono float to 48 kHz s16 microphone resampler.
+pub(super) struct CaptureResampler(*mut c_void);
+
+impl CaptureResampler {
+    pub fn new(rate: u32) -> io::Result<Self> {
+        let rate = c_int::try_from(rate).map_err(|_| invalid("capture rate too large"))?;
+        let mut result = Self(ptr::null_mut());
+        let mut mono = AVChannelLayout::default();
+        // SAFETY: mono is initialized storage; FFmpeg initializes and releases its layout.
+        unsafe { av_channel_layout_default(&mut mono, 1) };
+        // SAFETY: layouts live through the call; result owns the returned context exclusively.
+        let status = unsafe {
+            swr_alloc_set_opts2(
+                &mut result.0,
+                &mono,
+                1,
+                48_000,
+                &mono,
+                AV_SAMPLE_FMT_FLT,
+                rate,
+                0,
+                ptr::null_mut(),
+            )
+        };
+        // SAFETY: mono was initialized above and is no longer referenced by swr.
+        unsafe { av_channel_layout_uninit(&mut mono) };
+        check_ffmpeg("could not allocate microphone resampler", status)?;
+        // SAFETY: the allocation succeeded and result exclusively owns the context.
+        check_ffmpeg("could not initialize microphone resampler", unsafe { swr_init(result.0) })?;
+        Ok(result)
+    }
+
+    pub fn convert(&mut self, input: &[f32], output: &mut [i16]) -> io::Result<usize> {
+        let count = c_int::try_from(input.len()).map_err(|_| invalid("capture input too large"))?;
+        let capacity =
+            c_int::try_from(output.len()).map_err(|_| invalid("capture output too large"))?;
+        let source = [input.as_ptr().cast::<u8>()];
+        let mut destination = [output.as_mut_ptr().cast::<u8>()];
+        // SAFETY: both mono interleaved buffers have the declared sample capacity; the context
+        // is initialized, exclusively borrowed, and configured for float input / i16 output.
+        let count = unsafe {
+            swr_convert(self.0, destination.as_mut_ptr(), capacity, source.as_ptr(), count)
+        };
+        check_ffmpeg("could not resample microphone", count)?;
+        Ok(count as usize)
+    }
+}
+
+impl Drop for CaptureResampler {
+    fn drop(&mut self) {
+        // SAFETY: this wrapper owns the allocation, and swr_free accepts null on failed setup.
+        unsafe { swr_free(&mut self.0) };
+    }
+}
+
 fn ffmpeg_error(context: &str, code: c_int) -> io::Error {
     let mut buffer: [c_char; 256] = [0; 256];
     let description = if unsafe { av_strerror(code, buffer.as_mut_ptr(), buffer.len()) } == 0 {

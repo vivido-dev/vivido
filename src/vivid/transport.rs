@@ -114,6 +114,10 @@ impl Reader {
         Ok(())
     }
 
+    pub fn set_write_timeout(&self, timeout: Duration) -> io::Result<()> {
+        self.stream.set_write_timeout(Some(timeout))
+    }
+
     /// Bound inactivity on a dedicated transfer connection after authentication.
     ///
     /// The deadline is refreshed only after a complete record is received, so byte-dribbling does
@@ -389,12 +393,30 @@ impl Writer {
         self.write_record_parts(record_type, object_id, &[body])
     }
 
+    pub fn write_record_sequenced(
+        &self,
+        record_type: u16,
+        object_id: u64,
+        body: &[u8],
+    ) -> io::Result<u64> {
+        self.write_parts_sequenced(record_type, object_id, &[body])
+    }
+
     pub fn write_record_parts(
         &self,
         record_type: u16,
         object_id: u64,
         parts: &[&[u8]],
     ) -> io::Result<()> {
+        self.write_parts_sequenced(record_type, object_id, parts).map(|_| ())
+    }
+
+    fn write_parts_sequenced(
+        &self,
+        record_type: u16,
+        object_id: u64,
+        parts: &[&[u8]],
+    ) -> io::Result<u64> {
         let body_length = parts.iter().try_fold(0_usize, |total, part| {
             total.checked_add(part.len()).ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidInput, "record body length overflows")
@@ -421,7 +443,8 @@ impl Writer {
         };
         let mut stream = inner.stream.as_ref();
         write_parts(&mut stream, &header.encode(), parts)?;
-        stream.flush()
+        stream.flush()?;
+        Ok(inner.sequence)
     }
 }
 
