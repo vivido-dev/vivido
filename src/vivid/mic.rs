@@ -281,7 +281,9 @@ fn capture(
         pending.extend(&output[..count]);
         while pending.len() >= SAMPLES {
             let mut pcm = [0; PCM_BYTES];
-            for (bytes, sample) in pcm.chunks_exact_mut(2).zip(pending.drain(..SAMPLES)) {
+            for (bytes, sample) in
+                pcm.as_chunks_mut::<2>().0.iter_mut().zip(pending.drain(..SAMPLES))
+            {
                 bytes.copy_from_slice(&sample.to_le_bytes());
             }
             if !enabled.load(Ordering::Acquire) || stopped.load(Ordering::Acquire) {
