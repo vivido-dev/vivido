@@ -82,6 +82,7 @@ use crate::display::Display;
 use crate::display::ScreenshotReadback;
 #[cfg(any(unix, windows))]
 use crate::display::color::{DIM_FACTOR, Rgb};
+use crate::display::window::initial_theme;
 use crate::event::{
     ActionContext, Event, EventProxy, EventSink, EventType, LoopHandle, Mouse, SearchState,
     TouchPurpose,
@@ -597,7 +598,7 @@ impl WindowContext {
         }
 
         // Always reload the theme to account for auto-theme switching.
-        self.display.window.set_theme(self.config.window.theme());
+        self.display.window.set_theme(initial_theme(&self.config));
 
         // Update display if either padding options or resize increments were changed.
         let window_config = &old_config.window;

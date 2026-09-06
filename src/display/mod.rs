@@ -882,6 +882,15 @@ impl Display {
         }
         self.meter.record(render_start.elapsed());
 
+        // Follow the terminal background, which programs can repaint through OSC 11, so the title
+        // bar keeps showing the same color, opacity, and blurred backdrop as the window below it.
+        #[cfg(target_os = "macos")]
+        self.window.set_titlebar_appearance(
+            background_color,
+            config.window_opacity(),
+            config.window.theme(),
+        );
+
         self.window.pre_present_notify();
 
         let base_color = Color::from_rgba8(

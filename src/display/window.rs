@@ -16,8 +16,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(target_os = "macos")]
 use {
     objc2::{MainThreadMarker, rc::Retained},
-    objc2_app_kit::{NSColorSpace, NSTextField, NSView},
-    objc2_foundation::NSString,
+    objc2_app_kit::{
+        NSBox, NSBoxType, NSColor, NSColorSpace, NSLayoutConstraint, NSTextField, NSTitlePosition,
+        NSView, NSWindow, NSWindowOrderingMode, NSWindowStyleMask,
+    },
+    objc2_foundation::{NSArray, NSString},
     winit::platform::macos::{OptionAsAlt, WindowAttributesExtMacOS, WindowExtMacOS},
 };
 
@@ -40,6 +43,8 @@ use crate::cli::WindowOptions;
 use crate::config::UiConfig;
 use crate::config::window::{Decorations, Identity, WindowConfig};
 use crate::display::SizeInfo;
+#[cfg(target_os = "macos")]
+use crate::display::color::Rgb;
 
 /// This should match the definition of IDI_ICON from `Vivido.rc`.
 #[cfg(windows)]
@@ -216,6 +221,28 @@ pub struct Window {
     tab_shortcut_label: Option<Retained<NSTextField>>,
     #[cfg(target_os = "macos")]
     tab_shortcut: Option<u8>,
+    #[cfg(target_os = "macos")]
+    titlebar: Titlebar,
+}
+
+/// Vivido's paint job for the native macOS title bar.
+#[cfg(target_os = "macos")]
+#[derive(Default)]
+struct Titlebar {
+    /// Fill drawn behind the transparent system title bar.
+    tint: Option<Retained<NSBox>>,
+
+    /// Appearance already applied, so redraws only reach into AppKit when something changed.
+    applied: Cell<Option<TitlebarAppearance>>,
+}
+
+/// How the title bar should look for a given terminal background.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct TitlebarAppearance {
+    background: Rgb,
+    alpha: u8,
+    theme: Theme,
 }
 
 impl Window {
@@ -261,7 +288,7 @@ impl Window {
 
         window_attributes = window_attributes
             .with_title(&identity.title)
-            .with_theme(config.window.theme())
+            .with_theme(initial_theme(config))
             .with_visible(false)
             .with_transparent(true)
             .with_blur(config.window.blur)
@@ -321,6 +348,8 @@ impl Window {
             tab_shortcut_label: None,
             #[cfg(target_os = "macos")]
             tab_shortcut: None,
+            #[cfg(target_os = "macos")]
+            titlebar: Default::default(),
         })
     }
 
@@ -355,6 +384,8 @@ impl Window {
             tab_shortcut_label: None,
             #[cfg(target_os = "macos")]
             tab_shortcut: None,
+            #[cfg(target_os = "macos")]
+            titlebar: Default::default(),
         }
     }
 
@@ -385,6 +416,8 @@ impl Window {
             tab_shortcut_label: None,
             #[cfg(target_os = "macos")]
             tab_shortcut: None,
+            #[cfg(target_os = "macos")]
+            titlebar: Default::default(),
         }
     }
 
@@ -509,17 +542,22 @@ impl Window {
     /// taking the keyboard away from the host it is being attached to.
     #[cfg(target_os = "macos")]
     pub fn order_front_without_focus(&self) {
-        let view = match self.raw_window_handle() {
-            Some(RawWindowHandle::AppKit(handle)) => {
-                assert!(MainThreadMarker::new().is_some());
-                unsafe { handle.ns_view.cast::<NSView>().as_ref() }
-            },
-            _ => return,
-        };
+        let Some(window) = self.ns_window() else { return };
 
         // `orderFrontRegardless` also works across applications, which `orderFront:` does not do
         // while another application is active — exactly the case a pane is created in.
-        view.window().unwrap().orderFrontRegardless();
+        window.orderFrontRegardless();
+    }
+
+    /// The `NSWindow` this window is drawn into, if a windowing system backs it at all.
+    #[cfg(target_os = "macos")]
+    fn ns_window(&self) -> Option<Retained<NSWindow>> {
+        let Some(RawWindowHandle::AppKit(handle)) = self.raw_window_handle() else { return None };
+        assert!(MainThreadMarker::new().is_some());
+
+        // SAFETY: Winit owns this NSView for the lifetime of the live window, and the main-thread
+        // assertion above proves this AppKit access is occurring on the main thread.
+        unsafe { handle.ns_view.cast::<NSView>().as_ref() }.window()
     }
 
     #[inline]
@@ -707,6 +745,11 @@ impl Window {
     }
 
     pub fn set_theme(&self, theme: Option<Theme>) {
+        // This drops whatever appearance the title bar tint installed, so let the next frame
+        // derive it again from the terminal background that is current by then.
+        #[cfg(target_os = "macos")]
+        self.titlebar.applied.set(None);
+
         match &self.backend {
             Backend::Winit(window) => window.set_theme(theme),
             Backend::Headless(headless) => headless.theme.set(theme),
@@ -785,15 +828,84 @@ impl Window {
     /// This prevents rendering artifacts from showing up when the window is transparent.
     #[cfg(target_os = "macos")]
     pub fn set_has_shadow(&self, has_shadows: bool) {
-        let view = match self.raw_window_handle() {
-            Some(RawWindowHandle::AppKit(handle)) => {
-                assert!(MainThreadMarker::new().is_some());
-                unsafe { handle.ns_view.cast::<NSView>().as_ref() }
+        let Some(window) = self.ns_window() else { return };
+
+        window.setHasShadow(has_shadows);
+    }
+
+    /// Paint the native title bar with the terminal background.
+    ///
+    /// AppKit fills the title bar with its own material, so a translucent dark terminal ends up
+    /// under a light gray strip. Making the bar transparent and filling the area behind it with
+    /// the terminal background instead gives the window one color throughout: the fill carries the
+    /// configured opacity, and being translucent it picks up the same blurred backdrop as the rest
+    /// of the window. The title text and window buttons stay AppKit's, so the window appearance
+    /// follows the background's brightness unless the configuration pinned a variant.
+    #[cfg(target_os = "macos")]
+    pub fn set_titlebar_appearance(&mut self, background: Rgb, opacity: f32, theme: Option<Theme>) {
+        let appearance = TitlebarAppearance {
+            background,
+            alpha: (opacity.clamp(0., 1.) * 255.).round() as u8,
+            theme: theme.unwrap_or_else(|| decorations_theme(background)),
+        };
+        if self.titlebar.applied.replace(Some(appearance)) == Some(appearance) {
+            return;
+        }
+
+        let Some(mtm) = MainThreadMarker::new() else { return };
+        let Some(window) = self.ns_window() else { return };
+
+        // Borderless windows — panes hosted by another shell, `decorations = "None"` — have no
+        // title bar to paint.
+        if !window.styleMask().contains(NSWindowStyleMask::Titled) {
+            return;
+        }
+
+        // Going through `set_theme` would discard the appearance recorded just above.
+        if let Some(winit) = self.backend.winit() {
+            winit.set_theme(Some(appearance.theme));
+        }
+        window.setTitlebarAppearsTransparent(true);
+
+        let (r, g, b) = background.as_tuple();
+        let fill = NSColor::colorWithSRGBRed_green_blue_alpha(
+            f64::from(r) / 255.,
+            f64::from(g) / 255.,
+            f64::from(b) / 255.,
+            f64::from(appearance.alpha) / 255.,
+        );
+
+        let tint = match &self.titlebar.tint {
+            Some(tint) => tint,
+            None => {
+                let Some(content) = window.contentView() else { return };
+                // SAFETY: The content view of a live window is always installed in that window's
+                // frame view, and the marker above proves we are on the main thread.
+                let Some(frame) = (unsafe { content.superview() }) else { return };
+
+                let tint = NSBox::new(mtm);
+                tint.setBoxType(NSBoxType::Custom);
+                tint.setTitlePosition(NSTitlePosition::NoTitle);
+                tint.setBorderWidth(0.);
+                tint.setTranslatesAutoresizingMaskIntoConstraints(false);
+
+                // The title bar belongs to the frame view rather than the content view, so the
+                // fill goes there, ordered below everything AppKit draws over it. Pinning its
+                // bottom to the content view sizes it to the title bar plus any tab bar, and
+                // collapses it to nothing in fullscreen, where the content covers the window.
+                frame.addSubview_positioned_relativeTo(&tint, NSWindowOrderingMode::Below, None);
+                NSLayoutConstraint::activateConstraints(&NSArray::from_retained_slice(&[
+                    tint.topAnchor().constraintEqualToAnchor(&frame.topAnchor()),
+                    tint.leadingAnchor().constraintEqualToAnchor(&frame.leadingAnchor()),
+                    tint.trailingAnchor().constraintEqualToAnchor(&frame.trailingAnchor()),
+                    tint.bottomAnchor().constraintEqualToAnchor(&content.topAnchor()),
+                ]));
+
+                self.titlebar.tint.insert(tint)
             },
-            _ => return,
         };
 
-        view.window().unwrap().setHasShadow(has_shadows);
+        tint.setFillColor(&fill);
     }
 
     /// Synchronize the native tab's right-aligned keyboard shortcut badge.
@@ -895,6 +1007,26 @@ bitflags! {
     }
 }
 
+/// Appearance system-drawn decorations should use over `background`.
+///
+/// Vivido paints the macOS title bar with the terminal background, so AppKit's title text and
+/// window buttons have to follow that color rather than the desktop's own appearance.
+#[cfg(target_os = "macos")]
+fn decorations_theme(background: Rgb) -> Theme {
+    if background.brightness() < 0.5 { Theme::Dark } else { Theme::Light }
+}
+
+/// Appearance the system window decorations should start out with.
+pub fn initial_theme(config: &UiConfig) -> Option<Theme> {
+    // Derive the title bar's appearance up front so the first frame does not have to change it.
+    #[cfg(target_os = "macos")]
+    let derived = Some(decorations_theme(config.colors.primary.background));
+    #[cfg(not(target_os = "macos"))]
+    let derived: Option<Theme> = None;
+
+    config.window.theme().or(derived)
+}
+
 #[cfg(target_os = "macos")]
 fn use_srgb_color_space(window: &WinitWindow) {
     let view = match window.window_handle().unwrap().as_raw() {
@@ -992,5 +1124,35 @@ mod tests {
         assert_eq!(tab_shortcut(0, 0), None);
         assert_eq!(tab_shortcut(3, 3), None);
         assert_eq!(tab_shortcut(usize::MAX, usize::MAX), None);
+    }
+
+    /// The title bar carries the terminal background, so AppKit's title text and window buttons
+    /// have to be legible against that rather than against the desktop's appearance.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn decorations_follow_the_terminal_background() {
+        let mut config = UiConfig::default();
+
+        config.colors.primary.background = Rgb::new(26, 27, 38);
+        assert_eq!(initial_theme(&config), Some(Theme::Dark));
+
+        config.colors.primary.background = Rgb::new(247, 245, 238);
+        assert_eq!(initial_theme(&config), Some(Theme::Light));
+    }
+
+    #[test]
+    fn a_configured_decorations_variant_outranks_the_background() {
+        let config: UiConfig = toml::from_str(
+            r##"
+            [window]
+            decorations_theme_variant = "Light"
+
+            [colors.primary]
+            background = "#1a1b26"
+            "##,
+        )
+        .unwrap();
+
+        assert_eq!(initial_theme(&config), Some(Theme::Light));
     }
 }
