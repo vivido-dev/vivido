@@ -3981,6 +3981,7 @@ name = "vivido"
 version = "0.4.6"
 dependencies = [
  "accesskit",
+ "accesskit_consumer",
  "accesskit_winit",
  "ahash",
  "arboard",
