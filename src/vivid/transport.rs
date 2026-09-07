@@ -256,8 +256,11 @@ impl Reader {
     }
 
     pub fn writer(&self, kind: ConnectionKind) -> io::Result<Writer> {
+        self.stream.set_write_timeout(Some(Duration::from_secs(2)))?;
         Ok(Writer {
+            shutdown: self.shutdown_handle()?,
             inner: Mutex::new(WriterInner {
+                failed: false,
                 stream: self.stream.clone(),
                 maximum: if kind == ConnectionKind::Control {
                     CONTROL_MAX_RECORD_BODY
@@ -368,16 +371,22 @@ fn handshake_expired() -> io::Error {
 }
 
 pub struct Writer {
+    shutdown: ReadShutdown,
     inner: Mutex<WriterInner>,
 }
 
 struct WriterInner {
+    failed: bool,
     stream: Arc<LocalStream>,
     maximum: u32,
     sequence: u64,
 }
 
 impl Writer {
+    pub fn shutdown_handle(&self) -> ReadShutdown {
+        self.shutdown.clone()
+    }
+
     pub fn set_maximum(&self, maximum: u32) -> io::Result<()> {
         if maximum == 0 || maximum > HARD_MAX_RECORD_BODY {
             return Err(io::Error::new(
@@ -425,25 +434,28 @@ impl Writer {
         let body_length = u32::try_from(body_length)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "record body exceeds u32"))?;
         let mut inner = self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if inner.failed {
+            return Err(io::Error::new(io::ErrorKind::BrokenPipe, "Vivid writer failed"));
+        }
         if body_length > inner.maximum || body_length > HARD_MAX_RECORD_BODY {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "outgoing Vivid record exceeds the accepted body limit",
             ));
         }
-        inner.sequence = inner.sequence.checked_add(1).ok_or_else(|| {
+        let sequence = inner.sequence.checked_add(1).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidData, "outgoing sequence exhausted")
         })?;
-        let header = RecordHeader {
-            body_length,
-            record_type,
-            flags: 0,
-            object_id,
-            sequence: inner.sequence,
-        };
+        let header = RecordHeader { body_length, record_type, flags: 0, object_id, sequence };
         let mut stream = inner.stream.as_ref();
-        write_parts(&mut stream, &header.encode(), parts)?;
-        stream.flush()?;
+        if let Err(error) =
+            write_parts(&mut stream, &header.encode(), parts).and_then(|()| stream.flush())
+        {
+            inner.failed = true;
+            self.shutdown.stop();
+            return Err(error);
+        }
+        inner.sequence = sequence;
         Ok(inner.sequence)
     }
 }
@@ -459,7 +471,10 @@ fn write_parts(stream: &mut &LocalStream, header: &[u8], parts: &[&[u8]]) -> io:
         let mut adjusted = Vec::with_capacity(current.len());
         adjusted.push(IoSlice::new(&current[0][offset..]));
         adjusted.extend(current[1..].iter().map(|slice| IoSlice::new(slice)));
-        let written = stream.write_vectored(&adjusted)?;
+        let written = match stream.write_vectored(&adjusted) {
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            result => result?,
+        };
         if written == 0 {
             return Err(io::Error::new(io::ErrorKind::WriteZero, "failed to write Vivid record"));
         }
@@ -668,4 +683,5 @@ mod tests {
         client.read_to_end(&mut bytes).unwrap();
         assert_eq!(bytes, vivid_protocol::wire::unsupported_version_record());
     }
+    include!("transport_regressions.rs");
 }

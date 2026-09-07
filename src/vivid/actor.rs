@@ -57,6 +57,7 @@ struct EgressQueue {
 /// block on a socket — the PTY parser, the winit UI thread, a track channel, another session's
 /// actor — only ever queue here.
 pub(crate) struct Egress {
+    cancel: Option<ReadShutdown>,
     queue: Mutex<EgressQueue>,
     ready: Condvar,
     overflowed: AtomicBool,
@@ -71,6 +72,7 @@ pub(crate) struct Egress {
 impl Egress {
     pub(crate) fn start(writer: Arc<Writer>, name: &'static str) -> io::Result<Arc<Self>> {
         let egress = Arc::new(Self {
+            cancel: Some(writer.shutdown_handle()),
             queue: Mutex::new(EgressQueue {
                 records: VecDeque::new(),
                 closed: false,
@@ -120,6 +122,7 @@ impl Egress {
     #[cfg(test)]
     fn detached() -> Arc<Self> {
         Arc::new(Self {
+            cancel: None,
             queue: Mutex::new(EgressQueue {
                 records: VecDeque::new(),
                 closed: false,
@@ -175,6 +178,15 @@ impl Egress {
     pub(crate) fn join(&self) {
         let worker = self.worker.lock().expect("egress worker").take();
         if let Some(worker) = worker {
+            let deadline = Instant::now() + Duration::from_millis(250);
+            while !worker.is_finished() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(2));
+            }
+            if !worker.is_finished()
+                && let Some(cancel) = &self.cancel
+            {
+                cancel.stop();
+            }
             let _ = worker.join();
         }
     }

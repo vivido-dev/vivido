@@ -158,6 +158,7 @@ const NEED_KEYFRAME_DECODER_RESET: u64 = 2;
 const NEED_FULL_FRAME_NO_BASE: u64 = 1;
 
 struct SessionRuntime {
+    control_body_limit: u32,
     identity: SessionIdentity,
     root_context: ContextIdentity,
     session_tag: [u8; 16],
@@ -238,6 +239,7 @@ impl MarkerAdmission {
 
 #[derive(Default)]
 struct Registry {
+    root_nonces: HashMap<[u8; 32], Instant>,
     sessions: HashMap<u64, Arc<SessionRuntime>>,
     /// Session tags to the sessions that own them, so an anchor marker off the PTY finds its
     /// session by lookup rather than by scanning every live one.
@@ -1248,6 +1250,7 @@ fn handle_control(
     let writer = Arc::new(reader.writer(ConnectionKind::Control)?);
     let first = reader.read_record(ConnectionKind::Control)?;
     let (hello_request, hello) = Hello::decode(&first.body)?;
+    writer.set_maximum(hello.maximum_control_body.min(vivid_protocol::CONTROL_MAX_RECORD_BODY))?;
     // Install the bounded egress before publishing the session. The registry lock held during
     // establishment keeps outside announcements behind WELCOME, and once it is released every
     // visible session is already able to queue them.
@@ -1278,10 +1281,8 @@ fn handle_control(
     // likes, and no longer charged against the pre-handshake budget. `WELCOME` has already been
     // written by the time these can fail, so the session exists and has to be retired rather than
     // abandoned — a peer that closed between `WELCOME` and here is exactly how they fail.
-    let established = reader
-        .set_maximum(hello.maximum_control_body)
-        .and_then(|()| writer.set_maximum(hello.maximum_control_body))
-        .and_then(|()| pending.authenticated(reader));
+    let established =
+        reader.set_maximum(session.control_body_limit).and_then(|()| pending.authenticated(reader));
     established?;
 
     // A session is a reader, an actor, and an egress. This thread is the reader: it parses and
@@ -1626,6 +1627,8 @@ fn admit_post_hello(shared: &Arc<ServiceShared>, session: &Arc<SessionRuntime>) 
     };
     if let Some(lease) = lock(&shared.registry).leases.get_mut(&key) {
         let _ = lease.machine.admit_post_hello();
+        lease.awaiting_first = false;
+        lease.resumed();
     }
 }
 
@@ -1751,6 +1754,17 @@ fn revoke_lease(
 }
 
 fn finish_session(shared: &Arc<ServiceShared>, session: &Arc<SessionRuntime>, clean: bool) {
+    // Preserve the exact establishment outcome until the first request or its deadline.
+    if !clean && let Some(key) = session.lease {
+        let mut registry = lock(&shared.registry);
+        if let Some(lease) = registry.leases.get_mut(&key)
+            && lease.awaiting_first
+            && lease.machine.confirm_transport_lost(false).is_ok()
+        {
+            registry.remove_session(session.identity.session_id);
+            return;
+        }
+    }
     // Parent cleanup: a session's leases and their children go with it (security §4.3).
     let issued = lock(&shared.registry).leases.issued_by(session.identity);
     for key in issued {
@@ -1883,7 +1897,11 @@ fn establish_root_session(
                     .leases
                     .get_mut(&key)
                     .ok_or_else(|| io::Error::other("lease disappeared during resume"))?;
-                if lease.machine.resume_generation().get() != *resume_generation {
+                if lease.machine.resume_generation().get() != *resume_generation
+                    && !(lease.awaiting_first
+                        && resume_generation.checked_add(1)
+                            == Some(lease.machine.resume_generation().get()))
+                {
                     return Err(fail_authentication(&writer, request_id, "resume failed"));
                 }
                 lease.resume_key().map(|key| Secret32::new(*key.expose()))
@@ -1945,6 +1963,25 @@ fn establish_root_session(
     registry::validate_profile_set(accepted.iter().map(String::as_str))
         .map_err(io::Error::other)?;
     let mut registry = lock(&shared.registry);
+    if matches!(principal, Principal::Root) {
+        let now = Instant::now();
+        registry.root_nonces.retain(|_, deadline| *deadline > now);
+        if registry.root_nonces.contains_key(&hello.client_nonce) {
+            return Err(fail_authentication(
+                &writer,
+                request_id,
+                "root authentication replay rejected",
+            ));
+        }
+        if registry.root_nonces.len() >= 4096 {
+            return Err(send_fatal(
+                &writer,
+                request_id,
+                messages::ERROR_LIMIT_EXCEEDED,
+                "root authentication capacity exhausted",
+            ));
+        }
+    }
     if registry.sessions.len() >= MAX_SESSIONS {
         return Err(send_fatal(
             &writer,
@@ -2106,7 +2143,6 @@ fn establish_root_session(
                     (session_id, server_nonce, welcome)
                 },
             };
-            lease.machine.commit_welcome().ok();
             lease.child = Some(
                 SessionIdentity::new(shared.presenter, decided_session)
                     .map_err(io::Error::other)?,
@@ -2150,9 +2186,7 @@ fn establish_root_session(
                     (session_id, server_nonce, welcome)
                 },
             };
-            lease.machine.commit_welcome().ok();
-            // The prior resume key is erased once the new confirmation is committed.
-            lease.resumed();
+            lease.begin_retry_window(Instant::now());
             let generation = lease.machine.resume_generation().get();
             let announcement = lease.changed_payload(key.1, key.2, reason::RESUMED, Instant::now());
             resumed_announcements.push((key.0.session_id, key.2, announcement));
@@ -2170,8 +2204,30 @@ fn establish_root_session(
     };
     let identity = SessionIdentity::new(shared.presenter, session_id).map_err(io::Error::other)?;
     let root_context = identity.context(root_context.context_id).map_err(io::Error::other)?;
-    writer.write_record(messages::WELCOME, 0, &welcome_body)?;
+    if matches!(principal, Principal::Root) {
+        registry.root_nonces.insert(hello.client_nonce, Instant::now() + Duration::from_secs(300));
+    }
+    if let Err(error) = writer.write_record(messages::WELCOME, 0, &welcome_body) {
+        if let Principal::Lease { key, .. } | Principal::Resume { key, .. } = &principal
+            && let Some(lease) = registry.leases.get_mut(key)
+        {
+            let _ = lease.machine.confirm_transport_lost(false);
+        }
+        return Err(error);
+    }
+    if let Principal::Lease { key, .. } | Principal::Resume { key, .. } = &principal
+        && let Some(lease) = registry.leases.get_mut(key)
+        && lease.machine.state() == vivid_protocol::lease::LeaseState::Reserved
+    {
+        lease
+            .machine
+            .commit_welcome()
+            .map_err(|_| io::Error::other("lease WELCOME commitment failed"))?;
+    }
     let runtime = Arc::new(SessionRuntime {
+        control_body_limit: welcome
+            .maximum_control_body
+            .min(vivid_protocol::CONTROL_MAX_RECORD_BODY),
         identity,
         root_context,
         session_tag,
@@ -2233,6 +2289,64 @@ fn dispatch_control(
     envelope
         .validate_request()
         .map_err(|_| ControlError::bad_message("control request ID must be nonzero"))?;
+    // Context-addressed requests also obey the delegated context's ceiling. Session-level
+    // liveness/revocation queries retain the separately negotiated connection ceiling.
+    let context_field = match record.record_type {
+        messages::CREATE_CONTEXT | messages::SET_FILE_DROP_BINDING => Some(1),
+        messages::ACCEPT_FILE_DROP | messages::CANCEL_FILE_DROP => Some(2),
+        messages::CREATE_SESSION_LEASE
+        | messages::ADVANCE_FILE_TRANSFER
+        | messages::CREATE_SURFACE
+        | messages::UPDATE_SURFACE
+        | messages::DESTROY_SURFACE
+        | messages::QUERY_SURFACE
+        | messages::PROBE_TRACK_CONFIG
+        | messages::CREATE_TRACK
+        | messages::DESTROY_TRACK
+        | messages::QUERY_TRACK
+        | messages::ADVANCE_CHANNEL
+        | messages::SET_AUDIO_GAIN
+        | messages::ACTIVATE_TRACK
+        | messages::BEGIN_TXN
+        | messages::CREATE_NODE
+        | messages::UPDATE_NODE
+        | messages::DELETE_NODE
+        | messages::QUERY_ANCHOR
+        | messages::WAIT_TRACK
+        | messages::PLAY
+        | messages::PAUSE
+        | messages::FLUSH
+        | messages::DRAIN => Some(0),
+        _ => None,
+    };
+    let context_id = if matches!(record.record_type, messages::COMMIT_TXN | messages::ABORT_TXN) {
+        Some(
+            shared
+                .scene
+                .transaction_context(
+                    session.identity,
+                    envelope.transaction_id.unwrap_or(record.object_id),
+                )
+                .map_err(ControlError::state)?
+                .context_id,
+        )
+    } else {
+        context_field.and_then(|key| {
+            envelope
+                .payload
+                .iter()
+                .find(|(field, _)| *field == key)
+                .and_then(|(_, value)| value.as_u64())
+        })
+    };
+    if let Some(limit) = context_id.and_then(|id| {
+        lock(&session.contexts)
+            .get(&id)
+            .map(|context| context.contract.get(Resource::ControlRecordBody))
+    }) && record.body.len() as u64 > limit
+    {
+        return Err(ControlError::limit("control body exceeds context contract"));
+    }
     let request_id = envelope.request_id;
     let value = Value::Map(envelope.payload.clone());
     let reply = match record.record_type {
@@ -8567,6 +8681,7 @@ mod tests {
                 service,
                 HelloAuthentication::Root { proof: [0; 32] },
                 move |hello: &mut Hello, preface: &[u8; 16]| {
+                    getrandom::fill(&mut hello.client_nonce).map_err(io::Error::other)?;
                     hello.authenticate_root(&secret, preface).map_err(io::Error::other)
                 },
             )
@@ -9820,4 +9935,5 @@ mod tests {
         let outcome = waiter.join().unwrap();
         assert!(outcome.is_err(), "an unreachable milestone must time out");
     }
+    include!("audit_regressions.rs");
 }

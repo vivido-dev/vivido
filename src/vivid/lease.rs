@@ -40,6 +40,7 @@ pub(crate) mod reason {
 
 /// One issued lease.
 pub(crate) struct Lease {
+    pub(crate) awaiting_first: bool,
     pub(crate) definition: SessionLeaseDefinition,
     pub(crate) machine: LeaseMachine,
     /// Capacity reserved from the owning context, released on final cleanup.
@@ -71,6 +72,7 @@ impl Lease {
         let activation_deadline =
             now.checked_add(Duration::from_micros(definition.activation_timeout_us)).unwrap_or(now);
         Self {
+            awaiting_first: true,
             definition,
             machine,
             contract,
@@ -80,6 +82,15 @@ impl Lease {
             child: None,
             resume_key: None,
         }
+    }
+
+    pub(crate) fn begin_retry_window(&mut self, now: Instant) {
+        if !self.awaiting_first {
+            self.activation_deadline = now
+                .checked_add(Duration::from_micros(self.definition.activation_timeout_us))
+                .unwrap_or(now);
+        }
+        self.awaiting_first = true;
     }
 
     /// Does this activation secret belong to this lease?
@@ -123,7 +134,8 @@ impl Lease {
     pub(crate) fn expired(&self, now: Instant) -> bool {
         match self.machine.state() {
             // An unactivated lease stops being usable at its activation deadline.
-            LeaseState::Issued => now >= self.activation_deadline,
+            LeaseState::Issued | LeaseState::Reserved => now >= self.activation_deadline,
+            LeaseState::Active if self.awaiting_first => now >= self.activation_deadline,
             // A suspended one stops at the end of its grace.
             LeaseState::Suspended => self.grace_deadline.is_some_and(|deadline| now >= deadline),
             _ => false,
@@ -133,7 +145,8 @@ impl Lease {
     /// The deadline which next requires service, when this lease is waiting on time.
     fn deadline(&self) -> Option<Instant> {
         match self.machine.state() {
-            LeaseState::Issued => Some(self.activation_deadline),
+            LeaseState::Issued | LeaseState::Reserved => Some(self.activation_deadline),
+            LeaseState::Active if self.awaiting_first => Some(self.activation_deadline),
             LeaseState::Suspended => self.grace_deadline,
             _ => None,
         }
@@ -229,7 +242,8 @@ impl LeaseTable {
             if key.1 != context_id || key.2 != lease_id {
                 continue;
             }
-            if lease.accepts(lease_id, secret) && found.is_none() {
+            if lease.accepts(lease_id, secret) && !lease.expired(Instant::now()) && found.is_none()
+            {
                 found = Some(*key);
             }
         }
@@ -251,7 +265,9 @@ impl LeaseTable {
             .find(|(key, lease)| {
                 key.1 == context_id
                     && key.2 == lease_id
-                    && lease.machine.state() == LeaseState::Suspended
+                    && (lease.machine.state() == LeaseState::Suspended
+                        || (lease.awaiting_first && lease.resume_key.is_some()))
+                    && !lease.expired(Instant::now())
                     && lease.child.is_some_and(|child| child.session_id == session_id)
             })
             .map(|(key, _)| *key)

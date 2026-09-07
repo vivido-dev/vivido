@@ -2,9 +2,9 @@
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io::{self, Read};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -51,11 +51,12 @@ enum SourceData {
 }
 
 struct FileSource {
+    generation: AtomicU64,
     data: SourceData,
     length: u64,
     suggested_name: String,
     cancelled: AtomicBool,
-    shutdown: Mutex<Option<ReadShutdown>>,
+    shutdown: Mutex<Option<(FileTransferGeneration, ReadShutdown)>>,
 }
 
 impl std::fmt::Debug for FileSource {
@@ -68,41 +69,87 @@ impl std::fmt::Debug for FileSource {
     }
 }
 
+// Cloned file handles share seek position. Each transfer instead owns an explicit offset.
+struct OffsetReader {
+    file: File,
+    offset: u64,
+}
+impl Read for OffsetReader {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        #[cfg(unix)]
+        let read = {
+            use std::os::unix::fs::FileExt;
+            self.file.read_at(bytes, self.offset)?
+        };
+        #[cfg(windows)]
+        let read = {
+            use std::os::windows::fs::FileExt;
+            self.file.seek_read(bytes, self.offset)?
+        };
+        self.offset = self
+            .offset
+            .checked_add(read as u64)
+            .ok_or_else(|| io::Error::other("file offset exhausted"))?;
+        Ok(read)
+    }
+}
+
 impl FileSource {
     /// Open an independent forward-only reader positioned at offset zero.
     fn open_stream(&self) -> io::Result<Box<dyn Read + Send>> {
         match &self.data {
             SourceData::File(file) => {
-                let mut file = file.try_clone()?;
-                file.seek(SeekFrom::Start(0))?;
-                Ok(Box::new(file))
+                Ok(Box::new(OffsetReader { file: file.try_clone()?, offset: 0 }))
             },
             SourceData::Memory(bytes) => Ok(Box::new(io::Cursor::new(bytes.clone()))),
         }
     }
 
-    fn install_shutdown(&self, shutdown: ReadShutdown) {
-        if self.cancelled.load(Ordering::Acquire) {
+    fn install_shutdown(
+        &self,
+        generation: FileTransferGeneration,
+        shutdown: ReadShutdown,
+    ) -> io::Result<()> {
+        let mut slot = lock(&self.shutdown);
+        if let Err(error) = self.ensure_generation(generation) {
             shutdown.stop();
-            return;
+            return Err(error);
         }
-        *lock(&self.shutdown) = Some(shutdown);
-        if self.cancelled.load(Ordering::Acquire)
-            && let Some(shutdown) = lock(&self.shutdown).take()
-        {
-            shutdown.stop();
+        *slot = Some((generation, shutdown));
+        Ok(())
+    }
+
+    fn clear_shutdown(&self, generation: FileTransferGeneration) {
+        let mut slot = lock(&self.shutdown);
+        if slot.as_ref().is_some_and(|(owner, _)| *owner == generation) {
+            slot.take();
         }
     }
 
-    fn clear_shutdown(&self) {
-        lock(&self.shutdown).take();
+    fn advance(&self, generation: FileTransferGeneration) {
+        let mut slot = lock(&self.shutdown);
+        self.generation.store(generation.get(), Ordering::Release);
+        if let Some((_, shutdown)) = slot.take() {
+            shutdown.stop();
+        }
     }
 
     fn cancel(&self) {
         self.cancelled.store(true, Ordering::Release);
-        if let Some(shutdown) = lock(&self.shutdown).take() {
+        if let Some((_, shutdown)) = lock(&self.shutdown).take() {
             shutdown.stop();
         }
+    }
+
+    fn ensure_generation(&self, generation: FileTransferGeneration) -> io::Result<()> {
+        self.ensure_active()?;
+        if self.generation.load(Ordering::Acquire) != generation.get() {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "file transfer generation retired",
+            ));
+        }
+        Ok(())
     }
 
     fn ensure_active(&self) -> io::Result<()> {
@@ -337,6 +384,7 @@ impl FileDropManager {
             return (LocalDropDisposition::Rejected("The pasted data is too large"), None);
         };
         let source = Arc::new(FileSource {
+            generation: AtomicU64::new(1),
             data: SourceData::Memory(bytes.into()),
             length,
             suggested_name: name,
@@ -508,7 +556,8 @@ impl FileDropManager {
     ) -> Result<vivid_protocol::file_drop::FileTransferAdvanced, &'static str> {
         let transfer = self
             .transfers
-            .get_mut(&(session, advance.transfer_id))
+            .get(&(session, advance.transfer_id))
+            .copied()
             .ok_or("file transfer is absent")?;
         if transfer.context_id != advance.context_id
             || transfer.surface_id != advance.surface_id
@@ -528,11 +577,6 @@ impl FileDropManager {
         {
             return Err("file-transfer advance has stale or impossible state");
         }
-        transfer.generation = advance.new_generation;
-        transfer.committed_offset = advance.committed_offset;
-        transfer.maximum_body_bytes = advance.maximum_body_bytes;
-        transfer.maximum_records = advance.maximum_records;
-        transfer.active = false;
         let idle_timeout_us = self
             .bindings
             .get(&BindingKey {
@@ -543,6 +587,21 @@ impl FileDropManager {
             .ok_or("file-drop binding is no longer live")?
             .grant
             .idle_timeout_us;
+        // Validation is complete. Retire old I/O before publishing the replacement.
+        let source = self.offers[&(session, transfer.drop_id)]
+            .source
+            .as_ref()
+            .ok_or("file-drop offer is terminal")?;
+        source.advance(advance.new_generation);
+        let transfer = self
+            .transfers
+            .get_mut(&(session, advance.transfer_id))
+            .ok_or("file transfer is absent")?;
+        transfer.generation = advance.new_generation;
+        transfer.committed_offset = advance.committed_offset;
+        transfer.maximum_body_bytes = advance.maximum_body_bytes;
+        transfer.maximum_records = advance.maximum_records;
+        transfer.active = false;
         transfer.deadline = Instant::now()
             .checked_add(std::time::Duration::from_micros(idle_timeout_us))
             .unwrap_or_else(Instant::now);
@@ -688,6 +747,16 @@ impl FileDropManager {
         let Some(transfer) = self.transfers.get_mut(&(session, result.transfer_id)) else {
             return;
         };
+        if transfer.generation != result.transfer_generation {
+            return;
+        }
+        if self
+            .offers
+            .get(&(session, transfer.drop_id))
+            .is_none_or(|offer| offer.cancelled || offer.terminal.is_some())
+        {
+            return;
+        }
         transfer.active = false;
         transfer.committed_offset = result.committed_length;
         let (context_id, surface_id, drop_id) =
@@ -737,8 +806,16 @@ impl FileDropManager {
         taken.into_iter().map(|(_, _, text)| text).collect()
     }
 
-    fn connection_lost(&mut self, session: SessionIdentity, transfer_id: u64) {
+    fn connection_lost(
+        &mut self,
+        session: SessionIdentity,
+        transfer_id: u64,
+        generation: FileTransferGeneration,
+    ) {
         if let Some(transfer) = self.transfers.get_mut(&(session, transfer_id)) {
+            if transfer.generation != generation {
+                return;
+            }
             transfer.active = false;
             if let Some(binding) = self.bindings.get(&BindingKey {
                 session,
@@ -993,25 +1070,28 @@ pub(super) fn handle_connection(
         lock(&shared.file_drops).begin_transfer(session.identity, &open).map_err(|message| {
             reject_open(&writer, open.transfer_id, messages::ERROR_PRECONDITION_FAILED, message)
         })?;
-    source.install_shutdown(shutdown);
-    pending.authenticated(reader)?;
-    let idle_timeout = lock(&shared.file_drops)
-        .binding_idle_timeout(session.identity, &open)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "file-drop binding is absent"))?;
-    reader.set_record_idle_timeout(std::time::Duration::from_micros(idle_timeout))?;
-    reader.set_maximum(64 * 1024)?;
-    writer.write_record(
-        registry::record::FILE_TRANSFER_ACCEPTED,
-        open.transfer_id,
-        &FileTransferAccepted {
-            transfer_id: open.transfer_id,
-            transfer_generation: open.transfer_generation,
-            resume_offset: open.resume_offset,
-        }
-        .encode()?,
-    )?;
-    let result = stream_source(reader, &writer, &open, &source);
-    source.clear_shutdown();
+    let result = (|| {
+        source.install_shutdown(open.transfer_generation, shutdown)?;
+        pending.authenticated(reader)?;
+        let idle_timeout =
+            lock(&shared.file_drops).binding_idle_timeout(session.identity, &open).ok_or_else(
+                || io::Error::new(io::ErrorKind::NotFound, "file-drop binding is absent"),
+            )?;
+        reader.set_record_idle_timeout(std::time::Duration::from_micros(idle_timeout))?;
+        reader.set_maximum(64 * 1024)?;
+        writer.write_record(
+            registry::record::FILE_TRANSFER_ACCEPTED,
+            open.transfer_id,
+            &FileTransferAccepted {
+                transfer_id: open.transfer_id,
+                transfer_generation: open.transfer_generation,
+                resume_offset: open.resume_offset,
+            }
+            .encode()?,
+        )?;
+        stream_source(reader, &writer, &open, &source)
+    })();
+    source.clear_shutdown(open.transfer_generation);
     match result {
         Ok(result) => {
             // Negotiation and config both have to agree before a remote path can reach the PTY.
@@ -1023,7 +1103,11 @@ pub(super) fn handle_connection(
             }
         },
         Err(error) => {
-            lock(&shared.file_drops).connection_lost(session.identity, open.transfer_id);
+            lock(&shared.file_drops).connection_lost(
+                session.identity,
+                open.transfer_id,
+                open.transfer_generation,
+            );
             wake_actor(&session);
             return Err(error);
         },
@@ -1085,7 +1169,7 @@ fn stream_source(
     open: &FileTransferOpen,
     source: &FileSource,
 ) -> io::Result<FileResult> {
-    source.ensure_active()?;
+    source.ensure_generation(open.transfer_generation)?;
     let mut file = source.open_stream()?;
     let chunk_size =
         usize::try_from(open.maximum_record_body - file_drop::FILE_DATA_PREFIX_SIZE as u32)
@@ -1099,7 +1183,7 @@ fn stream_source(
     let mut maximum_body = open.maximum_body_bytes;
     let mut maximum_records = open.maximum_records;
     while offset < open.resume_offset {
-        source.ensure_active()?;
+        source.ensure_generation(open.transfer_generation)?;
         let remaining = usize::try_from((open.resume_offset - offset).min(chunk_size as u64))
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "file length exceeds usize"))?;
         file.read_exact(&mut buffer[..remaining])?;
@@ -1109,7 +1193,7 @@ fn stream_source(
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "file offset overflow"))?;
     }
     while offset < source.length {
-        source.ensure_active()?;
+        source.ensure_generation(open.transfer_generation)?;
         let remaining = usize::try_from((source.length - offset).min(chunk_size as u64))
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "file length exceeds usize"))?;
         file.read_exact(&mut buffer[..remaining])?;
@@ -1118,7 +1202,7 @@ fn stream_source(
         while sent_body.checked_add(body_length).is_none_or(|value| value > maximum_body)
             || sent_records.checked_add(1).is_none_or(|value| value > maximum_records)
         {
-            source.ensure_active()?;
+            source.ensure_generation(open.transfer_generation)?;
             read_credit(
                 reader,
                 open,
@@ -1128,7 +1212,7 @@ fn stream_source(
                 sent_records,
             )?;
         }
-        source.ensure_active()?;
+        source.ensure_generation(open.transfer_generation)?;
         let prefix = file_drop::file_data_prefix(offset, remaining)?;
         writer.write_record_parts(
             registry::record::FILE_DATA,
@@ -1151,10 +1235,10 @@ fn stream_source(
         final_length: source.length,
         sha256: hasher.finalize().into(),
     };
-    source.ensure_active()?;
+    source.ensure_generation(open.transfer_generation)?;
     writer.write_record(registry::record::FILE_FINISH, open.transfer_id, &finish.encode()?)?;
     loop {
-        source.ensure_active()?;
+        source.ensure_generation(open.transfer_generation)?;
         let record = reader.read_record(ConnectionKind::FileTransfer)?;
         if record.object_id != open.transfer_id {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "file result object mismatch"));
@@ -1288,6 +1372,7 @@ fn open_source(path: &Path) -> io::Result<FileSource> {
         .unwrap_or("dropped-file")
         .to_owned();
     Ok(FileSource {
+        generation: AtomicU64::new(1),
         data: SourceData::File(file),
         length: metadata.len(),
         suggested_name,
@@ -1447,6 +1532,7 @@ mod tests {
         let file = open_source(&path).unwrap();
         let _ = std::fs::remove_file(&path);
         let memory = FileSource {
+            generation: AtomicU64::new(1),
             data: SourceData::Memory(bytes.to_vec().into()),
             length: bytes.len() as u64,
             suggested_name: "pasted-image.png".into(),
@@ -1701,4 +1787,5 @@ mod tests {
         // The local fallback is deliberately untouched, so a local drop is byte-identical.
         assert_eq!(local_paste_text(Path::new("folder/report.txt")), "folder/report.txt ");
     }
+    include!("file_drop_regressions.rs");
 }

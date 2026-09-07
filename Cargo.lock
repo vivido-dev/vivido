@@ -3974,6 +3974,7 @@ dependencies = [
  "crossterm",
  "getrandom 0.4.3",
  "vivid_protocol",
+ "zeroize",
 ]
 
 [[package]]
