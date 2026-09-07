@@ -993,7 +993,12 @@ impl Window {
 
     #[cfg(target_os = "macos")]
     pub fn tabbing_id(&self) -> String {
-        self.backend.winit().map(|window| window.tabbing_identifier()).unwrap_or_default()
+        let Some(window) = self.backend.winit() else { return String::new() };
+        let identifier = window.tabbing_identifier();
+        // AppKit's implicit identifier does not group with the same explicitly assigned string.
+        // Make the source explicit too before winit assigns this identifier to the new tab.
+        window.set_tabbing_identifier(&identifier);
+        identifier
     }
 }
 
