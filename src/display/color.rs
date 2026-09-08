@@ -7,7 +7,7 @@ use serde::de::{Error as SerdeError, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::terminal::term::color::COUNT;
-use crate::terminal::vte::ansi::{NamedColor, Rgb as VteRgb};
+use crate::terminal::vvte::ansi::{NamedColor, Rgb as VteRgb};
 
 use crate::config::color::Colors;
 

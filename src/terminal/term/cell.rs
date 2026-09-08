@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::terminal::grid::{self, GridCell};
 use crate::terminal::index::Column;
-use crate::terminal::vte::ansi::{Color, Hyperlink as VteHyperlink, NamedColor};
+use crate::terminal::vvte::ansi::{Color, Hyperlink as VteHyperlink, NamedColor};
 
 bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

@@ -22,13 +22,13 @@ use crate::terminal::index::{self, Boundary, Column, Direction, Line, Point};
 use crate::terminal::selection::{Selection, SelectionRange, SelectionType};
 use crate::terminal::term::cell::{Cell, Flags, LineLength};
 use crate::terminal::term::color::Colors;
-use crate::terminal::vte::ansi::{
+use crate::terminal::vvte::ansi::{
     self, Attr, CharsetIndex, Color, CursorShape, CursorStyle, Handler, Hyperlink, KeyboardModes,
     KeyboardModesApplyBehavior, NamedColor, NamedMode, NamedPrivateMode, PrivateMode, Rgb,
     StandardCharset,
 };
 // The same `cursor-icon` type winit re-exports, keeping this module winit-free.
-use crate::terminal::vte::ansi::cursor_icon::CursorIcon;
+use crate::terminal::vvte::ansi::cursor_icon::CursorIcon;
 
 pub mod cell;
 pub mod color;
@@ -665,7 +665,7 @@ impl<T> Term<T> {
         }
     }
 
-    /// Advance terminal input while intercepting the bounded DCS queries that vte's ANSI adapter
+    /// Advance terminal input while intercepting the bounded DCS queries that vvte's ANSI adapter
     /// otherwise discards before they reach [`Handler`].
     pub fn advance(&mut self, processor: &mut ansi::Processor, bytes: &[u8])
     where
@@ -1852,7 +1852,7 @@ impl<T: EventListener> Handler for Term<T> {
     ///
     /// Deliberately ignored, for parity with Alacritty and Kitty: xterm displays a
     /// replacement glyph here, but the VT100 parity-error semantic vte documents ("substitute
-    /// char under cursor") is obsolete. vte's state machine still cancels any in-progress
+    /// char under cursor") is obsolete. vvte's state machine still cancels any in-progress
     /// escape sequence on SUB before this is reached.
     #[inline]
     fn substitute(&mut self) {}
@@ -3046,7 +3046,7 @@ mod tests {
     use crate::terminal::term::cell::Cell;
     use crate::terminal::term::cell::Flags;
     use crate::terminal::term::test::{TermSize, mock_term};
-    use crate::terminal::vte::ansi::{self, CharsetIndex, Handler, StandardCharset};
+    use crate::terminal::vvte::ansi::{self, CharsetIndex, Handler, StandardCharset};
 
     #[cfg(windows)]
     #[derive(Clone, Default)]

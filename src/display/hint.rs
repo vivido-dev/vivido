@@ -592,7 +592,7 @@ impl<T> Iterator for HintPostProcessor<'_, T> {
 mod tests {
     use crate::terminal::index::{Column, Line};
     use crate::terminal::term::test::mock_term;
-    use crate::terminal::vte::ansi::Handler;
+    use crate::terminal::vvte::ansi::Handler;
 
     use super::*;
 

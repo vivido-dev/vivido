@@ -8,7 +8,7 @@ use crate::osc_notification::OscNotification;
 use crate::terminal::event_loop::EventLoopSendError;
 use crate::terminal::graphics::GraphicsCommand;
 use crate::terminal::term::ClipboardType;
-use crate::terminal::vte::ansi::Rgb;
+use crate::terminal::vvte::ansi::Rgb;
 
 /// Terminal event.
 ///

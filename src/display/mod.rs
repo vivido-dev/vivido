@@ -25,7 +25,7 @@ use crate::terminal::term::cell::Flags;
 use crate::terminal::term::{
     self, LineDamageBounds, MIN_COLUMNS, MIN_SCREEN_LINES, Term, TermDamage, TermMode,
 };
-use crate::terminal::vte::ansi::{CursorShape, NamedColor};
+use crate::terminal::vvte::ansi::{CursorShape, NamedColor};
 
 use crate::config::UiConfig;
 use crate::config::font::{Font, FontSize};

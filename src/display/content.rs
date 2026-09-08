@@ -10,7 +10,7 @@ use crate::terminal::selection::SelectionRange;
 use crate::terminal::term::cell::{Cell, Flags, Hyperlink};
 use crate::terminal::term::search::{Match, RegexSearch};
 use crate::terminal::term::{self, RenderableContent as TerminalContent, Term};
-use crate::terminal::vte::ansi::{Color, CursorShape, NamedColor};
+use crate::terminal::vvte::ansi::{Color, CursorShape, NamedColor};
 
 use crate::config::UiConfig;
 use crate::display::color::{CellRgb, DIM_FACTOR, List, Rgb};

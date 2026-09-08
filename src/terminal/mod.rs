@@ -20,4 +20,4 @@ mod ref_tests;
 
 pub use crate::terminal::grid::Grid;
 pub use crate::terminal::term::Term;
-pub use vte;
+pub use vvte;

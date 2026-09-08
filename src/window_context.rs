@@ -64,7 +64,7 @@ use crate::terminal::term::cell::Flags;
 use crate::terminal::term::test::TermSize;
 use crate::terminal::tty;
 #[cfg(any(unix, windows))]
-use crate::terminal::vte::ansi::{Color, NamedColor};
+use crate::terminal::vvte::ansi::{Color, NamedColor};
 
 #[cfg(any(unix, windows))]
 use crate::automation::{AutomationWindowState, Transcript};

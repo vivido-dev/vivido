@@ -25,7 +25,7 @@ use crate::terminal::event::{self, Event, EventListener, WindowSize};
 use crate::terminal::sync::FairMutex;
 use crate::terminal::term::Term;
 use crate::terminal::{thread, tty};
-use vte::ansi;
+use vvte::ansi;
 
 use crate::client_fault::{self, ClientFault, ClientFaultClass};
 

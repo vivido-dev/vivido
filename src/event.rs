@@ -50,7 +50,7 @@ use crate::terminal::term::search::{Match, RegexSearch};
 use crate::terminal::term::{self, ClipboardType, Term, TermMode};
 #[cfg(windows)]
 use crate::terminal::tty::windows::win32_string;
-use crate::terminal::vte::ansi::NamedColor;
+use crate::terminal::vvte::ansi::NamedColor;
 
 #[cfg(any(unix, windows))]
 use crate::automation::{AutomationHub, SubscriptionRequest};

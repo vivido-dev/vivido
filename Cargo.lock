@@ -4037,7 +4037,7 @@ dependencies = [
  "vello",
  "vivid_protocol",
  "vivid_sdk",
- "vte",
+ "vvte",
  "wgpu",
  "windows 0.62.2",
  "windows-sys 0.61.2",
@@ -4067,12 +4067,9 @@ dependencies = [
 ]
 
 [[package]]
-name = "vte"
+name = "vvte"
 version = "0.15.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a5924018406ce0063cd67f8e008104968b74b563ee1b85dde3ed1f7cb87d3dbd"
 dependencies = [
- "arrayvec",
  "bitflags 2.13.1",
  "cursor-icon",
  "log",

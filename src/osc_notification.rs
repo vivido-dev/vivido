@@ -14,7 +14,7 @@ use memchr::{memchr, memchr2};
 
 use crate::event::{EventProxy, EventType};
 use crate::terminal::event::Notify;
-use crate::terminal::vte::{self, Perform};
+use crate::terminal::vvte::{self, Perform};
 
 const MAX_OSC_BYTES: usize = 8 * 1024;
 const MAX_PLAIN_PAYLOAD_BYTES: usize = 2 * 1024;
@@ -35,7 +35,7 @@ pub enum OscNotification {
     Kitty(KittyNotification),
 }
 
-/// One complete, bounded OSC sequence `vte` does not dispatch itself.
+/// One complete, bounded OSC sequence `vvte` does not dispatch itself.
 #[derive(Clone, Debug)]
 pub(crate) enum OscMessage {
     Notification(OscNotification),
@@ -112,7 +112,7 @@ enum Sound {
 /// completed body at a time rather than reading every byte that crosses the PTY.
 #[derive(Default)]
 pub(crate) struct OscNotificationParser {
-    parser: vte::Parser<8193>,
+    parser: vvte::Parser<8193>,
     capture: OscCapture,
 }
 
@@ -153,7 +153,7 @@ impl OscNotificationParser {
     /// The body is bounded by [`MAX_OSC_BYTES`] and the parser is reset first, so one sequence can
     /// never leak a dispatch into the decision made about the next one.
     fn is_top_level_notification(&mut self, raw: &[u8]) -> bool {
-        self.parser = vte::Parser::default();
+        self.parser = vvte::Parser::default();
         let mut performer = OscDispatch::default();
         self.parser.advance(&mut performer, b"\x1b]");
         self.parser.advance(&mut performer, raw);
