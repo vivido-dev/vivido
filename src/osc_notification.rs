@@ -122,19 +122,20 @@ impl OscNotificationParser {
         let mut rest = bytes;
 
         while !rest.is_empty() {
-            // Ordinary output in the ground state, and the body of a sequence already known to be
-            // uninteresting, cannot do anything until a byte that matters arrives. Find that byte
-            // instead of stepping the state machine over every one in between.
-            if self.capture.is_ground() {
-                let Some(index) = memchr(0x1b, rest) else { break };
-                rest = &rest[index..];
-            } else if self.capture.is_skipping_body() {
-                let Some(index) = memchr2(0x07, 0x1b, rest) else { break };
-                rest = &rest[index..];
-            }
-
-            let Some((&byte, remainder)) = rest.split_first() else { break };
-            rest = remainder;
+            // Scan inert runs without changing the bytewise capture's boundaries. Non-OSC
+            // strings only care about ESC; discarded OSC bodies also recognize BEL.
+            let next = match self.capture.state {
+                CaptureState::Ground | CaptureState::OtherString { escape: false } => {
+                    memchr(0x1b, rest)
+                },
+                CaptureState::Osc { discarding: true, escape: false, .. } => {
+                    memchr2(0x07, 0x1b, rest)
+                },
+                _ => Some(0),
+            };
+            let Some(index) = next else { break };
+            let byte = rest[index];
+            rest = &rest[index + 1..];
 
             if let CaptureObservation::Complete(Some(raw)) = self.capture.advance(byte)
                 && self.is_top_level_notification(&raw)
@@ -199,19 +200,6 @@ enum CaptureObservation {
 }
 
 impl OscCapture {
-    /// Whether no sequence is open, so only an escape can change this state machine.
-    fn is_ground(&self) -> bool {
-        matches!(self.state, CaptureState::Ground)
-    }
-
-    /// Whether a body that cannot become a notification is being scanned for its terminator.
-    ///
-    /// Only `BEL` and `ESC` matter in that state. A pending escape is excluded because the byte
-    /// after it decides whether the sequence ends.
-    fn is_skipping_body(&self) -> bool {
-        matches!(self.state, CaptureState::Osc { discarding: true, escape: false, .. })
-    }
-
     fn advance(&mut self, byte: u8) -> CaptureObservation {
         match &mut self.state {
             CaptureState::Ground => {
@@ -1334,6 +1322,59 @@ mod tests {
     #[test]
     fn ignores_osc_inside_dcs() {
         assert!(parse(b"\x1bPignored\x1b]9;nope\x1b\\\x1b\\").is_empty());
+    }
+
+    #[test]
+    fn other_strings_preserve_notification_boundaries() {
+        for introducer in [b'P', b'_', b'^', b'X'] {
+            let mut bytes = vec![0x1b, introducer];
+            // Every non-escape byte is inert in the observer's OtherString state, including
+            // BEL, CAN, SUB, and C1 bytes. Only ESC followed by backslash ends this capture.
+            bytes.extend((0..=255).filter(|byte| *byte != 0x1b));
+            bytes.extend_from_slice(b"\x1b]9;inside\x07\x1b\x1b!still inside");
+            bytes.extend_from_slice(b"\x1b\\\x1b]9;after\x07");
+            for split in 0..=bytes.len() {
+                let mut parser = OscNotificationParser::default();
+                let mut messages = parser.advance(&bytes[..split]);
+                messages.extend(parser.advance(&bytes[split..]));
+                assert!(
+                    matches!(
+                        messages.as_slice(),
+                        [OscMessage::Notification(OscNotification::Legacy(value))] if value == "after"
+                    ),
+                    "introducer={introducer}, split={split}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn bulk_observer_matches_bytewise_capture() {
+        let mut bytes = Vec::new();
+        for introducer in [b'P', b'_', b'^', b'X', b']'] {
+            bytes.extend_from_slice(&[0x1b, introducer]);
+            bytes.extend_from_slice(b"6;");
+            bytes.extend(std::iter::repeat_n(b'A', 128 * 1024));
+            bytes.extend_from_slice(b"\x1b\x1b\\\x1b]7;file:///tmp\x07\x1b]9;after\x07");
+        }
+        let mut scalar = OscNotificationParser::default();
+        let mut expected = Vec::new();
+        for &byte in &bytes {
+            if let CaptureObservation::Complete(Some(raw)) = scalar.capture.advance(byte)
+                && scalar.is_top_level_notification(&raw)
+                && let Some(message) = parse_osc(&raw)
+            {
+                expected.push(message);
+            }
+        }
+        for chunk_size in [1, 2, 3, 127, 4096, 65535, bytes.len()] {
+            let mut parser = OscNotificationParser::default();
+            let actual = bytes
+                .chunks(chunk_size)
+                .flat_map(|chunk| parser.advance(chunk))
+                .collect::<Vec<_>>();
+            assert_eq!(format!("{actual:?}"), format!("{expected:?}"), "chunk_size={chunk_size}");
+        }
     }
 
     #[test]

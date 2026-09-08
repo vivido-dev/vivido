@@ -167,13 +167,13 @@ impl Cell {
     /// Write a new zerowidth character to this cell.
     #[inline]
     pub fn push_zerowidth(&mut self, character: char) {
-        let extra = self.extra.get_or_insert(Default::default());
+        let extra = self.extra.get_or_insert_with(Default::default);
         Arc::make_mut(extra).zerowidth.push(character);
     }
 
     /// Attach a temporary Vivid anchor index before terminal resize/reflow.
     pub(crate) fn push_vivid_resize_tracking(&mut self, index: usize) {
-        let extra = self.extra.get_or_insert(Default::default());
+        let extra = self.extra.get_or_insert_with(Default::default);
         Arc::make_mut(extra).vivid_resize_tracking.push(index);
     }
 
@@ -215,7 +215,7 @@ impl Cell {
         {
             self.extra = None;
         } else {
-            let extra = self.extra.get_or_insert(Default::default());
+            let extra = self.extra.get_or_insert_with(Default::default);
             Arc::make_mut(extra).underline_color = color;
         }
     }
@@ -238,7 +238,7 @@ impl Cell {
         if should_drop {
             self.extra = None;
         } else {
-            let extra = self.extra.get_or_insert(Default::default());
+            let extra = self.extra.get_or_insert_with(Default::default);
             Arc::make_mut(extra).hyperlink = hyperlink;
         }
     }
@@ -343,6 +343,26 @@ mod tests {
 
         // Ensure that cell size isn't growing by accident.
         assert!(mem::size_of::<Cell>() <= EXPECTED_CELL_SIZE);
+    }
+
+    #[test]
+    fn extra_updates_preserve_shared_cell_contents() {
+        let mut cell = Cell::default();
+        cell.push_zerowidth('\u{301}');
+        let original = cell.clone();
+        cell.push_zerowidth('\u{302}');
+        cell.set_underline_color(Some(Color::Indexed(3)));
+        cell.push_vivid_resize_tracking(7);
+
+        assert_eq!(original.zerowidth(), Some(['\u{301}'].as_slice()));
+        assert_eq!(original.underline_color(), None);
+        assert!(original.extra.as_ref().unwrap().vivid_resize_tracking.is_empty());
+        assert_eq!(cell.zerowidth(), Some(['\u{301}', '\u{302}'].as_slice()));
+        assert_eq!(cell.underline_color(), Some(Color::Indexed(3)));
+        assert_eq!(cell.take_vivid_resize_tracking(), [7]);
+        cell.set_underline_color(None);
+        cell.set_hyperlink(None);
+        assert_eq!(cell.zerowidth(), Some(['\u{301}', '\u{302}'].as_slice()));
     }
 
     #[test]

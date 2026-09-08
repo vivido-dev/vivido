@@ -882,6 +882,63 @@ impl<T> PeekableReceiver<T> {
 }
 
 #[cfg(test)]
+mod parser_benchmark {
+    use std::hint::black_box;
+
+    use super::*;
+    use crate::terminal::event::VoidListener;
+    use crate::terminal::term::{Config, test::TermSize};
+
+    /// Feed a captured workload through each parsing layer without PTY or rendering noise.
+    /// Run in release mode with VIVIDO_BENCH_INPUT pointing to the workload's raw bytes.
+    #[test]
+    #[ignore = "manual throughput measurement; requires VIVIDO_BENCH_INPUT"]
+    fn parser_throughput() {
+        let path = std::env::var_os("VIVIDO_BENCH_INPUT").expect("VIVIDO_BENCH_INPUT");
+        let data = std::fs::read(path).unwrap();
+        assert!(!data.is_empty());
+        let repetitions = (64 * 1024 * 1024 / data.len()).max(1);
+        let size = TermSize::new(24, 80);
+        for layer in ["observer", "terminal", "pipeline"] {
+            let mut samples = Vec::new();
+            for sample in 0..8 {
+                let mut term = Term::new(Config::default(), &size, VoidListener);
+                let mut state = State::default();
+                let transcript = Arc::new(Mutex::new(Transcript::default()));
+                term.advance(&mut state.parser, b"\x1b[?1049h");
+                let start = Instant::now();
+                for _ in 0..repetitions {
+                    for chunk in data.chunks(MAX_LOCKED_READ) {
+                        match layer {
+                            "observer" => {
+                                black_box(state.osc_notifications.advance(black_box(chunk)));
+                            },
+                            "terminal" => term.advance(&mut state.parser, black_box(chunk)),
+                            _ => {
+                                black_box(state.advance(&mut term, black_box(chunk), &transcript));
+                            },
+                        }
+                    }
+                }
+                let elapsed = start.elapsed().as_secs_f64();
+                black_box((&term, &state, &transcript));
+                if sample != 0 {
+                    samples.push(elapsed);
+                }
+            }
+            samples.sort_by(f64::total_cmp);
+            let mib = (data.len() * repetitions) as f64 / (1024. * 1024.);
+            println!(
+                "{layer}: median {:.1} MiB/s (range {:.1}..{:.1})",
+                mib / samples[3],
+                mib / samples[6],
+                mib / samples[0],
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod vivid_marker_tests {
     use super::*;
 
