@@ -3045,6 +3045,8 @@ fn vivid_track_status_json(window_id: u64, status: &crate::vivid::scene::TrackSt
             "audio_rebases": status.metrics.audio_rebases,
         },
         "playback": {
+            "clock_pts_us": status.playback_position_pts_us,
+            "paused": status.playback_paused,
             "state": if status.configuration.mode as u64 == 2 { "timed" } else { "live" },
             "media_epoch": status.state.media_epoch,
         },

@@ -467,6 +467,24 @@ impl AudioOutput {
                 )
     }
 
+    /// Audio-master position remains observable while paused or waiting for prebuffer.
+    pub fn clock_pts(&self) -> Option<i64> {
+        let origin = self.shared.timeline_origin_us.load(Ordering::SeqCst);
+        (origin != UNSET_PTS).then(|| {
+            rendered_pts_us(
+                origin,
+                self.shared.rendered_samples.load(Ordering::SeqCst),
+                self.sample_rate,
+                self.channels,
+            )
+        })
+    }
+
+    #[cfg(test)]
+    pub(super) fn enabled_for_test(&self) -> bool {
+        self.shared.enabled.load(Ordering::SeqCst)
+    }
+
     /// The media PTS currently leaving the device, or `None` before playback is running.
     pub fn rendered_pts(&self) -> Option<i64> {
         if !self.shared.enabled.load(Ordering::SeqCst)

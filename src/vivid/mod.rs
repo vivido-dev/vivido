@@ -965,7 +965,15 @@ impl VividService {
 
     #[cfg(any(unix, windows))]
     pub(crate) fn automation_track_status(&self, identity: TrackIdentity) -> Option<TrackStatus> {
-        self.scene.track_status(identity)
+        let mut status = self.scene.track_status(identity)?;
+        let audio = self.scene.active_track(identity.surface, 2).unwrap_or(identity);
+        let pts =
+            lock(&self.shared.audio_outputs).get(&audio).and_then(|output| output.clock_pts());
+        if let Some((state, pts)) = self.scene.playback_state(identity, pts) {
+            status.playback_position_pts_us = Some(pts);
+            status.playback_paused = Some(state == 3);
+        }
+        Some(status)
     }
 
     #[cfg(any(unix, windows))]
@@ -2897,19 +2905,38 @@ fn dispatch_control(
         },
         messages::QUERY_TRACK => {
             let identity = payload_track_identity(session, &value)?;
+            // Gateways observe completion through status queries, without a blocking DRAIN.
+            if let Some(status) = shared.scene.track_status(identity)
+                && status.state.milestones & track::MILESTONE_BUFFERED_ENDED == 0
+                && lock(&shared.audio_outputs)
+                    .get(&identity)
+                    .is_some_and(|output| matches!(output.poll_drained(), Some(Ok(()))))
+            {
+                let _ = shared.scene.mark_buffered_ended(identity, status.state.channel_generation);
+            }
             let status = shared
                 .scene
                 .track_status(identity)
                 .ok_or_else(|| ControlError::not_found("track does not exist"))?;
-            (
-                messages::TRACK_STATUS,
-                record.object_id,
-                Envelope::new(
-                    request_id,
-                    track_status_payload(&status, session.supports(registry::AUDIO_GAIN)),
-                )
-                .encode(),
-            )
+            let audio_identity = shared.scene.active_track(identity.surface, 2).unwrap_or(identity);
+            let audio_pts = lock(&shared.audio_outputs)
+                .get(&audio_identity)
+                .and_then(|output| output.clock_pts());
+            let mut payload = track_status_payload(&status, session.supports(registry::AUDIO_GAIN));
+            if let Some((state, pts)) = shared.scene.playback_state(identity, audio_pts) {
+                payload.push((
+                    21,
+                    Value::Map(vec![
+                        (3, Value::Unsigned(state)),
+                        (4, signed(pts)),
+                        (5, Value::Unsigned(u64::from(status.state.media_epoch))),
+                        (10, Value::Unsigned(status.state.revision.get())),
+                    ]),
+                ));
+            }
+            // AUDIO_GAIN (23) may already be present; CBOR maps require sorted keys.
+            payload.sort_unstable_by_key(|(key, _)| *key);
+            (messages::TRACK_STATUS, record.object_id, Envelope::new(request_id, payload).encode())
         },
         messages::ADVANCE_CHANNEL => {
             let identity = payload_track_identity(session, &value)?;
@@ -3332,6 +3359,9 @@ fn dispatch_control(
                         generation,
                         condition,
                         value: condition_value,
+                        completion_output: (condition == 6)
+                            .then(|| lock(&shared.audio_outputs).get(&identity).cloned())
+                            .flatten(),
                         deadline: Instant::now()
                             .checked_add(Duration::from_micros(timeout_us))
                             .unwrap_or_else(Instant::now),
@@ -3368,7 +3398,13 @@ fn dispatch_control(
             let before = shared.scene.track_status(identity).ok_or_else(|| {
                 ControlError::not_found("track does not exist").with_track(identity)
             })?;
-            let output = lock(&shared.audio_outputs).get(&identity).cloned();
+            let output_identity = if matches!(record.record_type, messages::PLAY | messages::PAUSE)
+            {
+                shared.scene.active_track(identity.surface, 2).unwrap_or(identity)
+            } else {
+                identity
+            };
+            let output = lock(&shared.audio_outputs).get(&output_identity).cloned();
             match record.record_type {
                 messages::PLAY => {
                     let map = StrictMap::new("PLAY", &value, &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
@@ -3446,13 +3482,16 @@ fn dispatch_control(
                     );
                 },
                 messages::PAUSE => {
-                    shared
-                        .scene
-                        .pause_playback(identity)
-                        .map_err(|message| ControlError::state(message).with_track(identity))?;
                     if let Some(output) = &output {
                         output.pause();
                     }
+                    shared
+                        .scene
+                        .pause_playback_at(
+                            identity,
+                            output.as_ref().and_then(|output| output.clock_pts()),
+                        )
+                        .map_err(|message| ControlError::state(message).with_track(identity))?;
                     let revision_after = shared
                         .scene
                         .track_status(identity)
@@ -5227,6 +5266,9 @@ fn wait_until_video_due(
         return Ok(());
     }
     loop {
+        if shared.scene.paused_frame_due(identity, pts_us) {
+            return Ok(());
+        }
         let audio = shared
             .scene
             .active_track(identity.surface, scene::SLOT_AUDIO)
@@ -7660,6 +7702,206 @@ mod tests {
             )
             .expect("a resize event and the presenter's scene precondition must agree");
         session.close().unwrap();
+    }
+
+    fn group_test_video(context_id: u64, surface_id: u64, track_id: u64) -> TrackConfiguration {
+        TrackConfiguration {
+            direction: Default::default(),
+            context_id,
+            surface_id,
+            track_id,
+            slot: 1,
+            mode: TrackMode::Timed,
+            lane: LaneClass::Realtime,
+            maximum_record_body: media::video_body_len(1024).unwrap(),
+            maximum_rate_millihertz: 60_000,
+            maximum_encoded_bits_per_second: 8_000_000,
+            maximum_records_per_second: 60,
+            maximum_inflight_body_bytes: 16 * 1024,
+            kind: KindConfiguration::Video(vivid_protocol::track::VideoConfiguration {
+                codec: "h264".into(),
+                packetization: "h264-annexb-au-v1".into(),
+                extradata: Vec::new(),
+                coded_width: 16,
+                coded_height: 16,
+                profile: 0,
+                level: 0,
+                maximum_reorder_depth: 16,
+                color_primaries: 1,
+                transfer: 1,
+                matrix: 1,
+                signal_range: 1,
+                aspect_numerator: 1,
+                aspect_denominator: 1,
+                maximum_access_unit_bytes: 1024,
+                codec_string: None,
+                decoder_configuration: None,
+            }),
+            target_latency_us: 20_000,
+            maximum_latency_us: 1_000_000,
+            retained_pixel_charge: 256,
+        }
+    }
+    fn group_test_audio(context_id: u64, surface_id: u64, track_id: u64) -> TrackConfiguration {
+        let maximum_record_body = media::audio_body_len(256).unwrap();
+        TrackConfiguration {
+            direction: Default::default(),
+            context_id,
+            surface_id,
+            track_id,
+            slot: 2,
+            mode: TrackMode::Timed,
+            lane: LaneClass::Realtime,
+            maximum_record_body,
+            maximum_rate_millihertz: 50_000,
+            maximum_encoded_bits_per_second: 512_000,
+            maximum_records_per_second: 50,
+            maximum_inflight_body_bytes: u64::from(maximum_record_body) * 8,
+            kind: KindConfiguration::Audio(AudioConfiguration {
+                codec: "pcm_s16le".into(),
+                packetization: "pcm-packet-v1".into(),
+                extradata: Vec::new(),
+                sample_rate: 48_000,
+                channels: 2,
+                channel_mask: 3,
+                maximum_access_unit_bytes: 256,
+                codec_string: None,
+            }),
+            target_latency_us: 0,
+            maximum_latency_us: 1_000_000,
+            retained_pixel_charge: 0,
+        }
+    }
+    #[test]
+    fn video_addressed_pause_controls_only_its_owners_linked_audio() {
+        let service =
+            socket_service!(VividService::start_with_wake(test_geometry(), Arc::new(|_| {})));
+        let mut owners = Vec::new();
+        for _ in 0..2 {
+            let mut config = test_config(&service);
+            config.optional_profiles.push(registry::AUDIO_GAIN.into());
+            config.optional_profiles.sort();
+            let mut session = vivid_sdk::Session::connect(config).unwrap();
+            let surface = grid_surface(&mut session, 9);
+            let video = session
+                .create_track(
+                    group_test_video(surface.context_id(), 9, 11),
+                    &RequestMetadata::default(),
+                )
+                .unwrap();
+            let audio = session
+                .create_track(
+                    group_test_audio(surface.context_id(), 9, 12),
+                    &RequestMetadata::default(),
+                )
+                .unwrap();
+            let session_identity = service
+                .shared
+                .scene
+                .track_keys()
+                .into_iter()
+                .find(|key| {
+                    key.surface.context.session.session_id == session.info().session_id
+                        && key.track_id == 12
+                })
+                .unwrap();
+            let video_identity = TrackIdentity { track_id: 11, ..session_identity };
+            for identity in [video_identity, session_identity] {
+                service
+                    .shared
+                    .scene
+                    .accept_channel(identity, ChannelGeneration::ONE, 65536, 32)
+                    .unwrap();
+                service.shared.scene.mark_output_ready(identity, ChannelGeneration::ONE).unwrap();
+            }
+            let output = AudioOutput::test_output();
+            lock(&service.shared.audio_outputs).insert(session_identity, output.clone());
+            session
+                .activate_tracks(
+                    &surface,
+                    &[
+                        SlotBinding {
+                            slot: 1,
+                            track_id: 11,
+                            expected_channel_generation: ChannelGeneration::ONE,
+                            required_milestone: MILESTONE_OUTPUT_READY,
+                        },
+                        SlotBinding {
+                            slot: 2,
+                            track_id: 12,
+                            expected_channel_generation: ChannelGeneration::ONE,
+                            required_milestone: MILESTONE_OUTPUT_READY,
+                        },
+                    ],
+                    &RequestMetadata::default(),
+                )
+                .unwrap();
+            session.play(&video, 4_000_000, 1, 1_000_000).unwrap();
+            assert!(output.enabled_for_test());
+            owners.push((session, video, audio, output));
+        }
+        let first_video = owners[0].1.clone();
+        owners[0].0.pause(&first_video).unwrap();
+        assert!(!owners[0].3.enabled_for_test());
+        assert!(owners[1].3.enabled_for_test(), "another owner reused both local track IDs");
+        let audio_status = owners[0].0.query_track(&owners[0].2).unwrap();
+        assert!(audio_status.playback_state.is_some());
+        let status = owners[0].0.query_track(&owners[0].1).unwrap();
+        let playback = status.playback_state.unwrap();
+        assert!(playback.contains(&(3, Value::Unsigned(3))));
+        assert!(playback.contains(&(4, signed(4_000_000))));
+        let owner =
+            SessionIdentity::new(service.shared.presenter, owners[0].0.info().session_id).unwrap();
+        let identity =
+            owner.context(first_video.context_id()).unwrap().surface(9).unwrap().track(11).unwrap();
+        service
+            .shared
+            .scene
+            .publish_decoded_frame(
+                identity,
+                ChannelGeneration::ONE,
+                Frame {
+                    frame_id: 1,
+                    pts_us: 1_000_000,
+                    width: 1,
+                    height: 1,
+                    sar_num: 1,
+                    sar_den: 1,
+                    alpha_mode: scene::ALPHA_STRAIGHT,
+                    rgba: Arc::new(RgbaBuffer::new(vec![0, 0, 0, 255])),
+                    damage: None,
+                },
+            )
+            .unwrap();
+        let shared = service.shared.clone();
+        let (done, received) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            let _ = done.send(wait_until_video_due(&shared, identity, 4_020_000, false, false));
+        });
+        if received.recv_timeout(Duration::from_millis(250)).is_err() {
+            owners[0].0.play(&first_video, 4_020_000, 1, 1_000_000).unwrap();
+            // The test output has no device to progress; removal releases its gate.
+            lock(&service.shared.audio_outputs).clear();
+            waiter.join().unwrap();
+            panic!("paused audio prevented the target video frame from being released");
+        }
+        waiter.join().unwrap();
+        owners[0].0.play(&first_video, 4_000_000, 1, 1_000_000).unwrap();
+        assert!(owners.iter().all(|owner| owner.3.enabled_for_test()));
+        // CHANNEL_EOS completion must be observable without first issuing blocking DRAIN.
+        owners[0].3.finish_decode();
+        owners[0].3.signal_eos();
+        let first_audio = owners[0].2.clone();
+        owners[0]
+            .0
+            .wait_track(&first_audio, vivid_sdk::TrackWaitCondition::PlaybackEnded, None, 500_000)
+            .unwrap();
+        let neighbor = owners[1].0.query_track(&owners[1].2).unwrap();
+        assert_eq!(neighbor.milestones & vivid_protocol::track::MILESTONE_BUFFERED_ENDED, 0);
+        owners[1].3.finish_decode();
+        owners[1].3.signal_eos();
+        let completed = owners[1].0.query_track(&owners[1].2).unwrap();
+        assert_ne!(completed.milestones & vivid_protocol::track::MILESTONE_BUFFERED_ENDED, 0);
     }
 
     #[test]

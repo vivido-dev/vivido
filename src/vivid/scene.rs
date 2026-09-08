@@ -176,6 +176,8 @@ pub struct TrackStatus {
     pub maximum_channel_records: u64,
     pub metrics: TrackMetrics,
     pub audio_gain: AudioGain,
+    pub playback_position_pts_us: Option<i64>,
+    pub playback_paused: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -294,6 +296,7 @@ struct PlaybackClock {
     start_media_epoch: u32,
     started_at: Option<Instant>,
     played_before_pause: Duration,
+    paused_pts_us: Option<i64>,
     eos: bool,
 }
 
@@ -304,11 +307,15 @@ impl PlaybackClock {
             start_media_epoch,
             started_at: Some(Instant::now()),
             played_before_pause: Duration::ZERO,
+            paused_pts_us: None,
             eos: false,
         }
     }
 
     fn current_pts_us(self) -> i64 {
+        if let Some(pts) = self.paused_pts_us {
+            return pts;
+        }
         let elapsed = self
             .started_at
             .map(|started| started.elapsed())
@@ -1066,6 +1073,39 @@ impl SharedScene {
         })
     }
 
+    pub fn playback_state(
+        &self,
+        identity: TrackIdentity,
+        audio_pts: Option<i64>,
+    ) -> Option<(u64, i64)> {
+        let state = self.lock();
+        let track = state.tracks.get(&identity)?;
+        let clock = track.playback?;
+        if clock.start_media_epoch != track.state.media_epoch {
+            return None;
+        }
+        Some((
+            if clock.started_at.is_some() { 2 } else { 3 },
+            audio_pts.unwrap_or_else(|| clock.current_pts_us()),
+        ))
+    }
+
+    /// Paused video uses the frozen scene clock, including one picture that brackets a seek.
+    /// The audio gate cannot release it: a paused device intentionally consumes no samples.
+    pub fn paused_frame_due(&self, identity: TrackIdentity, pts_us: i64) -> bool {
+        let state = self.lock();
+        let Some(track) = state.tracks.get(&identity) else {
+            return false;
+        };
+        let Some(clock) = track.playback else {
+            return false;
+        };
+        clock.started_at.is_none()
+            && clock.start_media_epoch == track.state.media_epoch
+            && (pts_us <= clock.current_pts_us()
+                || track.frame.as_ref().is_none_or(|frame| frame.pts_us < clock.start_pts_us))
+    }
+
     /// Where the track's clock reads now, which a paused clock holds at its start.
     #[cfg(test)]
     pub fn playback_position_pts_us(&self, identity: TrackIdentity) -> Option<i64> {
@@ -1404,6 +1444,14 @@ impl SharedScene {
     }
 
     pub fn pause_playback(&self, identity: TrackIdentity) -> Result<(), &'static str> {
+        self.pause_playback_at(identity, None)
+    }
+
+    pub fn pause_playback_at(
+        &self,
+        identity: TrackIdentity,
+        audio_pts: Option<i64>,
+    ) -> Result<(), &'static str> {
         let mut state = self.lock();
         let surface = identity.surface;
         if !state.tracks.contains_key(&identity) {
@@ -1419,6 +1467,11 @@ impl SharedScene {
             {
                 playback.played_before_pause =
                     playback.played_before_pause.saturating_add(started.elapsed());
+                if let Some(pts) = audio_pts {
+                    // Preserve PLAY's target separately from the physical pause observation.
+                    // Changing the target here could release another future picture after PAUSE.
+                    playback.paused_pts_us = Some(pts);
+                }
                 track.state.revision =
                     track.state.revision.advance().map_err(|_| "track revision exhausted")?;
             }
@@ -1526,6 +1579,15 @@ impl SharedScene {
             };
             let remaining = pts_us.saturating_sub(playback.current_pts_us());
             if remaining <= 0 {
+                return Ok(());
+            }
+            // A seek target can fall between pictures. Replacement tracks may already hold a
+            // pre-target priming picture, so release the first target-or-later picture once,
+            // without moving the exact frozen clock that audio and resume must retain.
+            if playback.started_at.is_none()
+                && track.frame.as_ref().is_none_or(|frame| frame.pts_us < playback.start_pts_us)
+                && pts_us >= playback.start_pts_us
+            {
                 return Ok(());
             }
             // A paused clock cannot reach this output by itself, but it must not be waited on
@@ -2196,6 +2258,8 @@ fn surface_status(identity: SurfaceIdentity, surface: &Surface) -> SurfaceStatus
 
 fn track_status(identity: TrackIdentity, track: &Track) -> TrackStatus {
     TrackStatus {
+        playback_position_pts_us: None,
+        playback_paused: None,
         identity,
         configuration: track.configuration.clone(),
         state: track.state.clone(),
@@ -3002,6 +3066,43 @@ mod tests {
         scene.start_playback(track_identity, 1_000_000).unwrap();
         held.join().unwrap().unwrap();
         assert!(seek_clock.elapsed() >= Duration::from_millis(25));
+        scene.pause_playback_at(track_identity, Some(1_005_000)).unwrap();
+        assert_eq!(scene.playback_start_pts_us(track_identity), Some(1_000_000));
+        assert_eq!(scene.playback_position_pts_us(track_identity), Some(1_005_000));
+        assert!(
+            !scene.paused_frame_due(track_identity, 1_040_000),
+            "the physical pause observation must not become a new seek target"
+        );
+
+        // A gateway replacement can prime an earlier picture before receiving PLAY(target).
+        // A target between pictures must release exactly the first following picture, without
+        // waiting for resume or changing the frozen position.
+        scene.start_playback(track_identity, 1_015_000).unwrap();
+        scene.pause_playback_at(track_identity, Some(1_015_000)).unwrap();
+        let target_scene = scene.clone();
+        let (done, received) = std::sync::mpsc::channel();
+        let target = std::thread::spawn(move || {
+            let result = target_scene.wait_until_due(track_identity, 1_040_000, false);
+            let _ = done.send(result);
+        });
+        if received.recv_timeout(Duration::from_millis(250)).is_err() {
+            scene.start_playback(track_identity, 1_040_000).unwrap();
+            target.join().unwrap();
+            panic!("paused seek failed to release the first picture after its target");
+        }
+        target.join().unwrap();
+        assert_eq!(scene.playback_position_pts_us(track_identity), Some(1_015_000));
+        let mut frame = (*scene.latest_frame(track_identity).unwrap()).clone();
+        frame.frame_id = 4;
+        frame.pts_us = 1_040_000;
+        scene.publish_decoded_frame(track_identity, ChannelGeneration::ONE, frame).unwrap();
+        let next_scene = scene.clone();
+        let next =
+            std::thread::spawn(move || next_scene.wait_until_due(track_identity, 1_080_000, false));
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(!next.is_finished(), "paused seek released more than one target picture");
+        scene.start_playback(track_identity, 1_080_000).unwrap();
+        next.join().unwrap().unwrap();
 
         scene.mark_eos(track_identity, ChannelGeneration::ONE, 3, 0).unwrap();
         scene.mark_buffered_ended(track_identity, ChannelGeneration::ONE).unwrap();
