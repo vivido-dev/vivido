@@ -34,6 +34,9 @@ pub mod cell;
 pub mod color;
 pub mod search;
 
+#[cfg(test)]
+mod rep_tests;
+
 /// Minimum number of columns.
 ///
 /// A minimum of 2 is necessary to hold fullwidth unicode characters.
@@ -1461,6 +1464,59 @@ impl<T> Dimensions for Term<T> {
 }
 
 impl<T: EventListener> Handler for Term<T> {
+    /// REP's ordinary ASCII path writes one row span at a time. Boundaries and cells requiring
+    /// cleanup still go through `input`, preserving its wrapping, scroll and metadata semantics.
+    fn repeat_char(&mut self, c: char, mut count: usize) {
+        if !(' '..='~').contains(&c)
+            || self.grid.cursor.charsets[self.active_charset] != StandardCharset::Ascii
+            || self.mode.contains(TermMode::INSERT)
+            || !self.mode.contains(TermMode::LINE_WRAP)
+            || self.grid.cursor.template.extra.is_some()
+        {
+            for _ in 0..count {
+                self.input(c);
+            }
+            return;
+        }
+
+        let wide = Flags::WIDE_CHAR | Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER;
+        while count > 0 {
+            if self.grid.cursor.input_needs_wrap {
+                self.input(c);
+                count -= 1;
+                continue;
+            }
+
+            let point = self.grid.cursor.point;
+            let columns = self.columns();
+            let end = point.column + count.min(columns - point.column.0);
+            // Inspect through an immutable slice: rejected cells must not increase row occupancy.
+            let run = self.grid[point.line][point.column..end]
+                .iter()
+                .take_while(|cell| cell.extra.is_none() && !cell.flags.intersects(wide))
+                .count();
+            if run == 0 {
+                self.input(c);
+                count -= 1;
+                continue;
+            }
+
+            let end = point.column + run;
+            let template = &self.grid.cursor.template;
+            let (fg, bg, flags) = (template.fg, template.bg, template.flags);
+            // Row's range accessor advances occupancy exactly to the last written cell.
+            for cell in &mut self.grid[point.line][point.column..end] {
+                cell.c = c;
+                cell.fg = fg;
+                cell.bg = bg;
+                cell.flags = flags;
+            }
+            self.grid.cursor.input_needs_wrap = end.0 == columns;
+            self.grid.cursor.point.column = Column(end.0.min(columns - 1));
+            count -= run;
+        }
+    }
+
     /// A character to be displayed.
     #[inline(never)]
     fn input(&mut self, c: char) {

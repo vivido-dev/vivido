@@ -1,5 +1,72 @@
 // Positive regressions for the 2026-09-07 presenter audit.
 #[test]
+fn rep_scroll_places_authenticated_anchors_and_preserves_the_other_owner() {
+    use crate::terminal::event::{Event as TerminalEvent, EventListener, VoidListener};
+    use crate::terminal::event_loop::State;
+    use crate::terminal::term::{Config as TermConfig, Term, test::TermSize};
+    use vvte::ansi::Handler;
+
+    struct PresenterEvents(Arc<VividService>);
+    impl EventListener for PresenterEvents {
+        fn send_event(&self, event: TerminalEvent) {
+            match event {
+                TerminalEvent::VividGridScroll { origin, end, lines, history_size } => {
+                    self.0.handle_grid_scroll(origin, end, lines, history_size);
+                },
+                TerminalEvent::VividMarker { marker, line, column, alternate } => {
+                    self.0.handle_terminal_marker(&marker, line, column, alternate);
+                },
+                _ => {},
+            }
+        }
+    }
+
+    let service = Arc::new(socket_service!(VividService::start_with_wake(
+        test_geometry(),
+        Arc::new(|_| {}),
+    )));
+    let first = connect(&service);
+    let second = connect(&service);
+    let first_context = first.info().root_context_id;
+    let second_context = second.info().root_context_id;
+    let anchor_id = 11;
+    let first_marker = first.anchor_marker(first_context, anchor_id).unwrap();
+    let second_marker = second.anchor_marker(second_context, anchor_id).unwrap();
+    let mut term = Term::new(
+        TermConfig::default(),
+        &TermSize::new(80, 24),
+        PresenterEvents(service.clone()),
+    );
+    let mut pipeline = State::default();
+    pipeline.advance_test_chunks(&mut term, first_marker.as_bytes().chunks(1));
+    assert_eq!(first.query_anchor(first_context, anchor_id).unwrap().state, 1);
+
+    // Enough REP output to wrap and scroll; the following marker must observe the new cursor.
+    let input = format!("a\x1b[2000b{second_marker}");
+    pipeline.advance_test_chunks(&mut term, input.as_bytes().chunks(1));
+    let mut scalar = Term::new(TermConfig::default(), &TermSize::new(80, 24), VoidListener);
+    for _ in 0..2001 {
+        scalar.input('a');
+    }
+    let point = scalar.grid().cursor.point;
+    assert_eq!(second.query_anchor(second_context, anchor_id).unwrap().state, 1);
+    let positions = service.scene.anchor_positions();
+    let expected_identity = lock(&service.shared.registry).sessions[&second.info().session_id]
+        .identity.context(second_context).unwrap().anchor(anchor_id).unwrap();
+    assert!(positions.contains(&(expected_identity, point.column.0, point.line.0, false)));
+
+    // Both owners reused anchor 11. Closing the earlier owner cannot unpublish the later anchor.
+    let before = second.query_anchor(second_context, anchor_id).unwrap();
+    let first_id = first.info().session_id;
+    first.cancel_handle()();
+    assert!(wait_until(Duration::from_secs(2), || {
+        !lock(&service.shared.registry).sessions.contains_key(&first_id)
+    }));
+    assert_eq!(second.query_anchor(second_context, anchor_id).unwrap(), before);
+    second.query_session().unwrap();
+}
+
+#[test]
 fn root_hello_replay_is_rejected() {
     let service = socket_service!(VividService::start_with_wake(test_geometry(), Arc::new(|_| {})));
     let open = || {

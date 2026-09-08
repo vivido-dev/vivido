@@ -1326,7 +1326,7 @@ mod tests {
 
     #[test]
     fn other_strings_preserve_notification_boundaries() {
-        for introducer in [b'P', b'_', b'^', b'X'] {
+        for introducer in *b"P_^X" {
             let mut bytes = vec![0x1b, introducer];
             // Every non-escape byte is inert in the observer's OtherString state, including
             // BEL, CAN, SUB, and C1 bytes. Only ESC followed by backslash ends this capture.
@@ -1351,7 +1351,7 @@ mod tests {
     #[test]
     fn bulk_observer_matches_bytewise_capture() {
         let mut bytes = Vec::new();
-        for introducer in [b'P', b'_', b'^', b'X', b']'] {
+        for introducer in *b"P_^X]" {
             bytes.extend_from_slice(&[0x1b, introducer]);
             bytes.extend_from_slice(b"6;");
             bytes.extend(std::iter::repeat_n(b'A', 128 * 1024));
