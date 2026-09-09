@@ -8,9 +8,10 @@ use objc2_foundation::{MainThreadMarker, NSString, NSURL, ns_string};
 
 use crate::event::{Event, EventSink, EventType};
 
-/// Commands which need Vivido terminal state rather than AppKit's responder chain.
+/// Native menu commands. Embedding shells may handle window and tab creation before forwarding
+/// the remaining commands to the terminal processor.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum MenuCommand {
+pub enum MenuCommand {
     NewWindow,
     NewTab,
     Copy,

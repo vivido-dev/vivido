@@ -46,6 +46,8 @@ pub use crate::cli::WindowOptions;
 pub use crate::client_fault::{ClientFault, ClientFaultClass, ClientHealth};
 pub use crate::display::window::Window;
 pub use crate::event::{Event, EventSink, EventType, LoopHandle, Processor};
+#[cfg(target_os = "macos")]
+pub use crate::macos::menu::MenuCommand as MacOsMenuCommand;
 pub use crate::serde_replace::SerdeReplace;
 pub use crate::terminal::tty;
 pub use crate::window_context::WindowContext;

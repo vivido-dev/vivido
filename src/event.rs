@@ -3795,6 +3795,11 @@ pub struct Event {
 }
 
 impl Event {
+    /// Inspect an event before forwarding it to the terminal processor.
+    pub fn payload(&self) -> &EventType {
+        &self.payload
+    }
+
     pub fn new<I: Into<Option<WindowId>>>(payload: EventType, window_id: I) -> Self {
         Self { window_id: window_id.into(), payload }
     }
@@ -3932,7 +3937,6 @@ pub enum EventType {
     Scroll(Scroll),
     CreateWindow(WindowOptions),
     #[cfg(target_os = "macos")]
-    #[allow(private_interfaces)]
     MacOsMenu(MenuCommand),
     #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     ShellAction(crate::shell::ShellAction),
