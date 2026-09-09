@@ -29,44 +29,44 @@ name = "macos_tabs"
 harness = false
 
 [dependencies]
-ahash = { version = "0.8.6", features = ["no-rng"] }
+ahash = { version = "0.8", features = ["no-rng"] }
 arboard = { version = "3.6", default-features = false, features = [
   "image-data",
 ] }
 async-channel = "2.5.0"
 base64 = "0.23.0"
-bitflags = { version = "2.4.1", features = ["serde"] }
-bytemuck = { version = "1.24", features = ["derive"] }
-clap = { version = "4.2.7", features = ["derive", "env"] }
-copypasta = { version = "0.10.1", default-features = false }
+bitflags = { version = "2.13", features = ["serde"] }
+bytemuck = { version = "1.25", features = ["derive"] }
+clap = { version = "4.6", features = ["derive", "env"] }
+copypasta = { version = "0.10", default-features = false }
 futures-lite = "2.6.1"
 futures-timer = "3.0.4"
 getrandom = "0.4"
-home = "0.5.5"
+home = "0.5"
 image = { version = "0.25", default-features = false, features = [
   "png",
   "jpeg",
 ] }
 libc = "0.2"
 log = { version = "0.4", features = ["std", "serde"] }
-memchr = "2.7"
+memchr = "2.8"
 percent-encoding = "2.3"
-notify = "8.0.0"
+notify = "8.2"
 notify-rust = { version = "4.18.0", features = ["preview-macos-un"] }
-parking_lot = "0.12.0"
+parking_lot = "0.12"
 parley = "0.11"
 polling = "3.11.0"
 pollster = "1.0"
-regex-automata = "0.4.3"
-rpassword = "7.4.0"
+regex-automata = "0.4"
+rpassword = "7.5"
 serde_json = "1"
 serde = { version = "1", features = ["derive", "rc"] }
 sha2 = "0.11"
-signal-hook = { version = "0.4.3", default-features = false }
-tempfile = "3.12.0"
+signal-hook = { version = "0.4", default-features = false }
+tempfile = "3.27"
 toml = "1.1"
 toml_edit = "0.25"
-unicode-width = "0.2.0"
+unicode-width = "0.2"
 unicode-script = "0.5"
 vivid_protocol = { version = "1.5", path = "../vivid_protocol" }
 vvte = { version = "0.15.0", path = "../vvte", default-features = false, features = [
@@ -77,7 +77,7 @@ vvte = { version = "0.15.0", path = "../vvte", default-features = false, feature
 zeroize = "1.8.1"
 vivid_sdk = { version = "1.5", path = "../vivid_sdk" }
 vello = { version = "0.10", default-features = false, features = ["wgpu"] }
-winit = { version = "0.30.9", default-features = false, features = [
+winit = { version = "0.30", default-features = false, features = [
   "rwh_06",
   "serde",
 ] }
@@ -91,7 +91,7 @@ accesskit_consumer = "0.39"
 accesskit_winit = { version = "0.34", default-features = false, features = [
   "rwh_06",
 ] }
-clap_complete = "4.2.3"
+clap_complete = "4.6"
 
 [target.'cfg(not(windows))'.dependencies]
 xdg = "3.0.0"
