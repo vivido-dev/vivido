@@ -69,7 +69,7 @@ toml_edit = "0.25"
 unicode-width = "0.2"
 unicode-script = "0.5"
 vivid_protocol = { version = "1.5", path = "../vivid_protocol" }
-vvte = { version = "0.15.0", path = "../vvte", default-features = false, features = [
+vvte = { version = "0.15", path = "../vvte", default-features = false, features = [
   "std",
   "ansi",
   "serde",
