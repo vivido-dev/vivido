@@ -112,11 +112,16 @@ fn lost_welcome_retries_the_same_immediate_lease() {
 #[test]
 fn egress_close_join_cancels_nonreading_peer() {
     let service = socket_service!(VividService::start_with_wake(test_geometry(), Arc::new(|_| {})));
+    let mut healthy = connect(&service);
+    let healthy_surface = grid_surface(&mut healthy, 1);
     let peer = RawClient::root(&service).unwrap();
     assert!(wait_until(Duration::from_secs(2), || lock(&service.shared.registry)
         .sessions
-        .contains_key(&peer.session_id)));
+        .get(&peer.session_id)
+        .is_some_and(|session| lock(&session.egress).is_some())));
     let runtime = lock(&service.shared.registry).sessions[&peer.session_id].clone();
+    // Both owners use root context 1; cancelling one connection must not affect the other.
+    assert_eq!(runtime.root_context.context_id, healthy.info().root_context_id);
     let egress = lock(&runtime.egress).clone().unwrap();
     egress.pause_worker_for_test();
     for _ in 0..8 {
@@ -133,6 +138,14 @@ fn egress_close_join_cancels_nonreading_peer() {
     drop(peer);
     waiter.join().unwrap();
     assert!(finished);
+    healthy.query_session().unwrap();
+    let healthy_identity = SessionIdentity::new(service.shared.presenter, healthy.info().session_id)
+        .unwrap()
+        .context(healthy.info().root_context_id)
+        .unwrap()
+        .surface(healthy_surface.id())
+        .unwrap();
+    assert_eq!(service.scene.surface_status(healthy_identity).unwrap().lifecycle, 1);
 }
 
 #[test]
