@@ -783,6 +783,34 @@ where
         };
         let start = cursor + relative_start;
         emit_bytes(emit, &buf[cursor..start]);
+        if envelope.payload_skip != 0 && !buf[start..].starts_with(envelope.prefix) {
+            if envelope.prefix.starts_with(&buf[start..]) {
+                return start;
+            }
+            emit_bytes(emit, &buf[start..start + 1]);
+            cursor = start + 1;
+            continue;
+        }
+        if envelope.payload_skip == 0 {
+            use vivid_protocol::anchor::conpty::{self, Scan};
+            match conpty::scan(&buf[start..]) {
+                Scan::Complete { consumed, body } => {
+                    let end = start + consumed;
+                    emit(VividChunk::Marker {
+                        raw: &buf[start..end],
+                        marker: &body,
+                        pass_to_terminal: false,
+                    });
+                    cursor = end;
+                },
+                Scan::Incomplete => return start,
+                Scan::Invalid => {
+                    emit_bytes(emit, &buf[start..start + 1]);
+                    cursor = start + 1;
+                },
+            }
+            continue;
+        }
         let payload_start = start + envelope.payload_skip;
         let terminator_search = start + envelope.prefix.len();
 
@@ -818,7 +846,15 @@ where
 fn find_marker_envelope(bytes: &[u8]) -> Option<(usize, VividMarkerEnvelope)> {
     VIVID_MARKER_ENVELOPES
         .iter()
-        .filter_map(|envelope| find_bytes(bytes, envelope.prefix).map(|start| (start, *envelope)))
+        .filter_map(|envelope| {
+            // The printable prefix itself may straddle a ConPTY soft wrap.
+            let prefix = if envelope.payload_skip == 0 {
+                &envelope.prefix[..1]
+            } else {
+                &envelope.prefix[..2]
+            };
+            find_bytes(bytes, prefix).map(|start| (start, *envelope))
+        })
         .min_by_key(|(start, _)| *start)
 }
 
@@ -960,6 +996,34 @@ mod vivid_marker_tests {
         });
 
         assert_eq!((printable, markers), (0, 1));
+    }
+
+    #[test]
+    fn conpty_wraps_inside_every_part_of_the_envelope_are_zero_width() {
+        let marker = format!("{MARKER_BODY};VIVID-END");
+        for insertion in 1..marker.len() {
+            let input = format!(
+                "before{}\r\n\x1b[23;40H{}{}after",
+                &marker[..insertion],
+                char::from(marker.as_bytes()[insertion - 1]),
+                &marker[insertion..]
+            );
+            let mut scanner = VividMarkerScanner::default();
+            let mut text = Vec::new();
+            let mut markers = Vec::new();
+            for byte in input.bytes() {
+                scanner.push(&[byte], &mut |chunk| match chunk {
+                    VividChunk::Bytes(bytes) => text.extend_from_slice(bytes),
+                    VividChunk::Marker { marker, pass_to_terminal, .. } => {
+                        assert!(!pass_to_terminal);
+                        markers.push(marker.to_owned());
+                    },
+                });
+            }
+            assert_eq!(text, b"beforeafter");
+            assert_eq!(markers, [MARKER_BODY]);
+            assert!(scanner.pending.is_empty());
+        }
     }
 
     #[test]
