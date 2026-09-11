@@ -1185,6 +1185,16 @@ impl ApplicationHandler<Event> for TabbedApplication {
         window_id: WindowId,
         event: WindowEvent,
     ) {
+        #[cfg(windows)]
+        if (Some(window_id) == self.chrome_id
+            || self.menu_window.as_ref().is_some_and(|window| window.id() == window_id))
+            && let Some(events) = super::touch_click_events(&event)
+        {
+            for event in events {
+                self.window_event(event_loop, window_id, event);
+            }
+            return;
+        }
         if Some(window_id) == self.chrome_id {
             self.handle_chrome_event(event_loop, event);
             return;

@@ -58,7 +58,11 @@ mod chrome;
 #[cfg(any(target_os = "linux", windows))]
 pub use chrome::{ChromeHitMap, ChromeLayout, ChromeRenderer, TAB_BAR_LOGICAL, compute_layout};
 mod launch;
+#[cfg(windows)]
+mod touch;
 pub use launch::{LaunchAction, LaunchEntry, entries as launch_entries};
+#[cfg(windows)]
+pub use touch::touch_click_events;
 #[cfg(any(target_os = "linux", windows))]
 mod menu;
 #[cfg(any(target_os = "linux", windows))]
