@@ -63,7 +63,7 @@ _arguments "${_arguments_options[@]}" : \
 '(-s --socket)--target=[Name of the headless session to talk to \[default\: \$VIVIDO_SESSION, else the only session\]]:NAME:_default' \
 '-h[Print help]' \
 '--help[Print help]' \
-":: :_vivido__msg_commands" \
+":: :_vivido__subcmd__msg_commands" \
 "*::: :->msg" \
 && ret=0
 
@@ -188,7 +188,7 @@ _arguments "${_arguments_options[@]}" : \
 '-w+[Window ID for the capture]:WINDOW_ID:_default' \
 '--window-id=[Window ID for the capture]:WINDOW_ID:_default' \
 '--after-frame=[Require a frame newer than this sequence before capture]:AFTER_FRAME:_default' \
-'--stable=[Wait for the terminal screen to remain unchanged; defaults to 250 ms when present]' \
+'--stable=[Wait for the terminal screen to remain unchanged; defaults to 250 ms when present]::DURATION:_default' \
 '--timeout=[Maximum wait time]:TIMEOUT:_default' \
 '--activate[Select and reveal the pane through an advertised host activation method]' \
 '-h[Print help]' \
@@ -225,7 +225,7 @@ ui\:"Process input through Vivido'\''s normal UI input pipeline"))' \
 _arguments "${_arguments_options[@]}" : \
 '-h[Print help]' \
 '--help[Print help]' \
-":: :_vivido__msg__mouse_commands" \
+":: :_vivido__subcmd__msg__subcmd__mouse_commands" \
 "*::: :->mouse" \
 && ret=0
 
@@ -379,7 +379,7 @@ ui\:"Process input through Vivido'\''s normal UI input pipeline"))' \
 ;;
 (help)
 _arguments "${_arguments_options[@]}" : \
-":: :_vivido__msg__mouse__help_commands" \
+":: :_vivido__subcmd__msg__subcmd__mouse__subcmd__help_commands" \
 "*::: :->help" \
 && ret=0
 
@@ -521,7 +521,7 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 '-h[Print help]' \
 '--help[Print help]' \
-":: :_vivido__msg__vivid_commands" \
+":: :_vivido__subcmd__msg__subcmd__vivid_commands" \
 "*::: :->vivid" \
 && ret=0
 
@@ -612,7 +612,7 @@ _arguments "${_arguments_options[@]}" : \
 ;;
 (help)
 _arguments "${_arguments_options[@]}" : \
-":: :_vivido__msg__vivid__help_commands" \
+":: :_vivido__subcmd__msg__subcmd__vivid__subcmd__help_commands" \
 "*::: :->help" \
 && ret=0
 
@@ -677,7 +677,7 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 '-h[Print help]' \
 '--help[Print help]' \
-":: :_vivido__msg__wait_commands" \
+":: :_vivido__subcmd__msg__subcmd__wait_commands" \
 "*::: :->wait" \
 && ret=0
 
@@ -770,7 +770,7 @@ _arguments "${_arguments_options[@]}" : \
 ;;
 (help)
 _arguments "${_arguments_options[@]}" : \
-":: :_vivido__msg__wait__help_commands" \
+":: :_vivido__subcmd__msg__subcmd__wait__subcmd__help_commands" \
 "*::: :->help" \
 && ret=0
 
@@ -844,7 +844,7 @@ _arguments "${_arguments_options[@]}" : \
 ;;
 (help)
 _arguments "${_arguments_options[@]}" : \
-":: :_vivido__msg__help_commands" \
+":: :_vivido__subcmd__msg__subcmd__help_commands" \
 "*::: :->help" \
 && ret=0
 
@@ -916,7 +916,7 @@ _arguments "${_arguments_options[@]}" : \
 ;;
 (mouse)
 _arguments "${_arguments_options[@]}" : \
-":: :_vivido__msg__help__mouse_commands" \
+":: :_vivido__subcmd__msg__subcmd__help__subcmd__mouse_commands" \
 "*::: :->mouse" \
 && ret=0
 
@@ -1000,7 +1000,7 @@ _arguments "${_arguments_options[@]}" : \
 ;;
 (vivid)
 _arguments "${_arguments_options[@]}" : \
-":: :_vivido__msg__help__vivid_commands" \
+":: :_vivido__subcmd__msg__subcmd__help__subcmd__vivid_commands" \
 "*::: :->vivid" \
 && ret=0
 
@@ -1048,7 +1048,7 @@ _arguments "${_arguments_options[@]}" : \
 ;;
 (wait)
 _arguments "${_arguments_options[@]}" : \
-":: :_vivido__msg__help__wait_commands" \
+":: :_vivido__subcmd__msg__subcmd__help__subcmd__wait_commands" \
 "*::: :->wait" \
 && ret=0
 
@@ -1150,7 +1150,7 @@ _arguments "${_arguments_options[@]}" : \
 ;;
 (help)
 _arguments "${_arguments_options[@]}" : \
-":: :_vivido__help_commands" \
+":: :_vivido__subcmd__help_commands" \
 "*::: :->help" \
 && ret=0
 
@@ -1162,7 +1162,7 @@ _arguments "${_arguments_options[@]}" : \
         case $line[1] in
             (msg)
 _arguments "${_arguments_options[@]}" : \
-":: :_vivido__help__msg_commands" \
+":: :_vivido__subcmd__help__subcmd__msg_commands" \
 "*::: :->msg" \
 && ret=0
 
@@ -1234,7 +1234,7 @@ _arguments "${_arguments_options[@]}" : \
 ;;
 (mouse)
 _arguments "${_arguments_options[@]}" : \
-":: :_vivido__help__msg__mouse_commands" \
+":: :_vivido__subcmd__help__subcmd__msg__subcmd__mouse_commands" \
 "*::: :->mouse" \
 && ret=0
 
@@ -1318,7 +1318,7 @@ _arguments "${_arguments_options[@]}" : \
 ;;
 (vivid)
 _arguments "${_arguments_options[@]}" : \
-":: :_vivido__help__msg__vivid_commands" \
+":: :_vivido__subcmd__help__subcmd__msg__subcmd__vivid_commands" \
 "*::: :->vivid" \
 && ret=0
 
@@ -1366,7 +1366,7 @@ _arguments "${_arguments_options[@]}" : \
 ;;
 (wait)
 _arguments "${_arguments_options[@]}" : \
-":: :_vivido__help__msg__wait_commands" \
+":: :_vivido__subcmd__help__subcmd__msg__subcmd__wait_commands" \
 "*::: :->wait" \
 && ret=0
 
@@ -1461,18 +1461,18 @@ _vivido_commands() {
     )
     _describe -t commands 'vivido commands' commands "$@"
 }
-(( $+functions[_vivido__debug-bundle_commands] )) ||
-_vivido__debug-bundle_commands() {
+(( $+functions[_vivido__subcmd__debug-bundle_commands] )) ||
+_vivido__subcmd__debug-bundle_commands() {
     local commands; commands=()
     _describe -t commands 'vivido debug-bundle commands' commands "$@"
 }
-(( $+functions[_vivido__doctor_commands] )) ||
-_vivido__doctor_commands() {
+(( $+functions[_vivido__subcmd__doctor_commands] )) ||
+_vivido__subcmd__doctor_commands() {
     local commands; commands=()
     _describe -t commands 'vivido doctor commands' commands "$@"
 }
-(( $+functions[_vivido__help_commands] )) ||
-_vivido__help_commands() {
+(( $+functions[_vivido__subcmd__help_commands] )) ||
+_vivido__subcmd__help_commands() {
     local commands; commands=(
 'msg:Send a message to the Vivido socket' \
 'list:List running headless sessions' \
@@ -1483,33 +1483,33 @@ _vivido__help_commands() {
     )
     _describe -t commands 'vivido help commands' commands "$@"
 }
-(( $+functions[_vivido__help__debug-bundle_commands] )) ||
-_vivido__help__debug-bundle_commands() {
+(( $+functions[_vivido__subcmd__help__subcmd__debug-bundle_commands] )) ||
+_vivido__subcmd__help__subcmd__debug-bundle_commands() {
     local commands; commands=()
     _describe -t commands 'vivido help debug-bundle commands' commands "$@"
 }
-(( $+functions[_vivido__help__doctor_commands] )) ||
-_vivido__help__doctor_commands() {
+(( $+functions[_vivido__subcmd__help__subcmd__doctor_commands] )) ||
+_vivido__subcmd__help__subcmd__doctor_commands() {
     local commands; commands=()
     _describe -t commands 'vivido help doctor commands' commands "$@"
 }
-(( $+functions[_vivido__help__help_commands] )) ||
-_vivido__help__help_commands() {
+(( $+functions[_vivido__subcmd__help__subcmd__help_commands] )) ||
+_vivido__subcmd__help__subcmd__help_commands() {
     local commands; commands=()
     _describe -t commands 'vivido help help commands' commands "$@"
 }
-(( $+functions[_vivido__help__kill-session_commands] )) ||
-_vivido__help__kill-session_commands() {
+(( $+functions[_vivido__subcmd__help__subcmd__kill-session_commands] )) ||
+_vivido__subcmd__help__subcmd__kill-session_commands() {
     local commands; commands=()
     _describe -t commands 'vivido help kill-session commands' commands "$@"
 }
-(( $+functions[_vivido__help__list_commands] )) ||
-_vivido__help__list_commands() {
+(( $+functions[_vivido__subcmd__help__subcmd__list_commands] )) ||
+_vivido__subcmd__help__subcmd__list_commands() {
     local commands; commands=()
     _describe -t commands 'vivido help list commands' commands "$@"
 }
-(( $+functions[_vivido__help__msg_commands] )) ||
-_vivido__help__msg_commands() {
+(( $+functions[_vivido__subcmd__help__subcmd__msg_commands] )) ||
+_vivido__subcmd__help__subcmd__msg_commands() {
     local commands; commands=(
 'create-window:Create a new window in the same Vivido process' \
 'quit:Shut down the Vivido instance, closing every window' \
@@ -1544,68 +1544,68 @@ _vivido__help__msg_commands() {
     )
     _describe -t commands 'vivido help msg commands' commands "$@"
 }
-(( $+functions[_vivido__help__msg__capabilities_commands] )) ||
-_vivido__help__msg__capabilities_commands() {
+(( $+functions[_vivido__subcmd__help__subcmd__msg__subcmd__capabilities_commands] )) ||
+_vivido__subcmd__help__subcmd__msg__subcmd__capabilities_commands() {
     local commands; commands=()
     _describe -t commands 'vivido help msg capabilities commands' commands "$@"
 }
-(( $+functions[_vivido__help__msg__capture_commands] )) ||
-_vivido__help__msg__capture_commands() {
+(( $+functions[_vivido__subcmd__help__subcmd__msg__subcmd__capture_commands] )) ||
+_vivido__subcmd__help__subcmd__msg__subcmd__capture_commands() {
     local commands; commands=()
     _describe -t commands 'vivido help msg capture commands' commands "$@"
 }
-(( $+functions[_vivido__help__msg__config_commands] )) ||
-_vivido__help__msg__config_commands() {
+(( $+functions[_vivido__subcmd__help__subcmd__msg__subcmd__config_commands] )) ||
+_vivido__subcmd__help__subcmd__msg__subcmd__config_commands() {
     local commands; commands=()
     _describe -t commands 'vivido help msg config commands' commands "$@"
 }
-(( $+functions[_vivido__help__msg__create-window_commands] )) ||
-_vivido__help__msg__create-window_commands() {
+(( $+functions[_vivido__subcmd__help__subcmd__msg__subcmd__create-window_commands] )) ||
+_vivido__subcmd__help__subcmd__msg__subcmd__create-window_commands() {
     local commands; commands=()
     _describe -t commands 'vivido help msg create-window commands' commands "$@"
 }
-(( $+functions[_vivido__help__msg__diagnose_commands] )) ||
-_vivido__help__msg__diagnose_commands() {
+(( $+functions[_vivido__subcmd__help__subcmd__msg__subcmd__diagnose_commands] )) ||
+_vivido__subcmd__help__subcmd__msg__subcmd__diagnose_commands() {
     local commands; commands=()
     _describe -t commands 'vivido help msg diagnose commands' commands "$@"
 }
-(( $+functions[_vivido__help__msg__focus_commands] )) ||
-_vivido__help__msg__focus_commands() {
+(( $+functions[_vivido__subcmd__help__subcmd__msg__subcmd__focus_commands] )) ||
+_vivido__subcmd__help__subcmd__msg__subcmd__focus_commands() {
     local commands; commands=()
     _describe -t commands 'vivido help msg focus commands' commands "$@"
 }
-(( $+functions[_vivido__help__msg__get-config_commands] )) ||
-_vivido__help__msg__get-config_commands() {
+(( $+functions[_vivido__subcmd__help__subcmd__msg__subcmd__get-config_commands] )) ||
+_vivido__subcmd__help__subcmd__msg__subcmd__get-config_commands() {
     local commands; commands=()
     _describe -t commands 'vivido help msg get-config commands' commands "$@"
 }
-(( $+functions[_vivido__help__msg__get-grid_commands] )) ||
-_vivido__help__msg__get-grid_commands() {
+(( $+functions[_vivido__subcmd__help__subcmd__msg__subcmd__get-grid_commands] )) ||
+_vivido__subcmd__help__subcmd__msg__subcmd__get-grid_commands() {
     local commands; commands=()
     _describe -t commands 'vivido help msg get-grid commands' commands "$@"
 }
-(( $+functions[_vivido__help__msg__get-text_commands] )) ||
-_vivido__help__msg__get-text_commands() {
+(( $+functions[_vivido__subcmd__help__subcmd__msg__subcmd__get-text_commands] )) ||
+_vivido__subcmd__help__subcmd__msg__subcmd__get-text_commands() {
     local commands; commands=()
     _describe -t commands 'vivido help msg get-text commands' commands "$@"
 }
-(( $+functions[_vivido__help__msg__inspect_commands] )) ||
-_vivido__help__msg__inspect_commands() {
+(( $+functions[_vivido__subcmd__help__subcmd__msg__subcmd__inspect_commands] )) ||
+_vivido__subcmd__help__subcmd__msg__subcmd__inspect_commands() {
     local commands; commands=()
     _describe -t commands 'vivido help msg inspect commands' commands "$@"
 }
-(( $+functions[_vivido__help__msg__key_commands] )) ||
-_vivido__help__msg__key_commands() {
+(( $+functions[_vivido__subcmd__help__subcmd__msg__subcmd__key_commands] )) ||
+_vivido__subcmd__help__subcmd__msg__subcmd__key_commands() {
     local commands; commands=()
     _describe -t commands 'vivido help msg key commands' commands "$@"
 }
-(( $+functions[_vivido__help__msg__list-windows_commands] )) ||
-_vivido__help__msg__list-windows_commands() {
+(( $+functions[_vivido__subcmd__help__subcmd__msg__subcmd__list-windows_commands] )) ||
+_vivido__subcmd__help__subcmd__msg__subcmd__list-windows_commands() {
     local commands; commands=()
     _describe -t commands 'vivido help msg list-windows commands' commands "$@"
 }
-(( $+functions[_vivido__help__msg__mouse_commands] )) ||
-_vivido__help__msg__mouse_commands() {
+(( $+functions[_vivido__subcmd__help__subcmd__msg__subcmd__mouse_commands] )) ||
+_vivido__subcmd__help__subcmd__msg__subcmd__mouse_commands() {
     local commands; commands=(
 'move:Mouse coordinate and modifier arguments' \
 'click:Mouse arguments requiring a button' \
@@ -1618,123 +1618,123 @@ _vivido__help__msg__mouse_commands() {
     )
     _describe -t commands 'vivido help msg mouse commands' commands "$@"
 }
-(( $+functions[_vivido__help__msg__mouse__click_commands] )) ||
-_vivido__help__msg__mouse__click_commands() {
+(( $+functions[_vivido__subcmd__help__subcmd__msg__subcmd__mouse__subcmd__click_commands] )) ||
+_vivido__subcmd__help__subcmd__msg__subcmd__mouse__subcmd__click_commands() {
     local commands; commands=()
     _describe -t commands 'vivido help msg mouse click commands' commands "$@"
 }
-(( $+functions[_vivido__help__msg__mouse__double-click_commands] )) ||
-_vivido__help__msg__mouse__double-click_commands() {
+(( $+functions[_vivido__subcmd__help__subcmd__msg__subcmd__mouse__subcmd__double-click_commands] )) ||
+_vivido__subcmd__help__subcmd__msg__subcmd__mouse__subcmd__double-click_commands() {
     local commands; commands=()
     _describe -t commands 'vivido help msg mouse double-click commands' commands "$@"
 }
-(( $+functions[_vivido__help__msg__mouse__down_commands] )) ||
-_vivido__help__msg__mouse__down_commands() {
+(( $+functions[_vivido__subcmd__help__subcmd__msg__subcmd__mouse__subcmd__down_commands] )) ||
+_vivido__subcmd__help__subcmd__msg__subcmd__mouse__subcmd__down_commands() {
     local commands; commands=()
     _describe -t commands 'vivido help msg mouse down commands' commands "$@"
 }
-(( $+functions[_vivido__help__msg__mouse__drag_commands] )) ||
-_vivido__help__msg__mouse__drag_commands() {
+(( $+functions[_vivido__subcmd__help__subcmd__msg__subcmd__mouse__subcmd__drag_commands] )) ||
+_vivido__subcmd__help__subcmd__msg__subcmd__mouse__subcmd__drag_commands() {
     local commands; commands=()
     _describe -t commands 'vivido help msg mouse drag commands' commands "$@"
 }
-(( $+functions[_vivido__help__msg__mouse__move_commands] )) ||
-_vivido__help__msg__mouse__move_commands() {
+(( $+functions[_vivido__subcmd__help__subcmd__msg__subcmd__mouse__subcmd__move_commands] )) ||
+_vivido__subcmd__help__subcmd__msg__subcmd__mouse__subcmd__move_commands() {
     local commands; commands=()
     _describe -t commands 'vivido help msg mouse move commands' commands "$@"
 }
-(( $+functions[_vivido__help__msg__mouse__path_commands] )) ||
-_vivido__help__msg__mouse__path_commands() {
+(( $+functions[_vivido__subcmd__help__subcmd__msg__subcmd__mouse__subcmd__path_commands] )) ||
+_vivido__subcmd__help__subcmd__msg__subcmd__mouse__subcmd__path_commands() {
     local commands; commands=()
     _describe -t commands 'vivido help msg mouse path commands' commands "$@"
 }
-(( $+functions[_vivido__help__msg__mouse__scroll_commands] )) ||
-_vivido__help__msg__mouse__scroll_commands() {
+(( $+functions[_vivido__subcmd__help__subcmd__msg__subcmd__mouse__subcmd__scroll_commands] )) ||
+_vivido__subcmd__help__subcmd__msg__subcmd__mouse__subcmd__scroll_commands() {
     local commands; commands=()
     _describe -t commands 'vivido help msg mouse scroll commands' commands "$@"
 }
-(( $+functions[_vivido__help__msg__mouse__up_commands] )) ||
-_vivido__help__msg__mouse__up_commands() {
+(( $+functions[_vivido__subcmd__help__subcmd__msg__subcmd__mouse__subcmd__up_commands] )) ||
+_vivido__subcmd__help__subcmd__msg__subcmd__mouse__subcmd__up_commands() {
     local commands; commands=()
     _describe -t commands 'vivido help msg mouse up commands' commands "$@"
 }
-(( $+functions[_vivido__help__msg__paste_commands] )) ||
-_vivido__help__msg__paste_commands() {
+(( $+functions[_vivido__subcmd__help__subcmd__msg__subcmd__paste_commands] )) ||
+_vivido__subcmd__help__subcmd__msg__subcmd__paste_commands() {
     local commands; commands=()
     _describe -t commands 'vivido help msg paste commands' commands "$@"
 }
-(( $+functions[_vivido__help__msg__ping_commands] )) ||
-_vivido__help__msg__ping_commands() {
+(( $+functions[_vivido__subcmd__help__subcmd__msg__subcmd__ping_commands] )) ||
+_vivido__subcmd__help__subcmd__msg__subcmd__ping_commands() {
     local commands; commands=()
     _describe -t commands 'vivido help msg ping commands' commands "$@"
 }
-(( $+functions[_vivido__help__msg__quit_commands] )) ||
-_vivido__help__msg__quit_commands() {
+(( $+functions[_vivido__subcmd__help__subcmd__msg__subcmd__quit_commands] )) ||
+_vivido__subcmd__help__subcmd__msg__subcmd__quit_commands() {
     local commands; commands=()
     _describe -t commands 'vivido help msg quit commands' commands "$@"
 }
-(( $+functions[_vivido__help__msg__reset-terminal_commands] )) ||
-_vivido__help__msg__reset-terminal_commands() {
+(( $+functions[_vivido__subcmd__help__subcmd__msg__subcmd__reset-terminal_commands] )) ||
+_vivido__subcmd__help__subcmd__msg__subcmd__reset-terminal_commands() {
     local commands; commands=()
     _describe -t commands 'vivido help msg reset-terminal commands' commands "$@"
 }
-(( $+functions[_vivido__help__msg__resize_commands] )) ||
-_vivido__help__msg__resize_commands() {
+(( $+functions[_vivido__subcmd__help__subcmd__msg__subcmd__resize_commands] )) ||
+_vivido__subcmd__help__subcmd__msg__subcmd__resize_commands() {
     local commands; commands=()
     _describe -t commands 'vivido help msg resize commands' commands "$@"
 }
-(( $+functions[_vivido__help__msg__restart-terminal_commands] )) ||
-_vivido__help__msg__restart-terminal_commands() {
+(( $+functions[_vivido__subcmd__help__subcmd__msg__subcmd__restart-terminal_commands] )) ||
+_vivido__subcmd__help__subcmd__msg__subcmd__restart-terminal_commands() {
     local commands; commands=()
     _describe -t commands 'vivido help msg restart-terminal commands' commands "$@"
 }
-(( $+functions[_vivido__help__msg__run-plan_commands] )) ||
-_vivido__help__msg__run-plan_commands() {
+(( $+functions[_vivido__subcmd__help__subcmd__msg__subcmd__run-plan_commands] )) ||
+_vivido__subcmd__help__subcmd__msg__subcmd__run-plan_commands() {
     local commands; commands=()
     _describe -t commands 'vivido help msg run-plan commands' commands "$@"
 }
-(( $+functions[_vivido__help__msg__screenshot_commands] )) ||
-_vivido__help__msg__screenshot_commands() {
+(( $+functions[_vivido__subcmd__help__subcmd__msg__subcmd__screenshot_commands] )) ||
+_vivido__subcmd__help__subcmd__msg__subcmd__screenshot_commands() {
     local commands; commands=()
     _describe -t commands 'vivido help msg screenshot commands' commands "$@"
 }
-(( $+functions[_vivido__help__msg__set-geometry_commands] )) ||
-_vivido__help__msg__set-geometry_commands() {
+(( $+functions[_vivido__subcmd__help__subcmd__msg__subcmd__set-geometry_commands] )) ||
+_vivido__subcmd__help__subcmd__msg__subcmd__set-geometry_commands() {
     local commands; commands=()
     _describe -t commands 'vivido help msg set-geometry commands' commands "$@"
 }
-(( $+functions[_vivido__help__msg__set-level_commands] )) ||
-_vivido__help__msg__set-level_commands() {
+(( $+functions[_vivido__subcmd__help__subcmd__msg__subcmd__set-level_commands] )) ||
+_vivido__subcmd__help__subcmd__msg__subcmd__set-level_commands() {
     local commands; commands=()
     _describe -t commands 'vivido help msg set-level commands' commands "$@"
 }
-(( $+functions[_vivido__help__msg__set-visible_commands] )) ||
-_vivido__help__msg__set-visible_commands() {
+(( $+functions[_vivido__subcmd__help__subcmd__msg__subcmd__set-visible_commands] )) ||
+_vivido__subcmd__help__subcmd__msg__subcmd__set-visible_commands() {
     local commands; commands=()
     _describe -t commands 'vivido help msg set-visible commands' commands "$@"
 }
-(( $+functions[_vivido__help__msg__signal_commands] )) ||
-_vivido__help__msg__signal_commands() {
+(( $+functions[_vivido__subcmd__help__subcmd__msg__subcmd__signal_commands] )) ||
+_vivido__subcmd__help__subcmd__msg__subcmd__signal_commands() {
     local commands; commands=()
     _describe -t commands 'vivido help msg signal commands' commands "$@"
 }
-(( $+functions[_vivido__help__msg__subscribe_commands] )) ||
-_vivido__help__msg__subscribe_commands() {
+(( $+functions[_vivido__subcmd__help__subcmd__msg__subcmd__subscribe_commands] )) ||
+_vivido__subcmd__help__subcmd__msg__subcmd__subscribe_commands() {
     local commands; commands=()
     _describe -t commands 'vivido help msg subscribe commands' commands "$@"
 }
-(( $+functions[_vivido__help__msg__transcript_commands] )) ||
-_vivido__help__msg__transcript_commands() {
+(( $+functions[_vivido__subcmd__help__subcmd__msg__subcmd__transcript_commands] )) ||
+_vivido__subcmd__help__subcmd__msg__subcmd__transcript_commands() {
     local commands; commands=()
     _describe -t commands 'vivido help msg transcript commands' commands "$@"
 }
-(( $+functions[_vivido__help__msg__typing_commands] )) ||
-_vivido__help__msg__typing_commands() {
+(( $+functions[_vivido__subcmd__help__subcmd__msg__subcmd__typing_commands] )) ||
+_vivido__subcmd__help__subcmd__msg__subcmd__typing_commands() {
     local commands; commands=()
     _describe -t commands 'vivido help msg typing commands' commands "$@"
 }
-(( $+functions[_vivido__help__msg__vivid_commands] )) ||
-_vivido__help__msg__vivid_commands() {
+(( $+functions[_vivido__subcmd__help__subcmd__msg__subcmd__vivid_commands] )) ||
+_vivido__subcmd__help__subcmd__msg__subcmd__vivid_commands() {
     local commands; commands=(
 'sessions:Common target selection for IPC commands' \
 'surfaces:Common target selection for IPC commands' \
@@ -1746,43 +1746,43 @@ _vivido__help__msg__vivid_commands() {
     )
     _describe -t commands 'vivido help msg vivid commands' commands "$@"
 }
-(( $+functions[_vivido__help__msg__vivid__scene-status_commands] )) ||
-_vivido__help__msg__vivid__scene-status_commands() {
+(( $+functions[_vivido__subcmd__help__subcmd__msg__subcmd__vivid__subcmd__scene-status_commands] )) ||
+_vivido__subcmd__help__subcmd__msg__subcmd__vivid__subcmd__scene-status_commands() {
     local commands; commands=()
     _describe -t commands 'vivido help msg vivid scene-status commands' commands "$@"
 }
-(( $+functions[_vivido__help__msg__vivid__sessions_commands] )) ||
-_vivido__help__msg__vivid__sessions_commands() {
+(( $+functions[_vivido__subcmd__help__subcmd__msg__subcmd__vivid__subcmd__sessions_commands] )) ||
+_vivido__subcmd__help__subcmd__msg__subcmd__vivid__subcmd__sessions_commands() {
     local commands; commands=()
     _describe -t commands 'vivido help msg vivid sessions commands' commands "$@"
 }
-(( $+functions[_vivido__help__msg__vivid__surface-status_commands] )) ||
-_vivido__help__msg__vivid__surface-status_commands() {
+(( $+functions[_vivido__subcmd__help__subcmd__msg__subcmd__vivid__subcmd__surface-status_commands] )) ||
+_vivido__subcmd__help__subcmd__msg__subcmd__vivid__subcmd__surface-status_commands() {
     local commands; commands=()
     _describe -t commands 'vivido help msg vivid surface-status commands' commands "$@"
 }
-(( $+functions[_vivido__help__msg__vivid__surfaces_commands] )) ||
-_vivido__help__msg__vivid__surfaces_commands() {
+(( $+functions[_vivido__subcmd__help__subcmd__msg__subcmd__vivid__subcmd__surfaces_commands] )) ||
+_vivido__subcmd__help__subcmd__msg__subcmd__vivid__subcmd__surfaces_commands() {
     local commands; commands=()
     _describe -t commands 'vivido help msg vivid surfaces commands' commands "$@"
 }
-(( $+functions[_vivido__help__msg__vivid__trace_commands] )) ||
-_vivido__help__msg__vivid__trace_commands() {
+(( $+functions[_vivido__subcmd__help__subcmd__msg__subcmd__vivid__subcmd__trace_commands] )) ||
+_vivido__subcmd__help__subcmd__msg__subcmd__vivid__subcmd__trace_commands() {
     local commands; commands=()
     _describe -t commands 'vivido help msg vivid trace commands' commands "$@"
 }
-(( $+functions[_vivido__help__msg__vivid__track-status_commands] )) ||
-_vivido__help__msg__vivid__track-status_commands() {
+(( $+functions[_vivido__subcmd__help__subcmd__msg__subcmd__vivid__subcmd__track-status_commands] )) ||
+_vivido__subcmd__help__subcmd__msg__subcmd__vivid__subcmd__track-status_commands() {
     local commands; commands=()
     _describe -t commands 'vivido help msg vivid track-status commands' commands "$@"
 }
-(( $+functions[_vivido__help__msg__vivid__tracks_commands] )) ||
-_vivido__help__msg__vivid__tracks_commands() {
+(( $+functions[_vivido__subcmd__help__subcmd__msg__subcmd__vivid__subcmd__tracks_commands] )) ||
+_vivido__subcmd__help__subcmd__msg__subcmd__vivid__subcmd__tracks_commands() {
     local commands; commands=()
     _describe -t commands 'vivido help msg vivid tracks commands' commands "$@"
 }
-(( $+functions[_vivido__help__msg__wait_commands] )) ||
-_vivido__help__msg__wait_commands() {
+(( $+functions[_vivido__subcmd__help__subcmd__msg__subcmd__wait_commands] )) ||
+_vivido__subcmd__help__subcmd__msg__subcmd__wait_commands() {
     local commands; commands=(
 'text:Text wait parameters' \
 'output:Output wait parameters' \
@@ -1794,53 +1794,53 @@ _vivido__help__msg__wait_commands() {
     )
     _describe -t commands 'vivido help msg wait commands' commands "$@"
 }
-(( $+functions[_vivido__help__msg__wait__exit_commands] )) ||
-_vivido__help__msg__wait__exit_commands() {
+(( $+functions[_vivido__subcmd__help__subcmd__msg__subcmd__wait__subcmd__exit_commands] )) ||
+_vivido__subcmd__help__subcmd__msg__subcmd__wait__subcmd__exit_commands() {
     local commands; commands=()
     _describe -t commands 'vivido help msg wait exit commands' commands "$@"
 }
-(( $+functions[_vivido__help__msg__wait__frame_commands] )) ||
-_vivido__help__msg__wait__frame_commands() {
+(( $+functions[_vivido__subcmd__help__subcmd__msg__subcmd__wait__subcmd__frame_commands] )) ||
+_vivido__subcmd__help__subcmd__msg__subcmd__wait__subcmd__frame_commands() {
     local commands; commands=()
     _describe -t commands 'vivido help msg wait frame commands' commands "$@"
 }
-(( $+functions[_vivido__help__msg__wait__output_commands] )) ||
-_vivido__help__msg__wait__output_commands() {
+(( $+functions[_vivido__subcmd__help__subcmd__msg__subcmd__wait__subcmd__output_commands] )) ||
+_vivido__subcmd__help__subcmd__msg__subcmd__wait__subcmd__output_commands() {
     local commands; commands=()
     _describe -t commands 'vivido help msg wait output commands' commands "$@"
 }
-(( $+functions[_vivido__help__msg__wait__screen-change_commands] )) ||
-_vivido__help__msg__wait__screen-change_commands() {
+(( $+functions[_vivido__subcmd__help__subcmd__msg__subcmd__wait__subcmd__screen-change_commands] )) ||
+_vivido__subcmd__help__subcmd__msg__subcmd__wait__subcmd__screen-change_commands() {
     local commands; commands=()
     _describe -t commands 'vivido help msg wait screen-change commands' commands "$@"
 }
-(( $+functions[_vivido__help__msg__wait__screen-stable_commands] )) ||
-_vivido__help__msg__wait__screen-stable_commands() {
+(( $+functions[_vivido__subcmd__help__subcmd__msg__subcmd__wait__subcmd__screen-stable_commands] )) ||
+_vivido__subcmd__help__subcmd__msg__subcmd__wait__subcmd__screen-stable_commands() {
     local commands; commands=()
     _describe -t commands 'vivido help msg wait screen-stable commands' commands "$@"
 }
-(( $+functions[_vivido__help__msg__wait__text_commands] )) ||
-_vivido__help__msg__wait__text_commands() {
+(( $+functions[_vivido__subcmd__help__subcmd__msg__subcmd__wait__subcmd__text_commands] )) ||
+_vivido__subcmd__help__subcmd__msg__subcmd__wait__subcmd__text_commands() {
     local commands; commands=()
     _describe -t commands 'vivido help msg wait text commands' commands "$@"
 }
-(( $+functions[_vivido__help__msg__wait__vivid-track_commands] )) ||
-_vivido__help__msg__wait__vivid-track_commands() {
+(( $+functions[_vivido__subcmd__help__subcmd__msg__subcmd__wait__subcmd__vivid-track_commands] )) ||
+_vivido__subcmd__help__subcmd__msg__subcmd__wait__subcmd__vivid-track_commands() {
     local commands; commands=()
     _describe -t commands 'vivido help msg wait vivid-track commands' commands "$@"
 }
-(( $+functions[_vivido__kill-session_commands] )) ||
-_vivido__kill-session_commands() {
+(( $+functions[_vivido__subcmd__kill-session_commands] )) ||
+_vivido__subcmd__kill-session_commands() {
     local commands; commands=()
     _describe -t commands 'vivido kill-session commands' commands "$@"
 }
-(( $+functions[_vivido__list_commands] )) ||
-_vivido__list_commands() {
+(( $+functions[_vivido__subcmd__list_commands] )) ||
+_vivido__subcmd__list_commands() {
     local commands; commands=()
     _describe -t commands 'vivido list commands' commands "$@"
 }
-(( $+functions[_vivido__msg_commands] )) ||
-_vivido__msg_commands() {
+(( $+functions[_vivido__subcmd__msg_commands] )) ||
+_vivido__subcmd__msg_commands() {
     local commands; commands=(
 'create-window:Create a new window in the same Vivido process' \
 'quit:Shut down the Vivido instance, closing every window' \
@@ -1876,53 +1876,53 @@ _vivido__msg_commands() {
     )
     _describe -t commands 'vivido msg commands' commands "$@"
 }
-(( $+functions[_vivido__msg__capabilities_commands] )) ||
-_vivido__msg__capabilities_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__capabilities_commands] )) ||
+_vivido__subcmd__msg__subcmd__capabilities_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg capabilities commands' commands "$@"
 }
-(( $+functions[_vivido__msg__capture_commands] )) ||
-_vivido__msg__capture_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__capture_commands] )) ||
+_vivido__subcmd__msg__subcmd__capture_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg capture commands' commands "$@"
 }
-(( $+functions[_vivido__msg__config_commands] )) ||
-_vivido__msg__config_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__config_commands] )) ||
+_vivido__subcmd__msg__subcmd__config_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg config commands' commands "$@"
 }
-(( $+functions[_vivido__msg__create-window_commands] )) ||
-_vivido__msg__create-window_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__create-window_commands] )) ||
+_vivido__subcmd__msg__subcmd__create-window_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg create-window commands' commands "$@"
 }
-(( $+functions[_vivido__msg__diagnose_commands] )) ||
-_vivido__msg__diagnose_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__diagnose_commands] )) ||
+_vivido__subcmd__msg__subcmd__diagnose_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg diagnose commands' commands "$@"
 }
-(( $+functions[_vivido__msg__focus_commands] )) ||
-_vivido__msg__focus_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__focus_commands] )) ||
+_vivido__subcmd__msg__subcmd__focus_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg focus commands' commands "$@"
 }
-(( $+functions[_vivido__msg__get-config_commands] )) ||
-_vivido__msg__get-config_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__get-config_commands] )) ||
+_vivido__subcmd__msg__subcmd__get-config_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg get-config commands' commands "$@"
 }
-(( $+functions[_vivido__msg__get-grid_commands] )) ||
-_vivido__msg__get-grid_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__get-grid_commands] )) ||
+_vivido__subcmd__msg__subcmd__get-grid_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg get-grid commands' commands "$@"
 }
-(( $+functions[_vivido__msg__get-text_commands] )) ||
-_vivido__msg__get-text_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__get-text_commands] )) ||
+_vivido__subcmd__msg__subcmd__get-text_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg get-text commands' commands "$@"
 }
-(( $+functions[_vivido__msg__help_commands] )) ||
-_vivido__msg__help_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__help_commands] )) ||
+_vivido__subcmd__msg__subcmd__help_commands() {
     local commands; commands=(
 'create-window:Create a new window in the same Vivido process' \
 'quit:Shut down the Vivido instance, closing every window' \
@@ -1958,73 +1958,73 @@ _vivido__msg__help_commands() {
     )
     _describe -t commands 'vivido msg help commands' commands "$@"
 }
-(( $+functions[_vivido__msg__help__capabilities_commands] )) ||
-_vivido__msg__help__capabilities_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__help__subcmd__capabilities_commands] )) ||
+_vivido__subcmd__msg__subcmd__help__subcmd__capabilities_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg help capabilities commands' commands "$@"
 }
-(( $+functions[_vivido__msg__help__capture_commands] )) ||
-_vivido__msg__help__capture_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__help__subcmd__capture_commands] )) ||
+_vivido__subcmd__msg__subcmd__help__subcmd__capture_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg help capture commands' commands "$@"
 }
-(( $+functions[_vivido__msg__help__config_commands] )) ||
-_vivido__msg__help__config_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__help__subcmd__config_commands] )) ||
+_vivido__subcmd__msg__subcmd__help__subcmd__config_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg help config commands' commands "$@"
 }
-(( $+functions[_vivido__msg__help__create-window_commands] )) ||
-_vivido__msg__help__create-window_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__help__subcmd__create-window_commands] )) ||
+_vivido__subcmd__msg__subcmd__help__subcmd__create-window_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg help create-window commands' commands "$@"
 }
-(( $+functions[_vivido__msg__help__diagnose_commands] )) ||
-_vivido__msg__help__diagnose_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__help__subcmd__diagnose_commands] )) ||
+_vivido__subcmd__msg__subcmd__help__subcmd__diagnose_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg help diagnose commands' commands "$@"
 }
-(( $+functions[_vivido__msg__help__focus_commands] )) ||
-_vivido__msg__help__focus_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__help__subcmd__focus_commands] )) ||
+_vivido__subcmd__msg__subcmd__help__subcmd__focus_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg help focus commands' commands "$@"
 }
-(( $+functions[_vivido__msg__help__get-config_commands] )) ||
-_vivido__msg__help__get-config_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__help__subcmd__get-config_commands] )) ||
+_vivido__subcmd__msg__subcmd__help__subcmd__get-config_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg help get-config commands' commands "$@"
 }
-(( $+functions[_vivido__msg__help__get-grid_commands] )) ||
-_vivido__msg__help__get-grid_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__help__subcmd__get-grid_commands] )) ||
+_vivido__subcmd__msg__subcmd__help__subcmd__get-grid_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg help get-grid commands' commands "$@"
 }
-(( $+functions[_vivido__msg__help__get-text_commands] )) ||
-_vivido__msg__help__get-text_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__help__subcmd__get-text_commands] )) ||
+_vivido__subcmd__msg__subcmd__help__subcmd__get-text_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg help get-text commands' commands "$@"
 }
-(( $+functions[_vivido__msg__help__help_commands] )) ||
-_vivido__msg__help__help_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__help__subcmd__help_commands] )) ||
+_vivido__subcmd__msg__subcmd__help__subcmd__help_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg help help commands' commands "$@"
 }
-(( $+functions[_vivido__msg__help__inspect_commands] )) ||
-_vivido__msg__help__inspect_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__help__subcmd__inspect_commands] )) ||
+_vivido__subcmd__msg__subcmd__help__subcmd__inspect_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg help inspect commands' commands "$@"
 }
-(( $+functions[_vivido__msg__help__key_commands] )) ||
-_vivido__msg__help__key_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__help__subcmd__key_commands] )) ||
+_vivido__subcmd__msg__subcmd__help__subcmd__key_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg help key commands' commands "$@"
 }
-(( $+functions[_vivido__msg__help__list-windows_commands] )) ||
-_vivido__msg__help__list-windows_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__help__subcmd__list-windows_commands] )) ||
+_vivido__subcmd__msg__subcmd__help__subcmd__list-windows_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg help list-windows commands' commands "$@"
 }
-(( $+functions[_vivido__msg__help__mouse_commands] )) ||
-_vivido__msg__help__mouse_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__help__subcmd__mouse_commands] )) ||
+_vivido__subcmd__msg__subcmd__help__subcmd__mouse_commands() {
     local commands; commands=(
 'move:Mouse coordinate and modifier arguments' \
 'click:Mouse arguments requiring a button' \
@@ -2037,123 +2037,123 @@ _vivido__msg__help__mouse_commands() {
     )
     _describe -t commands 'vivido msg help mouse commands' commands "$@"
 }
-(( $+functions[_vivido__msg__help__mouse__click_commands] )) ||
-_vivido__msg__help__mouse__click_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__help__subcmd__mouse__subcmd__click_commands] )) ||
+_vivido__subcmd__msg__subcmd__help__subcmd__mouse__subcmd__click_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg help mouse click commands' commands "$@"
 }
-(( $+functions[_vivido__msg__help__mouse__double-click_commands] )) ||
-_vivido__msg__help__mouse__double-click_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__help__subcmd__mouse__subcmd__double-click_commands] )) ||
+_vivido__subcmd__msg__subcmd__help__subcmd__mouse__subcmd__double-click_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg help mouse double-click commands' commands "$@"
 }
-(( $+functions[_vivido__msg__help__mouse__down_commands] )) ||
-_vivido__msg__help__mouse__down_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__help__subcmd__mouse__subcmd__down_commands] )) ||
+_vivido__subcmd__msg__subcmd__help__subcmd__mouse__subcmd__down_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg help mouse down commands' commands "$@"
 }
-(( $+functions[_vivido__msg__help__mouse__drag_commands] )) ||
-_vivido__msg__help__mouse__drag_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__help__subcmd__mouse__subcmd__drag_commands] )) ||
+_vivido__subcmd__msg__subcmd__help__subcmd__mouse__subcmd__drag_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg help mouse drag commands' commands "$@"
 }
-(( $+functions[_vivido__msg__help__mouse__move_commands] )) ||
-_vivido__msg__help__mouse__move_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__help__subcmd__mouse__subcmd__move_commands] )) ||
+_vivido__subcmd__msg__subcmd__help__subcmd__mouse__subcmd__move_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg help mouse move commands' commands "$@"
 }
-(( $+functions[_vivido__msg__help__mouse__path_commands] )) ||
-_vivido__msg__help__mouse__path_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__help__subcmd__mouse__subcmd__path_commands] )) ||
+_vivido__subcmd__msg__subcmd__help__subcmd__mouse__subcmd__path_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg help mouse path commands' commands "$@"
 }
-(( $+functions[_vivido__msg__help__mouse__scroll_commands] )) ||
-_vivido__msg__help__mouse__scroll_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__help__subcmd__mouse__subcmd__scroll_commands] )) ||
+_vivido__subcmd__msg__subcmd__help__subcmd__mouse__subcmd__scroll_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg help mouse scroll commands' commands "$@"
 }
-(( $+functions[_vivido__msg__help__mouse__up_commands] )) ||
-_vivido__msg__help__mouse__up_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__help__subcmd__mouse__subcmd__up_commands] )) ||
+_vivido__subcmd__msg__subcmd__help__subcmd__mouse__subcmd__up_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg help mouse up commands' commands "$@"
 }
-(( $+functions[_vivido__msg__help__paste_commands] )) ||
-_vivido__msg__help__paste_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__help__subcmd__paste_commands] )) ||
+_vivido__subcmd__msg__subcmd__help__subcmd__paste_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg help paste commands' commands "$@"
 }
-(( $+functions[_vivido__msg__help__ping_commands] )) ||
-_vivido__msg__help__ping_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__help__subcmd__ping_commands] )) ||
+_vivido__subcmd__msg__subcmd__help__subcmd__ping_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg help ping commands' commands "$@"
 }
-(( $+functions[_vivido__msg__help__quit_commands] )) ||
-_vivido__msg__help__quit_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__help__subcmd__quit_commands] )) ||
+_vivido__subcmd__msg__subcmd__help__subcmd__quit_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg help quit commands' commands "$@"
 }
-(( $+functions[_vivido__msg__help__reset-terminal_commands] )) ||
-_vivido__msg__help__reset-terminal_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__help__subcmd__reset-terminal_commands] )) ||
+_vivido__subcmd__msg__subcmd__help__subcmd__reset-terminal_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg help reset-terminal commands' commands "$@"
 }
-(( $+functions[_vivido__msg__help__resize_commands] )) ||
-_vivido__msg__help__resize_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__help__subcmd__resize_commands] )) ||
+_vivido__subcmd__msg__subcmd__help__subcmd__resize_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg help resize commands' commands "$@"
 }
-(( $+functions[_vivido__msg__help__restart-terminal_commands] )) ||
-_vivido__msg__help__restart-terminal_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__help__subcmd__restart-terminal_commands] )) ||
+_vivido__subcmd__msg__subcmd__help__subcmd__restart-terminal_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg help restart-terminal commands' commands "$@"
 }
-(( $+functions[_vivido__msg__help__run-plan_commands] )) ||
-_vivido__msg__help__run-plan_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__help__subcmd__run-plan_commands] )) ||
+_vivido__subcmd__msg__subcmd__help__subcmd__run-plan_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg help run-plan commands' commands "$@"
 }
-(( $+functions[_vivido__msg__help__screenshot_commands] )) ||
-_vivido__msg__help__screenshot_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__help__subcmd__screenshot_commands] )) ||
+_vivido__subcmd__msg__subcmd__help__subcmd__screenshot_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg help screenshot commands' commands "$@"
 }
-(( $+functions[_vivido__msg__help__set-geometry_commands] )) ||
-_vivido__msg__help__set-geometry_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__help__subcmd__set-geometry_commands] )) ||
+_vivido__subcmd__msg__subcmd__help__subcmd__set-geometry_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg help set-geometry commands' commands "$@"
 }
-(( $+functions[_vivido__msg__help__set-level_commands] )) ||
-_vivido__msg__help__set-level_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__help__subcmd__set-level_commands] )) ||
+_vivido__subcmd__msg__subcmd__help__subcmd__set-level_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg help set-level commands' commands "$@"
 }
-(( $+functions[_vivido__msg__help__set-visible_commands] )) ||
-_vivido__msg__help__set-visible_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__help__subcmd__set-visible_commands] )) ||
+_vivido__subcmd__msg__subcmd__help__subcmd__set-visible_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg help set-visible commands' commands "$@"
 }
-(( $+functions[_vivido__msg__help__signal_commands] )) ||
-_vivido__msg__help__signal_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__help__subcmd__signal_commands] )) ||
+_vivido__subcmd__msg__subcmd__help__subcmd__signal_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg help signal commands' commands "$@"
 }
-(( $+functions[_vivido__msg__help__subscribe_commands] )) ||
-_vivido__msg__help__subscribe_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__help__subcmd__subscribe_commands] )) ||
+_vivido__subcmd__msg__subcmd__help__subcmd__subscribe_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg help subscribe commands' commands "$@"
 }
-(( $+functions[_vivido__msg__help__transcript_commands] )) ||
-_vivido__msg__help__transcript_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__help__subcmd__transcript_commands] )) ||
+_vivido__subcmd__msg__subcmd__help__subcmd__transcript_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg help transcript commands' commands "$@"
 }
-(( $+functions[_vivido__msg__help__typing_commands] )) ||
-_vivido__msg__help__typing_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__help__subcmd__typing_commands] )) ||
+_vivido__subcmd__msg__subcmd__help__subcmd__typing_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg help typing commands' commands "$@"
 }
-(( $+functions[_vivido__msg__help__vivid_commands] )) ||
-_vivido__msg__help__vivid_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__help__subcmd__vivid_commands] )) ||
+_vivido__subcmd__msg__subcmd__help__subcmd__vivid_commands() {
     local commands; commands=(
 'sessions:Common target selection for IPC commands' \
 'surfaces:Common target selection for IPC commands' \
@@ -2165,43 +2165,43 @@ _vivido__msg__help__vivid_commands() {
     )
     _describe -t commands 'vivido msg help vivid commands' commands "$@"
 }
-(( $+functions[_vivido__msg__help__vivid__scene-status_commands] )) ||
-_vivido__msg__help__vivid__scene-status_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__help__subcmd__vivid__subcmd__scene-status_commands] )) ||
+_vivido__subcmd__msg__subcmd__help__subcmd__vivid__subcmd__scene-status_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg help vivid scene-status commands' commands "$@"
 }
-(( $+functions[_vivido__msg__help__vivid__sessions_commands] )) ||
-_vivido__msg__help__vivid__sessions_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__help__subcmd__vivid__subcmd__sessions_commands] )) ||
+_vivido__subcmd__msg__subcmd__help__subcmd__vivid__subcmd__sessions_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg help vivid sessions commands' commands "$@"
 }
-(( $+functions[_vivido__msg__help__vivid__surface-status_commands] )) ||
-_vivido__msg__help__vivid__surface-status_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__help__subcmd__vivid__subcmd__surface-status_commands] )) ||
+_vivido__subcmd__msg__subcmd__help__subcmd__vivid__subcmd__surface-status_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg help vivid surface-status commands' commands "$@"
 }
-(( $+functions[_vivido__msg__help__vivid__surfaces_commands] )) ||
-_vivido__msg__help__vivid__surfaces_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__help__subcmd__vivid__subcmd__surfaces_commands] )) ||
+_vivido__subcmd__msg__subcmd__help__subcmd__vivid__subcmd__surfaces_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg help vivid surfaces commands' commands "$@"
 }
-(( $+functions[_vivido__msg__help__vivid__trace_commands] )) ||
-_vivido__msg__help__vivid__trace_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__help__subcmd__vivid__subcmd__trace_commands] )) ||
+_vivido__subcmd__msg__subcmd__help__subcmd__vivid__subcmd__trace_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg help vivid trace commands' commands "$@"
 }
-(( $+functions[_vivido__msg__help__vivid__track-status_commands] )) ||
-_vivido__msg__help__vivid__track-status_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__help__subcmd__vivid__subcmd__track-status_commands] )) ||
+_vivido__subcmd__msg__subcmd__help__subcmd__vivid__subcmd__track-status_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg help vivid track-status commands' commands "$@"
 }
-(( $+functions[_vivido__msg__help__vivid__tracks_commands] )) ||
-_vivido__msg__help__vivid__tracks_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__help__subcmd__vivid__subcmd__tracks_commands] )) ||
+_vivido__subcmd__msg__subcmd__help__subcmd__vivid__subcmd__tracks_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg help vivid tracks commands' commands "$@"
 }
-(( $+functions[_vivido__msg__help__wait_commands] )) ||
-_vivido__msg__help__wait_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__help__subcmd__wait_commands] )) ||
+_vivido__subcmd__msg__subcmd__help__subcmd__wait_commands() {
     local commands; commands=(
 'text:Text wait parameters' \
 'output:Output wait parameters' \
@@ -2213,58 +2213,58 @@ _vivido__msg__help__wait_commands() {
     )
     _describe -t commands 'vivido msg help wait commands' commands "$@"
 }
-(( $+functions[_vivido__msg__help__wait__exit_commands] )) ||
-_vivido__msg__help__wait__exit_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__help__subcmd__wait__subcmd__exit_commands] )) ||
+_vivido__subcmd__msg__subcmd__help__subcmd__wait__subcmd__exit_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg help wait exit commands' commands "$@"
 }
-(( $+functions[_vivido__msg__help__wait__frame_commands] )) ||
-_vivido__msg__help__wait__frame_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__help__subcmd__wait__subcmd__frame_commands] )) ||
+_vivido__subcmd__msg__subcmd__help__subcmd__wait__subcmd__frame_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg help wait frame commands' commands "$@"
 }
-(( $+functions[_vivido__msg__help__wait__output_commands] )) ||
-_vivido__msg__help__wait__output_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__help__subcmd__wait__subcmd__output_commands] )) ||
+_vivido__subcmd__msg__subcmd__help__subcmd__wait__subcmd__output_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg help wait output commands' commands "$@"
 }
-(( $+functions[_vivido__msg__help__wait__screen-change_commands] )) ||
-_vivido__msg__help__wait__screen-change_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__help__subcmd__wait__subcmd__screen-change_commands] )) ||
+_vivido__subcmd__msg__subcmd__help__subcmd__wait__subcmd__screen-change_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg help wait screen-change commands' commands "$@"
 }
-(( $+functions[_vivido__msg__help__wait__screen-stable_commands] )) ||
-_vivido__msg__help__wait__screen-stable_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__help__subcmd__wait__subcmd__screen-stable_commands] )) ||
+_vivido__subcmd__msg__subcmd__help__subcmd__wait__subcmd__screen-stable_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg help wait screen-stable commands' commands "$@"
 }
-(( $+functions[_vivido__msg__help__wait__text_commands] )) ||
-_vivido__msg__help__wait__text_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__help__subcmd__wait__subcmd__text_commands] )) ||
+_vivido__subcmd__msg__subcmd__help__subcmd__wait__subcmd__text_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg help wait text commands' commands "$@"
 }
-(( $+functions[_vivido__msg__help__wait__vivid-track_commands] )) ||
-_vivido__msg__help__wait__vivid-track_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__help__subcmd__wait__subcmd__vivid-track_commands] )) ||
+_vivido__subcmd__msg__subcmd__help__subcmd__wait__subcmd__vivid-track_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg help wait vivid-track commands' commands "$@"
 }
-(( $+functions[_vivido__msg__inspect_commands] )) ||
-_vivido__msg__inspect_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__inspect_commands] )) ||
+_vivido__subcmd__msg__subcmd__inspect_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg inspect commands' commands "$@"
 }
-(( $+functions[_vivido__msg__key_commands] )) ||
-_vivido__msg__key_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__key_commands] )) ||
+_vivido__subcmd__msg__subcmd__key_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg key commands' commands "$@"
 }
-(( $+functions[_vivido__msg__list-windows_commands] )) ||
-_vivido__msg__list-windows_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__list-windows_commands] )) ||
+_vivido__subcmd__msg__subcmd__list-windows_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg list-windows commands' commands "$@"
 }
-(( $+functions[_vivido__msg__mouse_commands] )) ||
-_vivido__msg__mouse_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__mouse_commands] )) ||
+_vivido__subcmd__msg__subcmd__mouse_commands() {
     local commands; commands=(
 'move:Mouse coordinate and modifier arguments' \
 'click:Mouse arguments requiring a button' \
@@ -2278,28 +2278,28 @@ _vivido__msg__mouse_commands() {
     )
     _describe -t commands 'vivido msg mouse commands' commands "$@"
 }
-(( $+functions[_vivido__msg__mouse__click_commands] )) ||
-_vivido__msg__mouse__click_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__mouse__subcmd__click_commands] )) ||
+_vivido__subcmd__msg__subcmd__mouse__subcmd__click_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg mouse click commands' commands "$@"
 }
-(( $+functions[_vivido__msg__mouse__double-click_commands] )) ||
-_vivido__msg__mouse__double-click_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__mouse__subcmd__double-click_commands] )) ||
+_vivido__subcmd__msg__subcmd__mouse__subcmd__double-click_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg mouse double-click commands' commands "$@"
 }
-(( $+functions[_vivido__msg__mouse__down_commands] )) ||
-_vivido__msg__mouse__down_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__mouse__subcmd__down_commands] )) ||
+_vivido__subcmd__msg__subcmd__mouse__subcmd__down_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg mouse down commands' commands "$@"
 }
-(( $+functions[_vivido__msg__mouse__drag_commands] )) ||
-_vivido__msg__mouse__drag_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__mouse__subcmd__drag_commands] )) ||
+_vivido__subcmd__msg__subcmd__mouse__subcmd__drag_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg mouse drag commands' commands "$@"
 }
-(( $+functions[_vivido__msg__mouse__help_commands] )) ||
-_vivido__msg__mouse__help_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__mouse__subcmd__help_commands] )) ||
+_vivido__subcmd__msg__subcmd__mouse__subcmd__help_commands() {
     local commands; commands=(
 'move:Mouse coordinate and modifier arguments' \
 'click:Mouse arguments requiring a button' \
@@ -2313,148 +2313,148 @@ _vivido__msg__mouse__help_commands() {
     )
     _describe -t commands 'vivido msg mouse help commands' commands "$@"
 }
-(( $+functions[_vivido__msg__mouse__help__click_commands] )) ||
-_vivido__msg__mouse__help__click_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__mouse__subcmd__help__subcmd__click_commands] )) ||
+_vivido__subcmd__msg__subcmd__mouse__subcmd__help__subcmd__click_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg mouse help click commands' commands "$@"
 }
-(( $+functions[_vivido__msg__mouse__help__double-click_commands] )) ||
-_vivido__msg__mouse__help__double-click_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__mouse__subcmd__help__subcmd__double-click_commands] )) ||
+_vivido__subcmd__msg__subcmd__mouse__subcmd__help__subcmd__double-click_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg mouse help double-click commands' commands "$@"
 }
-(( $+functions[_vivido__msg__mouse__help__down_commands] )) ||
-_vivido__msg__mouse__help__down_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__mouse__subcmd__help__subcmd__down_commands] )) ||
+_vivido__subcmd__msg__subcmd__mouse__subcmd__help__subcmd__down_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg mouse help down commands' commands "$@"
 }
-(( $+functions[_vivido__msg__mouse__help__drag_commands] )) ||
-_vivido__msg__mouse__help__drag_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__mouse__subcmd__help__subcmd__drag_commands] )) ||
+_vivido__subcmd__msg__subcmd__mouse__subcmd__help__subcmd__drag_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg mouse help drag commands' commands "$@"
 }
-(( $+functions[_vivido__msg__mouse__help__help_commands] )) ||
-_vivido__msg__mouse__help__help_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__mouse__subcmd__help__subcmd__help_commands] )) ||
+_vivido__subcmd__msg__subcmd__mouse__subcmd__help__subcmd__help_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg mouse help help commands' commands "$@"
 }
-(( $+functions[_vivido__msg__mouse__help__move_commands] )) ||
-_vivido__msg__mouse__help__move_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__mouse__subcmd__help__subcmd__move_commands] )) ||
+_vivido__subcmd__msg__subcmd__mouse__subcmd__help__subcmd__move_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg mouse help move commands' commands "$@"
 }
-(( $+functions[_vivido__msg__mouse__help__path_commands] )) ||
-_vivido__msg__mouse__help__path_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__mouse__subcmd__help__subcmd__path_commands] )) ||
+_vivido__subcmd__msg__subcmd__mouse__subcmd__help__subcmd__path_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg mouse help path commands' commands "$@"
 }
-(( $+functions[_vivido__msg__mouse__help__scroll_commands] )) ||
-_vivido__msg__mouse__help__scroll_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__mouse__subcmd__help__subcmd__scroll_commands] )) ||
+_vivido__subcmd__msg__subcmd__mouse__subcmd__help__subcmd__scroll_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg mouse help scroll commands' commands "$@"
 }
-(( $+functions[_vivido__msg__mouse__help__up_commands] )) ||
-_vivido__msg__mouse__help__up_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__mouse__subcmd__help__subcmd__up_commands] )) ||
+_vivido__subcmd__msg__subcmd__mouse__subcmd__help__subcmd__up_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg mouse help up commands' commands "$@"
 }
-(( $+functions[_vivido__msg__mouse__move_commands] )) ||
-_vivido__msg__mouse__move_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__mouse__subcmd__move_commands] )) ||
+_vivido__subcmd__msg__subcmd__mouse__subcmd__move_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg mouse move commands' commands "$@"
 }
-(( $+functions[_vivido__msg__mouse__path_commands] )) ||
-_vivido__msg__mouse__path_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__mouse__subcmd__path_commands] )) ||
+_vivido__subcmd__msg__subcmd__mouse__subcmd__path_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg mouse path commands' commands "$@"
 }
-(( $+functions[_vivido__msg__mouse__scroll_commands] )) ||
-_vivido__msg__mouse__scroll_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__mouse__subcmd__scroll_commands] )) ||
+_vivido__subcmd__msg__subcmd__mouse__subcmd__scroll_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg mouse scroll commands' commands "$@"
 }
-(( $+functions[_vivido__msg__mouse__up_commands] )) ||
-_vivido__msg__mouse__up_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__mouse__subcmd__up_commands] )) ||
+_vivido__subcmd__msg__subcmd__mouse__subcmd__up_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg mouse up commands' commands "$@"
 }
-(( $+functions[_vivido__msg__paste_commands] )) ||
-_vivido__msg__paste_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__paste_commands] )) ||
+_vivido__subcmd__msg__subcmd__paste_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg paste commands' commands "$@"
 }
-(( $+functions[_vivido__msg__ping_commands] )) ||
-_vivido__msg__ping_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__ping_commands] )) ||
+_vivido__subcmd__msg__subcmd__ping_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg ping commands' commands "$@"
 }
-(( $+functions[_vivido__msg__quit_commands] )) ||
-_vivido__msg__quit_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__quit_commands] )) ||
+_vivido__subcmd__msg__subcmd__quit_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg quit commands' commands "$@"
 }
-(( $+functions[_vivido__msg__reset-terminal_commands] )) ||
-_vivido__msg__reset-terminal_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__reset-terminal_commands] )) ||
+_vivido__subcmd__msg__subcmd__reset-terminal_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg reset-terminal commands' commands "$@"
 }
-(( $+functions[_vivido__msg__resize_commands] )) ||
-_vivido__msg__resize_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__resize_commands] )) ||
+_vivido__subcmd__msg__subcmd__resize_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg resize commands' commands "$@"
 }
-(( $+functions[_vivido__msg__restart-terminal_commands] )) ||
-_vivido__msg__restart-terminal_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__restart-terminal_commands] )) ||
+_vivido__subcmd__msg__subcmd__restart-terminal_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg restart-terminal commands' commands "$@"
 }
-(( $+functions[_vivido__msg__run-plan_commands] )) ||
-_vivido__msg__run-plan_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__run-plan_commands] )) ||
+_vivido__subcmd__msg__subcmd__run-plan_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg run-plan commands' commands "$@"
 }
-(( $+functions[_vivido__msg__screenshot_commands] )) ||
-_vivido__msg__screenshot_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__screenshot_commands] )) ||
+_vivido__subcmd__msg__subcmd__screenshot_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg screenshot commands' commands "$@"
 }
-(( $+functions[_vivido__msg__set-geometry_commands] )) ||
-_vivido__msg__set-geometry_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__set-geometry_commands] )) ||
+_vivido__subcmd__msg__subcmd__set-geometry_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg set-geometry commands' commands "$@"
 }
-(( $+functions[_vivido__msg__set-level_commands] )) ||
-_vivido__msg__set-level_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__set-level_commands] )) ||
+_vivido__subcmd__msg__subcmd__set-level_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg set-level commands' commands "$@"
 }
-(( $+functions[_vivido__msg__set-visible_commands] )) ||
-_vivido__msg__set-visible_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__set-visible_commands] )) ||
+_vivido__subcmd__msg__subcmd__set-visible_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg set-visible commands' commands "$@"
 }
-(( $+functions[_vivido__msg__signal_commands] )) ||
-_vivido__msg__signal_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__signal_commands] )) ||
+_vivido__subcmd__msg__subcmd__signal_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg signal commands' commands "$@"
 }
-(( $+functions[_vivido__msg__subscribe_commands] )) ||
-_vivido__msg__subscribe_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__subscribe_commands] )) ||
+_vivido__subcmd__msg__subcmd__subscribe_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg subscribe commands' commands "$@"
 }
-(( $+functions[_vivido__msg__transcript_commands] )) ||
-_vivido__msg__transcript_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__transcript_commands] )) ||
+_vivido__subcmd__msg__subcmd__transcript_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg transcript commands' commands "$@"
 }
-(( $+functions[_vivido__msg__typing_commands] )) ||
-_vivido__msg__typing_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__typing_commands] )) ||
+_vivido__subcmd__msg__subcmd__typing_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg typing commands' commands "$@"
 }
-(( $+functions[_vivido__msg__vivid_commands] )) ||
-_vivido__msg__vivid_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__vivid_commands] )) ||
+_vivido__subcmd__msg__subcmd__vivid_commands() {
     local commands; commands=(
 'sessions:Common target selection for IPC commands' \
 'surfaces:Common target selection for IPC commands' \
@@ -2467,8 +2467,8 @@ _vivido__msg__vivid_commands() {
     )
     _describe -t commands 'vivido msg vivid commands' commands "$@"
 }
-(( $+functions[_vivido__msg__vivid__help_commands] )) ||
-_vivido__msg__vivid__help_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__vivid__subcmd__help_commands] )) ||
+_vivido__subcmd__msg__subcmd__vivid__subcmd__help_commands() {
     local commands; commands=(
 'sessions:Common target selection for IPC commands' \
 'surfaces:Common target selection for IPC commands' \
@@ -2481,83 +2481,83 @@ _vivido__msg__vivid__help_commands() {
     )
     _describe -t commands 'vivido msg vivid help commands' commands "$@"
 }
-(( $+functions[_vivido__msg__vivid__help__help_commands] )) ||
-_vivido__msg__vivid__help__help_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__vivid__subcmd__help__subcmd__help_commands] )) ||
+_vivido__subcmd__msg__subcmd__vivid__subcmd__help__subcmd__help_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg vivid help help commands' commands "$@"
 }
-(( $+functions[_vivido__msg__vivid__help__scene-status_commands] )) ||
-_vivido__msg__vivid__help__scene-status_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__vivid__subcmd__help__subcmd__scene-status_commands] )) ||
+_vivido__subcmd__msg__subcmd__vivid__subcmd__help__subcmd__scene-status_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg vivid help scene-status commands' commands "$@"
 }
-(( $+functions[_vivido__msg__vivid__help__sessions_commands] )) ||
-_vivido__msg__vivid__help__sessions_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__vivid__subcmd__help__subcmd__sessions_commands] )) ||
+_vivido__subcmd__msg__subcmd__vivid__subcmd__help__subcmd__sessions_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg vivid help sessions commands' commands "$@"
 }
-(( $+functions[_vivido__msg__vivid__help__surface-status_commands] )) ||
-_vivido__msg__vivid__help__surface-status_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__vivid__subcmd__help__subcmd__surface-status_commands] )) ||
+_vivido__subcmd__msg__subcmd__vivid__subcmd__help__subcmd__surface-status_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg vivid help surface-status commands' commands "$@"
 }
-(( $+functions[_vivido__msg__vivid__help__surfaces_commands] )) ||
-_vivido__msg__vivid__help__surfaces_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__vivid__subcmd__help__subcmd__surfaces_commands] )) ||
+_vivido__subcmd__msg__subcmd__vivid__subcmd__help__subcmd__surfaces_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg vivid help surfaces commands' commands "$@"
 }
-(( $+functions[_vivido__msg__vivid__help__trace_commands] )) ||
-_vivido__msg__vivid__help__trace_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__vivid__subcmd__help__subcmd__trace_commands] )) ||
+_vivido__subcmd__msg__subcmd__vivid__subcmd__help__subcmd__trace_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg vivid help trace commands' commands "$@"
 }
-(( $+functions[_vivido__msg__vivid__help__track-status_commands] )) ||
-_vivido__msg__vivid__help__track-status_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__vivid__subcmd__help__subcmd__track-status_commands] )) ||
+_vivido__subcmd__msg__subcmd__vivid__subcmd__help__subcmd__track-status_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg vivid help track-status commands' commands "$@"
 }
-(( $+functions[_vivido__msg__vivid__help__tracks_commands] )) ||
-_vivido__msg__vivid__help__tracks_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__vivid__subcmd__help__subcmd__tracks_commands] )) ||
+_vivido__subcmd__msg__subcmd__vivid__subcmd__help__subcmd__tracks_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg vivid help tracks commands' commands "$@"
 }
-(( $+functions[_vivido__msg__vivid__scene-status_commands] )) ||
-_vivido__msg__vivid__scene-status_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__vivid__subcmd__scene-status_commands] )) ||
+_vivido__subcmd__msg__subcmd__vivid__subcmd__scene-status_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg vivid scene-status commands' commands "$@"
 }
-(( $+functions[_vivido__msg__vivid__sessions_commands] )) ||
-_vivido__msg__vivid__sessions_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__vivid__subcmd__sessions_commands] )) ||
+_vivido__subcmd__msg__subcmd__vivid__subcmd__sessions_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg vivid sessions commands' commands "$@"
 }
-(( $+functions[_vivido__msg__vivid__surface-status_commands] )) ||
-_vivido__msg__vivid__surface-status_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__vivid__subcmd__surface-status_commands] )) ||
+_vivido__subcmd__msg__subcmd__vivid__subcmd__surface-status_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg vivid surface-status commands' commands "$@"
 }
-(( $+functions[_vivido__msg__vivid__surfaces_commands] )) ||
-_vivido__msg__vivid__surfaces_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__vivid__subcmd__surfaces_commands] )) ||
+_vivido__subcmd__msg__subcmd__vivid__subcmd__surfaces_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg vivid surfaces commands' commands "$@"
 }
-(( $+functions[_vivido__msg__vivid__trace_commands] )) ||
-_vivido__msg__vivid__trace_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__vivid__subcmd__trace_commands] )) ||
+_vivido__subcmd__msg__subcmd__vivid__subcmd__trace_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg vivid trace commands' commands "$@"
 }
-(( $+functions[_vivido__msg__vivid__track-status_commands] )) ||
-_vivido__msg__vivid__track-status_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__vivid__subcmd__track-status_commands] )) ||
+_vivido__subcmd__msg__subcmd__vivid__subcmd__track-status_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg vivid track-status commands' commands "$@"
 }
-(( $+functions[_vivido__msg__vivid__tracks_commands] )) ||
-_vivido__msg__vivid__tracks_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__vivid__subcmd__tracks_commands] )) ||
+_vivido__subcmd__msg__subcmd__vivid__subcmd__tracks_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg vivid tracks commands' commands "$@"
 }
-(( $+functions[_vivido__msg__wait_commands] )) ||
-_vivido__msg__wait_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__wait_commands] )) ||
+_vivido__subcmd__msg__subcmd__wait_commands() {
     local commands; commands=(
 'text:Text wait parameters' \
 'output:Output wait parameters' \
@@ -2570,18 +2570,18 @@ _vivido__msg__wait_commands() {
     )
     _describe -t commands 'vivido msg wait commands' commands "$@"
 }
-(( $+functions[_vivido__msg__wait__exit_commands] )) ||
-_vivido__msg__wait__exit_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__wait__subcmd__exit_commands] )) ||
+_vivido__subcmd__msg__subcmd__wait__subcmd__exit_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg wait exit commands' commands "$@"
 }
-(( $+functions[_vivido__msg__wait__frame_commands] )) ||
-_vivido__msg__wait__frame_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__wait__subcmd__frame_commands] )) ||
+_vivido__subcmd__msg__subcmd__wait__subcmd__frame_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg wait frame commands' commands "$@"
 }
-(( $+functions[_vivido__msg__wait__help_commands] )) ||
-_vivido__msg__wait__help_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__wait__subcmd__help_commands] )) ||
+_vivido__subcmd__msg__subcmd__wait__subcmd__help_commands() {
     local commands; commands=(
 'text:Text wait parameters' \
 'output:Output wait parameters' \
@@ -2594,68 +2594,68 @@ _vivido__msg__wait__help_commands() {
     )
     _describe -t commands 'vivido msg wait help commands' commands "$@"
 }
-(( $+functions[_vivido__msg__wait__help__exit_commands] )) ||
-_vivido__msg__wait__help__exit_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__wait__subcmd__help__subcmd__exit_commands] )) ||
+_vivido__subcmd__msg__subcmd__wait__subcmd__help__subcmd__exit_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg wait help exit commands' commands "$@"
 }
-(( $+functions[_vivido__msg__wait__help__frame_commands] )) ||
-_vivido__msg__wait__help__frame_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__wait__subcmd__help__subcmd__frame_commands] )) ||
+_vivido__subcmd__msg__subcmd__wait__subcmd__help__subcmd__frame_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg wait help frame commands' commands "$@"
 }
-(( $+functions[_vivido__msg__wait__help__help_commands] )) ||
-_vivido__msg__wait__help__help_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__wait__subcmd__help__subcmd__help_commands] )) ||
+_vivido__subcmd__msg__subcmd__wait__subcmd__help__subcmd__help_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg wait help help commands' commands "$@"
 }
-(( $+functions[_vivido__msg__wait__help__output_commands] )) ||
-_vivido__msg__wait__help__output_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__wait__subcmd__help__subcmd__output_commands] )) ||
+_vivido__subcmd__msg__subcmd__wait__subcmd__help__subcmd__output_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg wait help output commands' commands "$@"
 }
-(( $+functions[_vivido__msg__wait__help__screen-change_commands] )) ||
-_vivido__msg__wait__help__screen-change_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__wait__subcmd__help__subcmd__screen-change_commands] )) ||
+_vivido__subcmd__msg__subcmd__wait__subcmd__help__subcmd__screen-change_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg wait help screen-change commands' commands "$@"
 }
-(( $+functions[_vivido__msg__wait__help__screen-stable_commands] )) ||
-_vivido__msg__wait__help__screen-stable_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__wait__subcmd__help__subcmd__screen-stable_commands] )) ||
+_vivido__subcmd__msg__subcmd__wait__subcmd__help__subcmd__screen-stable_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg wait help screen-stable commands' commands "$@"
 }
-(( $+functions[_vivido__msg__wait__help__text_commands] )) ||
-_vivido__msg__wait__help__text_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__wait__subcmd__help__subcmd__text_commands] )) ||
+_vivido__subcmd__msg__subcmd__wait__subcmd__help__subcmd__text_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg wait help text commands' commands "$@"
 }
-(( $+functions[_vivido__msg__wait__help__vivid-track_commands] )) ||
-_vivido__msg__wait__help__vivid-track_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__wait__subcmd__help__subcmd__vivid-track_commands] )) ||
+_vivido__subcmd__msg__subcmd__wait__subcmd__help__subcmd__vivid-track_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg wait help vivid-track commands' commands "$@"
 }
-(( $+functions[_vivido__msg__wait__output_commands] )) ||
-_vivido__msg__wait__output_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__wait__subcmd__output_commands] )) ||
+_vivido__subcmd__msg__subcmd__wait__subcmd__output_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg wait output commands' commands "$@"
 }
-(( $+functions[_vivido__msg__wait__screen-change_commands] )) ||
-_vivido__msg__wait__screen-change_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__wait__subcmd__screen-change_commands] )) ||
+_vivido__subcmd__msg__subcmd__wait__subcmd__screen-change_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg wait screen-change commands' commands "$@"
 }
-(( $+functions[_vivido__msg__wait__screen-stable_commands] )) ||
-_vivido__msg__wait__screen-stable_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__wait__subcmd__screen-stable_commands] )) ||
+_vivido__subcmd__msg__subcmd__wait__subcmd__screen-stable_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg wait screen-stable commands' commands "$@"
 }
-(( $+functions[_vivido__msg__wait__text_commands] )) ||
-_vivido__msg__wait__text_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__wait__subcmd__text_commands] )) ||
+_vivido__subcmd__msg__subcmd__wait__subcmd__text_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg wait text commands' commands "$@"
 }
-(( $+functions[_vivido__msg__wait__vivid-track_commands] )) ||
-_vivido__msg__wait__vivid-track_commands() {
+(( $+functions[_vivido__subcmd__msg__subcmd__wait__subcmd__vivid-track_commands] )) ||
+_vivido__subcmd__msg__subcmd__wait__subcmd__vivid-track_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg wait vivid-track commands' commands "$@"
 }
