@@ -1,4 +1,4 @@
-//! Launch choices offered by the tab strip's `+` menu.
+//! Launch choices offered by the tab strip's launch menu.
 //!
 //! Presentation lives in [`super::menu`]; this module only answers *what* the current platform can
 //! start. Keeping the two apart means a future source of entries — configured profiles, remote
@@ -6,7 +6,7 @@
 
 use crate::config::ui_config::Program;
 
-/// What choosing a `+` menu entry does.
+/// What choosing a launch menu entry does.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LaunchAction {
     /// Open a tab; `None` runs the configured shell, as a plain `+` click does.
@@ -15,7 +15,7 @@ pub enum LaunchAction {
     NewWindow,
 }
 
-/// One row of the `+` menu.
+/// One row of the launch menu.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LaunchEntry {
     pub label: String,
@@ -28,7 +28,7 @@ impl LaunchEntry {
     }
 }
 
-/// Entries the `+` menu offers on this platform.
+/// Entries the launch menu offers on this platform.
 ///
 /// Probing costs a process spawn on Windows, so callers build this once and keep the result rather
 /// than rebuilding it per menu open.
@@ -40,7 +40,7 @@ pub fn entries() -> Vec<LaunchEntry> {
     ]
 }
 
-/// Entries the `+` menu offers on this platform.
+/// Entries the launch menu offers on this platform.
 ///
 /// PowerShell and every installed WSL distribution, each as its own tab. Probing costs a process
 /// spawn, so callers build this once and keep the result rather than rebuilding it per menu open.

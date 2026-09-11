@@ -241,13 +241,13 @@ impl TabbedApplication {
         options
     }
 
-    /// Open the `+` button's launch menu, or close it when it is already open.
+    /// Open the `˅` button's launch menu, or close it when it is already open.
     fn toggle_new_tab_menu(&mut self, event_loop: &ActiveEventLoop) {
         if self.menu.is_some() {
             self.close_menu();
             return;
         }
-        let anchor = self.hits.new_tab;
+        let anchor = self.hits.new_tab_menu;
         let Some(bounds) = self.chrome.as_ref().map(|chrome| chrome.inner_size()) else { return };
         if anchor.width == 0 {
             return;
@@ -404,6 +404,9 @@ impl TabbedApplication {
     #[cfg(windows)]
     fn handle_menu_window_event(&mut self, event_loop: &ActiveEventLoop, event: WindowEvent) {
         match event {
+            WindowEvent::KeyboardInput { event: key, .. } => {
+                self.menu_key(event_loop, &key);
+            },
             WindowEvent::RedrawRequested => {
                 if let (Some(window), Some(menu)) = (&mut self.menu_window, &self.menu) {
                     window.render(menu);
@@ -782,6 +785,7 @@ impl TabbedApplication {
                 self.draw_controls,
                 &frames,
                 self.menu.as_ref(),
+                self.cursor,
             ) {
                 Ok((layout, hits, _)) => {
                     let geometry_changed = layout != self.layout;
@@ -826,6 +830,10 @@ impl TabbedApplication {
             self.hits.tabs.iter().find(|(_, rect)| rect.contains(position.x, position.y))
         {
             self.switch_to(*index);
+            return;
+        }
+        if self.hits.new_tab_menu.contains(position.x, position.y) {
+            self.toggle_new_tab_menu(event_loop);
             return;
         }
         if self.hits.new_tab.contains(position.x, position.y) {
@@ -1015,6 +1023,11 @@ impl TabbedApplication {
             },
             WindowEvent::RedrawRequested => self.render(),
             event @ WindowEvent::CursorMoved { position, .. } => {
+                if self.hits.hovered_tab_action(self.cursor)
+                    != self.hits.hovered_tab_action(Some(position))
+                {
+                    self.request_redraw();
+                }
                 self.cursor = Some(position);
                 self.update_resize_cursor(position);
                 // An open menu owns the pointer, so the pane never sees a move behind it.
@@ -1026,6 +1039,14 @@ impl TabbedApplication {
                     }
                     return;
                 }
+                #[cfg(target_os = "linux")]
+                self.route_linux_input(event);
+                #[cfg(windows)]
+                let _ = event;
+            },
+            event @ WindowEvent::CursorLeft { .. } => {
+                self.cursor = None;
+                self.request_redraw();
                 #[cfg(target_os = "linux")]
                 self.route_linux_input(event);
                 #[cfg(windows)]
@@ -1047,16 +1068,6 @@ impl TabbedApplication {
                     Some(index) => self.activate_menu_entry(event_loop, index),
                     None => self.close_menu(),
                 }
-            },
-            WindowEvent::MouseInput {
-                state: ElementState::Pressed,
-                button: MouseButton::Right,
-                ..
-            } if self
-                .cursor
-                .is_some_and(|position| self.hits.new_tab.contains(position.x, position.y)) =>
-            {
-                self.toggle_new_tab_menu(event_loop)
             },
             WindowEvent::KeyboardInput { event: key, .. } if self.menu.is_some() => {
                 self.menu_key(event_loop, &key);

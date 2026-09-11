@@ -31,6 +31,7 @@ const NEXT_ID: NodeId = NodeId(0x2_002);
 const MINIMIZE_ID: NodeId = NodeId(0x2_003);
 const MAXIMIZE_ID: NodeId = NodeId(0x2_004);
 const CLOSE_WINDOW_ID: NodeId = NodeId(0x2_005);
+const NEW_TAB_MENU_ID: NodeId = NodeId(0x2_007);
 #[cfg(target_os = "linux")]
 const MENU_ID: NodeId = NodeId(0x2_006);
 #[cfg(target_os = "linux")]
@@ -44,7 +45,7 @@ pub enum AccessibilityCommand {
     SelectTab(usize),
     CloseTab(usize),
     NewTab,
-    /// Open the `+` button's launch menu.
+    /// Open the `˅` button's launch menu.
     ShowNewTabMenu,
     /// Run the launch entry at this index of the open menu.
     #[cfg(target_os = "linux")]
@@ -225,10 +226,11 @@ fn build_tree(
     }
     if hits.new_tab.width > 0 {
         tab_list_children.push(NEW_TAB_ID);
-        let mut new_tab = button("New tab", hits.new_tab);
-        // The same button offers the launch menu a right-click opens.
-        new_tab.add_action(Action::ShowContextMenu);
-        nodes.push((NEW_TAB_ID, new_tab));
+        nodes.push((NEW_TAB_ID, button("New tab", hits.new_tab)));
+    }
+    if hits.new_tab_menu.width > 0 {
+        tab_list_children.push(NEW_TAB_MENU_ID);
+        nodes.push((NEW_TAB_MENU_ID, button("New tab options", hits.new_tab_menu)));
     }
     if draw_controls {
         for (id, label, bounds) in [
@@ -380,9 +382,6 @@ fn line_id(index: usize) -> NodeId {
 }
 
 fn command_for_action(action: Action, id: NodeId) -> Option<AccessibilityCommand> {
-    if action == Action::ShowContextMenu {
-        return (id == NEW_TAB_ID).then_some(AccessibilityCommand::ShowNewTabMenu);
-    }
     if !matches!(action, Action::Click | Action::Focus) {
         return None;
     }
@@ -402,6 +401,7 @@ fn command_for_node(id: NodeId) -> Option<AccessibilityCommand> {
     }
     match id {
         NEW_TAB_ID => Some(AccessibilityCommand::NewTab),
+        NEW_TAB_MENU_ID => Some(AccessibilityCommand::ShowNewTabMenu),
         PREVIOUS_ID => Some(AccessibilityCommand::PreviousTabs),
         NEXT_ID => Some(AccessibilityCommand::NextTabs),
         MINIMIZE_ID => Some(AccessibilityCommand::Minimize),
@@ -532,15 +532,17 @@ mod tests {
     }
 
     #[test]
-    fn the_new_tab_button_answers_click_and_context_menu_differently() {
+    fn new_tab_and_options_have_separate_click_actions() {
         assert_eq!(
             command_for_action(Action::Click, NEW_TAB_ID),
             Some(AccessibilityCommand::NewTab)
         );
         assert_eq!(
-            command_for_action(Action::ShowContextMenu, NEW_TAB_ID),
+            command_for_action(Action::Click, NEW_TAB_MENU_ID),
             Some(AccessibilityCommand::ShowNewTabMenu)
         );
+        assert_eq!(command_for_action(Action::ShowContextMenu, NEW_TAB_ID), None);
+        assert_eq!(command_for_action(Action::ShowContextMenu, NEW_TAB_MENU_ID), None);
         assert_eq!(command_for_action(Action::ShowContextMenu, CLOSE_WINDOW_ID), None);
         assert_eq!(command_for_action(Action::Increment, NEW_TAB_ID), None);
     }
