@@ -1,4 +1,4 @@
-//! Opt-in release throughput measurements. See docs/csi-performance.md for the matrix.
+//! Opt-in release throughput measurements. Set VIVIDO_BENCH_WORKLOAD and VIVIDO_BENCH_LAYER to select a workload and layer.
 
 use std::hint::black_box;
 
@@ -46,7 +46,10 @@ fn workload(name: &str) -> Vec<u8> {
             "unicode" => "漢字😀e\u{301}\t\n".as_bytes(),
             "long_escape" => {
                 data.extend_from_slice(b"\x1b]6;");
-                data.extend(std::iter::repeat_n(b'x', 8024));
+                // Match kitty's printable payload, including ordinary `V` candidates.
+                for _ in 0..8024 {
+                    data.push(ASCII[random(ASCII.len() - 2)]);
+                }
                 data.push(7);
                 continue;
             },

@@ -723,6 +723,7 @@ const CONPTY_VIVID_MARKER: VividMarkerEnvelope = VividMarkerEnvelope {
     payload_skip: 0,
     pass_to_terminal: false,
 };
+#[cfg(test)]
 const VIVID_MARKER_ENVELOPES: [VividMarkerEnvelope; 2] = [APC_VIVID_MARKER, CONPTY_VIVID_MARKER];
 
 /// One span of scanned PTY bytes: ordinary terminal data, or one authenticated anchor marker.
@@ -769,25 +770,37 @@ where
     F: FnMut(VividChunk<'_>),
 {
     let mut cursor = 0;
+    let mut text_start = 0;
+    // Cache each search independently: a rejected candidate must not cause another scan of the
+    // remainder for the other envelope. Searching for APC's two-byte prefix also skips ordinary
+    // CSI/OSC escapes without inspecting each one in the marker loop.
+    let mut apc_start = find_bytes(buf, b"\x1b_");
+    let mut conpty_start = memchr::memchr(b'V', buf);
 
     loop {
-        let Some((relative_start, envelope)) = find_marker_envelope(&buf[cursor..]) else {
-            let keep = VIVID_MARKER_ENVELOPES
-                .iter()
-                .map(|envelope| partial_prefix_len(&buf[cursor..], envelope.prefix))
-                .max()
-                .unwrap_or(0);
-            let end = buf.len().saturating_sub(keep);
-            emit_bytes(emit, &buf[cursor..end]);
-            return end;
+        if apc_start.is_some_and(|start| start < cursor) {
+            apc_start = find_bytes(&buf[cursor..], b"\x1b_").map(|start| cursor + start);
+        }
+        if conpty_start.is_some_and(|start| start < cursor) {
+            conpty_start = memchr::memchr(b'V', &buf[cursor..]).map(|start| cursor + start);
+        }
+        let (start, envelope) = match (apc_start, conpty_start) {
+            (Some(apc), Some(conpty)) if apc < conpty => (apc, APC_VIVID_MARKER),
+            (_, Some(conpty)) => (conpty, CONPTY_VIVID_MARKER),
+            (Some(apc), None) => (apc, APC_VIVID_MARKER),
+            (None, None) => {
+                // The first APC prefix byte can straddle reads.
+                let keep = usize::from(buf[cursor..].ends_with(b"\x1b"));
+                let end = buf.len() - keep;
+                emit_bytes(emit, &buf[text_start..end]);
+                return end;
+            },
         };
-        let start = cursor + relative_start;
-        emit_bytes(emit, &buf[cursor..start]);
         if envelope.payload_skip != 0 && !buf[start..].starts_with(envelope.prefix) {
             if envelope.prefix.starts_with(&buf[start..]) {
+                emit_bytes(emit, &buf[text_start..start]);
                 return start;
             }
-            emit_bytes(emit, &buf[start..start + 1]);
             cursor = start + 1;
             continue;
         }
@@ -796,66 +809,52 @@ where
             match conpty::scan(&buf[start..]) {
                 Scan::Complete { consumed, body } => {
                     let end = start + consumed;
+                    emit_bytes(emit, &buf[text_start..start]);
                     emit(VividChunk::Marker {
                         raw: &buf[start..end],
                         marker: &body,
                         pass_to_terminal: false,
                     });
                     cursor = end;
+                    text_start = end;
                 },
-                Scan::Incomplete => return start,
-                Scan::Invalid => {
-                    emit_bytes(emit, &buf[start..start + 1]);
-                    cursor = start + 1;
+                Scan::Incomplete => {
+                    emit_bytes(emit, &buf[text_start..start]);
+                    return start;
                 },
+                Scan::Invalid => cursor = start + 1,
             }
             continue;
         }
         let payload_start = start + envelope.payload_skip;
         let terminator_search = start + envelope.prefix.len();
 
-        let Some(relative_end) = find_bytes(&buf[terminator_search..], envelope.terminator) else {
+        // Search only the bounded marker candidate, not the entire remaining PTY read.
+        let candidate_end = start + (buf.len() - start).min(MAX_VIVID_MARKER_BYTES);
+        let Some(relative_end) =
+            find_bytes(&buf[terminator_search..candidate_end], envelope.terminator)
+        else {
             if buf.len() - start > MAX_VIVID_MARKER_BYTES {
-                emit_bytes(emit, &buf[start..start + envelope.prefix.len()]);
                 cursor = start + envelope.prefix.len();
                 continue;
             }
+            emit_bytes(emit, &buf[text_start..start]);
             return start;
         };
 
         let terminator = terminator_search + relative_end;
         let end = terminator + envelope.terminator.len();
-        if end - start > MAX_VIVID_MARKER_BYTES {
-            emit_bytes(emit, &buf[start..start + envelope.prefix.len()]);
-            cursor = start + envelope.prefix.len();
-            continue;
-        }
-
-        match std::str::from_utf8(&buf[payload_start..terminator]) {
-            Ok(marker) => emit(VividChunk::Marker {
+        if let Ok(marker) = std::str::from_utf8(&buf[payload_start..terminator]) {
+            emit_bytes(emit, &buf[text_start..start]);
+            emit(VividChunk::Marker {
                 raw: &buf[start..end],
                 marker,
                 pass_to_terminal: envelope.pass_to_terminal,
-            }),
-            Err(_) => emit_bytes(emit, &buf[start..end]),
+            });
+            text_start = end;
         }
         cursor = end;
     }
-}
-
-fn find_marker_envelope(bytes: &[u8]) -> Option<(usize, VividMarkerEnvelope)> {
-    VIVID_MARKER_ENVELOPES
-        .iter()
-        .filter_map(|envelope| {
-            // The printable prefix itself may straddle a ConPTY soft wrap.
-            let prefix = if envelope.payload_skip == 0 {
-                &envelope.prefix[..1]
-            } else {
-                &envelope.prefix[..2]
-            };
-            find_bytes(bytes, prefix).map(|start| (start, *envelope))
-        })
-        .min_by_key(|(start, _)| *start)
 }
 
 fn emit_bytes<F>(emit: &mut F, bytes: &[u8])
@@ -873,10 +872,6 @@ where
 /// directly in the throughput of ordinary terminal traffic.
 fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     memmem::find(haystack, needle)
-}
-
-fn partial_prefix_len(bytes: &[u8], prefix: &[u8]) -> usize {
-    (1..prefix.len()).rev().find(|&length| bytes.ends_with(&prefix[..length])).unwrap_or(0)
 }
 
 impl Writing {
@@ -1037,6 +1032,105 @@ mod vivid_marker_tests {
                 assert!(matches!(chunk, VividChunk::Bytes(_)));
             });
         }
+    }
+
+    #[test]
+    fn rejected_marker_candidates_stay_in_one_borrowed_text_span() {
+        // Ordinary ASCII and kitty-style OSC payloads must not split at every `V` or escape.
+        let ascii = b"V text VV VIVID;no marker \x1b[31mred\x1b[m \x1b_not-an-anchor ";
+        let mut input = ascii.repeat(2048);
+        input.extend_from_slice(b"\x1b]6;");
+        input.extend_from_slice(&ascii.repeat(2048));
+        input.push(7);
+        let mut scanner = VividMarkerScanner::default();
+        let mut spans = 0;
+        scanner.push(&input, &mut |chunk| {
+            let VividChunk::Bytes(bytes) = chunk else { panic!("unexpected marker") };
+            assert_eq!(bytes, input);
+            assert_eq!(bytes.as_ptr(), input.as_ptr());
+            spans += 1;
+        });
+        assert_eq!(spans, 1);
+        assert!(scanner.pending.is_empty());
+    }
+
+    #[test]
+    fn rejected_candidates_around_markers_preserve_text_and_order() {
+        let before = b"VV \x1b[31m \x1b_invalid ";
+        let after = b"VV \x1b[m ";
+        for envelope in VIVID_MARKER_ENVELOPES {
+            let mut input = before.to_vec();
+            input.extend_from_slice(envelope.prefix);
+            input.extend_from_slice(MARKER_PAYLOAD);
+            input.extend_from_slice(envelope.terminator);
+            input.extend_from_slice(after);
+            for split in 0..=input.len() {
+                let mut scanner = VividMarkerScanner::default();
+                let mut text = Vec::new();
+                let mut markers = 0;
+                let mut emit = |chunk: VividChunk<'_>| match chunk {
+                    VividChunk::Bytes(bytes) => text.extend_from_slice(bytes),
+                    VividChunk::Marker { marker, .. } => {
+                        assert_eq!(text, before);
+                        assert_eq!(marker, MARKER_BODY);
+                        markers += 1;
+                    },
+                };
+                scanner.push(&input[..split], &mut emit);
+                scanner.push(&input[split..], &mut emit);
+                assert_eq!(text, [before.as_slice(), after.as_slice()].concat());
+                assert_eq!(markers, 1);
+                assert!(scanner.pending.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn apc_size_limit_and_invalid_utf8_preserve_stream_bytes() {
+        for len in [MAX_VIVID_MARKER_BYTES - 1, MAX_VIVID_MARKER_BYTES, MAX_VIVID_MARKER_BYTES + 1]
+        {
+            for valid_utf8 in [false, true] {
+                let mut input = APC_VIVID_MARKER.prefix.to_vec();
+                input.resize(len - 2, if valid_utf8 { b'x' } else { 0xff });
+                input.extend_from_slice(APC_VIVID_MARKER.terminator);
+                for split in 0..=input.len() {
+                    let mut scanner = VividMarkerScanner::default();
+                    let mut text = Vec::new();
+                    let mut markers = 0;
+                    let mut emit = |chunk: VividChunk<'_>| match chunk {
+                        VividChunk::Bytes(bytes) => text.extend_from_slice(bytes),
+                        VividChunk::Marker { raw, .. } => {
+                            assert_eq!(raw, input);
+                            markers += 1;
+                        },
+                    };
+                    scanner.push(&input[..split], &mut emit);
+                    scanner.push(&input[split..], &mut emit);
+                    if valid_utf8 && len <= MAX_VIVID_MARKER_BYTES {
+                        assert_eq!(markers, 1);
+                        assert!(text.is_empty());
+                    } else {
+                        assert_eq!(markers, 0);
+                        assert_eq!(text, input);
+                    }
+                    assert!(scanner.pending.is_empty());
+                }
+            }
+        }
+
+        let mut input = APC_VIVID_MARKER.prefix.to_vec();
+        input.resize(MAX_VIVID_MARKER_BYTES, b'x');
+        let mut scanner = VividMarkerScanner::default();
+        scanner.push(&input, &mut |_| panic!("candidate released before the size limit"));
+        assert_eq!(scanner.pending, input);
+        let mut text = Vec::new();
+        scanner.push(b"!", &mut |chunk| {
+            let VividChunk::Bytes(bytes) = chunk else { panic!("unexpected marker") };
+            text.extend_from_slice(bytes);
+        });
+        input.push(b'!');
+        assert_eq!(text, input);
+        assert!(scanner.pending.is_empty());
     }
 
     #[test]
