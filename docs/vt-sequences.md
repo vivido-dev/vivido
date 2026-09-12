@@ -36,6 +36,11 @@ enable enhanced keyboard input. In particular, Vivido understanding Kitty keyboa
 sequences does not imply that a Windows console library can enable or decode those sequences over
 ConPTY.
 
+Vivido uses Windows' built-in ConPTY APIs. It does not load `conpty.dll` from other terminal
+installations on `PATH`: older console hosts can discard enhanced key-release reports, leaving
+game controls stuck. Clients reading enhanced input must still enable VT input and decode the
+escape sequences themselves rather than relying on synthesized native key records.
+
 If an application exits without leaving the alternate screen or disabling mouse, focus,
 bracketed-paste, Kitty-keyboard, or synchronized-output modes, press `Ctrl+Shift+F12`. The
 host-owned recovery prompt offers Reset Terminal, Restart Terminal, and Cancel. Reset discards

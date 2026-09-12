@@ -7,6 +7,13 @@ text like a champion — and then goes where no terminal has gone before: images
 play *inside* your shell, and AI agents get a first-class API to drive, read, and observe every
 window. One terminal, built for the two users who share it: you and your agent.
 
+> [!WARNING]
+> **On Windows, do not install WezTerm alongside Vivido.** Older Vivido builds can load
+> WezTerm's bundled `conpty.dll` from `PATH`. We reproduced dropped key-release events with
+> that DLL, causing controls in apps such as vvdoom to stop responding after the first movement.
+> Updated Vivido builds use Windows' built-in ConPTY instead. If WezTerm is already installed,
+> remove its directory from `PATH` or uninstall it, then restart Vivido completely.
+
 ## Why developers love Vivido
 
 ### Speed you can feel

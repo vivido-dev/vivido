@@ -1,4 +1,4 @@
-use log::{info, warn};
+use log::warn;
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::io::{Error, Result};
@@ -10,9 +10,7 @@ use windows_sys::Win32::Foundation::{HANDLE, S_OK};
 use windows_sys::Win32::System::Console::{
     COORD, ClosePseudoConsole, CreatePseudoConsole, HPCON, ResizePseudoConsole,
 };
-use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
-use windows_sys::core::{HRESULT, PWSTR};
-use windows_sys::{s, w};
+use windows_sys::core::PWSTR;
 
 use windows_sys::Win32::System::Threading::{
     CREATE_UNICODE_ENVIRONMENT, CreateProcessW, EXTENDED_STARTUPINFO_PRESENT,
@@ -28,70 +26,11 @@ use crate::terminal::tty::windows::{Pty, cmdline, win32_string};
 
 const PIPE_CAPACITY: usize = crate::terminal::event_loop::READ_BUFFER_SIZE;
 
-/// Load the pseudoconsole API from conpty.dll if possible, otherwise use the
-/// standard Windows API.
-///
-/// The conpty.dll from the Windows Terminal project
-/// supports loading OpenConsole.exe, which offers many improvements and
-/// bugfixes compared to the standard conpty that ships with Windows.
-///
-/// The conpty.dll and OpenConsole.exe files will be searched in PATH and in
-/// the directory where Vivido's executable is located.
-type CreatePseudoConsoleFn =
-    unsafe extern "system" fn(COORD, HANDLE, HANDLE, u32, *mut HPCON) -> HRESULT;
-type ResizePseudoConsoleFn = unsafe extern "system" fn(HPCON, COORD) -> HRESULT;
-type ClosePseudoConsoleFn = unsafe extern "system" fn(HPCON);
-
-struct ConptyApi {
-    create: CreatePseudoConsoleFn,
-    resize: ResizePseudoConsoleFn,
-    close: ClosePseudoConsoleFn,
-}
-
-impl ConptyApi {
-    fn new() -> Self {
-        match Self::load_conpty() {
-            Some(conpty) => {
-                info!("Using conpty.dll for pseudoconsole");
-                conpty
-            },
-            None => {
-                // Cannot load conpty.dll - use the standard Windows API.
-                info!("Using Windows API for pseudoconsole");
-                Self {
-                    create: CreatePseudoConsole,
-                    resize: ResizePseudoConsole,
-                    close: ClosePseudoConsole,
-                }
-            },
-        }
-    }
-
-    /// Try loading ConptyApi from conpty.dll library.
-    fn load_conpty() -> Option<Self> {
-        type LoadedFn = unsafe extern "system" fn() -> isize;
-        unsafe {
-            let hmodule = LoadLibraryW(w!("conpty.dll"));
-            if hmodule.is_null() {
-                return None;
-            }
-            let create_fn = GetProcAddress(hmodule, s!("CreatePseudoConsole"))?;
-            let resize_fn = GetProcAddress(hmodule, s!("ResizePseudoConsole"))?;
-            let close_fn = GetProcAddress(hmodule, s!("ClosePseudoConsole"))?;
-
-            Some(Self {
-                create: mem::transmute::<LoadedFn, CreatePseudoConsoleFn>(create_fn),
-                resize: mem::transmute::<LoadedFn, ResizePseudoConsoleFn>(resize_fn),
-                close: mem::transmute::<LoadedFn, ClosePseudoConsoleFn>(close_fn),
-            })
-        }
-    }
-}
-
+// Use the OS ConPTY implementation. Loading conpty.dll through PATH can select an
+// unrelated terminal's older console host, which can silently drop Kitty key releases.
 /// RAII Pseudoconsole.
 pub struct Conpty {
     pub handle: HPCON,
-    api: ConptyApi,
 }
 
 impl Drop for Conpty {
@@ -101,7 +40,7 @@ impl Drop for Conpty {
         // always runs first.
         //
         // See PR #3084 and https://docs.microsoft.com/en-us/windows/console/closepseudoconsole.
-        unsafe { (self.api.close)(self.handle) }
+        unsafe { ClosePseudoConsole(self.handle) }
     }
 }
 
@@ -109,7 +48,6 @@ impl Drop for Conpty {
 unsafe impl Send for Conpty {}
 
 pub fn new(config: &Options, window_size: WindowSize) -> Result<Pty> {
-    let api = ConptyApi::new();
     let mut pty_handle: HPCON = 0;
 
     // Passing 0 as the size parameter allows the "system default" buffer
@@ -121,7 +59,7 @@ pub fn new(config: &Options, window_size: WindowSize) -> Result<Pty> {
 
     // Create the Pseudo Console, using the pipes.
     let result = unsafe {
-        (api.create)(
+        CreatePseudoConsole(
             window_size.into(),
             conin_pty_handle.into_raw_handle() as HANDLE,
             conout_pty_handle.into_raw_handle() as HANDLE,
@@ -239,7 +177,7 @@ pub fn new(config: &Options, window_size: WindowSize) -> Result<Pty> {
     let conout = UnblockedReader::new(conout, PIPE_CAPACITY);
 
     let child_watcher = ChildExitWatcher::new(proc_info.hProcess)?;
-    let conpty = Conpty { handle: pty_handle as HPCON, api };
+    let conpty = Conpty { handle: pty_handle as HPCON };
 
     Ok(Pty::new(conpty, conout, conin, child_watcher))
 }
@@ -303,7 +241,7 @@ fn add_windows_env_key_value_to_block(block: &mut Vec<u16>, key: &OsStr, value: 
 
 impl OnResize for Conpty {
     fn on_resize(&mut self, window_size: WindowSize) {
-        let result = unsafe { (self.api.resize)(self.handle, window_size.into()) };
+        let result = unsafe { ResizePseudoConsole(self.handle, window_size.into()) };
         assert_eq!(result, S_OK);
     }
 }
