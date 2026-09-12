@@ -4475,6 +4475,7 @@ fn channel_loop(
             let decoder =
                 channel_io!(ChannelFailureKind::Decode, output.decoder(audio_configuration));
             if configuration.mode == vivid_protocol::track::TrackMode::Live {
+                output.configure_live(configuration.target_latency_us);
                 output.start();
             }
             let channel_output =
