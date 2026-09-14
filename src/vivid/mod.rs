@@ -6538,6 +6538,106 @@ mod tests {
         assert!(lock(&service.shared.overlays).drawing(&service.scene).is_empty());
     }
 
+    #[test]
+    #[ignore = "requires built SDK bindings and VIVID_OVERLAY_TEST_PYTHON/VIVID_OVERLAY_TEST_NODE"]
+    fn native_overlay_python_and_typescript_bindings() {
+        use crate::display::renderer::SceneRenderer;
+        use crate::display::window::RenderSource;
+        use std::process::{Command, Stdio};
+        use vivid_sdk::overlay::Event;
+        struct Child(std::process::Child);
+        impl Drop for Child {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let sdk = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../vivid_sdk");
+        for (runtime, fixture, mode) in [
+            ("VIVID_OVERLAY_TEST_PYTHON", "overlay_python.py", "blocking"),
+            ("VIVID_OVERLAY_TEST_PYTHON", "overlay_python.py", "async"),
+            ("VIVID_OVERLAY_TEST_NODE", "overlay_node.mjs", "async"),
+        ] {
+            let executable =
+                std::env::var_os(runtime).expect("binding test runtime must be configured");
+            let service =
+                socket_service!(VividService::start_with_wake(test_geometry(), Arc::new(|_| {})));
+            service.update_overlay_viewport(800., 600., 2.);
+            let mut command = Command::new(executable);
+            command
+                .arg(sdk.join("bindings/tests").join(fixture))
+                .arg(mode)
+                .env("VIVID_ROOT_SECRET", service.root_secret())
+                .env("PYTHONPATH", sdk.join("python"))
+                .stdin(Stdio::piped());
+            for endpoint in [
+                "VIVID_ENDPOINT_CONTROL",
+                "VIVID_ENDPOINT_INTERACTIVE",
+                "VIVID_ENDPOINT_REALTIME",
+                "VIVID_ENDPOINT_BULK",
+            ] {
+                command.env(endpoint, service.control_endpoint());
+            }
+            let mut child = Child(command.spawn().expect("binding test producer starts"));
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while lock(&service.shared.overlays).drawing(&service.scene).is_empty() {
+                assert!(
+                    child.0.try_wait().unwrap().is_none(),
+                    "binding producer exited before presenting"
+                );
+                assert!(Instant::now() < deadline, "binding producer did not present");
+                thread::sleep(Duration::from_millis(2));
+            }
+            // Read actual Vello pixels while the child holds its scene until the release marker.
+            let mut renderer = SceneRenderer::new(
+                RenderSource::Offscreen,
+                winit::dpi::PhysicalSize::new(800, 600),
+                false,
+            )
+            .expect("binding render acceptance requires a Vello adapter");
+            renderer.set_vivid_scene(service.scene());
+            let media = renderer
+                .prepare_media(&SizeInfo::new(800., 600., 10., 25., 0., 0., false), 0)
+                .unwrap();
+            let mut scene = vello::Scene::new();
+            scene.draw_image(media.overlay.as_ref().unwrap(), vello::kurbo::Affine::IDENTITY);
+            renderer.render(&scene, vello::peniko::Color::TRANSPARENT).unwrap();
+            let screenshot = renderer.begin_screenshot().unwrap();
+            let pixels = loop {
+                if let Some(pixels) = renderer.poll_screenshot(&screenshot).unwrap() {
+                    break pixels;
+                }
+                assert!(Instant::now() < deadline, "binding readback timed out");
+                thread::yield_now();
+            };
+            for (x, y, color) in [
+                (30, 50, [255, 0, 0, 255]),
+                (50, 50, [0, 255, 0, 255]),
+                (30, 70, [0, 0, 255, 255]),
+                (50, 70, [255, 255, 0, 255]),
+            ] {
+                let offset = y * pixels.padded_bytes_per_row as usize + x * 4;
+                assert_eq!(&pixels.bytes[offset..offset + 4], &color, "{fixture} {mode} pixels");
+            }
+            assert!(service.overlay_pointer(24., 44., Some((1, true)), 0));
+            assert!(service.overlay_pointer(24., 44., Some((1, false)), 0));
+            assert!(service.overlay_keyboard(
+                Event::Ime { preedit: "A😀日".into(), selection: Some((1, 5)) },
+                false
+            ));
+            child.0.stdin.take().unwrap().write_all(b"release\n").unwrap();
+            loop {
+                if let Some(status) = child.0.try_wait().unwrap() {
+                    assert!(status.success(), "{fixture} {mode} failed");
+                    break;
+                }
+                assert!(Instant::now() < deadline, "binding producer did not finish");
+                thread::sleep(Duration::from_millis(2));
+            }
+            assert!(lock(&service.shared.overlays).drawing(&service.scene).is_empty());
+        }
+    }
+
     /// A producer config pinned to one test presenter on every endpoint.
     ///
     /// Only the control endpoint is passed explicitly by callers; the SDK resolves the others
