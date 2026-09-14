@@ -129,6 +129,7 @@ pub struct SourceUploadMetrics {
 #[derive(Debug, Clone)]
 pub struct PreparedMedia {
     pub layers: [Option<ImageData>; 3],
+    pub overlay: Option<ImageData>,
     pub image_generation: u64,
     pub changed: bool,
 }
@@ -339,6 +340,7 @@ impl VividMediaRenderer {
             self.source_upload_metrics.skipped_passes =
                 self.source_upload_metrics.skipped_passes.saturating_add(1);
             return Some(PreparedMedia {
+                overlay: None,
                 layers: self
                     .targets
                     .each_ref()
@@ -485,6 +487,7 @@ impl VividMediaRenderer {
         }
         self.last_snapshot = Some(snapshot_key);
         Some(PreparedMedia {
+            overlay: None,
             layers: self.targets.each_ref().map(|target| target.as_ref().map(|t| t.image.clone())),
             image_generation: self.image_generation,
             changed: true,

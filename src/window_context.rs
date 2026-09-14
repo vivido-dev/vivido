@@ -437,6 +437,12 @@ impl WindowContext {
                 service.root_secret(),
                 ipc_window_id,
             );
+            service.update_overlay_viewport(
+                f64::from(display.size_info.width()),
+                f64::from(display.size_info.height()),
+                display.window.scale_factor,
+            );
+            service.set_overlay_font(config.font.clone());
             display.set_vivid_scene(service.scene());
             service
         };
@@ -580,6 +586,7 @@ impl WindowContext {
         self.terminal.lock().set_options(self.config.term_options());
         self.notifications.set_enabled(self.config.terminal.osc_notifications);
         self.vivid_service.set_remote_drop_paste(self.config.file_drop.paste_remote_path);
+        self.vivid_service.set_overlay_font(self.config.font.clone());
 
         // Reload cursor if its thickness has changed.
         if (old_config.cursor.thickness() - self.config.cursor.thickness()).abs() > f32::EPSILON {
@@ -904,6 +911,11 @@ impl WindowContext {
 
             self.dirty = true;
             let changed = self.vivid_service.update_metrics(self.display.size_info.into());
+            self.vivid_service.update_overlay_viewport(
+                f64::from(self.display.size_info.width()),
+                f64::from(self.display.size_info.height()),
+                self.display.window.scale_factor,
+            );
             if let Some(generation) = changed {
                 let window_id = self.id();
                 let timer_id = TimerId::new(Topic::VividResizeSettled, window_id);
@@ -1192,6 +1204,12 @@ impl WindowContext {
         self.terminal.lock().reset_client_state();
         self.display.set_vivid_scene(new_service.scene());
         self.vivid_service = new_service;
+        self.vivid_service.set_overlay_font(self.config.font.clone());
+        self.vivid_service.update_overlay_viewport(
+            f64::from(self.display.size_info.width()),
+            f64::from(self.display.size_info.height()),
+            self.display.window.scale_factor,
+        );
         #[cfg(not(windows))]
         {
             self.master_fd = master_fd;

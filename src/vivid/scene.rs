@@ -405,6 +405,7 @@ impl State {
 
 struct Inner {
     microphone: super::mic::Microphone,
+    overlays: Arc<Mutex<super::overlay::Host>>,
     state: Mutex<State>,
     changed: Condvar,
     target: Arc<dyn PresentationTarget>,
@@ -444,6 +445,7 @@ impl SharedScene {
     pub fn new(target: Arc<dyn PresentationTarget>) -> Self {
         Self(Arc::new(Inner {
             microphone: super::mic::Microphone::default(),
+            overlays: Arc::new(Mutex::new(super::overlay::Host::default())),
             state: Mutex::new(State::default()),
             changed: Condvar::new(),
             target,
@@ -453,6 +455,10 @@ impl SharedScene {
 
     pub fn target(&self) -> &Arc<dyn PresentationTarget> {
         &self.0.target
+    }
+
+    pub(crate) fn overlays(&self) -> &Arc<Mutex<super::overlay::Host>> {
+        &self.0.overlays
     }
 
     pub fn optimization_metrics(&self) -> SceneOptimizationMetrics {
@@ -945,7 +951,7 @@ impl SharedScene {
         {
             return Err("track owner does not match complete identity");
         }
-        if configuration.slot > SLOT_POSTER && configuration.slot < 32 {
+        if configuration.slot > vivid_sdk::SLOT_VECTOR && configuration.slot < 32 {
             return Err("reserved surface slot");
         }
         if configuration.slot >= 32 {
@@ -1016,7 +1022,7 @@ impl SharedScene {
         }
         let mut candidate = surface.active_slots.clone();
         for &(slot, track_id, expected_generation, required_milestone) in bindings {
-            if slot > SLOT_POSTER || slot == 0 {
+            if slot > vivid_sdk::SLOT_VECTOR || slot == 0 {
                 return Err("unsupported surface slot");
             }
             if track_id == 0 {
@@ -1258,6 +1264,33 @@ impl SharedScene {
         }
         track.state.detach().map_err(|_| "track revision exhausted")?;
         self.0.changed.notify_all();
+        Ok(())
+    }
+
+    /// Assets consume channel credit and participate in ordered EOS without advancing scene IDs.
+    pub fn admit_vector_asset(
+        &self,
+        identity: TrackIdentity,
+        generation: ChannelGeneration,
+        body_length: u32,
+        sequence: u64,
+    ) -> Result<(), &'static str> {
+        let mut state = self.lock();
+        let track = state.tracks.get_mut(&identity).ok_or("track does not exist")?;
+        if track.state.channel_generation != generation
+            || track.lifecycle != 1
+            || !matches!(track.configuration.kind, KindConfiguration::VectorScene(_))
+            || sequence <= track.last_media_record_sequence
+            || sequence <= 1
+        {
+            return Err("invalid vector asset attachment or sequence");
+        }
+        track
+            .state
+            .flow
+            .admit(body_length)
+            .map_err(|_| "vector asset exceeds channel allowance")?;
+        track.last_media_record_sequence = sequence;
         Ok(())
     }
 

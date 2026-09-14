@@ -37,6 +37,9 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
         let mods = self.ctx.modifiers().state();
 
         if key.state == ElementState::Released {
+            if !self.ctx.search_active() && self.forward_overlay_key(&key) {
+                return;
+            }
             self.key_release(key, mode, mods);
             return;
         }
@@ -68,6 +71,9 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
         }
 
         // Mask `Alt` modifier from input when we won't send esc.
+        if self.forward_overlay_key(&key) {
+            return;
+        }
         let mods = if self.alt_send_esc(&key, text) { mods } else { mods & !ModifiersState::ALT };
 
         let build_key_sequence = Self::should_build_sequence(&key, text, mode, mods);
@@ -93,6 +99,31 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
             }
             self.ctx.write_to_pty(bytes);
         }
+    }
+
+    /// Route physical transitions and committed text to the focused pane overlay.
+    fn forward_overlay_key(&mut self, key: &KeyEvent) -> bool {
+        let physical = match key.physical_key {
+            PhysicalKey::Code(code) => crate::vivid::hid::usage(code).map(u32::from).unwrap_or(0),
+            _ => 0,
+        };
+        let down = key.state == ElementState::Pressed;
+        let modifiers = self.ctx.modifiers().state().bits();
+        let consumed = self.ctx.overlay_keyboard(
+            vivid_protocol::overlay::Event::Key { physical, down, repeat: key.repeat, modifiers },
+            key.logical_key == Key::Named(NamedKey::Escape),
+        );
+        if consumed
+            && down
+            && let Some(text) = key
+                .text
+                .as_ref()
+                .filter(|text| !text.is_empty() && !text.chars().any(char::is_control))
+        {
+            self.ctx
+                .overlay_keyboard(vivid_protocol::overlay::Event::Text(text.to_string()), false);
+        }
+        consumed
     }
 
     /// Send one physical key transition to a producer holding a desktop-input grant.

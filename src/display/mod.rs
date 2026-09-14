@@ -64,6 +64,7 @@ mod corners;
 mod damage;
 mod media;
 mod meter;
+mod overlay;
 
 #[cfg(any(unix, windows))]
 #[cfg(test)]
@@ -776,6 +777,9 @@ impl Display {
             }
 
             // Host UI remains above application media, including the terminal search and IME UI.
+            if let Some(image) = prepared_media.as_ref().and_then(|media| media.overlay.as_ref()) {
+                scene.draw_image(image, Affine::IDENTITY);
+            }
             if search_state.regex().is_some() {
                 self.draw_line_indicator(&mut scene, config, total_lines, None, display_offset);
             }

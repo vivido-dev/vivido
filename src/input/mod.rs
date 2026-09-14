@@ -136,6 +136,24 @@ pub trait ActionContext<T: EventListener> {
     fn send_desktop_input(&self, _event: vivid_protocol::input::InputEvent) -> bool {
         false
     }
+    fn overlay_keyboard(&self, _event: vivid_protocol::overlay::Event, _escape: bool) -> bool {
+        false
+    }
+    fn overlay_capturing(&self) -> bool {
+        false
+    }
+    fn overlay_pointer(
+        &self,
+        _x: f64,
+        _y: f64,
+        _button: Option<(u16, bool)>,
+        _modifiers: u32,
+    ) -> bool {
+        false
+    }
+    fn overlay_wheel(&self, _x: f64, _y: f64, _dx: f64, _dy: f64, _modifiers: u32) -> bool {
+        false
+    }
     /// Route clipboard media to the live file-drop binding, returning whether it took the paste.
     ///
     /// The default is "no binding", which is every context that is not a live window.
@@ -428,6 +446,15 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
     #[inline]
     pub fn mouse_moved(&mut self, position: PhysicalPosition<f64>) {
         let size_info = self.ctx.size_info();
+        let overlay_modifiers = self.ctx.modifiers().state().bits();
+        if (size_info.contains_point(position.x.max(0.) as usize, position.y.max(0.) as usize)
+            || self.ctx.overlay_capturing())
+            && self.ctx.overlay_pointer(position.x, position.y, None, overlay_modifiers)
+        {
+            self.ctx.mouse_mut().x = position.x.max(0.) as usize;
+            self.ctx.mouse_mut().y = position.y.max(0.) as usize;
+            return;
+        }
 
         let (x, y) = position.into();
         let old_pixel = (self.ctx.mouse().x, self.ctx.mouse().y);
@@ -689,6 +716,23 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
     }
 
     pub fn mouse_wheel_input(&mut self, delta: MouseScrollDelta, phase: TouchPhase) {
+        let overlay_modifiers = self.ctx.modifiers().state().bits();
+        let (dx, dy) = match delta {
+            MouseScrollDelta::LineDelta(x, y) => (
+                f64::from(x * self.ctx.size_info().cell_width()),
+                f64::from(y * self.ctx.size_info().cell_height()),
+            ),
+            MouseScrollDelta::PixelDelta(position) => (position.x, position.y),
+        };
+        if self.ctx.overlay_wheel(
+            self.ctx.mouse().x as f64,
+            self.ctx.mouse().y as f64,
+            dx,
+            dy,
+            overlay_modifiers,
+        ) {
+            return;
+        }
         let multiplier = self.ctx.config().scrolling.multiplier;
         match delta {
             MouseScrollDelta::LineDelta(columns, lines) => {
@@ -952,6 +996,26 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
     }
 
     pub fn mouse_input(&mut self, state: ElementState, button: MouseButton) {
+        let overlay_modifiers = self.ctx.modifiers().state().bits();
+        let overlay_button = match button {
+            MouseButton::Left => 1,
+            MouseButton::Right => 2,
+            MouseButton::Middle => 3,
+            MouseButton::Back => 4,
+            MouseButton::Forward => 5,
+            MouseButton::Other(button) => button.saturating_add(6),
+        };
+        if (self.ctx.size_info().contains_point(self.ctx.mouse().x, self.ctx.mouse().y)
+            || self.ctx.overlay_capturing())
+            && self.ctx.overlay_pointer(
+                self.ctx.mouse().x as f64,
+                self.ctx.mouse().y as f64,
+                Some((overlay_button, state == ElementState::Pressed)),
+                overlay_modifiers,
+            )
+        {
+            return;
+        }
         match button {
             MouseButton::Left => self.ctx.mouse_mut().left_button_state = state,
             MouseButton::Middle => self.ctx.mouse_mut().middle_button_state = state,

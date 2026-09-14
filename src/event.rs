@@ -4093,6 +4093,18 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
     fn send_desktop_input(&self, event: vivid_protocol::input::InputEvent) -> bool {
         self.vivid_service.send_input(event)
     }
+    fn overlay_capturing(&self) -> bool {
+        self.vivid_service.overlay_capturing()
+    }
+    fn overlay_keyboard(&self, event: vivid_protocol::overlay::Event, escape: bool) -> bool {
+        self.vivid_service.overlay_keyboard(event, escape)
+    }
+    fn overlay_pointer(&self, x: f64, y: f64, button: Option<(u16, bool)>, modifiers: u32) -> bool {
+        self.vivid_service.overlay_pointer(x, y, button, modifiers)
+    }
+    fn overlay_wheel(&self, x: f64, y: f64, dx: f64, dy: f64, modifiers: u32) -> bool {
+        self.vivid_service.overlay_wheel(x, y, dx, dy, modifiers)
+    }
 
     fn paste_clipboard_media(&mut self) -> bool {
         use crate::clipboard::ClipboardMedia;
@@ -4650,6 +4662,11 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
 
     /// Paste a text into the terminal.
     fn paste(&mut self, text: &str, bracketed: bool) {
+        if !self.search_active()
+            && self.overlay_keyboard(vivid_protocol::overlay::Event::Text(text.to_owned()), false)
+        {
+            return;
+        }
         if self.search_active() {
             for c in text.chars() {
                 self.search_input(c);
@@ -5233,6 +5250,7 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                     },
                     WindowEvent::Touch(touch) => self.touch(touch),
                     WindowEvent::Focused(is_focused) => {
+                        self.ctx.vivid_service.overlay_focus(is_focused);
                         self.ctx.terminal.is_focused = is_focused;
 
                         // When the unfocused hollow is used we must redraw on focus change.
@@ -5325,12 +5343,34 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                     },
                     WindowEvent::Ime(ime) => match ime {
                         Ime::Commit(text) => {
+                            if !self.ctx.search_active()
+                                && self.ctx.overlay_keyboard(
+                                    vivid_protocol::overlay::Event::Text(text.clone()),
+                                    false,
+                                )
+                            {
+                                return;
+                            }
                             *self.ctx.dirty = true;
                             // Don't use bracketed paste for single char input.
                             self.ctx.paste(&text, text.chars().count() > 1);
                             self.ctx.update_cursor_blinking();
                         },
                         Ime::Preedit(text, cursor_offset) => {
+                            let selection = cursor_offset.and_then(|(start, end)| {
+                                Some((u32::try_from(start).ok()?, u32::try_from(end).ok()?))
+                            });
+                            if !self.ctx.search_active()
+                                && self.ctx.overlay_keyboard(
+                                    vivid_protocol::overlay::Event::Ime {
+                                        preedit: text.clone(),
+                                        selection,
+                                    },
+                                    false,
+                                )
+                            {
+                                return;
+                            }
                             let preedit =
                                 (!text.is_empty()).then(|| Preedit::new(text, cursor_offset));
 

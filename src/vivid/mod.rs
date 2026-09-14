@@ -10,6 +10,7 @@ pub(crate) mod hid;
 mod lane;
 mod lease;
 mod mic;
+pub(crate) mod overlay;
 pub mod scene;
 pub mod target;
 pub(crate) mod trace;
@@ -276,6 +277,7 @@ struct ServiceShared {
     root_secret: Secret32,
     presenter: PresenterInstanceId,
     scene: SharedScene,
+    overlays: Arc<Mutex<overlay::Host>>,
     registry: Mutex<Registry>,
     audio_outputs: Mutex<HashMap<TrackIdentity, Arc<AudioOutput>>>,
     next_session: AtomicU64,
@@ -368,6 +370,7 @@ impl Drop for TrackAttachmentCleanup {
 
 /// Release one admitted interactive transport without touching a later generation.
 struct LaneCleanup {
+    shared: Arc<ServiceShared>,
     session: Arc<SessionRuntime>,
     generation: u64,
     writer: Arc<Writer>,
@@ -380,6 +383,12 @@ impl Drop for LaneCleanup {
             .as_ref()
             .is_some_and(|state| state.generation() == self.generation);
         if owns_lane {
+            let surfaces =
+                lock(&self.shared.overlays).lane_lost(self.session.identity, self.generation);
+            for surface in surfaces {
+                let _ = self.shared.scene.destroy_surface(surface);
+            }
+            self.shared.request_frame_wake();
             lane::confirm_lost(&mut lock(&self.session.lane), self.generation);
             revoke_input(&self.session, grant_reason::LANE_LOSS);
         }
@@ -560,6 +569,7 @@ impl VividService {
             root_secret: Secret32::new(secret),
             presenter: PresenterInstanceId(presenter),
             scene: scene.clone(),
+            overlays: scene.overlays().clone(),
             registry: Mutex::new(Registry::default()),
             audio_outputs: Mutex::new(HashMap::new()),
             next_session: AtomicU64::new(1),
@@ -633,6 +643,57 @@ impl VividService {
     /// `flush_display_change` so live sessions observe it as `TARGET_CHANGED`.
     pub fn update_metrics(&self, geometry: DisplayGeometry) -> Option<u64> {
         self.shared.scene.target().offer_geometry(geometry)
+    }
+
+    /// Refresh viewport logical coordinates from the actual pane size and native display scale.
+    pub fn update_overlay_viewport(&self, width: f64, height: f64, scale: f64) {
+        let _ = lock(&self.shared.overlays).update_viewport(width, height, scale);
+    }
+    pub(crate) fn set_overlay_font(&self, font: crate::config::font::Font) {
+        lock(&self.shared.overlays).set_font(font);
+    }
+
+    pub(crate) fn overlay_keyboard(
+        &self,
+        event: vivid_protocol::overlay::Event,
+        escape: bool,
+    ) -> bool {
+        let consumed = lock(&self.shared.overlays).keyboard(event, escape);
+        if consumed {
+            self.shared.request_frame_wake();
+            self.shared.wake_overlay_actors();
+        }
+        consumed
+    }
+    pub(crate) fn overlay_focus(&self, focused: bool) {
+        lock(&self.shared.overlays).set_pane_focus(focused);
+        self.shared.wake_overlay_actors();
+    }
+    pub(crate) fn overlay_capturing(&self) -> bool {
+        lock(&self.shared.overlays).capturing()
+    }
+
+    pub(crate) fn overlay_pointer(
+        &self,
+        x: f64,
+        y: f64,
+        button: Option<(u16, bool)>,
+        modifiers: u32,
+    ) -> bool {
+        let consumed = lock(&self.shared.overlays).pointer(&self.scene, x, y, button, modifiers);
+        if consumed {
+            self.shared.request_frame_wake();
+            self.shared.wake_overlay_actors();
+        }
+        consumed
+    }
+
+    pub(crate) fn overlay_wheel(&self, x: f64, y: f64, dx: f64, dy: f64, modifiers: u32) -> bool {
+        let consumed = lock(&self.shared.overlays).wheel(&self.scene, x, y, dx, dy, modifiers);
+        if consumed {
+            self.shared.wake_overlay_actors();
+        }
+        consumed
     }
 
     /// Announce a queued display change, or re-announce the current one as settled.
@@ -1095,6 +1156,13 @@ impl SessionRuntime {
 }
 
 impl ServiceShared {
+    fn wake_overlay_actors(&self) {
+        for session in lock(&self.registry).sessions.values() {
+            if session.supports(registry::OVERLAY_INPUT) {
+                session.wake_actor();
+            }
+        }
+    }
     fn trace(
         &self,
         category: trace::TraceCategory,
@@ -1135,13 +1203,25 @@ impl ServiceShared {
     /// negotiates it and every peer degrades to the pre-feature wire.
     fn offered_profiles(&self) -> Vec<&'static str> {
         let allow = self.remote_drop_paste.load(Ordering::Relaxed);
-        self.scene
+        let mut profiles: Vec<_> = self
+            .scene
             .target()
             .supported_profiles()
             .iter()
             .copied()
             .filter(|profile| allow || *profile != registry::FILE_DROP_PATH)
-            .collect()
+            .collect();
+        if self.scene.target().profile_name() == registry::TERMINAL_SURFACE
+            && lock(&self.overlays).has_viewport()
+        {
+            profiles.extend([
+                registry::TERMINAL_OVERLAY,
+                registry::VECTOR_SCENE,
+                registry::OVERLAY_INPUT,
+            ]);
+            profiles.sort_unstable();
+        }
+        profiles
     }
 
     /// Build a complete track identity for a session this presenter owns.
@@ -1390,6 +1470,12 @@ fn actor_loop(
     loop {
         let now = Instant::now();
         let timeout = actor_wait_timeout(&shared, &session, pending.observation_timeout(now), now);
+        let timeout = minimum_timeout(
+            timeout,
+            lock(&shared.overlays)
+                .deadline(session.identity)
+                .map(|deadline| deadline.saturating_duration_since(now)),
+        );
         let received = match timeout {
             Some(timeout) => incoming.recv_timeout(timeout),
             None => incoming.recv().map_err(|_| mpsc::RecvTimeoutError::Disconnected),
@@ -1428,6 +1514,7 @@ fn actor_loop(
         }
         expire_leases(&shared, &session);
         service_input_renewal(&session);
+        overlay::service_input(&shared, &session);
         drain_observations(&session, &egress);
         service_file_drop_timeouts(&shared, &session, &egress);
     }
@@ -1750,6 +1837,7 @@ fn revoke_lease(
         let _ = context.release_child(&lease.contract);
     }
     if let Some(child) = child {
+        lock(&shared.overlays).remove_owner(child);
         shared.scene.remove_session(child);
     }
     drop(child_runtime);
@@ -1762,6 +1850,11 @@ fn revoke_lease(
 }
 
 fn finish_session(shared: &Arc<ServiceShared>, session: &Arc<SessionRuntime>, clean: bool) {
+    // Overlay windows never become retained terminal posters, even for clean or leased exits.
+    let overlays = lock(&shared.overlays).remove_owner(session.identity);
+    for surface in overlays {
+        let _ = shared.scene.destroy_surface(surface);
+    }
     // Preserve the exact establishment outcome until the first request or its deadline.
     if !clean && let Some(key) = session.lease {
         let mut registry = lock(&shared.registry);
@@ -1968,6 +2061,21 @@ fn establish_root_session(
     );
     accepted.sort();
     accepted.dedup();
+    // This presenter implements vector output as interactive pane windows. Do not accept a
+    // partial bundle and then silently drop rendering or input semantics at track creation.
+    let overlay_profiles =
+        [registry::TERMINAL_OVERLAY, registry::VECTOR_SCENE, registry::OVERLAY_INPUT];
+    if !overlay_profiles.iter().all(|profile| accepted.iter().any(|p| p == profile)) {
+        if hello.required_profiles.iter().any(|p| overlay_profiles.contains(&p.as_str())) {
+            return Err(send_fatal(
+                &writer,
+                request_id,
+                messages::ERROR_UNSUPPORTED_PROFILE,
+                "Vivido overlays require the complete window, vector, and input profile bundle",
+            ));
+        }
+        accepted.retain(|p| !overlay_profiles.contains(&p.as_str()));
+    }
     registry::validate_profile_set(accepted.iter().map(String::as_str))
         .map_err(io::Error::other)?;
     let mut registry = lock(&shared.registry);
@@ -2116,6 +2224,9 @@ fn establish_root_session(
         },
         extensions: vec![],
     };
+    if welcome.accepted_profiles.iter().any(|p| p == registry::VECTOR_SCENE) {
+        welcome.extensions.push((15, vivid_protocol::vector::Limits::default().to_value()));
+    }
     welcome.confirm(&prk)?;
     let welcome_body = welcome.encode(request_id)?;
 
@@ -2308,6 +2419,9 @@ fn dispatch_control(
         | messages::UPDATE_SURFACE
         | messages::DESTROY_SURFACE
         | messages::QUERY_SURFACE
+        | messages::SET_OVERLAY_WINDOW
+        | messages::OVERLAY_ACTION
+        | messages::QUERY_OVERLAY
         | messages::PROBE_TRACK_CONFIG
         | messages::CREATE_TRACK
         | messages::DESTROY_TRACK
@@ -2358,6 +2472,9 @@ fn dispatch_control(
     let request_id = envelope.request_id;
     let value = Value::Map(envelope.payload.clone());
     let reply = match record.record_type {
+        messages::SET_OVERLAY_WINDOW | messages::OVERLAY_ACTION | messages::QUERY_OVERLAY => {
+            overlay::dispatch(shared, session, record, request_id, &value)?
+        },
         messages::PING => (messages::PONG, 0, Envelope::new(request_id, envelope.payload).encode()),
         messages::GOODBYE => (messages::OK, 0, Ok(messages::ok(request_id))),
         messages::QUERY_SESSION => {
@@ -2660,6 +2777,7 @@ fn dispatch_control(
             }
             drop(contexts);
             shared.scene.remove_contexts(session.identity, &removed);
+            lock(&shared.overlays).remove_contexts(session.identity, &removed);
             lock(&shared.file_drops).remove_contexts(session.identity, &removed);
             (messages::OK, context_id, Ok(messages::ok(request_id)))
         },
@@ -2744,6 +2862,7 @@ fn dispatch_control(
                 )
                 .map_err(ControlError::state)?;
             if status.generation != current.generation {
+                lock(&shared.overlays).remove_surface(identity);
                 lock(&shared.file_drops).remove_surface(
                     session.identity,
                     identity.context.context_id,
@@ -2759,6 +2878,7 @@ fn dispatch_control(
                 observe_surface(session, &status, SURFACE_CHANGED_LIFECYCLE);
             }
             shared.scene.destroy_surface(identity).map_err(ControlError::state)?;
+            lock(&shared.overlays).remove_surface(identity);
             lock(&shared.file_drops).remove_surface(
                 session.identity,
                 identity.context.context_id,
@@ -2782,6 +2902,8 @@ fn dispatch_control(
             let configuration = TrackConfiguration::decode(0, &value, true)
                 .map_err(|_| ControlError::bad_message("invalid track probe"))?;
             let supported = supports_track(&configuration)
+                && (!matches!(configuration.kind, KindConfiguration::VectorScene(_))
+                    || session.supports(registry::VECTOR_SCENE))
                 && (configuration.direction != vivid_protocol::track::TrackDirection::Uplink
                     || session.supports(registry::AUDIO_INPUT));
             (
@@ -2817,6 +2939,8 @@ fn dispatch_control(
                 configuration.track_id,
             )?;
             if !supports_track(&configuration)
+                || (matches!(configuration.kind, KindConfiguration::VectorScene(_))
+                    && !session.supports(registry::VECTOR_SCENE))
                 || (configuration.direction == vivid_protocol::track::TrackDirection::Uplink
                     && !session.supports(registry::AUDIO_INPUT))
             {
@@ -2877,6 +3001,7 @@ fn dispatch_control(
                 .scene
                 .destroy_track(identity)
                 .map_err(|message| ControlError::state(message).with_track(identity))?;
+            lock(&shared.overlays).remove_track(identity);
             let audio_output_stopped =
                 if let Some(output) = lock(&shared.audio_outputs).remove(&identity) {
                     output.stop();
@@ -2964,6 +3089,7 @@ fn dispatch_control(
                 .scene
                 .advance_channel(identity)
                 .map_err(|message| ControlError::state(message).with_track(identity))?;
+            lock(&shared.overlays).remove_track(identity);
             let (audio_output_preserved, audio_output_stopped) = advance_audio_output(
                 &shared.audio_outputs,
                 identity,
@@ -3085,6 +3211,10 @@ fn dispatch_control(
                 })
                 .collect::<Result<Vec<_>, ControlError>>()?;
             let identity = surface_identity(session, context_id, surface_id)?;
+            let mut overlays = lock(&shared.overlays);
+            overlays
+                .validate_activation(&shared.scene, identity, &bindings)
+                .map_err(ControlError::state)?;
             let status = shared
                 .scene
                 .activate_tracks(
@@ -3095,6 +3225,8 @@ fn dispatch_control(
                     &bindings,
                 )
                 .map_err(ControlError::state)?;
+            overlays.sync_revision(&shared.scene, identity);
+            drop(overlays);
             observe_surface(session, &status, SURFACE_CHANGED_SLOTS);
             for (_slot, track_id, _generation, _milestone) in &bindings {
                 if let Ok(track) = identity.track(*track_id)
@@ -4503,6 +4635,8 @@ fn channel_loop(
     // reads into one buffer for the life of the connection instead of allocating per record — on
     // the path that carries every video packet, every raster frame and every audio packet.
     let mut body = Vec::new();
+    let mut vector = matches!(configuration.kind, KindConfiguration::VectorScene(_))
+        .then(|| overlay::VectorWorker::new(lock(&shared.overlays).font()));
     loop {
         let mut recovery_unit = false;
         let header = match reader.read_record_into(ConnectionKind::Track, &mut body) {
@@ -4525,6 +4659,8 @@ fn channel_loop(
                 | messages::AUDIO_PACKET
                 | messages::RASTER_FRAME
                 | messages::IMAGE_DATA
+                | messages::VECTOR_FRAME
+                | messages::VECTOR_ASSET
         ) {
             if shapes_ingress(&configuration) {
                 channel_io!(
@@ -4549,6 +4685,27 @@ fn channel_loop(
             channel_other!(ChannelFailureKind::InternalState, channel.admit_media(generation));
         }
         match header.record_type {
+            messages::VECTOR_FRAME | messages::VECTOR_ASSET => {
+                let Some(worker) = vector.as_mut() else {
+                    return Err(ChannelFailure::message(
+                        ChannelFailureKind::RecordType,
+                        ErrorKind::InvalidData,
+                        "vector record used a non-vector track",
+                        context,
+                    ));
+                };
+                channel_other!(
+                    ChannelFailureKind::MediaAdmission,
+                    worker.process(
+                        shared,
+                        identity,
+                        generation,
+                        header.record_type,
+                        header.sequence,
+                        &body
+                    )
+                );
+            },
             messages::RASTER_FRAME => {
                 let KindConfiguration::Raster(raster) = &configuration.kind else {
                     return Err(ChannelFailure::message(
@@ -5157,6 +5314,8 @@ fn channel_loop(
                 | messages::AUDIO_PACKET
                 | messages::RASTER_FRAME
                 | messages::IMAGE_DATA
+                | messages::VECTOR_FRAME
+                | messages::VECTOR_ASSET
         ) {
             let (maximum_bytes, maximum_records) = channel_other!(
                 ChannelFailureKind::FlowControl,
@@ -5382,6 +5541,7 @@ fn handle_lane(
     }
 
     let mut cleanup = LaneCleanup {
+        shared: shared.clone(),
         session: session.clone(),
         generation: open.lane_generation,
         writer: writer.clone(),
@@ -5401,6 +5561,9 @@ fn handle_lane(
     )
     .encode()
     .map_err(io::Error::other)?;
+    if session.supports(registry::OVERLAY_INPUT) {
+        lock(&shared.overlays).lane_open(session.identity, open.lane_generation);
+    }
     writer.write_record(messages::LANE_ACCEPTED, 0, &accepted)?;
 
     // From here the lane is reader plus egress, exactly as the control connection is. Nothing that
@@ -5410,7 +5573,7 @@ fn handle_lane(
     *lock(&session.lane_writer) = Some(writer.clone());
     *lock(&session.lane_egress) = Some(egress.clone());
 
-    let outcome = serve_lane(reader, &writer, &session, &shared.scene);
+    let outcome = serve_lane(reader, &writer, &session, shared);
     drop(cleanup);
     outcome
 }
@@ -5523,7 +5686,7 @@ fn serve_lane(
     reader: &mut Reader,
     writer: &Arc<Writer>,
     session: &Arc<SessionRuntime>,
-    scene: &SharedScene,
+    shared: &Arc<ServiceShared>,
 ) -> io::Result<()> {
     loop {
         let record = match reader.read_record(ConnectionKind::Lane) {
@@ -5531,7 +5694,20 @@ fn serve_lane(
             Err(error) if error.kind() == ErrorKind::UnexpectedEof => return Ok(()),
             Err(error) => return Err(error),
         };
-        if !lane::carries(record.record_type) {
+        let overlay = session.supports(registry::OVERLAY_INPUT);
+        let legal = if overlay {
+            matches!(
+                record.record_type,
+                messages::PING
+                    | messages::PONG
+                    | messages::ERROR
+                    | messages::OVERLAY_INPUT_CAPTURE
+                    | messages::OVERLAY_INPUT_RENEW
+            )
+        } else {
+            lane::carries(record.record_type)
+        };
+        if !legal {
             return Err(send_fatal(
                 writer,
                 0,
@@ -5540,6 +5716,9 @@ fn serve_lane(
             ));
         }
         match record.record_type {
+            messages::OVERLAY_INPUT_CAPTURE | messages::OVERLAY_INPUT_RENEW => {
+                overlay::lane_record(shared, session, &record)?;
+            },
             messages::PING => {
                 let envelope = messages::decode_control(&record.body)?;
                 let body = Envelope::new(envelope.request_id, envelope.payload)
@@ -5562,7 +5741,7 @@ fn serve_lane(
                         "invalid SET_INPUT_BINDING",
                     ));
                 };
-                let body = apply_input_binding(scene, session, &binding)?;
+                let body = apply_input_binding(&shared.scene, session, &binding)?;
                 session.post_lane(messages::INPUT_BOUND, binding.surface_id, body);
             },
             _ => {
@@ -5716,7 +5895,7 @@ fn supports_track(configuration: &TrackConfiguration) -> bool {
     if configuration.direction == vivid_protocol::track::TrackDirection::Uplink {
         return vivid_protocol::audio_input::supports(configuration);
     }
-    configuration.slot <= scene::SLOT_POSTER
+    configuration.slot <= vivid_sdk::SLOT_VECTOR
         && configuration.slot != 0
         && match (&configuration.kind, configuration.slot) {
             (KindConfiguration::Video(video), scene::SLOT_PRIMARY_VIDEO) => {
@@ -5725,6 +5904,7 @@ fn supports_track(configuration: &TrackConfiguration) -> bool {
             (KindConfiguration::Audio(audio), scene::SLOT_AUDIO) => supports_audio(audio),
             (KindConfiguration::Raster(_), scene::SLOT_RASTER | scene::SLOT_POSTER)
             | (KindConfiguration::EncodedImage(_), scene::SLOT_POSTER) => true,
+            (KindConfiguration::VectorScene(_), vivid_sdk::SLOT_VECTOR) => true,
             _ => false,
         }
 }
@@ -6201,6 +6381,161 @@ mod tests {
 
     fn connect(service: &VividService) -> vivid_sdk::Session {
         vivid_sdk::Session::connect(test_config(service)).unwrap()
+    }
+
+    #[test]
+    fn native_overlay_windows_present_move_receive_input_and_cleanup_independently() {
+        use vivid_sdk::overlay::{
+            Brush, Canvas, Color, Event, OverlayWindowOptions, Path, Rect, WindowMode,
+        };
+        let service =
+            socket_service!(VividService::start_with_wake(test_geometry(), Arc::new(|_| {})));
+        service.update_overlay_viewport(800., 600., 2.);
+        let first = vivid_sdk::OverlaySession::connect(test_config(&service)).unwrap();
+        let second = vivid_sdk::OverlaySession::connect(test_config(&service)).unwrap();
+        let window = first
+            .create_window(OverlayWindowOptions::new(
+                Rect::new(10., 20., 100., 80.).unwrap(),
+                WindowMode::Floating,
+            ))
+            .unwrap();
+        let neighbor = second
+            .create_window(OverlayWindowOptions::new(
+                Rect::new(200., 20., 100., 80.).unwrap(),
+                WindowMode::Floating,
+            ))
+            .unwrap();
+        let mut canvas = Canvas::new();
+        canvas
+            .fill(
+                Path::rectangle(Rect::new(0., 0., 100., 80.).unwrap()).unwrap(),
+                Brush::Solid(Color(0xff0000ff)),
+            )
+            .unwrap();
+        window.present(canvas.clone()).unwrap();
+        neighbor.present(canvas.clone()).unwrap();
+        {
+            use crate::display::renderer::SceneRenderer;
+            use crate::display::window::RenderSource;
+            use vello::kurbo::Affine;
+            use vello::peniko::Color as VelloColor;
+            if let Ok(mut renderer) = SceneRenderer::new(
+                RenderSource::Offscreen,
+                winit::dpi::PhysicalSize::new(800, 600),
+                false,
+            ) {
+                renderer.set_vivid_scene(service.scene());
+                let size = SizeInfo::new(800., 600., 10., 25., 0., 0., false);
+                let media = renderer.prepare_media(&size, 0).unwrap();
+                let mut composed = vello::Scene::new();
+                composed.draw_image(media.overlay.as_ref().unwrap(), Affine::IDENTITY);
+                assert!(renderer.render(&composed, VelloColor::from_rgb8(0, 255, 0)).unwrap());
+                let readback = renderer.begin_screenshot().unwrap();
+                let deadline = Instant::now() + Duration::from_secs(10);
+                let pixels = loop {
+                    if let Some(pixels) = renderer.poll_screenshot(&readback).unwrap() {
+                        break pixels;
+                    }
+                    assert!(Instant::now() < deadline, "overlay GPU readback timed out");
+                    thread::yield_now();
+                };
+                let offset = 50 * pixels.padded_bytes_per_row as usize + 30 * 4;
+                assert_eq!(&pixels.bytes[offset..offset + 4], &[255, 0, 0, 255]);
+                assert_eq!(
+                    &pixels.bytes[..4],
+                    &[0, 255, 0, 255],
+                    "overlay remains clipped to its bounds"
+                );
+                assert!(
+                    !renderer.prepare_media(&size, 0).unwrap().changed,
+                    "unchanged overlays reuse their GPU target"
+                );
+                let generation = media.image_generation;
+                window.set_bounds(Rect::new(20., 20., 100., 80.).unwrap()).unwrap();
+                let moved = renderer.prepare_media(&size, 0).unwrap();
+                assert!(moved.changed);
+                assert_eq!(
+                    moved.image_generation, generation,
+                    "movement preserves the texture used by cached terminal scenes"
+                );
+            } else {
+                eprintln!("overlay GPU readback unavailable: no usable adapter");
+            }
+        }
+        assert_eq!(lock(&service.shared.overlays).drawing(&service.scene).len(), 2);
+        assert_eq!(window.viewport().unwrap().width.get(), 400.);
+        window.center().unwrap();
+        assert_eq!(window.bounds().unwrap().origin.x.get(), 150.);
+        window.set_bounds(Rect::new(10., 20., 100., 80.).unwrap()).unwrap();
+        assert!(service.overlay_pointer(30., 50., Some((1, true)), 0));
+        assert!(service.overlay_pointer(30., 50., Some((1, false)), 0));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            assert!(Instant::now() < deadline, "pointer event did not reach the producer");
+            let received = first.wait_event(Duration::from_millis(50)).unwrap();
+            if let Some(vivid_sdk::OverlayLaneEvent::Input(event)) = received
+                && matches!(event.event, Event::Pointer { button: Some((1, true)), .. })
+            {
+                assert!(first.event_targets(&event, &window).unwrap());
+                assert_eq!(event.scene_revision, 1);
+                break;
+            }
+        }
+        first.capture_pointer(&window, true).unwrap();
+        first.capture_pointer(&window, false).unwrap();
+        let modal = first
+            .create_window(OverlayWindowOptions::new(
+                Rect::new(10., 10., 80., 60.).unwrap(),
+                WindowMode::Modal,
+            ))
+            .unwrap();
+        modal.present(canvas.clone()).unwrap();
+        assert!(neighbor.request_focus().is_err(), "another producer cannot steal modal focus");
+        assert!(service.overlay_keyboard(
+            Event::Ime { preedit: "日本語".into(), selection: Some((0, 9)) },
+            false
+        ));
+        assert!(service.overlay_keyboard(Event::Text("日本語".into()), false));
+        service.overlay_focus(false);
+        service.overlay_focus(true);
+        assert!(service.overlay_keyboard(
+            Event::Key { physical: 41, down: true, repeat: false, modifiers: 0 },
+            true
+        ));
+        assert!(service.overlay_keyboard(
+            Event::Key { physical: 41, down: false, repeat: false, modifiers: 0 },
+            true
+        ));
+        modal.close().unwrap();
+        let popup = first
+            .create_child(
+                &window,
+                OverlayWindowOptions::new(
+                    Rect::new(10., 10., 20., 20.).unwrap(),
+                    WindowMode::Popup,
+                ),
+            )
+            .unwrap();
+        popup.present(canvas.clone()).unwrap();
+        assert!(
+            service.overlay_pointer(790., 590., Some((1, true)), 0),
+            "outside dismissal consumes the press"
+        );
+        assert!(
+            service.overlay_pointer(790., 590., Some((1, false)), 0),
+            "dismissal also consumes the matching release"
+        );
+        popup.close().unwrap();
+        first.close().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while lock(&service.shared.overlays).drawing(&service.scene).len() != 1 {
+            assert!(Instant::now() < deadline, "owner cleanup did not finish");
+            thread::yield_now();
+        }
+        neighbor.present(canvas).unwrap();
+        neighbor.close().unwrap();
+        second.close().unwrap();
+        assert!(lock(&service.shared.overlays).drawing(&service.scene).is_empty());
     }
 
     /// A producer config pinned to one test presenter on every endpoint.

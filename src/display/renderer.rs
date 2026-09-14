@@ -136,6 +136,7 @@ pub struct SceneRenderer {
     valid_target: bool,
     max_surface_dimension: u32,
     media: VividMediaRenderer,
+    overlays: super::overlay::OverlayRenderer,
     /// Rounds the finished frame's corners. Built only for a window which draws its own frame.
     corners: Option<CornerMask>,
     /// Physical corner radius applied to the finished frame; zero leaves the corners square.
@@ -378,6 +379,7 @@ impl SceneRenderer {
             valid_target,
             max_surface_dimension,
             media,
+            overlays: Default::default(),
             corners: None,
             corner_radius: 0.0,
             render_target,
@@ -452,6 +454,8 @@ impl SceneRenderer {
     }
 
     pub fn set_vivid_scene(&mut self, scene: crate::vivid::scene::SharedScene) {
+        self.overlays.clear(&mut self.renderer.borrow_mut());
+        self.overlays.scene = Some(scene.clone());
         self.media.set_scene(scene);
     }
 
@@ -469,7 +473,33 @@ impl SceneRenderer {
         display_offset: usize,
     ) -> Option<super::media::PreparedMedia> {
         let mut renderer = self.renderer.borrow_mut();
-        self.media.draw(&self.device, &self.queue, &mut renderer, size, display_offset)
+        let media = self.media.draw(&self.device, &self.queue, &mut renderer, size, display_offset);
+        let (overlay, changed) = match self.overlays.draw(
+            &self.device,
+            &self.queue,
+            &mut renderer,
+            size.width() as u32,
+            size.height() as u32,
+        ) {
+            Ok(result) => result,
+            Err(error) => {
+                log::warn!("overlay rendering failed: {error}");
+                return media;
+            },
+        };
+        if media.is_none() && overlay.is_none() {
+            return None;
+        }
+        let mut media = media.unwrap_or(super::media::PreparedMedia {
+            layers: [None, None, None],
+            overlay: None,
+            image_generation: 0,
+            changed: false,
+        });
+        media.overlay = overlay;
+        media.changed |= changed;
+        media.image_generation = media.image_generation.wrapping_add(self.overlays.generation);
+        Some(media)
     }
 
     pub fn render(&mut self, scene: &Scene, base_color: Color) -> Result<bool, Error> {
@@ -755,6 +785,7 @@ fn frame_copy_regions(
 impl Drop for SceneRenderer {
     fn drop(&mut self) {
         self.media.clear_target(&mut self.renderer.borrow_mut());
+        self.overlays.clear(&mut self.renderer.borrow_mut());
     }
 }
 
