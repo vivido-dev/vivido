@@ -3,10 +3,7 @@
 //! Native terminal targets install viewport geometry before offering the profile bundle.
 //! Keeping dispatch here avoids embedding window policy in the terminal loop.
 
-use crate::display::{
-    text::TextSystem,
-    vector::{CompiledScene, compile},
-};
+use crate::display::{text::TextSystem, vector::CompiledScene};
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::sync::Weak;
 use vello::peniko::{Blob, ImageAlphaType, ImageData, ImageFormat};
@@ -19,12 +16,18 @@ use vivid_protocol::overlay::{DismissReason, Windows};
 use vivid_protocol::vector::Scalar;
 
 use super::*;
+#[cfg(test)]
+use crate::display::vector::compile;
 
 #[path = "overlay_text.rs"]
 pub(super) mod text;
 
 #[derive(Default)]
 pub(crate) struct Host {
+    pub(super) layouts:
+        HashMap<(SurfaceIdentity, u64), Arc<crate::display::vector::text_layout::MeasuredLayout>>,
+    pub(super) layout_charges: HashMap<(SessionIdentity, u64), Weak<()>>,
+    next_layout: u64,
     text_jobs: HashSet<SessionIdentity>,
     editor: Option<(SurfaceIdentity, vivid_protocol::overlay::wire::text::EditorGeometry)>,
     windows: Windows,
@@ -155,6 +158,7 @@ impl Host {
     }
 
     pub fn remove_surface(&mut self, identity: SurfaceIdentity) {
+        self.layouts.retain(|(surface, _), _| *surface != identity);
         if self.editor.is_some_and(|(id, _)| id == identity) {
             self.editor = None;
         }
@@ -177,6 +181,7 @@ impl Host {
     }
 
     pub fn remove_owner(&mut self, owner: SessionIdentity) -> Vec<SurfaceIdentity> {
+        self.layouts.retain(|(surface, _), _| surface.context.session != owner);
         if self.editor.is_some_and(|(id, _)| id.context.session == owner) {
             self.editor = None;
         }
@@ -561,8 +566,35 @@ impl VectorWorker {
                 self.text.update_font(font.clone());
                 self.font = font;
             }
-            let mut compiled =
-                compile(&frame.canvas, &mut self.text, &self.images).map_err(|e| e.0)?;
+            let layouts = {
+                let host = lock(&shared.overlays);
+                let mut layouts = BTreeMap::new();
+                for command in frame.canvas.commands() {
+                    if let vivid_protocol::vector::Command::TextLayout { layout, .. } = command {
+                        if !host
+                            .actors
+                            .get(&identity.surface.context.session)
+                            .and_then(Weak::upgrade)
+                            .is_some_and(|session| session.supports(registry::OVERLAY_TEXT_LAYOUT))
+                        {
+                            return Err("text layouts were not negotiated");
+                        }
+                        let value = host
+                            .layouts
+                            .get(&(identity.surface, *layout))
+                            .ok_or("text layout is absent or released")?;
+                        layouts.insert(*layout, value.clone());
+                    }
+                }
+                layouts
+            };
+            let mut compiled = crate::display::vector::compile_with_layouts(
+                &frame.canvas,
+                &mut self.text,
+                &self.images,
+                &layouts,
+            )
+            .map_err(|e| e.0)?;
             let ids: HashSet<_> = frame
                 .canvas
                 .commands()
@@ -572,10 +604,11 @@ impl VectorWorker {
                     _ => None,
                 })
                 .collect();
-            compiled.retained = ids
-                .iter()
-                .map(|id| self.tokens.get(id).cloned().ok_or("retained image is absent"))
-                .collect::<Result<_, _>>()?;
+            compiled.retained.extend(
+                ids.iter()
+                    .map(|id| self.tokens.get(id).cloned().ok_or("retained image is absent"))
+                    .collect::<Result<Vec<_>, _>>()?,
+            );
             let compiled = Arc::new(compiled);
             let mut host = lock(&shared.overlays);
             if !host.surfaces.contains(&identity.surface) {
@@ -841,6 +874,7 @@ pub(super) fn service_input(shared: &ServiceShared, session: &SessionRuntime) {
         .filter(|id| id.context.session == session.identity && host.windows.get(*id).is_none())
         .collect();
     for surface in dismissed {
+        host.layouts.retain(|(owner, _), _| *owner != surface);
         host.retire_presentation(surface);
     }
     let expired =

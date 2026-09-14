@@ -1,9 +1,182 @@
 //! Bounded host text work, independent of control, input and UI event loops.
 use super::*;
+use vivid_protocol::overlay::wire::text::styled::{
+    BatchMeasured, MAX_RETAINED_LAYOUTS, MeasureBatch, ReleaseLayouts,
+};
 use vivid_protocol::overlay::wire::text::{
     EditorGeometry, MAX_TEXT_GEOMETRY, MeasureText, TextGeometry, TextMeasurement,
 };
 use vivid_protocol::vector::{Rect, Text};
+
+pub(in crate::vivid) fn measure_batch(
+    shared: &Arc<ServiceShared>,
+    session: &Arc<SessionRuntime>,
+    record: &Record,
+    request_id: u64,
+    value: &Value,
+) -> Result<(), ControlError> {
+    if !session.supports(registry::OVERLAY_TEXT_LAYOUT) {
+        return Err(ControlError::unsupported("overlay-text-layout-v1 was not negotiated"));
+    }
+    let request = MeasureBatch::decode(record.object_id, value)
+        .map_err(|_| ControlError::bad_message("invalid text batch"))?;
+    require_context_operation(session, request.address.context_id, OP_SURFACE_TRACK_MEDIA)?;
+    let (font, id) = {
+        let mut host = lock(&shared.overlays);
+        let id = authorize(&host, session, request.address)?;
+        host.layout_charges.retain(|_, token| token.strong_count() != 0);
+        let charged =
+            host.layout_charges.keys().filter(|(owner, _)| *owner == session.identity).count();
+        if host.text_jobs.contains(&session.identity)
+            || host.text_jobs.len() >= vivid_protocol::overlay::MAX_OWNERS
+            || (request.retain && charged + request.texts.len() > MAX_RETAINED_LAYOUTS)
+            || (request.retain
+                && host.layout_charges.len() + request.texts.len()
+                    > MAX_RETAINED_LAYOUTS * vivid_protocol::overlay::MAX_OWNERS)
+        {
+            return Err(ControlError::limit("text worker or retained layout capacity exceeded"));
+        }
+        host.text_jobs.insert(session.identity);
+        (host.font(), id)
+    };
+    let worker_shared = shared.clone();
+    let worker_session = session.clone();
+    let spawned = thread::Builder::new().name("vivid-overlay-text-batch".into()).spawn(move || {
+        let shared = worker_shared;
+        let session = worker_session;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut system = TextSystem::new(font);
+            let mut results = Vec::with_capacity(request.texts.len());
+            for text in &request.texts {
+                let layout = system.shape_styled(text);
+                let source = text.text();
+                let mut measured = layout_geometry(
+                    &layout,
+                    &source,
+                    text.max_lines.map_or(usize::MAX, usize::from),
+                )?;
+                if let Some(width) = text.max_width {
+                    measured.width = width;
+                }
+                let painted = if request.retain {
+                    Some(Arc::new(
+                        crate::display::vector::text_layout::paint(
+                            &layout,
+                            text,
+                            measured.width.get(),
+                            measured.height.get(),
+                        )
+                        .map_err(|e| e.0)?,
+                    ))
+                } else {
+                    None
+                };
+                results.push((measured, painted));
+            }
+            Ok::<_, &'static str>(results)
+        }))
+        .unwrap_or(Err("host text shaping failed"));
+        // The context lock precedes the host lock, matching authorization elsewhere.
+        let contexts = lock(&session.contexts);
+        let context = contexts
+            .get(&request.address.context_id)
+            .filter(|c| c.operation_classes & OP_SURFACE_TRACK_MEDIA != 0);
+        let mut host = lock(&shared.overlays);
+        let response = (|| {
+            let context = context.ok_or(ControlError::bad_state("text context was revoked"))?;
+            authorize(&host, &session, request.address)?;
+            let results = result.map_err(ControlError::limit)?;
+            host.layout_charges.retain(|_, token| token.strong_count() != 0);
+            if request.retain
+                && host.layout_charges.len() + results.len()
+                    > MAX_RETAINED_LAYOUTS * vivid_protocol::overlay::MAX_OWNERS
+            {
+                return Err(ControlError::limit("global retained layout capacity exceeded"));
+            }
+            let count = if request.retain { results.len() as u64 } else { 0 };
+            let next = host
+                .next_layout
+                .checked_add(count)
+                .ok_or(ControlError::limit("layout identities exhausted"))?;
+            let first = host.next_layout;
+            let layouts = results
+                .iter()
+                .enumerate()
+                .map(|(i, (m, _))| {
+                    (if request.retain { first + i as u64 + 1 } else { 0 }, m.clone())
+                })
+                .collect();
+            let payload = BatchMeasured { address: request.address, layouts }
+                .payload()
+                .map_err(|_| ControlError::limit("text batch geometry limit"))?;
+            let body = Envelope::new(request_id, payload)
+                .encode()
+                .map_err(|_| ControlError::limit("text batch encoding failed"))?;
+            let limit = context
+                .contract
+                .get(Resource::ControlRecordBody)
+                .min(u64::from(session.control_body_limit));
+            if body.len() as u64 > limit {
+                return Err(ControlError::limit("text batch exceeds reply limit"));
+            }
+            // Install the complete batch only after all shaping, geometry, and reply checks pass.
+            for (i, (_, layout)) in results.into_iter().enumerate() {
+                if let Some(layout) = layout {
+                    let layout_id = first + i as u64 + 1;
+                    host.layout_charges
+                        .insert((session.identity, layout_id), Arc::downgrade(&layout.token));
+                    host.layouts.insert((id, layout_id), layout);
+                }
+            }
+            host.next_layout = next;
+            Ok(body)
+        })();
+        host.text_jobs.remove(&session.identity);
+        match response {
+            Ok(body) => {
+                session.post_control(
+                    messages::OVERLAY_TEXT_BATCH_MEASURED,
+                    request.address.surface_id,
+                    body,
+                );
+            },
+            Err(error) => {
+                if let Ok(body) = protocol_error(request_id, error.code, false, error.message) {
+                    session.post_control(messages::ERROR, request.address.surface_id, body);
+                }
+            },
+        }
+    });
+    if spawned.is_err() {
+        lock(&shared.overlays).text_jobs.remove(&session.identity);
+        return Err(ControlError::limit("could not start text worker"));
+    }
+    Ok(())
+}
+
+pub(in crate::vivid) fn release_layouts(
+    shared: &ServiceShared,
+    session: &SessionRuntime,
+    record: &Record,
+    value: &Value,
+) -> Result<(), ControlError> {
+    if !session.supports(registry::OVERLAY_TEXT_LAYOUT) {
+        return Err(ControlError::unsupported("overlay-text-layout-v1 was not negotiated"));
+    }
+    let request = ReleaseLayouts::decode(record.object_id, value)
+        .map_err(|_| ControlError::bad_message("invalid layout release"))?;
+    require_context_operation(session, request.address.context_id, OP_SURFACE_TRACK_MEDIA)?;
+    let mut host = lock(&shared.overlays);
+    let id = authorize(&host, session, request.address)?;
+    if request.ids.iter().any(|layout| !host.layouts.contains_key(&(id, *layout))) {
+        return Err(ControlError::not_found("text layout is absent or released"));
+    }
+    for layout in request.ids {
+        host.layouts.remove(&(id, layout));
+    }
+    host.layout_charges.retain(|_, token| token.strong_count() != 0);
+    Ok(())
+}
 
 fn authorize(
     host: &Host,
@@ -151,14 +324,28 @@ pub(super) fn measure_text(
     text: &Text,
 ) -> Result<TextMeasurement, &'static str> {
     let layout = system.shape_overlay(text);
+    let mut measured = layout_geometry(&layout, &text.text, usize::MAX)?;
+    measured.width =
+        Scalar::new(if text.text.is_empty() { 0. } else { f64::from(layout.full_width()) })
+            .map_err(|_| "text extent out of range")?;
+    measured.height =
+        Scalar::new(f64::from(layout.height())).map_err(|_| "text extent out of range")?;
+    Ok(measured)
+}
+
+fn layout_geometry<B: parley::Brush>(
+    layout: &parley::Layout<B>,
+    source: &str,
+    max_lines: usize,
+) -> Result<TextMeasurement, &'static str> {
     let scalar = |v: f32| Scalar::new(f64::from(v)).map_err(|_| "text geometry out of range");
     let mut result = TextMeasurement {
-        width: if text.text.is_empty() { Scalar::ZERO } else { scalar(layout.full_width())? },
-        height: scalar(layout.height())?,
+        width: Scalar::ZERO,
+        height: Scalar::ZERO,
         lines: Vec::new(),
         clusters: Vec::new(),
     };
-    for line in layout.lines() {
+    for line in layout.lines().take(max_lines) {
         if result.lines.len() >= MAX_TEXT_GEOMETRY {
             return Err("too many text lines");
         }
@@ -166,15 +353,21 @@ pub(super) fn measure_text(
         let range = line.text_range();
         let geometry = TextGeometry {
             start: range.start as u32,
-            end: range.end.min(text.text.len()) as u32,
+            end: range.end.min(source.len()) as u32,
             x: scalar(m.offset)?,
             y: scalar(m.block_min_coord)?,
-            width: if text.text.is_empty() { Scalar::ZERO } else { scalar(m.advance)? },
+            width: if source.is_empty() { Scalar::ZERO } else { scalar(m.advance)? },
             height: scalar(m.block_max_coord - m.block_min_coord)?,
             baseline: scalar(m.baseline)?,
             rtl: false,
         };
         result.lines.push(geometry.clone());
+        result.width = result.width.max(if source.is_empty() {
+            Scalar::ZERO
+        } else {
+            scalar(m.offset + m.advance)?
+        });
+        result.height = scalar(m.block_max_coord)?;
         let mut x = m.offset;
         for run in line.runs() {
             for cluster in run.visual_clusters() {
@@ -195,13 +388,54 @@ pub(super) fn measure_text(
             }
         }
     }
-    result.validate_text(&text.text).map_err(|_| "invalid text ranges")?;
+    result.validate_text(source).map_err(|_| "invalid text ranges")?;
     Ok(result)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn styled_layout_wraps_aligns_clips_and_preserves_unicode_style_boundaries() {
+        use vivid_protocol::overlay::wire::text::styled::*;
+        let mut system = TextSystem::new(Default::default());
+        let mut text = StyledText::new(
+            "one two three four five six",
+            TextStyle { size: Scalar::new(18.).unwrap(), ..Default::default() },
+        );
+        text.max_width = Some(Scalar::new(90.).unwrap());
+        let wrapped = system.shape_styled(&text);
+        assert!(wrapped.len() > 1);
+        let full = layout_geometry(&wrapped, &text.text(), usize::MAX).unwrap();
+        let clipped = layout_geometry(&wrapped, &text.text(), 1).unwrap();
+        assert_eq!(clipped.lines.len(), 1);
+        assert!(clipped.height < full.height);
+        text.runs[0].text = "A".into();
+        text.wrap = false;
+        text.alignment = TextAlignment::Center;
+        let centered = system.shape_styled(&text);
+        assert!(centered.get(0).unwrap().metrics().offset > 10.);
+        text.runs.push(TextRun {
+            text: "😀日".into(),
+            style: TextStyle {
+                size: Scalar::new(24.).unwrap(),
+                weight: 700,
+                underline: true,
+                ..Default::default()
+            },
+        });
+        let layout = system.shape_styled(&text);
+        let geometry = layout_geometry(&layout, &text.text(), usize::MAX).unwrap();
+        assert_eq!(geometry.clusters.iter().map(|c| c.end).max(), Some(8));
+        let scene = crate::display::vector::text_layout::paint(
+            &layout,
+            &text,
+            geometry.width.get(),
+            geometry.height.get(),
+        )
+        .unwrap();
+        assert!(!scene.scene.encoding().resources.glyphs.is_empty());
+    }
     #[test]
     fn measurement_uses_paint_shaping_and_unicode_cluster_boundaries() {
         let mut system = TextSystem::new(Default::default());

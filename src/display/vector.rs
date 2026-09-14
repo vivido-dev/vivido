@@ -11,6 +11,10 @@ use vivid_protocol::vector::{self as wire, Canvas, Command, HitRole, InvalidScen
 
 use super::text::TextSystem;
 
+#[path = "vector_text.rs"]
+pub mod text_layout;
+use text_layout::MeasuredLayout;
+
 #[derive(Clone)]
 struct HitPath {
     path: Arc<BezPath>,
@@ -68,6 +72,15 @@ pub fn compile(
     canvas: &Canvas,
     text: &mut TextSystem,
     images: &BTreeMap<u64, ImageData>,
+) -> Result<CompiledScene, InvalidScene> {
+    compile_with_layouts(canvas, text, images, &BTreeMap::new())
+}
+
+pub fn compile_with_layouts(
+    canvas: &Canvas,
+    text: &mut TextSystem,
+    images: &BTreeMap<u64, ImageData>,
+    layouts: &BTreeMap<u64, Arc<MeasuredLayout>>,
 ) -> Result<CompiledScene, InvalidScene> {
     canvas.validate()?;
     let mut result = CompiledScene { scene: Scene::new(), retained: Vec::new(), hits: Vec::new() };
@@ -158,6 +171,16 @@ pub fn compile(
                     );
                 }
                 match command {
+                    Command::TextLayout { layout, origin } => {
+                        let layout = layouts
+                            .get(layout)
+                            .ok_or(InvalidScene("unknown or released text layout"))?;
+                        let transform =
+                            state.transform * Affine::translate((origin.x.get(), origin.y.get()));
+                        check_bounds(Rect::new(0., 0., layout.width, layout.height), transform)?;
+                        result.scene.append(&layout.scene, Some(transform));
+                        result.retained.push(layout.token.clone());
+                    },
                     Command::Fill(path, brush) => result.scene.fill(
                         fill_rule(path),
                         state.transform,

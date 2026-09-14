@@ -1232,6 +1232,7 @@ impl ServiceShared {
                 registry::VECTOR_SCENE,
                 registry::OVERLAY_INPUT,
                 registry::OVERLAY_TEXT,
+                registry::OVERLAY_TEXT_LAYOUT,
             ]);
             profiles.sort_unstable();
         }
@@ -2088,7 +2089,11 @@ fn establish_root_session(
                 "Vivido overlays require the complete window, vector, and input profile bundle",
             ));
         }
-        accepted.retain(|p| !overlay_profiles.contains(&p.as_str()) && p != registry::OVERLAY_TEXT);
+        accepted.retain(|p| {
+            !overlay_profiles.contains(&p.as_str())
+                && p != registry::OVERLAY_TEXT
+                && p != registry::OVERLAY_TEXT_LAYOUT
+        });
     }
     registry::validate_profile_set(accepted.iter().map(String::as_str))
         .map_err(io::Error::other)?;
@@ -2437,6 +2442,8 @@ fn dispatch_control(
         | messages::OVERLAY_ACTION
         | messages::QUERY_OVERLAY
         | messages::MEASURE_OVERLAY_TEXT
+        | messages::MEASURE_OVERLAY_TEXT_BATCH
+        | messages::RELEASE_OVERLAY_TEXT_LAYOUTS
         | messages::SET_OVERLAY_EDITOR
         | messages::PROBE_TRACK_CONFIG
         | messages::CREATE_TRACK
@@ -2491,6 +2498,14 @@ fn dispatch_control(
         messages::MEASURE_OVERLAY_TEXT => {
             overlay::text::measure(shared, session, record, request_id, &value)?;
             return Ok(None);
+        },
+        messages::MEASURE_OVERLAY_TEXT_BATCH => {
+            overlay::text::measure_batch(shared, session, record, request_id, &value)?;
+            return Ok(None);
+        },
+        messages::RELEASE_OVERLAY_TEXT_LAYOUTS => {
+            overlay::text::release_layouts(shared, session, record, &value)?;
+            (messages::OK, record.object_id, Ok(messages::ok(request_id)))
         },
         messages::SET_OVERLAY_EDITOR => {
             overlay::text::set_editor(shared, session, record, &value)?;
@@ -6443,7 +6458,37 @@ mod tests {
                 Brush::Solid(Color(0xff0000ff)),
             )
             .unwrap();
-        let receipt = window.submit(canvas.clone()).unwrap();
+        let styled = vivid_sdk::overlay::StyledText::new(
+            "A😀日",
+            vivid_sdk::overlay::TextStyle {
+                size: vivid_sdk::overlay::Scalar::new(18.).unwrap(),
+                underline: true,
+                ..Default::default()
+            },
+        );
+        let layouts = window.layout_text_batch(&[styled.clone(), styled.clone()]).unwrap();
+        assert_eq!(layouts[0].measurement(), layouts[1].measurement());
+        let neighbor_layout = neighbor.layout_text(&styled).unwrap();
+        assert!(
+            neighbor
+                .draw_text_layout(
+                    &mut Canvas::new(),
+                    &layouts[0],
+                    vivid_sdk::overlay::Point::new(0., 0.).unwrap()
+                )
+                .is_err()
+        );
+        let mut text_scene = canvas.clone();
+        window
+            .draw_text_layout(
+                &mut text_scene,
+                &layouts[0],
+                vivid_sdk::overlay::Point::new(40., 40.).unwrap(),
+            )
+            .unwrap();
+        window.release_text_layout(&layouts[1]).unwrap();
+        assert!(window.release_text_layout(&layouts[1]).is_err());
+        let receipt = window.submit(text_scene.clone()).unwrap();
         assert_eq!(receipt.wait(Duration::ZERO).unwrap(), None);
         neighbor.present(canvas.clone()).unwrap();
         {
@@ -6519,6 +6564,17 @@ mod tests {
             .unwrap();
         assert!(measured.width.get() > 0.);
         assert_eq!(measured.clusters.iter().map(|c| c.end).max(), Some(8));
+        window.release_text_layout(&layouts[0]).unwrap();
+        assert!(window.submit(text_scene).is_err());
+        {
+            let host = lock(&service.shared.overlays);
+            assert_eq!(host.layouts.len(), 1, "only the other owner's namespace remains");
+            assert_eq!(
+                host.layout_charges.values().filter(|token| token.strong_count() > 0).count(),
+                2,
+                "the released displayed layout is still charged"
+            );
+        }
         if receipt.wait(Duration::ZERO).unwrap().is_some() {
             window.set_editor_geometry(1, Some(Rect::new(5., 6., 1., 18.).unwrap())).unwrap();
             assert_eq!(service.overlay_editor_area(), Some((30., 52., 2., 36.)));
@@ -6597,10 +6653,56 @@ mod tests {
             assert!(Instant::now() < deadline, "owner cleanup did not finish");
             thread::yield_now();
         }
+        neighbor
+            .draw_text_layout(
+                &mut canvas,
+                &neighbor_layout,
+                vivid_sdk::overlay::Point::new(40., 40.).unwrap(),
+            )
+            .unwrap();
         neighbor.present(canvas).unwrap();
         neighbor.close().unwrap();
         second.close().unwrap();
         assert!(lock(&service.shared.overlays).drawing(&service.scene).is_empty());
+    }
+
+    #[test]
+    fn native_text_batches_reject_atomically_and_recover_released_capacity() {
+        use vivid_sdk::overlay::{OverlayWindowOptions, Rect, StyledText, TextStyle, WindowMode};
+        let service =
+            socket_service!(VividService::start_with_wake(test_geometry(), Arc::new(|_| {})));
+        service.update_overlay_viewport(800., 600., 1.);
+        let first = vivid_sdk::OverlaySession::connect(test_config(&service)).unwrap();
+        let second = vivid_sdk::OverlaySession::connect(test_config(&service)).unwrap();
+        let options =
+            OverlayWindowOptions::new(Rect::new(0., 0., 100., 100.).unwrap(), WindowMode::Floating);
+        let window = first.create_window(options.clone()).unwrap();
+        let other = second.create_window(options).unwrap();
+        let text = StyledText::new("A", TextStyle::default());
+        let huge = StyledText::new("a".repeat(1024), TextStyle::default());
+        assert!(window.layout_text_batch(&[text.clone(), huge]).is_err());
+        assert!(
+            lock(&service.shared.overlays).layouts.is_empty(),
+            "failed batch must not publish its first layout"
+        );
+        let mut layouts = Vec::new();
+        for _ in 0..4 {
+            layouts.extend(window.layout_text_batch(&vec![text.clone(); 32]).unwrap());
+        }
+        assert!(window.layout_text(&text).is_err(), "per-owner layout limit must reject");
+        let independent = other.layout_text(&text).unwrap();
+        window.release_text_layout(&layouts[0]).unwrap();
+        window.layout_text(&text).unwrap();
+        first.close().unwrap();
+        // A stale first-owner handle cannot release the other owner's reused local surface.
+        assert!(other.release_text_layout(&layouts[1]).is_err());
+        other.release_text_layout(&independent).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !lock(&service.shared.overlays).layouts.is_empty() {
+            assert!(Instant::now() < deadline, "layout namespace cleanup timed out");
+            thread::yield_now();
+        }
+        second.close().unwrap();
     }
 
     #[test]
@@ -6685,6 +6787,22 @@ mod tests {
                 assert_eq!(&pixels.bytes[offset..offset + 4], &color, "{fixture} {mode} pixels");
             }
             assert!(service.overlay_pointer(24., 44., Some((1, true)), 0));
+            let mut red_text = 0;
+            let mut blue_text = 0;
+            for y in 120..200 {
+                for x in 20..220 {
+                    let offset = y * pixels.padded_bytes_per_row as usize + x * 4;
+                    let pixel = &pixels.bytes[offset..offset + 4];
+                    red_text +=
+                        usize::from(pixel[0] > 80 && u16::from(pixel[0]) > u16::from(pixel[2]) * 2);
+                    blue_text +=
+                        usize::from(pixel[2] > 80 && u16::from(pixel[2]) > u16::from(pixel[0]) * 2);
+                }
+            }
+            assert!(
+                red_text > 10 && blue_text > 10,
+                "{fixture} {mode} retained text preserves both run colors"
+            );
             assert!(service.overlay_pointer(24., 44., Some((1, false)), 0));
             assert!(service.overlay_keyboard(
                 Event::Ime { preedit: "A😀日".into(), selection: Some((1, 5)) },

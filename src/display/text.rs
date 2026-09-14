@@ -193,6 +193,66 @@ impl TextSystem {
         self.metrics
     }
 
+    /// A single paragraph with ranged styles; shaping never restarts at run boundaries.
+    pub fn shape_styled(
+        &mut self,
+        text: &vivid_protocol::overlay::wire::text::styled::StyledText,
+    ) -> Layout<usize> {
+        use vivid_protocol::overlay::wire::text::styled::TextAlignment;
+        let source = text.text();
+        self.ensure_fontique_fallbacks(&source);
+        let mut context = LayoutContext::<usize>::default();
+        let mut builder = context.ranged_builder(&mut self.font_cx, &source, 1.0, true);
+        builder.push_default(self.family_stacks[0].clone());
+        builder.push_default(StyleProperty::Locale(self.locale));
+        // Empty paragraphs still need the requested line height.
+        builder.push_default(StyleProperty::FontSize(text.runs[0].style.size.get() as f32));
+        let mut start = 0;
+        for (index, run) in text.runs.iter().enumerate() {
+            let end = start + run.text.len();
+            let range = start..end;
+            let style = &run.style;
+            if !style.family.is_empty() {
+                builder.push(FontFamily::from(style.family.as_str()), range.clone());
+            }
+            builder.push(StyleProperty::FontSize(style.size.get() as f32), range.clone());
+            builder.push(
+                StyleProperty::FontWeight(FontWeight::new(f32::from(style.weight))),
+                range.clone(),
+            );
+            builder.push(
+                StyleProperty::FontStyle(if style.italic {
+                    ParleyFontStyle::Italic
+                } else {
+                    ParleyFontStyle::Normal
+                }),
+                range.clone(),
+            );
+            builder.push(StyleProperty::Brush(index), range);
+            start = end;
+        }
+        let mut layout = builder.build(&source);
+        let width = text.max_width.map(|w| w.get() as f32);
+        if !text.wrap && width.is_some() {
+            let mut breaker = layout.break_lines();
+            while breaker.break_next().is_some() {
+                breaker.set_prior_line_width(width.unwrap_or(f32::MAX));
+            }
+        } else {
+            layout.break_all_lines(width);
+        }
+        layout.align(
+            match text.alignment {
+                TextAlignment::Start => Alignment::Start,
+                TextAlignment::Center => Alignment::Center,
+                TextAlignment::End => Alignment::End,
+                TextAlignment::Justify => Alignment::Justify,
+            },
+            AlignmentOptions::default(),
+        );
+        layout
+    }
+
     /// Whether compatible terminal cells should be shaped as ligature runs.
     pub fn ligatures(&self) -> bool {
         self.font.ligatures()
