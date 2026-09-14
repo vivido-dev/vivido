@@ -653,6 +653,19 @@ impl VividService {
         lock(&self.shared.overlays).set_font(font);
     }
 
+    pub(crate) fn overlay_editor_area(&self) -> Option<(f64, f64, f64, f64)> {
+        let mut host = lock(&self.shared.overlays);
+        let rect = host.editor_rect()?;
+        let viewport = host.viewport?;
+        let scale = f64::from(viewport.scale_numerator) / f64::from(viewport.scale_denominator);
+        Some((
+            rect.origin.x.get() * scale,
+            rect.origin.y.get() * scale,
+            rect.width.get() * scale,
+            rect.height.get() * scale,
+        ))
+    }
+
     pub(crate) fn overlay_keyboard(
         &self,
         event: vivid_protocol::overlay::Event,
@@ -1218,6 +1231,7 @@ impl ServiceShared {
                 registry::TERMINAL_OVERLAY,
                 registry::VECTOR_SCENE,
                 registry::OVERLAY_INPUT,
+                registry::OVERLAY_TEXT,
             ]);
             profiles.sort_unstable();
         }
@@ -2074,7 +2088,7 @@ fn establish_root_session(
                 "Vivido overlays require the complete window, vector, and input profile bundle",
             ));
         }
-        accepted.retain(|p| !overlay_profiles.contains(&p.as_str()));
+        accepted.retain(|p| !overlay_profiles.contains(&p.as_str()) && p != registry::OVERLAY_TEXT);
     }
     registry::validate_profile_set(accepted.iter().map(String::as_str))
         .map_err(io::Error::other)?;
@@ -2422,6 +2436,8 @@ fn dispatch_control(
         | messages::SET_OVERLAY_WINDOW
         | messages::OVERLAY_ACTION
         | messages::QUERY_OVERLAY
+        | messages::MEASURE_OVERLAY_TEXT
+        | messages::SET_OVERLAY_EDITOR
         | messages::PROBE_TRACK_CONFIG
         | messages::CREATE_TRACK
         | messages::DESTROY_TRACK
@@ -2472,6 +2488,14 @@ fn dispatch_control(
     let request_id = envelope.request_id;
     let value = Value::Map(envelope.payload.clone());
     let reply = match record.record_type {
+        messages::MEASURE_OVERLAY_TEXT => {
+            overlay::text::measure(shared, session, record, request_id, &value)?;
+            return Ok(None);
+        },
+        messages::SET_OVERLAY_EDITOR => {
+            overlay::text::set_editor(shared, session, record, &value)?;
+            (messages::OK, record.object_id, Ok(messages::ok(request_id)))
+        },
         messages::SET_OVERLAY_WINDOW | messages::OVERLAY_ACTION | messages::QUERY_OVERLAY => {
             overlay::dispatch(shared, session, record, request_id, &value)?
         },
@@ -6481,6 +6505,31 @@ mod tests {
         window.set_bounds(Rect::new(10., 20., 100., 80.).unwrap()).unwrap();
         assert!(service.overlay_pointer(30., 50., Some((1, true)), 0));
         assert!(service.overlay_pointer(30., 50., Some((1, false)), 0));
+        let measured = window
+            .measure_text(&vivid_sdk::overlay::Text {
+                text: "A😀日".into(),
+                origin: vivid_sdk::overlay::Point::new(0., 0.).unwrap(),
+                size: vivid_sdk::overlay::Scalar::new(18.).unwrap(),
+                family: String::new(),
+                weight: 400,
+                italic: false,
+                color: Color(0xffffffff),
+                max_width: None,
+            })
+            .unwrap();
+        assert!(measured.width.get() > 0.);
+        assert_eq!(measured.clusters.iter().map(|c| c.end).max(), Some(8));
+        if receipt.wait(Duration::ZERO).unwrap().is_some() {
+            window.set_editor_geometry(1, Some(Rect::new(5., 6., 1., 18.).unwrap())).unwrap();
+            assert_eq!(service.overlay_editor_area(), Some((30., 52., 2., 36.)));
+            assert!(
+                neighbor.set_editor_geometry(1, Some(Rect::new(1., 1., 1., 18.).unwrap())).is_err()
+            );
+            assert_eq!(service.overlay_editor_area(), Some((30., 52., 2., 36.)));
+            assert!(window.set_editor_geometry(2, None).is_err());
+            window.set_editor_geometry(1, None).unwrap();
+            assert_eq!(service.overlay_editor_area(), None);
+        }
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
             assert!(Instant::now() < deadline, "pointer event did not reach the producer");

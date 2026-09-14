@@ -712,13 +712,18 @@ impl WindowContext {
 
         // Redraw the window.
         let terminal = self.terminal.lock();
-        self.display.draw(
+        let presented = self.display.draw(
             terminal,
             scheduler,
             &self.message_buffer,
             &self.config,
             &mut self.search_state,
-        )
+        );
+        let area = self.vivid_service.overlay_editor_area().map(|(x, y, w, h)| {
+            (winit::dpi::PhysicalPosition::new(x, y), winit::dpi::PhysicalSize::new(w, h))
+        });
+        self.display.window.set_overlay_ime_area(area);
+        presented
     }
 
     /// Present latency-sensitive state without waiting for Windows to synthesize `WM_PAINT`.
@@ -2217,6 +2222,10 @@ impl WindowContext {
         json_value!({
             "window": self.automation_summary_with_terminal(&terminal),
             "cell": {"width": size.cell_width(), "height": size.cell_height()},
+            "ime_cursor_area": self.display.window.ime_area().map(|(overlay,position,size)| json_value!({
+                "source": if overlay {"overlay"} else {"terminal"},
+                "x":position.x,"y":position.y,"width":size.width,"height":size.height,
+            })),
             "scale_factor": self.display.window.scale_factor,
             "scrollback_size": grid.history_size(),
             "display_offset": grid.display_offset(),

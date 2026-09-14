@@ -20,10 +20,15 @@ use vivid_protocol::vector::Scalar;
 
 use super::*;
 
+#[path = "overlay_text.rs"]
+pub(super) mod text;
+
 #[derive(Default)]
 pub(crate) struct Host {
+    text_jobs: HashSet<SessionIdentity>,
+    editor: Option<(SurfaceIdentity, vivid_protocol::overlay::wire::text::EditorGeometry)>,
     windows: Windows,
-    viewport: Option<Viewport>,
+    pub(super) viewport: Option<Viewport>,
     surfaces: HashSet<SurfaceIdentity>,
     scenes: HashMap<TrackIdentity, (ChannelGeneration, u64, Arc<CompiledScene>)>,
     assets: HashMap<(TrackIdentity, ChannelGeneration, u64), (Weak<()>, usize)>,
@@ -150,6 +155,9 @@ impl Host {
     }
 
     pub fn remove_surface(&mut self, identity: SurfaceIdentity) {
+        if self.editor.is_some_and(|(id, _)| id == identity) {
+            self.editor = None;
+        }
         self.retire_presentation(identity);
         self.accepted.remove(&identity);
         self.windows.close(identity, DismissReason::Closed);
@@ -169,6 +177,9 @@ impl Host {
     }
 
     pub fn remove_owner(&mut self, owner: SessionIdentity) -> Vec<SurfaceIdentity> {
+        if self.editor.is_some_and(|(id, _)| id.context.session == owner) {
+            self.editor = None;
+        }
         let ids = self.surfaces.iter().copied().filter(|id| id.context.session == owner).collect();
         self.windows.revoke_owner(owner);
         self.surfaces.retain(|id| id.context.session != owner);
@@ -206,9 +217,14 @@ impl Host {
     }
 
     pub(super) fn keyboard(&mut self, event: vivid_protocol::overlay::Event, escape: bool) -> bool {
-        self.windows.keyboard(event, escape)
+        let consumed = self.windows.keyboard(event, escape);
+        self.editor_rect();
+        consumed
     }
     pub(super) fn set_pane_focus(&mut self, focused: bool) {
+        if !focused {
+            self.editor = None;
+        }
         self.windows.set_pane_focus(focused);
     }
 
@@ -228,9 +244,11 @@ impl Host {
             return false;
         };
         let drawings: Vec<_> = self.displayed.values().cloned().collect();
-        self.windows.pointer(point, button, modifiers, |id, point| {
+        let consumed = self.windows.pointer(point, button, modifiers, |id, point| {
             drawings.iter().find(|d| d.window == id).and_then(|d| d.compiled.hit(point))
-        })
+        });
+        self.editor_rect();
+        consumed
     }
 
     pub(super) fn wheel(
@@ -449,6 +467,7 @@ impl Host {
 
 /// Lives only on the authenticated bulk channel worker. Shaping never executes on the UI loop.
 pub(super) struct VectorWorker {
+    font: crate::config::font::Font,
     text: TextSystem,
     images: BTreeMap<u64, ImageData>,
     tokens: BTreeMap<u64, Arc<()>>,
@@ -457,7 +476,8 @@ pub(super) struct VectorWorker {
 impl VectorWorker {
     pub fn new(font: crate::config::font::Font) -> Self {
         Self {
-            text: TextSystem::new(font),
+            text: TextSystem::new(font.clone()),
+            font,
             images: BTreeMap::new(),
             tokens: BTreeMap::new(),
             last_asset: 0,
@@ -535,6 +555,11 @@ impl VectorWorker {
             };
             if body.len() > config.maximum_scene_bytes as usize + 12 {
                 return Err("vector scene exceeds immutable track ceiling");
+            }
+            let font = lock(&shared.overlays).font();
+            if self.font != font {
+                self.text.update_font(font.clone());
+                self.font = font;
             }
             let mut compiled =
                 compile(&frame.canvas, &mut self.text, &self.images).map_err(|e| e.0)?;
@@ -727,6 +752,7 @@ pub(super) fn dispatch(
         },
         _ => return Err(ControlError::bad_message("unknown overlay control")),
     };
+    host.editor_rect();
     drop(host);
     if record.record_type != messages::QUERY_OVERLAY {
         shared.request_frame_wake();
