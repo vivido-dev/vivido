@@ -65,6 +65,8 @@ mod damage;
 mod media;
 mod meter;
 mod overlay;
+#[cfg(windows)]
+mod windows_live_move;
 
 #[cfg(any(unix, windows))]
 #[cfg(test)]

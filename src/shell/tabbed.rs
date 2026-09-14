@@ -1000,12 +1000,6 @@ impl TabbedApplication {
                 self.close_all();
                 event_loop.exit();
             },
-            #[cfg(windows)]
-            WindowEvent::Moved(_) => {
-                if let Some(pane) = self.tabs.active_window() {
-                    self.processor.present_moving_host_pane(pane);
-                }
-            },
             WindowEvent::Resized(size) => {
                 self.close_menu();
                 if let (Some(renderer), Some(chrome)) = (&mut self.renderer, &self.chrome) {

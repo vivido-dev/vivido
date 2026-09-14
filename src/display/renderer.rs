@@ -165,6 +165,8 @@ impl WindowsComposition {
             unreachable!("Windows can only create Win32 window handles");
         };
         let hwnd = windows::Win32::Foundation::HWND(handle.hwnd.get() as *mut std::ffi::c_void);
+        // SAFETY: this native window was obtained on its owning event-loop thread.
+        unsafe { super::windows_live_move::install(hwnd.0) }?;
 
         let device: IDCompositionDevice = unsafe { DCompositionCreateDevice2(None::<&IUnknown>) }?;
         // Put the visual above any HWND client/child content. The HWND itself has no redirection

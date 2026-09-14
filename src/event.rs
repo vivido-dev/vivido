@@ -470,26 +470,6 @@ impl Processor {
         self.windows.get_mut(&window_id)
     }
 
-    /// Refresh a native child surface while its host is in the Windows move loop.
-    /// Child coordinates do not change when the parent moves, so Windows need not send the pane
-    /// its own move/paint event. Keep presentation live without invalidating cached text or media.
-    #[cfg(windows)]
-    pub fn present_moving_host_pane(&mut self, window_id: WindowId) {
-        let Some(window) = self.windows.get_mut(&window_id) else { return };
-        window.display.mark_vivid_frame();
-        window.dirty = true;
-        window.display.window.request_redraw();
-        if window.draw_latency_sensitive(&mut self.scheduler) == Some(true) {
-            let public_id = window.ipc_window_id();
-            let frame_sequence = window.automation.record_frame();
-            self.automation.emit(
-                Some(public_id),
-                "frame_presented",
-                serde_json::json!({"frame_sequence": frame_sequence}),
-            );
-        }
-    }
-
     /// Run the event loop.
     ///
     /// The result is exit code generate from the loop.
