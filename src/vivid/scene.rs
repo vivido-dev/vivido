@@ -2281,6 +2281,7 @@ pub fn track_kind_name(configuration: &TrackConfiguration) -> &'static str {
         KindConfiguration::Audio(_) => "audio",
         KindConfiguration::Raster(_) => "raster",
         KindConfiguration::EncodedImage(_) => "encoded-image",
+        KindConfiguration::VectorScene(_) => "vector",
     }
 }
 

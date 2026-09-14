@@ -56,6 +56,7 @@ pub mod hint;
 pub mod rects;
 pub mod renderer;
 pub mod text;
+pub mod vector;
 pub mod window;
 
 mod bell;
@@ -732,12 +733,17 @@ impl Display {
         {
             let text_system = &mut self.text_system;
 
+            if let Some(image) = prepared_media.as_ref().and_then(|media| media.layers[0].as_ref())
+            {
+                scene.draw_image(image, Affine::IDENTITY);
+            }
             for cell in &prepared_cells {
                 Self::paint_cell_background(&mut scene, cell, size_info);
             }
 
-            if let Some(media) = &prepared_media {
-                scene.draw_image(&media.image, Affine::IDENTITY);
+            if let Some(image) = prepared_media.as_ref().and_then(|media| media.layers[1].as_ref())
+            {
+                scene.draw_image(image, Affine::IDENTITY);
             }
 
             for span in
@@ -762,11 +768,17 @@ impl Display {
 
             let mut rects = lines.rects(&metrics, &size_info);
 
+            rects.extend(cursor.rects(&size_info, config.cursor.thickness()));
+            paint_rects(&mut scene, std::mem::take(&mut rects));
+            if let Some(image) = prepared_media.as_ref().and_then(|media| media.layers[2].as_ref())
+            {
+                scene.draw_image(image, Affine::IDENTITY);
+            }
+
+            // Host UI remains above application media, including the terminal search and IME UI.
             if search_state.regex().is_some() {
                 self.draw_line_indicator(&mut scene, config, total_lines, None, display_offset);
             }
-
-            rects.extend(cursor.rects(&size_info, config.cursor.thickness()));
 
             let visual_bell_intensity = self.visual_bell.intensity();
             if visual_bell_intensity != 0. {

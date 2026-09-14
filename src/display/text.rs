@@ -166,6 +166,29 @@ impl TextSystem {
         text_system
     }
 
+    /// Shape on the scene worker with the same font collection and script fallback as the terminal.
+    pub fn shape_overlay(&mut self, text: &vivid_protocol::vector::Text) -> Layout<()> {
+        self.ensure_fontique_fallbacks(&text.text);
+        let mut builder = self.layout_cx.ranged_builder(&mut self.font_cx, &text.text, 1.0, true);
+        if text.family.is_empty() {
+            builder.push_default(self.family_stacks[0].clone());
+        } else {
+            builder.push_default(FontFamily::from(text.family.as_str()));
+        }
+        builder.push_default(StyleProperty::FontSize(text.size.get() as f32));
+        builder.push_default(StyleProperty::FontWeight(FontWeight::new(f32::from(text.weight))));
+        builder.push_default(StyleProperty::FontStyle(if text.italic {
+            ParleyFontStyle::Italic
+        } else {
+            ParleyFontStyle::Normal
+        }));
+        builder.push_default(StyleProperty::Locale(self.locale));
+        let mut layout = builder.build(&text.text);
+        layout.break_all_lines(text.max_width.map(|width| width.get() as f32));
+        layout.align(Alignment::Start, AlignmentOptions::default());
+        layout
+    }
+
     pub fn metrics(&self) -> TextMetrics {
         self.metrics
     }

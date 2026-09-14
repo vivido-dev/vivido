@@ -1058,6 +1058,256 @@ mod tests {
 
     #[cfg(any(unix, windows))]
     #[test]
+    fn media_text_layers_have_separate_gpu_targets() {
+        use crate::vivid::scene::{Frame, RgbaBuffer, SharedScene};
+        use std::sync::Arc;
+        use vivid_protocol::{
+            cbor::Value,
+            identity::{PresenterInstanceId, SessionIdentity},
+            messages::LaneClass,
+            revision::{ChannelGeneration, SurfaceRevision, TargetGeneration},
+            scene::{Fit, SceneNode},
+            surface::{CoordinateModel, SurfaceDefinition, SurfaceDescriptor},
+            track::{MILESTONE_OUTPUT_READY, TrackMode},
+        };
+        let _gpu = gpu_lock();
+        if offscreen_device().is_err() {
+            eprintln!("Skipping layer rendering test: no wgpu adapter");
+            return;
+        }
+        let shared = SharedScene::for_test();
+        let owner = SessionIdentity::new(PresenterInstanceId([77; 16]), 1).unwrap();
+        let context = owner.context(1).unwrap();
+        shared.register_session(owner, TargetGeneration::ONE).unwrap();
+        for layer in 0..3_u64 {
+            let surface = context.surface(layer + 1).unwrap();
+            let track = surface.track(1).unwrap();
+            shared
+                .create_surface(
+                    surface,
+                    SurfaceDefinition {
+                        context_id: 1,
+                        surface_id: layer + 1,
+                        semantic_profile: vivid_protocol::registry::TERMINAL_CONTENT.into(),
+                        coordinate_model: CoordinateModel::TerminalContentCells,
+                        logical_width: 2,
+                        logical_height: 2,
+                        scale_numerator: 1,
+                        scale_denominator: 1,
+                        rotation: 0,
+                        descriptor: SurfaceDescriptor {
+                            role: vivid_protocol::surface::SurfaceRole::Figure,
+                            title: String::new(),
+                            semantic_content_revision: 0,
+                            semantic_availability: 0,
+                            locator_hint: String::new(),
+                        },
+                        policy: 0,
+                        profile_parameters: vec![],
+                    },
+                )
+                .unwrap();
+            let config = vivid_sdk::TrackBuilder::detached(
+                1,
+                layer + 1,
+                3,
+                TrackMode::Live,
+                LaneClass::Bulk,
+            )
+            .raster(1, 1)
+            .unwrap()
+            .build(
+                &vivid_protocol::resource::ResourceContract::new(
+                    [u64::MAX; vivid_protocol::resource::RESOURCE_COUNT],
+                ),
+                1,
+            )
+            .unwrap();
+            shared.create_track(track, config).unwrap();
+            shared.accept_channel(track, ChannelGeneration::ONE, 4096, 8).unwrap();
+            shared
+                .publish_frame(
+                    track,
+                    ChannelGeneration::ONE,
+                    80,
+                    1,
+                    1,
+                    true,
+                    2,
+                    Frame {
+                        frame_id: 1,
+                        pts_us: 0,
+                        width: 1,
+                        height: 1,
+                        sar_num: 1,
+                        sar_den: 1,
+                        alpha_mode: 1,
+                        rgba: Arc::new(RgbaBuffer::new(vec![255, 0, 0, 255])),
+                        damage: None,
+                    },
+                )
+                .unwrap();
+            shared
+                .activate_tracks(
+                    surface,
+                    SurfaceRevision::ONE,
+                    &[(3, 1, ChannelGeneration::ONE, MILESTONE_OUTPUT_READY)],
+                )
+                .unwrap();
+            shared.begin_transaction(context, layer + 1).unwrap();
+            shared
+                .queue_node_create(
+                    context,
+                    layer + 1,
+                    SceneNode {
+                        owning_context_id: 1,
+                        node_id: layer + 1,
+                        surface_context_id: 1,
+                        surface_id: layer + 1,
+                        geometry: vec![
+                            (0, Value::Unsigned(1)),
+                            (1, Value::Unsigned((layer * 2) << 32)),
+                            (2, Value::Unsigned(0)),
+                            (3, Value::Unsigned(2 << 32)),
+                            (4, Value::Unsigned(2 << 32)),
+                            (5, Value::Unsigned(layer)),
+                        ],
+                        fit: Fit::Contain,
+                        linear_sampling: false,
+                        z_index: 0,
+                        visible: true,
+                        opacity: u16::MAX,
+                        clip: None,
+                    },
+                )
+                .unwrap();
+            shared.commit_transaction(context, layer + 1, TargetGeneration::ONE, None).unwrap();
+        }
+        let mut renderer =
+            SceneRenderer::new(RenderSource::Offscreen, PhysicalSize::new(64, 32), false).unwrap();
+        renderer.set_vivid_scene(shared);
+        let size = crate::display::SizeInfo::new(64., 32., 8., 8., 0., 0., false);
+        let media = renderer.prepare_media(&size, 0).unwrap();
+        assert!(media.layers.iter().all(Option::is_some));
+        let mut scene = Scene::new();
+        scene.draw_image(media.layers[0].as_ref().unwrap(), kurbo::Affine::IDENTITY);
+        scene.fill(
+            vello::peniko::Fill::NonZero,
+            kurbo::Affine::IDENTITY,
+            Color::from_rgb8(0, 0, 255),
+            None,
+            &kurbo::Rect::new(0., 0., 64., 32.),
+        );
+        scene.draw_image(media.layers[1].as_ref().unwrap(), kurbo::Affine::IDENTITY);
+        // Opaque glyph/cursor coverage between normal and above-text media.
+        for x in [4., 20., 36.] {
+            scene.fill(
+                vello::peniko::Fill::NonZero,
+                kurbo::Affine::IDENTITY,
+                Color::from_rgb8(0, 255, 0),
+                None,
+                &kurbo::Rect::new(x, 4., x + 8., 12.),
+            );
+        }
+        scene.draw_image(media.layers[2].as_ref().unwrap(), kurbo::Affine::IDENTITY);
+        renderer.render(&scene, Color::BLACK).unwrap();
+        let readback = renderer.begin_screenshot().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let pixels = loop {
+            if let Some(pixels) = renderer.poll_screenshot(&readback).unwrap() {
+                break pixels;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        };
+        let pixel = |x: usize, y: usize| {
+            let offset = y * pixels.padded_bytes_per_row as usize + x * 4;
+            &pixels.bytes[offset..offset + 4]
+        };
+        assert_eq!(pixel(1, 1), [0, 0, 255, 255], "layer zero belongs below cell backgrounds");
+        assert_eq!(pixel(17, 1), [255, 0, 0, 255], "layer one belongs above cell backgrounds");
+        assert_eq!(pixel(24, 8), [0, 255, 0, 255], "layer one belongs below glyph/cursor coverage");
+        assert_eq!(pixel(40, 8), [255, 0, 0, 255], "layer two belongs above glyph/cursor coverage");
+        let uploads = renderer.media_metrics().uploaded_pixels;
+        assert!(!renderer.prepare_media(&size, 0).unwrap().changed);
+        assert_eq!(renderer.media_metrics().uploaded_pixels, uploads);
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn portable_vector_scene_renders_and_hit_tests_the_same_transform_and_clip() {
+        use std::collections::BTreeMap;
+        use vivid_protocol::vector::{
+            Brush, Canvas, Color as WireColor, Command, GradientStop, HitRole, Path, Point, Rect,
+            Transform,
+        };
+
+        let _gpu = gpu_lock();
+        if offscreen_device().is_err() {
+            eprintln!("Skipping vector rendering test: no wgpu adapter");
+            return;
+        }
+        let mut renderer =
+            SceneRenderer::new(RenderSource::Offscreen, PhysicalSize::new(64, 64), false).unwrap();
+        let mut canvas = Canvas::new();
+        canvas.push(Command::Save).unwrap();
+        canvas.push(Command::Transform(Transform::new([1., 0., 0., 1., 8., 8.]).unwrap())).unwrap();
+        let clip = Path::rectangle(Rect::new(0., 0., 32., 32.).unwrap()).unwrap();
+        canvas.push(Command::Clip(clip.clone())).unwrap();
+        canvas
+            .fill(
+                Path::rectangle(Rect::new(0., 0., 48., 48.).unwrap()).unwrap(),
+                Brush::Linear {
+                    start: Point::new(0., 0.).unwrap(),
+                    end: Point::new(32., 0.).unwrap(),
+                    stops: vec![
+                        GradientStop { offset: 0, color: WireColor(0xff0000ff) },
+                        GradientStop { offset: 65535, color: WireColor(0x0000ffff) },
+                    ],
+                },
+            )
+            .unwrap();
+        canvas.push(Command::Hit { id: u64::MAX, path: clip, role: HitRole::Drag }).unwrap();
+        canvas
+            .push(Command::Hit {
+                id: 2,
+                path: Path::ellipse(Rect::new(12., 12., 8., 8.).unwrap()).unwrap(),
+                role: HitRole::Transparent,
+            })
+            .unwrap();
+        canvas.push(Command::Restore).unwrap();
+        let mut text = crate::display::text::TextSystem::new(crate::config::font::Font::default());
+        let compiled =
+            crate::display::vector::compile(&canvas, &mut text, &BTreeMap::new()).unwrap();
+        assert_eq!(compiled.hit(Point::new(10., 10.).unwrap()), Some((u64::MAX, HitRole::Drag)));
+        assert_eq!(compiled.hit(Point::new(24., 24.).unwrap()), None);
+        assert_eq!(compiled.hit(Point::new(41., 10.).unwrap()), None);
+        renderer.render(&compiled.scene, Color::from_rgb8(255, 255, 255)).unwrap();
+        let readback = renderer.begin_screenshot().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let pixels = loop {
+            if let Some(pixels) = renderer.poll_screenshot(&readback).unwrap() {
+                break pixels;
+            }
+            assert!(std::time::Instant::now() < deadline, "GPU readback timed out");
+            std::thread::yield_now();
+        };
+        let pixel = |x: usize, y: usize| {
+            let offset = y * pixels.padded_bytes_per_row as usize + x * 4;
+            &pixels.bytes[offset..offset + 4]
+        };
+        assert_eq!(pixel(4, 4), [255, 255, 255, 255]);
+        assert_eq!(pixel(41, 10), [255, 255, 255, 255]);
+        assert!(pixel(10, 10)[0] > pixel(10, 10)[2]);
+        assert!(pixel(37, 10)[2] > pixel(37, 10)[0]);
+        // Moving/rescaling a cached scene does not require compilation or text shaping.
+        let mut moved = Scene::new();
+        moved.append(&compiled.scene, Some(kurbo::Affine::scale(0.5)));
+        assert!(renderer.render(&moved, Color::from_rgb8(255, 255, 255)).unwrap());
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
     fn offscreen_renderer_preserves_straight_alpha() {
         let _gpu = gpu_lock();
         if offscreen_device().is_err() {
