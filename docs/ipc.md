@@ -312,6 +312,10 @@ waiting until it disconnects, the same as any unanswered request.
   capabilities. `current_directory` prefers the shell's OSC 7 report when its host is this
   machine and falls back to the foreground-process probe; over Windows OSC 7 is the only
   source.
+  It also reports `ime_cursor_area`, lightweight native-accessibility state, `vivid_overlay`
+  resource/submission counters, and overlay render-cache passes, skips, and target allocations.
+  These counters are cumulative and are intended for bounded acceptance and performance probes;
+  they do not expose producer content or capability material.
 - `list_windows`, `inspect`, and `diagnose` include `client_health` (`healthy`, `quarantined`, or
   `recovering`) and an optional bounded `last_client_fault` containing only an opaque fault ID,
   fault class, and fixed diagnostic text.

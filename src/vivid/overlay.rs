@@ -48,6 +48,10 @@ pub(crate) struct Host {
     pub(super) actors: HashMap<SessionIdentity, Weak<SessionRuntime>>,
     lanes: HashMap<SessionIdentity, (u64, Instant)>,
     font: crate::config::font::Font,
+    compiled_scenes: u64,
+    presented_scenes: u64,
+    superseded_scenes: u64,
+    window_updates: u64,
 }
 
 #[derive(Clone)]
@@ -67,6 +71,31 @@ impl Host {
     }
     pub(super) fn capturing(&self) -> bool {
         self.windows.has_pointer_capture()
+    }
+    pub(super) fn focused(&self) -> bool {
+        self.windows.focus().is_some()
+    }
+    #[cfg(test)]
+    pub(super) fn compiled_scene_count(&self) -> u64 {
+        self.compiled_scenes
+    }
+    #[cfg(any(unix, windows))]
+    pub(super) fn automation_metrics(&self) -> serde_json::Value {
+        serde_json::json!({
+            "windows": self.windows.visible().count(),
+            "focused": self.windows.focus().is_some(),
+            "pointer_capture": self.windows.has_pointer_capture(),
+            "compiled_scenes": self.compiled_scenes,
+            "presented_scenes": self.presented_scenes,
+            "superseded_scenes": self.superseded_scenes,
+            "window_updates": self.window_updates,
+            "compiled_tracks": self.scenes.len(),
+            "retained_assets": self.assets.len(),
+            "retained_layouts": self.layouts.len(),
+            "pending_submissions": self.pending.len(),
+            "queued_outcomes": self.outcomes.values().map(VecDeque::len).sum::<usize>(),
+            "input_lanes": self.lanes.len(),
+        })
     }
     pub(super) fn font(&self) -> crate::config::font::Font {
         self.font.clone()
@@ -355,6 +384,14 @@ impl Host {
         outcome: PresentationOutcome,
     ) {
         if self.pending.remove(&(owner, submission)) {
+            match outcome {
+                PresentationOutcome::Presented => {
+                    self.presented_scenes = self.presented_scenes.saturating_add(1);
+                },
+                PresentationOutcome::Superseded => {
+                    self.superseded_scenes = self.superseded_scenes.saturating_add(1);
+                },
+            }
             self.outcomes
                 .entry(owner)
                 .or_default()
@@ -672,6 +709,7 @@ impl VectorWorker {
                 }
             }
             host.scenes.insert(identity, (generation, frame.revision, compiled));
+            host.compiled_scenes = host.compiled_scenes.saturating_add(1);
             host.accepted.insert(identity.surface, frame.revision);
             host.pending.insert((owner, submission));
             if let Some(old) = host.submissions.insert(identity, submission) {
@@ -743,6 +781,7 @@ pub(super) fn dispatch(
                     .create(identity, request.address.generation, request.options.clone())
                     .map(|()| 1)
             } else {
+                host.window_updates = host.window_updates.saturating_add(1);
                 host.windows.update(
                     identity,
                     request.address.generation,

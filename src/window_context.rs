@@ -111,6 +111,16 @@ type PtyWorker =
 
 const VIVID_RESIZE_SETTLE_DELAY: Duration = Duration::from_millis(120);
 
+#[cfg(any(unix, windows))]
+fn ui_paste_needs_action_context(search_active: bool, overlay_focused: bool) -> bool {
+    search_active || overlay_focused
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+fn terminal_accessibility_focused(terminal_focused: bool, overlay_focused: bool) -> bool {
+    terminal_focused && !overlay_focused
+}
+
 /// Maximum delay between directly presented frames during continuous Windows input or PTY output.
 #[cfg(windows)]
 const LATENCY_SENSITIVE_FRAME_INTERVAL: Duration = Duration::from_millis(16);
@@ -456,24 +466,33 @@ impl WindowContext {
         let terminal = Arc::new(FairMutex::new(terminal));
 
         #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
-        let accessibility = if terminal_document_enabled() {
-            let snapshot = AccessibilitySnapshot::new(
-                &terminal.lock(),
-                display.size_info,
-                display.window.title(),
-            );
+        let accessibility = {
+            let document = terminal_document_enabled();
+            let snapshot = if document {
+                AccessibilitySnapshot::new(
+                    &terminal.lock(),
+                    display.size_info,
+                    display.window.title(),
+                )
+            } else {
+                AccessibilitySnapshot::window(
+                    display.size_info,
+                    display.window.title(),
+                    terminal.lock().is_focused,
+                )
+            };
+            let accessibility_target =
+                if document { options.vivid_target } else { VividTarget::Desktop };
             #[cfg(target_os = "macos")]
             let state = (!display.window.is_headless() && !display.window.is_embedded())
-                .then(|| AccessibilityState::new(&display.window, options.vivid_target, snapshot));
+                .then(|| AccessibilityState::new(&display.window, accessibility_target, snapshot));
             #[cfg(any(target_os = "linux", target_os = "windows"))]
             let state = event_loop_handle.winit().and_then(|event_loop| {
                 display.window.winit_window().map(|window| {
-                    AccessibilityState::new(event_loop, window, options.vivid_target, snapshot)
+                    AccessibilityState::new(event_loop, window, accessibility_target, snapshot)
                 })
             });
             state
-        } else {
-            None
         };
 
         // Map only after any enabled native accessibility adapter has been installed.
@@ -984,11 +1003,14 @@ impl WindowContext {
     /// Immutable accessibility state for composition by a containing shell.
     #[cfg(target_os = "linux")]
     pub(crate) fn accessibility_snapshot(&self) -> AccessibilitySnapshot {
-        AccessibilitySnapshot::new(
+        let mut snapshot = AccessibilitySnapshot::new(
             &self.terminal.lock(),
             self.display.size_info,
             self.display.window.title(),
-        )
+        );
+        snapshot.focused =
+            terminal_accessibility_focused(snapshot.focused, self.vivid_service.overlay_focused());
+        snapshot
     }
 
     /// Current terminal content size in physical pixels.
@@ -1098,7 +1120,10 @@ impl WindowContext {
         clipboard: &mut Clipboard,
         scheduler: &mut Scheduler,
     ) -> Vec<u8> {
-        if self.search_state.regex().is_none() {
+        if !ui_paste_needs_action_context(
+            self.search_state.regex().is_some(),
+            self.vivid_service.overlay_focused(),
+        ) {
             return self.application_paste(text);
         }
 
@@ -2118,9 +2143,6 @@ impl WindowContext {
     /// Publish a coalesced read-only accessibility snapshot.
     #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
     pub fn sync_accessibility(&mut self) {
-        if !terminal_document_enabled() {
-            return;
-        }
         let Some(accessibility) = &mut self.accessibility else { return };
 
         // A retained terminal document carries per-cell text geometry for the entire scrollback.
@@ -2133,11 +2155,21 @@ impl WindowContext {
         }
 
         let terminal = self.terminal.lock();
-        let snapshot = AccessibilitySnapshot::new(
-            &terminal,
-            self.display.size_info,
-            self.display.window.title(),
-        );
+        let mut snapshot = if terminal_document_enabled() {
+            AccessibilitySnapshot::new(
+                &terminal,
+                self.display.size_info,
+                self.display.window.title(),
+            )
+        } else {
+            AccessibilitySnapshot::window(
+                self.display.size_info,
+                self.display.window.title(),
+                terminal.is_focused,
+            )
+        };
+        snapshot.focused =
+            terminal_accessibility_focused(snapshot.focused, self.vivid_service.overlay_focused());
         drop(terminal);
         accessibility.update(snapshot);
     }
@@ -2216,7 +2248,11 @@ impl WindowContext {
         };
         #[cfg(windows)]
         let echo = None::<bool>;
-        let (text_scene_builds, cached_scene_frames, media_metrics) =
+        #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+        let native_accessibility = self.accessibility.is_some();
+        #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+        let native_accessibility = false;
+        let (text_scene_builds, cached_scene_frames, media_metrics, overlay_metrics) =
             self.display.optimization_metrics();
 
         json_value!({
@@ -2243,6 +2279,16 @@ impl WindowContext {
             "client_health": self.client_health.as_str(),
             "last_client_fault": self.last_client_fault.as_ref().map(client_fault_json),
             "vivid_streaming": self.vivid_service.automation_streaming_metrics(),
+            "vivid_overlay": self.vivid_service.automation_overlay_metrics(),
+            "accessibility": {
+                "native_adapter": native_accessibility,
+                "terminal_document": terminal_document_enabled(),
+                "terminal_focused": terminal_accessibility_focused(
+                    terminal.is_focused,
+                    self.vivid_service.overlay_focused(),
+                ),
+                "overlay_semantics": false,
+            },
             "render_optimization": {
                 "text_scene_builds": text_scene_builds,
                 "cached_scene_frames": cached_scene_frames,
@@ -2251,6 +2297,9 @@ impl WindowContext {
                 "uploaded_frames": media_metrics.frames,
                 "uploaded_pixels": media_metrics.uploaded_pixels,
                 "full_frame_pixels": media_metrics.full_frame_pixels,
+                "overlay_render_passes": overlay_metrics.render_passes,
+                "overlay_skipped_passes": overlay_metrics.skipped_passes,
+                "overlay_target_allocations": overlay_metrics.target_allocations,
             },
             "limits": {
                 "transcript_bytes": crate::automation::TRANSCRIPT_CAPACITY,
@@ -3415,6 +3464,10 @@ mod vivid_environment_tests {
     #[cfg(any(unix, windows))]
     use super::assign_ipc_window_id;
     use super::configure_vivid_pty_environment;
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    use super::terminal_accessibility_focused;
+    #[cfg(any(unix, windows))]
+    use super::ui_paste_needs_action_context;
     #[cfg(windows)]
     use super::vivid_wslenv;
     #[cfg(windows)]
@@ -3437,6 +3490,22 @@ mod vivid_environment_tests {
     use winit::event::{DeviceId, Event as WinitEvent, MouseScrollDelta, TouchPhase, WindowEvent};
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     use winit::window::WindowId;
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn ui_paste_routes_through_a_focused_overlay() {
+        assert!(!ui_paste_needs_action_context(false, false));
+        assert!(ui_paste_needs_action_context(true, false));
+        assert!(ui_paste_needs_action_context(false, true));
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    #[test]
+    fn overlay_focus_suppresses_terminal_accessibility_focus() {
+        assert!(terminal_accessibility_focused(true, false));
+        assert!(!terminal_accessibility_focused(true, true));
+        assert!(!terminal_accessibility_focused(false, false));
+    }
 
     #[cfg(any(unix, windows))]
     #[test]

@@ -357,8 +357,15 @@ impl Display {
         self.vivid_frame_requested = true;
     }
 
-    pub(crate) fn optimization_metrics(&self) -> (u64, u64, media::SourceUploadMetrics) {
-        (self.text_scene_builds, self.cached_scene_frames, self.scene_renderer.media_metrics())
+    pub(crate) fn optimization_metrics(
+        &self,
+    ) -> (u64, u64, media::SourceUploadMetrics, overlay::OverlayRenderMetrics) {
+        (
+            self.text_scene_builds,
+            self.cached_scene_frames,
+            self.scene_renderer.media_metrics(),
+            self.scene_renderer.overlay_metrics(),
+        )
     }
 
     fn invalidate_cached_scene(&mut self) {

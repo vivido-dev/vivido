@@ -686,6 +686,10 @@ impl VividService {
         lock(&self.shared.overlays).capturing()
     }
 
+    pub(crate) fn overlay_focused(&self) -> bool {
+        lock(&self.shared.overlays).focused()
+    }
+
     pub(crate) fn overlay_pointer(
         &self,
         x: f64,
@@ -1079,6 +1083,11 @@ impl VividService {
             "actor_timeout_services": self.shared.actor_timeout_services.load(Ordering::Acquire),
             "snapshot_rebuilds": self.scene.optimization_metrics().snapshot_rebuilds,
         })
+    }
+
+    #[cfg(any(unix, windows))]
+    pub(crate) fn automation_overlay_metrics(&self) -> serde_json::Value {
+        lock(&self.shared.overlays).automation_metrics()
     }
 
     #[cfg(any(unix, windows))]
@@ -6506,6 +6515,8 @@ mod tests {
                 renderer.set_vivid_scene(service.scene());
                 let size = SizeInfo::new(800., 600., 10., 25., 0., 0., false);
                 let media = renderer.prepare_media(&size, 0).unwrap();
+                assert_eq!(renderer.overlay_metrics().render_passes, 1);
+                assert_eq!(renderer.overlay_metrics().target_allocations, 1);
                 let mut composed = vello::Scene::new();
                 composed.draw_image(media.overlay.as_ref().unwrap(), Affine::IDENTITY);
                 assert!(renderer.render(&composed, VelloColor::from_rgb8(0, 255, 0)).unwrap());
@@ -6533,10 +6544,14 @@ mod tests {
                     !renderer.prepare_media(&size, 0).unwrap().changed,
                     "unchanged overlays reuse their GPU target"
                 );
+                assert_eq!(renderer.overlay_metrics().skipped_passes, 1);
                 let generation = media.image_generation;
+                let compiled = lock(&service.shared.overlays).compiled_scene_count();
                 window.set_bounds(Rect::new(20., 20., 100., 80.).unwrap()).unwrap();
                 let moved = renderer.prepare_media(&size, 0).unwrap();
                 assert!(moved.changed);
+                assert_eq!(renderer.overlay_metrics().render_passes, 2);
+                assert_eq!(lock(&service.shared.overlays).compiled_scene_count(), compiled);
                 assert_eq!(
                     moved.image_generation, generation,
                     "movement preserves the texture used by cached terminal scenes"
@@ -6615,8 +6630,11 @@ mod tests {
             false
         ));
         assert!(service.overlay_keyboard(Event::Text("日本語".into()), false));
+        assert!(service.overlay_focused());
         service.overlay_focus(false);
+        assert!(!service.overlay_focused());
         service.overlay_focus(true);
+        assert!(service.overlay_focused());
         assert!(service.overlay_keyboard(
             Event::Key { physical: 41, down: true, repeat: false, modifiers: 0 },
             true
@@ -6666,6 +6684,84 @@ mod tests {
         neighbor.close().unwrap();
         second.close().unwrap();
         assert!(lock(&service.shared.overlays).drawing(&service.scene).is_empty());
+    }
+
+    #[test]
+    #[ignore = "records hardware-dependent overlay frame-time percentiles"]
+    fn overlay_window_movement_performance_measurement() {
+        use crate::display::renderer::SceneRenderer;
+        use crate::display::window::RenderSource;
+        use vivid_sdk::overlay::{
+            Brush, Canvas, Color, OverlayWindowOptions, Path, Rect, WindowMode,
+        };
+
+        let service =
+            socket_service!(VividService::start_with_wake(test_geometry(), Arc::new(|_| {})));
+        service.update_overlay_viewport(800., 600., 1.);
+        let session = vivid_sdk::OverlaySession::connect(test_config(&service)).unwrap();
+        let window = session
+            .create_window(OverlayWindowOptions::new(
+                Rect::new(10., 20., 240., 160.).unwrap(),
+                WindowMode::Floating,
+            ))
+            .unwrap();
+        let mut canvas = Canvas::new();
+        canvas
+            .fill(
+                Path::rounded_rectangle(Rect::new(0., 0., 240., 160.).unwrap(), 12.).unwrap(),
+                Brush::Solid(Color(0x285080e8)),
+            )
+            .unwrap();
+        window.present(canvas).unwrap();
+
+        let mut renderer = SceneRenderer::new(
+            RenderSource::Offscreen,
+            winit::dpi::PhysicalSize::new(800, 600),
+            false,
+        )
+        .expect("overlay performance measurement requires a Vello adapter");
+        renderer.set_vivid_scene(service.scene());
+        let size = SizeInfo::new(800., 600., 10., 25., 0., 0., false);
+        let prepared = renderer.prepare_media(&size, 0).unwrap();
+        let mut scene = vello::Scene::new();
+        scene.draw_image(prepared.overlay.as_ref().unwrap(), vello::kurbo::Affine::IDENTITY);
+        renderer.render(&scene, vello::peniko::Color::BLACK).unwrap();
+        let compiled = lock(&service.shared.overlays).compiled_scene_count();
+
+        const FRAMES: usize = 240;
+        let mut samples = Vec::with_capacity(FRAMES);
+        for frame in 0..FRAMES {
+            let x = 10. + f64::from((frame % 240) as u16);
+            let y = 20. + f64::from((frame % 120) as u16);
+            let started = Instant::now();
+            window.set_bounds(Rect::new(x, y, 240., 160.).unwrap()).unwrap();
+            assert!(renderer.prepare_media(&size, 0).unwrap().changed);
+            samples.push(started.elapsed());
+        }
+        samples.sort_unstable();
+        let percentile = |numerator: usize| samples[(FRAMES - 1) * numerator / 100];
+        let p50 = percentile(50);
+        let p95 = percentile(95);
+        let maximum = samples[FRAMES - 1];
+        let metrics = renderer.overlay_metrics();
+        eprintln!(
+            "overlay movement: frames={FRAMES} p50_us={} p95_us={} max_us={} renders={} skips={} allocations={}",
+            p50.as_micros(),
+            p95.as_micros(),
+            maximum.as_micros(),
+            metrics.render_passes,
+            metrics.skipped_passes,
+            metrics.target_allocations,
+        );
+        assert_eq!(lock(&service.shared.overlays).compiled_scene_count(), compiled);
+        assert_eq!(metrics.target_allocations, 1);
+        assert_eq!(metrics.render_passes, FRAMES as u64 + 1);
+        assert!(
+            p95 < Duration::from_micros(16_667),
+            "95th-percentile movement work exceeded one 60 Hz frame"
+        );
+        window.close().unwrap();
+        session.close().unwrap();
     }
 
     #[test]

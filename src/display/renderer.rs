@@ -469,6 +469,10 @@ impl SceneRenderer {
         self.media.source_upload_metrics()
     }
 
+    pub(crate) fn overlay_metrics(&self) -> super::overlay::OverlayRenderMetrics {
+        self.overlays.metrics()
+    }
+
     pub fn prepare_media(
         &mut self,
         size: &SizeInfo,

@@ -83,6 +83,26 @@ pub(crate) struct AccessibilitySnapshot {
 }
 
 impl AccessibilitySnapshot {
+    /// Minimal native tree used where exposing retained terminal history would be too expensive.
+    pub(crate) fn window(size: SizeInfo, title: &str, focused: bool) -> Self {
+        Self {
+            title: title.to_owned(),
+            text: String::new(),
+            lines: Vec::new(),
+            cursor: AccessibleRange::default(),
+            selection: None,
+            block_selection: Vec::new(),
+            visible: AccessibleRange::default(),
+            focused,
+            width: size.width(),
+            height: size.height(),
+            cell_width: size.cell_width(),
+            cell_height: size.cell_height(),
+            padding_x: size.padding_x(),
+            padding_y: size.padding_y(),
+        }
+    }
+
     pub(crate) fn new<T>(term: &Term<T>, size: SizeInfo, title: &str) -> Self {
         let grid = term.grid();
         let top = grid.topmost_line();
@@ -371,6 +391,15 @@ mod tests {
     use crate::terminal::index::Side;
     use crate::terminal::selection::{Selection, SelectionType};
     use crate::terminal::term::test::TermSize;
+
+    #[test]
+    fn lightweight_window_snapshot_has_no_terminal_document() {
+        let snapshot = AccessibilitySnapshot::window(size(4, 2), "test", true);
+        assert!(snapshot.text.is_empty());
+        assert!(snapshot.lines.is_empty());
+        assert!(snapshot.focused);
+        assert_eq!(snapshot.title, "test");
+    }
 
     fn term(columns: usize, lines: usize) -> Term<VoidListener> {
         Term::new(Default::default(), &TermSize::new(columns, lines), VoidListener)

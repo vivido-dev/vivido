@@ -6,6 +6,14 @@ use vello::kurbo::{Affine, Rect};
 use vello::peniko::{Color, Fill, ImageAlphaType, ImageData, Mix};
 use vello::{AaConfig, RenderParams, Renderer, Scene, wgpu};
 
+/// Cumulative work performed by the pane-overlay render cache.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct OverlayRenderMetrics {
+    pub render_passes: u64,
+    pub skipped_passes: u64,
+    pub target_allocations: u64,
+}
+
 #[derive(Default)]
 pub(super) struct OverlayRenderer {
     pub scene: Option<SharedScene>,
@@ -18,6 +26,7 @@ pub(super) struct OverlayRenderer {
         u64,
     )>,
     pub generation: u64,
+    metrics: OverlayRenderMetrics,
 }
 struct Target {
     _texture: wgpu::Texture,
@@ -27,6 +36,10 @@ struct Target {
     height: u32,
 }
 impl OverlayRenderer {
+    pub fn metrics(&self) -> OverlayRenderMetrics {
+        self.metrics
+    }
+
     pub fn finish(&mut self, presented: bool) {
         if let Some(scene) = &self.scene {
             scene.overlays().lock().unwrap_or_else(|p| p.into_inner()).finish(presented);
@@ -77,6 +90,7 @@ impl OverlayRenderer {
             let mut image = renderer.register_texture(texture.clone());
             image.alpha_type = ImageAlphaType::AlphaPremultiplied;
             self.target = Some(Target { _texture: texture, view, image, width, height });
+            self.metrics.target_allocations = self.metrics.target_allocations.saturating_add(1);
         }
         let key: Vec<_> = drawings
             .iter()
@@ -99,8 +113,10 @@ impl OverlayRenderer {
             )?;
             renderer.mark_override_image_dirty(&target.image);
             self.key = key;
+            self.metrics.render_passes = self.metrics.render_passes.saturating_add(1);
             Ok((Some(target.image.clone()), true))
         } else {
+            self.metrics.skipped_passes = self.metrics.skipped_passes.saturating_add(1);
             Ok((Some(target.image.clone()), false))
         }
     }
