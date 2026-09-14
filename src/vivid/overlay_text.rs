@@ -20,6 +20,11 @@ pub(in crate::vivid) fn measure_batch(
     }
     let request = MeasureBatch::decode(record.object_id, value)
         .map_err(|_| ControlError::bad_message("invalid text batch"))?;
+    if request.texts.iter().any(|t| t.typography != Default::default())
+        && !session.supports(registry::OVERLAY_TYPOGRAPHY)
+    {
+        return Err(ControlError::unsupported("overlay-typography-v1 was not negotiated"));
+    }
     require_context_operation(session, request.address.context_id, OP_SURFACE_TRACK_MEDIA)?;
     let (font, id) = {
         let mut host = lock(&shared.overlays);
@@ -48,21 +53,37 @@ pub(in crate::vivid) fn measure_batch(
             let mut system = TextSystem::new(font);
             let mut results = Vec::with_capacity(request.texts.len());
             for text in &request.texts {
-                let layout = system.shape_styled(text);
-                let source = text.text();
+                let prepared = system.prepare_styled(text);
+                let layout = &prepared.layout;
+                let source = prepared.text.text();
                 let mut measured = layout_geometry(
-                    &layout,
+                    layout,
                     &source,
                     text.max_lines.map_or(usize::MAX, usize::from),
                 )?;
+                if let Some(cut) = prepared.truncated_at {
+                    measured.clusters.retain(|g| g.end as usize > prepared.prefix_bytes);
+                    for geometry in measured.lines.iter_mut().chain(&mut measured.clusters) {
+                        geometry.start = (geometry.start as usize)
+                            .saturating_sub(prepared.prefix_bytes)
+                            .min(cut) as u32;
+                        geometry.end = (geometry.end as usize)
+                            .saturating_sub(prepared.prefix_bytes)
+                            .min(cut) as u32;
+                    }
+                    measured.truncated_at = Some(cut as u32);
+                    measured
+                        .validate_text(&text.text())
+                        .map_err(|_| "invalid ellipsis source mapping")?;
+                }
                 if let Some(width) = text.max_width {
                     measured.width = width;
                 }
                 let painted = if request.retain {
                     Some(Arc::new(
                         crate::display::vector::text_layout::paint(
-                            &layout,
-                            text,
+                            layout,
+                            &prepared.text,
                             measured.width.get(),
                             measured.height.get(),
                         )
@@ -340,6 +361,7 @@ fn layout_geometry<B: parley::Brush>(
 ) -> Result<TextMeasurement, &'static str> {
     let scalar = |v: f32| Scalar::new(f64::from(v)).map_err(|_| "text geometry out of range");
     let mut result = TextMeasurement {
+        truncated_at: None,
         width: Scalar::ZERO,
         height: Scalar::ZERO,
         lines: Vec::new(),

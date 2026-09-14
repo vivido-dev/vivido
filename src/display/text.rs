@@ -23,6 +23,9 @@ use crate::config::font::Font;
 use crate::display::color::Rgb;
 use crate::display::content::RenderableCell;
 
+#[path = "typography.rs"]
+mod typography;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct TextMetrics {
     pub cell_width: f32,
@@ -206,6 +209,21 @@ impl TextSystem {
         builder.push_default(self.family_stacks[0].clone());
         builder.push_default(StyleProperty::Locale(self.locale));
         // Empty paragraphs still need the requested line height.
+        builder.push_default(StyleProperty::LetterSpacing(
+            text.typography.letter_spacing.get() as f32
+        ));
+        builder.push_default(StyleProperty::WordSpacing(text.typography.word_spacing.get() as f32));
+        if let Some(height) = text.typography.line_height {
+            builder.push_default(LineHeight::Absolute(height.get() as f32));
+        }
+        builder.push_default(parley::FontFeatures::from(
+            match (text.typography.ligatures, text.typography.kerning) {
+                (true, true) => "",
+                (true, false) => "\"kern\" 0",
+                (false, true) => "\"liga\" 0, \"clig\" 0, \"dlig\" 0, \"calt\" 0",
+                (false, false) => "\"liga\" 0, \"clig\" 0, \"dlig\" 0, \"calt\" 0, \"kern\" 0",
+            },
+        ));
         builder.push_default(StyleProperty::FontSize(text.runs[0].style.size.get() as f32));
         let mut start = 0;
         for (index, run) in text.runs.iter().enumerate() {
