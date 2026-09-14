@@ -13,7 +13,7 @@ pub(super) struct OverlayRenderer {
     key: Vec<(
         vivid_protocol::identity::SurfaceIdentity,
         u64,
-        u64,
+        vivid_protocol::overlay::wire::Submission,
         vivid_protocol::vector::Rect,
         u64,
     )>,
@@ -27,6 +27,11 @@ struct Target {
     height: u32,
 }
 impl OverlayRenderer {
+    pub fn finish(&mut self, presented: bool) {
+        if let Some(scene) = &self.scene {
+            scene.overlays().lock().unwrap_or_else(|p| p.into_inner()).finish(presented);
+        }
+    }
     pub fn clear(&mut self, renderer: &mut Renderer) {
         if let Some(target) = self.target.take() {
             renderer.unregister_texture(target.image);
@@ -43,10 +48,11 @@ impl OverlayRenderer {
         width: u32,
         height: u32,
     ) -> Result<(Option<ImageData>, bool), vello::Error> {
+        self.finish(false);
         let drawings = self
             .scene
             .as_ref()
-            .map(|scene| scene.overlays().lock().unwrap_or_else(|p| p.into_inner()).drawing(scene))
+            .map(|scene| scene.overlays().lock().unwrap_or_else(|p| p.into_inner()).prepare(scene))
             .unwrap_or_default();
         if drawings.is_empty() && self.target.is_none() {
             return Ok((None, false));
@@ -74,7 +80,7 @@ impl OverlayRenderer {
         }
         let key: Vec<_> = drawings
             .iter()
-            .map(|d| (d.window, d.window_revision, d.revision, d.bounds, d.scale.to_bits()))
+            .map(|d| (d.window, d.window_revision, d.submission, d.bounds, d.scale.to_bits()))
             .collect();
         let target = self.target.as_ref().expect("overlay target allocated");
         if new_target || self.key != key {
@@ -97,6 +103,12 @@ impl OverlayRenderer {
         } else {
             Ok((Some(target.image.clone()), false))
         }
+    }
+}
+
+impl Drop for OverlayRenderer {
+    fn drop(&mut self) {
+        self.finish(false);
     }
 }
 

@@ -3225,7 +3225,7 @@ fn dispatch_control(
                     &bindings,
                 )
                 .map_err(ControlError::state)?;
-            overlays.sync_revision(&shared.scene, identity);
+            overlays.sync_active(&shared.scene, identity);
             drop(overlays);
             observe_surface(session, &status, SURFACE_CHANGED_SLOTS);
             for (_slot, track_id, _generation, _milestone) in &bindings {
@@ -4360,6 +4360,7 @@ fn handle_track_channel(
         }),
     );
     if let (Err(failure), Some(status)) = (&result, lost_status) {
+        lock(&shared.overlays).track_lost(identity, generation);
         stop_failed_audio_output(&shared.audio_outputs, identity);
         let error_code = failure.protocol_error_code();
         let diagnostic = failure.diagnostic();
@@ -4661,6 +4662,7 @@ fn channel_loop(
                 | messages::IMAGE_DATA
                 | messages::VECTOR_FRAME
                 | messages::VECTOR_ASSET
+                | messages::VECTOR_ASSET_RELEASE
         ) {
             if shapes_ingress(&configuration) {
                 channel_io!(
@@ -4685,7 +4687,7 @@ fn channel_loop(
             channel_other!(ChannelFailureKind::InternalState, channel.admit_media(generation));
         }
         match header.record_type {
-            messages::VECTOR_FRAME | messages::VECTOR_ASSET => {
+            messages::VECTOR_FRAME | messages::VECTOR_ASSET | messages::VECTOR_ASSET_RELEASE => {
                 let Some(worker) = vector.as_mut() else {
                     return Err(ChannelFailure::message(
                         ChannelFailureKind::RecordType,
@@ -5316,6 +5318,7 @@ fn channel_loop(
                 | messages::IMAGE_DATA
                 | messages::VECTOR_FRAME
                 | messages::VECTOR_ASSET
+                | messages::VECTOR_ASSET_RELEASE
         ) {
             let (maximum_bytes, maximum_records) = channel_other!(
                 ChannelFailureKind::FlowControl,
@@ -5572,6 +5575,10 @@ fn handle_lane(
     egress.set_shutdown(reader.shutdown_handle()?);
     *lock(&session.lane_writer) = Some(writer.clone());
     *lock(&session.lane_egress) = Some(egress.clone());
+    if session.supports(registry::OVERLAY_INPUT) {
+        lock(&shared.overlays).actors.insert(session.identity, Arc::downgrade(&session));
+        session.wake_actor();
+    }
 
     let outcome = serve_lane(reader, &writer, &session, shared);
     drop(cleanup);
@@ -6412,7 +6419,8 @@ mod tests {
                 Brush::Solid(Color(0xff0000ff)),
             )
             .unwrap();
-        window.present(canvas.clone()).unwrap();
+        let receipt = window.submit(canvas.clone()).unwrap();
+        assert_eq!(receipt.wait(Duration::ZERO).unwrap(), None);
         neighbor.present(canvas.clone()).unwrap();
         {
             use crate::display::renderer::SceneRenderer;
@@ -6430,6 +6438,10 @@ mod tests {
                 let mut composed = vello::Scene::new();
                 composed.draw_image(media.overlay.as_ref().unwrap(), Affine::IDENTITY);
                 assert!(renderer.render(&composed, VelloColor::from_rgb8(0, 255, 0)).unwrap());
+                assert_eq!(
+                    receipt.wait(Duration::from_secs(2)).unwrap(),
+                    Some(vivid_sdk::overlay::PresentationOutcome::Presented)
+                );
                 let readback = renderer.begin_screenshot().unwrap();
                 let deadline = Instant::now() + Duration::from_secs(10);
                 let pixels = loop {
@@ -6516,7 +6528,7 @@ mod tests {
                 ),
             )
             .unwrap();
-        popup.present(canvas.clone()).unwrap();
+        let popup_receipt = popup.submit(canvas.clone()).unwrap();
         assert!(
             service.overlay_pointer(790., 590., Some((1, true)), 0),
             "outside dismissal consumes the press"
@@ -6524,6 +6536,10 @@ mod tests {
         assert!(
             service.overlay_pointer(790., 590., Some((1, false)), 0),
             "dismissal also consumes the matching release"
+        );
+        assert_eq!(
+            popup_receipt.wait(Duration::from_secs(2)).unwrap(),
+            Some(vivid_sdk::overlay::PresentationOutcome::Superseded)
         );
         popup.close().unwrap();
         first.close().unwrap();
@@ -6626,7 +6642,26 @@ mod tests {
                 false
             ));
             child.0.stdin.take().unwrap().write_all(b"release\n").unwrap();
+            service.update_overlay_viewport(1000., 600., 2.);
+            let mut replacement_rendered = false;
             loop {
+                if !replacement_rendered
+                    && lock(&service.shared.overlays)
+                        .drawing(&service.scene)
+                        .iter()
+                        .any(|d| d.revision == 3)
+                {
+                    let media = renderer
+                        .prepare_media(&SizeInfo::new(800., 600., 10., 25., 0., 0., false), 0)
+                        .unwrap();
+                    let mut scene = vello::Scene::new();
+                    scene.draw_image(
+                        media.overlay.as_ref().unwrap(),
+                        vello::kurbo::Affine::IDENTITY,
+                    );
+                    assert!(renderer.render(&scene, vello::peniko::Color::TRANSPARENT).unwrap());
+                    replacement_rendered = true;
+                }
                 if let Some(status) = child.0.try_wait().unwrap() {
                     assert!(status.success(), "{fixture} {mode} failed");
                     break;
@@ -6635,6 +6670,7 @@ mod tests {
                 thread::sleep(Duration::from_millis(2));
             }
             assert!(lock(&service.shared.overlays).drawing(&service.scene).is_empty());
+            assert!(replacement_rendered, "replacement track was never composed");
         }
     }
 

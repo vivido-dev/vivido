@@ -7,10 +7,14 @@ use crate::display::{
     text::TextSystem,
     vector::{CompiledScene, compile},
 };
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::sync::Weak;
 use vello::peniko::{Blob, ImageAlphaType, ImageData, ImageFormat};
 
 use vivid_protocol::overlay::wire::{Action, Query, SetWindow, Status, Viewport, WindowAddress};
+use vivid_protocol::overlay::wire::{
+    PresentationOutcome, Submission, SubmissionOutcome, ViewportChanged,
+};
 use vivid_protocol::overlay::{DismissReason, Windows};
 use vivid_protocol::vector::Scalar;
 
@@ -22,11 +26,23 @@ pub(crate) struct Host {
     viewport: Option<Viewport>,
     surfaces: HashSet<SurfaceIdentity>,
     scenes: HashMap<TrackIdentity, (ChannelGeneration, u64, Arc<CompiledScene>)>,
-    assets: HashMap<(TrackIdentity, ChannelGeneration), (usize, usize)>,
+    assets: HashMap<(TrackIdentity, ChannelGeneration, u64), (Weak<()>, usize)>,
+    submissions: HashMap<TrackIdentity, Submission>,
+    active: HashMap<SurfaceIdentity, Submission>,
+    accepted: HashMap<SurfaceIdentity, u64>,
+    pending: HashSet<(SessionIdentity, Submission)>,
+    outcomes: HashMap<SessionIdentity, VecDeque<SubmissionOutcome>>,
+    overflow: HashSet<SessionIdentity>,
+    displayed: HashMap<SurfaceIdentity, Drawing>,
+    inflight: HashMap<SurfaceIdentity, Drawing>,
+    viewport_revision: u64,
+    viewport_dirty: HashSet<SessionIdentity>,
+    pub(super) actors: HashMap<SessionIdentity, Weak<SessionRuntime>>,
     lanes: HashMap<SessionIdentity, (u64, Instant)>,
     font: crate::config::font::Font,
 }
 
+#[derive(Clone)]
 pub(crate) struct Drawing {
     pub window: SurfaceIdentity,
     pub window_revision: u64,
@@ -34,6 +50,7 @@ pub(crate) struct Drawing {
     pub bounds: vivid_protocol::vector::Rect,
     pub scale: f64,
     pub compiled: Arc<CompiledScene>,
+    pub submission: Submission,
 }
 
 impl Host {
@@ -68,7 +85,15 @@ impl Host {
             scale_denominator: 1_000_000,
         };
         viewport.validate().map_err(|_| "invalid overlay viewport")?;
-        self.viewport = Some(viewport);
+        if self.viewport != Some(viewport) {
+            self.viewport_revision =
+                self.viewport_revision.checked_add(1).ok_or("viewport revision exhausted")?;
+            self.viewport = Some(viewport);
+            self.viewport_dirty.extend(self.lanes.keys().copied());
+            for actor in self.actors.values().filter_map(Weak::upgrade) {
+                actor.wake_actor();
+            }
+        }
         Ok(())
     }
 
@@ -96,14 +121,39 @@ impl Host {
                 .ok_or_else(|| ControlError::bad_state("overlay viewport is unavailable"))?,
             focused: self.windows.focus() == Some(id),
             scene_revision: window.scene_revision,
+            active: self.active.get(&id).copied(),
+            accepted_revision: self.accepted.get(&id).copied().unwrap_or(0),
+            viewport_revision: self.viewport_revision,
         })
     }
 
+    fn retire_presentation(&mut self, identity: SurfaceIdentity) {
+        let pending: Vec<_> = self
+            .pending
+            .iter()
+            .copied()
+            .filter(|(owner, s)| {
+                *owner == identity.context.session
+                    && s.address.context_id == identity.context.context_id
+                    && s.address.surface_id == identity.surface_id
+            })
+            .collect();
+        for (owner, submission) in pending {
+            self.resolve(owner, submission, PresentationOutcome::Superseded);
+        }
+        self.displayed.remove(&identity);
+        self.inflight.remove(&identity);
+        self.active.remove(&identity);
+        self.submissions.retain(|id, _| id.surface != identity);
+        self.scenes.retain(|id, _| id.surface != identity);
+        self.assets.retain(|_, (token, _)| token.strong_count() != 0);
+    }
+
     pub fn remove_surface(&mut self, identity: SurfaceIdentity) {
+        self.retire_presentation(identity);
+        self.accepted.remove(&identity);
         self.windows.close(identity, DismissReason::Closed);
         self.surfaces.remove(&identity);
-        self.scenes.retain(|id, _| id.surface != identity);
-        self.assets.retain(|(id, _), _| id.surface != identity);
     }
 
     pub fn remove_contexts(&mut self, owner: SessionIdentity, contexts: &HashSet<u64>) {
@@ -123,13 +173,24 @@ impl Host {
         self.windows.revoke_owner(owner);
         self.surfaces.retain(|id| id.context.session != owner);
         self.scenes.retain(|id, _| id.surface.context.session != owner);
-        self.assets.retain(|(id, _), _| id.surface.context.session != owner);
+        self.submissions.retain(|id, _| id.surface.context.session != owner);
+        self.active.retain(|id, _| id.context.session != owner);
+        self.accepted.retain(|id, _| id.context.session != owner);
+        self.displayed.retain(|id, _| id.context.session != owner);
+        self.inflight.retain(|id, _| id.context.session != owner);
+        self.assets.retain(|_, (token, _)| token.strong_count() != 0);
+        self.pending.retain(|(id, _)| *id != owner);
+        self.outcomes.remove(&owner);
+        self.overflow.remove(&owner);
+        self.viewport_dirty.remove(&owner);
+        self.actors.remove(&owner);
         self.lanes.remove(&owner);
         ids
     }
 
     pub(super) fn lane_open(&mut self, owner: SessionIdentity, generation: u64) {
         self.lanes.insert(owner, (generation, Instant::now() + Duration::from_secs(5)));
+        self.viewport_dirty.insert(owner);
     }
 
     pub(super) fn lane_lost(
@@ -153,7 +214,7 @@ impl Host {
 
     pub(super) fn pointer(
         &mut self,
-        scene: &SharedScene,
+        _scene: &SharedScene,
         x: f64,
         y: f64,
         button: Option<(u16, bool)>,
@@ -166,7 +227,7 @@ impl Host {
         let Ok(point) = vivid_protocol::vector::Point::new(x / scale, y / scale) else {
             return false;
         };
-        let drawings = self.drawing(scene);
+        let drawings: Vec<_> = self.displayed.values().cloned().collect();
         self.windows.pointer(point, button, modifiers, |id, point| {
             drawings.iter().find(|d| d.window == id).and_then(|d| d.compiled.hit(point))
         })
@@ -174,7 +235,7 @@ impl Host {
 
     pub(super) fn wheel(
         &mut self,
-        scene: &SharedScene,
+        _scene: &SharedScene,
         x: f64,
         y: f64,
         dx: f64,
@@ -192,7 +253,7 @@ impl Host {
         ) else {
             return false;
         };
-        let drawings = self.drawing(scene);
+        let drawings: Vec<_> = self.displayed.values().cloned().collect();
         self.windows.wheel(point, dx, dy, modifiers, |id, point| {
             drawings.iter().find(|d| d.window == id).and_then(|d| d.compiled.hit(point))
         })
@@ -200,7 +261,19 @@ impl Host {
 
     pub fn remove_track(&mut self, identity: TrackIdentity) {
         self.scenes.remove(&identity);
-        self.assets.retain(|(id, _), _| *id != identity);
+        if let Some(submission) = self.submissions.remove(&identity) {
+            self.supersede(identity.surface.context.session, submission);
+        }
+        self.active
+            .retain(|surface, s| *surface != identity.surface || s.track_id != identity.track_id);
+        // Displayed/in-flight scenes retain their resources after the immutable track retires.
+        self.assets.retain(|_, (token, _)| token.strong_count() != 0);
+    }
+
+    pub(super) fn track_lost(&mut self, identity: TrackIdentity, generation: ChannelGeneration) {
+        if self.scenes.get(&identity).is_some_and(|(current, _, _)| *current == generation) {
+            self.remove_track(identity);
+        }
     }
 
     /// A bounded snapshot of immutable scenes. Moving windows only changes placement transforms.
@@ -211,7 +284,15 @@ impl Host {
             .filter_map(|window| {
                 let active = scene.active_track(window.identity, vivid_sdk::SLOT_VECTOR)?;
                 let active = scene.track_status(active)?;
-                let (generation, revision, compiled) = self.scenes.get(&active.identity)?;
+                let Some((generation, revision, compiled)) = self.scenes.get(&active.identity)
+                else {
+                    let mut previous = self.displayed.get(&window.identity)?.clone();
+                    previous.bounds = window.options.bounds;
+                    previous.window_revision = window.revision;
+                    previous.scale =
+                        f64::from(viewport.scale_numerator) / f64::from(viewport.scale_denominator);
+                    return Some(previous);
+                };
                 if *generation != active.state.channel_generation || active.lifecycle != 1 {
                     return None;
                 }
@@ -223,25 +304,98 @@ impl Host {
                     scale: f64::from(viewport.scale_numerator)
                         / f64::from(viewport.scale_denominator),
                     compiled: compiled.clone(),
+                    submission: self.submissions.get(&active.identity).copied()?,
                 })
             })
             .collect()
     }
 
-    pub(super) fn sync_revision(&mut self, scene: &SharedScene, surface: SurfaceIdentity) {
+    pub(super) fn sync_active(&mut self, scene: &SharedScene, surface: SurfaceIdentity) {
         let Some(active) = scene.active_track(surface, vivid_sdk::SLOT_VECTOR) else { return };
         let Some(active) = scene.track_status(active) else { return };
-        let Some((generation, revision, _)) = self.scenes.get(&active.identity) else { return };
+        let Some((generation, _, _)) = self.scenes.get(&active.identity) else { return };
         if *generation != active.state.channel_generation {
             return;
         }
-        if let Some(window) = self.windows.get(surface)
-            && *revision > window.scene_revision
+        if let Some(submission) = self.submissions.get(&active.identity).copied()
+            && let Some(old) = self.active.insert(surface, submission)
+            && old != submission
         {
-            self.windows
-                .publish_scene(surface, window.generation, *revision)
-                .expect("validated scene revision under the overlay lock");
+            self.supersede(surface.context.session, old);
         }
+    }
+
+    fn resolve(
+        &mut self,
+        owner: SessionIdentity,
+        submission: Submission,
+        outcome: PresentationOutcome,
+    ) {
+        if self.pending.remove(&(owner, submission)) {
+            self.outcomes
+                .entry(owner)
+                .or_default()
+                .push_back(SubmissionOutcome { submission, outcome });
+            if let Some(actor) = self.actors.get(&owner).and_then(Weak::upgrade) {
+                actor.wake_actor();
+            }
+        }
+    }
+
+    fn supersede(&mut self, owner: SessionIdentity, submission: Submission) {
+        if !self
+            .inflight
+            .values()
+            .any(|d| d.window.context.session == owner && d.submission == submission)
+        {
+            self.resolve(owner, submission, PresentationOutcome::Superseded);
+        }
+    }
+
+    /// Reserve the exact snapshot being composed. A newer candidate cannot retire it mid-render.
+    pub fn prepare(&mut self, scene: &SharedScene) -> Vec<Drawing> {
+        let drawings = self.drawing(scene);
+        self.inflight = drawings.iter().map(|d| (d.window, d.clone())).collect();
+        drawings
+    }
+
+    /// Called only after successful final composition, or to abandon an unpresented snapshot.
+    pub fn finish(&mut self, presented: bool) {
+        let inflight = std::mem::take(&mut self.inflight);
+        for (surface, drawing) in inflight {
+            if presented
+                && self
+                    .windows
+                    .get(surface)
+                    .is_some_and(|w| w.generation == drawing.submission.address.generation)
+            {
+                if self.windows.get(surface).is_some_and(|w| w.scene_revision < drawing.revision) {
+                    let _ = self.windows.publish_scene(
+                        surface,
+                        drawing.submission.address.generation,
+                        drawing.revision,
+                    );
+                }
+                self.resolve(
+                    surface.context.session,
+                    drawing.submission,
+                    PresentationOutcome::Presented,
+                );
+                self.displayed.insert(surface, drawing.clone());
+            }
+            if !self
+                .submissions
+                .iter()
+                .any(|(id, s)| id.surface == surface && *s == drawing.submission)
+            {
+                self.resolve(
+                    surface.context.session,
+                    drawing.submission,
+                    PresentationOutcome::Superseded,
+                );
+            }
+        }
+        self.assets.retain(|_, (token, _)| token.strong_count() != 0);
     }
 
     /// Scene revisions are window-scoped, including across track replacement. Validate before
@@ -252,7 +406,10 @@ impl Host {
         revision: u64,
     ) -> Result<(), &'static str> {
         let window = self.windows.get(surface).ok_or("overlay window is absent")?;
-        if revision == 0 || revision <= window.scene_revision {
+        if revision == 0
+            || revision <= window.scene_revision
+            || self.active.get(&surface).is_some_and(|s| revision <= s.revision)
+        {
             return Err("overlay scene revision must advance across track replacement");
         }
         Ok(())
@@ -269,6 +426,14 @@ impl Host {
                 continue;
             }
             let identity = surface.track(*track).map_err(|_| "invalid vector track identity")?;
+            if scene.active_track(surface, *slot) == Some(identity)
+                && self
+                    .active
+                    .get(&surface)
+                    .is_some_and(|s| s.channel_generation == generation.get())
+            {
+                continue;
+            }
             let (compiled_generation, revision, _) =
                 self.scenes.get(&identity).ok_or("vector track has no compiled scene")?;
             if compiled_generation != generation {
@@ -286,10 +451,17 @@ impl Host {
 pub(super) struct VectorWorker {
     text: TextSystem,
     images: BTreeMap<u64, ImageData>,
+    tokens: BTreeMap<u64, Arc<()>>,
+    last_asset: u64,
 }
 impl VectorWorker {
     pub fn new(font: crate::config::font::Font) -> Self {
-        Self { text: TextSystem::new(font), images: BTreeMap::new() }
+        Self {
+            text: TextSystem::new(font),
+            images: BTreeMap::new(),
+            tokens: BTreeMap::new(),
+            last_asset: 0,
+        }
     }
 
     pub fn process(
@@ -305,22 +477,19 @@ impl VectorWorker {
         let length = u32::try_from(body.len()).map_err(|_| "vector record exceeds u32")?;
         if record_type == messages::VECTOR_ASSET {
             let asset = ImageAsset::decode(body).map_err(|e| e.0)?;
-            if self.images.contains_key(&asset.id) {
-                return Err("retained image ID already exists");
+            if asset.id <= self.last_asset {
+                return Err("retained image IDs must increase within a channel generation");
             }
             let mut host = lock(&shared.overlays);
-            let (count, bytes) =
-                host.assets.get(&(identity, generation)).copied().unwrap_or_default();
-            let next_bytes =
-                bytes.checked_add(asset.rgba.len()).ok_or("retained image bytes overflow")?;
+            host.assets.retain(|_, (token, _)| token.strong_count() != 0);
             let (owner_count, owner_bytes) = host
                 .assets
                 .iter()
-                .filter(|((track, _), _)| {
+                .filter(|((track, _, _), _)| {
                     track.surface.context.session == identity.surface.context.session
                 })
-                .try_fold((0_usize, 0_usize), |(count, bytes), (_, (n, b))| {
-                    Some((count.checked_add(*n)?, bytes.checked_add(*b)?))
+                .try_fold((0_usize, 0_usize), |(count, bytes), (_, (_, b))| {
+                    Some((count.checked_add(1)?, bytes.checked_add(*b)?))
                 })
                 .ok_or("retained image accounting overflow")?;
             if owner_count >= vivid_protocol::vector::MAX_RETAINED_ASSETS
@@ -331,6 +500,13 @@ impl VectorWorker {
                 return Err("retained image capacity exhausted");
             }
             shared.scene.admit_vector_asset(identity, generation, length, sequence)?;
+            let token = Arc::new(());
+            host.assets.insert(
+                (identity, generation, asset.id),
+                (Arc::downgrade(&token), asset.rgba.len()),
+            );
+            self.tokens.insert(asset.id, token);
+            self.last_asset = asset.id;
             self.images.insert(
                 asset.id,
                 ImageData {
@@ -341,7 +517,15 @@ impl VectorWorker {
                     alpha_type: ImageAlphaType::Alpha,
                 },
             );
-            host.assets.insert((identity, generation), (count + 1, next_bytes));
+        } else if record_type == messages::VECTOR_ASSET_RELEASE {
+            let release = vivid_protocol::vector::AssetRelease::decode(body).map_err(|e| e.0)?;
+            if !self.images.contains_key(&release.id) {
+                return Err("retained image is absent or released");
+            }
+            shared.scene.admit_vector_asset(identity, generation, length, sequence)?;
+            self.images.remove(&release.id);
+            self.tokens.remove(&release.id);
+            lock(&shared.overlays).assets.retain(|_, (token, _)| token.strong_count() != 0);
         } else {
             let frame = Frame::decode(body).map_err(|e| e.0)?;
             frame.canvas.validate_with_limits(&Limits::default()).map_err(|e| e.0)?;
@@ -352,12 +536,56 @@ impl VectorWorker {
             if body.len() > config.maximum_scene_bytes as usize + 12 {
                 return Err("vector scene exceeds immutable track ceiling");
             }
-            let compiled =
-                Arc::new(compile(&frame.canvas, &mut self.text, &self.images).map_err(|e| e.0)?);
+            let mut compiled =
+                compile(&frame.canvas, &mut self.text, &self.images).map_err(|e| e.0)?;
+            let ids: HashSet<_> = frame
+                .canvas
+                .commands()
+                .iter()
+                .filter_map(|c| match c {
+                    vivid_protocol::vector::Command::Image { asset, .. } => Some(*asset),
+                    _ => None,
+                })
+                .collect();
+            compiled.retained = ids
+                .iter()
+                .map(|id| self.tokens.get(id).cloned().ok_or("retained image is absent"))
+                .collect::<Result<_, _>>()?;
+            let compiled = Arc::new(compiled);
             let mut host = lock(&shared.overlays);
             if !host.surfaces.contains(&identity.surface) {
                 return Err("vector surface has no overlay window");
             }
+            let owner = identity.surface.context.session;
+            if host.pending.iter().filter(|(id, _)| *id == owner).count()
+                + host.outcomes.get(&owner).map_or(0, VecDeque::len)
+                >= 256
+            {
+                host.overflow.insert(owner);
+                if let Some(actor) = host.actors.get(&owner).and_then(Weak::upgrade) {
+                    actor.wake_actor();
+                }
+                return Err("overlay outcome capacity exhausted");
+            }
+            if host
+                .accepted
+                .get(&identity.surface)
+                .is_some_and(|revision| frame.revision <= *revision)
+            {
+                return Err("scene revision must advance across all window tracks");
+            }
+            let window = host.windows.get(identity.surface).ok_or("overlay window is absent")?;
+            let submission = Submission {
+                address: WindowAddress {
+                    context_id: identity.surface.context.context_id,
+                    surface_id: identity.surface.surface_id,
+                    generation: window.generation,
+                },
+                track_id: identity.track_id,
+                channel_generation: generation.get(),
+                epoch: frame.epoch,
+                revision: frame.revision,
+            };
             if shared.scene.active_track(identity.surface, vivid_sdk::SLOT_VECTOR) == Some(identity)
             {
                 host.validate_revision(identity.surface, frame.revision)?;
@@ -371,9 +599,28 @@ impl VectorWorker {
                 true,
                 sequence,
             )?;
+            // One pending replacement per window, including tracks being primed. Keep the
+            // displayed and reserved snapshots independently of the candidate's track lifetime.
+            let retired: Vec<_> = host
+                .scenes
+                .keys()
+                .copied()
+                .filter(|id| id.surface == identity.surface && *id != identity)
+                .collect();
+            for track in retired {
+                host.scenes.remove(&track);
+                if let Some(old) = host.submissions.remove(&track) {
+                    host.supersede(owner, old);
+                }
+            }
             host.scenes.insert(identity, (generation, frame.revision, compiled));
+            host.accepted.insert(identity.surface, frame.revision);
+            host.pending.insert((owner, submission));
+            if let Some(old) = host.submissions.insert(identity, submission) {
+                host.supersede(owner, old);
+            }
             shared.scene.mark_output_ready(identity, generation)?;
-            host.sync_revision(&shared.scene, identity.surface);
+            host.sync_active(&shared.scene, identity.surface);
         }
         shared.request_frame_wake();
         Ok(())
@@ -429,6 +676,11 @@ pub(super) fn dispatch(
                 return Err(ControlError::bad_state("overlay input lane is unavailable"));
             }
             request.expected_revision = if request.expected_revision == 0 {
+                if host.surfaces.contains(&identity) {
+                    return Err(ControlError::state(
+                        "an overlay surface cannot be reopened after dismissal",
+                    ));
+                }
                 host.windows
                     .create(identity, request.address.generation, request.options.clone())
                     .map(|()| 1)
@@ -550,13 +802,50 @@ pub(super) fn lane_record(
 
 /// Called by the existing bounded control actor, independently of vector compilation.
 pub(super) fn service_input(shared: &ServiceShared, session: &SessionRuntime) {
-    if !session.supports(registry::OVERLAY_INPUT) {
+    if !session.supports(registry::OVERLAY_INPUT) || lock(&session.lane_writer).is_none() {
         return;
     }
     let mut host = lock(&shared.overlays);
+    // Dismissal removes the window model, but the producer may retain its semantic surface.
+    // Resolve receipts now; retaining that surface must not keep dead presentations alive.
+    let dismissed: Vec<_> = host
+        .surfaces
+        .iter()
+        .copied()
+        .filter(|id| id.context.session == session.identity && host.windows.get(*id).is_none())
+        .collect();
+    for surface in dismissed {
+        host.retire_presentation(surface);
+    }
     let expired =
         host.lanes.get(&session.identity).is_some_and(|(_, deadline)| Instant::now() >= *deadline);
-    let mut failed = expired || host.windows.take_overflow(session.identity);
+    let mut failed = expired
+        || host.windows.take_overflow(session.identity)
+        || host.overflow.remove(&session.identity);
+    if !failed
+        && host.viewport_dirty.remove(&session.identity)
+        && let Some(viewport) = host.viewport
+    {
+        let update = ViewportChanged { revision: host.viewport_revision, viewport };
+        failed = update
+            .payload()
+            .and_then(|p| Envelope::new(0, p).encode())
+            .map_or(true, |body| !session.post_lane(messages::OVERLAY_VIEWPORT_CHANGED, 0, body));
+    }
+    if !failed && let Some(outcomes) = host.outcomes.get_mut(&session.identity) {
+        while let Some(outcome) = outcomes.pop_front() {
+            if outcome.payload().and_then(|p| Envelope::new(0, p).encode()).map_or(true, |body| {
+                !session.post_lane(
+                    messages::OVERLAY_SUBMISSION_OUTCOME,
+                    outcome.submission.address.surface_id,
+                    body,
+                )
+            }) {
+                failed = true;
+                break;
+            }
+        }
+    }
     if !failed {
         while let Some(event) = host.windows.take_event(session.identity) {
             let event = vivid_protocol::overlay::wire::InputEvent {
@@ -675,9 +964,95 @@ mod tests {
         let mut host = Host::default();
         host.update_viewport(800., 600., 1.25).unwrap();
         let previous = host.viewport;
+        host.update_viewport(800., 600., 1.25).unwrap();
+        assert_eq!(host.viewport_revision, 1);
         for (width, height, scale) in [(0., 600., 1.), (800., 600., 0.), (800., 600., f64::NAN)] {
             assert!(host.update_viewport(width, height, scale).is_err());
             assert_eq!(host.viewport, previous);
         }
+    }
+
+    #[test]
+    fn outcomes_hold_inflight_scenes_and_assets_across_replacement_and_owner_cleanup() {
+        let mut host = Host::default();
+        host.update_viewport(800., 600., 2.).unwrap();
+        let mut text = TextSystem::new(Default::default());
+        let mut owners = Vec::new();
+        for serial in [1, 2] {
+            let owner = SessionIdentity::new(PresenterInstanceId([1; 16]), serial).unwrap();
+            let surface = owner.context(1).unwrap().surface(1).unwrap();
+            let bounds = Rect::new(0., 0., 10., 10.).unwrap();
+            host.windows
+                .create(surface, 1, WindowOptions::new(bounds, WindowMode::Floating))
+                .unwrap();
+            host.surfaces.insert(surface);
+            host.lane_open(owner, 1);
+            let token = Arc::new(());
+            host.assets.insert(
+                (surface.track(2).unwrap(), ChannelGeneration::ONE, 1),
+                (Arc::downgrade(&token), 4),
+            );
+            let mut compiled =
+                compile(&vivid_protocol::vector::Canvas::new(), &mut text, &BTreeMap::new())
+                    .unwrap();
+            compiled.retained.push(token); // Namespace release leaves only the scene's reference.
+            let submission = Submission {
+                address: WindowAddress { context_id: 1, surface_id: 1, generation: 1 },
+                track_id: 2,
+                channel_generation: 1,
+                epoch: 1,
+                revision: 1,
+            };
+            host.pending.insert((owner, submission));
+            host.active.insert(surface, submission);
+            host.inflight.insert(
+                surface,
+                Drawing {
+                    window: surface,
+                    window_revision: 1,
+                    revision: 1,
+                    bounds,
+                    scale: 2.,
+                    compiled: Arc::new(compiled),
+                    submission,
+                },
+            );
+            host.supersede(owner, submission);
+            assert!(
+                host.pending.contains(&(owner, submission)),
+                "composition owns this submission"
+            );
+            owners.push((owner, surface, submission));
+        }
+        let (first, surface, old) = owners[0];
+        let replacement = Submission { track_id: 3, revision: 2, ..old };
+        host.pending.insert((first, replacement));
+        host.active.insert(surface, replacement);
+        host.finish(true);
+        assert_eq!(host.windows.get(surface).unwrap().scene_revision, 1);
+        assert_eq!(host.outcomes[&first].front().unwrap().outcome, PresentationOutcome::Presented);
+        assert_eq!(host.assets.len(), 2, "displayed images stay charged after namespace release");
+        let mut failed = host.displayed[&surface].clone();
+        failed.submission = replacement;
+        failed.revision = 2;
+        host.inflight.insert(surface, failed);
+        host.finish(false);
+        assert_eq!(
+            host.windows.get(surface).unwrap().scene_revision,
+            1,
+            "failed composition cannot publish hits"
+        );
+        host.remove_track(surface.track(3).unwrap());
+        host.remove_surface(surface);
+        assert_eq!(host.outcomes[&first].back().unwrap().outcome, PresentationOutcome::Superseded);
+        let (second, other, _) = owners[1];
+        assert_eq!(host.displayed[&other].revision, 1);
+        assert_eq!(host.assets.len(), 1);
+        assert!(host.lanes.contains_key(&second));
+        host.update_viewport(1000., 600., 2.).unwrap();
+        assert_eq!(host.viewport_revision, 2);
+        assert!(host.viewport_dirty.contains(&second));
+        host.remove_owner(first);
+        assert_eq!(host.outcomes[&second].len(), 1);
     }
 }

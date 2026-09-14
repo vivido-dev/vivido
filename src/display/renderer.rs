@@ -484,6 +484,7 @@ impl SceneRenderer {
             Ok(result) => result,
             Err(error) => {
                 log::warn!("overlay rendering failed: {error}");
+                self.overlays.finish(false);
                 return media;
             },
         };
@@ -623,6 +624,7 @@ impl SceneRenderer {
         }
 
         self.has_rendered_frame = true;
+        self.overlays.finish(true);
         Ok(true)
     }
 

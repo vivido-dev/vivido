@@ -34,6 +34,7 @@ struct HitRegion {
 /// Drawing and hit testing are published as one immutable object.
 pub struct CompiledScene {
     pub scene: Scene,
+    pub(crate) retained: Vec<Arc<()>>,
     hits: Vec<HitRegion>,
 }
 impl CompiledScene {
@@ -69,7 +70,7 @@ pub fn compile(
     images: &BTreeMap<u64, ImageData>,
 ) -> Result<CompiledScene, InvalidScene> {
     canvas.validate()?;
-    let mut result = CompiledScene { scene: Scene::new(), hits: Vec::new() };
+    let mut result = CompiledScene { scene: Scene::new(), retained: Vec::new(), hits: Vec::new() };
     let mut state = DrawState { transform: Affine::IDENTITY, opacity: 1.0, clips: Vec::new() };
     let mut stack = Vec::new();
     for command in canvas.commands() {
