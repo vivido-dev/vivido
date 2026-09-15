@@ -483,13 +483,24 @@ impl WindowContext {
             };
             let accessibility_target =
                 if document { options.vivid_target } else { VividTarget::Desktop };
+            // An assistive-technology request arrives on the platform's own thread; this hands
+            // it to the presenter, which owns the lane that reaches the application. The AppKit
+            // adapter builds its own tree, so only the AccessKit backends take the callback.
+            #[cfg(any(target_os = "linux", target_os = "windows"))]
+            let invoke = vivid_service.accessibility_actions();
             #[cfg(target_os = "macos")]
             let state = (!display.window.is_headless() && !display.window.is_embedded())
                 .then(|| AccessibilityState::new(&display.window, accessibility_target, snapshot));
             #[cfg(any(target_os = "linux", target_os = "windows"))]
             let state = event_loop_handle.winit().and_then(|event_loop| {
                 display.window.winit_window().map(|window| {
-                    AccessibilityState::new(event_loop, window, accessibility_target, snapshot)
+                    AccessibilityState::new(
+                        event_loop,
+                        window,
+                        accessibility_target,
+                        snapshot,
+                        invoke.callback(),
+                    )
                 })
             });
             state
@@ -2174,6 +2185,7 @@ impl WindowContext {
                 terminal.is_focused,
             )
         };
+        snapshot.semantics = self.vivid_service.overlay_semantics();
         snapshot.focused =
             terminal_accessibility_focused(snapshot.focused, self.vivid_service.overlay_focused());
         drop(terminal);
@@ -2293,7 +2305,8 @@ impl WindowContext {
                     terminal.is_focused,
                     self.vivid_service.overlay_focused(),
                 ),
-                "overlay_semantics": false,
+                // Whether an overlay has published a semantic tree for what it is showing.
+                "overlay_semantics": self.vivid_service.overlay_semantics().is_some(),
             },
             "render_optimization": {
                 "text_scene_builds": text_scene_builds,

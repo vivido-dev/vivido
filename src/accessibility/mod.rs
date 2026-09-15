@@ -80,6 +80,19 @@ pub(crate) struct AccessibilitySnapshot {
     pub cell_height: f32,
     pub padding_x: f32,
     pub padding_y: f32,
+    /// The application's own semantic tree, when an overlay published one for the scene it is
+    /// currently showing. `None` means the terminal beneath is the whole story.
+    pub semantics: Option<OverlaySemantics>,
+}
+
+/// A window's semantic tree together with the overlay window that published it.
+///
+/// The identity travels with the tree because a node ID is only unique within one application's
+/// tree, so an action naming node 7 needs to know whose node 7 it is.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct OverlaySemantics {
+    pub window: vivid_protocol::identity::SurfaceIdentity,
+    pub nodes: Vec<vivid_protocol::overlay::SemanticNode>,
 }
 
 impl AccessibilitySnapshot {
@@ -100,6 +113,7 @@ impl AccessibilitySnapshot {
             cell_height: size.cell_height(),
             padding_x: size.padding_x(),
             padding_y: size.padding_y(),
+            semantics: None,
         }
     }
 
@@ -257,6 +271,7 @@ impl AccessibilitySnapshot {
             cell_height: size.cell_height(),
             padding_x: size.padding_x(),
             padding_y: size.padding_y(),
+            semantics: None,
         }
     }
 

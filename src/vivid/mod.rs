@@ -87,6 +87,7 @@ use crate::vivid::transport::{ReadShutdown, Reader, Writer};
 use vivid_protocol::lease::{AttemptDecision, SessionLeaseDefinition};
 
 use crate::display::SizeInfo;
+use vivid_protocol::overlay::AccessibleAction;
 use vivid_protocol::overlay::wire::Appearance;
 use winit::window::CursorIcon;
 
@@ -712,6 +713,23 @@ impl VividService {
         lock(&self.shared.overlays).cursor().map(overlay::cursor_icon)
     }
 
+    /// The application semantic tree this window should expose, if an overlay published one for
+    /// the scene it is currently showing.
+    pub(crate) fn overlay_semantics(&self) -> Option<crate::accessibility::OverlaySemantics> {
+        let overlays = lock(&self.shared.overlays);
+        let (window, semantics) = overlays.windows_with_semantics().into_iter().next()?;
+        Some(crate::accessibility::OverlaySemantics { window, nodes: semantics.nodes.clone() })
+    }
+
+    /// A handle an accessibility adapter can use to deliver a request to the application.
+    ///
+    /// Only the AccessKit adapters take one, so this is unused on macOS, where the AppKit adapter
+    /// builds its own tree. It is kept compiled and type-checked there rather than configured away.
+    #[cfg_attr(not(any(target_os = "linux", target_os = "windows")), allow(dead_code))]
+    pub(crate) fn accessibility_actions(&self) -> AccessibilityActions {
+        AccessibilityActions { shared: Arc::clone(&self.shared) }
+    }
+
     /// Record the desktop appearance. The host republishes the environment if it changed, and
     /// wakes the lanes itself when it does.
     pub(crate) fn set_overlay_appearance(&self, dark: bool) {
@@ -1222,6 +1240,31 @@ impl SessionRuntime {
     }
 }
 
+/// Delivers an assistive-technology request to the application that asked for one.
+///
+/// It holds only the shared service state, so the accessibility thread can use it without
+/// touching window or terminal state.
+#[cfg_attr(not(any(target_os = "linux", target_os = "windows")), allow(dead_code))]
+#[derive(Clone)]
+pub(crate) struct AccessibilityActions {
+    shared: Arc<ServiceShared>,
+}
+
+impl AccessibilityActions {
+    /// The callback an accessibility adapter carries, since it is constructed before the window
+    /// that will own it.
+    #[cfg_attr(not(any(target_os = "linux", target_os = "windows")), allow(dead_code))]
+    pub(crate) fn callback(
+        &self,
+    ) -> Arc<dyn Fn(vivid_protocol::identity::SurfaceIdentity, u64, AccessibleAction) + Send + Sync>
+    {
+        let shared = Arc::clone(&self.shared);
+        Arc::new(move |window, node, action| {
+            lock(&shared.overlays).queue_accessibility(window, node, action);
+        })
+    }
+}
+
 impl ServiceShared {
     /// Stage a validated clipboard write for the UI thread, which owns the real clipboard.
     ///
@@ -1300,6 +1343,7 @@ impl ServiceShared {
                 registry::OVERLAY_POINTER,
                 registry::OVERLAY_CLIPBOARD,
                 registry::OVERLAY_ENV,
+                registry::OVERLAY_A11Y,
             ]);
             profiles.sort_unstable();
         }
@@ -2165,6 +2209,7 @@ fn establish_root_session(
                 && p != registry::OVERLAY_POINTER
                 && p != registry::OVERLAY_CLIPBOARD
                 && p != registry::OVERLAY_ENV
+                && p != registry::OVERLAY_A11Y
         });
     }
     registry::validate_profile_set(accepted.iter().map(String::as_str))

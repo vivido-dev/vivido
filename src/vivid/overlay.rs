@@ -10,14 +10,15 @@ use vello::peniko::{Blob, ImageAlphaType, ImageData, ImageFormat};
 use winit::window::CursorIcon;
 
 use vivid_protocol::overlay::wire::{
-    Action, Appearance, Clipboard, Environment, EnvironmentChanged, Query, SetWindow, Status,
-    Viewport, WindowAddress,
+    Action, Appearance, Clipboard, Environment, EnvironmentChanged, Query, SetSemantics, SetWindow,
+    Status, Viewport, WindowAddress,
 };
 use vivid_protocol::overlay::wire::{
     PresentationOutcome, Submission, SubmissionOutcome, ViewportChanged,
 };
 use vivid_protocol::overlay::{
-    DismissReason, MAX_CLICKS, PointerReport, Scroll, ScrollPhase, Windows,
+    AccessibleAction, DismissReason, Event, MAX_CLICKS, PointerReport, Scroll, ScrollPhase,
+    Semantics, Windows,
 };
 use vivid_protocol::vector::Scalar;
 
@@ -27,6 +28,12 @@ use crate::display::vector::compile;
 
 #[path = "overlay_text.rs"]
 pub(super) mod text;
+
+/// Assistive-technology actions awaiting their producer's lane, per owning session: the window
+/// they name and the encoded event body, in the order they were asked for.
+///
+/// Queued rather than posted because the asker is not the actor that owns the lane writer.
+type PendingAccessibility = HashMap<SessionIdentity, VecDeque<(u64, Vec<(u64, Value)>)>>;
 
 #[derive(Default)]
 pub(crate) struct Host {
@@ -40,6 +47,9 @@ pub(crate) struct Host {
     pub(super) viewport: Option<Viewport>,
     /// Pointer capture is established from this, never from a producer-supplied position.
     pointer_position: Option<vivid_protocol::vector::Point>,
+    accessibility: PendingAccessibility,
+    /// Each window's semantic tree and the published scene revision it describes.
+    semantics: BTreeMap<SurfaceIdentity, Semantics>,
     /// The window a key press or pointer press was last delivered to, and when. A clipboard
     /// write must be caused by the user, so this is what authorizes one.
     last_gesture: Option<(SurfaceIdentity, Instant)>,
@@ -293,6 +303,7 @@ impl Host {
             self.resolve(owner, submission, PresentationOutcome::Superseded);
         }
         self.displayed.remove(&identity);
+        self.semantics.remove(&identity);
         self.inflight.remove(&identity);
         self.active.remove(&identity);
         self.submissions.retain(|id, _| id.surface != identity);
@@ -481,6 +492,96 @@ impl Host {
             self.refresh_hover();
         }
         result
+    }
+
+    /// Replace a window's semantic tree. Stale revisions are refused rather than stored, so
+    /// assistive technology is never told about a control that is not on screen.
+    pub(super) fn set_semantics(
+        &mut self,
+        id: SurfaceIdentity,
+        semantics: Semantics,
+    ) -> Result<(), &'static str> {
+        let presented = self.displayed.get(&id).map_or(0, |drawing| drawing.revision);
+        if semantics.scene_revision != presented {
+            return Err("semantics must describe the currently published scene");
+        }
+        self.semantics.insert(id, semantics);
+        Ok(())
+    }
+
+    /// Queue an assistive-technology action for the producer that owns a window.
+    ///
+    /// It arrives as an ordinary input event on the producer's own lane, naming the application's
+    /// node ID, so a producer routes it the way it routes anything else the host tells it.
+    ///
+    /// Only the AccessKit adapters can deliver an action, so nothing calls this on macOS, where
+    /// the AppKit adapter builds its own tree. It is kept compiled and type-checked there rather
+    /// than configured away.
+    #[cfg_attr(not(any(target_os = "linux", target_os = "windows")), allow(dead_code))]
+    pub(super) fn queue_accessibility(
+        &mut self,
+        window: SurfaceIdentity,
+        node: u64,
+        action: AccessibleAction,
+    ) -> bool {
+        let Some(current) = self.windows.get(window) else {
+            return false;
+        };
+        // An adapter builds its tree from what was published, so a node the live tree no longer
+        // names is one the user is not looking at: the scene was replaced while the asker held
+        // the old tree.
+        if !self.semantics.get(&window).is_some_and(|tree| tree.nodes.iter().any(|n| n.id == node))
+        {
+            return false;
+        }
+        let event = vivid_protocol::overlay::wire::InputEvent {
+            address: vivid_protocol::overlay::wire::WindowAddress {
+                context_id: window.context.context_id,
+                surface_id: window.surface_id,
+                generation: current.generation,
+            },
+            // An action is not tied to one scene, so it carries the window's published revision.
+            scene_revision: self.displayed.get(&window).map_or(0, |drawing| drawing.revision),
+            event: Event::Accessibility { node, action },
+        };
+        let Ok(payload) = event.payload() else {
+            return false;
+        };
+        let owner = window.context.session;
+        let queue = self.accessibility.entry(owner).or_default();
+        // Assistive technology cannot generate actions faster than a person presses them, but a
+        // stuck client could; the queue is bounded like every other lane queue.
+        if queue.len() >= vivid_protocol::overlay::MAX_PENDING_EVENTS {
+            return false;
+        }
+        queue.push_back((window.surface_id, payload));
+        if let Some(actor) = self.actors.get(&owner).and_then(Weak::upgrade) {
+            actor.wake_actor();
+        }
+        true
+    }
+
+    /// Every window that has a live semantic tree, in a stable order.
+    pub(super) fn windows_with_semantics(&self) -> Vec<(SurfaceIdentity, &Semantics)> {
+        self.semantics.iter().map(|(id, semantics)| (*id, semantics)).collect()
+    }
+
+    /// Drop semantics that no longer describe what is displayed. Called where a scene publishes,
+    /// so a tree that named a stale revision never outlives the scene it described.
+    fn retire_stale_semantics(&mut self) {
+        let stale: Vec<SurfaceIdentity> = self
+            .semantics
+            .iter()
+            .filter(|(id, semantics)| {
+                self.displayed
+                    .get(id)
+                    .is_none_or(|drawing| drawing.revision != semantics.scene_revision)
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        for id in stale {
+            self.semantics.remove(&id);
+        }
     }
 
     /// Re-evaluate hover after the scene under the pointer changed.
@@ -695,6 +796,7 @@ impl Host {
         // The scene under the pointer has just been replaced, so the region it names may differ
         // from the one the producer last saw.
         self.refresh_hover();
+        self.retire_stale_semantics();
     }
 
     /// Scene revisions are window-scoped, including across track replacement. Validate before
@@ -1087,6 +1189,28 @@ pub(super) fn dispatch(
             // The write itself happens on the UI thread, and the tail of this function wakes it.
             (messages::OK, vec![])
         },
+        messages::SET_OVERLAY_SEMANTICS => {
+            if !session.supports(registry::OVERLAY_A11Y) {
+                return Err(ControlError::unsupported("overlay-a11y-v1 was not negotiated"));
+            }
+            let request = SetSemantics::decode(record.object_id, value)
+                .map_err(|_| ControlError::bad_message("invalid overlay semantics"))?;
+            require_context_operation(session, request.address.context_id, OP_SURFACE_TRACK_MEDIA)?;
+            let identity = request
+                .address
+                .identity(session.identity)
+                .map_err(|_| ControlError::bad_message("invalid overlay identity"))?;
+            let generation = host
+                .windows
+                .get(identity)
+                .ok_or_else(|| ControlError::not_found("overlay window is absent"))?
+                .generation;
+            if generation != request.address.generation {
+                return Err(ControlError::precondition("stale overlay window generation"));
+            }
+            host.set_semantics(identity, request.semantics).map_err(ControlError::state)?;
+            (messages::OK, vec![])
+        },
         messages::QUERY_OVERLAY => {
             let query = Query::decode(record.object_id, value)
                 .map_err(|_| ControlError::bad_message("invalid overlay query"))?;
@@ -1213,6 +1337,18 @@ pub(super) fn service_input(shared: &ServiceShared, session: &SessionRuntime) {
             .payload()
             .and_then(|p| Envelope::new(0, p).encode())
             .map_or(true, |body| !session.post_lane(messages::OVERLAY_VIEWPORT_CHANGED, 0, body));
+    }
+    if !failed && let Some(actions) = host.accessibility.get_mut(&session.identity) {
+        while let Some((surface_id, payload)) = actions.pop_front() {
+            let body = match Envelope::new(0, payload).encode() {
+                Ok(body) => body,
+                Err(_) => break,
+            };
+            if !session.post_lane(messages::OVERLAY_INPUT_EVENT, surface_id, body) {
+                failed = true;
+                break;
+            }
+        }
     }
     if !failed && let Some(outcomes) = host.outcomes.get_mut(&session.identity) {
         while let Some(outcome) = outcomes.pop_front() {
@@ -1900,5 +2036,78 @@ mod tests {
             },
         )]);
         assert!(compile(&present, &mut text, &images).is_ok());
+    }
+    /// A semantic tree describing `id` in a scene at revision 1.
+    fn describing(id: u64) -> Semantics {
+        Semantics {
+            scene_revision: 1,
+            nodes: vec![vivid_protocol::overlay::SemanticNode {
+                id,
+                role: vivid_protocol::overlay::SemanticRole::Group,
+                bounds: Rect::new(0., 0., 100., 100.).unwrap(),
+                label: format!("owner {id}"),
+                numeric: None,
+                level: None,
+                set: None,
+                toggled: None,
+                disabled: false,
+                actions: Vec::new(),
+                children: Vec::new(),
+            }],
+        }
+    }
+
+    #[test]
+    fn one_owners_scene_replacement_retires_only_its_semantic_tree() {
+        let mut host = Host::default();
+        let first = SessionIdentity::new(PresenterInstanceId([1; 16]), 1).unwrap();
+        let second = SessionIdentity::new(PresenterInstanceId([1; 16]), 2).unwrap();
+        let bounds = Rect::new(0., 0., 100., 100.).unwrap();
+        // Both owners number their first window and first scene the same way, so only the
+        // complete owner identity separates the two trees.
+        let first_window = placed(&mut host, first, 1, bounds, None);
+        let second_window = placed(&mut host, second, 1, bounds, None);
+        assert_eq!(first_window.surface_id, second_window.surface_id);
+        assert_ne!(first_window.context, second_window.context);
+
+        host.set_semantics(first_window, describing(11)).unwrap();
+        host.set_semantics(second_window, describing(22)).unwrap();
+        assert_eq!(host.windows_with_semantics().len(), 2);
+
+        // The first owner publishes a new scene. Its own tree described the old one, so it is
+        // retired; the other owner's tree still describes what its window is showing.
+        host.displayed.get_mut(&first_window).unwrap().revision = 2;
+        host.retire_stale_semantics();
+        let held = host.windows_with_semantics();
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].0, second_window);
+        assert_eq!(held[0].1.nodes[0].id, 22);
+
+        // An action is delivered only for a node the live tree names: the first owner's retired
+        // node is refused rather than sent, since it is no longer on screen.
+        assert!(!host.queue_accessibility(first_window, 11, AccessibleAction::Click));
+        assert!(host.queue_accessibility(second_window, 22, AccessibleAction::Click));
+        let queued = &host.accessibility[&second];
+        assert_eq!(queued.len(), 1);
+        let sent = vivid_protocol::overlay::wire::InputEvent {
+            address: vivid_protocol::overlay::wire::WindowAddress {
+                context_id: second_window.context.context_id,
+                surface_id: second_window.surface_id,
+                generation: 1,
+            },
+            scene_revision: 1,
+            event: Event::Accessibility { node: 22, action: AccessibleAction::Click },
+        };
+        assert_eq!(queued[0].1, sent.payload().unwrap());
+
+        // Describing the new scene is what the first owner does next, and it must not disturb the
+        // other owner's tree.
+        let mut replaced = describing(33);
+        replaced.scene_revision = 2;
+        host.set_semantics(first_window, replaced).unwrap();
+        let mut ids: Vec<u64> =
+            host.windows_with_semantics().iter().map(|(_, tree)| tree.nodes[0].id).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![22, 33]);
     }
 }
