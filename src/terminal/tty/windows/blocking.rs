@@ -42,9 +42,6 @@ pub struct UnblockedReader<R> {
     /// The pipe that we are reading from.
     pipe: Reader,
 
-    /// Is this the first time registering?
-    first_register: bool,
-
     /// We logically own the reader, but we don't actually use it.
     _reader: PhantomData<R>,
 }
@@ -97,17 +94,22 @@ impl<R: Read + Send + 'static> UnblockedReader<R> {
             }
         });
 
-        Self { interest, pipe: reader, first_register: true, _reader: PhantomData }
+        Self { interest, pipe: reader, _reader: PhantomData }
     }
 
     /// Register interest in the reader.
     pub fn register(&mut self, poller: &Arc<Poller>, event: Event, mode: PollMode) {
-        let mut interest = self.interest.interest.lock().unwrap();
-        *interest = Some(Interest { event, poller: poller.clone(), mode });
+        *self.interest.interest.lock().unwrap() =
+            Some(Interest { event, poller: poller.clone(), mode });
 
-        // Send the event to start off with if we have any data.
-        if (!self.pipe.is_empty() && event.readable) || self.first_register {
-            self.first_register = false;
+        // A fair read slice can empty the pipe without polling it again. Merely testing
+        // is_empty would leave no waker installed for the next burst. Poll with an empty
+        // destination to arm readiness without consuming data. Do not hold the interest
+        // lock: Piper may synchronously wake us when it yields.
+        let waker = Waker::from(self.interest.clone());
+        if event.readable
+            && self.pipe.poll_drain_bytes(&mut Context::from_waker(&waker), &mut []).is_ready()
+        {
             poller.post(CompletionPacket::new(event)).ok();
         }
     }
@@ -199,12 +201,15 @@ impl<W: Write + Send + 'static> UnblockedWriter<W> {
     }
 
     /// Register interest in the writer.
-    pub fn register(&self, poller: &Arc<Poller>, event: Event, mode: PollMode) {
-        let mut interest = self.interest.interest.lock().unwrap();
-        *interest = Some(Interest { event, poller: poller.clone(), mode });
+    pub fn register(&mut self, poller: &Arc<Poller>, event: Event, mode: PollMode) {
+        *self.interest.interest.lock().unwrap() =
+            Some(Interest { event, poller: poller.clone(), mode });
 
-        // Send the event to start off with if we have room for data.
-        if !self.pipe.is_full() && event.writable {
+        // Likewise, filling the pipe exactly must arm a wake for newly available space.
+        let waker = Waker::from(self.interest.clone());
+        if event.writable
+            && self.pipe.poll_fill_bytes(&mut Context::from_waker(&waker), &[]).is_ready()
+        {
             poller.post(CompletionPacket::new(event)).ok();
         }
     }
@@ -279,12 +284,61 @@ impl Wake for Registration {
 mod tests {
     use std::io::{Cursor, Read};
     use std::num::NonZeroUsize;
-    use std::sync::{Arc, mpsc};
+    use std::sync::{Arc, Mutex, mpsc};
     use std::time::Duration;
 
     use polling::{Event, Events, PollMode, Poller};
 
-    use super::UnblockedReader;
+    use super::{PipeEnd, Registration, UnblockedReader, UnblockedWriter};
+
+    #[test]
+    fn rearming_an_empty_reader_wakes_for_the_next_burst() {
+        let (pipe, mut writer) = piper::pipe(64);
+        let mut reader = UnblockedReader::<Cursor<Vec<u8>>> {
+            interest: Arc::new(Registration { interest: Mutex::new(None), end: PipeEnd::Reader }),
+            pipe,
+            _reader: std::marker::PhantomData,
+        };
+        let poller = Arc::new(Poller::new().unwrap());
+        let event = Event::readable(7);
+        let mut events = Events::new();
+        for burst in [1, 2] {
+            // Rearm after a fairness slice drained exactly all available bytes, without
+            // another read that would have installed a waker on the now-empty pipe.
+            reader.register(&poller, event, PollMode::Level);
+            assert_eq!(writer.try_fill(&[burst; 64]), 64);
+            poller.wait(&mut events, Some(Duration::from_secs(1))).unwrap();
+            assert!(events.iter().any(|ready| ready.key == event.key));
+            let mut received = Vec::new();
+            while received.len() < 64 {
+                let mut buffer = [0; 64];
+                let count = reader.read(&mut buffer).unwrap();
+                received.extend_from_slice(&buffer[..count]);
+            }
+            assert_eq!(received, vec![burst; 64]);
+            events.clear();
+            poller.wait(&mut events, Some(Duration::ZERO)).unwrap();
+            events.clear();
+        }
+    }
+
+    #[test]
+    fn rearming_a_full_writer_wakes_when_space_returns() {
+        let (mut reader, pipe) = piper::pipe(64);
+        let mut writer = UnblockedWriter::<Vec<u8>> {
+            interest: Arc::new(Registration { interest: Mutex::new(None), end: PipeEnd::Writer }),
+            pipe,
+            _reader: std::marker::PhantomData,
+        };
+        let poller = Arc::new(Poller::new().unwrap());
+        let event = Event::writable(8);
+        assert_eq!(writer.pipe.try_fill(&[3; 64]), 64);
+        writer.register(&poller, event, PollMode::Level);
+        assert_eq!(reader.try_drain(&mut [0; 64]), 64);
+        let mut events = Events::new();
+        poller.wait(&mut events, Some(Duration::from_secs(1))).unwrap();
+        assert!(events.iter().any(|ready| ready.key == event.key));
+    }
 
     #[test]
     fn a_buffered_level_reader_makes_progress_when_rearmed_after_each_fair_slice() {
