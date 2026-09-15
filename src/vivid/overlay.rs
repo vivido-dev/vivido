@@ -345,6 +345,44 @@ impl Host {
         self.windows.cursor()
     }
 
+    /// Create or update a window, then re-evaluate what the pointer is over.
+    ///
+    /// Moving, resizing, and hiding a window change the region under a stationary pointer just
+    /// as publishing a scene does. Keeping that inside the mutation rather than at each call
+    /// site means a caller cannot forget it.
+    pub(super) fn set_window(
+        &mut self,
+        identity: SurfaceIdentity,
+        generation: u64,
+        expected_revision: u64,
+        options: vivid_protocol::overlay::WindowOptions,
+    ) -> Result<u64, vivid_protocol::vector::InvalidScene> {
+        let result = if expected_revision == 0 {
+            self.windows.create(identity, generation, options).map(|()| 1)
+        } else {
+            self.window_updates = self.window_updates.saturating_add(1);
+            self.windows.update(identity, generation, expected_revision, options)
+        };
+        if result.is_ok() {
+            self.refresh_hover();
+        }
+        result
+    }
+
+    /// Apply a conditional window action, then re-evaluate what the pointer is over.
+    pub(super) fn apply_action(
+        &mut self,
+        owner: SessionIdentity,
+        action: vivid_protocol::overlay::wire::Action,
+        viewport: Viewport,
+    ) -> Result<Option<u64>, vivid_protocol::vector::InvalidScene> {
+        let result = self.windows.apply_action(owner, action, viewport);
+        if result.is_ok() {
+            self.refresh_hover();
+        }
+        result
+    }
+
     /// Re-evaluate hover after the scene under the pointer changed.
     pub(super) fn refresh_hover(&mut self) {
         let Some(point) = self.pointer_position else {
@@ -894,25 +932,19 @@ pub(super) fn dispatch(
             if !host.lanes.contains_key(&session.identity) {
                 return Err(ControlError::bad_state("overlay input lane is unavailable"));
             }
-            request.expected_revision = if request.expected_revision == 0 {
-                if host.surfaces.contains(&identity) {
-                    return Err(ControlError::state(
-                        "an overlay surface cannot be reopened after dismissal",
-                    ));
-                }
-                host.windows
-                    .create(identity, request.address.generation, request.options.clone())
-                    .map(|()| 1)
-            } else {
-                host.window_updates = host.window_updates.saturating_add(1);
-                host.windows.update(
+            if request.expected_revision == 0 && host.surfaces.contains(&identity) {
+                return Err(ControlError::state(
+                    "an overlay surface cannot be reopened after dismissal",
+                ));
+            }
+            request.expected_revision = host
+                .set_window(
                     identity,
                     request.address.generation,
                     request.expected_revision,
                     request.options.clone(),
                 )
-            }
-            .map_err(|e| ControlError::state(e.0))?;
+                .map_err(|e| ControlError::state(e.0))?;
             host.surfaces.insert(identity);
             (
                 messages::OVERLAY_WINDOW_READY,
@@ -928,8 +960,7 @@ pub(super) fn dispatch(
             let viewport = host
                 .viewport
                 .ok_or_else(|| ControlError::bad_state("overlay viewport is unavailable"))?;
-            host.windows
-                .apply_action(session.identity, action, viewport)
+            host.apply_action(session.identity, action, viewport)
                 .map_err(|e| ControlError::state(e.0))?;
             (messages::OK, vec![])
         },
@@ -1175,6 +1206,109 @@ mod tests {
             assert!(host.validate_activation(&scene, surface, &bindings).is_ok());
             assert_eq!(scene.active_track(surface, vivid_sdk::SLOT_VECTOR), None);
         }
+    }
+
+    /// A window covering `x..x+100`, `y..y+100`, with one region over the whole of it.
+    fn placed(
+        host: &mut Host,
+        owner: SessionIdentity,
+        surface_id: u64,
+        bounds: Rect,
+        cursor: Option<vivid_protocol::vector::CursorShape>,
+    ) -> SurfaceIdentity {
+        let surface = owner.context(1).unwrap().surface(surface_id).unwrap();
+        host.windows.create(surface, 1, WindowOptions::new(bounds, WindowMode::Floating)).unwrap();
+        let mut canvas = vivid_protocol::vector::Canvas::new();
+        canvas
+            .push(vivid_protocol::vector::Command::Hit {
+                id: surface_id,
+                path: vivid_protocol::vector::Path::rectangle(
+                    Rect::new(0., 0., bounds.width.get(), bounds.height.get()).unwrap(),
+                )
+                .unwrap(),
+                role: vivid_protocol::vector::HitRole::Input,
+                cursor,
+            })
+            .unwrap();
+        let compiled = Arc::new(
+            compile(&canvas, &mut TextSystem::new(Default::default()), &BTreeMap::new()).unwrap(),
+        );
+        host.displayed.insert(
+            surface,
+            Drawing {
+                window: surface,
+                window_revision: 1,
+                revision: 1,
+                bounds,
+                scale: 1.,
+                compiled,
+                submission: Submission {
+                    address: vivid_protocol::overlay::wire::WindowAddress {
+                        context_id: 1,
+                        surface_id,
+                        generation: 1,
+                    },
+                    track_id: surface_id,
+                    channel_generation: 1,
+                    epoch: 1,
+                    revision: 1,
+                },
+            },
+        );
+        surface
+    }
+
+    #[test]
+    fn hover_follows_window_movement_raise_and_hide() {
+        let mut host = Host::default();
+        host.update_viewport(800., 600., 1.).unwrap();
+        let owner = SessionIdentity::new(PresenterInstanceId([1; 16]), 1).unwrap();
+        // Two overlapping windows, the second created above the first.
+        let below = placed(
+            &mut host,
+            owner,
+            1,
+            Rect::new(0., 0., 200., 200.).unwrap(),
+            Some(vivid_protocol::vector::CursorShape::Text),
+        );
+        let above = placed(
+            &mut host,
+            owner,
+            2,
+            Rect::new(0., 0., 200., 200.).unwrap(),
+            Some(vivid_protocol::vector::CursorShape::Pointer),
+        );
+        host.pointer_position = Some(vivid_protocol::vector::Point::new(50., 50.).unwrap());
+        host.refresh_hover();
+        // The topmost window owns the pointer.
+        assert_eq!(host.cursor(), Some(vivid_protocol::vector::CursorShape::Pointer));
+
+        // Raising the lower one changes which window is on top with no pointer movement.
+        let raise = Action {
+            address: vivid_protocol::overlay::wire::WindowAddress {
+                context_id: 1,
+                surface_id: 1,
+                generation: 1,
+            },
+            expected_revision: 1,
+            action: vivid_protocol::overlay::wire::WindowAction::Raise,
+        };
+        host.apply_action(owner, raise, host.viewport.unwrap()).unwrap();
+        assert_eq!(host.cursor(), Some(vivid_protocol::vector::CursorShape::Text));
+
+        // Moving the now-topmost window away leaves the pointer over the other one.
+        host.set_window(
+            below,
+            1,
+            2,
+            WindowOptions::new(Rect::new(400., 400., 200., 200.).unwrap(), WindowMode::Floating),
+        )
+        .unwrap();
+        assert_eq!(host.cursor(), Some(vivid_protocol::vector::CursorShape::Pointer));
+
+        // Hiding the last window under the pointer ends the hover entirely.
+        host.windows.close(above, vivid_protocol::overlay::DismissReason::Closed);
+        assert_eq!(host.cursor(), None);
     }
 
     #[test]
