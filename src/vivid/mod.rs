@@ -1319,6 +1319,13 @@ impl ServiceShared {
     ///
     /// The path sub-profile is config-gated, so a deployment with it turned off simply never
     /// negotiates it and every peer degrades to the pre-feature wire.
+    ///
+    /// The overlay bundle is offered on every platform, `overlay-a11y-v1` included. A profile
+    /// says what this wire carries, not what one platform's adapter happens to read today: a
+    /// semantic tree is accepted, validated, retired with its scene and reported in `inspect`
+    /// everywhere, and only the last hop into AppKit is missing on macOS. Withdrawing it there
+    /// would put every producer on a permanent fallback and make them all change again the day
+    /// that hop lands, in exchange for knowledge none of them could act on.
     fn offered_profiles(&self) -> Vec<&'static str> {
         let allow = self.remote_drop_paste.load(Ordering::Relaxed);
         let mut profiles: Vec<_> = self
@@ -7234,6 +7241,34 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         };
         assert_eq!(pastes, vec![format!("{committed} ")]);
+    }
+
+    #[test]
+    fn the_overlay_bundle_is_offered_wherever_the_wire_carries_it() {
+        let service =
+            socket_service!(VividService::start_with_wake(test_geometry(), Arc::new(|_| {})));
+        service.update_overlay_viewport(800., 600., 2.);
+        let offered = service.shared.offered_profiles();
+        for profile in [
+            registry::TERMINAL_OVERLAY,
+            registry::VECTOR_SCENE,
+            registry::OVERLAY_INPUT,
+            registry::OVERLAY_TEXT,
+            registry::OVERLAY_TEXT_LAYOUT,
+            registry::OVERLAY_TYPOGRAPHY,
+            registry::OVERLAY_PAINT,
+            registry::OVERLAY_POINTER,
+            registry::OVERLAY_CLIPBOARD,
+            registry::OVERLAY_ENV,
+            // Deliberately unconditional. On macOS the AppKit adapter builds its own tree and
+            // does not yet read overlay nodes, so a description reaches no screen reader there —
+            // but it is still accepted, validated, retired with its scene and visible in
+            // `inspect`, which is what the profile claims. Gating this on the platform would
+            // strand producers on a fallback and force them all to change back later.
+            registry::OVERLAY_A11Y,
+        ] {
+            assert!(offered.contains(&profile), "{profile} is not offered");
+        }
     }
 
     #[test]
