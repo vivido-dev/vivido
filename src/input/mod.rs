@@ -151,7 +151,13 @@ pub trait ActionContext<T: EventListener> {
     ) -> bool {
         false
     }
-    fn overlay_wheel(&self, _x: f64, _y: f64, _dx: f64, _dy: f64, _modifiers: u32) -> bool {
+    fn overlay_wheel(
+        &self,
+        _x: f64,
+        _y: f64,
+        _scroll: crate::vivid::overlay::ScrollInput,
+        _modifiers: u32,
+    ) -> bool {
         false
     }
     /// Route clipboard media to the live file-drop binding, returning whether it took the paste.
@@ -446,7 +452,7 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
     #[inline]
     pub fn mouse_moved(&mut self, position: PhysicalPosition<f64>) {
         let size_info = self.ctx.size_info();
-        let overlay_modifiers = self.ctx.modifiers().state().bits();
+        let overlay_modifiers = crate::vivid::hid::modifiers(self.ctx.modifiers().state());
         if (size_info.contains_point(position.x.max(0.) as usize, position.y.max(0.) as usize)
             || self.ctx.overlay_capturing())
             && self.ctx.overlay_pointer(position.x, position.y, None, overlay_modifiers)
@@ -716,19 +722,30 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
     }
 
     pub fn mouse_wheel_input(&mut self, delta: MouseScrollDelta, phase: TouchPhase) {
-        let overlay_modifiers = self.ctx.modifiers().state().bits();
-        let (dx, dy) = match delta {
+        let overlay_modifiers = crate::vivid::hid::modifiers(self.ctx.modifiers().state());
+        let (dx, dy, precise) = match delta {
             MouseScrollDelta::LineDelta(x, y) => (
                 f64::from(x * self.ctx.size_info().cell_width()),
                 f64::from(y * self.ctx.size_info().cell_height()),
+                false,
             ),
-            MouseScrollDelta::PixelDelta(position) => (position.x, position.y),
+            MouseScrollDelta::PixelDelta(position) => (position.x, position.y, true),
+        };
+        let scroll = crate::vivid::overlay::ScrollInput {
+            dx,
+            dy,
+            precise,
+            phase: match phase {
+                TouchPhase::Started => vivid_protocol::overlay::ScrollPhase::Began,
+                TouchPhase::Moved => vivid_protocol::overlay::ScrollPhase::Changed,
+                TouchPhase::Ended => vivid_protocol::overlay::ScrollPhase::Ended,
+                TouchPhase::Cancelled => vivid_protocol::overlay::ScrollPhase::Cancelled,
+            },
         };
         if self.ctx.overlay_wheel(
             self.ctx.mouse().x as f64,
             self.ctx.mouse().y as f64,
-            dx,
-            dy,
+            scroll,
             overlay_modifiers,
         ) {
             return;
@@ -996,17 +1013,10 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
     }
 
     pub fn mouse_input(&mut self, state: ElementState, button: MouseButton) {
-        let overlay_modifiers = self.ctx.modifiers().state().bits();
-        let overlay_button = match button {
-            MouseButton::Left => 1,
-            MouseButton::Right => 2,
-            MouseButton::Middle => 3,
-            MouseButton::Back => 4,
-            MouseButton::Forward => 5,
-            MouseButton::Other(button) => button.saturating_add(6),
-        };
-        if (self.ctx.size_info().contains_point(self.ctx.mouse().x, self.ctx.mouse().y)
-            || self.ctx.overlay_capturing())
+        let overlay_modifiers = crate::vivid::hid::modifiers(self.ctx.modifiers().state());
+        if let Some(overlay_button) = crate::vivid::hid::button(button)
+            && (self.ctx.size_info().contains_point(self.ctx.mouse().x, self.ctx.mouse().y)
+                || self.ctx.overlay_capturing())
             && self.ctx.overlay_pointer(
                 self.ctx.mouse().x as f64,
                 self.ctx.mouse().y as f64,

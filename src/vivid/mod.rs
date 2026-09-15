@@ -697,7 +697,7 @@ impl VividService {
         button: Option<(u16, bool)>,
         modifiers: u32,
     ) -> bool {
-        let consumed = lock(&self.shared.overlays).pointer(&self.scene, x, y, button, modifiers);
+        let consumed = lock(&self.shared.overlays).pointer(x, y, button, modifiers);
         if consumed {
             self.shared.request_frame_wake();
             self.shared.wake_overlay_actors();
@@ -705,8 +705,14 @@ impl VividService {
         consumed
     }
 
-    pub(crate) fn overlay_wheel(&self, x: f64, y: f64, dx: f64, dy: f64, modifiers: u32) -> bool {
-        let consumed = lock(&self.shared.overlays).wheel(&self.scene, x, y, dx, dy, modifiers);
+    pub(crate) fn overlay_wheel(
+        &self,
+        x: f64,
+        y: f64,
+        scroll: overlay::ScrollInput,
+        modifiers: u32,
+    ) -> bool {
+        let consumed = lock(&self.shared.overlays).wheel(x, y, scroll, modifiers);
         if consumed {
             self.shared.wake_overlay_actors();
         }

@@ -108,7 +108,7 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
             _ => 0,
         };
         let down = key.state == ElementState::Pressed;
-        let modifiers = self.ctx.modifiers().state().bits();
+        let modifiers = crate::vivid::hid::modifiers(self.ctx.modifiers().state());
         let consumed = self.ctx.overlay_keyboard(
             vivid_protocol::overlay::Event::Key { physical, down, repeat: key.repeat, modifiers },
             key.logical_key == Key::Named(NamedKey::Escape),

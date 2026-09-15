@@ -12,7 +12,7 @@ use vivid_protocol::overlay::wire::{Action, Query, SetWindow, Status, Viewport, 
 use vivid_protocol::overlay::wire::{
     PresentationOutcome, Submission, SubmissionOutcome, ViewportChanged,
 };
-use vivid_protocol::overlay::{DismissReason, Windows};
+use vivid_protocol::overlay::{DismissReason, Scroll, ScrollPhase, Windows};
 use vivid_protocol::vector::Scalar;
 
 use super::*;
@@ -32,6 +32,8 @@ pub(crate) struct Host {
     editor: Option<(SurfaceIdentity, vivid_protocol::overlay::wire::text::EditorGeometry)>,
     windows: Windows,
     pub(super) viewport: Option<Viewport>,
+    /// Pointer capture is established from this, never from a producer-supplied position.
+    pointer_position: Option<vivid_protocol::vector::Point>,
     surfaces: HashSet<SurfaceIdentity>,
     scenes: HashMap<TrackIdentity, (ChannelGeneration, u64, Arc<CompiledScene>)>,
     assets: HashMap<(TrackIdentity, ChannelGeneration, u64), (Weak<()>, usize)>,
@@ -52,6 +54,16 @@ pub(crate) struct Host {
     presented_scenes: u64,
     superseded_scenes: u64,
     window_updates: u64,
+}
+
+/// A platform wheel delta in physical pixels, before the viewport scale is applied.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ScrollInput {
+    pub dx: f64,
+    pub dy: f64,
+    /// True for pixel-precise devices such as trackpads, false for detented wheels.
+    pub precise: bool,
+    pub phase: ScrollPhase,
 }
 
 #[derive(Clone)]
@@ -264,7 +276,6 @@ impl Host {
 
     pub(super) fn pointer(
         &mut self,
-        _scene: &SharedScene,
         x: f64,
         y: f64,
         button: Option<(u16, bool)>,
@@ -277,6 +288,7 @@ impl Host {
         let Ok(point) = vivid_protocol::vector::Point::new(x / scale, y / scale) else {
             return false;
         };
+        self.pointer_position = Some(point);
         let drawings: Vec<_> = self.displayed.values().cloned().collect();
         let consumed = self.windows.pointer(point, button, modifiers, |id, point| {
             drawings.iter().find(|d| d.window == id).and_then(|d| d.compiled.hit(point))
@@ -285,28 +297,22 @@ impl Host {
         consumed
     }
 
-    pub(super) fn wheel(
-        &mut self,
-        _scene: &SharedScene,
-        x: f64,
-        y: f64,
-        dx: f64,
-        dy: f64,
-        modifiers: u32,
-    ) -> bool {
+    pub(super) fn wheel(&mut self, x: f64, y: f64, scroll: ScrollInput, modifiers: u32) -> bool {
         let Some(viewport) = self.viewport else {
             return false;
         };
         let scale = f64::from(viewport.scale_numerator) / f64::from(viewport.scale_denominator);
         let (Ok(point), Ok(dx), Ok(dy)) = (
             vivid_protocol::vector::Point::new(x / scale, y / scale),
-            Scalar::new(dx / scale),
-            Scalar::new(dy / scale),
+            Scalar::new(scroll.dx / scale),
+            Scalar::new(scroll.dy / scale),
         ) else {
             return false;
         };
+        self.pointer_position = Some(point);
+        let scroll = Scroll { dx, dy, precise: scroll.precise, phase: scroll.phase };
         let drawings: Vec<_> = self.displayed.values().cloned().collect();
-        self.windows.wheel(point, dx, dy, modifiers, |id, point| {
+        self.windows.wheel(point, scroll, modifiers, |id, point| {
             drawings.iter().find(|d| d.window == id).and_then(|d| d.compiled.hit(point))
         })
     }
@@ -867,12 +873,8 @@ pub(super) fn lane_record(
                     return Err("stale overlay capture scene");
                 }
                 if capture.capture {
-                    host.windows
-                        .capture_pointer(
-                            id,
-                            vivid_protocol::vector::Point::new(0., 0.).map_err(|e| e.0)?,
-                        )
-                        .map_err(|e| e.0)?;
+                    let position = host.pointer_position.unwrap_or_default();
+                    host.windows.capture_pointer(id, position).map_err(|e| e.0)?;
                 } else {
                     host.windows.release_pointer(id);
                 }
@@ -1056,6 +1058,43 @@ mod tests {
             assert!(host.validate_activation(&scene, surface, &bindings).is_ok());
             assert_eq!(scene.active_track(surface, vivid_sdk::SLOT_VECTOR), None);
         }
+    }
+
+    #[test]
+    fn pointer_capture_uses_the_host_observed_position() {
+        let mut host = Host::default();
+        host.update_viewport(800., 600., 2.).unwrap();
+        let owner = SessionIdentity::new(PresenterInstanceId([1; 16]), 1).unwrap();
+        let surface = owner.context(1).unwrap().surface(1).unwrap();
+        host.windows
+            .create(
+                surface,
+                1,
+                WindowOptions::new(Rect::new(0., 0., 100., 100.).unwrap(), WindowMode::Floating),
+            )
+            .unwrap();
+        assert_eq!(host.pointer_position, None);
+
+        // Physical pixels become logical pixels through the viewport scale.
+        host.pointer(120., 80., None, 0);
+        assert_eq!(
+            host.pointer_position,
+            Some(vivid_protocol::vector::Point::new(60., 40.).unwrap())
+        );
+
+        // Wheel events carry the same authoritative position.
+        let scroll = ScrollInput { dx: 0., dy: 3., precise: true, phase: ScrollPhase::Changed };
+        host.wheel(40., 20., scroll, 0);
+        assert_eq!(
+            host.pointer_position,
+            Some(vivid_protocol::vector::Point::new(20., 10.).unwrap())
+        );
+
+        // A capture established now starts from that position, never from a fabricated origin.
+        host.windows.request_focus(surface).unwrap();
+        let position = host.pointer_position.unwrap();
+        host.windows.capture_pointer(surface, position).unwrap();
+        assert!(host.windows.has_pointer_capture());
     }
 
     #[test]

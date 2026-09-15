@@ -4102,8 +4102,14 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
     fn overlay_pointer(&self, x: f64, y: f64, button: Option<(u16, bool)>, modifiers: u32) -> bool {
         self.vivid_service.overlay_pointer(x, y, button, modifiers)
     }
-    fn overlay_wheel(&self, x: f64, y: f64, dx: f64, dy: f64, modifiers: u32) -> bool {
-        self.vivid_service.overlay_wheel(x, y, dx, dy, modifiers)
+    fn overlay_wheel(
+        &self,
+        x: f64,
+        y: f64,
+        scroll: crate::vivid::overlay::ScrollInput,
+        modifiers: u32,
+    ) -> bool {
+        self.vivid_service.overlay_wheel(x, y, scroll, modifiers)
     }
 
     fn paste_clipboard_media(&mut self) -> bool {
