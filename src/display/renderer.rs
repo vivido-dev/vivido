@@ -1303,6 +1303,7 @@ mod tests {
                         GradientStop { offset: 0, color: WireColor(0xff0000ff) },
                         GradientStop { offset: 65535, color: WireColor(0x0000ffff) },
                     ],
+                    color_space: vivid_protocol::vector::ColorSpace::Srgb,
                 },
             )
             .unwrap();

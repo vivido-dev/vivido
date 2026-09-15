@@ -4,8 +4,13 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use vello::kurbo::{Affine, BezPath, Point, Rect, Shape, Stroke};
-use vello::peniko::{Brush, Color, ColorStop, Fill, Gradient, ImageData, Mix};
+use vello::kurbo::{
+    Affine, BezPath, Cap, Join, Point, Rect, RoundedRect, RoundedRectRadii, Shape, Stroke,
+};
+use vello::peniko::color::ColorSpaceTag;
+use vello::peniko::{
+    Brush, Color, ColorStop, Extend as ImageExtend, Fill, Gradient, ImageBrush, ImageData, Mix,
+};
 use vello::{Glyph, Scene};
 use vivid_protocol::vector::{self as wire, Canvas, Command, HitRole, InvalidScene, Segment};
 
@@ -184,17 +189,47 @@ pub fn compile_with_layouts(
                     Command::Fill(path, brush) => result.scene.fill(
                         fill_rule(path),
                         state.transform,
-                        &paint(brush),
-                        None,
+                        &paint(brush, images)?,
+                        brush_transform(brush),
                         &path_geometry(path),
                     ),
                     Command::Stroke(path, brush, width) => result.scene.stroke(
                         &Stroke::new(width.get()),
                         state.transform,
-                        &paint(brush),
-                        None,
+                        &paint(brush, images)?,
+                        brush_transform(brush),
                         &path_geometry(path),
                     ),
+                    Command::StyledStroke(path, brush, style) => {
+                        let mut stroke = Stroke::new(style.width.get())
+                            .with_caps(match style.cap {
+                                wire::Cap::Butt => Cap::Butt,
+                                wire::Cap::Round => Cap::Round,
+                                wire::Cap::Square => Cap::Square,
+                            })
+                            .with_join(match style.join {
+                                wire::Join::Miter => Join::Miter,
+                                wire::Join::Bevel => Join::Bevel,
+                                wire::Join::Round => Join::Round,
+                            })
+                            .with_miter_limit(style.miter_limit.get());
+                        if !style.dashes.is_empty() {
+                            stroke = stroke.with_dashes(
+                                style.dash_offset.get(),
+                                style.dashes.iter().map(|d| d.get()),
+                            );
+                        }
+                        result.scene.stroke(
+                            &stroke,
+                            state.transform,
+                            &paint(brush, images)?,
+                            brush_transform(brush),
+                            &path_geometry(path),
+                        );
+                    },
+                    Command::Shadow(shadow) => {
+                        draw_shadow(&mut result.scene, shadow, state.transform)?;
+                    },
                     Command::Text(value) => {
                         let layout = text.shape_overlay(value);
                         let transform = state.transform
@@ -313,14 +348,31 @@ fn color(c: wire::Color) -> Color {
     let [r, g, b, a] = c.0.to_be_bytes();
     Color::from_rgba8(r, g, b, a)
 }
-fn paint(brush: &wire::Brush) -> Brush {
-    let (gradient, stops) = match brush {
-        wire::Brush::Solid(c) => return Brush::Solid(color(*c)),
-        wire::Brush::Linear { start, end, stops } => {
-            (Gradient::new_linear(point(*start), point(*end)), stops)
+fn paint(brush: &wire::Brush, images: &BTreeMap<u64, ImageData>) -> Result<Brush, InvalidScene> {
+    let (gradient, stops, space) = match brush {
+        wire::Brush::Solid(c) => return Ok(Brush::Solid(color(*c))),
+        wire::Brush::Linear { start, end, stops, color_space } => {
+            (Gradient::new_linear(point(*start), point(*end)), stops, *color_space)
         },
-        wire::Brush::Radial { center, radius, stops } => {
-            (Gradient::new_radial(point(*center), radius.get() as f32), stops)
+        wire::Brush::Radial { center, radius, stops, color_space } => {
+            (Gradient::new_radial(point(*center), radius.get() as f32), stops, *color_space)
+        },
+        wire::Brush::Image { asset, extend, .. } => {
+            let image = images.get(asset).ok_or(InvalidScene("unknown retained image"))?;
+            if image.width == 0 || image.height == 0 {
+                return Err(InvalidScene("empty retained image"));
+            }
+            if image.format.size_in_bytes(image.width, image.height) != Some(image.data.len())
+                || image.data.len() > wire::MAX_ASSET_BYTES
+            {
+                return Err(InvalidScene("invalid retained image bytes"));
+            }
+            let brush = ImageBrush::new(image.clone()).with_extend(match extend {
+                wire::Extend::Pad => ImageExtend::Pad,
+                wire::Extend::Repeat => ImageExtend::Repeat,
+                wire::Extend::Reflect => ImageExtend::Reflect,
+            });
+            return Ok(Brush::Image(brush));
         },
     };
     let stops: Vec<_> = stops
@@ -330,5 +382,156 @@ fn paint(brush: &wire::Brush) -> Brush {
             color: color(stop.color).into(),
         })
         .collect();
-    Brush::Gradient(gradient.with_stops(stops.as_slice()))
+    let gradient = gradient.with_stops(stops.as_slice());
+    Ok(Brush::Gradient(match space {
+        wire::ColorSpace::Srgb => gradient,
+        wire::ColorSpace::Oklab => gradient.with_interpolation_cs(ColorSpaceTag::Oklab),
+    }))
 }
+
+/// The affine mapping an image brush paints through, if it carries one.
+fn brush_transform(brush: &wire::Brush) -> Option<Affine> {
+    let wire::Brush::Image { transform, .. } = brush else {
+        return None;
+    };
+    transform.map(|t| {
+        Affine::new([
+            t.0[0].get(),
+            t.0[1].get(),
+            t.0[2].get(),
+            t.0[3].get(),
+            t.0[4].get(),
+            t.0[5].get(),
+        ])
+    })
+}
+
+/// A wire shadow's shape after spread, with its radii grown or shrunk to match.
+fn shadow_shape(shadow: &wire::Shadow) -> (Rect, RoundedRectRadii) {
+    let spread = shadow.spread.get();
+    let rect = Rect::new(
+        shadow.rect.origin.x.get(),
+        shadow.rect.origin.y.get(),
+        shadow.rect.origin.x.get() + shadow.rect.width.get(),
+        shadow.rect.origin.y.get() + shadow.rect.height.get(),
+    )
+    .inflate(spread, spread);
+    let [tl, tr, br, bl] = shadow.radii.0.map(|r| (r.get() + spread).max(0.0));
+    (rect, RoundedRectRadii::new(tl, tr, br, bl))
+}
+
+/// Paint one shadow, honouring the current transform.
+///
+/// Vello's blurred-rounded-rect primitive takes a single radius, so a shadow whose four corners
+/// agree gets a true gaussian. Mixed corners and inset shadows are approximated with stepped
+/// rings whose alphas follow the same gaussian falloff: bounded work, an exact wire value, and
+/// an approximation that lives only in this host where a better renderer can replace it.
+fn draw_shadow(
+    scene: &mut Scene,
+    shadow: &wire::Shadow,
+    transform: Affine,
+) -> Result<(), InvalidScene> {
+    let (rect, radii) = shadow_shape(shadow);
+    let sigma = shadow.blur.get() / 2.0;
+    let offset = (shadow.offset.x.get(), shadow.offset.y.get());
+    let paint = transform * Affine::translate(offset);
+    check_bounds(rect, paint)?;
+    let uniform = shadow.radii.uniform_value().map(|r| (r + shadow.spread.get()).max(0.0));
+    if !shadow.inset
+        && let Some(radius) = uniform
+        && sigma >= 0.25
+    {
+        scene.draw_blurred_rounded_rect(paint, rect, color(shadow.color), radius, sigma);
+        return Ok(());
+    }
+    let steps = SHADOW_STEPS as f64;
+    if sigma < 0.25 {
+        // No blur to approximate: the shadow is the spread-adjusted shape itself.
+        let shape = RoundedRect::from_rect(rect, radii);
+        if shadow.inset {
+            scene.push_layer(Fill::NonZero, Mix::Normal, 1.0, paint, &shape);
+            scene.fill(Fill::NonZero, paint, color(shadow.color), None, &shape);
+            scene.pop_layer();
+        } else {
+            scene.fill(Fill::NonZero, paint, color(shadow.color), None, &shape);
+        }
+        return Ok(());
+    }
+    // How far the falloff runs before it is imperceptible, matching vello's own kernel extent.
+    let extent = 2.5 * sigma;
+    let [rtl, rtr, rbr, rbl] =
+        [radii.top_left, radii.top_right, radii.bottom_right, radii.bottom_left];
+    if shadow.inset {
+        // Clip to the shape, then stack eroded fills deepest first: a point at depth p ends up
+        // carrying the alpha of the largest erosion that still covers it, which is the falloff
+        // at p. The erosion is translated by the offset so the shadow leans away from its light.
+        let shape = RoundedRect::from_rect(rect, radii);
+        scene.push_layer(Fill::NonZero, Mix::Normal, 1.0, transform, &shape);
+        let lean = Affine::translate(offset);
+        for step in (0..SHADOW_STEPS).rev() {
+            let depth = (step as f64 + 0.5) / steps * extent;
+            if rect.width() / 2.0 <= depth || rect.height() / 2.0 <= depth {
+                continue;
+            }
+            let eroded = rect.inflate(-depth, -depth);
+            let eroded = RoundedRect::new(
+                eroded.x0,
+                eroded.y0,
+                eroded.x1,
+                eroded.y1,
+                RoundedRectRadii::new(
+                    (rtl - depth).max(0.0),
+                    (rtr - depth).max(0.0),
+                    (rbr - depth).max(0.0),
+                    (rbl - depth).max(0.0),
+                ),
+            );
+            let alpha = falloff(depth, sigma);
+            scene.fill(
+                Fill::NonZero,
+                transform * lean,
+                color(shadow.color).multiply_alpha(alpha),
+                None,
+                &eroded,
+            );
+        }
+        scene.pop_layer();
+    } else {
+        // Inflate outward, largest extent first, so each smaller fill lands on top with the
+        // higher alpha a nearer distance deserves.
+        for step in (0..SHADOW_STEPS).rev() {
+            let distance = (step as f64 + 0.5) / steps * extent;
+            let grown = rect.inflate(distance, distance);
+            let grown = RoundedRect::new(
+                grown.x0,
+                grown.y0,
+                grown.x1,
+                grown.y1,
+                RoundedRectRadii::new(
+                    rtl + distance,
+                    rtr + distance,
+                    rbr + distance,
+                    rbl + distance,
+                ),
+            );
+            let alpha = falloff(distance, sigma);
+            scene.fill(
+                Fill::NonZero,
+                paint,
+                color(shadow.color).multiply_alpha(alpha),
+                None,
+                &grown,
+            );
+        }
+    }
+    Ok(())
+}
+
+/// One stepped falloff weight of a gaussian edge at `distance` from the shape.
+fn falloff(distance: f64, sigma: f64) -> f32 {
+    0.5 * (-distance * distance / (2.0 * sigma * sigma)).exp() as f32
+}
+
+/// How many stepped rings approximate a blur. Ten keeps a band below about a pixel for the
+/// small blurs a user interface actually casts.
+const SHADOW_STEPS: usize = 10;

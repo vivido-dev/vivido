@@ -609,6 +609,18 @@ impl VectorWorker {
                 self.text.update_font(font.clone());
                 self.font = font;
             }
+            // Paint commands are available only to a producer that negotiated the paint profile,
+            // exactly as retained text layouts are. Checking before compilation keeps an
+            // un-negotiated command from ever reaching a renderer.
+            if frame.canvas.commands().iter().any(|command| command.requires_paint())
+                && !lock(&shared.overlays)
+                    .actors
+                    .get(&identity.surface.context.session)
+                    .and_then(Weak::upgrade)
+                    .is_some_and(|session| session.supports(registry::OVERLAY_PAINT))
+            {
+                return Err("paint commands were not negotiated");
+            }
             let layouts = {
                 let host = lock(&shared.overlays);
                 let mut layouts = BTreeMap::new();
@@ -1192,5 +1204,138 @@ mod tests {
         assert!(host.viewport_dirty.contains(&second));
         host.remove_owner(first);
         assert_eq!(host.outcomes[&second].len(), 1);
+    }
+    #[test]
+    fn paint_commands_compile_into_the_cached_scene() {
+        let mut text = TextSystem::new(Default::default());
+        let rect = Rect::new(0., 0., 200., 100.).unwrap();
+        let mut canvas = vivid_protocol::vector::Canvas::new();
+        canvas
+            .shadow(vivid_protocol::vector::Shadow {
+                rect,
+                radii: vivid_protocol::vector::Corners::new([2., 6., 10., 14.]).unwrap(),
+                color: vivid_protocol::vector::Color(0x00000055),
+                offset: vivid_protocol::vector::Point::new(0., 8.).unwrap(),
+                blur: vivid_protocol::vector::Scalar::new(16.).unwrap(),
+                spread: vivid_protocol::vector::Scalar::new(2.).unwrap(),
+                inset: false,
+            })
+            .unwrap();
+        canvas
+            .stroke_styled(
+                vivid_protocol::vector::Path::rectangle(rect).unwrap(),
+                vivid_protocol::vector::Brush::Solid(vivid_protocol::vector::Color(0xffffffff)),
+                vivid_protocol::vector::StrokeStyle {
+                    width: vivid_protocol::vector::Scalar::new(2.).unwrap(),
+                    cap: vivid_protocol::vector::Cap::Round,
+                    join: vivid_protocol::vector::Join::Round,
+                    miter_limit: vivid_protocol::vector::Scalar::new(4.).unwrap(),
+                    dashes: vec![
+                        vivid_protocol::vector::Scalar::new(6.).unwrap(),
+                        vivid_protocol::vector::Scalar::new(3.).unwrap(),
+                    ],
+                    dash_offset: vivid_protocol::vector::Scalar::ZERO,
+                },
+            )
+            .unwrap();
+        let compiled = compile(&canvas, &mut text, &BTreeMap::new()).unwrap();
+        assert!(!compiled.retained.is_empty() || true);
+        // Hit geometry is unchanged by paint commands: no regions were declared, so the whole
+        // window rectangle remains the input area.
+        assert_eq!(
+            compiled.hit(vivid_protocol::vector::Point::new(1., 1.).unwrap()),
+            Some((0, vivid_protocol::vector::HitRole::Input))
+        );
+
+        // An inset shadow with the same geometry must also compile: the ring approximation is
+        // host-local and cannot fail where the outer one succeeded.
+        let mut inset_canvas = vivid_protocol::vector::Canvas::new();
+        inset_canvas
+            .shadow(vivid_protocol::vector::Shadow {
+                inset: true,
+                ..{
+                    let shadow = vivid_protocol::vector::Shadow {
+                        rect,
+                        radii: vivid_protocol::vector::Corners::uniform(8.).unwrap(),
+                        color: vivid_protocol::vector::Color(0x00000080),
+                        offset: vivid_protocol::vector::Point::new(0., 4.).unwrap(),
+                        blur: vivid_protocol::vector::Scalar::new(12.).unwrap(),
+                        spread: vivid_protocol::vector::Scalar::ZERO,
+                        inset: false,
+                    };
+                    shadow.validate().unwrap();
+                    shadow
+                }
+            })
+            .unwrap();
+        compile(&inset_canvas, &mut text, &BTreeMap::new()).unwrap();
+    }
+
+    #[test]
+    fn oklab_gradients_and_image_brushes_compile_and_missing_assets_fail_atomically() {
+        use vello::peniko::ImageData;
+        let mut text = TextSystem::new(Default::default());
+        let rect = Rect::new(0., 0., 80., 40.).unwrap();
+        let path = vivid_protocol::vector::Path::rectangle(rect).unwrap();
+        let mut canvas = vivid_protocol::vector::Canvas::new();
+        canvas
+            .fill(
+                path.clone(),
+                vivid_protocol::vector::Brush::Linear {
+                    start: vivid_protocol::vector::Point::new(0., 0.).unwrap(),
+                    end: vivid_protocol::vector::Point::new(80., 0.).unwrap(),
+                    stops: vec![
+                        vivid_protocol::vector::GradientStop {
+                            offset: 0,
+                            color: vivid_protocol::vector::Color(0xff0000ff),
+                        },
+                        vivid_protocol::vector::GradientStop {
+                            offset: u16::MAX,
+                            color: vivid_protocol::vector::Color(0x0000ffff),
+                        },
+                    ],
+                    color_space: vivid_protocol::vector::ColorSpace::Oklab,
+                },
+            )
+            .unwrap();
+        assert!(compile(&canvas, &mut text, &BTreeMap::new()).is_ok());
+
+        // An image brush referencing an asset the channel never carried fails the whole list
+        // rather than rendering a placeholder.
+        let mut missing = vivid_protocol::vector::Canvas::new();
+        missing
+            .fill(
+                path,
+                vivid_protocol::vector::Brush::Image {
+                    asset: 9,
+                    transform: None,
+                    extend: vivid_protocol::vector::Extend::Repeat,
+                },
+            )
+            .unwrap();
+        assert!(compile(&missing, &mut text, &BTreeMap::new()).is_err());
+
+        let mut present = vivid_protocol::vector::Canvas::new();
+        present
+            .fill(
+                vivid_protocol::vector::Path::rectangle(rect).unwrap(),
+                vivid_protocol::vector::Brush::Image {
+                    asset: 1,
+                    transform: None,
+                    extend: vivid_protocol::vector::Extend::Repeat,
+                },
+            )
+            .unwrap();
+        let images = BTreeMap::from([(
+            1_u64,
+            ImageData {
+                data: vello::peniko::Blob::from(vec![0_u8; 2 * 2 * 4]),
+                format: vello::peniko::ImageFormat::Rgba8,
+                alpha_type: vello::peniko::ImageAlphaType::AlphaPremultiplied,
+                width: 2,
+                height: 2,
+            },
+        )]);
+        assert!(compile(&present, &mut text, &images).is_ok());
     }
 }

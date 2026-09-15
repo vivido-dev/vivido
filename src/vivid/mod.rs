@@ -1249,6 +1249,7 @@ impl ServiceShared {
                 registry::OVERLAY_TEXT,
                 registry::OVERLAY_TEXT_LAYOUT,
                 registry::OVERLAY_TYPOGRAPHY,
+                registry::OVERLAY_PAINT,
             ]);
             profiles.sort_unstable();
         }
@@ -2110,6 +2111,7 @@ fn establish_root_session(
                 && p != registry::OVERLAY_TEXT
                 && p != registry::OVERLAY_TEXT_LAYOUT
                 && p != registry::OVERLAY_TYPOGRAPHY
+                && p != registry::OVERLAY_PAINT
         });
     }
     registry::validate_profile_set(accepted.iter().map(String::as_str))
