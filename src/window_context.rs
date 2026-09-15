@@ -1017,6 +1017,16 @@ impl WindowContext {
             .or_else(|| self.probed_working_directory())
     }
 
+    /// Current directory for display, preserving the shell's namespace (including WSL paths).
+    /// This path need not be usable as a native process launch directory.
+    pub fn display_directory(&self) -> Option<PathBuf> {
+        self.terminal
+            .lock()
+            .working_directory()
+            .map(PathBuf::from)
+            .or_else(|| self.probed_working_directory())
+    }
+
     /// Immutable accessibility state for composition by a containing shell.
     #[cfg(target_os = "linux")]
     pub(crate) fn accessibility_snapshot(&self) -> AccessibilitySnapshot {

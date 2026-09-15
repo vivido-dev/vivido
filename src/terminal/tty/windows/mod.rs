@@ -12,6 +12,7 @@ use crate::terminal::tty::{ChildEvent, EventedPty, EventedReadWrite, Options, Sh
 mod blocking;
 mod child;
 mod conpty;
+mod powershell;
 
 use blocking::{UnblockedReader, UnblockedWriter};
 use conpty::Conpty as Backend;
@@ -42,7 +43,8 @@ pub struct Pty {
 }
 
 pub fn new(config: &Options, window_size: WindowSize, _window_id: u64) -> Result<Pty> {
-    let config = with_shell_environment(config);
+    let mut config = with_shell_environment(config);
+    powershell::configure(&mut config);
     conpty::new(&config, window_size)
 }
 
