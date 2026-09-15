@@ -2069,10 +2069,48 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     #[cfg(unix)]
     use std::os::unix::io::AsRawFd;
+    use std::sync::{Mutex, MutexGuard};
 
     use serde_json::json;
 
     use super::*;
+
+    /// Serializes the tests that touch the process-wide claimed-method registries.
+    ///
+    /// `HOST_METHODS` and `HOST_METHOD_CAPABILITIES` are process-wide because the handshake is
+    /// answered on the listener thread while claiming happens on the main loop. Tests run in
+    /// threads of one process, so two that publish would otherwise read each other's claims —
+    /// and each clearing up after itself would clear the other's state as well.
+    static CLAIMED_REGISTRY: Mutex<()> = Mutex::new(());
+
+    /// Exclusive use of the claimed-method registries, empty at both ends.
+    ///
+    /// Held for the whole of any test that publishes or reads the advertised set, so what such a
+    /// test sees is only ever what it put there.
+    struct ClaimedMethods(#[allow(dead_code)] MutexGuard<'static, ()>);
+
+    impl ClaimedMethods {
+        fn acquire() -> Self {
+            // A test that panicked while holding this poisoned the lock. The registries are
+            // emptied on both ends regardless, so one failure is not a reason to fail every test
+            // that runs after it.
+            let guard = CLAIMED_REGISTRY.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let claimed = Self(guard);
+            claimed.empty();
+            claimed
+        }
+
+        fn empty(&self) {
+            publish_host_methods([].iter());
+            publish_host_method_capabilities(&[]);
+        }
+    }
+
+    impl Drop for ClaimedMethods {
+        fn drop(&mut self) {
+            self.empty();
+        }
+    }
 
     #[test]
     fn bounded_plan_accepts_backward_only_alias_references() {
@@ -2136,6 +2174,7 @@ mod tests {
 
     #[test]
     fn handshake_classifies_standard_and_host_methods() {
+        let _claimed = ClaimedMethods::acquire();
         let descriptors = [MethodCapability::host("vivida_layout", MethodClass::Observe, false)];
         publish_host_methods([String::from("vivida_layout")].iter());
         publish_host_method_capabilities(&descriptors);
@@ -2147,8 +2186,6 @@ mod tests {
                 && !capability.host_claimed
         }));
         assert!(capabilities.iter().any(|capability| capability == &descriptors[0]));
-        publish_host_methods([].iter());
-        publish_host_method_capabilities(&[]);
     }
 
     #[test]
@@ -2420,6 +2457,9 @@ mod tests {
 
     #[test]
     fn hello_advertises_required_limits() {
+        // This reads the advertised method set, which a test publishing into it would change
+        // underneath it.
+        let _claimed = ClaimedMethods::acquire();
         let hello = hello_result();
         assert_eq!(hello["protocol_version"], 2);
         assert_eq!(hello["limits"]["connections"], 32);
@@ -2448,6 +2488,7 @@ mod tests {
 
     #[test]
     fn hello_advertises_host_claimed_methods_beside_vivido_own() {
+        let _claimed = ClaimedMethods::acquire();
         let claimed = [String::from("vvbox_list_tabs"), String::from("create_window")];
         publish_host_methods(claimed.iter());
 
