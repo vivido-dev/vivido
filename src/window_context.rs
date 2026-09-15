@@ -56,12 +56,12 @@ use crate::terminal::index::Direction;
 #[cfg(any(unix, windows))]
 use crate::terminal::index::{Column, Line};
 use crate::terminal::sync::FairMutex;
-use crate::terminal::term::Term;
 #[cfg(any(unix, windows))]
 use crate::terminal::term::TermMode;
 #[cfg(any(unix, windows))]
 use crate::terminal::term::cell::Flags;
 use crate::terminal::term::test::TermSize;
+use crate::terminal::term::{ClipboardType, Term};
 use crate::terminal::tty;
 #[cfg(any(unix, windows))]
 use crate::terminal::vvte::ansi::{Color, NamedColor};
@@ -861,6 +861,12 @@ impl WindowContext {
                 self.event_queue.push(event);
                 return;
             },
+        }
+
+        // An overlay only reaches the clipboard through here: it asks, the host validates, and
+        // the thread that owns the clipboard performs the write.
+        for text in self.vivid_service.take_overlay_clipboard() {
+            clipboard.store(ClipboardType::Clipboard, text);
         }
 
         let mut terminal = self.terminal.lock();

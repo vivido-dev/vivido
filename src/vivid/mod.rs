@@ -16,7 +16,7 @@ pub mod target;
 pub(crate) mod trace;
 mod transport;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 #[cfg(unix)]
 use std::fs;
 use std::io::{self, ErrorKind};
@@ -279,6 +279,8 @@ struct ServiceShared {
     presenter: PresenterInstanceId,
     scene: SharedScene,
     overlays: Arc<Mutex<overlay::Host>>,
+    /// Validated clipboard writes awaiting the UI thread, which owns the real clipboard.
+    overlay_clipboard: Mutex<BTreeMap<SessionIdentity, String>>,
     registry: Mutex<Registry>,
     audio_outputs: Mutex<HashMap<TrackIdentity, Arc<AudioOutput>>>,
     next_session: AtomicU64,
@@ -571,6 +573,7 @@ impl VividService {
             presenter: PresenterInstanceId(presenter),
             scene: scene.clone(),
             overlays: scene.overlays().clone(),
+            overlay_clipboard: Mutex::new(BTreeMap::new()),
             registry: Mutex::new(Registry::default()),
             audio_outputs: Mutex::new(HashMap::new()),
             next_session: AtomicU64::new(1),
@@ -695,6 +698,15 @@ impl VividService {
     ///
     /// Read straight from the overlay host so a newly published scene and a pointer report are
     /// both visible without a second copy to keep in step.
+    /// Drained by the UI thread, in a deterministic order. An overlay never reads a clipboard;
+    /// this is only the write half.
+    pub(crate) fn take_overlay_clipboard(&self) -> Vec<String> {
+        let mut staged = lock(&self.shared.overlay_clipboard);
+        let mut texts: Vec<String> = std::mem::take(&mut *staged).into_values().collect();
+        texts.shrink_to_fit();
+        texts
+    }
+
     pub(crate) fn overlay_cursor(&self) -> Option<CursorIcon> {
         lock(&self.shared.overlays).cursor().map(overlay::cursor_icon)
     }
@@ -1194,6 +1206,14 @@ impl SessionRuntime {
 }
 
 impl ServiceShared {
+    /// Stage a validated clipboard write for the UI thread, which owns the real clipboard.
+    ///
+    /// Latest per owner: two writes from one producer before the UI drains mean the user's
+    /// newer gesture supersedes the older one, which is what a clipboard does anyway.
+    fn stage_clipboard(&self, owner: SessionIdentity, text: String) {
+        lock(&self.overlay_clipboard).insert(owner, text);
+    }
+
     fn wake_overlay_actors(&self) {
         for session in lock(&self.registry).sessions.values() {
             if session.supports(registry::OVERLAY_INPUT) {
@@ -1261,6 +1281,7 @@ impl ServiceShared {
                 registry::OVERLAY_TYPOGRAPHY,
                 registry::OVERLAY_PAINT,
                 registry::OVERLAY_POINTER,
+                registry::OVERLAY_CLIPBOARD,
             ]);
             profiles.sort_unstable();
         }
@@ -2124,6 +2145,7 @@ fn establish_root_session(
                 && p != registry::OVERLAY_TYPOGRAPHY
                 && p != registry::OVERLAY_PAINT
                 && p != registry::OVERLAY_POINTER
+                && p != registry::OVERLAY_CLIPBOARD
         });
     }
     registry::validate_profile_set(accepted.iter().map(String::as_str))

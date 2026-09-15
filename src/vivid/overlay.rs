@@ -9,7 +9,9 @@ use std::sync::Weak;
 use vello::peniko::{Blob, ImageAlphaType, ImageData, ImageFormat};
 use winit::window::CursorIcon;
 
-use vivid_protocol::overlay::wire::{Action, Query, SetWindow, Status, Viewport, WindowAddress};
+use vivid_protocol::overlay::wire::{
+    Action, Clipboard, Query, SetWindow, Status, Viewport, WindowAddress,
+};
 use vivid_protocol::overlay::wire::{
     PresentationOutcome, Submission, SubmissionOutcome, ViewportChanged,
 };
@@ -37,6 +39,9 @@ pub(crate) struct Host {
     pub(super) viewport: Option<Viewport>,
     /// Pointer capture is established from this, never from a producer-supplied position.
     pointer_position: Option<vivid_protocol::vector::Point>,
+    /// The window a key press or pointer press was last delivered to, and when. A clipboard
+    /// write must be caused by the user, so this is what authorizes one.
+    last_gesture: Option<(SurfaceIdentity, Instant)>,
     /// The last press of the current sequence: when, which button, where, and the count so far.
     last_click: Option<(Instant, u16, vivid_protocol::vector::Point, u8)>,
     surfaces: HashSet<SurfaceIdentity>,
@@ -300,9 +305,38 @@ impl Host {
     }
 
     pub(super) fn keyboard(&mut self, event: vivid_protocol::overlay::Event, escape: bool) -> bool {
+        // A key press goes to the focused window, which is therefore the one it reached.
+        if matches!(event, vivid_protocol::overlay::Event::Key { down: true, .. }) {
+            self.last_gesture = self.windows.focus().map(|id| (id, Instant::now()));
+        }
         let consumed = self.windows.keyboard(event, escape);
         self.editor_rect();
         consumed
+    }
+
+    /// Whether a clipboard write from this window may be honored, and why not when it may not.
+    ///
+    /// A clipboard is shared with every other application on the machine and is frequently where
+    /// a password or a command line briefly lives, so a write is only honored when the user just
+    /// did something in the window asking for it.
+    pub(super) fn authorize_clipboard(&self, id: SurfaceIdentity) -> Result<(), &'static str> {
+        if self.windows.get(id).is_none() {
+            return Err("overlay window is absent");
+        }
+        if self.windows.focus() != Some(id) {
+            return Err("a clipboard write requires the focused overlay window");
+        }
+        match self.last_gesture {
+            Some((window, at)) if window == id => {
+                if at.elapsed() <= vivid_protocol::overlay::MAX_CLIPBOARD_GESTURE_AGE {
+                    Ok(())
+                } else {
+                    Err("the gesture authorizing this clipboard write is too old")
+                }
+            },
+            // A gesture in another window is not this window's to spend.
+            _ => Err("a clipboard write requires a recent gesture in the same window"),
+        }
     }
     pub(super) fn set_pane_focus(&mut self, focused: bool) {
         if !focused {
@@ -336,6 +370,11 @@ impl Host {
                 drawings.iter().find(|d| d.window == id).and_then(|d| d.compiled.hit(point))
             },
         );
+        if consumed && button.is_some_and(|(_, down)| down) {
+            // Read after the dispatch: that is what settles which window the press reached. A
+            // press that reached no window clears any gesture a producer might otherwise bank.
+            self.last_gesture = self.windows.hovered_window().map(|id| (id, Instant::now()));
+        }
         self.editor_rect();
         consumed
     }
@@ -964,6 +1003,29 @@ pub(super) fn dispatch(
                 .map_err(|e| ControlError::state(e.0))?;
             (messages::OK, vec![])
         },
+        messages::SET_OVERLAY_CLIPBOARD => {
+            let request = Clipboard::decode(record.object_id, value)
+                .map_err(|_| ControlError::bad_message("invalid overlay clipboard request"))?;
+            require_context_operation(session, request.address.context_id, OP_SURFACE_TRACK_MEDIA)?;
+            let identity = request
+                .address
+                .identity(session.identity)
+                .map_err(|_| ControlError::bad_message("invalid overlay identity"))?;
+            let generation = host
+                .windows
+                .get(identity)
+                .ok_or_else(|| ControlError::not_found("overlay window is absent"))?
+                .generation;
+            if generation != request.address.generation {
+                return Err(ControlError::precondition("stale overlay window generation"));
+            }
+            // A clipboard is shared with every other application, so a write is only honored
+            // when the user just acted in the window asking for it.
+            host.authorize_clipboard(identity).map_err(ControlError::state)?;
+            shared.stage_clipboard(session.identity, request.text);
+            // The write itself happens on the UI thread, and the tail of this function wakes it.
+            (messages::OK, vec![])
+        },
         messages::QUERY_OVERLAY => {
             let query = Query::decode(record.object_id, value)
                 .map_err(|_| ControlError::bad_message("invalid overlay query"))?;
@@ -1309,6 +1371,78 @@ mod tests {
         // Hiding the last window under the pointer ends the hover entirely.
         host.windows.close(above, vivid_protocol::overlay::DismissReason::Closed);
         assert_eq!(host.cursor(), None);
+    }
+
+    #[test]
+    fn a_clipboard_write_needs_focus_a_recent_gesture_in_the_same_window() {
+        let mut host = Host::default();
+        host.update_viewport(800., 600., 1.).unwrap();
+        let owner = SessionIdentity::new(PresenterInstanceId([1; 16]), 1).unwrap();
+        let first = placed(&mut host, owner, 1, Rect::new(0., 0., 100., 100.).unwrap(), None);
+        let second = placed(&mut host, owner, 2, Rect::new(200., 0., 100., 100.).unwrap(), None);
+
+        // Nothing has happened yet.
+        assert!(host.authorize_clipboard(first).is_err());
+        host.pointer_position = Some(vivid_protocol::vector::Point::new(10., 10.).unwrap());
+        host.refresh_hover();
+
+        // A press in the first window authorizes a write from the first window.
+        host.pointer(10., 10., Some((0, true)), 0, None);
+        assert!(host.authorize_clipboard(first).is_ok());
+        // It does not authorize a write from the other window, even though that one exists.
+        assert!(host.authorize_clipboard(second).is_err());
+        // Nor from a window that is not there at all.
+        let absent = owner.context(1).unwrap().surface(99).unwrap();
+        assert!(host.authorize_clipboard(absent).is_err());
+
+        // Focusing elsewhere withdraws it, because focus is what a write requires.
+        host.pointer(210., 10., Some((0, true)), 0, None);
+        assert!(host.authorize_clipboard(first).is_err());
+        assert!(host.authorize_clipboard(second).is_ok());
+
+        // A gesture in one window is never spendable by another, even right after focusing it.
+        let mut third = Host::default();
+        third.update_viewport(800., 600., 1.).unwrap();
+        let a = placed(&mut third, owner, 1, Rect::new(0., 0., 100., 100.).unwrap(), None);
+        let b = placed(&mut third, owner, 2, Rect::new(200., 0., 100., 100.).unwrap(), None);
+        third.pointer_position = Some(vivid_protocol::vector::Point::new(10., 10.).unwrap());
+        third.refresh_hover();
+        third.pointer(10., 10., Some((0, true)), 0, None);
+        // Requesting focus for the other window does not launder the first window's gesture.
+        third.windows.request_focus(b).unwrap();
+        // B is focused and still refused, so what refuses it is the gesture guard rather than
+        // the focus check happening to fail.
+        assert_eq!(third.windows.focus(), Some(b));
+        assert!(third.authorize_clipboard(b).is_err());
+        // And A is refused because focusing B revoked A's eligibility.
+        assert!(third.authorize_clipboard(a).is_err());
+        // A press in B is what finally authorizes B.
+        third.pointer_position = Some(vivid_protocol::vector::Point::new(210., 10.).unwrap());
+        third.refresh_hover();
+        third.pointer(210., 10., Some((0, true)), 0, None);
+        assert!(third.authorize_clipboard(b).is_ok());
+    }
+
+    #[test]
+    fn an_expired_gesture_cannot_be_banked() {
+        let mut host = Host::default();
+        host.update_viewport(800., 600., 1.).unwrap();
+        let owner = SessionIdentity::new(PresenterInstanceId([1; 16]), 1).unwrap();
+        let window = placed(&mut host, owner, 1, Rect::new(0., 0., 100., 100.).unwrap(), None);
+        host.pointer_position = Some(vivid_protocol::vector::Point::new(10., 10.).unwrap());
+        host.refresh_hover();
+        host.pointer(10., 10., Some((0, true)), 0, None);
+        assert!(host.authorize_clipboard(window).is_ok());
+
+        // Replaying the gesture at an age past the ceiling must fail, so a producer cannot hold
+        // one and spend it later.
+        host.last_gesture = Some((
+            window,
+            Instant::now()
+                - vivid_protocol::overlay::MAX_CLIPBOARD_GESTURE_AGE
+                - Duration::from_millis(1),
+        ));
+        assert!(host.authorize_clipboard(window).is_err());
     }
 
     #[test]
