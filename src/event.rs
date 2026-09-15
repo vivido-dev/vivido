@@ -4093,14 +4093,24 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
     fn send_desktop_input(&self, event: vivid_protocol::input::InputEvent) -> bool {
         self.vivid_service.send_input(event)
     }
+    fn overlay_cursor(&self) -> Option<winit::window::CursorIcon> {
+        self.vivid_service.overlay_cursor()
+    }
     fn overlay_capturing(&self) -> bool {
         self.vivid_service.overlay_capturing()
     }
     fn overlay_keyboard(&self, event: vivid_protocol::overlay::Event, escape: bool) -> bool {
         self.vivid_service.overlay_keyboard(event, escape)
     }
-    fn overlay_pointer(&self, x: f64, y: f64, button: Option<(u16, bool)>, modifiers: u32) -> bool {
-        self.vivid_service.overlay_pointer(x, y, button, modifiers)
+    fn overlay_pointer(
+        &self,
+        x: f64,
+        y: f64,
+        button: Option<(u16, bool)>,
+        modifiers: u32,
+        pressure: Option<f64>,
+    ) -> bool {
+        self.vivid_service.overlay_pointer(x, y, button, modifiers, pressure)
     }
     fn overlay_wheel(
         &self,

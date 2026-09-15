@@ -33,9 +33,10 @@ impl HitPath {
     }
 }
 
-struct HitRegion {
+struct CompiledHit {
     id: u64,
     role: HitRole,
+    cursor: Option<wire::CursorShape>,
     path: HitPath,
     clips: Vec<HitPath>,
 }
@@ -44,14 +45,14 @@ struct HitRegion {
 pub struct CompiledScene {
     pub scene: Scene,
     pub(crate) retained: Vec<Arc<()>>,
-    hits: Vec<HitRegion>,
+    hits: Vec<CompiledHit>,
 }
 impl CompiledScene {
     /// Coordinates are already window-local logical pixels. The caller clips to the window.
     /// A window without explicit regions has a rectangular input area.
-    pub fn hit(&self, point: wire::Point) -> Option<(u64, HitRole)> {
+    pub fn hit(&self, point: wire::Point) -> Option<wire::HitRegion> {
         if self.hits.is_empty() {
-            return Some((0, HitRole::Input));
+            return Some(wire::HitRegion { id: 0, role: HitRole::Input, cursor: None });
         }
         let point = Point::new(point.x.get(), point.y.get());
         self.hits
@@ -60,7 +61,13 @@ impl CompiledScene {
             .find(|hit| {
                 hit.path.contains(point) && hit.clips.iter().all(|clip| clip.contains(point))
             })
-            .and_then(|hit| (hit.role != HitRole::Transparent).then_some((hit.id, hit.role)))
+            .and_then(|hit| {
+                (hit.role != HitRole::Transparent).then_some(wire::HitRegion {
+                    id: hit.id,
+                    role: hit.role,
+                    cursor: hit.cursor,
+                })
+            })
     }
 }
 
@@ -149,9 +156,10 @@ pub fn compile_with_layouts(
                     even_odd: path.even_odd,
                 });
             },
-            Command::Hit { id, path, role } => result.hits.push(HitRegion {
+            Command::Hit { id, path, role, cursor } => result.hits.push(CompiledHit {
                 id: *id,
                 role: *role,
+                cursor: *cursor,
                 path: HitPath {
                     path: Arc::new(path_geometry(path)),
                     inverse: state.transform.inverse(),

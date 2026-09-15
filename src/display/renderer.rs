@@ -1307,19 +1307,35 @@ mod tests {
                 },
             )
             .unwrap();
-        canvas.push(Command::Hit { id: u64::MAX, path: clip, role: HitRole::Drag }).unwrap();
+        canvas
+            .push(Command::Hit {
+                id: u64::MAX,
+                path: clip,
+                role: HitRole::Drag,
+                cursor: Some(vivid_protocol::vector::CursorShape::Move),
+            })
+            .unwrap();
         canvas
             .push(Command::Hit {
                 id: 2,
                 path: Path::ellipse(Rect::new(12., 12., 8., 8.).unwrap()).unwrap(),
                 role: HitRole::Transparent,
+                cursor: None,
             })
             .unwrap();
         canvas.push(Command::Restore).unwrap();
         let mut text = crate::display::text::TextSystem::new(crate::config::font::Font::default());
         let compiled =
             crate::display::vector::compile(&canvas, &mut text, &BTreeMap::new()).unwrap();
-        assert_eq!(compiled.hit(Point::new(10., 10.).unwrap()), Some((u64::MAX, HitRole::Drag)));
+        // The compiled region carries the cursor its command declared.
+        assert_eq!(
+            compiled.hit(Point::new(10., 10.).unwrap()),
+            Some(vivid_protocol::vector::HitRegion {
+                id: u64::MAX,
+                role: HitRole::Drag,
+                cursor: Some(vivid_protocol::vector::CursorShape::Move),
+            })
+        );
         assert_eq!(compiled.hit(Point::new(24., 24.).unwrap()), None);
         assert_eq!(compiled.hit(Point::new(41., 10.).unwrap()), None);
         renderer.render(&compiled.scene, Color::from_rgb8(255, 255, 255)).unwrap();

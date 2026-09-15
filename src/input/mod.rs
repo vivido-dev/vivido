@@ -62,7 +62,7 @@ const SELECTION_SCROLLING_STEP: f64 = 20.;
 const MAX_TAP_DISTANCE: f64 = 20.;
 
 /// Maximum delay between two clicks in a double-click or triple-click sequence.
-const CLICK_THRESHOLD: Duration = Duration::from_millis(400);
+pub(crate) const CLICK_THRESHOLD: Duration = Duration::from_millis(400);
 
 const SELECTION_CLIPBOARDS: [ClipboardType; 2] =
     [ClipboardType::Selection, ClipboardType::Clipboard];
@@ -142,12 +142,17 @@ pub trait ActionContext<T: EventListener> {
     fn overlay_capturing(&self) -> bool {
         false
     }
+    /// The cursor the hovered overlay region asks for, if any.
+    fn overlay_cursor(&self) -> Option<CursorIcon> {
+        None
+    }
     fn overlay_pointer(
         &self,
         _x: f64,
         _y: f64,
         _button: Option<(u16, bool)>,
         _modifiers: u32,
+        _pressure: Option<f64>,
     ) -> bool {
         false
     }
@@ -455,7 +460,7 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
         let overlay_modifiers = crate::vivid::hid::modifiers(self.ctx.modifiers().state());
         if (size_info.contains_point(position.x.max(0.) as usize, position.y.max(0.) as usize)
             || self.ctx.overlay_capturing())
-            && self.ctx.overlay_pointer(position.x, position.y, None, overlay_modifiers)
+            && self.ctx.overlay_pointer(position.x, position.y, None, overlay_modifiers, None)
         {
             self.ctx.mouse_mut().x = position.x.max(0.) as usize;
             self.ctx.mouse_mut().y = position.y.max(0.) as usize;
@@ -1022,6 +1027,7 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
                 self.ctx.mouse().y as f64,
                 Some((overlay_button, state == ElementState::Pressed)),
                 overlay_modifiers,
+                None,
             )
         {
             return;
@@ -1052,6 +1058,7 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
                 Ordering::Equal => CursorIcon::Pointer,
                 Ordering::Greater => crate::display::resolve_mouse_cursor(
                     None,
+                    self.ctx.overlay_cursor(),
                     false,
                     self.ctx.terminal().mouse_cursor_icon(),
                     self.ctx.mouse_mode(),
@@ -1142,6 +1149,7 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
 
         crate::display::resolve_mouse_cursor(
             self.message_bar_cursor_state(),
+            self.ctx.overlay_cursor(),
             self.ctx.display().highlighted_hint.as_ref().is_some_and(hint_highlighted),
             self.ctx.terminal().mouse_cursor_icon(),
             !self.modifiers_state().shift_key() && self.ctx.mouse_mode(),

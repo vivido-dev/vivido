@@ -87,6 +87,7 @@ use crate::vivid::transport::{ReadShutdown, Reader, Writer};
 use vivid_protocol::lease::{AttemptDecision, SessionLeaseDefinition};
 
 use crate::display::SizeInfo;
+use winit::window::CursorIcon;
 
 #[cfg(windows)]
 type LocalListener = TcpListener;
@@ -690,14 +691,23 @@ impl VividService {
         lock(&self.shared.overlays).focused()
     }
 
+    /// The cursor a hovered overlay region asks for, or None when the pointer is not over one.
+    ///
+    /// Read straight from the overlay host so a newly published scene and a pointer report are
+    /// both visible without a second copy to keep in step.
+    pub(crate) fn overlay_cursor(&self) -> Option<CursorIcon> {
+        lock(&self.shared.overlays).cursor().map(overlay::cursor_icon)
+    }
+
     pub(crate) fn overlay_pointer(
         &self,
         x: f64,
         y: f64,
         button: Option<(u16, bool)>,
         modifiers: u32,
+        pressure: Option<f64>,
     ) -> bool {
-        let consumed = lock(&self.shared.overlays).pointer(x, y, button, modifiers);
+        let consumed = lock(&self.shared.overlays).pointer(x, y, button, modifiers, pressure);
         if consumed {
             self.shared.request_frame_wake();
             self.shared.wake_overlay_actors();
@@ -1250,6 +1260,7 @@ impl ServiceShared {
                 registry::OVERLAY_TEXT_LAYOUT,
                 registry::OVERLAY_TYPOGRAPHY,
                 registry::OVERLAY_PAINT,
+                registry::OVERLAY_POINTER,
             ]);
             profiles.sort_unstable();
         }
@@ -2112,6 +2123,7 @@ fn establish_root_session(
                 && p != registry::OVERLAY_TEXT_LAYOUT
                 && p != registry::OVERLAY_TYPOGRAPHY
                 && p != registry::OVERLAY_PAINT
+                && p != registry::OVERLAY_POINTER
         });
     }
     registry::validate_profile_set(accepted.iter().map(String::as_str))
@@ -6573,8 +6585,8 @@ mod tests {
         window.center().unwrap();
         assert_eq!(window.bounds().unwrap().origin.x.get(), 150.);
         window.set_bounds(Rect::new(10., 20., 100., 80.).unwrap()).unwrap();
-        assert!(service.overlay_pointer(30., 50., Some((1, true)), 0));
-        assert!(service.overlay_pointer(30., 50., Some((1, false)), 0));
+        assert!(service.overlay_pointer(30., 50., Some((1, true)), 0, None));
+        assert!(service.overlay_pointer(30., 50., Some((1, false)), 0, None));
         let measured = window
             .measure_text(&vivid_sdk::overlay::Text {
                 text: "A😀日".into(),
@@ -6663,11 +6675,11 @@ mod tests {
             .unwrap();
         let popup_receipt = popup.submit(canvas.clone()).unwrap();
         assert!(
-            service.overlay_pointer(790., 590., Some((1, true)), 0),
+            service.overlay_pointer(790., 590., Some((1, true)), 0, None),
             "outside dismissal consumes the press"
         );
         assert!(
-            service.overlay_pointer(790., 590., Some((1, false)), 0),
+            service.overlay_pointer(790., 590., Some((1, false)), 0, None),
             "dismissal also consumes the matching release"
         );
         assert_eq!(
@@ -6892,7 +6904,7 @@ mod tests {
                 let offset = y * pixels.padded_bytes_per_row as usize + x * 4;
                 assert_eq!(&pixels.bytes[offset..offset + 4], &color, "{fixture} {mode} pixels");
             }
-            assert!(service.overlay_pointer(24., 44., Some((1, true)), 0));
+            assert!(service.overlay_pointer(24., 44., Some((1, true)), 0, None));
             let mut red_text = 0;
             let mut blue_text = 0;
             for y in 120..200 {
@@ -6909,7 +6921,7 @@ mod tests {
                 red_text > 10 && blue_text > 10,
                 "{fixture} {mode} retained text preserves both run colors"
             );
-            assert!(service.overlay_pointer(24., 44., Some((1, false)), 0));
+            assert!(service.overlay_pointer(24., 44., Some((1, false)), 0, None));
             assert!(service.overlay_keyboard(
                 Event::Ime { preedit: "A😀日".into(), selection: Some((1, 5)) },
                 false

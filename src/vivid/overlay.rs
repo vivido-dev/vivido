@@ -7,12 +7,15 @@ use crate::display::{text::TextSystem, vector::CompiledScene};
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::sync::Weak;
 use vello::peniko::{Blob, ImageAlphaType, ImageData, ImageFormat};
+use winit::window::CursorIcon;
 
 use vivid_protocol::overlay::wire::{Action, Query, SetWindow, Status, Viewport, WindowAddress};
 use vivid_protocol::overlay::wire::{
     PresentationOutcome, Submission, SubmissionOutcome, ViewportChanged,
 };
-use vivid_protocol::overlay::{DismissReason, Scroll, ScrollPhase, Windows};
+use vivid_protocol::overlay::{
+    DismissReason, MAX_CLICKS, PointerReport, Scroll, ScrollPhase, Windows,
+};
 use vivid_protocol::vector::Scalar;
 
 use super::*;
@@ -34,6 +37,8 @@ pub(crate) struct Host {
     pub(super) viewport: Option<Viewport>,
     /// Pointer capture is established from this, never from a producer-supplied position.
     pointer_position: Option<vivid_protocol::vector::Point>,
+    /// The last press of the current sequence: when, which button, where, and the count so far.
+    last_click: Option<(Instant, u16, vivid_protocol::vector::Point, u8)>,
     surfaces: HashSet<SurfaceIdentity>,
     scenes: HashMap<TrackIdentity, (ChannelGeneration, u64, Arc<CompiledScene>)>,
     assets: HashMap<(TrackIdentity, ChannelGeneration, u64), (Weak<()>, usize)>,
@@ -54,6 +59,38 @@ pub(crate) struct Host {
     presented_scenes: u64,
     superseded_scenes: u64,
     window_updates: u64,
+}
+
+/// How far a pointer may drift between presses and still count as one sequence. The threshold
+/// itself is the terminal's, so the whole presenter counts clicks one way.
+const CLICK_SLOP: f64 = 4.;
+
+/// Map the protocol's closed cursor set onto the platform's. Every shape has an icon, so a
+/// region can ask for any of them without a fallback that would silently change behavior.
+pub(crate) fn cursor_icon(shape: vivid_protocol::vector::CursorShape) -> CursorIcon {
+    use vivid_protocol::vector::CursorShape as Shape;
+    match shape {
+        Shape::Default => CursorIcon::Default,
+        Shape::Pointer => CursorIcon::Pointer,
+        Shape::Text => CursorIcon::Text,
+        Shape::Move => CursorIcon::Move,
+        Shape::Crosshair => CursorIcon::Crosshair,
+        Shape::NotAllowed => CursorIcon::NotAllowed,
+        Shape::Grab => CursorIcon::Grab,
+        Shape::Grabbing => CursorIcon::Grabbing,
+        Shape::Wait => CursorIcon::Wait,
+        Shape::Progress => CursorIcon::Progress,
+        Shape::ResizeLeft => CursorIcon::WResize,
+        Shape::ResizeRight => CursorIcon::EResize,
+        Shape::ResizeUp => CursorIcon::NResize,
+        Shape::ResizeDown => CursorIcon::SResize,
+        Shape::ResizeUpLeft => CursorIcon::NwResize,
+        Shape::ResizeUpRight => CursorIcon::NeResize,
+        Shape::ResizeDownLeft => CursorIcon::SwResize,
+        Shape::ResizeDownRight => CursorIcon::SeResize,
+        Shape::ResizeLeftRight => CursorIcon::EwResize,
+        Shape::ResizeUpDown => CursorIcon::NsResize,
+    }
 }
 
 /// A platform wheel delta in physical pixels, before the viewport scale is applied.
@@ -280,6 +317,7 @@ impl Host {
         y: f64,
         button: Option<(u16, bool)>,
         modifiers: u32,
+        pressure: Option<f64>,
     ) -> bool {
         let Some(viewport) = self.viewport else {
             return false;
@@ -289,12 +327,62 @@ impl Host {
             return false;
         };
         self.pointer_position = Some(point);
+        let clicks = self.count_clicks(point, button);
+        let pressure = pressure.and_then(|p| Scalar::new(p).ok());
         let drawings: Vec<_> = self.displayed.values().cloned().collect();
-        let consumed = self.windows.pointer(point, button, modifiers, |id, point| {
-            drawings.iter().find(|d| d.window == id).and_then(|d| d.compiled.hit(point))
-        });
+        let consumed = self.windows.pointer(
+            PointerReport { position: point, button, modifiers, clicks, pressure },
+            |id, point| {
+                drawings.iter().find(|d| d.window == id).and_then(|d| d.compiled.hit(point))
+            },
+        );
         self.editor_rect();
         consumed
+    }
+
+    /// The cursor the pointer calls for, which the window backend then applies.
+    pub(super) fn cursor(&self) -> Option<vivid_protocol::vector::CursorShape> {
+        self.windows.cursor()
+    }
+
+    /// Re-evaluate hover after the scene under the pointer changed.
+    pub(super) fn refresh_hover(&mut self) {
+        let Some(point) = self.pointer_position else {
+            return;
+        };
+        let drawings: Vec<_> = self.displayed.values().cloned().collect();
+        self.windows.refresh_hover(point, &|id, point| {
+            drawings.iter().find(|d| d.window == id).and_then(|d| d.compiled.hit(point))
+        });
+    }
+
+    /// Count a press in the current sequence, using the same threshold and target rule the
+    /// terminal's own click detection uses, plus a small tolerance because a pointer drifts a
+    /// pixel or two between presses where a terminal cell does not.
+    fn count_clicks(
+        &mut self,
+        position: vivid_protocol::vector::Point,
+        button: Option<(u16, bool)>,
+    ) -> u8 {
+        let Some((button_id, true)) = button else {
+            return 0;
+        };
+        let now = Instant::now();
+        let clicks = match self.last_click {
+            Some((at, id, point, count))
+                if id == button_id
+                    && now.saturating_duration_since(at) < crate::input::CLICK_THRESHOLD
+                    && (point.x.get() - position.x.get()).abs() <= CLICK_SLOP
+                    && (point.y.get() - position.y.get()).abs() <= CLICK_SLOP =>
+            {
+                // A fourth press matches nothing and restarts the sequence, exactly as a
+                // terminal click does, so the count stays inside the protocol's range.
+                if count >= MAX_CLICKS { 1 } else { count + 1 }
+            },
+            _ => 1,
+        };
+        self.last_click = Some((now, button_id, position, clicks));
+        clicks
     }
 
     pub(super) fn wheel(&mut self, x: f64, y: f64, scroll: ScrollInput, modifiers: u32) -> bool {
@@ -313,7 +401,11 @@ impl Host {
         let scroll = Scroll { dx, dy, precise: scroll.precise, phase: scroll.phase };
         let drawings: Vec<_> = self.displayed.values().cloned().collect();
         self.windows.wheel(point, scroll, modifiers, |id, point| {
-            drawings.iter().find(|d| d.window == id).and_then(|d| d.compiled.hit(point))
+            drawings
+                .iter()
+                .find(|d| d.window == id)
+                .and_then(|d| d.compiled.hit(point))
+                .map(|target| (target.id, target.role))
         })
     }
 
@@ -462,6 +554,9 @@ impl Host {
             }
         }
         self.assets.retain(|_, (token, _)| token.strong_count() != 0);
+        // The scene under the pointer has just been replaced, so the region it names may differ
+        // from the one the producer last saw.
+        self.refresh_hover();
     }
 
     /// Scene revisions are window-scoped, including across track replacement. Validate before
@@ -620,6 +715,16 @@ impl VectorWorker {
                     .is_some_and(|session| session.supports(registry::OVERLAY_PAINT))
             {
                 return Err("paint commands were not negotiated");
+            }
+            // A cursor is available only to a producer that negotiated the pointer profile.
+            if frame.canvas.commands().iter().any(|command| command.requires_pointer())
+                && !lock(&shared.overlays)
+                    .actors
+                    .get(&identity.surface.context.session)
+                    .and_then(Weak::upgrade)
+                    .is_some_and(|session| session.supports(registry::OVERLAY_POINTER))
+            {
+                return Err("cursor shapes were not negotiated");
             }
             let layouts = {
                 let host = lock(&shared.overlays);
@@ -1073,6 +1178,85 @@ mod tests {
     }
 
     #[test]
+    fn click_counts_follow_the_sequence_and_restart_after_a_fourth() {
+        let mut host = Host::default();
+        host.update_viewport(800., 600., 1.).unwrap();
+        let point = vivid_protocol::vector::Point::new(10., 10.).unwrap();
+        // A release is never a click.
+        assert_eq!(host.count_clicks(point, Some((0, false))), 0);
+        assert_eq!(host.count_clicks(point, None), 0);
+        for expected in [1, 2, 3, 1] {
+            assert_eq!(host.count_clicks(point, Some((0, true))), expected);
+        }
+        // A different button, or a pointer that moved, starts a new sequence.
+        assert_eq!(host.count_clicks(point, Some((2, true))), 1);
+        assert_eq!(host.count_clicks(point, Some((2, true))), 2);
+        let far = vivid_protocol::vector::Point::new(200., 200.).unwrap();
+        assert_eq!(host.count_clicks(far, Some((2, true))), 1);
+    }
+
+    #[test]
+    fn hover_follows_the_published_scene_not_only_the_pointer() {
+        let mut host = Host::default();
+        host.update_viewport(800., 600., 1.).unwrap();
+        let owner = SessionIdentity::new(PresenterInstanceId([1; 16]), 1).unwrap();
+        let surface = owner.context(1).unwrap().surface(1).unwrap();
+        host.windows
+            .create(
+                surface,
+                1,
+                WindowOptions::new(Rect::new(0., 0., 100., 100.).unwrap(), WindowMode::Floating),
+            )
+            .unwrap();
+        host.pointer_position = Some(vivid_protocol::vector::Point::new(10., 10.).unwrap());
+        // Nothing is displayed yet, so the pointer is over no region at all.
+        assert_eq!(host.cursor(), None);
+
+        let mut with_region = vivid_protocol::vector::Canvas::new();
+        with_region
+            .push(vivid_protocol::vector::Command::Hit {
+                id: 1,
+                path: vivid_protocol::vector::Path::rectangle(Rect::new(0., 0., 50., 50.).unwrap())
+                    .unwrap(),
+                role: vivid_protocol::vector::HitRole::Input,
+                cursor: Some(vivid_protocol::vector::CursorShape::Text),
+            })
+            .unwrap();
+        let compiled = Arc::new(
+            compile(&with_region, &mut TextSystem::new(Default::default()), &BTreeMap::new())
+                .unwrap(),
+        );
+        host.displayed.insert(
+            surface,
+            Drawing {
+                window: surface,
+                window_revision: 1,
+                revision: 1,
+                bounds: Rect::new(0., 0., 100., 100.).unwrap(),
+                scale: 1.,
+                compiled,
+                submission: Submission {
+                    address: vivid_protocol::overlay::wire::WindowAddress {
+                        context_id: 1,
+                        surface_id: 1,
+                        generation: 1,
+                    },
+                    track_id: 2,
+                    channel_generation: 1,
+                    epoch: 1,
+                    revision: 1,
+                },
+            },
+        );
+        host.refresh_hover();
+        assert_eq!(host.cursor(), Some(vivid_protocol::vector::CursorShape::Text));
+        assert!(matches!(
+            host.windows.take_event(owner).map(|e| e.event),
+            Some(vivid_protocol::overlay::Event::Hover { region: 1, entered: true })
+        ));
+    }
+
+    #[test]
     fn pointer_capture_uses_the_host_observed_position() {
         let mut host = Host::default();
         host.update_viewport(800., 600., 2.).unwrap();
@@ -1088,7 +1272,7 @@ mod tests {
         assert_eq!(host.pointer_position, None);
 
         // Physical pixels become logical pixels through the viewport scale.
-        host.pointer(120., 80., None, 0);
+        host.pointer(120., 80., None, 0, None);
         assert_eq!(
             host.pointer_position,
             Some(vivid_protocol::vector::Point::new(60., 40.).unwrap())
@@ -1244,7 +1428,11 @@ mod tests {
         // window rectangle remains the input area.
         assert_eq!(
             compiled.hit(vivid_protocol::vector::Point::new(1., 1.).unwrap()),
-            Some((0, vivid_protocol::vector::HitRole::Input))
+            Some(vivid_protocol::vector::HitRegion {
+                id: 0,
+                role: vivid_protocol::vector::HitRole::Input,
+                cursor: None,
+            })
         );
 
         // An inset shadow with the same geometry must also compile: the ring approximation is

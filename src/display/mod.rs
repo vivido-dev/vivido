@@ -319,6 +319,9 @@ impl DisplayUpdate {
 pub struct Display {
     pub window: Window,
     pub size_info: SizeInfo,
+    /// The cursor a pane overlay asks for, ranked below Vivido's own chrome and above the
+    /// terminal's. Refreshed from the service on every update.
+    overlay_cursor: Option<CursorIcon>,
     pub highlighted_hint: Option<HintMatch>,
     highlighted_hint_age: usize,
     pub cursor_hidden: bool,
@@ -475,6 +478,7 @@ impl Display {
         damage_tracker.debug = config.debug.highlight_damage;
 
         Ok(Self {
+            overlay_cursor: None,
             window,
             size_info,
             highlighted_hint: Default::default(),
@@ -548,6 +552,20 @@ impl Display {
     ) where
         T: EventListener,
     {
+        // A pane overlay's cursor can change from a pointer report or from a newly published
+        // scene, so it is re-applied whenever it differs rather than only on input.
+        let overlay_cursor = vivid_service.overlay_cursor();
+        if overlay_cursor != self.overlay_cursor {
+            self.overlay_cursor = overlay_cursor;
+            let icon = resolve_mouse_cursor(
+                None,
+                overlay_cursor,
+                false,
+                terminal.mouse_cursor_icon(),
+                terminal.mode().intersects(TermMode::MOUSE_MODE),
+            );
+            self.window.set_mouse_cursor(icon);
+        }
         let pending_update = std::mem::take(&mut self.pending_update);
         let mut metrics = self.text_system.metrics();
 
@@ -989,6 +1007,7 @@ impl Display {
             self.hint_mouse_point = None;
             self.window.set_mouse_cursor(resolve_mouse_cursor(
                 None,
+                self.overlay_cursor,
                 false,
                 term.mouse_cursor_icon(),
                 term.mode().intersects(TermMode::MOUSE_MODE),
@@ -1473,6 +1492,7 @@ impl Display {
                 if reset_mouse {
                     self.window.set_mouse_cursor(resolve_mouse_cursor(
                         None,
+                        self.overlay_cursor,
                         false,
                         app_icon,
                         mouse_reporting,
@@ -1585,11 +1605,16 @@ impl Display {
 /// without the shift exemption, matching the historical behavior of the display-side restores.
 pub(crate) fn resolve_mouse_cursor(
     ui_icon: Option<CursorIcon>,
+    overlay_icon: Option<CursorIcon>,
     hint_highlighted: bool,
     app_icon: Option<CursorIcon>,
     mouse_reporting: bool,
 ) -> CursorIcon {
     if let Some(icon) = ui_icon {
+        icon
+    } else if let Some(icon) = overlay_icon {
+        // A pane overlay is drawn above the terminal and below Vivido's own chrome, and its
+        // cursor ranks the same way.
         icon
     } else if hint_highlighted {
         CursorIcon::Pointer
@@ -1851,23 +1876,79 @@ mod tests {
         assert_eq!(
             resolve_mouse_cursor(
                 Some(CursorIcon::Crosshair),
+                None,
                 true,
                 Some(CursorIcon::Progress),
                 true
             ),
             CursorIcon::Crosshair
         );
+        // An overlay region outranks the hint highlight and the terminal's own cursor.
         assert_eq!(
-            resolve_mouse_cursor(None, true, Some(CursorIcon::Progress), true),
+            resolve_mouse_cursor(
+                None,
+                Some(CursorIcon::Text),
+                true,
+                Some(CursorIcon::Progress),
+                true
+            ),
+            CursorIcon::Text
+        );
+        // Vivido's own chrome still outranks an overlay.
+        assert_eq!(
+            resolve_mouse_cursor(
+                Some(CursorIcon::Grab),
+                Some(CursorIcon::Text),
+                false,
+                None,
+                false
+            ),
+            CursorIcon::Grab
+        );
+        assert_eq!(
+            resolve_mouse_cursor(None, None, true, Some(CursorIcon::Progress), true),
             CursorIcon::Pointer
         );
         // An application shape outranks the mouse-reporting arrow.
         assert_eq!(
-            resolve_mouse_cursor(None, false, Some(CursorIcon::Progress), true),
+            resolve_mouse_cursor(None, None, false, Some(CursorIcon::Progress), true),
             CursorIcon::Progress
         );
-        assert_eq!(resolve_mouse_cursor(None, false, None, true), CursorIcon::Default);
-        assert_eq!(resolve_mouse_cursor(None, false, None, false), CursorIcon::Text);
+        assert_eq!(resolve_mouse_cursor(None, None, false, None, true), CursorIcon::Default);
+        assert_eq!(resolve_mouse_cursor(None, None, false, None, false), CursorIcon::Text);
+    }
+
+    #[test]
+    fn every_cursor_shape_maps_to_a_distinct_platform_icon() {
+        use vivid_protocol::vector::CursorShape;
+        let shapes = [
+            CursorShape::Default,
+            CursorShape::Pointer,
+            CursorShape::Text,
+            CursorShape::Move,
+            CursorShape::Crosshair,
+            CursorShape::NotAllowed,
+            CursorShape::Grab,
+            CursorShape::Grabbing,
+            CursorShape::Wait,
+            CursorShape::Progress,
+            CursorShape::ResizeLeft,
+            CursorShape::ResizeRight,
+            CursorShape::ResizeUp,
+            CursorShape::ResizeDown,
+            CursorShape::ResizeUpLeft,
+            CursorShape::ResizeUpRight,
+            CursorShape::ResizeDownLeft,
+            CursorShape::ResizeDownRight,
+            CursorShape::ResizeLeftRight,
+            CursorShape::ResizeUpDown,
+        ];
+        let mut seen = Vec::new();
+        for shape in shapes {
+            let icon = crate::vivid::overlay::cursor_icon(shape);
+            assert!(!seen.contains(&icon), "{shape:?} collides with an earlier shape on one icon");
+            seen.push(icon);
+        }
     }
 
     #[test]
