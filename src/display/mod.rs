@@ -552,6 +552,12 @@ impl Display {
     ) where
         T: EventListener,
     {
+        // The environment a producer sees is the same facts this window already has: read them
+        // each update and let the host republish only when one actually changed.
+        vivid_service
+            .set_overlay_appearance(self.window.theme() == Some(winit::window::Theme::Dark));
+        vivid_service.set_overlay_refresh_interval(self.window.refresh_millihertz());
+
         // A pane overlay's cursor can change from a pointer report or from a newly published
         // scene, so it is re-applied whenever it differs rather than only on input.
         let overlay_cursor = vivid_service.overlay_cursor();

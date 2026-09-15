@@ -10,7 +10,8 @@ use vello::peniko::{Blob, ImageAlphaType, ImageData, ImageFormat};
 use winit::window::CursorIcon;
 
 use vivid_protocol::overlay::wire::{
-    Action, Clipboard, Query, SetWindow, Status, Viewport, WindowAddress,
+    Action, Appearance, Clipboard, Environment, EnvironmentChanged, Query, SetWindow, Status,
+    Viewport, WindowAddress,
 };
 use vivid_protocol::overlay::wire::{
     PresentationOutcome, Submission, SubmissionOutcome, ViewportChanged,
@@ -57,6 +58,12 @@ pub(crate) struct Host {
     inflight: HashMap<SurfaceIdentity, Drawing>,
     viewport_revision: u64,
     viewport_dirty: HashSet<SessionIdentity>,
+    /// The environment a producer sees, and the revision it last changed at.
+    environment: Environment,
+    environment_revision: u64,
+    environment_dirty: HashSet<SessionIdentity>,
+    appearance: Appearance,
+    refresh_interval_us: Option<u64>,
     pub(super) actors: HashMap<SessionIdentity, Weak<SessionRuntime>>,
     lanes: HashMap<SessionIdentity, (u64, Instant)>,
     font: crate::config::font::Font,
@@ -156,6 +163,59 @@ impl Host {
     }
     pub(super) fn set_font(&mut self, font: crate::config::font::Font) {
         self.font = font;
+        // The environment names the default font, so a font change is an environment change.
+        self.refresh_environment();
+    }
+
+    /// The host's defaults as a producer sees them: the pane's own font, the desktop's
+    /// appearance, and what the display can actually do.
+    pub(super) fn environment(&self) -> Environment {
+        let normal = self.font.normal();
+        Environment {
+            font_family: normal.family.clone(),
+            font_size: Scalar::new(f64::from(self.font.size().as_px()))
+                .unwrap_or_else(|_| Scalar::new(16.).expect("16 is a valid scalar")),
+            appearance: self.appearance,
+            // Vivido has no reduced-motion signal from the platform, so it reports absence
+            // rather than asserting a preference it cannot read.
+            reduced_motion: None,
+            refresh_interval_us: self.refresh_interval_us,
+        }
+    }
+
+    /// Republish the environment if anything in it changed.
+    pub(super) fn refresh_environment(&mut self) {
+        let environment = self.environment();
+        if environment.validate().is_err() || self.environment == environment {
+            return;
+        }
+        self.environment = environment;
+        // Revisions are nonzero and a lane's first snapshot is revision 1, so the counter starts
+        // there rather than at the zero a derived default leaves it at.
+        self.environment_revision = self.environment_revision.max(1).saturating_add(1);
+        self.environment_dirty.extend(self.lanes.keys().copied());
+        for actor in self.actors.values().filter_map(Weak::upgrade) {
+            actor.wake_actor();
+        }
+    }
+
+    /// Record the desktop appearance, republishing if it differs.
+    pub(super) fn set_appearance(&mut self, appearance: Appearance) {
+        if self.appearance == appearance {
+            return;
+        }
+        self.appearance = appearance;
+        self.refresh_environment();
+    }
+
+    /// Record the display refresh interval, republishing if it differs.
+    pub(super) fn set_refresh_interval(&mut self, interval_us: Option<u64>) {
+        let interval_us = interval_us.filter(|rate| *rate != 0);
+        if self.refresh_interval_us == interval_us {
+            return;
+        }
+        self.refresh_interval_us = interval_us;
+        self.refresh_environment();
     }
     pub(super) fn deadline(&self, owner: SessionIdentity) -> Option<Instant> {
         self.lanes.get(&owner).map(|(_, deadline)| *deadline)
@@ -290,6 +350,7 @@ impl Host {
     pub(super) fn lane_open(&mut self, owner: SessionIdentity, generation: u64) {
         self.lanes.insert(owner, (generation, Instant::now() + Duration::from_secs(5)));
         self.viewport_dirty.insert(owner);
+        self.environment_dirty.insert(owner);
     }
 
     pub(super) fn lane_lost(
@@ -1133,6 +1194,16 @@ pub(super) fn service_input(shared: &ServiceShared, session: &SessionRuntime) {
     let mut failed = expired
         || host.windows.take_overflow(session.identity)
         || host.overflow.remove(&session.identity);
+    if !failed && host.environment_dirty.remove(&session.identity) {
+        let update = EnvironmentChanged {
+            revision: host.environment_revision.max(1),
+            environment: host.environment.clone(),
+        };
+        failed = update
+            .payload()
+            .and_then(|p| Envelope::new(0, p).encode())
+            .map_or(true, |body| !session.post_lane(messages::OVERLAY_ENV_CHANGED, 0, body));
+    }
     if !failed
         && host.viewport_dirty.remove(&session.identity)
         && let Some(viewport) = host.viewport
@@ -1318,6 +1389,42 @@ mod tests {
             },
         );
         surface
+    }
+
+    #[test]
+    fn the_environment_names_the_host_font_and_only_real_preferences() {
+        let mut host = Host::default();
+        // A default that failed validation would revoke a lane before the host learned its font.
+        assert!(host.environment().validate().is_ok());
+
+        let font = crate::config::font::Font::default()
+            .with_size(crate::config::font::FontSize::from_px(13.5));
+        let family = font.normal().family.clone();
+        host.set_font(font);
+        let environment = host.environment();
+        // The environment names the pane's own font, so plain overlay text matches the terminal.
+        assert_eq!(environment.font_family, family);
+        assert_eq!(environment.font_size.get(), 13.5);
+        // Vivido has no reduced-motion signal, so it reports absence rather than asserting one.
+        assert_eq!(environment.reduced_motion, None);
+
+        // A display rate becomes an interval, and an unknown one stays absent.
+        // The host records microseconds; the service converts a monitor's millihertz into them.
+        host.set_refresh_interval(Some(16_667));
+        assert_eq!(host.environment().refresh_interval_us, Some(16_667));
+        // A zero interval is not a rate, so it is absence rather than a fast display.
+        host.set_refresh_interval(Some(0));
+        assert_eq!(host.environment().refresh_interval_us, None);
+        host.set_refresh_interval(None);
+        assert_eq!(host.environment().refresh_interval_us, None);
+
+        // An appearance change republishes; repeating it does not.
+        let before = host.environment_revision;
+        host.set_appearance(vivid_protocol::overlay::wire::Appearance::Dark);
+        assert!(host.environment_revision > before);
+        let settled = host.environment_revision;
+        host.set_appearance(vivid_protocol::overlay::wire::Appearance::Dark);
+        assert_eq!(host.environment_revision, settled);
     }
 
     #[test]

@@ -87,6 +87,7 @@ use crate::vivid::transport::{ReadShutdown, Reader, Writer};
 use vivid_protocol::lease::{AttemptDecision, SessionLeaseDefinition};
 
 use crate::display::SizeInfo;
+use vivid_protocol::overlay::wire::Appearance;
 use winit::window::CursorIcon;
 
 #[cfg(windows)]
@@ -711,6 +712,22 @@ impl VividService {
         lock(&self.shared.overlays).cursor().map(overlay::cursor_icon)
     }
 
+    /// Record the desktop appearance. The host republishes the environment if it changed, and
+    /// wakes the lanes itself when it does.
+    pub(crate) fn set_overlay_appearance(&self, dark: bool) {
+        let appearance = if dark { Appearance::Dark } else { Appearance::Light };
+        lock(&self.shared.overlays).set_appearance(appearance);
+    }
+
+    /// Record how often the display refreshes. `None` means the host cannot tell.
+    pub(crate) fn set_overlay_refresh_interval(&self, millhertz: Option<u32>) {
+        // The protocol carries an interval in microseconds. A display never refreshes faster
+        // than a kilohertz, so this cannot round to zero for any rate a monitor reports.
+        let interval_us =
+            millhertz.filter(|rate| *rate > 0).map(|rate| 1_000_000_000_u64 / u64::from(rate));
+        lock(&self.shared.overlays).set_refresh_interval(interval_us);
+    }
+
     pub(crate) fn overlay_pointer(
         &self,
         x: f64,
@@ -1282,6 +1299,7 @@ impl ServiceShared {
                 registry::OVERLAY_PAINT,
                 registry::OVERLAY_POINTER,
                 registry::OVERLAY_CLIPBOARD,
+                registry::OVERLAY_ENV,
             ]);
             profiles.sort_unstable();
         }
@@ -2146,6 +2164,7 @@ fn establish_root_session(
                 && p != registry::OVERLAY_PAINT
                 && p != registry::OVERLAY_POINTER
                 && p != registry::OVERLAY_CLIPBOARD
+                && p != registry::OVERLAY_ENV
         });
     }
     registry::validate_profile_set(accepted.iter().map(String::as_str))

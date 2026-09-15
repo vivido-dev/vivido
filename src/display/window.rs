@@ -752,6 +752,16 @@ impl Window {
         }
     }
 
+    /// The desktop appearance the platform reports, or `None` when it reports none.
+    pub fn theme(&self) -> Option<Theme> {
+        self.backend.winit().and_then(|window| window.theme())
+    }
+
+    /// How often the monitor this window is on refreshes, in millihertz.
+    pub fn refresh_millihertz(&self) -> Option<u32> {
+        self.current_monitor().and_then(|monitor| monitor.refresh_rate_millihertz())
+    }
+
     pub fn set_theme(&self, theme: Option<Theme>) {
         // This drops whatever appearance the title bar tint installed, so let the next frame
         // derive it again from the terminal background that is current by then.
