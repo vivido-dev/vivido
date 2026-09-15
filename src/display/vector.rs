@@ -543,3 +543,56 @@ fn falloff(distance: f64, sigma: f64) -> f32 {
 /// How many stepped rings approximate a blur. Ten keeps a band below about a pixel for the
 /// small blurs a user interface actually casts.
 const SHADOW_STEPS: usize = 10;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Hit testing follows the same fill rule the shape is drawn by, so an even-odd hole is a
+    /// hole to the pointer too. A ring drawn as two nested circles is the case that shows it:
+    /// the hole is not a smaller disc lying on top, and a click through it reaches whatever the
+    /// ring was covering rather than the ring.
+    #[test]
+    fn an_even_odd_hole_is_not_a_hit_target() {
+        let ring = |even_odd: bool| {
+            let path = wire::Path::builder()
+                .move_to(0., 0.)
+                .line_to(100., 0.)
+                .line_to(100., 100.)
+                .line_to(0., 100.)
+                .close()
+                .move_to(40., 40.)
+                .line_to(60., 40.)
+                .line_to(60., 60.)
+                .line_to(40., 60.)
+                .close();
+            let path = if even_odd { path.even_odd() } else { path };
+            let mut canvas = Canvas::new();
+            canvas
+                .push(Command::Hit {
+                    id: 7,
+                    path: path.build().expect("a ring the wire carries"),
+                    role: HitRole::Input,
+                    cursor: None,
+                })
+                .unwrap();
+            compile(&canvas, &mut TextSystem::new(Default::default()), &BTreeMap::new())
+                .expect("the scene compiles")
+        };
+
+        let point = |x: f64, y: f64| wire::Point::new(x, y).unwrap();
+
+        // Filled by winding, the inner square is solid: the middle is part of the shape.
+        assert_eq!(ring(false).hit(point(50., 50.)).map(|hit| hit.id), Some(7));
+
+        // Filled even-odd, it is a hole, and the band around it still is not.
+        let holed = ring(true);
+        assert_eq!(holed.hit(point(50., 50.)), None, "the hole is not a hit target");
+        assert_eq!(
+            holed.hit(point(20., 50.)).map(|hit| hit.id),
+            Some(7),
+            "the ring around it still is"
+        );
+        assert_eq!(holed.hit(point(120., 50.)), None, "and outside is outside");
+    }
+}
