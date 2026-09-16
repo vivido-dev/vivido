@@ -1934,7 +1934,7 @@ mod tests {
             )
             .unwrap();
         let compiled = compile(&canvas, &mut text, &BTreeMap::new()).unwrap();
-        assert!(!compiled.retained.is_empty() || true);
+        assert!(compiled.retained.is_empty());
         // Hit geometry is unchanged by paint commands: no regions were declared, so the whole
         // window rectangle remains the input area.
         assert_eq!(
