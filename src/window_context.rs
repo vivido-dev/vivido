@@ -2940,6 +2940,12 @@ fn configure_vivid_pty_environment(
     root_secret: &str,
     window_id: u64,
 ) {
+    environment
+        .entry("TERM".into())
+        .or_insert_with(|| std::env::var("TERM").unwrap_or_else(|_| "vivido".into()));
+    environment
+        .entry("COLORTERM".into())
+        .or_insert_with(|| std::env::var("COLORTERM").unwrap_or_else(|_| "truecolor".into()));
     environment.insert("VIVID_ENDPOINT_CONTROL".into(), control_endpoint.into());
     environment.insert("VIVID_ROOT_SECRET".into(), root_secret.into());
     environment.insert("VIVIDO_WINDOW_ID".into(), window_id.to_string());
@@ -2991,7 +2997,7 @@ fn vivid_wslenv(inherited: &str) -> String {
     // WSLENV makes WSL create that variable with an empty value when this window does not offer
     // the lane. Producers correctly reject a present-but-empty endpoint as malformed instead of
     // applying the missing-lane fallback.
-    const MANAGED: [&str; 8] = [
+    const MANAGED: [&str; 10] = [
         "VIVID_ENDPOINT_CONTROL",
         "VIVID_ENDPOINT_INTERACTIVE",
         "VIVID_ENDPOINT_REALTIME",
@@ -3000,13 +3006,17 @@ fn vivid_wslenv(inherited: &str) -> String {
         "VIVID_ANCHOR_TRANSPORT",
         "VIVIDO_WINDOW_ID",
         "VIVIDO_INPUT_TRANSPORT",
+        "TERM",
+        "COLORTERM",
     ];
-    const EXPORTED: [&str; 5] = [
+    const EXPORTED: [&str; 7] = [
         "VIVID_ENDPOINT_CONTROL",
         "VIVID_ROOT_SECRET",
         "VIVID_ANCHOR_TRANSPORT",
         "VIVIDO_WINDOW_ID",
         "VIVIDO_INPUT_TRANSPORT",
+        "TERM",
+        "COLORTERM",
     ];
 
     let mut entries = inherited
@@ -3698,10 +3708,23 @@ mod vivid_environment_tests {
             environment.get("VIVIDO_INPUT_TRANSPORT").map(String::as_str),
             Some(if cfg!(windows) { "win32-console" } else { "pty-bytes" })
         );
+        assert!(environment.contains_key("TERM"));
+        assert!(environment.contains_key("COLORTERM"));
         #[cfg(windows)]
         assert_eq!(environment.get("VIVID_ANCHOR_TRANSPORT").map(String::as_str), Some("conpty"));
         #[cfg(not(windows))]
         assert!(!environment.contains_key("VIVID_ANCHOR_TRANSPORT"));
+    }
+
+    #[test]
+    fn child_preserves_custom_term_environment() {
+        let mut environment = HashMap::new();
+        environment.insert("TERM".into(), "custom-term".into());
+        environment.insert("COLORTERM".into(), "custom-color".into());
+        configure_vivid_pty_environment(&mut environment, "tcp:127.0.0.1:1", "secret", 42);
+
+        assert_eq!(environment.get("TERM").map(String::as_str), Some("custom-term"));
+        assert_eq!(environment.get("COLORTERM").map(String::as_str), Some("custom-color"));
     }
 
     #[cfg(any(unix, windows))]
@@ -3765,10 +3788,10 @@ mod vivid_environment_tests {
         assert_eq!(
             vivid_wslenv(
                 "GOPATH/p:VIVID_ROOT_SECRET/w:VIVID_ENDPOINT_BULK/u::CARGO_HOME/p:\
-                 VIVID_ENDPOINT_CONTROL/l:VIVIDO_WINDOW_ID/w"
+                 VIVID_ENDPOINT_CONTROL/l:VIVIDO_WINDOW_ID/w:TERM/w:COLORTERM/w"
             ),
             "GOPATH/p:CARGO_HOME/p:VIVID_ENDPOINT_CONTROL/u:VIVID_ROOT_SECRET/u:\
-             VIVID_ANCHOR_TRANSPORT/u:VIVIDO_WINDOW_ID/u:VIVIDO_INPUT_TRANSPORT/u"
+             VIVID_ANCHOR_TRANSPORT/u:VIVIDO_WINDOW_ID/u:VIVIDO_INPUT_TRANSPORT/u:TERM/u:COLORTERM/u"
         );
     }
 }
