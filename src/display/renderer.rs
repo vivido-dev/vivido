@@ -991,45 +991,46 @@ fn premultiply_blend_state() -> wgpu::BlendState {
     }
 }
 
+/// Keep native GPU initialization, rendering, and teardown serialized across test modules.
+/// Some drivers fault when separate tests create devices concurrently in one process.
+#[cfg(test)]
+pub(crate) fn gpu_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static GPU: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    GPU.lock().unwrap_or_else(|err| err.into_inner())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         RenderSource, SceneRenderer, SharedRenderContext, clamp_render_size, embedded_copy_extent,
-        frame_copy_regions, offscreen_device, premultiply_blend_state, screenshot_layout,
-        shutdown_window_render_context, surface_alpha_mode, window_render_context,
+        frame_copy_regions, gpu_test_lock as gpu_lock, offscreen_device, premultiply_blend_state,
+        screenshot_layout, shutdown_window_render_context, surface_alpha_mode,
+        window_render_context,
     };
     use std::rc::Rc;
-    use std::sync::{Mutex, MutexGuard};
 
     use vello::peniko::Color;
     use vello::wgpu::CompositeAlphaMode;
     use vello::{Scene, kurbo};
     use winit::dpi::{PhysicalPosition, PhysicalSize};
 
-    /// Serializes tests that create a wgpu device.
-    ///
-    /// Several drivers fault when two devices are created concurrently in one process, and the
-    /// test harness runs tests on parallel threads by default.
-    static GPU: Mutex<()> = Mutex::new(());
-
     #[test]
     fn window_renderers_reuse_the_thread_render_context() {
+        let _gpu = gpu_lock();
         let first = window_render_context();
         let second = window_render_context();
         assert!(Rc::ptr_eq(&first.0, &second.0));
+        shutdown_window_render_context();
     }
 
     #[test]
     fn shutting_down_window_render_context_allows_clean_recreation() {
+        let _gpu = gpu_lock();
         let first = window_render_context();
         shutdown_window_render_context();
         let second = window_render_context();
         assert!(!Rc::ptr_eq(&first.0, &second.0));
         shutdown_window_render_context();
-    }
-
-    fn gpu_lock() -> MutexGuard<'static, ()> {
-        GPU.lock().unwrap_or_else(|err| err.into_inner())
     }
 
     #[test]

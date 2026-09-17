@@ -6606,6 +6606,7 @@ mod tests {
 
     #[test]
     fn native_overlay_windows_present_move_receive_input_and_cleanup_independently() {
+        let _gpu = crate::display::renderer::gpu_test_lock();
         use vivid_sdk::overlay::{
             Brush, Canvas, Color, Event, OverlayWindowOptions, Path, Rect, WindowMode,
         };
@@ -6853,6 +6854,7 @@ mod tests {
     #[test]
     #[ignore = "records hardware-dependent overlay frame-time percentiles"]
     fn overlay_window_movement_performance_measurement() {
+        let _gpu = crate::display::renderer::gpu_test_lock();
         use crate::display::renderer::SceneRenderer;
         use crate::display::window::RenderSource;
         use vivid_sdk::overlay::{
@@ -6970,6 +6972,7 @@ mod tests {
     #[test]
     #[ignore = "requires built SDK bindings and VIVID_OVERLAY_TEST_PYTHON/VIVID_OVERLAY_TEST_NODE"]
     fn native_overlay_python_and_typescript_bindings() {
+        let _gpu = crate::display::renderer::gpu_test_lock();
         use crate::display::renderer::SceneRenderer;
         use crate::display::window::RenderSource;
         use std::process::{Command, Stdio};
