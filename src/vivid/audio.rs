@@ -297,6 +297,31 @@ impl AudioOutput {
         })
     }
 
+    /// A device-free sink that runs the production callback against a bounded ring.
+    #[cfg(test)]
+    pub(super) fn test_clocked_output(generation: u64) -> Arc<Self> {
+        let mut output = Arc::try_unwrap(Self::test_output()).ok().unwrap();
+        let capacity = 48_000 * 2 * RING_BUFFER_SECONDS;
+        let shared = Arc::get_mut(&mut output.shared).unwrap();
+        shared.ring_capacity_samples = capacity as u64;
+        shared.channel_generation.store(generation, Ordering::SeqCst);
+        let (producer, mut consumer) = HeapRb::<f32>::new(capacity).split();
+        output.producer = Mutex::new(producer);
+        let weak = Arc::downgrade(&output.shared);
+        thread::spawn(move || {
+            let mut samples = [0.0_f32; 960];
+            loop {
+                thread::sleep(Duration::from_millis(10));
+                let Some(shared) = weak.upgrade() else { break };
+                if shared.stopped.load(Ordering::SeqCst) {
+                    break;
+                }
+                render_audio(&mut samples, &mut consumer, &shared);
+            }
+        });
+        Arc::new(output)
+    }
+
     #[cfg(test)]
     #[allow(dead_code)]
     pub(super) fn force_video_gate_stall_for_test(&self) {
@@ -414,6 +439,10 @@ impl AudioOutput {
                 observed_at: Instant::now(),
             };
         self.realign_timeline();
+    }
+
+    pub fn ready_to_start(&self) -> bool {
+        audio_prebuffer_ready(&self.shared)
     }
 
     pub fn pause(&self) {
@@ -927,86 +956,88 @@ where
     device
         .build_output_stream(
             *config,
-            move |output: &mut [T], _| {
-                if discard_stale_samples(&shared, &mut consumer) > 0 {
-                    output.fill_with(|| T::from_sample(0.0));
-                    return;
-                }
-                if !shared.enabled.load(Ordering::SeqCst) {
-                    output.fill_with(|| T::from_sample(0.0));
-                    return;
-                }
-                if !shared.prebuffered.load(Ordering::SeqCst) {
-                    if !audio_prebuffer_ready(&shared) {
-                        output.fill_with(|| T::from_sample(0.0));
-                        return;
-                    }
-                    trim_to_live_prebuffer(&shared, &mut consumer);
-                    shared.resume_waiting_for_audio.store(false, Ordering::SeqCst);
-                    shared.prebuffered.store(true, Ordering::SeqCst);
-                }
-                let mut played = 0_u64;
-                // Media time only advances for samples that actually carried the timeline: real
-                // audio, and the leading silence that stands in for timeline before the first
-                // packet. An underrun renders silence the producer never sent, and a hold is delay
-                // that has not happened yet — counting either would run the clock ahead of the
-                // media and make every linked video frame look late for the rest of the session.
-                let mut rendered = 0_u64;
-                // Whether this callback wanted media the ring did not have. Accumulated locally:
-                // this runs once per sample, and the reserve is only revisited once per callback.
-                let mut underran = false;
-                let gain = f32::from_bits(shared.gain_bits.load(Ordering::SeqCst));
-                for sample in output {
-                    if shared
-                        .hold_silence_samples
-                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
-                            remaining.checked_sub(1)
-                        })
-                        .is_ok()
-                    {
-                        *sample = T::from_sample(0.0);
-                        continue;
-                    }
-                    let emit_silence = shared
-                        .gap_silence_samples
-                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
-                            remaining.checked_sub(1)
-                        })
-                        .is_ok()
-                        || shared
-                            .leading_silence_samples
-                            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
-                                remaining.checked_sub(1)
-                            })
-                            .is_ok();
-                    if emit_silence {
-                        *sample = T::from_sample(0.0);
-                        rendered += 1;
-                    } else if let Some(value) = consumer.try_pop() {
-                        *sample = T::from_sample((value * gain).clamp(-1.0, 1.0));
-                        played += 1;
-                        rendered += 1;
-                    } else {
-                        *sample = T::from_sample(0.0);
-                        underran = true;
-                    }
-                }
-                shared.played_samples.fetch_add(played, Ordering::SeqCst);
-                shared.rendered_samples.fetch_add(rendered, Ordering::SeqCst);
-                // A reserve this presenter tightened on the producer's word, and which the link
-                // then failed to hold, earns a step back. A stream that has finished decoding has
-                // simply run out and has nothing to learn from.
-                if underran
-                    && shared.trim_to_prebuffer.load(Ordering::SeqCst)
-                    && !shared.decode_done.load(Ordering::SeqCst)
-                {
-                    grow_live_prebuffer(&shared);
-                }
-            },
+            move |output: &mut [T], _| render_audio(output, &mut consumer, &shared),
             move |error| error_shared.set_error(format!("audio output stream error: {error}")),
             None,
         )
         .map_err(|error| io::Error::other(format!("could not build audio output: {error}")))
+}
+
+fn render_audio<T, C>(output: &mut [T], consumer: &mut C, shared: &Shared)
+where
+    T: SizedSample + FromSample<f32>,
+    C: Consumer<Item = f32>,
+{
+    if discard_stale_samples(shared, consumer) > 0 {
+        output.fill_with(|| T::from_sample(0.0));
+        return;
+    }
+    if !shared.enabled.load(Ordering::SeqCst) {
+        output.fill_with(|| T::from_sample(0.0));
+        return;
+    }
+    if !shared.prebuffered.load(Ordering::SeqCst) {
+        if !audio_prebuffer_ready(shared) {
+            output.fill_with(|| T::from_sample(0.0));
+            return;
+        }
+        trim_to_live_prebuffer(shared, consumer);
+        shared.resume_waiting_for_audio.store(false, Ordering::SeqCst);
+        shared.prebuffered.store(true, Ordering::SeqCst);
+    }
+    let mut played = 0_u64;
+    // Media time only advances for samples that actually carried the timeline: real
+    // audio, and the leading silence that stands in for timeline before the first
+    // packet. An underrun renders silence the producer never sent, and a hold is delay
+    // that has not happened yet — counting either would run the clock ahead of the
+    // media and make every linked video frame look late for the rest of the session.
+    let mut rendered = 0_u64;
+    // Whether this callback wanted media the ring did not have. Accumulated locally:
+    // this runs once per sample, and the reserve is only revisited once per callback.
+    let mut underran = false;
+    let gain = f32::from_bits(shared.gain_bits.load(Ordering::SeqCst));
+    for sample in output {
+        if shared
+            .hold_silence_samples
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| remaining.checked_sub(1))
+            .is_ok()
+        {
+            *sample = T::from_sample(0.0);
+            continue;
+        }
+        let emit_silence = shared
+            .gap_silence_samples
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| remaining.checked_sub(1))
+            .is_ok()
+            || shared
+                .leading_silence_samples
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok();
+        if emit_silence {
+            *sample = T::from_sample(0.0);
+            rendered += 1;
+        } else if let Some(value) = consumer.try_pop() {
+            *sample = T::from_sample((value * gain).clamp(-1.0, 1.0));
+            played += 1;
+            rendered += 1;
+        } else {
+            *sample = T::from_sample(0.0);
+            underran = true;
+        }
+    }
+    shared.played_samples.fetch_add(played, Ordering::SeqCst);
+    shared.rendered_samples.fetch_add(rendered, Ordering::SeqCst);
+    // A reserve this presenter tightened on the producer's word, and which the link
+    // then failed to hold, earns a step back. A stream that has finished decoding has
+    // simply run out and has nothing to learn from.
+    if underran
+        && shared.trim_to_prebuffer.load(Ordering::SeqCst)
+        && !shared.decode_done.load(Ordering::SeqCst)
+    {
+        grow_live_prebuffer(shared);
+    }
 }
 
 pub struct AudioDecoder {

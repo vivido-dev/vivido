@@ -124,7 +124,6 @@ const LIVE_AUDIO_FLOW_RESERVE_US: u64 = 2_000_000;
 /// A recovery key frame is the largest unit a producer can send. Asking for one because media is
 /// late, on a link that is late *because* it is saturated, is how a slow session becomes a stopped
 /// one, so latency-driven requests are spaced at least this far apart.
-const LATENCY_KEYFRAME_INTERVAL: Duration = Duration::from_secs(2);
 /// How often the live audio/video delay is allowed to shrink back toward zero.
 const LIVE_DELAY_REVIEW: Duration = Duration::from_secs(5);
 /// Video arrival margin kept when shrinking the delay, so a shrink cannot cause the next frame to
@@ -277,6 +276,9 @@ impl Registry {
 }
 
 struct ServiceShared {
+    playback_transition: Mutex<()>,
+    #[cfg(test)]
+    clocked_test_audio: AtomicBool,
     root_secret: Secret32,
     presenter: PresenterInstanceId,
     scene: SharedScene,
@@ -571,6 +573,9 @@ impl VividService {
         let root_secret = encode_hex(&secret);
         let scene = SharedScene::new(target);
         let shared = Arc::new(ServiceShared {
+            playback_transition: Mutex::new(()),
+            #[cfg(test)]
+            clocked_test_audio: AtomicBool::new(false),
             root_secret: Secret32::new(secret),
             presenter: PresenterInstanceId(presenter),
             scene: scene.clone(),
@@ -3702,10 +3707,13 @@ fn dispatch_control(
             let output = lock(&shared.audio_outputs).get(&output_identity).cloned();
             match record.record_type {
                 messages::PLAY => {
-                    let map = StrictMap::new("PLAY", &value, &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
-                        .map_err(|_| {
-                        ControlError::bad_message("invalid PLAY schema").with_track(identity)
-                    })?;
+                    let transition = lock(&shared.playback_transition);
+                    let map =
+                        StrictMap::new("PLAY", &value, &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11])
+                            .map_err(|_| {
+                                ControlError::bad_message("invalid PLAY schema")
+                                    .with_track(identity)
+                            })?;
                     let start = map
                         .required(3)
                         .map_err(|_| {
@@ -3731,11 +3739,30 @@ fn dispatch_control(
                     let generation = map.required_u64(10).map_err(|_| {
                         ControlError::bad_message("PLAY generation").with_track(identity)
                     })?;
+                    let synchronized = map.required_u64(9).ok() == Some(2);
+                    // This presenter retains one timed video picture rather than a decoded
+                    // video queue. Do not admit a buffer promise that it cannot honor. Linked
+                    // audio has its own bounded prebuffer; video-only starts still require an
+                    // eligible picture even with a zero minimum duration.
+                    if synchronized && output.is_none() && minimum != 0 {
+                        return Err(ControlError::bad_state(
+                            "video-only synchronized playback requires minimum_buffer_us=0",
+                        )
+                        .with_track(identity));
+                    }
                     if minimum > maximum
                         || rate != 1_i64 << 32
                         || map.required_u64(7).ok() != Some(1)
                         || map.required_u64(8).ok() != Some(0)
-                        || map.required_u64(9).ok() != Some(1)
+                        || (!synchronized && map.required_u64(9).ok() != Some(1))
+                        || (synchronized && !session.supports(registry::TIMED_MEDIA_SYNC))
+                        || (map.optional(11).is_some()
+                            && (!synchronized
+                                || map
+                                    .optional_u64(11)
+                                    .ok()
+                                    .flatten()
+                                    .is_none_or(|serial| serial == 0)))
                         || generation != before.state.channel_generation.get()
                     {
                         return Err(ControlError::bad_state(
@@ -3745,12 +3772,19 @@ fn dispatch_control(
                     }
                     shared
                         .scene
-                        .start_playback(identity, start)
+                        .configure_playback(identity, start, synchronized)
                         .map_err(|message| ControlError::state(message).with_track(identity))?;
                     if let Some(output) = &output {
+                        if synchronized {
+                            output.pause();
+                        }
                         output.configure_play(start, minimum);
-                        output.start();
+                        if !synchronized {
+                            output.start();
+                        }
                     }
+                    drop(transition);
+                    try_start_synchronized(shared, identity);
                     let revision_after = shared
                         .scene
                         .track_status(identity)
@@ -3777,6 +3811,7 @@ fn dispatch_control(
                     );
                 },
                 messages::PAUSE => {
+                    let _transition = lock(&shared.playback_transition);
                     if let Some(output) = &output {
                         output.pause();
                     }
@@ -4761,7 +4796,7 @@ fn channel_loop(
                 None => {
                     let output = channel_io!(
                         ChannelFailureKind::AudioOutput,
-                        AudioOutput::open(generation.get())
+                        open_audio_output(shared, generation.get())
                     );
                     lock(&shared.audio_outputs).insert(identity, output.clone());
                     output
@@ -4789,9 +4824,7 @@ fn channel_loop(
     let mut byte_bucket = TokenBucket::new(byte_rate, maximum_record_charge);
     let mut record_bucket = TokenBucket::new(configuration.maximum_records_per_second, 1);
     let mut last_rate_update = Instant::now();
-    let mut latency_recovery_epoch = None;
     let mut expected_audio_pts_us = None;
-    let mut last_latency_keyframe: Option<Instant> = None;
     let mut delay_review_started = Instant::now();
     let mut delay_window_headroom_us: Option<i64> = None;
     let mut last_flow_trace = Instant::now();
@@ -5146,30 +5179,12 @@ fn channel_loop(
                         audio.discard_video_before(configuration.maximum_latency_us)
                     })
                 };
-                let (discard_before, late) =
+                let (discard_before, _late) =
                     video_discard_plan(start_discard_before, latency_discard_before, packet.pts_us);
                 // A key frame recovers a *broken* stream. Late media is not broken, and on a
                 // saturated link the recovery unit is the largest thing that could be added to the
                 // queue that made it late, so the request is spaced as well as deduplicated.
-                let requested_keyframe = late
-                    && latency_recovery_epoch != Some(packet.epoch)
-                    && last_latency_keyframe
-                        .is_none_or(|at| at.elapsed() >= LATENCY_KEYFRAME_INTERVAL);
-                if requested_keyframe {
-                    request_keyframe(
-                        writer,
-                        shared,
-                        identity,
-                        generation,
-                        NEED_KEYFRAME_DECODER_RESET,
-                    );
-                    latency_recovery_epoch = Some(packet.epoch);
-                    last_latency_keyframe = Some(Instant::now());
-                } else if random_access
-                    && latency_recovery_epoch.is_some_and(|epoch| packet.epoch > epoch)
-                {
-                    latency_recovery_epoch = None;
-                }
+                let requested_keyframe = false;
                 let frames = video_decoder
                     .as_mut()
                     .ok_or_else(|| {
@@ -5259,6 +5274,7 @@ fn channel_loop(
                         )
                     );
                     shared.request_frame_wake();
+                    try_start_synchronized(shared, identity);
                 }
             },
             messages::AUDIO_PACKET => {
@@ -5349,6 +5365,7 @@ fn channel_loop(
                     ChannelFailureKind::SceneState,
                     shared.scene.mark_output_ready(identity, generation)
                 );
+                try_start_synchronized(shared, identity);
             },
             messages::CHANNEL_EOS => {
                 let envelope =
@@ -5409,6 +5426,13 @@ fn channel_loop(
                     // output, complete that bounded priming unit before waiting for PLAY.
                     let priming_record = shared.scene.latest_frame(identity).is_none();
                     for decoded in channel_io!(ChannelFailureKind::Decode, decoder.finish()) {
+                        if shared
+                            .scene
+                            .playback_start_pts_us(identity)
+                            .is_some_and(|target| decoded.pts_us < target)
+                        {
+                            continue;
+                        }
                         let (sar_num, sar_den) = match &configuration.kind {
                             KindConfiguration::Video(configuration) => (
                                 u32::try_from(configuration.aspect_numerator).unwrap_or(u32::MAX),
@@ -5449,6 +5473,7 @@ fn channel_loop(
                             )
                         );
                         shared.request_frame_wake();
+                        try_start_synchronized(shared, identity);
                     }
                     channel_other!(
                         ChannelFailureKind::SceneState,
@@ -5461,6 +5486,7 @@ fn channel_loop(
                     channel_io!(ChannelFailureKind::AudioOutput, output.finish_decode());
                     channel_io!(ChannelFailureKind::AudioOutput, output.signal_eos());
                 }
+                try_start_synchronized(shared, identity);
                 return Ok(context);
             },
             _ if header.flags & RECORD_OPTIONAL != 0 => {},
@@ -5573,6 +5599,30 @@ fn pace_ingress(
     }
 }
 
+fn open_audio_output(shared: &ServiceShared, generation: u64) -> io::Result<Arc<AudioOutput>> {
+    #[cfg(test)]
+    if shared.clocked_test_audio.load(Ordering::SeqCst) {
+        return Ok(AudioOutput::test_clocked_output(generation));
+    }
+    let _ = shared;
+    AudioOutput::open(generation)
+}
+
+fn try_start_synchronized(shared: &Arc<ServiceShared>, identity: TrackIdentity) {
+    let _transition = lock(&shared.playback_transition);
+    let output = shared
+        .scene
+        .active_track(identity.surface, scene::SLOT_AUDIO)
+        .and_then(|id| lock(&shared.audio_outputs).get(&id).cloned());
+    if shared.scene.try_start_synchronized(
+        identity,
+        output.as_ref().is_none_or(|audio| audio.ready_to_start()),
+    ) && let Some(output) = output
+    {
+        output.start();
+    }
+}
+
 fn wait_until_video_due(
     shared: &Arc<ServiceShared>,
     identity: TrackIdentity,
@@ -5592,6 +5642,7 @@ fn wait_until_video_due(
         return Ok(());
     }
     loop {
+        try_start_synchronized(shared, identity);
         if shared.scene.paused_frame_due(identity, pts_us) {
             return Ok(());
         }
@@ -11056,4 +11107,5 @@ mod tests {
         assert!(outcome.is_err(), "an unreachable milestone must time out");
     }
     include!("audit_regressions.rs");
+    include!("playback_regressions.rs");
 }
