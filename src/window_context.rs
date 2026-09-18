@@ -2540,6 +2540,41 @@ impl WindowContext {
         })
     }
 
+    /// Start a file drop for an owner-only automation request (`vivido msg drop-file`).
+    ///
+    /// `at` names a cell to drop onto; its centre is hit-tested exactly as a pointer drop would
+    /// be, so a surface with its own binding receives it.
+    pub(crate) fn automation_drop_file(
+        &self,
+        path: &std::path::Path,
+        at: Option<(u16, u16)>,
+        type_path: bool,
+    ) -> Result<
+        (crate::vivid::file_drop::DropHandle, String, u64),
+        crate::vivid::file_drop::LocalDropDisposition,
+    > {
+        let size = self.display.size_info;
+        let display_offset = self.terminal.lock().grid().display_offset();
+        let pixel = at.map(|(column, row)| {
+            let x = size.padding_x() + (f32::from(column) + 0.5) * size.cell_width();
+            let y = size.padding_y() + (f32::from(row) + 0.5) * size.cell_height();
+            (x as usize, y as usize)
+        });
+        self.vivid_service.automation_drop_file(
+            path,
+            pixel.map(|(x, y)| (x, y, &size, display_offset)),
+            type_path,
+        )
+    }
+
+    /// Where an automation file drop has got to.
+    pub(crate) fn automation_drop_state(
+        &self,
+        handle: crate::vivid::file_drop::DropHandle,
+    ) -> crate::vivid::file_drop::AutomationDropState {
+        self.vivid_service.automation_drop_state(handle)
+    }
+
     #[cfg(any(unix, windows))]
     #[allow(clippy::too_many_arguments)]
     pub fn automation_vivid_wait(

@@ -984,6 +984,84 @@ impl Processor {
                     return;
                 }
             },
+            "drop_file" => {
+                let params: crate::cli::IpcDropFile = match decode_ipc_params(&request) {
+                    Ok(params) => params,
+                    Err(error) => {
+                        request.connection.error(request.id, error);
+                        return;
+                    },
+                };
+                let target = match self.resolve_ipc_target(params.target.window_id) {
+                    Ok(target) => target,
+                    Err(error) => {
+                        request.connection.error(request.id, error);
+                        return;
+                    },
+                };
+                if !params.path.is_absolute() {
+                    request.connection.error(
+                        request.id,
+                        IpcError::new("invalid_params", "drop-file needs an absolute path"),
+                    );
+                    return;
+                }
+                if !(1..=86_400_000).contains(&params.timeout) {
+                    request.connection.error(
+                        request.id,
+                        IpcError::new("invalid_params", "timeout must be 1 ms through 24 hours"),
+                    );
+                    return;
+                }
+                let window = self.windows.get_mut(&target).unwrap();
+                match window.automation_drop_file(&params.path, params.at, params.type_path) {
+                    Ok((handle, name, length)) => {
+                        // The trusted indication a drag shows: automation does not make a transfer
+                        // silent (spec file-drop §7).
+                        replace_file_drop_message(
+                            &mut window.message_buffer,
+                            format!(
+                                "Automation is copying {name} ({length} bytes) to the remote receiver"
+                            ),
+                            MessageType::Warning,
+                        );
+                        window.dirty = true;
+                        window.display.window.request_redraw();
+                        window.automation.waiters.push(Waiter {
+                            connection: request.connection.clone(),
+                            request_id: request.id,
+                            deadline: Instant::now() + Duration::from_millis(params.timeout),
+                            kind: WaitKind::FileDrop { handle },
+                        });
+                        self.evaluate_waiters(target);
+                        self.schedule_automation_timer(target);
+                    },
+                    Err(refused) => {
+                        use crate::vivid::file_drop::{LocalDropDisposition, TOO_MANY_PENDING};
+                        let error = match refused {
+                            // No fallback to typing the local path, which is what an unbound drag
+                            // does: an automation caller asked for a copy, not for text.
+                            LocalDropDisposition::NoBinding => IpcError::new(
+                                "no_file_drop_binding",
+                                "no receiver is bound to this window; is vvreceive running on the \
+                                 remote host?",
+                            ),
+                            LocalDropDisposition::Rejected(TOO_MANY_PENDING) => IpcError::new(
+                                "busy",
+                                "the receiver already has as many drops pending as it accepts",
+                            ),
+                            LocalDropDisposition::Rejected(reason) => {
+                                IpcError::new("file_drop_rejected", reason)
+                            },
+                            LocalDropDisposition::Offered => {
+                                IpcError::new("internal", "an offered drop was reported refused")
+                            },
+                        };
+                        request.connection.error(request.id, error);
+                    },
+                }
+                return;
+            },
             "mouse" => {
                 let params: IpcMouse = match decode_ipc_params(&request) {
                     Ok(params) => params,
@@ -2695,6 +2773,58 @@ impl Processor {
                 WaitKind::Focus { after_focus } => {
                     (window.automation.focus_confirmation > *after_focus && window.is_focused())
                         .then(|| Ok(serde_json::json!({"focused": true})))
+                },
+                WaitKind::FileDrop { handle } => {
+                    use crate::vivid::file_drop::AutomationDropState;
+                    use vivid_protocol::file_drop::FileResultCode;
+                    let answer = match window.automation_drop_state(*handle) {
+                        AutomationDropState::Pending => None,
+                        AutomationDropState::Finished(outcome) => {
+                            let result = match outcome.result {
+                                FileResultCode::Committed => "committed",
+                                FileResultCode::AlreadyCommitted => "already_committed",
+                                FileResultCode::Rejected => "rejected",
+                                FileResultCode::Cancelled => "cancelled",
+                                FileResultCode::HashMismatch => "hash_mismatch",
+                                FileResultCode::IoError => "io_error",
+                            };
+                            Some(match outcome.result {
+                                FileResultCode::Committed | FileResultCode::AlreadyCommitted => {
+                                    Ok(serde_json::json!({
+                                        "result": result,
+                                        "basename": outcome.final_name,
+                                        "bytes": outcome.committed_length,
+                                        "sha256": outcome.sha256.map(|digest| {
+                                            digest.iter().map(|byte| format!("{byte:02x}"))
+                                                .collect::<String>()
+                                        }),
+                                        // Only to this caller, which started the drop; never in
+                                        // status, diagnostics, or logs (spec file-drop §8).
+                                        "remote_path": outcome.remote_path,
+                                    }))
+                                },
+                                _ => Err(IpcError::new(
+                                    "file_drop_failed",
+                                    format!("the receiver reported the drop {result}"),
+                                )
+                                .with_data(serde_json::json!({"result": result}))),
+                            })
+                        },
+                        AutomationDropState::Cancelled => Some(Err(IpcError::new(
+                            "file_drop_cancelled",
+                            "the drop was cancelled or timed out before the receiver finished",
+                        ))),
+                        AutomationDropState::Lost => Some(Err(IpcError::new(
+                            "file_drop_lost",
+                            "the receiver went away before it reported a result",
+                        ))),
+                    };
+                    if answer.is_some() {
+                        window.message_buffer.remove_target(FILE_DROP_MESSAGE_TARGET);
+                        window.dirty = true;
+                        window.display.window.request_redraw();
+                    }
+                    answer
                 },
             };
 

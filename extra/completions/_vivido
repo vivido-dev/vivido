@@ -221,6 +221,18 @@ ui\:"Process input through Vivido'\''s normal UI input pipeline"))' \
 ':text -- Literal UTF-8 text to paste:_default' \
 && ret=0
 ;;
+(drop-file)
+_arguments "${_arguments_options[@]}" : \
+'--at=[Drop onto the surface at this cell, \`COLUMN,ROW\`, for a receiver bound to one surface (a remote desktop, say). Without it the window'\''s whole-window binding receives the file]:COLUMN,ROW:_default' \
+'--timeout=[How long to wait for the receiver'\''s result (for example 30s or 10m)]:TIMEOUT:_default' \
+'-w+[Window ID. The focused window is used when this is omitted]:WINDOW_ID:_default' \
+'--window-id=[Window ID. The focused window is used when this is omitted]:WINDOW_ID:_default' \
+'--type-path[Type the committed remote path into the terminal afterwards, exactly as a drag would. Off by default\: the typed text lands in whatever has focus]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+':path -- The local file to copy. Vivido opens it itself, as it does a dragged file; only its name and length reach the receiver:_files' \
+&& ret=0
+;;
 (mouse)
 _arguments "${_arguments_options[@]}" : \
 '-h[Print help]' \
@@ -914,6 +926,10 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
+(drop-file)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
 (mouse)
 _arguments "${_arguments_options[@]}" : \
 ":: :_vivido__subcmd__msg__subcmd__help__subcmd__mouse_commands" \
@@ -1232,6 +1248,10 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
+(drop-file)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
 (mouse)
 _arguments "${_arguments_options[@]}" : \
 ":: :_vivido__subcmd__help__subcmd__msg__subcmd__mouse_commands" \
@@ -1526,6 +1546,7 @@ _vivido__subcmd__help__subcmd__msg_commands() {
 'capture:Activate, settle, and capture a window in one client operation' \
 'key:Send one mode-aware key to a terminal' \
 'paste:Paste literal text into a terminal' \
+'drop-file:Copy a local file to the remote receiver bound to a window, as a drag would' \
 'mouse:Send a mouse action to a terminal or Vivido UI' \
 'resize:Resize a terminal window' \
 'set-geometry:Move and optionally resize a window'\''s outer frame' \
@@ -1568,6 +1589,11 @@ _vivido__subcmd__help__subcmd__msg__subcmd__create-window_commands() {
 _vivido__subcmd__help__subcmd__msg__subcmd__diagnose_commands() {
     local commands; commands=()
     _describe -t commands 'vivido help msg diagnose commands' commands "$@"
+}
+(( $+functions[_vivido__subcmd__help__subcmd__msg__subcmd__drop-file_commands] )) ||
+_vivido__subcmd__help__subcmd__msg__subcmd__drop-file_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido help msg drop-file commands' commands "$@"
 }
 (( $+functions[_vivido__subcmd__help__subcmd__msg__subcmd__focus_commands] )) ||
 _vivido__subcmd__help__subcmd__msg__subcmd__focus_commands() {
@@ -1857,6 +1883,7 @@ _vivido__subcmd__msg_commands() {
 'capture:Activate, settle, and capture a window in one client operation' \
 'key:Send one mode-aware key to a terminal' \
 'paste:Paste literal text into a terminal' \
+'drop-file:Copy a local file to the remote receiver bound to a window, as a drag would' \
 'mouse:Send a mouse action to a terminal or Vivido UI' \
 'resize:Resize a terminal window' \
 'set-geometry:Move and optionally resize a window'\''s outer frame' \
@@ -1901,6 +1928,11 @@ _vivido__subcmd__msg__subcmd__diagnose_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg diagnose commands' commands "$@"
 }
+(( $+functions[_vivido__subcmd__msg__subcmd__drop-file_commands] )) ||
+_vivido__subcmd__msg__subcmd__drop-file_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg drop-file commands' commands "$@"
+}
 (( $+functions[_vivido__subcmd__msg__subcmd__focus_commands] )) ||
 _vivido__subcmd__msg__subcmd__focus_commands() {
     local commands; commands=()
@@ -1939,6 +1971,7 @@ _vivido__subcmd__msg__subcmd__help_commands() {
 'capture:Activate, settle, and capture a window in one client operation' \
 'key:Send one mode-aware key to a terminal' \
 'paste:Paste literal text into a terminal' \
+'drop-file:Copy a local file to the remote receiver bound to a window, as a drag would' \
 'mouse:Send a mouse action to a terminal or Vivido UI' \
 'resize:Resize a terminal window' \
 'set-geometry:Move and optionally resize a window'\''s outer frame' \
@@ -1982,6 +2015,11 @@ _vivido__subcmd__msg__subcmd__help__subcmd__create-window_commands() {
 _vivido__subcmd__msg__subcmd__help__subcmd__diagnose_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg help diagnose commands' commands "$@"
+}
+(( $+functions[_vivido__subcmd__msg__subcmd__help__subcmd__drop-file_commands] )) ||
+_vivido__subcmd__msg__subcmd__help__subcmd__drop-file_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg help drop-file commands' commands "$@"
 }
 (( $+functions[_vivido__subcmd__msg__subcmd__help__subcmd__focus_commands] )) ||
 _vivido__subcmd__msg__subcmd__help__subcmd__focus_commands() {

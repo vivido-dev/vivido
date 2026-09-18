@@ -193,6 +193,48 @@ pub(crate) enum LocalDropDisposition {
     Rejected(&'static str),
 }
 
+/// Why a drop was refused because the binding was full, as opposed to any other refusal.
+pub(crate) const TOO_MANY_PENDING: &str = "Too many file drops are pending";
+
+/// One drop an automation client started, and is waiting on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DropHandle {
+    session: SessionIdentity,
+    drop_id: u64,
+}
+
+/// What a drop started by automation may do that a gesture's may not, and what it learned.
+#[derive(Debug)]
+struct AutomationDrop {
+    /// Type the committed path, as a drag would. Off unless the caller asked: in an agent handoff
+    /// the path would land in whatever pane of a remote multiplexer has focus.
+    type_path: bool,
+    /// The SHA-256 this presenter computed for `FILE_FINISH`, over the bytes it actually sent.
+    sha256: Option<[u8; 32]>,
+}
+
+/// Where an automation drop has got to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AutomationDropState {
+    Pending,
+    Finished(AutomationDropOutcome),
+    Cancelled,
+    /// The drop or its session is gone without a result.
+    Lost,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AutomationDropOutcome {
+    pub result: FileResultCode,
+    pub final_name: String,
+    pub committed_length: u64,
+    /// The committed path on the producer's host, revalidated here, for the local caller that
+    /// started the drop and no one else (spec file-drop §8). Absent unless the producer negotiated
+    /// `file-drop-path-v1` and committed into a real directory.
+    pub remote_path: Option<String>,
+    pub sha256: Option<[u8; 32]>,
+}
+
 pub(crate) fn local_paste_text(path: &Path) -> String {
     let path: String = path.to_string_lossy().into();
     path + " "
@@ -235,8 +277,12 @@ pub(crate) struct FileDropManager {
     next_activation: u64,
     grant_generations: HashMap<SessionIdentity, FileDropGrantGeneration>,
     cancellations: Vec<(SessionIdentity, CancelFileDrop)>,
-    /// Committed remote paths waiting for the event loop that owns the PTY to type them.
-    pending_pastes: Vec<(SessionIdentity, u64, String)>,
+    /// Committed remote paths waiting for the event loop that owns the PTY to type them, and
+    /// whether each came from a gesture (governed by the paste option) or an automation request
+    /// that asked for it.
+    pending_pastes: Vec<(SessionIdentity, u64, String, bool)>,
+    /// Drops started by an owner-only automation request rather than a gesture.
+    automation: HashMap<(SessionIdentity, u64), AutomationDrop>,
 }
 
 /// A queued paste can never grow without bound, however badly a producer behaves.
@@ -366,6 +412,51 @@ impl FileDropManager {
         self.offer_source(key, source)
     }
 
+    /// Offer a local file on behalf of an owner-only automation request (spec file-drop §1).
+    ///
+    /// The same rules as a drag: the file is opened here without following a final link, must be
+    /// regular, and only its basename and length reach the producer. Without a position the drop
+    /// goes to the target-wide binding; with one, the surface there wins as for a drag. There is no
+    /// fallback to typing a local path: without a binding the request fails.
+    pub(crate) fn offer_automation_file(
+        &mut self,
+        path: &Path,
+        hit: Option<(SurfaceIdentity, SurfaceGeneration)>,
+        type_path: bool,
+    ) -> Result<(DropHandle, SessionIdentity, FileDropOffer), LocalDropDisposition> {
+        match self.offer_local_file(path, hit) {
+            (LocalDropDisposition::Offered, Some((session, offer))) => {
+                let drop_id = offer.binding.drop_id;
+                self.automation
+                    .insert((session, drop_id), AutomationDrop { type_path, sha256: None });
+                Ok((DropHandle { session, drop_id }, session, offer))
+            },
+            (disposition, _) => Err(disposition),
+        }
+    }
+
+    /// Where a drop started by automation has got to.
+    pub(crate) fn automation_state(&mut self, handle: DropHandle) -> AutomationDropState {
+        self.expire();
+        let key = (handle.session, handle.drop_id);
+        let Some(offer) = self.offers.get(&key) else {
+            return AutomationDropState::Lost;
+        };
+        if let Some(result) = &offer.terminal {
+            return AutomationDropState::Finished(AutomationDropOutcome {
+                result: result.result,
+                final_name: result.final_name.clone(),
+                committed_length: result.committed_length,
+                remote_path: accepted_committed_path(result).map(str::to_owned),
+                sha256: self.automation.get(&key).and_then(|drop| drop.sha256),
+            });
+        }
+        if offer.cancelled {
+            return AutomationDropState::Cancelled;
+        }
+        AutomationDropState::Pending
+    }
+
     /// Route retained clipboard bytes to the effective binding under a presenter-chosen name.
     pub(crate) fn offer_local_bytes(
         &mut self,
@@ -420,7 +511,7 @@ impl FileDropManager {
             })
             .count() as u64;
         if pending >= entry.grant.maximum_pending_offers {
-            return (LocalDropDisposition::Rejected("Too many file drops are pending"), None);
+            return (LocalDropDisposition::Rejected(TOO_MANY_PENDING), None);
         }
         self.next_drop_id = match self.next_drop_id.checked_add(1) {
             Some(id) if id != 0 => id,
@@ -743,24 +834,44 @@ impl FileDropManager {
             .map(|binding| binding.grant.idle_timeout_us)
     }
 
-    fn finish_transfer(&mut self, session: SessionIdentity, result: FileResult, allow_paste: bool) {
+    /// Record a transfer's terminal result. Returns whether a path was queued for typing.
+    ///
+    /// A gesture's path is typed when `gesture_paste` (the config option, and a negotiated path
+    /// profile) allows. An automation drop's path is typed only when its caller asked for it and
+    /// the profile was negotiated — the config option governs gestures.
+    fn finish_transfer(
+        &mut self,
+        session: SessionIdentity,
+        result: FileResult,
+        gesture_paste: bool,
+        path_negotiated: bool,
+        sha256: [u8; 32],
+    ) -> bool {
         let Some(transfer) = self.transfers.get_mut(&(session, result.transfer_id)) else {
-            return;
+            return false;
         };
         if transfer.generation != result.transfer_generation {
-            return;
+            return false;
         }
         if self
             .offers
             .get(&(session, transfer.drop_id))
             .is_none_or(|offer| offer.cancelled || offer.terminal.is_some())
         {
-            return;
+            return false;
         }
         transfer.active = false;
         transfer.committed_offset = result.committed_length;
         let (context_id, surface_id, drop_id) =
             (transfer.context_id, transfer.surface_id, transfer.drop_id);
+        let gesture = !self.automation.contains_key(&(session, drop_id));
+        let allow_paste = match self.automation.get_mut(&(session, drop_id)) {
+            Some(automation) => {
+                automation.sha256 = Some(sha256);
+                automation.type_path && path_negotiated
+            },
+            None => gesture_paste,
+        };
 
         // Only a shell-cwd binding this presenter itself created may put text into the PTY, and
         // only the first terminal result may: a lost result replays as already-committed, and the
@@ -777,7 +888,7 @@ impl FileDropManager {
             });
 
         let Some(offer) = self.offers.get_mut(&(session, drop_id)) else {
-            return;
+            return false;
         };
         let first_terminal = offer.terminal.is_none();
         offer.source = None;
@@ -790,8 +901,10 @@ impl FileDropManager {
             && first_terminal
             && self.pending_pastes.len() < MAX_PENDING_PASTES
         {
-            self.pending_pastes.push((session, drop_id, text));
+            self.pending_pastes.push((session, drop_id, text, gesture));
+            return true;
         }
+        false
     }
 
     /// Drain the committed remote paths the event loop still has to type.
@@ -800,10 +913,10 @@ impl FileDropManager {
     /// turn — the common case for a multi-file drop — types in gesture order rather than
     /// completion order. Across turns the order follows completion, which is preferable to
     /// letting one stalled transfer hold every later path until its idle timeout.
-    pub(crate) fn take_pending_pastes(&mut self) -> Vec<String> {
+    pub(crate) fn take_pending_pastes(&mut self) -> Vec<(String, bool)> {
         let mut taken = std::mem::take(&mut self.pending_pastes);
-        taken.sort_by_key(|(_, drop_id, _)| *drop_id);
-        taken.into_iter().map(|(_, _, text)| text).collect()
+        taken.sort_by_key(|(_, drop_id, ..)| *drop_id);
+        taken.into_iter().map(|(_, _, text, gesture)| (text, gesture)).collect()
     }
 
     fn connection_lost(
@@ -868,6 +981,7 @@ impl FileDropManager {
         self.grant_generations.remove(&session);
         self.cancellations.retain(|(owner, _)| *owner != session);
         self.pending_pastes.retain(|(owner, ..)| *owner != session);
+        self.automation.retain(|(owner, _), _| *owner != session);
     }
 
     pub(crate) fn remove_contexts(
@@ -900,7 +1014,7 @@ impl FileDropManager {
             .map(|(_, drop_id)| *drop_id)
             .collect();
         self.pending_pastes
-            .retain(|(owner, drop_id, _)| *owner != session || live.contains(drop_id));
+            .retain(|(owner, drop_id, ..)| *owner != session || live.contains(drop_id));
     }
 
     pub(crate) fn remove_surface(
@@ -1005,6 +1119,7 @@ impl FileDropManager {
             })
             .collect::<Vec<_>>();
         for key in terminal_expired {
+            self.automation.remove(&key);
             if let Some(mut offer) = self.offers.remove(&key) {
                 cancel_offer_source(&mut offer);
                 if let Some(transfer_id) = offer.transfer {
@@ -1093,14 +1208,23 @@ pub(super) fn handle_connection(
     })();
     source.clear_shutdown(open.transfer_generation);
     match result {
-        Ok(result) => {
-            // Negotiation and config both have to agree before a remote path can reach the PTY.
-            let allow_paste = shared.remote_drop_paste.load(Ordering::Relaxed)
-                && session.supports(registry::FILE_DROP_PATH);
-            lock(&shared.file_drops).finish_transfer(session.identity, result, allow_paste);
-            if allow_paste {
+        Ok((result, sha256)) => {
+            // A gesture's path is typed only when negotiation and the config option agree; an
+            // automation drop's, only when its caller asked (see `finish_transfer`).
+            let path_negotiated = session.supports(registry::FILE_DROP_PATH);
+            let gesture_paste = shared.remote_drop_paste.load(Ordering::Relaxed) && path_negotiated;
+            let queued = lock(&shared.file_drops).finish_transfer(
+                session.identity,
+                result,
+                gesture_paste,
+                path_negotiated,
+                sha256,
+            );
+            if queued {
                 shared.request_file_drop_paste_wake();
             }
+            // An automation request waiting on this drop is answered on the next frame wake.
+            shared.request_frame_wake();
         },
         Err(error) => {
             lock(&shared.file_drops).connection_lost(
@@ -1168,7 +1292,7 @@ fn stream_source(
     writer: &Writer,
     open: &FileTransferOpen,
     source: &FileSource,
-) -> io::Result<FileResult> {
+) -> io::Result<(FileResult, [u8; 32])> {
     source.ensure_generation(open.transfer_generation)?;
     let mut file = source.open_stream()?;
     let chunk_size =
@@ -1235,6 +1359,7 @@ fn stream_source(
         final_length: source.length,
         sha256: hasher.finalize().into(),
     };
+    let sha256 = finish.sha256;
     source.ensure_generation(open.transfer_generation)?;
     writer.write_record(registry::record::FILE_FINISH, open.transfer_id, &finish.encode()?)?;
     loop {
@@ -1256,7 +1381,7 @@ fn stream_source(
                 {
                     return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid FILE_RESULT"));
                 }
-                return Ok(result);
+                return Ok((result, sha256));
             },
             registry::record::MAX_FILE_DATA => {
                 let maximum = MaximumFileData::decode(&record.body)?;
@@ -1384,6 +1509,22 @@ fn open_source(path: &Path) -> io::Result<FileSource> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The texts queued for typing, in drain order.
+    fn typed(manager: &mut FileDropManager) -> Vec<String> {
+        manager.take_pending_pastes().into_iter().map(|(text, _)| text).collect()
+    }
+
+    /// A gesture drop's result, as the transfer thread records it: `allow` is the config option
+    /// and negotiated path profile together.
+    fn finish(
+        manager: &mut FileDropManager,
+        session: SessionIdentity,
+        result: FileResult,
+        allow: bool,
+    ) -> bool {
+        manager.finish_transfer(session, result, allow, allow, [0; 32])
+    }
     use vivid_protocol::file_drop::{
         DEFAULT_ACTIVE_FILE_TRANSFERS, DEFAULT_FILE_DROP_ACCEPTANCE_US,
         DEFAULT_FILE_TRANSFER_IDLE_US, DEFAULT_PENDING_FILE_DROPS, FileDropDestination,
@@ -1626,14 +1767,15 @@ mod tests {
         let owner = session(1);
         let mut manager = FileDropManager::default();
         let transfer = accepted_drop(&mut manager, owner, FileDropDestination::ShellCwd, 7);
-        manager.finish_transfer(
+        finish(
+            &mut manager,
             owner,
             result(transfer, Some("/home/u/report.txt"), FileResultCode::Committed),
             true,
         );
-        assert_eq!(manager.take_pending_pastes(), vec!["/home/u/report.txt ".to_owned()]);
+        assert_eq!(typed(&mut manager), vec!["/home/u/report.txt ".to_owned()]);
         // Draining is destructive, so the path is never typed twice.
-        assert!(manager.take_pending_pastes().is_empty());
+        assert!(typed(&mut manager).is_empty());
     }
 
     #[test]
@@ -1643,18 +1785,19 @@ mod tests {
         // The config/negotiation gate: the exact pre-feature behavior.
         let mut manager = FileDropManager::default();
         let transfer = accepted_drop(&mut manager, owner, FileDropDestination::ShellCwd, 7);
-        manager.finish_transfer(
+        finish(
+            &mut manager,
             owner,
             result(transfer, Some("/home/u/report.txt"), FileResultCode::Committed),
             false,
         );
-        assert!(manager.take_pending_pastes().is_empty());
+        assert!(typed(&mut manager).is_empty());
 
         // An old receiver that negotiated the profile but sends no path.
         let mut manager = FileDropManager::default();
         let transfer = accepted_drop(&mut manager, owner, FileDropDestination::ShellCwd, 7);
-        manager.finish_transfer(owner, result(transfer, None, FileResultCode::Committed), true);
-        assert!(manager.take_pending_pastes().is_empty());
+        finish(&mut manager, owner, result(transfer, None, FileResultCode::Committed), true);
+        assert!(typed(&mut manager).is_empty());
     }
 
     #[test]
@@ -1662,12 +1805,13 @@ mod tests {
         let owner = session(1);
         let mut manager = FileDropManager::default();
         let transfer = accepted_drop(&mut manager, owner, FileDropDestination::DesktopFolder, 7);
-        manager.finish_transfer(
+        finish(
+            &mut manager,
             owner,
             result(transfer, Some("/home/u/Desktop/report.txt"), FileResultCode::Committed),
             true,
         );
-        assert!(manager.take_pending_pastes().is_empty());
+        assert!(typed(&mut manager).is_empty());
     }
 
     #[test]
@@ -1682,22 +1826,19 @@ mod tests {
         ] {
             let mut manager = FileDropManager::default();
             let transfer = accepted_drop(&mut manager, owner, FileDropDestination::ShellCwd, 7);
-            manager.finish_transfer(
+            finish(
+                &mut manager,
                 owner,
                 result(transfer, Some(path), FileResultCode::Committed),
                 true,
             );
-            assert!(manager.take_pending_pastes().is_empty(), "{path:?} was queued");
+            assert!(typed(&mut manager).is_empty(), "{path:?} was queued");
         }
         for code in [FileResultCode::HashMismatch, FileResultCode::IoError] {
             let mut manager = FileDropManager::default();
             let transfer = accepted_drop(&mut manager, owner, FileDropDestination::ShellCwd, 7);
-            manager.finish_transfer(
-                owner,
-                result(transfer, Some("/home/u/report.txt"), code),
-                true,
-            );
-            assert!(manager.take_pending_pastes().is_empty());
+            finish(&mut manager, owner, result(transfer, Some("/home/u/report.txt"), code), true);
+            assert!(typed(&mut manager).is_empty());
         }
     }
 
@@ -1707,14 +1848,10 @@ mod tests {
         let mut manager = FileDropManager::default();
         let transfer = accepted_drop(&mut manager, owner, FileDropDestination::ShellCwd, 7);
         let path = Some("/home/u/report.txt");
-        manager.finish_transfer(owner, result(transfer, path, FileResultCode::Committed), true);
+        finish(&mut manager, owner, result(transfer, path, FileResultCode::Committed), true);
         // The receiver replays after a lost result; the file was committed exactly once.
-        manager.finish_transfer(
-            owner,
-            result(transfer, path, FileResultCode::AlreadyCommitted),
-            true,
-        );
-        assert_eq!(manager.take_pending_pastes().len(), 1);
+        finish(&mut manager, owner, result(transfer, path, FileResultCode::AlreadyCommitted), true);
+        assert_eq!(typed(&mut manager).len(), 1);
     }
 
     #[test]
@@ -1724,13 +1861,15 @@ mod tests {
         let mut manager = FileDropManager::default();
         // Both owners use context 4, surface 0, and transfer ID 7.
         let transfer = accepted_drop(&mut manager, first, FileDropDestination::ShellCwd, 7);
-        manager.finish_transfer(
+        finish(
+            &mut manager,
             first,
             result(transfer, Some("/home/first/report.txt"), FileResultCode::Committed),
             true,
         );
         let transfer = accepted_drop(&mut manager, second, FileDropDestination::ShellCwd, 7);
-        manager.finish_transfer(
+        finish(
+            &mut manager,
             second,
             result(transfer, Some("/home/second/report.txt"), FileResultCode::Committed),
             true,
@@ -1738,7 +1877,7 @@ mod tests {
 
         // Tearing the second owner down must not take the first owner's path with it.
         manager.remove_session(second);
-        assert_eq!(manager.take_pending_pastes(), vec!["/home/first/report.txt ".to_owned()]);
+        assert_eq!(typed(&mut manager), vec!["/home/first/report.txt ".to_owned()]);
     }
 
     #[test]
@@ -1748,12 +1887,9 @@ mod tests {
         // Several files from one multi-file drop, completing out of order. Drop IDs are
         // manager-wide monotonic, so the drain restores the order the user dropped them in.
         for drop_id in [3, 1, 2] {
-            manager.pending_pastes.push((owner, drop_id, format!("/home/u/{drop_id}.png ")));
+            manager.pending_pastes.push((owner, drop_id, format!("/home/u/{drop_id}.png "), true));
         }
-        assert_eq!(
-            manager.take_pending_pastes(),
-            vec!["/home/u/1.png ", "/home/u/2.png ", "/home/u/3.png "]
-        );
+        assert_eq!(typed(&mut manager), vec!["/home/u/1.png ", "/home/u/2.png ", "/home/u/3.png "]);
     }
 
     #[test]
@@ -1761,15 +1897,16 @@ mod tests {
         let owner = session(1);
         let mut manager = FileDropManager::default();
         for drop_id in 0..MAX_PENDING_PASTES as u64 {
-            manager.pending_pastes.push((owner, drop_id, "/home/u/queued.png ".to_owned()));
+            manager.pending_pastes.push((owner, drop_id, "/home/u/queued.png ".to_owned(), true));
         }
         let transfer = accepted_drop(&mut manager, owner, FileDropDestination::ShellCwd, 7);
-        manager.finish_transfer(
+        finish(
+            &mut manager,
             owner,
             result(transfer, Some("/home/u/report.txt"), FileResultCode::Committed),
             true,
         );
-        assert_eq!(manager.take_pending_pastes().len(), MAX_PENDING_PASTES);
+        assert_eq!(typed(&mut manager).len(), MAX_PENDING_PASTES);
     }
 
     #[test]

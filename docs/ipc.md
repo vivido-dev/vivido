@@ -253,6 +253,19 @@ waiting until it disconnects, the same as any unanswered request.
 - `paste {"text":"...","route":"application","target":{...}}` accepts at most 1 MiB. Application
   paste uses Vivido's bracketed-paste filtering and newline normalization without entering local UI
   state. UI paste can instead update an active search.
+- `drop_file {"path":"/abs/file","at":[COLUMN,ROW],"type_path":false,"timeout":MS,"target":{...}}`
+  copies a local regular file to the Vivid receiver bound to a window, exactly as a drag would
+  (`file-drop-v1`, automation origin). Vivido opens `path` itself — the client sends it absolute —
+  without following a final link, and the receiver sees only the basename and length. Without
+  `at` the window's target-wide binding receives it; `at` hit-tests a cell for a surface binding.
+  The reply waits for the receiver's result: `{"result":"committed"|"already_committed",
+  "basename","bytes","sha256","remote_path"}`, where `sha256` is what Vivido sent and
+  `remote_path` is the committed absolute path when the receiver negotiated `file-drop-path-v1`.
+  That path goes only to this caller: never to status, diagnostics, or logs. Nothing is typed
+  unless `type_path` is true. Errors: `no_file_drop_binding` (never a fallback to typing a local
+  path), `busy`, `file_drop_rejected`, `file_drop_failed` (with `data.result`),
+  `file_drop_cancelled`, `file_drop_lost`, `timeout`. The window shows the same message-bar
+  notice as a drag while the copy runs.
 - `mouse {"action":{"move":POSITION}}` supports `move`, `click`, `double_click`, `down`, `up`,
   `drag`, `path`, and `scroll`. A position contains exactly one zero-based cell pair
   (`cell_column`,`cell_row`) or physical-pixel pair (`x`,`y`), plus `mods`, `route`, and `target`.

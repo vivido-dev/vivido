@@ -37,20 +37,20 @@ fn advancing_transfer_rejects_old_generation_completion() {
     manager.transfers.get_mut(&(owner, 7)).unwrap().active = true;
     manager.connection_lost(owner, 7, FileTransferGeneration::ONE);
     assert!(manager.transfers[&(owner, 7)].active);
-    manager.finish_transfer(
+    finish(&mut manager, 
         owner,
         result(7, Some("/tmp/report.txt"), FileResultCode::Committed),
         true,
     );
     assert_eq!(manager.transfers[&(owner, 7)].generation, FileTransferGeneration::new(2));
     assert!(manager.offers[&(owner, drop_id)].terminal.is_none());
-    assert!(manager.take_pending_pastes().is_empty());
-    manager.finish_transfer(
+    assert!(typed(&mut manager).is_empty());
+    finish(&mut manager, 
         other,
         result(7, Some("/tmp/report.txt"), FileResultCode::Committed),
         true,
     );
-    assert_eq!(manager.take_pending_pastes(), vec!["/tmp/report.txt ".to_owned()]);
+    assert_eq!(typed(&mut manager), vec!["/tmp/report.txt ".to_owned()]);
     assert!(manager.offers[&(owner, drop_id)].source.is_some());
 }
 

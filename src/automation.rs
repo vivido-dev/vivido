@@ -286,6 +286,10 @@ pub enum WaitKind {
     Focus {
         after_focus: u64,
     },
+    /// A file drop this request started, answered with the receiver's result.
+    FileDrop {
+        handle: crate::vivid::file_drop::DropHandle,
+    },
 }
 
 #[derive(Clone, Debug)]

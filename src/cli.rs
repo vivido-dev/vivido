@@ -506,6 +506,12 @@ pub enum SocketMessage {
     /// Paste literal text into a terminal.
     Paste(IpcPaste),
 
+    /// Copy a local file to the remote receiver bound to a window, as a drag would.
+    ///
+    /// Waits for the receiver's result and prints it as JSON, including the committed path on
+    /// the remote host when the receiver reports one. Nothing is typed unless `--type-path` asks.
+    DropFile(IpcDropFile),
+
     /// Send a mouse action to a terminal or Vivido UI.
     Mouse(IpcMouse),
 
@@ -1090,6 +1096,43 @@ impl std::fmt::Debug for IpcPaste {
             .field("target", &self.target)
             .finish()
     }
+}
+
+/// Parameters to the `drop-file` IPC subcommand.
+#[cfg(any(unix, windows))]
+#[derive(Args, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct IpcDropFile {
+    /// The local file to copy. Vivido opens it itself, as it does a dragged file; only its name
+    /// and length reach the receiver.
+    #[clap(required = true, value_name = "PATH")]
+    pub path: PathBuf,
+
+    /// Drop onto the surface at this cell, `COLUMN,ROW`, for a receiver bound to one surface
+    /// (a remote desktop, say). Without it the window's whole-window binding receives the file.
+    #[clap(long, value_name = "COLUMN,ROW", value_parser = parse_drop_cell)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at: Option<(u16, u16)>,
+
+    /// Type the committed remote path into the terminal afterwards, exactly as a drag would.
+    /// Off by default: the typed text lands in whatever has focus.
+    #[clap(long)]
+    #[serde(default)]
+    pub type_path: bool,
+
+    /// How long to wait for the receiver's result (for example 30s or 10m).
+    #[clap(long, default_value = "10m", value_parser = parse_ipc_duration)]
+    pub timeout: u64,
+
+    #[clap(flatten)]
+    pub target: IpcTarget,
+}
+
+#[cfg(any(unix, windows))]
+fn parse_drop_cell(value: &str) -> Result<(u16, u16), String> {
+    let (column, row) =
+        value.split_once(',').ok_or_else(|| "expected COLUMN,ROW, e.g. 10,4".to_owned())?;
+    let parse = |text: &str| text.trim().parse::<u16>().map_err(|error| error.to_string());
+    Ok((parse(column)?, parse(row)?))
 }
 
 /// Mouse coordinate and modifier arguments.
@@ -1868,6 +1911,54 @@ mod tests {
         let command_index =
             arguments.iter().position(|argument| argument == "--command=powershell.exe").unwrap();
         assert!(handle_index < command_index, "internal flags must precede an attached command");
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn parse_drop_file_message() {
+        let options = Options::try_parse_from([
+            "vivido",
+            "msg",
+            "drop-file",
+            "build/firmware.bin",
+            "--window-id",
+            "12",
+            "--at",
+            "10,4",
+            "--type-path",
+            "--timeout",
+            "30s",
+        ])
+        .unwrap();
+        let Some(Subcommands::Msg(message)) = options.subcommands else {
+            panic!("expected msg subcommand");
+        };
+        assert_eq!(
+            message.message,
+            SocketMessage::DropFile(IpcDropFile {
+                path: PathBuf::from("build/firmware.bin"),
+                at: Some((10, 4)),
+                type_path: true,
+                timeout: 30_000,
+                target: IpcTarget { window_id: Some(12) },
+            })
+        );
+
+        // Defaults: the whole-window binding, nothing typed, ten minutes.
+        let options =
+            Options::try_parse_from(["vivido", "msg", "drop-file", "/tmp/x", "--window-id", "1"])
+                .unwrap();
+        let Some(Subcommands::Msg(message)) = options.subcommands else {
+            panic!("expected msg subcommand");
+        };
+        let SocketMessage::DropFile(params) = message.message else {
+            panic!("expected drop-file");
+        };
+        assert_eq!((params.at, params.type_path, params.timeout), (None, false, 600_000));
+
+        for bad in ["10", "a,b", "10,-1", "70000,1"] {
+            assert!(parse_drop_cell(bad).is_err(), "{bad}");
+        }
     }
 
     #[cfg(any(unix, windows))]

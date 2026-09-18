@@ -520,9 +520,9 @@ impl VividService {
         Ok(service)
     }
 
-    /// Honor a live config reload: stop typing immediately, and stop offering the profile to
-    /// sessions established from now on. Profiles are negotiated once, so re-enabling only
-    /// reaches sessions created afterwards.
+    /// Honor a live config reload: whether a gesture's committed remote path is typed, from the
+    /// next result on. The path profile itself stays offered — an automation caller that starts a
+    /// drop is owed its path (spec file-drop §8) — so this governs typing only.
     pub fn set_remote_drop_paste(&self, enabled: bool) {
         self.shared.remote_drop_paste.store(enabled, Ordering::Relaxed);
     }
@@ -530,10 +530,12 @@ impl VividService {
     /// Take the committed remote paths the event loop still has to type into the PTY.
     ///
     /// The queue is drained either way, so turning the option off between the commit and this
-    /// call discards the path rather than typing it late.
+    /// call discards a gesture's path rather than typing it late. A path an automation request
+    /// asked to have typed is not the option's to withhold.
     pub(crate) fn take_file_drop_pastes(&self) -> Vec<String> {
         let pastes = lock(&self.shared.file_drops).take_pending_pastes();
-        if self.shared.remote_drop_paste.load(Ordering::Relaxed) { pastes } else { Vec::new() }
+        let typing = self.shared.remote_drop_paste.load(Ordering::Relaxed);
+        pastes.into_iter().filter(|(_, gesture)| typing || !gesture).map(|(text, _)| text).collect()
     }
 
     /// Start a window that presents `desktop-surface-v1` instead of a terminal.
@@ -970,6 +972,35 @@ impl VividService {
         self.post_offer(disposition, offer)
     }
 
+    /// Offer a local file for an owner-only automation request (`vivido msg drop-file`).
+    ///
+    /// `at` is a window-space position for a drop onto a particular surface; without it the drop
+    /// goes to the target-wide binding, as a paste does. Returns the handle to wait on, and the
+    /// basename and length the producer was offered.
+    pub(crate) fn automation_drop_file(
+        &self,
+        path: &std::path::Path,
+        at: Option<(usize, usize, &SizeInfo, usize)>,
+        type_path: bool,
+    ) -> Result<(file_drop::DropHandle, String, u64), file_drop::LocalDropDisposition> {
+        let hit = at.and_then(|(x, y, size, offset)| self.file_drop_surface_at(x, y, size, offset));
+        let (handle, owner, offer) =
+            lock(&self.shared.file_drops).offer_automation_file(path, hit, type_path)?;
+        let (name, length) = (offer.suggested_name.clone(), offer.declared_length);
+        match self.post_offer(file_drop::LocalDropDisposition::Offered, Some((owner, offer))) {
+            file_drop::LocalDropDisposition::Offered => Ok((handle, name, length)),
+            refused => Err(refused),
+        }
+    }
+
+    /// Where an automation drop has got to.
+    pub(crate) fn automation_drop_state(
+        &self,
+        handle: file_drop::DropHandle,
+    ) -> file_drop::AutomationDropState {
+        lock(&self.shared.file_drops).automation_state(handle)
+    }
+
     /// Deliver an admitted offer to its owning session, keeping the manager's disposition.
     fn post_offer(
         &self,
@@ -1322,9 +1353,6 @@ impl ServiceShared {
 
     /// The profiles this target offers right now.
     ///
-    /// The path sub-profile is config-gated, so a deployment with it turned off simply never
-    /// negotiates it and every peer degrades to the pre-feature wire.
-    ///
     /// The overlay bundle is offered on every platform, `overlay-a11y-v1` included. A profile
     /// says what this wire carries, not what one platform's adapter happens to read today: a
     /// semantic tree is accepted, validated, retired with its scene and reported in `inspect`
@@ -1332,15 +1360,10 @@ impl ServiceShared {
     /// would put every producer on a permanent fallback and make them all change again the day
     /// that hop lands, in exchange for knowledge none of them could act on.
     fn offered_profiles(&self) -> Vec<&'static str> {
-        let allow = self.remote_drop_paste.load(Ordering::Relaxed);
-        let mut profiles: Vec<_> = self
-            .scene
-            .target()
-            .supported_profiles()
-            .iter()
-            .copied()
-            .filter(|profile| allow || *profile != registry::FILE_DROP_PATH)
-            .collect();
+        // `file-drop-path-v1` is offered whenever the target supports it. The paste option
+        // decides only whether a *gesture's* committed path is typed; an automation caller that
+        // started a drop is owed the path whatever that option says.
+        let mut profiles: Vec<_> = self.scene.target().supported_profiles().to_vec();
         if self.scene.target().profile_name() == registry::TERMINAL_SURFACE
             && lock(&self.overlays).has_viewport()
         {
@@ -7140,41 +7163,265 @@ mod tests {
     }
 
     #[test]
-    fn the_path_profile_is_negotiated_only_while_the_option_is_on() {
+    fn the_path_profile_is_negotiated_whatever_the_paste_option_says() {
+        // The option decides whether a gesture's path is *typed*. The path itself is owed to an
+        // automation caller that started a drop (spec file-drop §8), so the profile is always
+        // offered, and a lease may permit it either way.
         let service =
             socket_service!(VividService::start_with_wake(test_geometry(), Arc::new(|_| {})));
-        let session = connect_file_drop_receiver(&service);
-        assert!(session.supports(registry::FILE_DROP_PATH));
-        session.close().unwrap();
+        for typing in [true, false] {
+            service.set_remote_drop_paste(typing);
+            let session = connect_file_drop_receiver(&service);
+            assert!(session.supports(registry::FILE_DROP_PATH), "typing {typing}");
+            session.close().unwrap();
+            assert!(service.shared.offered_profiles().contains(&registry::FILE_DROP_PATH));
+        }
+    }
 
-        // With the option off the offer is not made, so a receiver can never send a path and the
-        // wire is exactly what it was before the profile existed.
-        service.set_remote_drop_paste(false);
-        let session = connect_file_drop_receiver(&service);
-        assert!(!session.supports(registry::FILE_DROP_PATH));
-        assert!(session.supports(registry::FILE_DROP));
-        assert_eq!(
-            session.info().accepted_profiles,
-            vec![
-                registry::FILE_DROP.to_owned(),
-                registry::TERMINAL_SURFACE.to_owned(),
-                registry::CORE_CONTROL.to_owned(),
-            ]
-        );
-        session.close().unwrap();
+    /// Bind a `vvreceive`-shaped receiver target-wide on `session`.
+    fn bind_shell_cwd(session: &vivid_sdk::Session) -> vivid_sdk::FileDropBindingGuard {
+        use vivid_protocol::file_drop::{
+            DEFAULT_ACTIVE_FILE_TRANSFERS, DEFAULT_FILE_DROP_ACCEPTANCE_US,
+            DEFAULT_FILE_TRANSFER_IDLE_US, DEFAULT_PENDING_FILE_DROPS, FileDropDestination,
+        };
+        let mut binding = vivid_sdk::FileDropBindingGuard::new();
+        let request = binding
+            .enable(
+                session.info().root_context_id,
+                0,
+                SurfaceGeneration::ZERO,
+                FileDropDestination::ShellCwd,
+                1 << 20,
+                DEFAULT_PENDING_FILE_DROPS,
+                DEFAULT_ACTIVE_FILE_TRANSFERS,
+                64 * 1024,
+                DEFAULT_FILE_DROP_ACCEPTANCE_US,
+                DEFAULT_FILE_TRANSFER_IDLE_US,
+            )
+            .unwrap();
+        let grant = session.set_file_drop_binding(&request, &RequestMetadata::default()).unwrap();
+        binding.handle_bound(grant).unwrap();
+        binding
+    }
+
+    /// Play the receiver for one offer: accept it, read every byte, and commit at `committed`.
+    /// Returns the drop id and the bytes received.
+    fn receive_one(session: &vivid_sdk::Session, committed: &str) -> (u64, Vec<u8>) {
+        use vivid_protocol::file_drop::{FileResult, FileResultCode};
+        use vivid_protocol::revision::FileTransferGeneration;
+        use vivid_sdk::{AcceptFileDrop, IncomingFileTransferEvent, IncomingFileTransferRequest};
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let offer = loop {
+            assert!(Instant::now() < deadline, "no file-drop offer arrived");
+            match session.take_event().unwrap() {
+                Some(SessionEvent::FileDropOffered(offer)) => break offer,
+                _ => std::thread::sleep(Duration::from_millis(5)),
+            }
+        };
+        let transfer_id = session.allocate_id().unwrap();
+        session
+            .accept_file_drop(
+                AcceptFileDrop {
+                    binding: offer.binding,
+                    transfer_id,
+                    transfer_generation: FileTransferGeneration::ONE,
+                    maximum_record_body: 64 * 1024,
+                    initial_maximum_body_bytes: 1 << 20,
+                    initial_maximum_records: 32,
+                },
+                &RequestMetadata::default(),
+            )
+            .unwrap();
+        let mut channel = session
+            .open_incoming_file_transfer(IncomingFileTransferRequest {
+                context_id: offer.binding.context_id,
+                surface_id: offer.binding.surface_id,
+                producer_epoch: offer.binding.producer_epoch,
+                grant_generation: offer.binding.grant_generation,
+                surface_generation: offer.binding.surface_generation,
+                drop_id: offer.binding.drop_id,
+                transfer_id,
+                transfer_generation: FileTransferGeneration::ONE,
+                resume_offset: 0,
+                declared_length: offer.declared_length,
+                maximum_record_body: 64 * 1024,
+                maximum_body_bytes: 1 << 20,
+                maximum_records: 32,
+            })
+            .unwrap();
+        let mut received = Vec::new();
+        loop {
+            match channel.read_event().unwrap() {
+                IncomingFileTransferEvent::Data { bytes, .. } => received.extend_from_slice(&bytes),
+                IncomingFileTransferEvent::Finished(_) => break,
+                IncomingFileTransferEvent::Aborted(_) => panic!("transfer aborted"),
+            }
+        }
+        let final_name = committed.rsplit('/').next().unwrap().to_owned();
+        channel
+            .send_result(&FileResult {
+                transfer_id,
+                transfer_generation: FileTransferGeneration::ONE,
+                result: FileResultCode::Committed,
+                committed_length: offer.declared_length,
+                final_name,
+                committed_path: Some(committed.to_owned()),
+            })
+            .unwrap();
+        (offer.binding.drop_id, received)
+    }
+
+    fn settle(
+        service: &VividService,
+        handle: file_drop::DropHandle,
+    ) -> file_drop::AutomationDropState {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match service.automation_drop_state(handle) {
+                file_drop::AutomationDropState::Pending => {
+                    assert!(Instant::now() < deadline, "the drop never finished");
+                    std::thread::sleep(Duration::from_millis(5));
+                },
+                settled => return settled,
+            }
+        }
+    }
+
+    fn scratch_file(bytes: &[u8]) -> (TempDir, std::path::PathBuf) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("firmware.bin");
+        std::fs::write(&path, bytes).unwrap();
+        (directory, path)
     }
 
     #[test]
-    fn a_disabled_option_refuses_a_lease_that_permits_the_path_profile() {
+    fn an_automation_drop_reports_the_remote_path_and_hash_and_types_nothing() {
+        use sha2::{Digest, Sha256};
+        use vivid_protocol::file_drop::FileResultCode;
+
+        let service =
+            socket_service!(VividService::start_with_wake(test_geometry(), Arc::new(|_| {})));
+        // Typing is on for gestures; an automation drop still types nothing unless it asks.
+        service.set_remote_drop_paste(true);
+        let session = connect_file_drop_receiver(&service);
+        let _binding = bind_shell_cwd(&session);
+        let payload = b"\x7fELF firmware image".to_vec();
+        let (_directory, path) = scratch_file(&payload);
+
+        let (handle, name, length) = service.automation_drop_file(&path, None, false).unwrap();
+        assert_eq!((name.as_str(), length), ("firmware.bin", payload.len() as u64));
+        let (drop_id, received) = receive_one(&session, "/home/tester/firmware.bin");
+        assert_eq!(received, payload);
+
+        let file_drop::AutomationDropState::Finished(outcome) = settle(&service, handle) else {
+            panic!("the drop did not finish");
+        };
+        assert_eq!(outcome.result, FileResultCode::Committed);
+        assert_eq!(outcome.final_name, "firmware.bin");
+        assert_eq!(outcome.committed_length, payload.len() as u64);
+        assert_eq!(outcome.remote_path.as_deref(), Some("/home/tester/firmware.bin"));
+        let expected: [u8; 32] = Sha256::digest(&payload).into();
+        assert_eq!(outcome.sha256, Some(expected), "the hash of the bytes actually sent");
+        assert!(service.take_file_drop_pastes().is_empty(), "nothing reaches the PTY");
+
+        // The path goes to the caller that started the drop and nowhere else: not into status.
+        let status = session
+            .query_file_drop(
+                vivid_protocol::file_drop::QueryFileDrop { drop_id },
+                &RequestMetadata::default(),
+            )
+            .unwrap();
+        assert_eq!(status.final_name, "firmware.bin");
+        assert!(!format!("{status:?}").contains("/home/tester"), "{status:?}");
+    }
+
+    #[test]
+    fn type_path_types_an_automation_drop_whatever_the_option_while_gestures_follow_it() {
         let service =
             socket_service!(VividService::start_with_wake(test_geometry(), Arc::new(|_| {})));
         service.set_remote_drop_paste(false);
-        // A lease may only permit profiles the window is actually offering, so the gate cannot be
-        // walked around by delegating.
-        let offered = service.shared.offered_profiles();
-        assert!(!offered.contains(&registry::FILE_DROP_PATH));
-        service.set_remote_drop_paste(true);
-        assert!(service.shared.offered_profiles().contains(&registry::FILE_DROP_PATH));
+        let session = connect_file_drop_receiver(&service);
+        let _binding = bind_shell_cwd(&session);
+
+        // Asked for: typed, although the option (which governs gestures) is off.
+        let (_directory, path) = scratch_file(b"one");
+        let (handle, ..) = service.automation_drop_file(&path, None, true).unwrap();
+        receive_one(&session, "/home/tester/one.bin");
+        settle(&service, handle);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let pastes = loop {
+            let pastes = service.take_file_drop_pastes();
+            if !pastes.is_empty() {
+                break pastes;
+            }
+            assert!(Instant::now() < deadline, "the requested path was never queued");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(pastes, vec!["/home/tester/one.bin ".to_owned()]);
+
+        // A gesture with the option off: copied, and not typed.
+        assert_eq!(
+            service.handle_pasted_bytes("pasted.png".into(), b"png".to_vec()),
+            file_drop::LocalDropDisposition::Offered
+        );
+        receive_one(&session, "/home/tester/pasted.png");
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(service.take_file_drop_pastes().is_empty());
+    }
+
+    #[test]
+    fn an_automation_drop_with_no_binding_fails_and_types_nothing() {
+        let service =
+            socket_service!(VividService::start_with_wake(test_geometry(), Arc::new(|_| {})));
+        let (_directory, path) = scratch_file(b"orphan");
+        assert_eq!(
+            service.automation_drop_file(&path, None, true).unwrap_err(),
+            file_drop::LocalDropDisposition::NoBinding
+        );
+        assert!(service.take_file_drop_pastes().is_empty(), "no fallback to typing a local path");
+    }
+
+    #[test]
+    fn a_drop_aimed_at_one_window_never_reaches_another_that_reuses_its_ids() {
+        // Two windows, each with its own presenter and its own receiver. Both managers start their
+        // drop ids at one, so the ids collide; the drop must still land only where it was aimed.
+        let window_a =
+            socket_service!(VividService::start_with_wake(test_geometry(), Arc::new(|_| {})));
+        let window_b =
+            socket_service!(VividService::start_with_wake(test_geometry(), Arc::new(|_| {})));
+        let receiver_a = connect_file_drop_receiver(&window_a);
+        let receiver_b = connect_file_drop_receiver(&window_b);
+        let _binding_a = bind_shell_cwd(&receiver_a);
+        let _binding_b = bind_shell_cwd(&receiver_b);
+
+        let (_directory, path) = scratch_file(b"for a");
+        let (handle_b, ..) = window_b.automation_drop_file(&path, None, false).unwrap();
+        let (drop_b, _) = receive_one(&receiver_b, "/home/b/for-a");
+        let (handle_a, ..) = window_a.automation_drop_file(&path, None, false).unwrap();
+        let (drop_a, _) = receive_one(&receiver_a, "/home/a/for-a");
+        assert_eq!(drop_a, drop_b, "the ids really do collide");
+
+        let file_drop::AutomationDropState::Finished(a) = settle(&window_a, handle_a) else {
+            panic!("window A's drop did not finish");
+        };
+        let file_drop::AutomationDropState::Finished(b) = settle(&window_b, handle_b) else {
+            panic!("window B's drop did not finish");
+        };
+        assert_eq!(a.remote_path.as_deref(), Some("/home/a/for-a"));
+        assert_eq!(b.remote_path.as_deref(), Some("/home/b/for-a"));
+        // One window's handle means nothing to the other.
+        assert_eq!(window_a.automation_drop_state(handle_b), file_drop::AutomationDropState::Lost);
+        // And no second offer went anywhere.
+        std::thread::sleep(Duration::from_millis(100));
+        for receiver in [&receiver_a, &receiver_b] {
+            while let Some(event) = receiver.take_event().unwrap() {
+                assert!(
+                    !matches!(event, SessionEvent::FileDropOffered(_)),
+                    "an extra offer arrived"
+                );
+            }
+        }
     }
 
     /// End-to-end: a pasted image reaches a `vvreceive`-shaped receiver and its committed path
