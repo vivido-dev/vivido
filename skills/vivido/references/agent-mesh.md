@@ -4,6 +4,11 @@ A durable mailbox for agent-to-agent messages, carried by `vvagent`. It is **not
 terminal: `vivid_protocol` gains nothing from it and depends on none of it. A message may *refer* to
 a pane or a file; it never carries media bytes, and it never enters a PTY.
 
+The complete mesh surface — cross-host peers and the SSH bridge, `--attach` file handoff, and the
+full command reference — is the **vvagent** skill
+([vivido-dev/vvagent · skills/vvagent](https://github.com/vivido-dev/vvagent/tree/master/skills/vvagent)).
+This file keeps what matters inside Vivido.
+
 Everything prints JSON, including errors (`{"error":{"code","message"}}`), because the primary
 caller is an agent — one that has to parse prose is back where it started.
 
