@@ -4,7 +4,9 @@ use std::ops::Range;
 use std::sync::Arc;
 use std::{array, env};
 
-use ahash::{AHashMap, AHashSet};
+use ahash::AHashSet;
+use hashbrown::Equivalent;
+type AHashMap<K, V> = hashbrown::HashMap<K, V, ahash::RandomState>;
 use parley::fontique::{FallbackKey, FamilyId, Language, ScriptExt};
 use parley::layout::PositionedLayoutItem;
 use parley::{
@@ -54,11 +56,36 @@ enum LayoutTextKey {
     String(Box<str>),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum LayoutTextKeyRef<'a> {
+    Char(char),
+    String(&'a str),
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct LayoutKey {
     text: LayoutTextKey,
     variant: FontVariant,
     font_size_bits: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct LayoutKeyRef<'a> {
+    text: LayoutTextKeyRef<'a>,
+    variant: FontVariant,
+    font_size_bits: u32,
+}
+
+impl Equivalent<LayoutKey> for LayoutKeyRef<'_> {
+    fn equivalent(&self, key: &LayoutKey) -> bool {
+        self.variant == key.variant
+            && self.font_size_bits == key.font_size_bits
+            && match (self.text, &key.text) {
+                (LayoutTextKeyRef::Char(a), LayoutTextKey::Char(b)) => a == *b,
+                (LayoutTextKeyRef::String(a), LayoutTextKey::String(b)) => a == b.as_ref(),
+                _ => false,
+            }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -67,6 +94,23 @@ struct TerminalLayoutKey {
     spans: Box<[TerminalStyleKey]>,
     ligatures: bool,
     font_size_bits: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct TerminalLayoutKeyRef<'a> {
+    text: &'a str,
+    spans: &'a [TerminalStyleKey],
+    ligatures: bool,
+    font_size_bits: u32,
+}
+
+impl Equivalent<TerminalLayoutKey> for TerminalLayoutKeyRef<'_> {
+    fn equivalent(&self, key: &TerminalLayoutKey) -> bool {
+        self.ligatures == key.ligatures
+            && self.font_size_bits == key.font_size_bits
+            && self.text == key.text.as_ref()
+            && self.spans == key.spans.as_ref()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -99,6 +143,10 @@ const MAX_CACHED_LAYOUTS: usize = 4096;
 /// the cache buys the next thousand insertions, so a flood of distinct clusters pays a constant
 /// amount each instead of a full scan apiece.
 const LAYOUT_EVICTION_BATCH: usize = MAX_CACHED_LAYOUTS / 4;
+
+/// Terminal row layouts cached at once. A terminal's visible working set is at most a few hundred rows.
+const MAX_CACHED_TERMINAL_LAYOUTS: usize = 1024;
+const TERMINAL_LAYOUT_EVICTION_BATCH: usize = MAX_CACHED_TERMINAL_LAYOUTS / 4;
 
 thread_local! {
     /// Parley designs its font context as one application/thread resource. Keep a pristine
@@ -160,9 +208,9 @@ impl TextSystem {
             fallback_search_families,
             checked_fallbacks: AHashSet::default(),
             pua_fallback_family_names,
-            cache: AHashMap::new(),
+            cache: AHashMap::default(),
             cache_clock: 0,
-            terminal_cache: AHashMap::new(),
+            terminal_cache: AHashMap::default(),
             terminal_cache_clock: 0,
         };
         text_system.metrics = text_system.measure_metrics();
@@ -320,24 +368,43 @@ impl TextSystem {
     ) -> Arc<Layout<Rgb>> {
         self.ensure_fontique_fallbacks(&text);
 
-        let style_keys = styles
-            .iter()
-            .map(|style| TerminalStyleKey {
-                end: style.range.end,
-                variant: font_variant(style.flags),
-                color: style.color.as_tuple(),
-            })
-            .collect::<Box<[_]>>();
+        let mut inline_styles =
+            [TerminalStyleKey { end: 0, variant: FontVariant::Normal, color: (0, 0, 0) }; 16];
+        let (stack_slice, heap_styles) = if styles.len() <= inline_styles.len() {
+            for (i, style) in styles.iter().enumerate() {
+                inline_styles[i] = TerminalStyleKey {
+                    end: style.range.end,
+                    variant: font_variant(style.flags),
+                    color: style.color.as_tuple(),
+                };
+            }
+            (&inline_styles[..styles.len()], None)
+        } else {
+            let keys: Vec<_> = styles
+                .iter()
+                .map(|style| TerminalStyleKey {
+                    end: style.range.end,
+                    variant: font_variant(style.flags),
+                    color: style.color.as_tuple(),
+                })
+                .collect();
+            (&[][..], Some(keys))
+        };
+        let query_spans: &[TerminalStyleKey] = heap_styles.as_deref().unwrap_or(stack_slice);
+        let font_size_bits = self.font.size().as_px().to_bits();
+        let query_key =
+            TerminalLayoutKeyRef { text: &text, spans: query_spans, ligatures, font_size_bits };
+        if let Some(layout) = self.cached_terminal_layout(&query_key) {
+            return layout;
+        }
+
+        let style_keys: Box<[TerminalStyleKey]> = query_spans.into();
         let key = TerminalLayoutKey {
             text: text.clone().into_boxed_str(),
             spans: style_keys,
             ligatures,
-            font_size_bits: self.font.size().as_px().to_bits(),
+            font_size_bits,
         };
-        if let Some(layout) = self.cached_terminal_layout(&key) {
-            return layout;
-        }
-
         self.build_and_cache_terminal_layout(key, &text, styles, ligatures)
     }
 
@@ -441,35 +508,37 @@ impl TextSystem {
         let text = character.encode_utf8(&mut buffer);
         self.ensure_fontique_fallbacks(text);
 
-        let key = LayoutKey {
-            text: LayoutTextKey::Char(character),
-            variant,
-            font_size_bits: self.font.size().as_px().to_bits(),
-        };
-        if let Some(layout) = self.cached_layout(&key) {
+        let font_size_bits = self.font.size().as_px().to_bits();
+        let query_key =
+            LayoutKeyRef { text: LayoutTextKeyRef::Char(character), variant, font_size_bits };
+        if let Some(layout) = self.cached_layout(&query_key) {
             return layout;
         }
 
+        let key = LayoutKey { text: LayoutTextKey::Char(character), variant, font_size_bits };
         self.build_and_cache_layout(key, text, variant)
     }
 
     fn shape_text(&mut self, text: String, variant: FontVariant) -> Arc<Layout<()>> {
         self.ensure_fontique_fallbacks(&text);
 
-        let key = LayoutKey {
-            text: LayoutTextKey::String(text.clone().into_boxed_str()),
-            variant,
-            font_size_bits: self.font.size().as_px().to_bits(),
-        };
-        if let Some(layout) = self.cached_layout(&key) {
+        let font_size_bits = self.font.size().as_px().to_bits();
+        let query_key =
+            LayoutKeyRef { text: LayoutTextKeyRef::String(&text), variant, font_size_bits };
+        if let Some(layout) = self.cached_layout(&query_key) {
             return layout;
         }
 
+        let key = LayoutKey {
+            text: LayoutTextKey::String(text.clone().into_boxed_str()),
+            variant,
+            font_size_bits,
+        };
         self.build_and_cache_layout(key, &text, variant)
     }
 
     /// Take a layout out of the cache, recording that it is the most recently wanted one.
-    fn cached_layout(&mut self, key: &LayoutKey) -> Option<Arc<Layout<()>>> {
+    fn cached_layout(&mut self, key: &LayoutKeyRef<'_>) -> Option<Arc<Layout<()>>> {
         let clock = self.cache_clock.saturating_add(1);
         let entry = self.cache.get_mut(key)?;
         entry.used = clock;
@@ -477,7 +546,10 @@ impl TextSystem {
         Some(Arc::clone(&entry.layout))
     }
 
-    fn cached_terminal_layout(&mut self, key: &TerminalLayoutKey) -> Option<Arc<Layout<Rgb>>> {
+    fn cached_terminal_layout(
+        &mut self,
+        key: &TerminalLayoutKeyRef<'_>,
+    ) -> Option<Arc<Layout<Rgb>>> {
         let clock = self.terminal_cache_clock.saturating_add(1);
         let entry = self.terminal_cache.get_mut(key)?;
         entry.used = clock;
@@ -502,11 +574,11 @@ impl TextSystem {
     }
 
     fn evict_cached_terminal_layouts(&mut self) {
-        if self.terminal_cache.len() < MAX_CACHED_LAYOUTS {
+        if self.terminal_cache.len() < MAX_CACHED_TERMINAL_LAYOUTS {
             return;
         }
         let mut used = self.terminal_cache.values().map(|entry| entry.used).collect::<Vec<_>>();
-        let (_, threshold, _) = used.select_nth_unstable(LAYOUT_EVICTION_BATCH);
+        let (_, threshold, _) = used.select_nth_unstable(TERMINAL_LAYOUT_EVICTION_BATCH);
         let threshold = *threshold;
         self.terminal_cache.retain(|_, entry| entry.used > threshold);
     }
@@ -640,6 +712,11 @@ impl TextSystem {
     #[cfg(test)]
     fn cache_len(&self) -> usize {
         self.cache.len()
+    }
+
+    #[cfg(test)]
+    fn terminal_cache_len(&self) -> usize {
+        self.terminal_cache.len()
     }
 
     fn ensure_fontique_fallbacks(&mut self, text: &str) {
@@ -1139,6 +1216,54 @@ mod tests {
 
         assert!(Arc::ptr_eq(&first, &second));
         assert_eq!(text.cache_len(), 1);
+    }
+
+    #[test]
+    fn repeated_terminal_run_layouts_share_cached_layout() {
+        let mut text = TextSystem::new(Font::default());
+        let content = "hello world";
+        let styles = [
+            TerminalTextStyle { range: 0..5, flags: Flags::BOLD, color: Rgb::new(255, 255, 255) },
+            TerminalTextStyle {
+                range: 5..content.len(),
+                flags: Flags::empty(),
+                color: Rgb::new(200, 200, 200),
+            },
+        ];
+
+        // The query goes through the borrowed inline-span key, so a hit proves the
+        // `Equivalent` lookup matches the owned `TerminalLayoutKey` built on the miss.
+        let first = text.shape_terminal_run(content.to_owned(), &styles, true);
+        let second = text.shape_terminal_run(content.to_owned(), &styles, true);
+
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(text.terminal_cache_len(), 1);
+    }
+
+    #[test]
+    fn terminal_run_layouts_beyond_the_inline_span_buffer_still_share_the_cache() {
+        let mut text = TextSystem::new(Font::default());
+        let content = "abcdefghijklmnopqr";
+        // One span per character except the last, so the run spills past the
+        // `[TerminalStyleKey; 16]` inline buffer and takes the heap-span query path.
+        let mut styles = (0..16)
+            .map(|end| TerminalTextStyle {
+                range: end..end + 1,
+                flags: Flags::empty(),
+                color: Rgb::new(255, 255, 255),
+            })
+            .collect::<Vec<_>>();
+        styles.push(TerminalTextStyle {
+            range: 16..content.len(),
+            flags: Flags::empty(),
+            color: Rgb::new(255, 255, 255),
+        });
+
+        let first = text.shape_terminal_run(content.to_owned(), &styles, true);
+        let second = text.shape_terminal_run(content.to_owned(), &styles, true);
+
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(text.terminal_cache_len(), 1);
     }
 
     #[test]

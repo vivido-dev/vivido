@@ -30,6 +30,7 @@ harness = false
 
 [dependencies]
 ahash = { version = "0.8", features = ["no-rng"] }
+hashbrown = { version = "0.15", default-features = false }
 arboard = { version = "3.6", default-features = false, features = [
   "image-data",
 ] }

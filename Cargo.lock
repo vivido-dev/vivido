@@ -3999,6 +3999,7 @@ dependencies = [
  "futures-lite",
  "futures-timer",
  "getrandom 0.4.3",
+ "hashbrown 0.15.5",
  "home",
  "image",
  "libc",

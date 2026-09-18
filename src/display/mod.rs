@@ -706,7 +706,8 @@ impl Display {
         }
 
         let mut content = RenderableContent::new(config, self, &terminal, search_state);
-        let mut grid_cells = Vec::new();
+        let screen_cells = terminal.grid().screen_lines() * terminal.grid().columns();
+        let mut grid_cells = Vec::with_capacity(screen_cells);
         for cell in &mut content {
             grid_cells.push(cell);
         }
@@ -741,9 +742,8 @@ impl Display {
         let mut lines = RenderLines::new();
         let has_highlighted_hint = self.highlighted_hint.is_some();
         let highlighted_hint = self.highlighted_hint.clone();
-        let mut prepared_cells = Vec::with_capacity(grid_cells.len());
 
-        for mut cell in grid_cells {
+        for cell in &mut grid_cells {
             if has_highlighted_hint {
                 let point = term::viewport_to_point(display_offset, cell.point);
                 let hyperlink = cell.extra.as_ref().and_then(|extra| extra.hyperlink.as_ref());
@@ -756,9 +756,9 @@ impl Display {
                 }
             }
 
-            lines.update(&cell);
-            prepared_cells.push(cell);
+            lines.update(cell);
         }
+        let prepared_cells = grid_cells;
 
         let mut scene = Scene::new();
         self.text_scene_builds = self.text_scene_builds.saturating_add(1);
@@ -1083,8 +1083,7 @@ impl Display {
             return;
         };
         let run = terminal_shaping_run(cells);
-        let layout =
-            text_system.shape_terminal_run(run.text.clone(), &run.styles, text_system.ligatures());
+        let layout = text_system.shape_terminal_run(run.text, &run.styles, text_system.ligatures());
         Self::paint_terminal_run_layout(
             scene,
             &layout,
@@ -1668,7 +1667,7 @@ fn terminal_shaping_run(cells: &[RenderableCell]) -> TerminalShapingRun {
     for cell in cells {
         debug_assert_eq!(cell.point.line, first.point.line);
         while next_column < cell.point.column.0 {
-            push_terminal_shaping_cell(&mut run, " ", 1, false, Flags::empty(), first.fg);
+            push_terminal_shaping_cell(&mut run, ' ', None, 1, false, Flags::empty(), first.fg);
             next_column += 1;
         }
 
@@ -1677,17 +1676,16 @@ fn terminal_shaping_run(cells: &[RenderableCell]) -> TerminalShapingRun {
             continue;
         }
 
-        let mut content = String::new();
         let hidden = cell.flags.contains(Flags::HIDDEN);
-        content.push(if cell.character == '\t' || hidden { ' ' } else { cell.character });
-        if !hidden
-            && let Some(zerowidth) = cell.extra.as_ref().and_then(|extra| extra.zerowidth.as_ref())
-        {
-            content.extend(zerowidth.iter().copied());
-        }
+        let ch = if cell.character == '\t' || hidden { ' ' } else { cell.character };
+        let zerowidth = if hidden {
+            None
+        } else {
+            cell.extra.as_ref().and_then(|extra| extra.zerowidth.as_ref()).map(|zw| zw.as_slice())
+        };
         let width =
             if cell.flags.contains(Flags::WIDE_CHAR) { 2 } else { char_cell_width(cell.character) };
-        push_terminal_shaping_cell(&mut run, &content, width, hidden, cell.flags, cell.fg);
+        push_terminal_shaping_cell(&mut run, ch, zerowidth, width, hidden, cell.flags, cell.fg);
         next_column = cell.point.column.0.saturating_add(width);
     }
 
@@ -1696,14 +1694,20 @@ fn terminal_shaping_run(cells: &[RenderableCell]) -> TerminalShapingRun {
 
 fn push_terminal_shaping_cell(
     run: &mut TerminalShapingRun,
-    content: &str,
+    character: char,
+    zerowidth: Option<&[char]>,
     width: usize,
     hidden: bool,
     flags: Flags,
     color: Rgb,
 ) {
     let start = run.text.len();
-    run.text.push_str(content);
+    run.text.push(character);
+    if let Some(zerowidth) = zerowidth {
+        for &zw in zerowidth {
+            run.text.push(zw);
+        }
+    }
     let end = run.text.len();
     run.cells.push(TerminalShapingCell { text: start..end, width, hidden });
 

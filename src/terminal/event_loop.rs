@@ -275,7 +275,7 @@ where
     pub fn spawn(mut self) -> JoinHandle<(Self, State)> {
         thread::spawn_named("PTY reader", move || {
             let mut state = State::default();
-            let mut buf = [0u8; READ_BUFFER_SIZE];
+            let mut buf = vec![0u8; READ_BUFFER_SIZE].into_boxed_slice();
 
             let poll_opts = PollMode::Level;
             let mut interest = PollingEvent::readable(0);
