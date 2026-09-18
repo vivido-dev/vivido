@@ -429,7 +429,7 @@ impl SceneRenderer {
         }
 
         if let (Some(context), Some(surface)) = (&self.context, &mut self.surface) {
-            context.0.borrow().context.resize_surface(surface, size.width, size.height);
+            reconfigure_surface(&context.0.borrow().context, surface, size.width, size.height);
         }
         (self.render_target, self.render_target_view) =
             create_render_target(&self.device, size.width, size.height);
@@ -542,7 +542,8 @@ impl SceneRenderer {
                 },
                 wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Outdated => {
                     if let (Some(context), Some(surface)) = (&self.context, &mut self.surface) {
-                        context.0.borrow().context.resize_surface(
+                        reconfigure_surface(
+                            &context.0.borrow().context,
                             surface,
                             width.max(1),
                             height.max(1),
@@ -959,7 +960,13 @@ fn create_window_surface(
         alpha_mode,
         view_formats: Vec::new(),
     };
-    let (target_texture, target_view) = create_render_target(&handle.device, width, height);
+    // Vello's `RenderSurface` carries an intermediate texture for callers that let it own the
+    // render target. Vivido does not: it paints into `SceneRenderer::render_target`, which also
+    // carries COPY_SRC, COPY_DST and RENDER_ATTACHMENT so screenshots and embedded panes can read
+    // and write it, none of which Vello's texture has. Vello's copy was never read, yet it was
+    // allocated at full window size and reallocated on every resize — a second full-window RGBA8
+    // texture per window, 25 MB at 2920x2184. A 1x1 stand-in keeps the field satisfied.
+    let (target_texture, target_view) = create_render_target(&handle.device, 1, 1);
     let blitter = if alpha_mode == wgpu::CompositeAlphaMode::PreMultiplied {
         wgpu::util::TextureBlitterBuilder::new(&handle.device, format)
             .blend_state(premultiply_blend_state())
@@ -1042,6 +1049,22 @@ fn offscreen_device() -> Result<(wgpu::Device, wgpu::Queue), Error> {
 
 fn clamp_render_size(size: PhysicalSize<u32>, max_dimension: u32) -> PhysicalSize<u32> {
     PhysicalSize::new(size.width.min(max_dimension), size.height.min(max_dimension))
+}
+
+/// Resize the swapchain without disturbing Vello's unused intermediate texture.
+///
+/// `RenderContext::resize_surface` would also reallocate `RenderSurface::target_texture` at the new
+/// size. Vivido never renders to it (see `create_window_surface`), so letting Vello resize it means
+/// a full-window RGBA8 texture allocated and thrown away on every resize.
+fn reconfigure_surface(
+    context: &RenderContext,
+    surface: &mut RenderSurface<'static>,
+    width: u32,
+    height: u32,
+) {
+    surface.config.width = width;
+    surface.config.height = height;
+    context.configure_surface(surface);
 }
 
 fn create_render_target(
