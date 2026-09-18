@@ -555,16 +555,7 @@ impl SceneRenderer {
             None => None,
         };
 
-        self.renderer
-            .borrow_mut()
-            .render_to_texture(
-                &self.device,
-                &self.queue,
-                scene,
-                &self.render_target_view,
-                &RenderParams { base_color, width, height, antialiasing_method: AaConfig::Msaa8 },
-            )
-            .map_err(Error::Render)?;
+        self.paint_scene(scene, base_color, width, height)?;
 
         if !frames.is_empty() {
             let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -790,10 +781,141 @@ fn frame_copy_regions(
     regions
 }
 
+impl SceneRenderer {
+    /// Rasterize `scene` into the render target.
+    ///
+    /// Normally this is Vello's synchronous path. Under `vello-bump-probe` it takes the async path
+    /// instead, which is the only one that reads the bump allocators back, and records the result.
+    fn paint_scene(
+        &mut self,
+        scene: &Scene,
+        base_color: Color,
+        width: u32,
+        height: u32,
+    ) -> Result<(), Error> {
+        let params =
+            RenderParams { base_color, width, height, antialiasing_method: AaConfig::Msaa8 };
+
+        #[cfg(not(feature = "vello-bump-probe"))]
+        {
+            self.renderer
+                .borrow_mut()
+                .render_to_texture(
+                    &self.device,
+                    &self.queue,
+                    scene,
+                    &self.render_target_view,
+                    &params,
+                )
+                .map_err(Error::Render)
+        }
+
+        #[cfg(feature = "vello-bump-probe")]
+        {
+            // `block_on` alone deadlocks here: the readback's `map_async` only completes while the
+            // device is polled, which is what Vello's own helper does between polls of the future.
+            #[expect(deprecated, reason = "the only path that reads the bump allocators back")]
+            let bump = vello::util::block_on_wgpu(
+                &self.device.clone(),
+                self.renderer.borrow_mut().render_to_texture_async(
+                    &self.device,
+                    &self.queue,
+                    scene,
+                    &self.render_target_view,
+                    &params,
+                    vello::low_level::DebugLayers::none(),
+                ),
+            )
+            .map_err(Error::Render)?;
+            match bump {
+                Some(bump) => bump_probe::record(&bump),
+                None => log::info!(target: "vivido", "bump probe: render returned no allocators"),
+            }
+            Ok(())
+        }
+    }
+}
+
 impl Drop for SceneRenderer {
     fn drop(&mut self) {
         self.media.clear_target(&mut self.renderer.borrow_mut());
         self.overlays.clear(&mut self.renderer.borrow_mut());
+    }
+}
+
+/// Peak bump-allocator usage observed across every frame this process has painted.
+///
+/// Vello sizes its bump buffers from constants, not from the scene, so the only way to know what a
+/// terminal actually needs is to read the allocators back and watch the high-water mark. Recorded
+/// only under `vello-bump-probe`; see `vendor/vello_encoding/src/config.rs` for what the numbers
+/// are used for.
+#[cfg(feature = "vello-bump-probe")]
+pub mod bump_probe {
+    use std::sync::Mutex;
+
+    use vello::low_level::BumpAllocators;
+
+    /// The per-buffer maxima, in elements, as `BumpAllocators` reports them.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct Peak {
+        pub frames: u64,
+        pub failed: u32,
+        pub binning: u32,
+        pub ptcl: u32,
+        pub tile: u32,
+        pub seg_counts: u32,
+        pub segments: u32,
+        pub blend: u32,
+        pub lines: u32,
+    }
+
+    static PEAK: Mutex<Peak> = Mutex::new(Peak {
+        frames: 0,
+        failed: 0,
+        binning: 0,
+        ptcl: 0,
+        tile: 0,
+        seg_counts: 0,
+        segments: 0,
+        blend: 0,
+        lines: 0,
+    });
+
+    pub(super) fn record(bump: &BumpAllocators) {
+        let Ok(mut peak) = PEAK.lock() else { return };
+        peak.frames += 1;
+        // `failed` is a bitfield: keep every stage that ever ran out.
+        peak.failed |= bump.failed;
+        peak.binning = peak.binning.max(bump.binning);
+        peak.ptcl = peak.ptcl.max(bump.ptcl);
+        peak.tile = peak.tile.max(bump.tile);
+        peak.seg_counts = peak.seg_counts.max(bump.seg_counts);
+        peak.segments = peak.segments.max(bump.segments);
+        peak.blend = peak.blend.max(bump.blend);
+        peak.lines = peak.lines.max(bump.lines);
+
+        // Reported periodically so a measurement run does not have to end cleanly to yield data.
+        if peak.frames.is_multiple_of(30) {
+            log::info!(
+                target: "vivido",
+                "peak after {} frames: failed={:#x} lines={} segments={} seg_counts={} tile={} \
+                 ptcl={} binning={} blend={}",
+                peak.frames,
+                peak.failed,
+                peak.lines,
+                peak.segments,
+                peak.seg_counts,
+                peak.tile,
+                peak.ptcl,
+                peak.binning,
+                peak.blend,
+            );
+        }
+    }
+
+    /// The high-water mark so far. Never resets, so a caller can sample it at any point.
+    pub fn peak() -> Peak {
+        PEAK.lock().map(|peak| *peak).unwrap_or_default()
     }
 }
 
@@ -1013,6 +1135,100 @@ mod tests {
     use vello::wgpu::CompositeAlphaMode;
     use vello::{Scene, kurbo};
     use winit::dpi::{PhysicalPosition, PhysicalSize};
+
+    /// Measure what a full-screen terminal actually asks of Vello's bump allocators.
+    ///
+    /// Vello sizes those buffers from constants, so the only way to justify changing them is to
+    /// read the allocators back on a scene at least as heavy as anything a terminal can draw. This
+    /// renders a completely full grid at the largest window size we support on this display class:
+    /// every cell carries a distinct glyph and its own background rect, which is denser than real
+    /// terminal output ever is.
+    ///
+    /// Requires the `vello-bump-probe` feature, which is the only way Vello reports the counts:
+    ///
+    /// ```sh
+    /// cargo test --release --features vello-bump-probe -- --ignored --nocapture bump
+    /// ```
+    #[test]
+    #[ignore = "needs a wgpu adapter and the vello-bump-probe feature"]
+    #[cfg(feature = "vello-bump-probe")]
+    fn a_full_terminal_grid_fits_the_bump_buffers() {
+        use crate::config::font::Font;
+        use crate::display::color::Rgb;
+        use crate::display::text::TextSystem;
+
+        let _guard = gpu_lock();
+
+        // A 2920x2184 surface with a 7x17 cell is 417 columns by 128 rows: the densest grid a
+        // Retina window of this size can hold. Override with `VIVIDO_BUMP_SIZE=WIDTHxHEIGHT` to
+        // check a larger display, which is what decides whether the buffers are big enough.
+        let size = std::env::var("VIVIDO_BUMP_SIZE")
+            .ok()
+            .and_then(|spec| {
+                let (width, height) = spec.split_once('x')?;
+                Some(PhysicalSize::new(width.parse().ok()?, height.parse().ok()?))
+            })
+            .unwrap_or(PhysicalSize::new(2920, 2184));
+        let (cell_width, cell_height) = (7.0_f32, 17.0_f32);
+        let columns = (size.width as f32 / cell_width) as usize;
+        let rows = (size.height as f32 / cell_height) as usize;
+
+        let mut renderer =
+            SceneRenderer::new(RenderSource::Offscreen, size, false).expect("offscreen renderer");
+        let mut text = TextSystem::new(Font::default());
+        let mut scene = Scene::new();
+
+        for row in 0..rows {
+            let y = row as f32 * cell_height;
+            // One background rect per cell, which is the worst case: a real frame merges runs of
+            // equal background into far fewer rects. `VIVIDO_BUMP_NO_RECTS=1` drops them, which
+            // brackets how much of the cost is glyph outlines alone.
+            for column in 0..columns {
+                if std::env::var_os("VIVIDO_BUMP_NO_RECTS").is_some() {
+                    break;
+                }
+                scene.fill(
+                    vello::peniko::Fill::NonZero,
+                    kurbo::Affine::IDENTITY,
+                    Color::from_rgb8(20, 20, 30),
+                    None,
+                    &kurbo::Rect::new(
+                        f64::from(column as f32 * cell_width),
+                        f64::from(y),
+                        f64::from((column + 1) as f32 * cell_width),
+                        f64::from(y + cell_height),
+                    ),
+                );
+            }
+            // Printable ASCII cycled so neighbouring rows never share a shaped run.
+            let line: String = (0..columns)
+                .map(|column| char::from(33 + ((row * columns + column) % 94) as u8))
+                .collect();
+            text.paint_text(&mut scene, &line, (0.0, y), Rgb::new(200, 200, 200), false);
+        }
+
+        renderer.render(&scene, Color::BLACK).expect("render");
+
+        let peak = super::bump_probe::peak();
+        println!(
+            "bump peak over {} frame(s) at {}x{} ({columns}x{rows} cells): failed={:#x} \
+             lines={} segments={} seg_counts={} tile={} ptcl={} binning={} blend={}",
+            peak.frames,
+            size.width,
+            size.height,
+            peak.failed,
+            peak.lines,
+            peak.segments,
+            peak.seg_counts,
+            peak.tile,
+            peak.ptcl,
+            peak.binning,
+            peak.blend,
+        );
+
+        assert!(peak.frames > 0, "the probe saw no frames, so the numbers mean nothing");
+        assert_eq!(peak.failed, 0, "a full terminal grid overran Vello's bump buffers: {peak:?}",);
+    }
 
     #[test]
     fn window_renderers_reuse_the_thread_render_context() {
