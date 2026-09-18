@@ -217,6 +217,8 @@ pub struct Window {
     mouse_visible: bool,
     ime_inhibitor: ImeInhibitor,
     ime_cursor_area: Cell<Option<(PhysicalPosition<f64>, PhysicalSize<f64>)>>,
+    terminal_ime_area: Cell<Option<(PhysicalPosition<f64>, PhysicalSize<f64>)>>,
+    overlay_ime_area: Cell<Option<(PhysicalPosition<f64>, PhysicalSize<f64>)>>,
     #[cfg(target_os = "macos")]
     tab_shortcut_label: Option<Retained<NSTextField>>,
     #[cfg(target_os = "macos")]
@@ -344,6 +346,8 @@ impl Window {
             hosted,
             ime_inhibitor: Default::default(),
             ime_cursor_area: Cell::new(None),
+            terminal_ime_area: Cell::new(None),
+            overlay_ime_area: Cell::new(None),
             #[cfg(target_os = "macos")]
             tab_shortcut_label: None,
             #[cfg(target_os = "macos")]
@@ -380,6 +384,8 @@ impl Window {
             hosted: false,
             ime_inhibitor: Default::default(),
             ime_cursor_area: Cell::new(None),
+            terminal_ime_area: Cell::new(None),
+            overlay_ime_area: Cell::new(None),
             #[cfg(target_os = "macos")]
             tab_shortcut_label: None,
             #[cfg(target_os = "macos")]
@@ -412,6 +418,8 @@ impl Window {
             hosted: true,
             ime_inhibitor: Default::default(),
             ime_cursor_area: Cell::new(None),
+            terminal_ime_area: Cell::new(None),
+            overlay_ime_area: Cell::new(None),
             #[cfg(target_os = "macos")]
             tab_shortcut_label: None,
             #[cfg(target_os = "macos")]
@@ -744,6 +752,16 @@ impl Window {
         }
     }
 
+    /// The desktop appearance the platform reports, or `None` when it reports none.
+    pub fn theme(&self) -> Option<Theme> {
+        self.backend.winit().and_then(|window| window.theme())
+    }
+
+    /// How often the monitor this window is on refreshes, in millihertz.
+    pub fn refresh_millihertz(&self) -> Option<u32> {
+        self.current_monitor().and_then(|monitor| monitor.refresh_rate_millihertz())
+    }
+
     pub fn set_theme(&self, theme: Option<Theme>) {
         // This drops whatever appearance the title bar tint installed, so let the next frame
         // derive it again from the terminal background that is current by then.
@@ -816,11 +834,38 @@ impl Window {
 
         let position = PhysicalPosition::new(nspot_x, nspot_y);
         let size = PhysicalSize::new(width, height);
-        self.ime_cursor_area.set(Some((position, size)));
+        self.terminal_ime_area.set(Some((position, size)));
+        self.apply_ime_area();
+    }
+
+    pub(crate) fn set_overlay_ime_area(
+        &self,
+        area: Option<(PhysicalPosition<f64>, PhysicalSize<f64>)>,
+    ) {
+        self.overlay_ime_area.set(area);
+        self.apply_ime_area();
+    }
+
+    fn apply_ime_area(&self) {
+        let area = self.overlay_ime_area.get().or(self.terminal_ime_area.get());
+        if self.ime_cursor_area.get() == area {
+            return;
+        }
+        self.ime_cursor_area.set(area);
+        let Some((position, size)) = area else {
+            return;
+        };
 
         if let Some(window) = self.backend.winit() {
             window.set_ime_cursor_area(position, size);
         }
+    }
+
+    /// Last physical editor rectangle sent to the native backend (or cached for an embedded host).
+    pub(crate) fn ime_area(&self) -> Option<(bool, PhysicalPosition<f64>, PhysicalSize<f64>)> {
+        self.ime_cursor_area
+            .get()
+            .map(|(position, size)| (self.overlay_ime_area.get().is_some(), position, size))
     }
 
     /// Disable macOS window shadows.
@@ -1064,6 +1109,31 @@ fn tab_shortcut(index: usize, tab_count: usize) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::terminal::index::Column;
+
+    #[test]
+    fn overlay_ime_area_survives_terminal_draws_and_restores_latest_terminal_caret() {
+        let config = UiConfig::default();
+        let window = Window::embedded(
+            &config,
+            &Identity::default(),
+            &WindowOptions::default(),
+            PhysicalSize::new(640, 480),
+            2.,
+        );
+        let size = SizeInfo::new(640., 480., 10., 20., 0., 0., false);
+        window.update_ime_position(Point::new(0, Column(0)), &size);
+        let overlay = (PhysicalPosition::new(120., 160.), PhysicalSize::new(2., 32.));
+        window.set_overlay_ime_area(Some(overlay));
+        window.update_ime_position(Point::new(2, Column(3)), &size);
+        assert_eq!(window.ime_area(), Some((true, overlay.0, overlay.1)));
+        assert_eq!(window.embedded_input_state().unwrap().ime_cursor_area, Some(overlay));
+        window.set_overlay_ime_area(None);
+        assert_eq!(
+            window.ime_area(),
+            Some((false, PhysicalPosition::new(30., 40.), PhysicalSize::new(20., 20.)))
+        );
+    }
 
     #[test]
     fn embedded_window_retains_host_managed_state() {

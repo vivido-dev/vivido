@@ -1,6 +1,6 @@
 [package]
 name = "vivido"
-version = "0.4.8"
+version = "0.4.9"
 authors = ["Wensheng Wang <wenshengwang@gmail.com>"]
 license = "Apache-2.0"
 description = "A fast cross-platform terminal emulator with protocol-neutral media hooks"
@@ -30,6 +30,7 @@ harness = false
 
 [dependencies]
 ahash = { version = "0.8", features = ["no-rng"] }
+hashbrown = { version = "0.15", default-features = false }
 arboard = { version = "3.6", default-features = false, features = [
   "image-data",
 ] }
@@ -68,14 +69,15 @@ toml = "1.1"
 toml_edit = "0.25"
 unicode-width = "0.2"
 unicode-script = "0.5"
-vivid_protocol = { version = "1.5", path = "../vivid_protocol" }
+unicode-segmentation = "1.12"
+vivid_protocol = { version = "1.5.9", path = "../vivid_protocol" }
 vvte = { version = "0.15", path = "../vvte", default-features = false, features = [
   "std",
   "ansi",
   "serde",
 ] }
 zeroize = "1.8.1"
-vivid_sdk = { version = "1.5", path = "../vivid_sdk" }
+vivid_sdk = { version = "1.5.8", path = "../vivid_sdk" }
 vello = { version = "0.10", default-features = false, features = ["wgpu"] }
 winit = { version = "0.30", default-features = false, features = [
   "rwh_06",
@@ -172,6 +174,7 @@ piper = "0.2.1"
 windows-sys = { version = "0.61.2", features = [
   "Win32_Networking_WinSock",
   "Win32_UI_WindowsAndMessaging",
+  "Win32_UI_Shell",
   "Win32_UI_Input_KeyboardAndMouse",
   "Win32_System_Threading",
   "Win32_System_Console",
@@ -223,6 +226,12 @@ wayland = [
   "winit/wayland-csd-adwaita",
 ]
 nightly = []
+# Reads Vello's bump allocators back after every frame and records the high-water mark, which is
+# the only way to learn what a terminal scene actually costs: Vello sizes those buffers from
+# constants and reports an overrun by setting a flag nobody reads. Drives the ignored
+# `a_full_terminal_grid_fits_the_bump_buffers` test. Off by default — the readback stalls the GPU
+# once per frame.
+vello-bump-probe = ["vello/debug_layers"]
 
 [workspace]
 resolver = "2"

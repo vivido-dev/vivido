@@ -56,6 +56,7 @@ pub mod hint;
 pub mod rects;
 pub mod renderer;
 pub mod text;
+pub mod vector;
 pub mod window;
 
 mod bell;
@@ -63,6 +64,9 @@ mod corners;
 mod damage;
 mod media;
 mod meter;
+mod overlay;
+#[cfg(windows)]
+mod windows_live_move;
 
 #[cfg(any(unix, windows))]
 #[cfg(test)]
@@ -315,6 +319,9 @@ impl DisplayUpdate {
 pub struct Display {
     pub window: Window,
     pub size_info: SizeInfo,
+    /// The cursor a pane overlay asks for, ranked below Vivido's own chrome and above the
+    /// terminal's. Refreshed from the service on every update.
+    overlay_cursor: Option<CursorIcon>,
     pub highlighted_hint: Option<HintMatch>,
     highlighted_hint_age: usize,
     pub cursor_hidden: bool,
@@ -353,8 +360,15 @@ impl Display {
         self.vivid_frame_requested = true;
     }
 
-    pub(crate) fn optimization_metrics(&self) -> (u64, u64, media::SourceUploadMetrics) {
-        (self.text_scene_builds, self.cached_scene_frames, self.scene_renderer.media_metrics())
+    pub(crate) fn optimization_metrics(
+        &self,
+    ) -> (u64, u64, media::SourceUploadMetrics, overlay::OverlayRenderMetrics) {
+        (
+            self.text_scene_builds,
+            self.cached_scene_frames,
+            self.scene_renderer.media_metrics(),
+            self.scene_renderer.overlay_metrics(),
+        )
     }
 
     fn invalidate_cached_scene(&mut self) {
@@ -464,6 +478,7 @@ impl Display {
         damage_tracker.debug = config.debug.highlight_damage;
 
         Ok(Self {
+            overlay_cursor: None,
             window,
             size_info,
             highlighted_hint: Default::default(),
@@ -537,6 +552,26 @@ impl Display {
     ) where
         T: EventListener,
     {
+        // The environment a producer sees is the same facts this window already has: read them
+        // each update and let the host republish only when one actually changed.
+        vivid_service
+            .set_overlay_appearance(self.window.theme() == Some(winit::window::Theme::Dark));
+        vivid_service.set_overlay_refresh_interval(self.window.refresh_millihertz());
+
+        // A pane overlay's cursor can change from a pointer report or from a newly published
+        // scene, so it is re-applied whenever it differs rather than only on input.
+        let overlay_cursor = vivid_service.overlay_cursor();
+        if overlay_cursor != self.overlay_cursor {
+            self.overlay_cursor = overlay_cursor;
+            let icon = resolve_mouse_cursor(
+                None,
+                overlay_cursor,
+                false,
+                terminal.mouse_cursor_icon(),
+                terminal.mode().intersects(TermMode::MOUSE_MODE),
+            );
+            self.window.set_mouse_cursor(icon);
+        }
         let pending_update = std::mem::take(&mut self.pending_update);
         let mut metrics = self.text_system.metrics();
 
@@ -620,6 +655,9 @@ impl Display {
         if self.renderer_unavailable {
             return false;
         }
+        // A hidden window gives its swapchain back; take it again before anything is painted, so
+        // the order the platform reports occlusion in cannot leave a frame aimed at a 1x1 surface.
+        self.scene_renderer.restore_after_hidden();
         match terminal.damage() {
             TermDamage::Full => self.damage_tracker.frame().mark_fully_damaged(),
             TermDamage::Partial(damaged_lines) => {
@@ -671,7 +709,8 @@ impl Display {
         }
 
         let mut content = RenderableContent::new(config, self, &terminal, search_state);
-        let mut grid_cells = Vec::new();
+        let screen_cells = terminal.grid().screen_lines() * terminal.grid().columns();
+        let mut grid_cells = Vec::with_capacity(screen_cells);
         for cell in &mut content {
             grid_cells.push(cell);
         }
@@ -706,9 +745,8 @@ impl Display {
         let mut lines = RenderLines::new();
         let has_highlighted_hint = self.highlighted_hint.is_some();
         let highlighted_hint = self.highlighted_hint.clone();
-        let mut prepared_cells = Vec::with_capacity(grid_cells.len());
 
-        for mut cell in grid_cells {
+        for cell in &mut grid_cells {
             if has_highlighted_hint {
                 let point = term::viewport_to_point(display_offset, cell.point);
                 let hyperlink = cell.extra.as_ref().and_then(|extra| extra.hyperlink.as_ref());
@@ -721,9 +759,9 @@ impl Display {
                 }
             }
 
-            lines.update(&cell);
-            prepared_cells.push(cell);
+            lines.update(cell);
         }
+        let prepared_cells = grid_cells;
 
         let mut scene = Scene::new();
         self.text_scene_builds = self.text_scene_builds.saturating_add(1);
@@ -732,12 +770,17 @@ impl Display {
         {
             let text_system = &mut self.text_system;
 
+            if let Some(image) = prepared_media.as_ref().and_then(|media| media.layers[0].as_ref())
+            {
+                scene.draw_image(image, Affine::IDENTITY);
+            }
             for cell in &prepared_cells {
                 Self::paint_cell_background(&mut scene, cell, size_info);
             }
 
-            if let Some(media) = &prepared_media {
-                scene.draw_image(&media.image, Affine::IDENTITY);
+            if let Some(image) = prepared_media.as_ref().and_then(|media| media.layers[1].as_ref())
+            {
+                scene.draw_image(image, Affine::IDENTITY);
             }
 
             for span in
@@ -762,11 +805,20 @@ impl Display {
 
             let mut rects = lines.rects(&metrics, &size_info);
 
+            rects.extend(cursor.rects(&size_info, config.cursor.thickness()));
+            paint_rects(&mut scene, std::mem::take(&mut rects));
+            if let Some(image) = prepared_media.as_ref().and_then(|media| media.layers[2].as_ref())
+            {
+                scene.draw_image(image, Affine::IDENTITY);
+            }
+
+            // Host UI remains above application media, including the terminal search and IME UI.
+            if let Some(image) = prepared_media.as_ref().and_then(|media| media.overlay.as_ref()) {
+                scene.draw_image(image, Affine::IDENTITY);
+            }
             if search_state.regex().is_some() {
                 self.draw_line_indicator(&mut scene, config, total_lines, None, display_offset);
             }
-
-            rects.extend(cursor.rects(&size_info, config.cursor.thickness()));
 
             let visual_bell_intensity = self.visual_bell.intensity();
             if visual_bell_intensity != 0. {
@@ -964,6 +1016,7 @@ impl Display {
             self.hint_mouse_point = None;
             self.window.set_mouse_cursor(resolve_mouse_cursor(
                 None,
+                self.overlay_cursor,
                 false,
                 term.mouse_cursor_icon(),
                 term.mode().intersects(TermMode::MOUSE_MODE),
@@ -1033,8 +1086,7 @@ impl Display {
             return;
         };
         let run = terminal_shaping_run(cells);
-        let layout =
-            text_system.shape_terminal_run(run.text.clone(), &run.styles, text_system.ligatures());
+        let layout = text_system.shape_terminal_run(run.text, &run.styles, text_system.ligatures());
         Self::paint_terminal_run_layout(
             scene,
             &layout,
@@ -1448,6 +1500,7 @@ impl Display {
                 if reset_mouse {
                     self.window.set_mouse_cursor(resolve_mouse_cursor(
                         None,
+                        self.overlay_cursor,
                         false,
                         app_icon,
                         mouse_reporting,
@@ -1512,6 +1565,15 @@ impl Display {
         Ok(())
     }
 
+    /// Hand back the GPU memory this window cannot use while it is hidden.
+    ///
+    /// The cached scene goes too: it is the encoding of a frame nobody can see, and the next draw
+    /// rebuilds it anyway.
+    pub fn release_while_hidden(&mut self) {
+        self.cached_scene = None;
+        self.scene_renderer.release_while_hidden();
+    }
+
     fn schedule_renderer_retry(&mut self, scheduler: &mut Scheduler) {
         let window_id = self.window.id();
         let timer_id = TimerId::new(Topic::RendererRecovery, window_id);
@@ -1560,11 +1622,16 @@ impl Display {
 /// without the shift exemption, matching the historical behavior of the display-side restores.
 pub(crate) fn resolve_mouse_cursor(
     ui_icon: Option<CursorIcon>,
+    overlay_icon: Option<CursorIcon>,
     hint_highlighted: bool,
     app_icon: Option<CursorIcon>,
     mouse_reporting: bool,
 ) -> CursorIcon {
     if let Some(icon) = ui_icon {
+        icon
+    } else if let Some(icon) = overlay_icon {
+        // A pane overlay is drawn above the terminal and below Vivido's own chrome, and its
+        // cursor ranks the same way.
         icon
     } else if hint_highlighted {
         CursorIcon::Pointer
@@ -1612,7 +1679,7 @@ fn terminal_shaping_run(cells: &[RenderableCell]) -> TerminalShapingRun {
     for cell in cells {
         debug_assert_eq!(cell.point.line, first.point.line);
         while next_column < cell.point.column.0 {
-            push_terminal_shaping_cell(&mut run, " ", 1, false, Flags::empty(), first.fg);
+            push_terminal_shaping_cell(&mut run, ' ', None, 1, false, Flags::empty(), first.fg);
             next_column += 1;
         }
 
@@ -1621,17 +1688,16 @@ fn terminal_shaping_run(cells: &[RenderableCell]) -> TerminalShapingRun {
             continue;
         }
 
-        let mut content = String::new();
         let hidden = cell.flags.contains(Flags::HIDDEN);
-        content.push(if cell.character == '\t' || hidden { ' ' } else { cell.character });
-        if !hidden
-            && let Some(zerowidth) = cell.extra.as_ref().and_then(|extra| extra.zerowidth.as_ref())
-        {
-            content.extend(zerowidth.iter().copied());
-        }
+        let ch = if cell.character == '\t' || hidden { ' ' } else { cell.character };
+        let zerowidth = if hidden {
+            None
+        } else {
+            cell.extra.as_ref().and_then(|extra| extra.zerowidth.as_ref()).map(|zw| zw.as_slice())
+        };
         let width =
             if cell.flags.contains(Flags::WIDE_CHAR) { 2 } else { char_cell_width(cell.character) };
-        push_terminal_shaping_cell(&mut run, &content, width, hidden, cell.flags, cell.fg);
+        push_terminal_shaping_cell(&mut run, ch, zerowidth, width, hidden, cell.flags, cell.fg);
         next_column = cell.point.column.0.saturating_add(width);
     }
 
@@ -1640,14 +1706,20 @@ fn terminal_shaping_run(cells: &[RenderableCell]) -> TerminalShapingRun {
 
 fn push_terminal_shaping_cell(
     run: &mut TerminalShapingRun,
-    content: &str,
+    character: char,
+    zerowidth: Option<&[char]>,
     width: usize,
     hidden: bool,
     flags: Flags,
     color: Rgb,
 ) {
     let start = run.text.len();
-    run.text.push_str(content);
+    run.text.push(character);
+    if let Some(zerowidth) = zerowidth {
+        for &zw in zerowidth {
+            run.text.push(zw);
+        }
+    }
     let end = run.text.len();
     run.cells.push(TerminalShapingCell { text: start..end, width, hidden });
 
@@ -1826,23 +1898,79 @@ mod tests {
         assert_eq!(
             resolve_mouse_cursor(
                 Some(CursorIcon::Crosshair),
+                None,
                 true,
                 Some(CursorIcon::Progress),
                 true
             ),
             CursorIcon::Crosshair
         );
+        // An overlay region outranks the hint highlight and the terminal's own cursor.
         assert_eq!(
-            resolve_mouse_cursor(None, true, Some(CursorIcon::Progress), true),
+            resolve_mouse_cursor(
+                None,
+                Some(CursorIcon::Text),
+                true,
+                Some(CursorIcon::Progress),
+                true
+            ),
+            CursorIcon::Text
+        );
+        // Vivido's own chrome still outranks an overlay.
+        assert_eq!(
+            resolve_mouse_cursor(
+                Some(CursorIcon::Grab),
+                Some(CursorIcon::Text),
+                false,
+                None,
+                false
+            ),
+            CursorIcon::Grab
+        );
+        assert_eq!(
+            resolve_mouse_cursor(None, None, true, Some(CursorIcon::Progress), true),
             CursorIcon::Pointer
         );
         // An application shape outranks the mouse-reporting arrow.
         assert_eq!(
-            resolve_mouse_cursor(None, false, Some(CursorIcon::Progress), true),
+            resolve_mouse_cursor(None, None, false, Some(CursorIcon::Progress), true),
             CursorIcon::Progress
         );
-        assert_eq!(resolve_mouse_cursor(None, false, None, true), CursorIcon::Default);
-        assert_eq!(resolve_mouse_cursor(None, false, None, false), CursorIcon::Text);
+        assert_eq!(resolve_mouse_cursor(None, None, false, None, true), CursorIcon::Default);
+        assert_eq!(resolve_mouse_cursor(None, None, false, None, false), CursorIcon::Text);
+    }
+
+    #[test]
+    fn every_cursor_shape_maps_to_a_distinct_platform_icon() {
+        use vivid_protocol::vector::CursorShape;
+        let shapes = [
+            CursorShape::Default,
+            CursorShape::Pointer,
+            CursorShape::Text,
+            CursorShape::Move,
+            CursorShape::Crosshair,
+            CursorShape::NotAllowed,
+            CursorShape::Grab,
+            CursorShape::Grabbing,
+            CursorShape::Wait,
+            CursorShape::Progress,
+            CursorShape::ResizeLeft,
+            CursorShape::ResizeRight,
+            CursorShape::ResizeUp,
+            CursorShape::ResizeDown,
+            CursorShape::ResizeUpLeft,
+            CursorShape::ResizeUpRight,
+            CursorShape::ResizeDownLeft,
+            CursorShape::ResizeDownRight,
+            CursorShape::ResizeLeftRight,
+            CursorShape::ResizeUpDown,
+        ];
+        let mut seen = Vec::new();
+        for shape in shapes {
+            let icon = crate::vivid::overlay::cursor_icon(shape);
+            assert!(!seen.contains(&icon), "{shape:?} collides with an earlier shape on one icon");
+            seen.push(icon);
+        }
     }
 
     #[test]

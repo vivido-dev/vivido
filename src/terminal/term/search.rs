@@ -35,10 +35,12 @@ impl RegexSearch {
         // https://github.com/rust-lang/regex/blob/061ee815ef2c44101dba7b0b124600fcb03c1912/regex-automata/src/meta/wrappers.rs#L581-L599
         let has_uppercase = search.chars().any(|c| c.is_uppercase());
         let syntax_config = SyntaxConfig::new().case_insensitive(!has_uppercase);
-        let config =
-            Config::new().minimum_cache_clear_count(Some(3)).minimum_bytes_per_state(Some(10));
-        let max_size = config.get_cache_capacity();
-        let thompson_config = ThompsonConfig::new().nfa_size_limit(Some(max_size));
+        let nfa_size_limit = 2 * 1024 * 1024;
+        let config = Config::new()
+            .cache_capacity(512 * 1024)
+            .minimum_cache_clear_count(Some(3))
+            .minimum_bytes_per_state(Some(10));
+        let thompson_config = ThompsonConfig::new().nfa_size_limit(Some(nfa_size_limit));
 
         // Create DFAs to find start/end in right-to-left search.
         let left_rdfa = LazyDfa::new(

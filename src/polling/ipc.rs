@@ -94,6 +94,7 @@ pub const METHODS: &[&str] = &[
     "screenshot",
     "key",
     "paste",
+    "drop_file",
     "mouse",
     "resize",
     "set_geometry",
@@ -222,7 +223,7 @@ fn method_class(name: &str) -> (MethodClass, bool) {
         | "transcript"
         | "subscribe"
         | "unsubscribe" => (MethodClass::Observe, false),
-        "typing" | "key" | "paste" | "mouse" => (MethodClass::Input, true),
+        "typing" | "key" | "paste" | "mouse" | "drop_file" => (MethodClass::Input, true),
         "create_window" | "resize" | "set_geometry" | "set_geometry_batch" | "set_visible"
         | "set_level" => (MethodClass::Window, true),
         "config" => (MethodClass::Config, true),
@@ -1557,6 +1558,12 @@ fn message_request(message: &SocketMessage) -> io::Result<(&'static str, Value)>
         },
         SocketMessage::Key(params) => Ok(("key", serialize_params(params)?)),
         SocketMessage::Paste(params) => Ok(("paste", serialize_params(params)?)),
+        SocketMessage::DropFile(params) => {
+            // The file is opened by the Vivido process, whose working directory is not ours.
+            let mut params = params.clone();
+            params.path = std::path::absolute(&params.path)?;
+            Ok(("drop_file", serialize_params(&params)?))
+        },
         SocketMessage::Mouse(params) => Ok(("mouse", serialize_params(params)?)),
         SocketMessage::Resize(params) => Ok(("resize", serialize_params(params)?)),
         SocketMessage::SetGeometry(params) => Ok(("set_geometry", serialize_params(params)?)),
@@ -1829,6 +1836,7 @@ fn write_cli_result(message: &SocketMessage, result: &Value) -> io::Result<()> {
         | SocketMessage::GetGrid(_)
         | SocketMessage::Wait(_)
         | SocketMessage::Transcript(_)
+        | SocketMessage::DropFile(_)
         | SocketMessage::Subscribe(_) => write_json_to(&mut stdout, result),
         SocketMessage::Typing(params) if params.report => write_json_to(&mut stdout, result),
         SocketMessage::Key(params) if params.report => write_json_to(&mut stdout, result),
@@ -2044,6 +2052,28 @@ pub(crate) fn test_connection() -> (IpcConnection, mpsc::Receiver<OutputFrame>) 
 mod tests {
 
     #[test]
+    fn drop_file_is_an_advertised_input_method_that_sends_an_absolute_path() {
+        assert!(METHODS.contains(&"drop_file"));
+        assert_eq!(method_class("drop_file"), (MethodClass::Input, true));
+
+        // The Vivido process opens the file, and its working directory is not the client's.
+        let message = SocketMessage::DropFile(crate::cli::IpcDropFile {
+            path: "relative/firmware.bin".into(),
+            at: None,
+            type_path: false,
+            timeout: 1_000,
+            target: crate::cli::IpcTarget { window_id: Some(3) },
+        });
+        let (method, params) = message_request(&message).unwrap();
+        assert_eq!(method, "drop_file");
+        let sent = std::path::PathBuf::from(params["path"].as_str().unwrap());
+        assert!(sent.is_absolute());
+        assert_eq!(sent, std::env::current_dir().unwrap().join("relative/firmware.bin"));
+        assert!(params.get("at").is_none());
+        assert_eq!(params["target"]["window_id"], 3, "nested, exactly as `paste` sends it");
+    }
+
+    #[test]
     fn every_emitted_event_kind_is_advertised() {
         // `EVENT_KINDS` is both the handshake advertisement and the `subscribe` allowlist, so a
         // kind missing from it is delivered to unfiltered subscriptions and rejected when asked for
@@ -2069,10 +2099,48 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     #[cfg(unix)]
     use std::os::unix::io::AsRawFd;
+    use std::sync::{Mutex, MutexGuard};
 
     use serde_json::json;
 
     use super::*;
+
+    /// Serializes the tests that touch the process-wide claimed-method registries.
+    ///
+    /// `HOST_METHODS` and `HOST_METHOD_CAPABILITIES` are process-wide because the handshake is
+    /// answered on the listener thread while claiming happens on the main loop. Tests run in
+    /// threads of one process, so two that publish would otherwise read each other's claims —
+    /// and each clearing up after itself would clear the other's state as well.
+    static CLAIMED_REGISTRY: Mutex<()> = Mutex::new(());
+
+    /// Exclusive use of the claimed-method registries, empty at both ends.
+    ///
+    /// Held for the whole of any test that publishes or reads the advertised set, so what such a
+    /// test sees is only ever what it put there.
+    struct ClaimedMethods(#[allow(dead_code)] MutexGuard<'static, ()>);
+
+    impl ClaimedMethods {
+        fn acquire() -> Self {
+            // A test that panicked while holding this poisoned the lock. The registries are
+            // emptied on both ends regardless, so one failure is not a reason to fail every test
+            // that runs after it.
+            let guard = CLAIMED_REGISTRY.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let claimed = Self(guard);
+            claimed.empty();
+            claimed
+        }
+
+        fn empty(&self) {
+            publish_host_methods([].iter());
+            publish_host_method_capabilities(&[]);
+        }
+    }
+
+    impl Drop for ClaimedMethods {
+        fn drop(&mut self) {
+            self.empty();
+        }
+    }
 
     #[test]
     fn bounded_plan_accepts_backward_only_alias_references() {
@@ -2136,6 +2204,7 @@ mod tests {
 
     #[test]
     fn handshake_classifies_standard_and_host_methods() {
+        let _claimed = ClaimedMethods::acquire();
         let descriptors = [MethodCapability::host("vivida_layout", MethodClass::Observe, false)];
         publish_host_methods([String::from("vivida_layout")].iter());
         publish_host_method_capabilities(&descriptors);
@@ -2147,8 +2216,6 @@ mod tests {
                 && !capability.host_claimed
         }));
         assert!(capabilities.iter().any(|capability| capability == &descriptors[0]));
-        publish_host_methods([].iter());
-        publish_host_method_capabilities(&[]);
     }
 
     #[test]
@@ -2420,6 +2487,9 @@ mod tests {
 
     #[test]
     fn hello_advertises_required_limits() {
+        // This reads the advertised method set, which a test publishing into it would change
+        // underneath it.
+        let _claimed = ClaimedMethods::acquire();
         let hello = hello_result();
         assert_eq!(hello["protocol_version"], 2);
         assert_eq!(hello["limits"]["connections"], 32);
@@ -2448,6 +2518,7 @@ mod tests {
 
     #[test]
     fn hello_advertises_host_claimed_methods_beside_vivido_own() {
+        let _claimed = ClaimedMethods::acquire();
         let claimed = [String::from("vvbox_list_tabs"), String::from("create_window")];
         publish_host_methods(claimed.iter());
 

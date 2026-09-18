@@ -37,6 +37,9 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
         let mods = self.ctx.modifiers().state();
 
         if key.state == ElementState::Released {
+            if !self.ctx.search_active() && self.forward_overlay_key(&key) {
+                return;
+            }
             self.key_release(key, mode, mods);
             return;
         }
@@ -68,6 +71,9 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
         }
 
         // Mask `Alt` modifier from input when we won't send esc.
+        if self.forward_overlay_key(&key) {
+            return;
+        }
         let mods = if self.alt_send_esc(&key, text) { mods } else { mods & !ModifiersState::ALT };
 
         let build_key_sequence = Self::should_build_sequence(&key, text, mode, mods);
@@ -93,6 +99,31 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
             }
             self.ctx.write_to_pty(bytes);
         }
+    }
+
+    /// Route physical transitions and committed text to the focused pane overlay.
+    fn forward_overlay_key(&mut self, key: &KeyEvent) -> bool {
+        let physical = match key.physical_key {
+            PhysicalKey::Code(code) => crate::vivid::hid::usage(code).map(u32::from).unwrap_or(0),
+            _ => 0,
+        };
+        let down = key.state == ElementState::Pressed;
+        let modifiers = crate::vivid::hid::modifiers(self.ctx.modifiers().state());
+        let consumed = self.ctx.overlay_keyboard(
+            vivid_protocol::overlay::Event::Key { physical, down, repeat: key.repeat, modifiers },
+            key.logical_key == Key::Named(NamedKey::Escape),
+        );
+        if consumed
+            && down
+            && let Some(text) = key
+                .text
+                .as_ref()
+                .filter(|text| !text.is_empty() && !text.chars().any(char::is_control))
+        {
+            self.ctx
+                .overlay_keyboard(vivid_protocol::overlay::Event::Text(text.to_string()), false);
+        }
+        consumed
     }
 
     /// Send one physical key transition to a producer holding a desktop-input grant.
@@ -336,9 +367,9 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
 
         self.reset_search_delay();
         let binding_mode = BindingMode::new(self.ctx.terminal().mode(), self.ctx.search_active());
-        let binding_key = match logical_key {
+        let binding_key = match &logical_key {
             Key::Character(character) => Key::Character(character.to_lowercase().into()),
-            logical_key => logical_key,
+            logical_key => logical_key.clone(),
         };
         let trigger = BindingKey::Keycode { key: binding_key, location: location.into() };
         let bindings = self.ctx.config().key_bindings().to_vec();
@@ -370,11 +401,96 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
             return Ok(None);
         }
 
+        // UI-routed automation follows the same overlay path as a native winit key. A single IPC
+        // request is a complete keystroke, so close the physical transition immediately after its
+        // optional committed text; this also prevents a failed test from leaving a held key.
+        let physical = ipc_hid_usage(key);
+        let overlay_modifiers = mods.bits();
+        let escape = logical_key == Key::Named(NamedKey::Escape);
+        if self.ctx.overlay_keyboard(
+            vivid_protocol::overlay::Event::Key {
+                physical,
+                down: true,
+                repeat: repeated,
+                modifiers: overlay_modifiers,
+            },
+            escape,
+        ) {
+            if !mods.intersects(ModifiersState::CONTROL | ModifiersState::SUPER)
+                && !text.is_empty()
+                && !text.chars().any(char::is_control)
+            {
+                self.ctx.overlay_keyboard(vivid_protocol::overlay::Event::Text(text), false);
+            }
+            self.ctx.overlay_keyboard(
+                vivid_protocol::overlay::Event::Key {
+                    physical,
+                    down: false,
+                    repeat: false,
+                    modifiers: overlay_modifiers,
+                },
+                escape,
+            );
+            return Ok(None);
+        }
+
         let bytes = encode_ipc_key_event(key, modifiers, mode, repeated)?;
         if !bytes.is_empty() {
             self.ctx.on_terminal_input_start();
         }
         Ok(Some(bytes))
+    }
+}
+
+/// HID usage for the deterministic UI-automation keyboard subset.
+#[cfg(any(unix, windows))]
+fn ipc_hid_usage(key: &str) -> u32 {
+    let mut chars = key.chars();
+    if let (Some(character), None) = (chars.next(), chars.next()) {
+        return match character.to_ascii_lowercase() {
+            'a'..='z' => u32::from(character.to_ascii_lowercase()) - u32::from('a') + 4,
+            '1'..='9' => u32::from(character) - u32::from('1') + 30,
+            '0' => 39,
+            ' ' => 44,
+            '-' => 45,
+            '=' => 46,
+            '[' => 47,
+            ']' => 48,
+            '\\' => 49,
+            ';' => 51,
+            '\'' => 52,
+            '`' => 53,
+            ',' => 54,
+            '.' => 55,
+            '/' => 56,
+            _ => 0,
+        };
+    }
+    let normalized = key.to_ascii_lowercase().replace(['-', '_'], "");
+    match normalized.as_str() {
+        "enter" | "return" => 40,
+        "escape" | "esc" => 41,
+        "backspace" => 42,
+        "tab" => 43,
+        "insert" => 73,
+        "home" => 74,
+        "pageup" => 75,
+        "delete" | "del" => 76,
+        "end" => 77,
+        "pagedown" => 78,
+        "arrowright" | "right" => 79,
+        "arrowleft" | "left" => 80,
+        "arrowdown" | "down" => 81,
+        "arrowup" | "up" => 82,
+        _ => normalized
+            .strip_prefix('f')
+            .and_then(|number| number.parse::<u32>().ok())
+            .and_then(|number| match number {
+                1..=12 => Some(57 + number),
+                13..=24 => Some(91 + number),
+                _ => None,
+            })
+            .unwrap_or(0),
     }
 }
 
@@ -1174,9 +1290,9 @@ fn ipc_logical_key(key: &str) -> Result<(Key, KeyLocation), crate::polling::ipc:
     Ok((Key::Named(named), location))
 }
 
-#[cfg(all(test, unix))]
+#[cfg(all(test, any(unix, windows)))]
 mod ipc_tests {
-    use super::encode_ipc_key_event;
+    use super::{encode_ipc_key_event, ipc_hid_usage};
     use crate::terminal::term::TermMode;
 
     fn encode_ipc_key(
@@ -1218,5 +1334,16 @@ mod ipc_tests {
             encode_ipc_key_event("F5", &[], TermMode::REPORT_EVENT_TYPES, true).unwrap(),
             b"\x1b[15;1:2~"
         );
+    }
+
+    #[test]
+    fn automation_keys_use_usb_hid_usages() {
+        assert_eq!(ipc_hid_usage("a"), 4);
+        assert_eq!(ipc_hid_usage("1"), 30);
+        assert_eq!(ipc_hid_usage("Escape"), 41);
+        assert_eq!(ipc_hid_usage("ArrowRight"), 79);
+        assert_eq!(ipc_hid_usage("F12"), 69);
+        assert_eq!(ipc_hid_usage("F24"), 115);
+        assert_eq!(ipc_hid_usage("界"), 0);
     }
 }

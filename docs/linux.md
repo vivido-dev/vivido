@@ -20,8 +20,9 @@ sudo apt install build-essential cmake git pkg-config ncurses-bin scdoc \
   libvulkan1 mesa-vulkan-drivers
 ```
 
-Use the equivalent packages on other distributions. A vendor Vulkan driver can replace Mesa's
-Vulkan driver where appropriate. `scdoc` is needed only to build the optional manual pages.
+Use the equivalent packages on other distributions (`ncurses` rather than `ncurses-bin` provides
+`tic` on Fedora, Arch Linux, and openSUSE). A vendor Vulkan driver can replace Mesa's Vulkan driver
+where appropriate. `scdoc` is needed only to build the optional manual pages.
 
 Install Rust with [rustup](https://rustup.rs/) if the distribution's Rust compiler is older than
 1.88, then confirm that Cargo is available:
@@ -69,12 +70,14 @@ git pull --ff-only
 cargo install --locked --force --path .
 ```
 
-## 3. Install the terminfo entries system-wide
+## 3. Install the terminfo entries
 
 This step is required for complete terminal compatibility. Vivido can provide a private temporary
 terminfo entry to ordinary child processes, but environment boundaries such as `sudo` discard the
 private `TERMINFO` path while preserving `TERM=vivido`. Programs using ncurses or a pager can then
 report that the terminal is not fully functional.
+
+### System-wide installation (recommended)
 
 From the repository checkout, compile both Vivido entries into the system terminfo database:
 
@@ -90,6 +93,34 @@ sudo infocmp vivido >/dev/null
 ```
 
 Both commands should exit successfully. New shells opened by Vivido use `TERM=vivido` by default.
+
+### User-local installation (without sudo)
+
+If administrative privileges are not available, install the entries into the user's personal
+terminfo directory instead:
+
+```sh
+tic -x -e vivido,vivido-direct -o "$HOME/.terminfo" extra/vivido.info
+```
+
+Verify the installation for the current user:
+
+```sh
+infocmp vivido >/dev/null
+```
+
+Note that user-local entries are placed in `~/.terminfo` and will not be visible across commands like
+`sudo` that run with sanitized environment variables or a different home directory.
+
+### Remote hosts over SSH
+
+When connecting to remote Linux machines from Vivido over standard SSH, remote curses-based tools
+(`nano`, `vim`, `less`, `htop`, `tmux`) will not recognize `TERM=vivido` unless the definition is
+available on the remote host. Copy and compile the local definition on a remote server with:
+
+```sh
+infocmp -x vivido | ssh remote-host tic -x -
+```
 
 ## 4. Add Vivido to the desktop application menu
 
@@ -178,6 +209,16 @@ widely installed terminal definition:
 
 ```sh
 sudo TERM=xterm-256color apt search sshd
+```
+
+### `WARNING: terminal is not fully functional` or unknown terminal on remote SSH hosts
+
+If a remote server reports an unknown terminal or missing terminfo for `vivido`, copy and compile the
+entry to the remote host as shown in step 3. Alternatively, specify a standard fallback terminal
+definition for that session:
+
+```sh
+TERM=xterm-256color ssh user@remote-host
 ```
 
 ### Vivido cannot open a window

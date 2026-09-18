@@ -41,14 +41,26 @@ pub(crate) struct AccessibleRange {
 }
 
 /// One selectable character in a physical terminal row.
+///
+/// Offsets are `u32` rather than `usize`: this is the per-cell axis of a document covering the
+/// whole scrollback, so the width shows up directly in the retained size — 56 bytes a character
+/// against 32. A terminal cannot reach 4 GiB of text; `MAX_SCROLLBACK_LINES` is 100 000 and the
+/// column count is bounded by the maximum texture dimension.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct AccessibleCharacter {
-    pub bytes: Range<usize>,
-    pub scalar: usize,
-    pub utf16: Range<usize>,
-    pub column: usize,
+    pub bytes: Range<u32>,
+    pub scalar: u32,
+    pub utf16: Range<u32>,
+    pub column: u32,
     pub x: f32,
     pub width: f32,
+}
+
+impl AccessibleCharacter {
+    /// UTF-16 range widened for the platform accessibility APIs, which index in `usize`.
+    pub fn utf16_range(&self) -> Range<usize> {
+        self.utf16.start as usize..self.utf16.end as usize
+    }
 }
 
 /// Accessibility data for one physical grid row.
@@ -80,9 +92,43 @@ pub(crate) struct AccessibilitySnapshot {
     pub cell_height: f32,
     pub padding_x: f32,
     pub padding_y: f32,
+    /// The application's own semantic tree, when an overlay published one for the scene it is
+    /// currently showing. `None` means the terminal beneath is the whole story.
+    pub semantics: Option<OverlaySemantics>,
+}
+
+/// A window's semantic tree together with the overlay window that published it.
+///
+/// The identity travels with the tree because a node ID is only unique within one application's
+/// tree, so an action naming node 7 needs to know whose node 7 it is.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct OverlaySemantics {
+    pub window: vivid_protocol::identity::SurfaceIdentity,
+    pub nodes: Vec<vivid_protocol::overlay::SemanticNode>,
 }
 
 impl AccessibilitySnapshot {
+    /// Minimal native tree used where exposing retained terminal history would be too expensive.
+    pub(crate) fn window(size: SizeInfo, title: &str, focused: bool) -> Self {
+        Self {
+            title: title.to_owned(),
+            text: String::new(),
+            lines: Vec::new(),
+            cursor: AccessibleRange::default(),
+            selection: None,
+            block_selection: Vec::new(),
+            visible: AccessibleRange::default(),
+            focused,
+            width: size.width(),
+            height: size.height(),
+            cell_width: size.cell_width(),
+            cell_height: size.cell_height(),
+            padding_x: size.padding_x(),
+            padding_y: size.padding_y(),
+            semantics: None,
+        }
+    }
+
     pub(crate) fn new<T>(term: &Term<T>, size: SizeInfo, title: &str) -> Self {
         let grid = term.grid();
         let top = grid.topmost_line();
@@ -120,8 +166,12 @@ impl AccessibilitySnapshot {
             let line_byte_start = text.len();
             let line_scalar_start = scalar_offset;
             let line_utf16_start = utf16_offset;
-            let mut characters = Vec::new();
-            let mut column_offsets = vec![scalar_offset; grid.columns().saturating_add(1)];
+            let mut characters = Vec::with_capacity(end_column.saturating_add(1));
+            // Sized to the line's own content, not the grid width. Every retained scrollback row
+            // carried `columns + 1` offsets whether or not it held any text, which is 1.5 KB per
+            // blank line at 185 columns. Columns past the content are answered by `point_offset`
+            // instead, which reproduces what the trailing fill used to store.
+            let mut column_offsets = vec![scalar_offset; end_column.saturating_add(1)];
             let mut tab_mode = false;
 
             for column_index in 0..end_column {
@@ -181,10 +231,6 @@ impl AccessibilitySnapshot {
                 }
                 column_offsets[column_index + 1] = scalar_offset;
             }
-            for offset in column_offsets.iter_mut().skip(end_column.saturating_add(1)) {
-                *offset = scalar_offset;
-            }
-
             let hard_break = !row.last().is_some_and(|cell| cell.flags.contains(Flags::WRAPLINE));
             if hard_break {
                 push_character(
@@ -237,6 +283,7 @@ impl AccessibilitySnapshot {
             cell_height: size.cell_height(),
             padding_x: size.padding_x(),
             padding_y: size.padding_y(),
+            semantics: None,
         }
     }
 
@@ -259,6 +306,14 @@ fn selection_row_end(selection: SelectionRange, line: Line, columns: usize) -> u
     }
 }
 
+/// Clamp a document offset into the `u32` the accessible document stores.
+///
+/// Saturating rather than wrapping: a terminal cannot produce 4 GiB of text, and a clamped offset
+/// degrades navigation at the very end of an impossible document rather than aliasing to the start.
+fn narrow(offset: usize) -> u32 {
+    u32::try_from(offset).unwrap_or(u32::MAX)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn push_character(
     text: &mut String,
@@ -275,10 +330,10 @@ fn push_character(
     let byte_end = text.len();
     let utf16_len = character.len_utf16();
     characters.push(AccessibleCharacter {
-        bytes: byte_start..byte_end,
-        scalar: *scalar_offset,
-        utf16: *utf16_offset..utf16_offset.saturating_add(utf16_len),
-        column,
+        bytes: narrow(byte_start)..narrow(byte_end),
+        scalar: narrow(*scalar_offset),
+        utf16: narrow(*utf16_offset)..narrow(utf16_offset.saturating_add(utf16_len)),
+        column: narrow(column),
         x,
         width,
     });
@@ -289,15 +344,24 @@ fn push_character(
 fn point_offset(lines: &[AccessibleLine], point: Point, after: bool) -> Option<usize> {
     let line = lines.iter().find(|line| line.grid_line == point.line.0)?;
     let column = point.column.0.saturating_add(usize::from(after));
-    line.column_offsets.get(column).copied().or(Some(line.range.scalar.end))
+    line.column_offsets.get(column).copied().or_else(|| Some(line_content_end(line)))
+}
+
+/// Scalar offset just past a line's content, before any trailing newline.
+///
+/// `column_offsets` only covers the columns a line actually occupies, so every column past that
+/// shares this offset — which is what the full-width trailing fill used to store in each of them.
+fn line_content_end(line: &AccessibleLine) -> usize {
+    line.range.scalar.end.saturating_sub(usize::from(line.hard_break))
 }
 
 fn scalar_to_utf16(lines: &[AccessibleLine], scalar: usize) -> Option<usize> {
     let line = lines.iter().find(|line| line.range.scalar.contains(&scalar))?;
+    let scalar = narrow(scalar);
     line.characters
         .iter()
         .find(|character| character.scalar == scalar)
-        .map(|character| character.utf16.start)
+        .map(|character| character.utf16.start as usize)
         .or(Some(line.range.utf16.end))
 }
 
@@ -371,6 +435,15 @@ mod tests {
     use crate::terminal::index::Side;
     use crate::terminal::selection::{Selection, SelectionType};
     use crate::terminal::term::test::TermSize;
+
+    #[test]
+    fn lightweight_window_snapshot_has_no_terminal_document() {
+        let snapshot = AccessibilitySnapshot::window(size(4, 2), "test", true);
+        assert!(snapshot.text.is_empty());
+        assert!(snapshot.lines.is_empty());
+        assert!(snapshot.focused);
+        assert_eq!(snapshot.title, "test");
+    }
 
     fn term(columns: usize, lines: usize) -> Term<VoidListener> {
         Term::new(Default::default(), &TermSize::new(columns, lines), VoidListener)
@@ -468,6 +541,56 @@ mod tests {
         let snapshot = AccessibilitySnapshot::new(&term, size(6, 1), "test");
         assert_eq!(snapshot.text, "     \n");
         assert_eq!(snapshot.cursor.scalar, 4..4);
+    }
+
+    #[test]
+    fn an_accessible_character_stays_narrow() {
+        // This is the per-cell axis of a document spanning the whole scrollback, so its width is
+        // the difference between tens of megabytes and twice that on a full history.
+        assert!(
+            size_of::<AccessibleCharacter>() <= 32,
+            "AccessibleCharacter grew to {} bytes",
+            size_of::<AccessibleCharacter>(),
+        );
+    }
+
+    #[test]
+    fn offsets_past_a_line_stop_before_its_newline() {
+        // `column_offsets` used to be allocated at the full grid width and its tail filled with the
+        // offset reached before the trailing newline. Sizing it to the line's own content saves
+        // that fill, but only if columns past the content still answer with the same value —
+        // `line.range.scalar.end` is one further along whenever the line hard-breaks.
+        let mut term = term(8, 2);
+        for (column, character) in "ab".chars().enumerate() {
+            term.grid_mut()[Point::new(Line(0), Column(column))].c = character;
+        }
+        let snapshot = AccessibilitySnapshot::new(&term, size(8, 2), "test");
+        let line = &snapshot.lines[0];
+
+        assert!(line.hard_break, "the fixture line ends in a newline");
+        assert_eq!(line.column_offsets.len(), 3, "two cells plus the trailing boundary");
+        assert_eq!(line.range.scalar.end, 3, "the range covers the newline");
+
+        // Every column past the content resolves to the pre-newline offset, not the range end.
+        for column in 2..8 {
+            assert_eq!(
+                point_offset(&snapshot.lines, Point::new(Line(0), Column(column)), false),
+                Some(2),
+                "column {column} must stop before the newline",
+            );
+        }
+    }
+
+    #[test]
+    fn a_blank_line_carries_one_offset() {
+        // The whole point of the change: a retained scrollback row with nothing on it used to hold
+        // `columns + 1` offsets, which is most of a full history.
+        let term = term(200, 2);
+        let snapshot = AccessibilitySnapshot::new(&term, size(200, 2), "test");
+
+        // Line 0 holds the cursor, which extends it by one column; line 1 is untouched.
+        assert_eq!(snapshot.lines[1].column_offsets.len(), 1);
+        assert_eq!(snapshot.lines[0].column_offsets.len(), 2, "the cursor occupies one column");
     }
 
     #[test]

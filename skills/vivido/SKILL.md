@@ -130,6 +130,11 @@ This is ambient, headed or headless: the pane inherits `AGENT_MESH_RUNTIME`,
 *are* windows), and Vivido starts the watcher itself when `vvagent` is on PATH. In a headless
 session the instance is the session name, so `vvagent bind --alias NAME` needs no other flags.
 
+The complete mesh surface — binding and authenticating as an endpoint, cross-host peers and trust,
+handing files with `--attach`, groups, and policy — is the **vvagent** skill
+([vivido-dev/vvagent · skills/vvagent](https://github.com/vivido-dev/vvagent/tree/master/skills/vvagent));
+load it for anything past a simple send and wait. The essentials for a Vivido window are below.
+
 ```sh
 vvagent whoami                                    # where am I, and am I bound
 vvagent bind --alias builder                      # claim a mailbox at this position
@@ -180,5 +185,8 @@ control local: this is an owner-only endpoint on one machine, not a remote trans
   result shapes, and limits.
 - [references/agent-mesh.md](references/agent-mesh.md) — identity, addressing, policy, groups, and
   what actually wakes an idle agent.
+- The **vvagent** skill — the complete agent-mesh surface: selectors across runtimes and hosts,
+  `--attach` file handoff, peer trust, and the SSH bridge.
+  [github.com/vivido-dev/vvagent/tree/master/skills/vvagent](https://github.com/vivido-dev/vvagent/tree/master/skills/vvagent).
 - [scripts/geometry.py](scripts/geometry.py) — cell↔pixel conversion and crop boxes from `capture`
   or `inspect` JSON, without the padding mistake.

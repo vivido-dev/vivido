@@ -286,6 +286,7 @@ struct Track {
 
 #[derive(Debug, Clone, Copy)]
 struct PlaybackClock {
+    synchronized_pending: bool,
     start_pts_us: i64,
     /// The media epoch this exact start was published for.
     ///
@@ -303,6 +304,7 @@ struct PlaybackClock {
 impl PlaybackClock {
     fn started(start_pts_us: i64, start_media_epoch: u32) -> Self {
         Self {
+            synchronized_pending: false,
             start_pts_us,
             start_media_epoch,
             started_at: Some(Instant::now()),
@@ -405,6 +407,7 @@ impl State {
 
 struct Inner {
     microphone: super::mic::Microphone,
+    overlays: Arc<Mutex<super::overlay::Host>>,
     state: Mutex<State>,
     changed: Condvar,
     target: Arc<dyn PresentationTarget>,
@@ -444,6 +447,7 @@ impl SharedScene {
     pub fn new(target: Arc<dyn PresentationTarget>) -> Self {
         Self(Arc::new(Inner {
             microphone: super::mic::Microphone::default(),
+            overlays: Arc::new(Mutex::new(super::overlay::Host::default())),
             state: Mutex::new(State::default()),
             changed: Condvar::new(),
             target,
@@ -453,6 +457,10 @@ impl SharedScene {
 
     pub fn target(&self) -> &Arc<dyn PresentationTarget> {
         &self.0.target
+    }
+
+    pub(crate) fn overlays(&self) -> &Arc<Mutex<super::overlay::Host>> {
+        &self.0.overlays
     }
 
     pub fn optimization_metrics(&self) -> SceneOptimizationMetrics {
@@ -945,7 +953,7 @@ impl SharedScene {
         {
             return Err("track owner does not match complete identity");
         }
-        if configuration.slot > SLOT_POSTER && configuration.slot < 32 {
+        if configuration.slot > vivid_sdk::SLOT_VECTOR && configuration.slot < 32 {
             return Err("reserved surface slot");
         }
         if configuration.slot >= 32 {
@@ -1016,7 +1024,7 @@ impl SharedScene {
         }
         let mut candidate = surface.active_slots.clone();
         for &(slot, track_id, expected_generation, required_milestone) in bindings {
-            if slot > SLOT_POSTER || slot == 0 {
+            if slot > vivid_sdk::SLOT_VECTOR || slot == 0 {
                 return Err("unsupported surface slot");
             }
             if track_id == 0 {
@@ -1085,7 +1093,13 @@ impl SharedScene {
             return None;
         }
         Some((
-            if clock.started_at.is_some() { 2 } else { 3 },
+            if clock.synchronized_pending {
+                1
+            } else if clock.started_at.is_some() {
+                2
+            } else {
+                3
+            },
             audio_pts.unwrap_or_else(|| clock.current_pts_us()),
         ))
     }
@@ -1261,6 +1275,33 @@ impl SharedScene {
         Ok(())
     }
 
+    /// Assets consume channel credit and participate in ordered EOS without advancing scene IDs.
+    pub fn admit_vector_asset(
+        &self,
+        identity: TrackIdentity,
+        generation: ChannelGeneration,
+        body_length: u32,
+        sequence: u64,
+    ) -> Result<(), &'static str> {
+        let mut state = self.lock();
+        let track = state.tracks.get_mut(&identity).ok_or("track does not exist")?;
+        if track.state.channel_generation != generation
+            || track.lifecycle != 1
+            || !matches!(track.configuration.kind, KindConfiguration::VectorScene(_))
+            || sequence <= track.last_media_record_sequence
+            || sequence <= 1
+        {
+            return Err("invalid vector asset attachment or sequence");
+        }
+        track
+            .state
+            .flow
+            .admit(body_length)
+            .map_err(|_| "vector asset exceeds channel allowance")?;
+        track.last_media_record_sequence = sequence;
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn admit_media(
         &self,
@@ -1408,6 +1449,15 @@ impl SharedScene {
         identity: TrackIdentity,
         start_pts_us: i64,
     ) -> Result<(), &'static str> {
+        self.configure_playback(identity, start_pts_us, false)
+    }
+
+    pub fn configure_playback(
+        &self,
+        identity: TrackIdentity,
+        start_pts_us: i64,
+        synchronized: bool,
+    ) -> Result<(), &'static str> {
         let mut state = self.lock();
         let master = state.tracks.get(&identity).ok_or("track does not exist")?;
         if master.configuration.mode != TrackMode::Timed || master.lifecycle != 1 {
@@ -1431,7 +1481,14 @@ impl SharedScene {
                 continue;
             }
             track.playback = Some(PlaybackClock::started(start_pts_us, track.state.media_epoch));
-            track.state.milestones |= MILESTONE_CLOCK_STARTED;
+            if synchronized {
+                let clock = track.playback.as_mut().unwrap();
+                clock.started_at = None;
+                clock.synchronized_pending = true;
+                track.state.milestones &= !MILESTONE_CLOCK_STARTED;
+            } else {
+                track.state.milestones |= MILESTONE_CLOCK_STARTED;
+            }
             track.state.revision =
                 track.state.revision.advance().map_err(|_| "track revision exhausted")?;
             started = true;
@@ -1441,6 +1498,70 @@ impl SharedScene {
         }
         self.0.changed.notify_all();
         Ok(())
+    }
+
+    /// Release one surface's pending start only after all current video outputs are eligible.
+    /// Audio readiness is sampled from its independently bounded device queue by the caller.
+    pub fn try_start_synchronized(&self, identity: TrackIdentity, audio_ready: bool) -> bool {
+        if !audio_ready {
+            return false;
+        }
+        let mut state = self.lock();
+        let Some(surface) = state.surfaces.get(&identity.surface) else {
+            return false;
+        };
+        let members = surface
+            .active_slots
+            .values()
+            .map(|id| TrackIdentity { surface: identity.surface, track_id: *id })
+            .collect::<Vec<_>>();
+        let pending = members.iter().any(|id| {
+            state
+                .tracks
+                .get(id)
+                .is_some_and(|track| track.playback.is_some_and(|clock| clock.synchronized_pending))
+        });
+        if !pending
+            || members.iter().any(|id| {
+                state.tracks.get(id).is_some_and(|track| {
+                    let Some(clock) = track.playback else {
+                        return false;
+                    };
+                    clock.synchronized_pending
+                        && (clock.start_media_epoch != track.state.media_epoch
+                            || (matches!(track.configuration.kind, KindConfiguration::Video(_))
+                                && track
+                                    .frame
+                                    .as_ref()
+                                    .is_none_or(|frame| frame.pts_us < clock.start_pts_us)
+                                && track.state.milestones & MILESTONE_BUFFERED_ENDED == 0))
+                })
+            })
+        {
+            return false;
+        }
+        let now = Instant::now();
+        if members.iter().any(|id| {
+            state.tracks.get(id).is_some_and(|track| {
+                track.playback.is_some_and(|clock| clock.synchronized_pending)
+                    && track.state.revision.advance().is_err()
+            })
+        }) {
+            return false;
+        }
+        for id in members {
+            if let Some(track) = state.tracks.get_mut(&id)
+                && let Some(clock) = track.playback.as_mut()
+                && clock.synchronized_pending
+            {
+                clock.synchronized_pending = false;
+                clock.started_at = Some(now);
+                track.state.milestones |= MILESTONE_CLOCK_STARTED;
+                track.state.revision = track.state.revision.advance().expect("checked revision");
+            }
+        }
+        self.0.changed.notify_all();
+        true
     }
 
     pub fn pause_playback(&self, identity: TrackIdentity) -> Result<(), &'static str> {
@@ -1462,6 +1583,9 @@ impl SharedScene {
             .iter_mut()
             .filter_map(|(candidate, track)| (candidate.surface == surface).then_some(track))
         {
+            if let Some(playback) = track.playback.as_mut() {
+                playback.synchronized_pending = false;
+            }
             if let Some(playback) = track.playback.as_mut()
                 && let Some(started) = playback.started_at.take()
             {
@@ -2281,6 +2405,7 @@ pub fn track_kind_name(configuration: &TrackConfiguration) -> &'static str {
         KindConfiguration::Audio(_) => "audio",
         KindConfiguration::Raster(_) => "raster",
         KindConfiguration::EncodedImage(_) => "encoded-image",
+        KindConfiguration::VectorScene(_) => "vector",
     }
 }
 
@@ -2889,6 +3014,109 @@ mod tests {
         assert!(scene.snapshot().items.is_empty());
     }
 
+    #[test]
+    fn synchronized_start_waits_for_target_picture_and_audio_without_a_deadline() {
+        let scene = SharedScene::for_test();
+        let owner = session(3, 1);
+        let context = owner.context(1).unwrap();
+        let surface_identity = context.surface(1).unwrap();
+        let track_identity = surface_identity.track(1).unwrap();
+        let maximum_record_body = vivid_protocol::media::video_body_len(16).unwrap();
+        scene.register_session(owner, TargetGeneration::ONE).unwrap();
+        scene.create_surface(surface_identity, definition(1, 1)).unwrap();
+        scene
+            .create_track(
+                track_identity,
+                TrackConfiguration {
+                    direction: Default::default(),
+                    context_id: 1,
+                    surface_id: 1,
+                    track_id: 1,
+                    slot: SLOT_PRIMARY_VIDEO,
+                    mode: TrackMode::Timed,
+                    lane: LaneClass::Bulk,
+                    maximum_record_body,
+                    maximum_rate_millihertz: 30_000,
+                    maximum_encoded_bits_per_second: 1_000_000,
+                    maximum_records_per_second: 30,
+                    maximum_inflight_body_bytes: u64::from(maximum_record_body) * 2,
+                    kind: KindConfiguration::Video(VideoConfiguration {
+                        codec: "av1".into(),
+                        packetization: "av1-low-overhead-tu-v1".into(),
+                        extradata: vec![],
+                        coded_width: 1,
+                        coded_height: 1,
+                        profile: 0,
+                        level: 0,
+                        maximum_reorder_depth: 1,
+                        color_primaries: 1,
+                        transfer: 1,
+                        matrix: 0,
+                        signal_range: 1,
+                        aspect_numerator: 1,
+                        aspect_denominator: 1,
+                        maximum_access_unit_bytes: 16,
+                        codec_string: None,
+                        decoder_configuration: None,
+                    }),
+                    target_latency_us: 0,
+                    maximum_latency_us: 1_000_000,
+                    retained_pixel_charge: 1,
+                },
+            )
+            .unwrap();
+        scene.accept_channel(track_identity, ChannelGeneration::ONE, 1_024, 8).unwrap();
+        scene
+            .publish_decoded_frame(
+                track_identity,
+                ChannelGeneration::ONE,
+                Frame {
+                    frame_id: 1,
+                    pts_us: 0,
+                    width: 1,
+                    height: 1,
+                    sar_num: 1,
+                    sar_den: 1,
+                    alpha_mode: ALPHA_STRAIGHT,
+                    rgba: Arc::new(RgbaBuffer::new(vec![0, 0, 0, 255])),
+                    damage: None,
+                },
+            )
+            .unwrap();
+        scene
+            .activate_tracks(
+                surface_identity,
+                SurfaceRevision::ONE,
+                &[(SLOT_PRIMARY_VIDEO, 1, ChannelGeneration::ONE, MILESTONE_OUTPUT_READY)],
+            )
+            .unwrap();
+
+        let other_session = session(3, 2);
+        scene.register_session(other_session, TargetGeneration::ONE).unwrap();
+        let other_surface = other_session.context(1).unwrap().surface(1).unwrap();
+        let other_track = other_surface.track(1).unwrap();
+        scene.create_surface(other_surface, definition(1, 1)).unwrap();
+        let config = scene.lock().tracks[&track_identity].configuration.clone();
+        scene.create_track(other_track, config).unwrap();
+        let other_revision = scene.track_status(other_track).unwrap().state.revision;
+        scene.configure_playback(track_identity, 1_000_001, true).unwrap();
+        assert_eq!(scene.playback_state(track_identity, None), Some((1, 1_000_001)));
+        assert!(!scene.try_start_synchronized(track_identity, true));
+        let mut frame = (*scene.latest_frame(track_identity).unwrap()).clone();
+        frame.pts_us = 1_040_000;
+        scene.publish_decoded_frame(track_identity, ChannelGeneration::ONE, frame).unwrap();
+        assert!(!scene.try_start_synchronized(track_identity, false));
+        assert_eq!(scene.playback_state(track_identity, None), Some((1, 1_000_001)));
+        assert!(scene.try_start_synchronized(track_identity, true));
+        assert_eq!(scene.playback_state(track_identity, None).unwrap().0, 2);
+        assert!(!scene.try_start_synchronized(track_identity, true));
+        assert_eq!(scene.track_status(other_track).unwrap().state.revision, other_revision);
+        assert!(scene.playback_state(other_track, None).is_none());
+        scene.configure_playback(track_identity, 2_000_000, true).unwrap();
+        scene.pause_playback(track_identity).unwrap();
+        assert!(!scene.try_start_synchronized(track_identity, true));
+        assert_eq!(scene.playback_state(track_identity, None), Some((3, 2_000_000)));
+    }
     #[test]
     fn a_complete_priming_record_precedes_playback_clock_pacing() {
         let scene = SharedScene::for_test();

@@ -381,8 +381,9 @@ impl<T> Grid<T> {
 
     #[inline]
     pub fn clear_history(&mut self) {
-        // Explicitly purge all lines from history.
+        // Clear all scrollback history.
         self.raw.shrink_lines(self.history_size());
+        self.raw.truncate();
 
         // Reset display offset.
         self.display_offset = 0;

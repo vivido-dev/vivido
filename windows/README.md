@@ -8,13 +8,15 @@ The Windows release produces two x64 artifacts for Windows 11 build 22000 or new
   7 and WSL are already provisioned.
 
 Both packages install `vivido`, `vivi`, `vvmux`, and `vvssh` below
-`%LOCALAPPDATA%\Programs\Vivido`. The MSI adds that directory to the user PATH and creates the
-`Vivido PowerShell` (`-e pwsh.exe`) and `Vivido WSL` (`-e wsl.exe`) Start Menu shortcuts. It does
-not create desktop shortcuts or taskbar pins. A WSL shell inherits the per-window Vivid endpoint,
-root secret, and ConPTY anchor transport through one-way `WSLENV` entries, so a Linux build of
-`vivi` can submit media to the native Windows Vivido window. Vivido removes stale optional-lane
-entries from inherited `WSLENV`; otherwise WSL can materialize an unavailable endpoint as an
-invalid empty variable instead of allowing the protocol's missing-lane fallback.
+`%LOCALAPPDATA%\Programs\Vivido`. The MSI adds that directory to the user PATH, configures `WSLENV`
+to export `TERM/u:COLORTERM/u`, and creates the `Vivido PowerShell` (`-e pwsh.exe`) and `Vivido WSL`
+(`-e wsl.exe`) Start Menu shortcuts. It does not create desktop shortcuts or taskbar pins. A WSL
+shell inherits the per-window Vivid endpoint, root secret, ConPTY anchor transport, `TERM`, and
+`COLORTERM` through one-way `WSLENV` entries, so a Linux build of `vivi` can submit media to the
+native Windows Vivido window, and terminal applications in WSL run with `TERM=vivido` and
+`COLORTERM=truecolor`. Vivido removes stale optional-lane entries from inherited `WSLENV`; otherwise
+WSL can materialize an unavailable endpoint as an invalid empty variable instead of allowing the
+protocol's missing-lane fallback.
 
 For a start-to-finish developer-machine procedure, including unsigned builds, installation,
 repair, uninstall, bundle prerequisite testing, and signed-artifact verification, see

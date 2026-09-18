@@ -169,6 +169,7 @@ impl TerminalTarget {
         registry::LIVE_MEDIA,
         registry::OBSERVABILITY,
         registry::TERMINAL_SURFACE,
+        registry::TIMED_MEDIA_SYNC,
         registry::TIMED_MEDIA,
         registry::WEB_CARRIER,
     ];
@@ -361,6 +362,7 @@ impl DesktopTarget {
         registry::FILE_DROP,
         registry::LIVE_MEDIA,
         registry::OBSERVABILITY,
+        registry::TIMED_MEDIA_SYNC,
         registry::TIMED_MEDIA,
         registry::WEB_CARRIER,
     ];

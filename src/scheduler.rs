@@ -29,6 +29,7 @@ pub enum Topic {
     BlinkTimeout,
     Frame,
     RendererRecovery,
+    HiddenRelease,
     VividResizeSettled,
     MessageTimeout,
     #[cfg(any(unix, windows))]

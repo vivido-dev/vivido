@@ -6,7 +6,44 @@
 //! equivalent inputs onto one shared numbering — which is why a producer can accept either
 //! without knowing where the event came from.
 
-use winit::keyboard::KeyCode;
+use winit::event::MouseButton;
+use winit::keyboard::{KeyCode, ModifiersState};
+
+/// The overlay modifier mask for a platform modifier state.
+///
+/// Overlays carry a normative mask, so a platform bitmask is translated here rather than
+/// forwarded: `ModifiersState::bits()` is a winit internal layout that no producer can rely on.
+/// Winit does not report the lock keys, so those normative bits stay clear on this host.
+pub fn modifiers(state: ModifiersState) -> u32 {
+    use vivid_protocol::overlay::modifiers as bit;
+    let mut mask = 0;
+    for (active, value) in [
+        (state.shift_key(), bit::SHIFT),
+        (state.control_key(), bit::CONTROL),
+        (state.alt_key(), bit::ALT),
+        (state.super_key(), bit::SUPER),
+    ] {
+        if active {
+            mask |= value;
+        }
+    }
+    mask
+}
+
+/// The overlay button number for a platform pointer button, or `None` for one outside the
+/// protocol's bounded range. An unrepresentable button is not forwarded to an overlay at all.
+pub fn button(button: MouseButton) -> Option<u16> {
+    use vivid_protocol::overlay::buttons as id;
+    let value = match button {
+        MouseButton::Left => id::PRIMARY,
+        MouseButton::Middle => id::AUXILIARY,
+        MouseButton::Right => id::SECONDARY,
+        MouseButton::Back => id::BACK,
+        MouseButton::Forward => id::FORWARD,
+        MouseButton::Other(other) => id::FORWARD.checked_add(1)?.checked_add(other)?,
+    };
+    (value <= id::MAXIMUM).then_some(value)
+}
 
 /// The HID keyboard-page usage for a physical key, or `None` for one the page does not name.
 pub fn usage(code: KeyCode) -> Option<u16> {
@@ -211,5 +248,36 @@ mod tests {
     fn an_unnamed_key_maps_to_nothing() {
         // A key with no keyboard-page usage is dropped rather than guessed at.
         assert!(usage(KeyCode::Fn).is_none());
+    }
+
+    #[test]
+    fn platform_modifiers_become_the_normative_mask() {
+        use vivid_protocol::overlay::modifiers as bit;
+        assert_eq!(modifiers(ModifiersState::empty()), 0);
+        assert_eq!(modifiers(ModifiersState::SHIFT), bit::SHIFT);
+        assert_eq!(modifiers(ModifiersState::CONTROL), bit::CONTROL);
+        assert_eq!(modifiers(ModifiersState::ALT), bit::ALT);
+        assert_eq!(modifiers(ModifiersState::SUPER), bit::SUPER);
+        let every = ModifiersState::SHIFT
+            | ModifiersState::CONTROL
+            | ModifiersState::ALT
+            | ModifiersState::SUPER;
+        let mask = modifiers(every);
+        assert_eq!(mask & !bit::KNOWN_MASK, 0, "no reserved bit may be set");
+        // The winit layout must not leak: these differ, which is the whole point of translating.
+        assert_ne!(mask, every.bits());
+    }
+
+    #[test]
+    fn platform_buttons_become_the_normative_numbering() {
+        use vivid_protocol::overlay::buttons as id;
+        assert_eq!(button(MouseButton::Left), Some(id::PRIMARY));
+        assert_eq!(button(MouseButton::Middle), Some(id::AUXILIARY));
+        assert_eq!(button(MouseButton::Right), Some(id::SECONDARY));
+        assert_eq!(button(MouseButton::Back), Some(id::BACK));
+        assert_eq!(button(MouseButton::Forward), Some(id::FORWARD));
+        assert_eq!(button(MouseButton::Other(0)), Some(id::FORWARD + 1));
+        assert_eq!(button(MouseButton::Other(id::MAXIMUM)), None);
+        assert_eq!(button(MouseButton::Other(u16::MAX)), None);
     }
 }

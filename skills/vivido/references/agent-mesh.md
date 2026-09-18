@@ -4,6 +4,11 @@ A durable mailbox for agent-to-agent messages, carried by `vvagent`. It is **not
 terminal: `vivid_protocol` gains nothing from it and depends on none of it. A message may *refer* to
 a pane or a file; it never carries media bytes, and it never enters a PTY.
 
+The complete mesh surface — cross-host peers and the SSH bridge, `--attach` file handoff, and the
+full command reference — is the **vvagent** skill
+([vivido-dev/vvagent · skills/vvagent](https://github.com/vivido-dev/vvagent/tree/master/skills/vvagent)).
+This file keeps what matters inside Vivido.
+
 Everything prints JSON, including errors (`{"error":{"code","message"}}`), because the primary
 caller is an agent — one that has to parse prose is back where it started.
 
@@ -158,6 +163,30 @@ lifetime.
 Cancelling queued work removes it. Cancelling *delivered* work only asks: it stays
 `cancellation_requested` unless the provider confirms a stop, and only an affirmative provider
 response yields `cancelled`.
+
+## Handing another agent a file
+
+`--attach FILE` (repeatable, up to 8; `attachments` in `agent_mesh_send`) hands the recipient the
+file itself, not just a claim about it:
+
+```sh
+vvagent send --to @buildbox:builder --text-file task.md --attach ./firmware.bin
+```
+
+- To an agent on this host nothing is copied: the message carries the path, length and SHA-256.
+- To an agent on another host the file first crosses through the `vvssh` window carrying that
+  host's bridge — `drop-file` on that window, exactly as a drag would — and the message refers to
+  the copy there. Send from a pane of the same Vivido or Vivida instance as that window. Without
+  one (a plain `ssh` bridge, or no `vvreceive` on the far side) it fails `file_drop_unavailable`,
+  and the message without the file still goes.
+- The sender hashes the file first; a copy that does not match fails `attachment_mismatch`. A
+  retry with the same `--idempotency-key` reuses the copies it already made, and an error after a
+  copy was made says where it is.
+- On receipt, `receive` and `agent_mesh_receive` check each file on this host and report
+  `attachments[].verified`: `true`, `false` with a reason, or `null` above 256 MiB
+  (`vvagent ref verify MESSAGE_ID` checks any size). Treat an unverified file as untrusted.
+- `vvagent policy attach deny` turns attachments off for an endpoint. Copies land in the remote
+  login shell's working directory and outlive the message.
 
 ## Asking several agents at once
 

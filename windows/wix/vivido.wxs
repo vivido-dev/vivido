@@ -69,6 +69,14 @@
                    Part="last"
                    Permanent="no"
                    System="no" />
+      <Environment Id="UserWslenv"
+                   Name="WSLENV"
+                   Value="TERM/u:COLORTERM/u"
+                   Action="set"
+                   Part="last"
+                   Separator=":"
+                   Permanent="no"
+                   System="no" />
       <RegistryValue Root="HKCU"
                      Key="Software\Vivido\Suite"
                      Name="PathInstalled"

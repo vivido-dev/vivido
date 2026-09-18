@@ -96,6 +96,12 @@ const MAX_SEARCH_WHILE_TYPING: Option<usize> = Some(1000);
 /// Maximum number of search terms stored in the history.
 const MAX_SEARCH_HISTORY_SIZE: usize = 255;
 
+/// How long a window stays hidden before its window-sized GPU memory is released.
+///
+/// Long enough that flipping between tabs does not churn the swapchain, short enough that a tab
+/// left in the background stops costing a full set of window-sized targets.
+const HIDDEN_RELEASE_DELAY: Duration = Duration::from_secs(5);
+
 #[cfg(any(unix, windows))]
 struct PacedGesture {
     path: crate::cli::IpcMousePath,
@@ -977,6 +983,84 @@ impl Processor {
                     }
                     return;
                 }
+            },
+            "drop_file" => {
+                let params: crate::cli::IpcDropFile = match decode_ipc_params(&request) {
+                    Ok(params) => params,
+                    Err(error) => {
+                        request.connection.error(request.id, error);
+                        return;
+                    },
+                };
+                let target = match self.resolve_ipc_target(params.target.window_id) {
+                    Ok(target) => target,
+                    Err(error) => {
+                        request.connection.error(request.id, error);
+                        return;
+                    },
+                };
+                if !params.path.is_absolute() {
+                    request.connection.error(
+                        request.id,
+                        IpcError::new("invalid_params", "drop-file needs an absolute path"),
+                    );
+                    return;
+                }
+                if !(1..=86_400_000).contains(&params.timeout) {
+                    request.connection.error(
+                        request.id,
+                        IpcError::new("invalid_params", "timeout must be 1 ms through 24 hours"),
+                    );
+                    return;
+                }
+                let window = self.windows.get_mut(&target).unwrap();
+                match window.automation_drop_file(&params.path, params.at, params.type_path) {
+                    Ok((handle, name, length)) => {
+                        // The trusted indication a drag shows: automation does not make a transfer
+                        // silent (spec file-drop §7).
+                        replace_file_drop_message(
+                            &mut window.message_buffer,
+                            format!(
+                                "Automation is copying {name} ({length} bytes) to the remote receiver"
+                            ),
+                            MessageType::Warning,
+                        );
+                        window.dirty = true;
+                        window.display.window.request_redraw();
+                        window.automation.waiters.push(Waiter {
+                            connection: request.connection.clone(),
+                            request_id: request.id,
+                            deadline: Instant::now() + Duration::from_millis(params.timeout),
+                            kind: WaitKind::FileDrop { handle },
+                        });
+                        self.evaluate_waiters(target);
+                        self.schedule_automation_timer(target);
+                    },
+                    Err(refused) => {
+                        use crate::vivid::file_drop::{LocalDropDisposition, TOO_MANY_PENDING};
+                        let error = match refused {
+                            // No fallback to typing the local path, which is what an unbound drag
+                            // does: an automation caller asked for a copy, not for text.
+                            LocalDropDisposition::NoBinding => IpcError::new(
+                                "no_file_drop_binding",
+                                "no receiver is bound to this window; is vvreceive running on the \
+                                 remote host?",
+                            ),
+                            LocalDropDisposition::Rejected(TOO_MANY_PENDING) => IpcError::new(
+                                "busy",
+                                "the receiver already has as many drops pending as it accepts",
+                            ),
+                            LocalDropDisposition::Rejected(reason) => {
+                                IpcError::new("file_drop_rejected", reason)
+                            },
+                            LocalDropDisposition::Offered => {
+                                IpcError::new("internal", "an offered drop was reported refused")
+                            },
+                        };
+                        request.connection.error(request.id, error);
+                    },
+                }
+                return;
             },
             "mouse" => {
                 let params: IpcMouse = match decode_ipc_params(&request) {
@@ -2690,6 +2774,58 @@ impl Processor {
                     (window.automation.focus_confirmation > *after_focus && window.is_focused())
                         .then(|| Ok(serde_json::json!({"focused": true})))
                 },
+                WaitKind::FileDrop { handle } => {
+                    use crate::vivid::file_drop::AutomationDropState;
+                    use vivid_protocol::file_drop::FileResultCode;
+                    let answer = match window.automation_drop_state(*handle) {
+                        AutomationDropState::Pending => None,
+                        AutomationDropState::Finished(outcome) => {
+                            let result = match outcome.result {
+                                FileResultCode::Committed => "committed",
+                                FileResultCode::AlreadyCommitted => "already_committed",
+                                FileResultCode::Rejected => "rejected",
+                                FileResultCode::Cancelled => "cancelled",
+                                FileResultCode::HashMismatch => "hash_mismatch",
+                                FileResultCode::IoError => "io_error",
+                            };
+                            Some(match outcome.result {
+                                FileResultCode::Committed | FileResultCode::AlreadyCommitted => {
+                                    Ok(serde_json::json!({
+                                        "result": result,
+                                        "basename": outcome.final_name,
+                                        "bytes": outcome.committed_length,
+                                        "sha256": outcome.sha256.map(|digest| {
+                                            digest.iter().map(|byte| format!("{byte:02x}"))
+                                                .collect::<String>()
+                                        }),
+                                        // Only to this caller, which started the drop; never in
+                                        // status, diagnostics, or logs (spec file-drop §8).
+                                        "remote_path": outcome.remote_path,
+                                    }))
+                                },
+                                _ => Err(IpcError::new(
+                                    "file_drop_failed",
+                                    format!("the receiver reported the drop {result}"),
+                                )
+                                .with_data(serde_json::json!({"result": result}))),
+                            })
+                        },
+                        AutomationDropState::Cancelled => Some(Err(IpcError::new(
+                            "file_drop_cancelled",
+                            "the drop was cancelled or timed out before the receiver finished",
+                        ))),
+                        AutomationDropState::Lost => Some(Err(IpcError::new(
+                            "file_drop_lost",
+                            "the receiver went away before it reported a result",
+                        ))),
+                    };
+                    if answer.is_some() {
+                        window.message_buffer.remove_target(FILE_DROP_MESSAGE_TARGET);
+                        window.dirty = true;
+                        window.display.window.request_redraw();
+                    }
+                    answer
+                },
             };
 
             match result {
@@ -3670,6 +3806,11 @@ impl Processor {
                     window_context.retry_renderer(&mut self.scheduler);
                 }
             },
+            (EventType::HiddenRelease, Some(window_id)) => {
+                if let Some(window_context) = self.windows.get_mut(window_id) {
+                    window_context.release_while_hidden();
+                }
+            },
             (EventType::VividResizeSettled(generation), Some(window_id)) => {
                 if let Some(window_context) = self.windows.get_mut(window_id) {
                     window_context.settle_vivid_resize(generation);
@@ -3723,22 +3864,19 @@ impl Processor {
             for window_id in &window_ids {
                 self.apply_automation_confirmations(*window_id);
             }
+            // The event carries the changed row indices, which is what `docs/ipc.md` documents as
+            // "current row replacements". It also carried a whole rendered grid, which no client in
+            // this repository reads, which is absent from the documented payload, and which a
+            // client that missed history is told to fetch with `get-grid` instead. Building it here
+            // meant rendering and retaining the viewport as JSON on every screen change even with
+            // nobody subscribed; the retained trees dominated the process heap.
             let mut changes = Vec::new();
-            for (platform_id, window) in &mut self.windows {
+            for window in self.windows.values_mut() {
                 if let Some((screen_sequence, rows)) = window.sync_automation_screen() {
-                    let grid = window
-                        .automation_grid(None, None, Some(screen_sequence.saturating_sub(1)))
-                        .ok();
-                    changes.push((
-                        *platform_id,
-                        window.ipc_window_id(),
-                        screen_sequence,
-                        rows,
-                        grid,
-                    ));
+                    changes.push((window.ipc_window_id(), screen_sequence, rows));
                 }
             }
-            for (_platform_id, window_id, screen_sequence, rows, grid) in changes {
+            for (window_id, screen_sequence, rows) in changes {
                 let full = rows.is_none();
                 self.automation.emit(
                     Some(window_id),
@@ -3747,7 +3885,6 @@ impl Processor {
                         "screen_sequence": screen_sequence,
                         "full": full,
                         "rows": rows,
-                        "grid": grid,
                     }),
                 );
             }
@@ -3963,6 +4100,8 @@ pub enum EventType {
     #[cfg(windows)]
     TerminalVividBatch,
     RendererRecovery,
+    /// A window has been hidden long enough to give its GPU memory back.
+    HiddenRelease,
     VividResizeSettled(u64),
     /// Dismiss the warning that was visible when this timer was scheduled.
     MessageTimeout(Message),
@@ -4092,6 +4231,34 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
     }
     fn send_desktop_input(&self, event: vivid_protocol::input::InputEvent) -> bool {
         self.vivid_service.send_input(event)
+    }
+    fn overlay_cursor(&self) -> Option<winit::window::CursorIcon> {
+        self.vivid_service.overlay_cursor()
+    }
+    fn overlay_capturing(&self) -> bool {
+        self.vivid_service.overlay_capturing()
+    }
+    fn overlay_keyboard(&self, event: vivid_protocol::overlay::Event, escape: bool) -> bool {
+        self.vivid_service.overlay_keyboard(event, escape)
+    }
+    fn overlay_pointer(
+        &self,
+        x: f64,
+        y: f64,
+        button: Option<(u16, bool)>,
+        modifiers: u32,
+        pressure: Option<f64>,
+    ) -> bool {
+        self.vivid_service.overlay_pointer(x, y, button, modifiers, pressure)
+    }
+    fn overlay_wheel(
+        &self,
+        x: f64,
+        y: f64,
+        scroll: crate::vivid::overlay::ScrollInput,
+        modifiers: u32,
+    ) -> bool {
+        self.vivid_service.overlay_wheel(x, y, scroll, modifiers)
     }
 
     fn paste_clipboard_media(&mut self) -> bool {
@@ -4650,6 +4817,11 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
 
     /// Paste a text into the terminal.
     fn paste(&mut self, text: &str, bracketed: bool) {
+        if !self.search_active()
+            && self.overlay_keyboard(vivid_protocol::overlay::Event::Text(text.to_owned()), false)
+        {
+            return;
+        }
         if self.search_active() {
             for c in text.chars() {
                 self.search_input(c);
@@ -5174,6 +5346,7 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                 | EventType::NotificationActivated
                 | EventType::Frame
                 | EventType::RendererRecovery
+                | EventType::HiddenRelease
                 | EventType::HostWakeup
                 | EventType::VividResizeSettled(_) => (),
                 #[cfg(windows)]
@@ -5233,6 +5406,7 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                     },
                     WindowEvent::Touch(touch) => self.touch(touch),
                     WindowEvent::Focused(is_focused) => {
+                        self.ctx.vivid_service.overlay_focus(is_focused);
                         self.ctx.terminal.is_focused = is_focused;
 
                         // When the unfocused hollow is used we must redraw on focus change.
@@ -5257,6 +5431,21 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                             !occluded,
                             self.ctx.terminal.grid().display_offset(),
                         );
+
+                        // A hidden window keeps a full swapchain and a set of window-sized
+                        // compositing targets it cannot use. Give them back once it is clear the
+                        // window is staying hidden, rather than on every flicker of occlusion.
+                        let timer_id =
+                            TimerId::new(Topic::HiddenRelease, self.ctx.display.window.id());
+                        self.ctx.scheduler.unschedule(timer_id);
+                        if occluded {
+                            self.ctx.scheduler.schedule(
+                                Event::new(EventType::HiddenRelease, self.ctx.display.window.id()),
+                                HIDDEN_RELEASE_DELAY,
+                                false,
+                                timer_id,
+                            );
+                        }
                     },
                     WindowEvent::DroppedFile(path) => {
                         // A drop supersedes the hover overlay. Leaving it at the front of the
@@ -5325,12 +5514,34 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                     },
                     WindowEvent::Ime(ime) => match ime {
                         Ime::Commit(text) => {
+                            if !self.ctx.search_active()
+                                && self.ctx.overlay_keyboard(
+                                    vivid_protocol::overlay::Event::Text(text.clone()),
+                                    false,
+                                )
+                            {
+                                return;
+                            }
                             *self.ctx.dirty = true;
                             // Don't use bracketed paste for single char input.
                             self.ctx.paste(&text, text.chars().count() > 1);
                             self.ctx.update_cursor_blinking();
                         },
                         Ime::Preedit(text, cursor_offset) => {
+                            let selection = cursor_offset.and_then(|(start, end)| {
+                                Some((u32::try_from(start).ok()?, u32::try_from(end).ok()?))
+                            });
+                            if !self.ctx.search_active()
+                                && self.ctx.overlay_keyboard(
+                                    vivid_protocol::overlay::Event::Ime {
+                                        preedit: text.clone(),
+                                        selection,
+                                    },
+                                    false,
+                                )
+                            {
+                                return;
+                            }
                             let preedit =
                                 (!text.is_empty()).then(|| Preedit::new(text, cursor_offset));
 

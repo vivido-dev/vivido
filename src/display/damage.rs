@@ -179,10 +179,16 @@ impl FrameDamage {
     fn reset(&mut self, num_lines: usize, num_cols: usize) {
         self.full = false;
         self.rects.clear();
-        self.lines.clear();
-        self.lines.reserve(num_lines);
-        for line in 0..num_lines {
-            self.lines.push(LineDamageBounds::undamaged(line, num_cols));
+        if self.lines.len() == num_lines {
+            for line in &mut self.lines {
+                line.reset(num_cols);
+            }
+        } else {
+            self.lines.clear();
+            self.lines.reserve(num_lines);
+            for line in 0..num_lines {
+                self.lines.push(LineDamageBounds::undamaged(line, num_cols));
+            }
         }
     }
 
