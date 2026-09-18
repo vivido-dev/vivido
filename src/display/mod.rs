@@ -655,6 +655,9 @@ impl Display {
         if self.renderer_unavailable {
             return false;
         }
+        // A hidden window gives its swapchain back; take it again before anything is painted, so
+        // the order the platform reports occlusion in cannot leave a frame aimed at a 1x1 surface.
+        self.scene_renderer.restore_after_hidden();
         match terminal.damage() {
             TermDamage::Full => self.damage_tracker.frame().mark_fully_damaged(),
             TermDamage::Partial(damaged_lines) => {
@@ -1560,6 +1563,15 @@ impl Display {
         self.damage_tracker.next_frame().mark_fully_damaged();
         self.window.request_redraw();
         Ok(())
+    }
+
+    /// Hand back the GPU memory this window cannot use while it is hidden.
+    ///
+    /// The cached scene goes too: it is the encoding of a frame nobody can see, and the next draw
+    /// rebuilds it anyway.
+    pub fn release_while_hidden(&mut self) {
+        self.cached_scene = None;
+        self.scene_renderer.release_while_hidden();
     }
 
     fn schedule_renderer_retry(&mut self, scheduler: &mut Scheduler) {

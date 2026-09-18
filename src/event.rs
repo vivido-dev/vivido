@@ -96,6 +96,12 @@ const MAX_SEARCH_WHILE_TYPING: Option<usize> = Some(1000);
 /// Maximum number of search terms stored in the history.
 const MAX_SEARCH_HISTORY_SIZE: usize = 255;
 
+/// How long a window stays hidden before its window-sized GPU memory is released.
+///
+/// Long enough that flipping between tabs does not churn the swapchain, short enough that a tab
+/// left in the background stops costing a full set of window-sized targets.
+const HIDDEN_RELEASE_DELAY: Duration = Duration::from_secs(5);
+
 #[cfg(any(unix, windows))]
 struct PacedGesture {
     path: crate::cli::IpcMousePath,
@@ -3670,6 +3676,11 @@ impl Processor {
                     window_context.retry_renderer(&mut self.scheduler);
                 }
             },
+            (EventType::HiddenRelease, Some(window_id)) => {
+                if let Some(window_context) = self.windows.get_mut(window_id) {
+                    window_context.release_while_hidden();
+                }
+            },
             (EventType::VividResizeSettled(generation), Some(window_id)) => {
                 if let Some(window_context) = self.windows.get_mut(window_id) {
                     window_context.settle_vivid_resize(generation);
@@ -3959,6 +3970,8 @@ pub enum EventType {
     #[cfg(windows)]
     TerminalVividBatch,
     RendererRecovery,
+    /// A window has been hidden long enough to give its GPU memory back.
+    HiddenRelease,
     VividResizeSettled(u64),
     /// Dismiss the warning that was visible when this timer was scheduled.
     MessageTimeout(Message),
@@ -5203,6 +5216,7 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                 | EventType::NotificationActivated
                 | EventType::Frame
                 | EventType::RendererRecovery
+                | EventType::HiddenRelease
                 | EventType::HostWakeup
                 | EventType::VividResizeSettled(_) => (),
                 #[cfg(windows)]
@@ -5287,6 +5301,21 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                             !occluded,
                             self.ctx.terminal.grid().display_offset(),
                         );
+
+                        // A hidden window keeps a full swapchain and a set of window-sized
+                        // compositing targets it cannot use. Give them back once it is clear the
+                        // window is staying hidden, rather than on every flicker of occlusion.
+                        let timer_id =
+                            TimerId::new(Topic::HiddenRelease, self.ctx.display.window.id());
+                        self.ctx.scheduler.unschedule(timer_id);
+                        if occluded {
+                            self.ctx.scheduler.schedule(
+                                Event::new(EventType::HiddenRelease, self.ctx.display.window.id()),
+                                HIDDEN_RELEASE_DELAY,
+                                false,
+                                timer_id,
+                            );
+                        }
                     },
                     WindowEvent::DroppedFile(path) => {
                         // A drop supersedes the hover overlay. Leaving it at the front of the

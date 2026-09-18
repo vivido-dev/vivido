@@ -148,6 +148,8 @@ pub struct SceneRenderer {
     /// Whether `render_target` holds a frame. Screenshots read that texture, not the swapchain,
     /// so this is set by both the windowed and the offscreen path.
     has_rendered_frame: bool,
+    /// Whether the window-sized GPU memory has been handed back while the window is hidden.
+    hidden_released: bool,
 }
 
 #[cfg(windows)]
@@ -388,6 +390,7 @@ impl SceneRenderer {
             render_target_view,
             target_size,
             has_rendered_frame: false,
+            hidden_released: false,
         })
     }
 
@@ -436,6 +439,51 @@ impl SceneRenderer {
         self.target_size = size;
         self.valid_target = true;
         self.has_rendered_frame = false;
+        self.hidden_released = false;
+    }
+
+    /// Hand back the window-sized GPU memory a hidden window cannot use.
+    ///
+    /// A background tab holds a full swapchain plus the media and overlay compositing targets, all
+    /// sized to the window and all unreachable until it is shown again. The swapchain is the
+    /// expensive part: three drawables at the window size, 75 MB for a 2920x2184 Retina window.
+    /// Shrinking the surface to 1x1 releases them without needing the window handle back, which
+    /// `SceneRenderer` does not keep.
+    ///
+    /// `render_target` deliberately stays: screenshots read that texture rather than the swapchain
+    /// (see `begin_screenshot`), so releasing it would make `screenshot` fail for exactly the
+    /// background tabs automation tends to ask about.
+    pub fn release_while_hidden(&mut self) {
+        if self.hidden_released || self.surface.is_none() {
+            return;
+        }
+
+        {
+            let mut renderer = self.renderer.borrow_mut();
+            self.media.clear_target(&mut renderer);
+            self.overlays.clear(&mut renderer);
+        }
+
+        if let (Some(context), Some(surface)) = (&self.context, &mut self.surface) {
+            reconfigure_surface(&context.0.borrow().context, surface, 1, 1);
+        }
+
+        self.hidden_released = true;
+    }
+
+    /// Undo [`Self::release_while_hidden`], restoring the swapchain to the window size.
+    ///
+    /// Called from the draw path rather than from a reveal event, so a frame can never be painted
+    /// against a 1x1 swapchain no matter which order the platform reports occlusion in.
+    pub fn restore_after_hidden(&mut self) {
+        if !self.hidden_released {
+            return;
+        }
+
+        self.hidden_released = false;
+        // Rebuilds the swapchain at `target_size`; the media and overlay targets are rebuilt
+        // lazily by their own `ensure_target` calls on the next frame.
+        self.resize(self.target_size);
     }
 
     pub fn clamp_render_size(&self, size: PhysicalSize<u32>) -> PhysicalSize<u32> {
@@ -1251,6 +1299,56 @@ mod tests {
 
         assert!(peak.frames > 0, "the probe saw no frames, so the numbers mean nothing");
         assert_eq!(peak.failed, 0, "a full terminal grid overran Vello's bump buffers: {peak:?}",);
+    }
+
+    #[test]
+    fn a_renderer_without_a_swapchain_ignores_the_hidden_release() {
+        // Offscreen and embedded renderers have no swapchain to hand back, and they keep
+        // rendering while their window is hidden — vvbox panes and headless capture both rely on
+        // that. The release path must be inert for them rather than tearing down a live target.
+        let _gpu = gpu_lock();
+        if offscreen_device().is_err() {
+            eprintln!("Skipping hidden-release test: no wgpu adapter");
+            return;
+        }
+
+        let size = PhysicalSize::new(64, 32);
+        let mut renderer =
+            SceneRenderer::new(RenderSource::Offscreen, size, false).expect("offscreen renderer");
+        renderer.render(&Scene::new(), Color::BLACK).expect("first render");
+        assert!(renderer.has_rendered_frame());
+
+        renderer.release_while_hidden();
+        // `render_target` must survive: `begin_screenshot` reads it, so a background pane would
+        // otherwise start answering `screenshot` with NoPresentedFrame.
+        assert!(
+            renderer.has_rendered_frame(),
+            "releasing a hidden window must not discard the frame screenshots read",
+        );
+
+        renderer.restore_after_hidden();
+        renderer.render(&Scene::new(), Color::BLACK).expect("render after release and restore");
+        assert!(renderer.has_rendered_frame());
+    }
+
+    #[test]
+    fn resizing_clears_the_hidden_release_state() {
+        // `restore_after_hidden` routes through `resize`, so a resize arriving first must leave the
+        // renderer in the restored state rather than waiting for a restore that never comes.
+        let _gpu = gpu_lock();
+        if offscreen_device().is_err() {
+            eprintln!("Skipping hidden-release resize test: no wgpu adapter");
+            return;
+        }
+
+        let mut renderer =
+            SceneRenderer::new(RenderSource::Offscreen, PhysicalSize::new(32, 16), false)
+                .expect("offscreen renderer");
+        renderer.hidden_released = true;
+        renderer.resize(PhysicalSize::new(48, 24));
+
+        assert!(!renderer.hidden_released, "a resize leaves the window ready to paint");
+        renderer.render(&Scene::new(), Color::BLACK).expect("render after resize");
     }
 
     #[test]

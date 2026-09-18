@@ -715,6 +715,17 @@ impl WindowContext {
         self.update_config(config);
     }
 
+    /// Release window-sized GPU memory after this window has stayed hidden.
+    ///
+    /// Scheduled by the occlusion handler. Re-checked here because the window may have been shown
+    /// again between the timer being set and it firing.
+    pub fn release_while_hidden(&mut self) {
+        if !self.occluded {
+            return;
+        }
+        self.display.release_while_hidden();
+    }
+
     /// Draw the window.
     pub fn draw(&mut self, scheduler: &mut Scheduler) -> bool {
         self.display.window.requested_redraw = false;
