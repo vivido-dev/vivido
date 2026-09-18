@@ -92,8 +92,8 @@ vivido msg drop-file ./firmware.bin --window-id 42
 ```
 
 - Nothing is typed unless `--type-path` asks. Typing lands in whatever has focus, and in a remote
-  `vvmux` that may be another agent's prompt. To give another *agent* a file, drop it without
-  `--type-path` and send that agent `remote_path` through the agent mesh.
+  `vvmux` that may be another agent's prompt. To give another *agent* a file, use
+  `vvagent send --attach`, which does this drop for you and hands the agent a verified reference.
 - With no receiver bound it fails `no_file_drop_binding`. It never falls back to typing a local
   path the way an unbound drag does.
 - `--at COLUMN,ROW` drops onto the surface under that cell, for a remote desktop's own binding.
