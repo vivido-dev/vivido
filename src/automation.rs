@@ -321,12 +321,54 @@ impl StoredPayload {
     }
 
     /// Contribution to the replay ring's byte budget, which bounds retained memory.
+    ///
+    /// Both arms are an upper bound on the bytes the ring actually holds, never on the bytes a
+    /// subscriber would read off the wire. Those two differ by an order of magnitude for JSON, so
+    /// measuring the wrong one silently multiplies the budget.
     fn encoded_size(&self) -> usize {
         match self {
-            Self::Json(value) => serde_json::to_vec(value).map_or(0, |value| value.len()),
-            // Charge what a subscriber would receive: base64 emits four bytes per three.
+            Self::Json(value) => json_footprint(value),
+            // Charge what a subscriber would receive: base64 emits four bytes per three. That
+            // over-charges the retained `Vec<u8>` by a third, which keeps the bound conservative.
             Self::Output { bytes, .. } => bytes.len().div_ceil(3) * 4,
         }
+    }
+}
+
+/// Approximate heap bytes retained by a `Value` tree.
+///
+/// This charged `serde_json::to_vec(value).len()` — the *serialized* length — against a budget
+/// documented as bounding retained memory. The ring holds the parsed tree instead, and the two are
+/// nowhere near each other: `serde_json::Map` is a `BTreeMap`, whose nodes are a fixed block of
+/// roughly 640 bytes holding up to eleven entries, so a three-key object retains ~640 bytes and
+/// serializes to about forty. Measured on a live window, a 4 MiB budget was holding ~48 MiB of
+/// `BTreeMap` nodes. Serializing the whole tree to measure it also threw the result away.
+fn json_footprint(value: &Value) -> usize {
+    /// `LeafNode<String, Value>`: two `u16`, a parent pointer, and eleven slots of each, which
+    /// lands in the 640-byte allocation class.
+    const BTREE_NODE_BYTES: usize = 640;
+    /// `BTreeMap`'s per-node entry capacity (`2 * B - 1`, with `B == 6`).
+    const BTREE_NODE_ENTRIES: usize = 11;
+
+    let inline = size_of::<Value>();
+    match value {
+        Value::Null | Value::Bool(_) | Value::Number(_) => inline,
+        Value::String(text) => inline + text.capacity(),
+        Value::Array(items) => {
+            inline
+                + items.capacity() * size_of::<Value>()
+                + items.iter().map(json_footprint).sum::<usize>()
+        },
+        Value::Object(entries) => {
+            // An empty object still owns a root node.
+            let nodes = entries.len().div_ceil(BTREE_NODE_ENTRIES).max(1);
+            inline
+                + nodes * BTREE_NODE_BYTES
+                + entries
+                    .iter()
+                    .map(|(key, value)| key.capacity() + json_footprint(value))
+                    .sum::<usize>()
+        },
     }
 }
 
@@ -650,6 +692,65 @@ mod tests {
         // A read running past the end returns exactly the retained remainder.
         assert_eq!(transcript.range(end - 3, 1000).unwrap().len(), 3);
         assert!(transcript.range(end, 1000).unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_replay_budget_charges_retained_bytes_not_serialized_bytes() {
+        // The budget is documented as bounding retained memory, but it measured
+        // `serde_json::to_vec(..).len()`. `serde_json::Map` is a `BTreeMap`, so even a three-key
+        // object owns a ~640-byte node: a live window was holding ~48 MiB against a 4 MiB budget.
+        let value = json!({"c": "x", "fg": 1, "bg": 2});
+        let serialized = serde_json::to_vec(&value).expect("the sample serializes").len();
+        let charged = StoredPayload::Json(value).encoded_size();
+
+        assert!(serialized < 64, "the sample is small on the wire: {serialized} bytes");
+        assert!(
+            charged > 10 * serialized,
+            "retained bytes ({charged}) must dominate serialized bytes ({serialized})",
+        );
+    }
+
+    #[test]
+    fn json_footprint_counts_nested_owners() {
+        // Nesting must recurse: a row of cells costs a node per cell, not one node for the array.
+        let cell = json!({"c": "x"});
+        let one = json_footprint(&cell);
+        let row = json!([cell.clone(), cell.clone(), cell]);
+
+        assert!(
+            json_footprint(&row) >= 3 * one,
+            "an array of three objects retains at least three objects",
+        );
+        // A string's own bytes are charged on top of the inline `Value`.
+        let short = json_footprint(&json!("a"));
+        let long = json_footprint(&Value::String("a".repeat(500)));
+        assert!(long >= 500, "a 500-byte string charges at least its bytes: {long}");
+        assert!(long > short, "a longer string costs more: {short} then {long}");
+    }
+
+    #[test]
+    fn the_replay_ring_stays_inside_its_byte_budget() {
+        // Object-shaped events are exactly what overran the ring in production.
+        let mut hub = AutomationHub::default();
+        for sequence in 0..4_000u64 {
+            hub.emit(
+                Some(1),
+                "screen_changed",
+                json!({"screen_sequence": sequence, "full": false, "rows": [1, 2, 3]}),
+            );
+        }
+
+        assert!(
+            hub.replay_bytes <= EVENT_REPLAY_BYTES,
+            "retained {} bytes against a {EVENT_REPLAY_BYTES} budget",
+            hub.replay_bytes,
+        );
+        assert!(hub.replay.len() <= EVENT_REPLAY_COUNT);
+        assert_eq!(
+            hub.replay_bytes,
+            hub.replay.iter().map(|event| event.encoded_size).sum::<usize>(),
+            "eviction must keep the running total consistent with the ring",
+        );
     }
 
     #[test]

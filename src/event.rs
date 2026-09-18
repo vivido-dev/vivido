@@ -3723,22 +3723,19 @@ impl Processor {
             for window_id in &window_ids {
                 self.apply_automation_confirmations(*window_id);
             }
+            // The event carries the changed row indices, which is what `docs/ipc.md` documents as
+            // "current row replacements". It also carried a whole rendered grid, which no client in
+            // this repository reads, which is absent from the documented payload, and which a
+            // client that missed history is told to fetch with `get-grid` instead. Building it here
+            // meant rendering and retaining the viewport as JSON on every screen change even with
+            // nobody subscribed; the retained trees dominated the process heap.
             let mut changes = Vec::new();
-            for (platform_id, window) in &mut self.windows {
+            for window in self.windows.values_mut() {
                 if let Some((screen_sequence, rows)) = window.sync_automation_screen() {
-                    let grid = window
-                        .automation_grid(None, None, Some(screen_sequence.saturating_sub(1)))
-                        .ok();
-                    changes.push((
-                        *platform_id,
-                        window.ipc_window_id(),
-                        screen_sequence,
-                        rows,
-                        grid,
-                    ));
+                    changes.push((window.ipc_window_id(), screen_sequence, rows));
                 }
             }
-            for (_platform_id, window_id, screen_sequence, rows, grid) in changes {
+            for (window_id, screen_sequence, rows) in changes {
                 let full = rows.is_none();
                 self.automation.emit(
                     Some(window_id),
@@ -3747,7 +3744,6 @@ impl Processor {
                         "screen_sequence": screen_sequence,
                         "full": full,
                         "rows": rows,
-                        "grid": grid,
                     }),
                 );
             }
