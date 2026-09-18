@@ -13,6 +13,10 @@ use zeroize::Zeroizing;
 
 const ENDPOINT_ENV: &str = "VVSSH_ASKPASS_ENDPOINT";
 const CONTEXT_ENV: &str = "VVSSH_ASKPASS_CONTEXT";
+/// Contexts with this prefix are answered only from the cache and never prompt. A background lane
+/// that reconnects in the middle of a session must not put a password prompt into the terminal the
+/// person is working in; if it needs an answer nobody has given yet, it does without.
+const UNATTENDED_PREFIX: &str = "unattended:";
 const MAX_FIELD_LENGTH: usize = 16 * 1024;
 const REQUEST_ANSWER: u8 = 1;
 const REQUEST_SHUTDOWN: u8 = 2;
@@ -52,6 +56,36 @@ impl CredentialBroker {
             .env(CONTEXT_ENV, context);
         command
     }
+
+    /// What a background process needs to authenticate the SSH processes it starts, answered
+    /// only from credentials this session has already been given.
+    pub(super) fn unattended(&self) -> UnattendedCredentials {
+        UnattendedCredentials {
+            endpoint: self.endpoint.clone(),
+            executable: self.executable.clone(),
+        }
+    }
+}
+
+/// The broker's environment for a process started away from the terminal, such as the agent mesh
+/// lane. Cheap to clone and send to the thread that supervises it.
+#[derive(Clone, Debug)]
+pub(super) struct UnattendedCredentials {
+    endpoint: PathBuf,
+    executable: PathBuf,
+}
+
+impl UnattendedCredentials {
+    /// Give `command`, and every SSH process it starts, the broker for this `attempt`. Each attempt
+    /// is its own context, so a cached password is reused rather than treated as a retry.
+    pub(super) fn apply(&self, command: &mut Command, lane: &str, attempt: u32) {
+        command
+            .env("SSH_ASKPASS", &self.executable)
+            .env("SSH_ASKPASS_REQUIRE", "force")
+            .env("DISPLAY", "vivido-askpass")
+            .env(ENDPOINT_ENV, &self.endpoint)
+            .env(CONTEXT_ENV, format!("{UNATTENDED_PREFIX}{lane}-{attempt}"));
+    }
 }
 
 impl Drop for CredentialBroker {
@@ -89,6 +123,12 @@ impl CredentialCache {
             && answer.source_context != context
         {
             return Ok(Zeroizing::new(answer.value.to_string()));
+        }
+        if context.starts_with(UNATTENDED_PREFIX) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "an unattended lane never prompts",
+            ));
         }
 
         let answer = Zeroizing::new(read_answer()?);
@@ -215,6 +255,27 @@ mod tests {
         assert_eq!(&*media, "secret-2");
         assert_eq!(&*interactive, "secret-2");
         assert_eq!(reads.get(), 2);
+    }
+
+    #[test]
+    fn an_unattended_lane_reuses_a_given_password_but_never_prompts() {
+        let reads = Cell::new(0);
+        let mut cache = CredentialCache::default();
+        let read = || {
+            reads.set(reads.get() + 1);
+            Ok("secret".to_owned())
+        };
+
+        // Nothing given yet: no prompt, just no answer.
+        assert!(cache.answer("unattended:agent-mesh-1", "user@host's password: ", read).is_err());
+        assert_eq!(reads.get(), 0);
+
+        cache.answer("setup", "user@host's password: ", read).unwrap();
+        let reused = cache.answer("unattended:agent-mesh-2", "user@host's password: ", read);
+        assert_eq!(&*reused.unwrap(), "secret");
+        // A one-time code is never cached, so a reconnect needing one goes without.
+        assert!(cache.answer("unattended:agent-mesh-3", "Verification code: ", read).is_err());
+        assert_eq!(reads.get(), 1);
     }
 
     #[test]
