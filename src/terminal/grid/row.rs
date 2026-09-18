@@ -55,6 +55,12 @@ impl<T: Default> Row<T> {
         Row { inner, occ: 0 }
     }
 
+    /// Backing capacity, in cells. Only used to assert that narrowing reclaims it.
+    #[cfg(test)]
+    pub fn inner_capacity(&self) -> usize {
+        self.inner.capacity()
+    }
+
     /// Increase the number of columns in the row.
     #[inline]
     pub fn grow(&mut self, columns: usize) {
@@ -82,6 +88,15 @@ impl<T: Default> Row<T> {
         new_row.truncate(index);
 
         self.occ = min(self.occ, columns);
+
+        // `split_off` leaves this row's capacity at the width it used to have, so narrowing a
+        // window keeps every scrollback row sized for its old column count — at 24 bytes a cell
+        // that is tens of megabytes across a full history. Reclaim it only once the waste is worth
+        // a reallocation, so dragging a window narrower a column at a time does not rebuild the
+        // whole scrollback on every step.
+        if self.inner.capacity() >= self.inner.len().saturating_mul(2) {
+            self.inner.shrink_to_fit();
+        }
 
         if new_row.is_empty() { None } else { Some(new_row) }
     }
