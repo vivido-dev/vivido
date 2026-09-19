@@ -448,7 +448,7 @@ pub struct MessageOptions {
     #[clap(short, long, value_hint = ValueHint::FilePath)]
     pub socket: Option<PathBuf>,
 
-    /// Name of the headless session to talk to [default: $VIVIDO_SESSION, else the only session].
+    /// Name of the session to talk to [default: $VIVIDO_SESSION or $VIVIDA_TARGET, else the only session].
     #[clap(short = 't', long, value_name = "NAME", conflicts_with = "socket")]
     pub target: Option<String>,
 
@@ -463,6 +463,9 @@ pub struct MessageOptions {
 pub enum SocketMessage {
     /// Create a new window in the same Vivido process.
     CreateWindow(WindowOptions),
+
+    /// Close one window, terminating its terminal without stopping the instance.
+    CloseWindow(IpcCloseWindow),
 
     /// Shut down the Vivido instance, closing every window.
     Quit,
@@ -889,6 +892,20 @@ pub struct IpcTarget {
     /// Window ID. The focused window is used when this is omitted.
     #[clap(short, long, env = "VIVIDO_WINDOW_ID")]
     pub window_id: Option<u64>,
+}
+
+/// Parameters to the `close-window` IPC subcommand.
+#[cfg(any(unix, windows))]
+#[derive(Args, Serialize, Deserialize, Default, Debug, Clone, PartialEq, Eq)]
+pub struct IpcCloseWindow {
+    /// Window ID. The focused window is used when this is omitted.
+    #[clap(short, long, env = "VIVIDO_WINDOW_ID")]
+    pub window_id: Option<u64>,
+
+    /// Kill the child process group first, for children that ignore hangup.
+    #[clap(short, long)]
+    #[serde(default)]
+    pub force: bool,
 }
 
 /// Parameters for a correlated diagnostic snapshot.
@@ -2041,6 +2058,30 @@ mod tests {
             panic!("expected create-window message");
         };
         assert_eq!(window_options.ipc_window_id, Some(5678));
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn parse_close_window() {
+        let options =
+            Options::try_parse_from(["vivido", "msg", "close-window", "-w", "2", "--force"])
+                .unwrap();
+        let Some(Subcommands::Msg(message)) = options.subcommands else {
+            panic!("expected msg subcommand");
+        };
+        assert_eq!(
+            message.message,
+            SocketMessage::CloseWindow(IpcCloseWindow { window_id: Some(2), force: true })
+        );
+
+        let options = Options::try_parse_from(["vivido", "msg", "close-window"]).unwrap();
+        let Some(Subcommands::Msg(message)) = options.subcommands else {
+            panic!("expected msg subcommand");
+        };
+        assert_eq!(
+            message.message,
+            SocketMessage::CloseWindow(IpcCloseWindow { window_id: None, force: false })
+        );
     }
 
     #[cfg(any(unix, windows))]

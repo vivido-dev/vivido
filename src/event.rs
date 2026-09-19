@@ -510,6 +510,27 @@ impl Processor {
         window.restart_terminal_client()
     }
 
+    /// Close one window, terminating its terminal while the instance keeps serving.
+    ///
+    /// The graceful path releases the PTY hold and exits the terminal, so the window leaves
+    /// through the normal `TerminalEvent::Exit` cleanup: pending automation requests fail with
+    /// `pty_closed`, `window_closed` is emitted, and only a headed instance that lost its last
+    /// window exits. With `force`, the child process group is killed first so a child ignoring
+    /// hangup cannot outlive its window; a kill that fails — the child is already gone — never
+    /// blocks the close.
+    #[cfg(any(unix, windows))]
+    pub fn close_window(&mut self, target: WindowId, force: bool) -> Result<(), IpcError> {
+        let window = self
+            .windows
+            .get_mut(&target)
+            .ok_or_else(|| IpcError::new("window_not_found", "terminal window does not exist"))?;
+        if force {
+            let _ = window.signal_process_group(crate::cli::IpcSignalName::Kill);
+        }
+        window.request_close();
+        Ok(())
+    }
+
     /// Look up one terminal window without exposing the processor's window map.
     pub fn window(&self, window_id: WindowId) -> Option<&WindowContext> {
         self.windows.get(&window_id)
@@ -717,10 +738,10 @@ impl Processor {
         }
 
         use crate::cli::{
-            IpcConfig, IpcGetConfig, IpcGetGrid, IpcGetText, IpcInputRoute, IpcKey, IpcMouse,
-            IpcPaste, IpcResize, IpcScreenshot, IpcSetGeometry, IpcSetGeometryBatch, IpcSetLevel,
-            IpcSetVisible, IpcSignal, IpcSubscribe, IpcTarget, IpcTranscript, IpcTyping,
-            IpcWaitCommon, IpcWaitFrame, IpcWaitOutput, IpcWaitSequence, IpcWaitStable,
+            IpcCloseWindow, IpcConfig, IpcGetConfig, IpcGetGrid, IpcGetText, IpcInputRoute, IpcKey,
+            IpcMouse, IpcPaste, IpcResize, IpcScreenshot, IpcSetGeometry, IpcSetGeometryBatch,
+            IpcSetLevel, IpcSetVisible, IpcSignal, IpcSubscribe, IpcTarget, IpcTranscript,
+            IpcTyping, IpcWaitCommon, IpcWaitFrame, IpcWaitOutput, IpcWaitSequence, IpcWaitStable,
             IpcWaitText, WindowOptions,
         };
 
@@ -816,6 +837,25 @@ impl Processor {
                     ),
                 }
                 return;
+            },
+            "close_window" => {
+                let params: IpcCloseWindow = match decode_ipc_params(&request) {
+                    Ok(params) => params,
+                    Err(error) => {
+                        request.connection.error(request.id, error);
+                        return;
+                    },
+                };
+                self.resolve_ipc_target(params.window_id).and_then(|target| {
+                    let window_id = self.windows[&target].ipc_window_id();
+                    self.close_window(target, params.force).map(|()| {
+                        serde_json::json!({
+                            "window_id": window_id,
+                            "closed": true,
+                            "forced": params.force,
+                        })
+                    })
+                })
             },
             "config" => {
                 let params: IpcConfig = match decode_ipc_params(&request) {

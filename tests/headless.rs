@@ -431,6 +431,55 @@ fn a_headless_session_persists_and_is_listed_until_it_is_told_to_quit() {
     assert!(!Path::new(&session.socket).exists(), "the socket survived shutdown");
 }
 
+/// `close-window` removes one window while the session keeps serving the rest.
+#[test]
+#[ignore = "spawns processes and needs a wgpu adapter"]
+fn close_window_removes_one_window_and_keeps_the_session() {
+    let session = Session::start("close", &shell_program());
+
+    let mut create_window = vec![String::from("create-window"), String::from("-e")];
+    create_window.extend(shell_program());
+    let second = session.msg(&create_window);
+    let second: u64 = second.trim().parse().expect("create-window returns a window id");
+
+    let closed = session.msg(&["close-window", "--window-id", &second.to_string()]);
+    let closed: serde_json::Value =
+        serde_json::from_str(&closed).expect("close-window replies with JSON");
+    assert_eq!(closed["window_id"], second);
+    assert_eq!(closed["closed"], true);
+
+    // The reply is sent before the terminal exit event is processed, so wait for the removal.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let windows = session.msg(&["list-windows"]);
+        if !windows.contains(&format!(r#""window_id":{second}"#)) {
+            assert_eq!(
+                windows.matches(r#""window_id""#).count(),
+                1,
+                "exactly one window remains: {windows}"
+            );
+            break;
+        }
+        assert!(Instant::now() < deadline, "closed window never left: {windows}");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    // The session outlives its closed window: the survivor still answers.
+    assert!(session.msg(&["ping"]).contains(r#""pong""#));
+
+    // A force close also removes its window rather than only killing the child.
+    let third = session.msg(&create_window);
+    let third: u64 = third.trim().parse().expect("create-window returns a window id");
+    let forced = session.msg(&["close-window", "--window-id", &third.to_string(), "--force"]);
+    let forced: serde_json::Value =
+        serde_json::from_str(&forced).expect("force close-window replies with JSON");
+    assert_eq!(forced["forced"], true);
+    assert!(session.msg(&["ping"]).contains(r#""pong""#));
+
+    // Closing a window that does not exist is refused, never silently accepted.
+    assert!(!session.try_msg(&["close-window", "--window-id", "424242"]).status.success());
+}
+
 /// Two sessions must be completely independent, including when one is torn down.
 ///
 /// Both windows deliberately carry the same numeric window id — headless ids start from the same

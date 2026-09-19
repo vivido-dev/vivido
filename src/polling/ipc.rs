@@ -60,6 +60,9 @@ const VIVIDO_SOCKET_ENV: &str = "VIVIDO_SOCKET";
 /// Environment variable naming the headless session a client should reach.
 const VIVIDO_SESSION_ENV: &str = "VIVIDO_SESSION";
 
+/// Vivida-side spelling of [`VIVIDO_SESSION_ENV`], honored by the same discovery.
+const VIVIDA_TARGET_ENV: &str = "VIVIDA_TARGET";
+
 /// How this instance describes itself in the `hello` capability document.
 ///
 /// Whether a process is headless, and which session it serves, is fixed at startup, so it is
@@ -87,6 +90,7 @@ pub const METHODS: &[&str] = &[
     "restart_terminal",
     "unsubscribe",
     "create_window",
+    "close_window",
     "config",
     "get_config",
     "typing",
@@ -228,7 +232,9 @@ fn method_class(name: &str) -> (MethodClass, bool) {
         | "set_level" => (MethodClass::Window, true),
         "config" => (MethodClass::Config, true),
         "focus" | "signal" => (MethodClass::Process, true),
-        "quit" | "reset_terminal" | "restart_terminal" => (MethodClass::Lifecycle, true),
+        "quit" | "reset_terminal" | "restart_terminal" | "close_window" => {
+            (MethodClass::Lifecycle, true)
+        },
         _ => (MethodClass::Extension, true),
     }
 }
@@ -1542,6 +1548,7 @@ fn read_client_frame<R: BufRead>(reader: &mut R) -> io::Result<Option<Vec<u8>>> 
 fn message_request(message: &SocketMessage) -> io::Result<(&'static str, Value)> {
     match message {
         SocketMessage::CreateWindow(params) => Ok(("create_window", serialize_params(params)?)),
+        SocketMessage::CloseWindow(params) => Ok(("close_window", serialize_params(params)?)),
         SocketMessage::Quit => Ok(("quit", Value::Object(Default::default()))),
         SocketMessage::Ping => Ok(("ping", json!({}))),
         SocketMessage::ResetTerminal(params) => Ok(("reset_terminal", serialize_params(params)?)),
@@ -1829,6 +1836,7 @@ fn write_cli_result(message: &SocketMessage, result: &Value) -> io::Result<()> {
         | SocketMessage::Ping
         | SocketMessage::ResetTerminal(_)
         | SocketMessage::RestartTerminal(_)
+        | SocketMessage::CloseWindow(_)
         | SocketMessage::ListWindows
         | SocketMessage::Inspect(_)
         | SocketMessage::Diagnose(_)
@@ -1966,7 +1974,11 @@ fn find_socket(socket_path: Option<PathBuf>, target: Option<&str>) -> io::Result
     }
 
     // An explicitly named session must never silently fall through to a different instance.
-    if let Some(target) = target.map(str::to_owned).or_else(|| env::var(VIVIDO_SESSION_ENV).ok()) {
+    if let Some(target) = target
+        .map(str::to_owned)
+        .or_else(|| env::var(VIVIDO_SESSION_ENV).ok())
+        .or_else(|| env::var(VIVIDA_TARGET_ENV).ok())
+    {
         let registry = crate::session::registered_instance(&target)?;
         return connect_checked(&registry.socket).map_err(|err| {
             IoError::new(err.kind(), format!("no running Vivido instance named {target:?}"))
@@ -1979,9 +1991,9 @@ fn find_socket(socket_path: Option<PathBuf>, target: Option<&str>) -> io::Result
         return Ok(socket);
     }
 
-    // A single live headless session is unambiguous, so an unqualified `msg` should reach it.
-    if let Ok(sessions) = crate::session::list_registries()
-        && let [session] = sessions.as_slice()
+    let sessions = crate::session::list_registries().unwrap_or_default();
+    // A single live session is unambiguous, so an unqualified `msg` should reach it.
+    if let [session] = sessions.as_slice()
         && let Ok(socket) = connect_checked(&session.socket)
     {
         return Ok(socket);
@@ -2016,7 +2028,51 @@ fn find_socket(socket_path: Option<PathBuf>, target: Option<&str>) -> io::Result
         }
     }
 
+    if sessions.len() > 1 {
+        return Err(ambiguous_sessions_error(&sessions));
+    }
     Err(IoError::new(ErrorKind::NotFound, "no socket found"))
+}
+
+/// Comparable process start for one registry entry.
+///
+/// Every live instance on a machine reports the same platform variant, so comparing the raw
+/// start value orders sessions oldest-first even though the units differ per platform.
+fn session_birth_rank(session: &crate::session::SessionRegistry) -> u64 {
+    match session.process_birth {
+        crate::session::ProcessBirth::Linux { start_ticks } => start_ticks,
+        crate::session::ProcessBirth::Macos { start_micros } => start_micros,
+        crate::session::ProcessBirth::Windows { creation_time } => creation_time,
+    }
+}
+
+/// Actionable error when an unqualified `msg` matches more than one live session.
+///
+/// The candidates are listed newest-first so the session a tester just started — the usual
+/// intended target — is named first, but no session is picked silently: routing a mutating
+/// command at the wrong instance is worse than refusing.
+fn ambiguous_sessions_error(sessions: &[crate::session::SessionRegistry]) -> IoError {
+    let mut sessions = sessions.to_vec();
+    sessions.sort_by(|left, right| {
+        session_birth_rank(right)
+            .cmp(&session_birth_rank(left))
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    let candidates = sessions
+        .iter()
+        .map(|session| {
+            format!("{:?} (pid {}, {})", session.name, session.pid, session.socket.display())
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    IoError::new(
+        ErrorKind::NotFound,
+        format!(
+            "multiple Vivido sessions found, newest first: {candidates}; \
+             specify --target NAME or --socket PATH, \
+             or set {VIVIDO_SESSION_ENV} or {VIVIDA_TARGET_ENV}"
+        ),
+    )
 }
 
 /// File prefix matching sockets on the current display server.
@@ -2071,6 +2127,56 @@ mod tests {
         assert_eq!(sent, std::env::current_dir().unwrap().join("relative/firmware.bin"));
         assert!(params.get("at").is_none());
         assert_eq!(params["target"]["window_id"], 3, "nested, exactly as `paste` sends it");
+    }
+
+    #[test]
+    fn close_window_is_an_advertised_lifecycle_method() {
+        assert!(METHODS.contains(&"close_window"));
+        assert_eq!(method_class("close_window"), (MethodClass::Lifecycle, true));
+
+        let message = SocketMessage::CloseWindow(crate::cli::IpcCloseWindow {
+            window_id: Some(2),
+            force: true,
+        });
+        let (method, params) = message_request(&message).unwrap();
+        assert_eq!(method, "close_window");
+        assert_eq!(params["window_id"], 2);
+        assert_eq!(params["force"], true);
+
+        // The force flag is server-bound: omitting it must still decode, defaulting to graceful.
+        let decoded: crate::cli::IpcCloseWindow =
+            serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(decoded.window_id, None);
+        assert!(!decoded.force);
+    }
+
+    #[test]
+    fn ambiguous_sessions_name_every_candidate_newest_first() {
+        let registry = |name: &str, pid: u32, start: u64| crate::session::SessionRegistry {
+            schema: 1,
+            name: name.to_owned(),
+            pid,
+            instance_nonce: String::from("nonce"),
+            vivido_version: String::from("test"),
+            protocol_version: 2,
+            endpoint_id: String::from("endpoint"),
+            process_birth: crate::session::ProcessBirth::Linux { start_ticks: start },
+            socket: std::path::PathBuf::from(format!("/tmp/{name}.sock")),
+            headless: true,
+            columns: 80,
+            lines: 24,
+        };
+        let sessions = [registry("hl-old", 100, 10), registry("hl-new", 200, 20)];
+        let error = ambiguous_sessions_error(&sessions);
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        let message = error.to_string();
+        assert!(message.contains("\"hl-old\""), "every candidate is named: {message}");
+        assert!(message.contains("\"hl-new\""), "every candidate is named: {message}");
+        assert!(message.contains("--target"), "the fix is actionable: {message}");
+        assert!(
+            message.find("\"hl-new\"").unwrap() < message.find("\"hl-old\"").unwrap(),
+            "newest session is listed first: {message}"
+        );
     }
 
     #[test]
