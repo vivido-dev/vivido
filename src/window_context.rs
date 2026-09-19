@@ -740,17 +740,6 @@ impl WindowContext {
         // Force the display to process any pending display update.
         self.display.process_renderer_update();
 
-        // Request immediate re-draw if visual bell animation is not finished yet.
-        if !self.display.visual_bell.completed() {
-            // We can get an OS redraw which bypasses Vivido's frame throttling, thus
-            // marking the window as dirty when we don't have frame yet.
-            if self.display.window.has_frame {
-                self.display.window.request_redraw();
-            } else {
-                self.dirty = true;
-            }
-        }
-
         // Redraw the window.
         let terminal = self.terminal.lock();
         let presented = self.display.draw(
@@ -760,6 +749,23 @@ impl WindowContext {
             &self.config,
             &mut self.search_state,
         );
+
+        // Request immediate re-draw if the visual bell or scrollbar animation is not done
+        // yet. This must run after the draw: the scrollbar wakes inside it, when the
+        // terminal's display offset is sampled, so checking earlier would miss the wake
+        // frame and let the fade stall after a single presentation.
+        if !self.display.visual_bell.completed()
+            || self.display.scrollbar.is_animating_at(Instant::now())
+        {
+            // We can get an OS redraw which bypasses Vivido's frame throttling, thus
+            // marking the window as dirty when we don't have frame yet.
+            if self.display.window.has_frame {
+                self.display.window.request_redraw();
+            } else {
+                self.dirty = true;
+            }
+        }
+
         let area = self.vivid_service.overlay_editor_area().map(|(x, y, w, h)| {
             (winit::dpi::PhysicalPosition::new(x, y), winit::dpi::PhysicalSize::new(w, h))
         });

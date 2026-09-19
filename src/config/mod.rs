@@ -447,6 +447,15 @@ mod tests {
     }
 
     #[test]
+    fn scrollbar_defaults_on_and_can_be_disabled() {
+        let config = toml::from_str::<UiConfig>("").unwrap();
+        assert!(config.scrolling.scrollbar);
+
+        let config = toml::from_str::<UiConfig>("[scrolling]\nscrollbar = false\n").unwrap();
+        assert!(!config.scrolling.scrollbar);
+    }
+
+    #[test]
     fn explicit_config_has_precedence_without_discovery() {
         let discovery_called = Cell::new(false);
         let explicit = PathBuf::from("explicit.toml");

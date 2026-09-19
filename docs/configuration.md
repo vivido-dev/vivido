@@ -168,11 +168,13 @@ instance = "Vivido"
 |---|---|---|---|
 | `history` | integer | `10000` | Scrollback lines retained. Maximum `100000`. |
 | `multiplier` | integer | `3` | Lines scrolled per wheel/step increment. |
+| `scrollbar` | boolean | `true` | Show the overlay scrollbar while scrolling, dragging it, or hovering its gutter. Never shown on the alternate screen or over pane overlays. |
 
 ```toml
 [scrolling]
 history = 50000
 multiplier = 3
+scrollbar = true
 ```
 
 ## `font`
