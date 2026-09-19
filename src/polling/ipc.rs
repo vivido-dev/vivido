@@ -689,6 +689,7 @@ fn spawn_connection(
 
     thread::spawn_named("IPC reader", move || {
         let _guard = guard;
+        let _ = event_proxy.send_event(Event::new(EventType::IpcConnect(connection_id), None));
         let connection = IpcConnection { inner };
         let result =
             client_fault::catch(ClientFaultClass::Ipc, "IPC reader worker panicked", || {

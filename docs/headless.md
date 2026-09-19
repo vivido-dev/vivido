@@ -42,11 +42,27 @@ later one, and stops only on `vivido msg quit`, `vivido kill-session`, or a term
 | `--session NAME` | Name the session. Default is `vivido-<pid>`, which is unique by construction. Requires `--headless`. |
 | `--foreground` | Do not detach; block in this terminal until shutdown. Requires `--headless`. |
 | `--headless-size SIZE` | Initial geometry, as `COLUMNSxLINES` or `WIDTHxHEIGHTpx`. Requires `--headless`. |
+| `--ephemeral` | Tear down when the launcher is gone or the last client disconnects. Requires `--headless`. |
 | `-s`, `--socket PATH` | Not needed headless: the session name determines the endpoint. |
 
 `--foreground` is the shape to use under a supervisor, a container entrypoint, or a test harness
 that wants the child's lifetime to be the session's lifetime. It prints the same two `export` lines
 on standard output once the session is serving.
+
+### Ephemeral sessions
+
+```sh
+vivido --headless --ephemeral --session temp_test
+```
+
+An ephemeral session tears itself down — child processes, named pipes/sockets, and registry
+entries, exactly as for `quit` — so background test runs never leak sessions. Teardown fires
+when the watched launcher process terminates (a foreground session watches its parent, which
+is the process that started it), or when the last IPC client has been disconnected for 30
+seconds. The linger tolerates the gaps between one-shot `msg` commands, each of which is its
+own connection; a detached session has no launcher to watch after detaching, so it relies on
+the disconnect trigger alone. A session nobody ever connects to stays up until its launcher
+goes away (foreground) or until it is quit explicitly.
 
 A session name is 1–64 ASCII letters, digits, `.`, `-`, or `_`, and may not start with `.`. The name
 becomes part of a filename and a pipe name, so anything that could escape the runtime directory is

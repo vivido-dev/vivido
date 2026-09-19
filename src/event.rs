@@ -253,6 +253,104 @@ fn update_available_message(version: &semver::Version, bytes: u64) -> String {
     )
 }
 
+/// How long an `--ephemeral` session survives after its last client disconnects.
+///
+/// The linger tolerates the gaps between one-shot client commands (each `msg` invocation is
+/// its own connection); teardown still fires promptly on the scale of leaked sessions.
+#[cfg(any(unix, windows))]
+const EPHEMERAL_LINGER: Duration = Duration::from_secs(30);
+
+/// How often a foreground `--ephemeral` session polls its launcher for liveness.
+#[cfg(any(unix, windows))]
+const EPHEMERAL_LAUNCHER_POLL: Duration = Duration::from_secs(1);
+
+/// Pure `--ephemeral` teardown decision, so the trigger matrix stays unit-testable.
+#[cfg(any(unix, windows))]
+fn ephemeral_exit_due(now: Instant, quiescent_since: Option<Instant>, launcher_dead: bool) -> bool {
+    launcher_dead
+        || quiescent_since
+            .is_some_and(|since| now.saturating_duration_since(since) >= EPHEMERAL_LINGER)
+}
+
+/// PID of the process that launched this instance, watched by a foreground `--ephemeral`
+/// session. Falls back to 0 (never a live launcher) when the PID does not fit.
+#[cfg(any(unix, windows))]
+pub(crate) fn launcher_parent_pid() -> u32 {
+    #[cfg(unix)]
+    {
+        // SAFETY: `getppid` takes no arguments and always succeeds.
+        u32::try_from(unsafe { libc::getppid() }).unwrap_or(0)
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+            CreateToolhelp32Snapshot, PROCESSENTRY32, Process32First, Process32Next,
+            TH32CS_SNAPPROCESS,
+        };
+        // SAFETY: the snapshot handle is checked before use and always closed; `entry`
+        // is a plain struct the API fills after `dwSize` versions it.
+        unsafe {
+            let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+            if snapshot == INVALID_HANDLE_VALUE {
+                return 0;
+            }
+            let own = std::process::id();
+            let mut entry = PROCESSENTRY32 {
+                dwSize: std::mem::size_of::<PROCESSENTRY32>() as u32,
+                ..Default::default()
+            };
+            let mut parent = 0;
+            if Process32First(snapshot, &mut entry) != 0 {
+                loop {
+                    if entry.th32ProcessID == own {
+                        parent = entry.th32ParentProcessID;
+                        break;
+                    }
+                    if Process32Next(snapshot, &mut entry) == 0 {
+                        break;
+                    }
+                }
+            }
+            CloseHandle(snapshot);
+            parent
+        }
+    }
+}
+
+/// Whether a watched launcher PID still names a live process.
+///
+/// An unopenable PID counts as alive: access errors must not tear down a live session, so
+/// only a definitive exit triggers teardown. PID reuse can delay teardown at most until
+/// the recycled PID exits.
+#[cfg(any(unix, windows))]
+fn launcher_is_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        // SAFETY: signal 0 performs only error checking, never delivering a signal.
+        i32::try_from(pid).is_ok_and(|raw| unsafe { libc::kill(raw, 0) == 0 })
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::{
+            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        // SAFETY: the handle is checked before use and always closed; `code` is a plain
+        // `u32` the API fills, and 259 is `STILL_ACTIVE`.
+        unsafe {
+            let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if handle.is_null() {
+                return true;
+            }
+            let mut code = 0u32;
+            let alive = GetExitCodeProcess(handle, &mut code) == 0 || code == 259;
+            CloseHandle(handle);
+            alive
+        }
+    }
+}
+
 /// The event processor.
 ///
 /// Stores some state from received events and dispatches actions when they are
@@ -279,6 +377,25 @@ pub struct Processor {
     /// One scheduled pointer gesture per target window.
     #[cfg(any(unix, windows))]
     paced_gestures: HashMap<WindowId, PacedGesture, RandomState>,
+    /// Live IPC connection IDs, tracked so an `--ephemeral` session can tear itself down
+    /// once its last client is gone.
+    #[cfg(any(unix, windows))]
+    ipc_connections: HashSet<u64, RandomState>,
+    /// Whether an IPC client has ever connected; arms `--ephemeral` disconnect teardown so
+    /// a session that nobody reached yet is not torn down before its first client.
+    #[cfg(any(unix, windows))]
+    ephemeral_client_seen: bool,
+    /// When the last client left an `--ephemeral` session; teardown fires after a linger
+    /// that tolerates the gaps between one-shot client commands.
+    #[cfg(any(unix, windows))]
+    ephemeral_quiescent_since: Option<Instant>,
+    /// Launcher PID watched by a foreground `--ephemeral` session; teardown fires promptly
+    /// when it dies, even if no client ever connected.
+    #[cfg(any(unix, windows))]
+    ephemeral_launcher: Option<u32>,
+    /// Last launcher-liveness check; the OS is polled at most once per second.
+    #[cfg(any(unix, windows))]
+    ephemeral_launcher_checked: Instant,
     /// Bounded window-management requests waiting for an embedding chrome.
     #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     shell_actions: VecDeque<crate::shell::ShellActionRequest>,
@@ -372,6 +489,16 @@ impl Processor {
             host_requests: Vec::new(),
             #[cfg(any(unix, windows))]
             paced_gestures: Default::default(),
+            #[cfg(any(unix, windows))]
+            ipc_connections: Default::default(),
+            #[cfg(any(unix, windows))]
+            ephemeral_client_seen: false,
+            #[cfg(any(unix, windows))]
+            ephemeral_quiescent_since: None,
+            #[cfg(any(unix, windows))]
+            ephemeral_launcher: None,
+            #[cfg(any(unix, windows))]
+            ephemeral_launcher_checked: Instant::now(),
             #[cfg(any(target_os = "linux", target_os = "macos", windows))]
             shell_actions: VecDeque::new(),
             config_monitor,
@@ -630,6 +757,12 @@ impl Processor {
         // Same per-iteration bookkeeping winit drives through `AboutToWait`.
         self.on_about_to_wait(handle);
 
+        #[cfg(any(unix, windows))]
+        self.poll_ephemeral_teardown();
+        if headless.exiting() {
+            return false;
+        }
+
         self.draw_headless(handle);
         true
     }
@@ -655,6 +788,13 @@ impl Processor {
         let deadline = match (scheduled, draw_deadline) {
             (Some(scheduled), Some(draw)) => Some(scheduled.min(draw)),
             (scheduled, draw) => scheduled.or(draw),
+        };
+
+        // An armed linger or a due launcher check must wake the loop even when idle.
+        #[cfg(any(unix, windows))]
+        let deadline = match (deadline, self.ephemeral_wake()) {
+            (Some(deadline), Some(wake)) => Some(deadline.min(wake)),
+            (deadline, wake) => deadline.or(wake),
         };
 
         match deadline {
@@ -753,6 +893,55 @@ impl Processor {
     /// process, so the live-terminal count is the gauge automation watches.
     fn live_pty_count(&self) -> usize {
         self.windows.values().filter(|window| window.automation.exit_status.is_none()).count()
+    }
+
+    /// Record the launcher a foreground `--ephemeral` session watches. A daemon reparented
+    /// by detaching has no meaningful launcher, so detached sessions leave this unset and
+    /// rely on disconnect teardown alone.
+    #[cfg(any(unix, windows))]
+    pub fn set_ephemeral_launcher(&mut self, pid: u32) {
+        self.ephemeral_launcher = Some(pid);
+    }
+
+    /// Ask once per pump whether an `--ephemeral` session must shut down, and request it.
+    ///
+    /// Teardown fires when the last client has been gone for the linger (which tolerates the
+    /// gaps between one-shot client commands) or when the watched launcher is dead. Shutdown
+    /// itself flows through the ordinary event so windows, children, sockets, and the
+    /// registry are cleaned up exactly as for `quit`.
+    #[cfg(any(unix, windows))]
+    fn poll_ephemeral_teardown(&mut self) {
+        if !self.cli_options.ephemeral {
+            return;
+        }
+        let now = Instant::now();
+        let launcher_dead = match self.ephemeral_launcher {
+            Some(pid)
+                if now.duration_since(self.ephemeral_launcher_checked)
+                    >= EPHEMERAL_LAUNCHER_POLL =>
+            {
+                self.ephemeral_launcher_checked = now;
+                !launcher_is_alive(pid)
+            },
+            _ => false,
+        };
+        if ephemeral_exit_due(now, self.ephemeral_quiescent_since, launcher_dead) {
+            let _ = self.proxy.send_event(Event::new(EventType::Shutdown, None));
+        }
+    }
+
+    /// Earliest instant the headless loop must wake for `--ephemeral` bookkeeping: an armed
+    /// linger deadline, or the next launcher-liveness poll.
+    #[cfg(any(unix, windows))]
+    fn ephemeral_wake(&self) -> Option<Instant> {
+        let linger = self.ephemeral_quiescent_since.map(|since| since + EPHEMERAL_LINGER);
+        let launcher = self
+            .ephemeral_launcher
+            .map(|_| self.ephemeral_launcher_checked + EPHEMERAL_LAUNCHER_POLL);
+        match (linger, launcher) {
+            (Some(linger), Some(launcher)) => Some(linger.min(launcher)),
+            (linger, launcher) => linger.or(launcher),
+        }
     }
 
     /// Search one named window, or every window in creation order, for a text pattern.
@@ -2630,6 +2819,13 @@ impl Processor {
             }
         }
         self.automation.disconnect(connection_id);
+        self.ipc_connections.remove(&connection_id);
+        if self.cli_options.ephemeral
+            && self.ephemeral_client_seen
+            && self.ipc_connections.is_empty()
+        {
+            self.ephemeral_quiescent_since.get_or_insert(Instant::now());
+        }
         for window in self.windows.values_mut() {
             if window.cancel_automation_connection(connection_id) {
                 self.scheduler.unschedule(TimerId::new(Topic::ScreenshotReadback, window.id()));
@@ -3831,6 +4027,13 @@ impl Processor {
             #[cfg(any(unix, windows))]
             (EventType::IpcRequest(request), _) => self.handle_ipc_request(event_loop, request),
             #[cfg(any(unix, windows))]
+            (EventType::IpcConnect(connection_id), _) => {
+                self.ipc_connections.insert(connection_id);
+                // A live client cancels a pending linger teardown.
+                self.ephemeral_client_seen = true;
+                self.ephemeral_quiescent_since = None;
+            },
+            #[cfg(any(unix, windows))]
             (EventType::IpcDisconnect(connection_id), _) => {
                 self.handle_ipc_disconnect(event_loop, connection_id);
             },
@@ -4681,6 +4884,8 @@ pub enum EventType {
     ShellAction(crate::shell::ShellAction),
     #[cfg(any(unix, windows))]
     IpcRequest(IpcRequest),
+    #[cfg(any(unix, windows))]
+    IpcConnect(u64),
     #[cfg(any(unix, windows))]
     IpcDisconnect(u64),
     #[cfg(any(unix, windows))]
@@ -5951,6 +6156,7 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                 },
                 #[cfg(any(unix, windows))]
                 EventType::IpcRequest(_)
+                | EventType::IpcConnect(_)
                 | EventType::IpcDisconnect(_)
                 | EventType::ScreenshotReadback
                 | EventType::ScreenshotComplete
@@ -6733,5 +6939,34 @@ mod host_claim_tests {
         assert!(processor.take_host_requests().is_empty());
 
         crate::polling::ipc::publish_host_methods([].iter());
+    }
+}
+
+#[cfg(all(test, any(unix, windows)))]
+mod ephemeral_tests {
+    use super::{EPHEMERAL_LINGER, ephemeral_exit_due, launcher_is_alive, launcher_parent_pid};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn teardown_triggers_cover_linger_and_launcher_death() {
+        let now = Instant::now();
+        let linger_ago = |secs: u64| now.checked_sub(Duration::from_secs(secs));
+        // A dead launcher always tears down, even with clients still connected.
+        assert!(ephemeral_exit_due(now, None, true));
+        assert!(ephemeral_exit_due(now, linger_ago(0), true));
+        // A fresh disconnection is still inside the linger.
+        assert!(!ephemeral_exit_due(now, linger_ago(0), false));
+        assert!(!ephemeral_exit_due(now, linger_ago(EPHEMERAL_LINGER.as_secs() - 1), false));
+        // An expired linger tears down without any launcher signal.
+        assert!(ephemeral_exit_due(now, linger_ago(EPHEMERAL_LINGER.as_secs()), false));
+        assert!(ephemeral_exit_due(now, linger_ago(EPHEMERAL_LINGER.as_secs() + 1), false));
+        // Nothing connected, launcher alive: the session stays up.
+        assert!(!ephemeral_exit_due(now, None, false));
+    }
+
+    #[test]
+    fn launcher_probes_observe_the_current_process() {
+        assert_ne!(launcher_parent_pid(), 0, "every test process has a parent");
+        assert!(launcher_is_alive(std::process::id()), "the test process is alive");
     }
 }

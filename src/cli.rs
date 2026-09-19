@@ -72,6 +72,12 @@ pub struct Options {
     #[clap(long, requires = "headless")]
     pub foreground: bool,
 
+    /// Tear the headless session down when its launcher is gone or its last IPC client
+    /// disconnects, so background test runs never leak sessions. Requires `--headless`.
+    #[cfg(any(unix, windows))]
+    #[clap(long, requires = "headless")]
+    pub ephemeral: bool,
+
     /// Size of the headless window, as COLUMNSxLINES or WIDTHxHEIGHTpx.
     #[cfg(any(unix, windows))]
     #[clap(long, value_name = "SIZE", requires = "headless")]
@@ -2408,6 +2414,25 @@ mod tests {
         assert_eq!(test.report, IpcPlanReport::Ndjson);
         assert_eq!(test.headless_size, HeadlessSize::Cells { columns: 100, lines: 30 });
         assert!(test.shell.is_empty());
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn parse_ephemeral_headless_session() {
+        let options = Options::try_parse_from([
+            "vivido",
+            "--headless",
+            "--ephemeral",
+            "--session",
+            "temp_test",
+        ])
+        .unwrap();
+        assert!(options.headless);
+        assert!(options.ephemeral);
+        assert_eq!(options.session.as_deref(), Some("temp_test"));
+
+        // Ephemeral teardown only means something for a headless session.
+        assert!(Options::try_parse_from(["vivido", "--ephemeral"]).is_err());
     }
 
     #[cfg(any(unix, windows))]

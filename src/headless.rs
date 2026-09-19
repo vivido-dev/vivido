@@ -123,6 +123,8 @@ fn serve(
     let _ = &handle;
 
     let headless_loop = HeadlessLoop::new(pixel_size, HEADLESS_SCALE_FACTOR);
+    let ephemeral = options.ephemeral;
+    let foreground = options.foreground;
     let mut processor = Processor::new_headless(config, options, proxy);
 
     // Build the window before publishing, so the registry records the geometry the session
@@ -140,6 +142,12 @@ fn serve(
     match readiness {
         Some(readiness) => readiness.success(&socket, &session),
         None => print_endpoint(&socket, &session),
+    }
+
+    // A foreground ephemeral session watches its launcher: the parent here is the process
+    // that started this instance, so its death means nobody will ever use the session again.
+    if ephemeral && foreground {
+        processor.set_ephemeral_launcher(crate::event::launcher_parent_pid());
     }
 
     let result = processor.run_headless(&events, &headless_loop);
