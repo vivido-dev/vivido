@@ -1113,6 +1113,12 @@ impl WindowContext {
         self.terminal.lock().is_focused
     }
 
+    /// Apply keyboard focus selected by this window's native or offscreen host.
+    #[cfg(any(unix, windows))]
+    pub fn set_automation_focused(&mut self, focused: bool) {
+        self.terminal.lock().is_focused = focused;
+    }
+
     /// Health of the untrusted client currently attached to this pane.
     #[cfg(any(unix, windows))]
     pub fn client_health(&self) -> ClientHealth {

@@ -589,35 +589,55 @@ impl Processor {
         events: &mpsc::Receiver<Event>,
         headless: &HeadlessLoop,
     ) -> Result<(), Box<dyn Error>> {
-        let handle = LoopHandle::Headless(headless);
-
-        while !headless.exiting() {
-            // Block until the scheduler's next deadline, then drain everything already queued so
-            // a burst of PTY output costs one pass rather than one pass per event.
-            match events.recv_timeout(self.headless_wait()) {
-                Ok(event) => self.on_user_event(handle, event),
-                Err(mpsc::RecvTimeoutError::Timeout) => (),
-                // Every sender is gone, so nothing can wake this loop again.
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
-            }
-            while !headless.exiting()
-                && let Ok(event) = events.try_recv()
-            {
-                self.on_user_event(handle, event);
-            }
-
-            if headless.exiting() {
-                break;
-            }
-
-            // Same per-iteration bookkeeping winit drives through `AboutToWait`.
-            self.on_about_to_wait(handle);
-
-            self.draw_headless(handle);
-        }
-
+        while self.pump_headless(events, headless) {}
         self.on_exiting();
         Ok(())
+    }
+
+    /// Run one headless iteration: a single blocking wait plus per-turn bookkeeping.
+    ///
+    /// Returns false when the loop must stop (exit requested or every sender gone), so an
+    /// embedding host can interleave its own dispatch on the same thread between pumps.
+    /// Finish with [`Self::finish_headless`] to run the shutdown bookkeeping `run_headless`
+    /// performs after its loop.
+    pub fn pump_headless(
+        &mut self,
+        events: &mpsc::Receiver<Event>,
+        headless: &HeadlessLoop,
+    ) -> bool {
+        let handle = LoopHandle::Headless(headless);
+        if headless.exiting() {
+            return false;
+        }
+        // Block until the scheduler's next deadline, then drain everything already queued so
+        // a burst of PTY output costs one pass rather than one pass per event.
+        match events.recv_timeout(self.headless_wait()) {
+            Ok(event) => self.on_user_event(handle, event),
+            Err(mpsc::RecvTimeoutError::Timeout) => (),
+            // Every sender is gone, so nothing can wake this loop again.
+            Err(mpsc::RecvTimeoutError::Disconnected) => return false,
+        }
+        while !headless.exiting()
+            && let Ok(event) = events.try_recv()
+        {
+            self.on_user_event(handle, event);
+        }
+
+        if headless.exiting() {
+            return false;
+        }
+
+        // Same per-iteration bookkeeping winit drives through `AboutToWait`.
+        self.on_about_to_wait(handle);
+
+        self.draw_headless(handle);
+        true
+    }
+
+    /// Shut down after a [`Self::pump_headless`] loop: fail pending automation requests and
+    /// release windows, exactly as `run_headless` does when its loop ends.
+    pub fn finish_headless(&mut self) {
+        self.on_exiting();
     }
 
     /// How long the headless loop may block before it must run again.
@@ -3569,6 +3589,31 @@ impl Processor {
         }
         window.display.window.request_inner_size(size);
         self.handle_embedded_window_event(window_id, WindowEvent::Resized(size));
+    }
+
+    /// Resize a headless window from an embedding host and reflow its grid and PTY.
+    ///
+    /// Headed resizes arrive from the compositor as `Resized`; headless windows have no
+    /// compositor, so this runs the same automation-geometry handshake the `set_geometry`
+    /// IPC path uses and delivers the reflow event directly.
+    #[cfg(any(unix, windows))]
+    pub fn resize_headless_window(
+        &mut self,
+        handle: LoopHandle<'_>,
+        window_id: WindowId,
+        size: PhysicalSize<u32>,
+    ) -> Result<serde_json::Value, IpcError> {
+        let result = self
+            .windows
+            .get(&window_id)
+            .ok_or_else(|| {
+                IpcError::new("window_not_found", "pane is missing from the window set")
+            })?
+            .request_automation_geometry(None, None, Some(size.width), Some(size.height));
+        if result.is_ok() && self.windows[&window_id].display.window.is_headless() {
+            self.on_window_event(handle, window_id, WindowEvent::Resized(size));
+        }
+        result
     }
 
     /// Show or hide an embedded terminal without changing any other window's lifecycle state.
