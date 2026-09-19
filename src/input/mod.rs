@@ -41,7 +41,7 @@ use crate::display::hint::HintMatch;
 use crate::display::window::{ImeInhibitor, Window};
 use crate::display::{Display, SizeInfo};
 use crate::event::{ClickState, Event, EventType, Mouse, TouchPurpose, TouchZoom};
-use crate::message_bar::{self, Message};
+use crate::message_bar::{self, Message, MessageType};
 use crate::scheduler::{Scheduler, TimerId, Topic};
 
 pub mod keyboard;
@@ -79,6 +79,13 @@ fn next_click_state(mouse: &Mouse, button: MouseButton, point: Point, now: Insta
         // A fourth click matches no arm and so restarts the sequence at a single click.
         _ => ClickState::Click,
     }
+}
+
+fn is_update_notice(message: Option<&Message>) -> bool {
+    message.is_some_and(|message| {
+        message.ty() == MessageType::Info
+            && message.target().map(String::as_str) == Some(crate::event::UPDATE_MESSAGE_TARGET)
+    })
 }
 
 fn selection_clipboards(button: MouseButton) -> &'static [ClipboardType] {
@@ -192,6 +199,8 @@ pub trait ActionContext<T: EventListener> {
     fn change_font_size(&mut self, _delta: f32) {}
     fn reset_font_size(&mut self) {}
     fn terminal_recovery(&mut self) {}
+    fn check_for_updates(&self) {}
+    fn install_update(&self) {}
     fn pop_message(&mut self) {}
     fn message(&self) -> Option<&Message>;
     fn config(&self) -> &UiConfig;
@@ -318,6 +327,7 @@ impl<T: EventListener> Execute<T> for Action {
             Action::DecreaseFontSize => ctx.change_font_size(-FONT_SIZE_STEP),
             Action::ResetFontSize => ctx.reset_font_size(),
             Action::TerminalRecovery => ctx.terminal_recovery(),
+            Action::CheckForUpdates => ctx.check_for_updates(),
             Action::ScrollPageUp
             | Action::ScrollPageDown
             | Action::ScrollHalfPageUp
@@ -1048,6 +1058,10 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
             let current_lines = self.ctx.message().map_or(0, |m| m.text(&size).len());
 
             self.ctx.clear_selection();
+            if self.update_notice_active() {
+                self.ctx.install_update();
+                return;
+            }
             self.ctx.pop_message();
 
             // Reset cursor when message bar height changed or all messages are gone.
@@ -1129,13 +1143,18 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
 
         if self.ctx.message().is_none() || (mouse.y <= terminal_end) {
             None
-        } else if mouse.y <= terminal_end + size.cell_height() as usize
-            && point.column + message_bar::CLOSE_BUTTON_TEXT.len() >= size.columns()
+        } else if self.update_notice_active()
+            || (mouse.y <= terminal_end + size.cell_height() as usize
+                && point.column + message_bar::CLOSE_BUTTON_TEXT.len() >= size.columns())
         {
             Some(CursorIcon::Pointer)
         } else {
             Some(CursorIcon::Default)
         }
+    }
+
+    fn update_notice_active(&self) -> bool {
+        is_update_notice(self.ctx.message())
     }
 
     /// Icon state of the cursor.
@@ -1313,6 +1332,21 @@ mod tests {
         assert_eq!(selection_clipboards(MouseButton::Left), &SELECTION_CLIPBOARDS);
         assert_eq!(selection_clipboards(MouseButton::Right), &SELECTION_CLIPBOARDS);
         assert!(selection_clipboards(MouseButton::Middle).is_empty());
+    }
+
+    #[test]
+    fn only_targeted_info_messages_activate_update_installation() {
+        let mut update = Message::new("Vivido 1.0 is available".into(), MessageType::Info);
+        update.set_target(crate::event::UPDATE_MESSAGE_TARGET.into());
+        assert!(is_update_notice(Some(&update)));
+
+        let mut warning = Message::new("Vivido 1.0 is available".into(), MessageType::Warning);
+        warning.set_target(crate::event::UPDATE_MESSAGE_TARGET.into());
+        assert!(!is_update_notice(Some(&warning)));
+
+        let information = Message::new("Vivido is up to date".into(), MessageType::Info);
+        assert!(!is_update_notice(Some(&information)));
+        assert!(!is_update_notice(None));
     }
 
     #[test]

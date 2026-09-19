@@ -454,7 +454,7 @@ Each binding needs a `key`, optional `mods` and `mode`, and one of `action`, `ch
 Window / app: `Quit`, `Hide`, `HideOtherApplications` (macOS), `Minimize`, `ToggleFullscreen`,
 `ToggleMaximized`, `ToggleSimpleFullscreen` (macOS), `SpawnNewInstance`, `CreateNewWindow`,
 `CreateNewTab`, `SelectNextTab`, `SelectPreviousTab`, `SelectTab1`…`SelectTab9`,
-`SelectLastTab`.
+`SelectLastTab`, `CheckForUpdates`.
 
 Clipboard / selection: `Copy`, `Paste`, `CopySelection`, `PasteSelection`, `ClearSelection`.
 
@@ -471,11 +471,12 @@ Misc: `ClearHistory`, `ClearLogNotice`, `ReceiveChar`, `None`.
 
 > There is no vi mode, so vi-motion, vi-cursor, and vi-selection actions do not exist in Vivido.
 
-### Default Windows/Linux tab bindings
+### Default Windows/Linux app and tab bindings
 
 | Keys | Action |
 |---|---|
 | `Ctrl+Shift+T` | Create and activate a tab |
+| `Ctrl+Shift+U` | Check for Vivido updates |
 | `Ctrl+Shift+W` | Close the active tab |
 | `Ctrl+Tab` / `Ctrl+Shift+Tab` | Select the next / previous tab, wrapping at either end |
 | `Alt+1`…`Alt+8` | Select the matching tab from the left |

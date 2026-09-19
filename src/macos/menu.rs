@@ -18,6 +18,7 @@ pub enum MenuCommand {
     Paste,
     Find,
     Clear,
+    CheckForUpdates,
 }
 
 struct MenuTargetIvars {
@@ -63,6 +64,11 @@ define_class!(
             self.send(MenuCommand::Clear);
         }
 
+        #[unsafe(method(checkForUpdates:))]
+        fn check_for_updates(&self, _sender: &AnyObject) {
+            self.send(MenuCommand::CheckForUpdates);
+        }
+
         #[unsafe(method(openDocumentation:))]
         fn open_documentation(&self, _sender: &AnyObject) {
             let Some(url) = NSURL::URLWithString(ns_string!("https://vivido.dev/docs")) else {
@@ -104,6 +110,7 @@ pub(crate) fn install(proxy: EventSink) {
     }
 
     let target = MenuTarget::new(proxy);
+    let update_in_app_menu = add_check_for_updates_to_app_menu(mtm, &menu_bar, &target);
 
     let file_menu = NSMenu::initWithTitle(mtm.alloc(), ns_string!("File"));
     add_target_item(
@@ -241,8 +248,45 @@ pub(crate) fn install(proxy: EventSink) {
         None,
         &target,
     );
+    if !update_in_app_menu {
+        add_target_item(
+            mtm,
+            &help_menu,
+            ns_string!("Check for Updates…"),
+            sel!(checkForUpdates:),
+            None,
+            &target,
+        );
+    }
     add_submenu(mtm, &menu_bar, ns_string!("Help"), &help_menu);
     app.setHelpMenu(Some(&help_menu));
+}
+
+fn add_check_for_updates_to_app_menu(
+    mtm: MainThreadMarker,
+    menu_bar: &NSMenu,
+    target: &MenuTarget,
+) -> bool {
+    let Some(app_menu) = menu_bar.itemAtIndex(0).and_then(|item| item.submenu()) else {
+        return false;
+    };
+
+    for index in 0..app_menu.numberOfItems() {
+        let Some(item) = app_menu.itemAtIndex(index) else { continue };
+        if item.action() != Some(sel!(terminate:)) {
+            continue;
+        }
+
+        let update_item =
+            menu_item(mtm, ns_string!("Check for Updates…"), sel!(checkForUpdates:), None);
+        // SAFETY: `target` implements `checkForUpdates:` with the standard single-sender
+        // signature used by this menu item.
+        unsafe { update_item.setTarget(Some(target)) };
+        app_menu.insertItem_atIndex(&update_item, index);
+        return true;
+    }
+
+    false
 }
 
 fn command_key(key: &NSString) -> KeyEquivalent<'_> {

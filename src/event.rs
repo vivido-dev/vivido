@@ -167,7 +167,10 @@ const HEADLESS_IDLE_WAIT: Duration = Duration::from_millis(100);
 const FILE_DROP_MESSAGE_TARGET: &str = "vivid-file-drop";
 
 /// Message-bar target used to replace the current update status.
-const UPDATE_MESSAGE_TARGET: &str = "vivido-update";
+pub(crate) const UPDATE_MESSAGE_TARGET: &str = "vivido-update";
+
+/// Message-bar target used for non-actionable update status on platforms without dialogs.
+const UPDATE_INFORMATION_MESSAGE_TARGET: &str = "vivido-update-information";
 
 /// Delay before a quiet startup check, keeping update I/O off the startup path.
 const UPDATE_STARTUP_DELAY: Duration = Duration::from_secs(1);
@@ -194,6 +197,7 @@ fn menu_effect(command: MenuCommand) -> MenuEffect {
         MenuCommand::Paste => MenuEffect::Action(Action::Paste),
         MenuCommand::Find => MenuEffect::Action(Action::SearchForward),
         MenuCommand::Clear => MenuEffect::Clear,
+        MenuCommand::CheckForUpdates => MenuEffect::Action(Action::CheckForUpdates),
     }
 }
 
@@ -2949,14 +2953,18 @@ impl Processor {
             return;
         }
 
-        if !self.cli_options.headless
-            && self.config.updates.enabled
-            && self.config.updates.startup_check
-        {
-            self.start_update_check(false, Some(UPDATE_STARTUP_DELAY));
+        if !self.cli_options.headless {
+            self.start_quiet_update_check();
         }
 
         info!("Initialisation complete");
+    }
+
+    /// Start the configured quiet update check for a graphical embedding host.
+    pub fn start_quiet_update_check(&mut self) {
+        if self.config.updates.enabled && self.config.updates.startup_check {
+            self.start_update_check(false, Some(UPDATE_STARTUP_DELAY));
+        }
     }
 
     fn start_update_check(&mut self, manual: bool, delay: Option<Duration>) {
@@ -3152,6 +3160,7 @@ impl Processor {
     fn replace_update_message(&mut self, text: String, ty: MessageType) {
         for window in self.windows.values_mut() {
             window.message_buffer.remove_target(UPDATE_MESSAGE_TARGET);
+            window.message_buffer.remove_target(UPDATE_INFORMATION_MESSAGE_TARGET);
             let mut message = Message::new(text.clone(), ty);
             message.set_target(UPDATE_MESSAGE_TARGET.into());
             window.message_buffer.push(message);
@@ -3173,7 +3182,15 @@ impl Processor {
         update::information(title, message);
 
         #[cfg(not(any(windows, target_os = "macos")))]
-        self.replace_update_message(format!("{title}: {message}"), MessageType::Info);
+        for window in self.windows.values_mut() {
+            window.message_buffer.remove_target(UPDATE_MESSAGE_TARGET);
+            window.message_buffer.remove_target(UPDATE_INFORMATION_MESSAGE_TARGET);
+            let mut notice = Message::new(format!("{title}: {message}"), MessageType::Info);
+            notice.set_target(UPDATE_INFORMATION_MESSAGE_TARGET.into());
+            window.message_buffer.push(notice);
+            window.dirty = true;
+            window.display.window.request_redraw();
+        }
     }
 
     /// Claim automation methods for the embedding host.
@@ -4829,6 +4846,18 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
             .send_event(Event::new(EventType::Terminal(TerminalEvent::RecoveryPrompt), None));
     }
 
+    fn check_for_updates(&self) {
+        let _ = self
+            .event_proxy
+            .send_event(Event::new(EventType::Update(UpdateEvent::CheckRequested), None));
+    }
+
+    fn install_update(&self) {
+        let _ = self
+            .event_proxy
+            .send_event(Event::new(EventType::Update(UpdateEvent::InstallRequested), None));
+    }
+
     #[inline]
     fn pop_message(&mut self) {
         if !self.message_buffer.is_empty() {
@@ -6312,6 +6341,7 @@ mod macos_menu_tests {
             (MenuCommand::Copy, Action::Copy),
             (MenuCommand::Paste, Action::Paste),
             (MenuCommand::Find, Action::SearchForward),
+            (MenuCommand::CheckForUpdates, Action::CheckForUpdates),
         ];
 
         for (command, action) in expected {

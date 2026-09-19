@@ -123,6 +123,9 @@ pub enum Action {
     /// Open the host-owned terminal recovery prompt.
     TerminalRecovery,
 
+    /// Check for a Vivido update.
+    CheckForUpdates,
+
     /// Scroll exactly one page up.
     ScrollPageUp,
 
@@ -412,6 +415,7 @@ fn common_keybindings() -> Vec<KeyBinding> {
         "f",    ModifiersState::CONTROL | ModifiersState::SHIFT, ~BindingMode::SEARCH;                   Action::SearchForward;
         "b",    ModifiersState::CONTROL | ModifiersState::SHIFT, ~BindingMode::SEARCH;                   Action::SearchBackward;
         "t",    ModifiersState::CONTROL | ModifiersState::SHIFT;                                         Action::CreateNewTab;
+        "u",    ModifiersState::CONTROL | ModifiersState::SHIFT;                                         Action::CheckForUpdates;
         "w",    ModifiersState::CONTROL | ModifiersState::SHIFT;                                         Action::Quit;
         Tab,    ModifiersState::CONTROL;                                                                  Action::SelectNextTab;
         Tab,    ModifiersState::CONTROL | ModifiersState::SHIFT;                                          Action::SelectPreviousTab;
@@ -1099,6 +1103,7 @@ impl_config_deserialize_enum!(Action {
     DecreaseFontSize,
     ResetFontSize,
     TerminalRecovery,
+    CheckForUpdates,
     ScrollPageUp,
     ScrollPageDown,
     ScrollHalfPageUp,
@@ -1449,6 +1454,18 @@ mod tests {
                 binding.trigger == trigger && binding.mods == mods && binding.action == action
             }));
         }
+    }
+
+    #[test]
+    fn non_macos_update_check_uses_ctrl_shift_u() {
+        let trigger =
+            BindingKey::Keycode { key: Key::Character("u".into()), location: KeyLocation::Any };
+
+        assert!(common_keybindings().iter().any(|binding| {
+            binding.trigger == trigger
+                && binding.mods == ModifiersState::CONTROL | ModifiersState::SHIFT
+                && binding.action == Action::CheckForUpdates
+        }));
     }
 
     #[test]
