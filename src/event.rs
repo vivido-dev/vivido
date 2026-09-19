@@ -805,7 +805,7 @@ impl Processor {
         }
 
         use crate::cli::{
-            IpcCloseWindow, IpcConfig, IpcFindText, IpcGetConfig, IpcGetGrid, IpcGetText,
+            IpcCloseWindow, IpcConfig, IpcExec, IpcFindText, IpcGetConfig, IpcGetGrid, IpcGetText,
             IpcInputRoute, IpcKey, IpcMouse, IpcPaste, IpcResize, IpcScreenshot, IpcSetGeometry,
             IpcSetGeometryBatch, IpcSetLevel, IpcSetVisible, IpcSignal, IpcSubscribe, IpcTarget,
             IpcTranscript, IpcTyping, IpcWaitCommon, IpcWaitFrame, IpcWaitOutput, IpcWaitSequence,
@@ -1547,6 +1547,41 @@ impl Processor {
                     },
                 };
                 self.find_text_matches(&params)
+            },
+            "exec" => {
+                let params: IpcExec = match decode_ipc_params(&request) {
+                    Ok(params) => params,
+                    Err(error) => {
+                        request.connection.error(request.id, error);
+                        return;
+                    },
+                };
+                if params.command.is_empty() {
+                    Err(IpcError::new("invalid_params", "command must not be empty"))
+                } else if params.command.len() > crate::exec::MAX_EXEC_COMMAND_BYTES {
+                    Err(IpcError::new("invalid_params", "command exceeds 64 KiB"))
+                } else if params.timeout == 0 || params.timeout > crate::exec::MAX_EXEC_TIMEOUT_MS {
+                    Err(IpcError::new("invalid_params", "timeout must be 1 ms through 24 hours"))
+                } else {
+                    match self.resolve_ipc_target(params.window_id) {
+                        Ok(target) => {
+                            // The worker owns the whole wait: the event loop stays responsive
+                            // while the command runs, and the reply arrives when it completes.
+                            let cwd = self.windows[&target].current_directory();
+                            match crate::exec::spawn_exec_command(
+                                request.connection.clone(),
+                                request.id,
+                                params.command,
+                                cwd,
+                                params.timeout,
+                            ) {
+                                Ok(()) => return,
+                                Err(error) => Err(IpcError::new("exec_failed", error.to_string())),
+                            }
+                        },
+                        Err(error) => Err(error),
+                    }
+                }
             },
             "screenshot" => {
                 let params: IpcScreenshot = match decode_ipc_params(&request) {

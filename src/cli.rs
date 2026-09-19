@@ -411,6 +411,12 @@ pub struct IpcTest {
     #[clap(long = "set", value_name = "KEY=VALUE")]
     pub set: Vec<String>,
 
+    /// Write a diagnostic bundle per failed step (frame.png, grid.json, transcript.bin,
+    /// presenter_trace.json, metadata.json). Secrets are masked in text artifacts; pixel
+    /// data in frame.png is not.
+    #[clap(long, value_name = "DIR", value_hint = ValueHint::DirPath)]
+    pub on_failure_dump: Option<PathBuf>,
+
     /// Shell program for the session's initial window; the headless default when omitted.
     #[clap(last = true, value_name = "SHELL")]
     pub shell: Vec<String>,
@@ -557,6 +563,9 @@ pub enum SocketMessage {
     /// Find pattern matches with cell and pixel rectangles.
     FindText(IpcFindText),
 
+    /// Run one shell command in a window's working directory and report its result.
+    Exec(IpcExec),
+
     /// Capture the last displayed terminal frame.
     Screenshot(IpcScreenshot),
 
@@ -670,6 +679,12 @@ pub struct IpcRunPlan {
     /// environments for secrets, which the plan masks in reports via `secrets` regardless.
     #[clap(long = "set", value_name = "KEY=VALUE")]
     pub set: Vec<String>,
+
+    /// Write a diagnostic bundle per failed step (frame.png, grid.json, transcript.bin,
+    /// presenter_trace.json, metadata.json). Secrets are masked in text artifacts; pixel
+    /// data in frame.png is not.
+    #[clap(long, value_name = "DIR", value_hint = ValueHint::DirPath)]
+    pub on_failure_dump: Option<PathBuf>,
 }
 
 /// Parameters to the client-side `capture` composite command.
@@ -1038,6 +1053,32 @@ pub struct IpcFindText {
 #[cfg(any(unix, windows))]
 const fn default_find_text_matches() -> u16 {
     50
+}
+
+/// Parameters to the `exec` IPC subcommand.
+#[cfg(any(unix, windows))]
+#[derive(Args, Serialize, Deserialize, Default, Debug, Clone, PartialEq, Eq)]
+pub struct IpcExec {
+    /// Shell command to run in the target window's working directory.
+    #[clap(long)]
+    pub command: String,
+
+    /// Window whose working directory scopes the command.
+    ///
+    /// The focused window is used when no ID is specified.
+    #[clap(short, long, env = "VIVIDO_WINDOW_ID")]
+    #[serde(default)]
+    pub window_id: Option<u64>,
+
+    /// Maximum wait for completion.
+    #[clap(long, default_value = "60s", value_parser = parse_ipc_duration)]
+    #[serde(default = "default_exec_timeout")]
+    pub timeout: u64,
+}
+
+#[cfg(any(unix, windows))]
+const fn default_exec_timeout() -> u64 {
+    crate::exec::DEFAULT_EXEC_TIMEOUT_MS
 }
 
 /// Parameters to the `screenshot` IPC subcommand.
@@ -2350,6 +2391,7 @@ mod tests {
                 artifacts_dir: Some(PathBuf::from("artifacts")),
                 shell: vec![String::from("sh"), String::from("-c"), String::from("echo hi"),],
                 set: Vec::new(),
+                on_failure_dump: None,
             }
         );
 
@@ -2805,6 +2847,18 @@ mod tests {
         };
         assert_eq!(plan.file, Some(PathBuf::from("plan.json")));
         assert_eq!(plan.set, ["USER=root".to_owned(), "TOKEN=hunter2".to_owned()]);
+        assert_eq!(plan.on_failure_dump, None);
+
+        let options =
+            Options::try_parse_from(["vivido", "msg", "run-plan", "--on-failure-dump", "dumps"])
+                .unwrap();
+        let Some(Subcommands::Msg(message)) = options.subcommands else {
+            panic!("expected msg subcommand");
+        };
+        let SocketMessage::RunPlan(plan) = message.message else {
+            panic!("expected run-plan message");
+        };
+        assert_eq!(plan.on_failure_dump, Some(PathBuf::from("dumps")));
 
         let options =
             Options::try_parse_from(["vivido", "test", "--set", "A=1", "--", "sh"]).unwrap();
@@ -2813,6 +2867,49 @@ mod tests {
         };
         assert_eq!(test.set, ["A=1".to_owned()]);
         assert_eq!(test.shell, ["sh".to_owned()]);
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn parse_exec_message() {
+        let options = Options::try_parse_from([
+            "vivido",
+            "msg",
+            "exec",
+            "--window-id",
+            "7",
+            "--command",
+            "cargo check",
+            "--timeout",
+            "5s",
+        ])
+        .unwrap();
+        let Some(Subcommands::Msg(message)) = options.subcommands else {
+            panic!("expected msg subcommand");
+        };
+        assert_eq!(
+            message.message,
+            SocketMessage::Exec(IpcExec {
+                command: "cargo check".to_owned(),
+                window_id: Some(7),
+                timeout: 5_000,
+            })
+        );
+
+        // Defaults wait one minute in the focused window.
+        let options =
+            Options::try_parse_from(["vivido", "msg", "exec", "--command", "true"]).unwrap();
+        let Some(Subcommands::Msg(message)) = options.subcommands else {
+            panic!("expected msg subcommand");
+        };
+        assert_eq!(
+            message.message,
+            SocketMessage::Exec(IpcExec {
+                command: "true".to_owned(),
+                window_id: None,
+                timeout: 60_000,
+            })
+        );
     }
 
     #[cfg(any(unix, windows))]

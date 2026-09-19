@@ -19,6 +19,7 @@ pub mod config;
 mod daemon;
 pub mod display;
 pub mod event;
+mod exec;
 mod headless;
 mod input;
 mod logging;

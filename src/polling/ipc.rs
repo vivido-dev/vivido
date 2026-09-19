@@ -123,6 +123,7 @@ pub const METHODS: &[&str] = &[
     "set_level",
     "focus",
     "signal",
+    "exec",
     "list_windows",
     "inspect",
     "diagnose",
@@ -252,7 +253,7 @@ fn method_class(name: &str) -> (MethodClass, bool) {
         "create_window" | "resize" | "set_geometry" | "set_geometry_batch" | "set_visible"
         | "set_level" => (MethodClass::Window, true),
         "config" => (MethodClass::Config, true),
-        "focus" | "signal" => (MethodClass::Process, true),
+        "focus" | "signal" | "exec" => (MethodClass::Process, true),
         "quit" | "reset_terminal" | "restart_terminal" | "close_window" => {
             (MethodClass::Lifecycle, true)
         },
@@ -852,7 +853,7 @@ fn hello_result() -> Value {
             "unsupported_version", "invalid_request", "invalid_params",
             "duplicate_request_id", "limit_exceeded", "window_not_found",
             "no_focused_window", "unsupported", "timeout", "sequence_gap", "pty_closed",
-            "resize_mismatch", "focus_denied", "regex_invalid", "subscription_overflow",
+            "resize_mismatch", "focus_denied", "regex_invalid", "subscription_overflow", "exec_failed",
             "invalid_state", "client_fault"
         ],
         "limits": {
@@ -1845,6 +1846,42 @@ fn run_plan(
                 ) {
                     return (Err(error), records);
                 }
+                if let Some(dir) = &options.on_failure_dump {
+                    let window = assert_window_id(step, &aliases).or_else(|| {
+                        client
+                            .request("list_windows", json!({}))
+                            .ok()
+                            .and_then(|reply| {
+                                reply.get("windows").and_then(Value::as_array)?.first().cloned()
+                            })
+                            .and_then(|window| window.get("window_id").and_then(Value::as_u64))
+                    });
+                    match window {
+                        Some(window) => {
+                            let files = write_failure_dump(
+                                &mut client,
+                                dir,
+                                &step.id,
+                                &step.method,
+                                window,
+                                &message,
+                                &secrets,
+                            );
+                            if !files.is_empty()
+                                && let Err(error) = write_plan_event(
+                                    &mut output,
+                                    json!({"type":"failure_dump","id":step.id,"dir":dir,"files":files}),
+                                )
+                            {
+                                return (Err(error), records);
+                            }
+                        },
+                        None => eprintln!(
+                            "run-plan: step {:?} failed but the session has no window to dump",
+                            step.id
+                        ),
+                    }
+                }
                 let window = assert_window_id(step, &aliases);
                 records.push(PlanStepRecord::error(step, &message, window, &step_started));
                 if step.on_error == IpcPlanErrorPolicy::Abort {
@@ -2060,6 +2097,7 @@ pub fn run_test(options: &IpcTest) -> io::Result<()> {
         report: options.report,
         output: options.output.clone(),
         set: options.set.clone(),
+        on_failure_dump: options.on_failure_dump.clone(),
     };
     let (outcome, records) = run_plan(None, Some(&name), &plan);
     if let Some(failed) =
@@ -2236,6 +2274,117 @@ fn capture_test_failure(socket: &Path, session: &str, failed: &PlanStepRecord, d
             eprintln!("vivido test: screenshot capture for {:?} failed: {error}", failed.id);
         },
     }
+}
+
+/// Replace secret byte strings with `***` in raw dumps.
+fn sanitize_bytes(bytes: Vec<u8>, secrets: &[String]) -> Vec<u8> {
+    if secrets.is_empty() {
+        return bytes;
+    }
+    let mut bytes = bytes;
+    for secret in secrets {
+        if secret.is_empty() {
+            continue;
+        }
+        let needle = secret.as_bytes();
+        let mut sanitized = Vec::with_capacity(bytes.len());
+        let mut rest = bytes.as_slice();
+        while let Some(at) = rest.windows(needle.len()).position(|window| window == needle) {
+            sanitized.extend_from_slice(&rest[..at]);
+            sanitized.extend_from_slice(PLAN_SECRET_MASK.as_bytes());
+            rest = &rest[at + needle.len()..];
+        }
+        sanitized.extend_from_slice(rest);
+        bytes = sanitized;
+    }
+    bytes
+}
+
+/// Write the `--on-failure-dump` bundle for one failed step: frame PNG, redacted grid JSON,
+/// sanitized raw transcript, presenter trace, and metadata.
+///
+/// Best-effort throughout: every failure warns on stderr and the bundle keeps what it got,
+/// never masking the plan error it documents. Returns the file names actually written.
+fn write_failure_dump(
+    client: &mut AutomationClient,
+    dir: &Path,
+    step_id: &str,
+    method: &str,
+    window_id: u64,
+    message: &str,
+    secrets: &[String],
+) -> Vec<String> {
+    let mut written = Vec::new();
+    if let Err(error) = fs::create_dir_all(dir) {
+        eprintln!("run-plan: cannot create failure dump dir {}: {error}", dir.display());
+        return written;
+    }
+    let path = |name: &str| dir.join(format!("{step_id}.{name}"));
+    let mut write_file = |name: &str, bytes: &[u8]| match fs::write(path(name), bytes) {
+        Ok(()) => written.push(format!("{step_id}.{name}")),
+        Err(error) => {
+            eprintln!("run-plan: cannot write failure dump {}: {error}", path(name).display());
+        },
+    };
+    // Step IDs are restricted to ASCII alphanumerics, `_`, and `-`, so the file names are safe.
+    match client.request("screenshot", json!({"window_id": window_id})) {
+        Ok(reply) => match reply.get("path").and_then(Value::as_str) {
+            Some(tmp) => match fs::read(tmp) {
+                Ok(bytes) => {
+                    write_file("frame.png", &bytes);
+                    let _ = fs::remove_file(tmp);
+                },
+                Err(error) => eprintln!("run-plan: cannot read screenshot {tmp}: {error}"),
+            },
+            None => eprintln!("run-plan: screenshot reply is missing its path"),
+        },
+        Err(error) => eprintln!("run-plan: failure dump screenshot failed: {error}"),
+    }
+    match client.request("get_grid", json!({"window_id": window_id})) {
+        Ok(mut grid) => {
+            redact_plan_value(&mut grid, secrets);
+            write_file(
+                "grid.json",
+                &serde_json::to_vec_pretty(&grid).unwrap_or_else(|_| grid.to_string().into_bytes()),
+            );
+        },
+        Err(error) => eprintln!("run-plan: failure dump grid failed: {error}"),
+    }
+    match client.request(
+        "transcript",
+        json!({"max_bytes": 1_048_576, "raw": true, "target": {"window_id": window_id}}),
+    ) {
+        Ok(reply) => match reply.get("data").and_then(Value::as_str) {
+            Some(encoded) => {
+                use base64::engine::Engine as _;
+                match base64::engine::general_purpose::STANDARD.decode(encoded) {
+                    Ok(bytes) => write_file("transcript.bin", &sanitize_bytes(bytes, secrets)),
+                    Err(error) => eprintln!("run-plan: transcript dump is not base64: {error}"),
+                }
+            },
+            None => eprintln!("run-plan: transcript reply is missing bounded data"),
+        },
+        Err(error) => eprintln!("run-plan: failure dump transcript failed: {error}"),
+    }
+    match client.request("vivid_trace", json!({"window_id": window_id, "tail": true, "limit": 128}))
+    {
+        Ok(trace) => write_file(
+            "presenter_trace.json",
+            &serde_json::to_vec_pretty(&trace).unwrap_or_else(|_| trace.to_string().into_bytes()),
+        ),
+        Err(error) => eprintln!("run-plan: presenter trace unavailable for failure dump: {error}"),
+    }
+    write_file(
+        "metadata.json",
+        &serde_json::to_vec_pretty(&json!({
+            "window_id": window_id,
+            "step_id": step_id,
+            "method": method,
+            "error": message,
+        }))
+        .unwrap_or_default(),
+    );
+    written
 }
 
 /// Window to capture: the failed assertion's window, else the session's first window.
@@ -2530,6 +2679,7 @@ fn message_request(message: &SocketMessage) -> io::Result<(&'static str, Value)>
         SocketMessage::Typing(params) => Ok(("typing", serialize_params(params)?)),
         SocketMessage::GetText(params) => Ok(("get_text", serialize_params(params)?)),
         SocketMessage::FindText(params) => Ok(("find_text", serialize_params(params)?)),
+        SocketMessage::Exec(params) => Ok(("exec", serialize_params(params)?)),
         SocketMessage::Screenshot(params) => Ok(("screenshot", serialize_params(params)?)),
         SocketMessage::Capabilities | SocketMessage::RunPlan(_) | SocketMessage::Capture(_) => {
             unreachable!("client-only automation command")
@@ -2655,6 +2805,17 @@ fn validate_message(message: &SocketMessage) -> io::Result<()> {
         && params.rows.is_some_and(|rows| rows == 0 || rows > 1000)
     {
         return Err(IoError::new(ErrorKind::InvalidInput, "row count must be between 1 and 1000"));
+    }
+    if let SocketMessage::Exec(params) = message {
+        if params.command.len() > crate::exec::MAX_EXEC_COMMAND_BYTES {
+            return Err(IoError::new(ErrorKind::InvalidInput, "exec command exceeds 64 KiB"));
+        }
+        if params.timeout == 0 || params.timeout > crate::exec::MAX_EXEC_TIMEOUT_MS {
+            return Err(IoError::new(
+                ErrorKind::InvalidInput,
+                "exec timeout must be 1 ms through 24 hours",
+            ));
+        }
     }
     if let SocketMessage::Resize(params) = message
         && !matches!(
@@ -2821,6 +2982,7 @@ fn write_cli_result(message: &SocketMessage, result: &Value) -> io::Result<()> {
         | SocketMessage::Transcript(_)
         | SocketMessage::DropFile(_)
         | SocketMessage::FindText(_)
+        | SocketMessage::Exec(_)
         | SocketMessage::Subscribe(_) => write_json_to(&mut stdout, result),
         SocketMessage::Typing(params) if params.report => write_json_to(&mut stdout, result),
         SocketMessage::Key(params) if params.report => write_json_to(&mut stdout, result),
@@ -3417,6 +3579,10 @@ mod tests {
             })
         );
 
+        assert_eq!(sanitize_bytes(b"pass=s3cret!".to_vec(), &ordered), b"pass=***!".to_vec());
+        assert_eq!(sanitize_bytes(b"plain".to_vec(), &[]), b"plain".to_vec());
+        assert_eq!(sanitize_bytes(b"abc".to_vec(), &[String::new()]), b"abc".to_vec());
+
         assert_eq!(redact_secret_text("nothing to hide", &ordered), "nothing to hide");
         // Empty values never mask: masking "" would wedge *** between every character.
         assert_eq!(redact_secret_text("abc", &[String::new()]), "abc");
@@ -3902,6 +4068,39 @@ mod tests {
 
         drop(output.recv().unwrap());
         assert_eq!(queued.load(Ordering::Acquire), MAX_SUBSCRIBER_EVENTS - 1);
+    }
+
+    #[test]
+    fn exec_is_an_advertised_process_method() {
+        assert!(METHODS.contains(&"exec"));
+        assert_eq!(method_class("exec"), (MethodClass::Process, true));
+
+        let (method, params) = message_request(&SocketMessage::Exec(crate::cli::IpcExec {
+            command: String::from("cargo check"),
+            window_id: Some(1),
+            timeout: 60_000,
+        }))
+        .unwrap();
+        assert_eq!(method, "exec");
+        assert_eq!(params["command"], "cargo check");
+        assert_eq!(params["timeout"], 60_000);
+
+        assert!(
+            validate_message(&SocketMessage::Exec(crate::cli::IpcExec {
+                command: String::from("ok"),
+                window_id: None,
+                timeout: 0,
+            }))
+            .is_err()
+        );
+        assert!(
+            validate_message(&SocketMessage::Exec(crate::cli::IpcExec {
+                command: "x".repeat(crate::exec::MAX_EXEC_COMMAND_BYTES + 1),
+                window_id: None,
+                timeout: 1_000,
+            }))
+            .is_err()
+        );
     }
 
     #[test]
