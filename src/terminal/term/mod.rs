@@ -897,6 +897,49 @@ impl<T> Term<T> {
         )
     }
 
+    /// Convert one viewport row to text, without a trailing newline.
+    ///
+    /// `row` counts from the visible top; negative values count from the visible bottom
+    /// (`-1` is the last row). An out-of-range row yields no text, which keeps a scoped wait
+    /// pending rather than erroring on transient geometry.
+    pub fn viewport_line_text(&self, row: i32) -> String {
+        let screen_lines = self.screen_lines() as i32;
+        let normalized = if row < 0 { screen_lines + row } else { row };
+        if !(0..screen_lines).contains(&normalized) {
+            return String::new();
+        }
+        let line = Line(-(self.grid.display_offset() as i32) + normalized);
+        self.bounds_to_string(Point::new(line, Column(0)), Point::new(line, self.last_column()))
+            .trim_end()
+            .to_owned()
+    }
+
+    /// Convert a viewport rectangle to newline-joined row text.
+    ///
+    /// Coordinates are zero-based from the visible top-left; the rectangle is clamped to the
+    /// viewport, and rows outside it contribute no text.
+    pub fn viewport_rect_text(&self, col: u16, row: u16, width: u16, height: u16) -> String {
+        let screen_lines = self.screen_lines() as u32;
+        let last_col = self.last_column().0;
+        let start_col = usize::from(col);
+        let mut rows = Vec::new();
+        for offset in 0..u32::from(height) {
+            let viewport_row = u32::from(row).saturating_add(offset);
+            if viewport_row >= screen_lines || start_col > last_col {
+                continue;
+            }
+            let line = Line(-(self.grid.display_offset() as i32) + viewport_row as i32);
+            let end_col =
+                start_col.saturating_add(usize::from(width).saturating_sub(1)).min(last_col);
+            rows.push(
+                self.line_to_string(line, Column(start_col)..Column(end_col), true)
+                    .trim_end()
+                    .to_owned(),
+            );
+        }
+        rows.join("\n")
+    }
+
     /// Convert a single line in the grid to a String.
     fn line_to_string(
         &self,
@@ -1249,6 +1292,19 @@ impl<T> Term<T> {
             self.working_directory = Some(report.path.clone());
             self.event_proxy.send_event(Event::WorkingDirectory(report.path));
         }
+    }
+
+    /// Forward an OSC 133 shell-lifecycle marker to the owning window.
+    ///
+    /// Every marker is forwarded — unlike the working directory, each one is a state
+    /// transition the automation layer folds into its prompt/command tracking.
+    pub(crate) fn shell_integration_report(
+        &self,
+        marker: crate::osc_notification::ShellIntegrationMarker,
+    ) where
+        T: EventListener,
+    {
+        self.event_proxy.send_event(Event::ShellIntegration(marker));
     }
 
     /// Forward a decoded graphics/media command to the UI renderer.
@@ -3334,6 +3390,24 @@ mod tests {
 
         assert_eq!(term.visible_text(), "abcDEF\n今x");
         assert_eq!(term.latest_text(2), "DEF\n今x");
+    }
+
+    #[test]
+    fn scoped_text_reads_one_row_or_rectangle() {
+        let term = mock_term("ROW0\nROW1 STATUS-42\nROW2");
+
+        assert_eq!(term.viewport_line_text(0), "ROW0");
+        assert_eq!(term.viewport_line_text(1), "ROW1 STATUS-42");
+        assert_eq!(term.viewport_line_text(-1), "ROW2");
+        assert_eq!(term.viewport_line_text(3), "");
+        assert_eq!(term.viewport_line_text(-4), "");
+
+        // "STATUS" starts at column 5 of row 1.
+        assert_eq!(term.viewport_rect_text(5, 1, 6, 1), "STATUS");
+        assert_eq!(term.viewport_rect_text(0, 0, 80, 3), "ROW0\nROW1 STATUS-42\nROW2");
+        // Rectangles clamp to the viewport instead of reaching outside it.
+        assert_eq!(term.viewport_rect_text(0, 2, 80, 5), "ROW2");
+        assert_eq!(term.viewport_rect_text(80, 0, 4, 1), "");
     }
 
     #[test]

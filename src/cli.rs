@@ -564,6 +564,16 @@ pub enum SocketMessage {
     Subscribe(IpcSubscribe),
 }
 
+/// Report format for the client-side `run-plan` composite command.
+#[cfg(any(unix, windows))]
+#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IpcPlanReport {
+    /// NDJSON step events on stdout (the historical output).
+    Ndjson,
+    /// JUnit XML suite written to `--output`, in addition to the NDJSON events.
+    Junit,
+}
+
 /// Parameters to the client-side `run-plan` composite command.
 #[cfg(any(unix, windows))]
 #[derive(Args, Debug, Clone, PartialEq, Eq)]
@@ -579,6 +589,14 @@ pub struct IpcRunPlan {
     /// Execute observation steps only and report mutating steps as skipped.
     #[clap(long, conflicts_with = "dry_run")]
     pub preflight: bool,
+
+    /// Report format. JUnit always writes `--output` and keeps the NDJSON events on stdout.
+    #[clap(long, value_enum, default_value = "ndjson")]
+    pub report: IpcPlanReport,
+
+    /// Destination file for `--report junit`.
+    #[clap(long, value_name = "PATH", value_hint = ValueHint::FilePath)]
+    pub output: Option<PathBuf>,
 }
 
 /// Parameters to the client-side `capture` composite command.
@@ -618,6 +636,9 @@ pub struct IpcCapture {
 #[serde(deny_unknown_fields)]
 pub struct IpcAutomationPlan {
     pub version: u16,
+    /// Suite name used by JUnit reports; defaults to the plan file stem.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     pub steps: Vec<IpcAutomationPlanStep>,
 }
 
@@ -638,6 +659,43 @@ pub struct IpcAutomationPlanStep {
     pub on_error: IpcPlanErrorPolicy,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verify: Option<IpcPlanVerification>,
+    /// Assertion evaluated against the step's result after a successful action.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assert: Option<IpcPlanAssertion>,
+}
+
+/// State assertion evaluated after a plan step's action succeeds.
+///
+/// A step carries at most the checks it needs: terminal-output checks, result-shape checks,
+/// or both. Either check failing fails the step exactly like an action error, honoring the
+/// step's `on_error` policy.
+#[cfg(any(unix, windows))]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct IpcPlanAssertion {
+    /// Substring that must appear in terminal text within `timeout_ms`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_contains: Option<String>,
+    /// Window the text check reads: a window ID or a `{"$ref": alias}` reference.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_id: Option<serde_json::Value>,
+    /// How long the text check waits before failing.
+    #[serde(default = "default_plan_assert_timeout")]
+    pub timeout_ms: u64,
+    /// Only inspect this many rows from the bottom of the viewport.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lines_from_bottom: Option<u16>,
+    /// JSON Pointer into the step's action result whose value must equal `result_equals`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_pointer: Option<String>,
+    /// Expected value at `result_pointer`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_equals: Option<serde_json::Value>,
+}
+
+#[cfg(any(unix, windows))]
+const fn default_plan_assert_timeout() -> u64 {
+    5_000
 }
 
 #[cfg(any(unix, windows))]
@@ -1524,6 +1582,42 @@ pub struct IpcWaitCommon {
     pub target: IpcTarget,
 }
 
+/// Viewport rectangle for scoped text waits, as `COL,ROW,WIDTH,HEIGHT` zero-based from the
+/// visible top-left.
+#[cfg(any(unix, windows))]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IpcTextRect {
+    pub col: u16,
+    pub row: u16,
+    pub width: u16,
+    pub height: u16,
+}
+
+#[cfg(any(unix, windows))]
+impl std::str::FromStr for IpcTextRect {
+    type Err = String;
+
+    fn from_str(rect: &str) -> Result<Self, Self::Err> {
+        let parts: Vec<&str> = rect.split(',').collect();
+        let [col, row, width, height] = parts.as_slice() else {
+            return Err(String::from("rect must be COL,ROW,WIDTH,HEIGHT"));
+        };
+        let parse = |part: &&str, name: &str| {
+            part.parse::<u16>().map_err(|_| format!("rect {name} must be 0 through 65535"))
+        };
+        let rect = Self {
+            col: parse(col, "col")?,
+            row: parse(row, "row")?,
+            width: parse(width, "width")?,
+            height: parse(height, "height")?,
+        };
+        if rect.width == 0 || rect.width > 1000 || rect.height == 0 || rect.height > 1000 {
+            return Err(String::from("rect width and height must be 1 through 1000"));
+        }
+        Ok(rect)
+    }
+}
+
 /// Text wait parameters.
 #[cfg(any(unix, windows))]
 #[derive(Args, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -1533,6 +1627,12 @@ pub struct IpcWaitText {
     pub regex: bool,
     #[clap(long)]
     pub after_screen: Option<u64>,
+    /// Restrict matching to one viewport row: 0 is the top row, -1 the bottom row.
+    #[clap(long, conflicts_with = "rect", allow_hyphen_values = true)]
+    pub line: Option<i32>,
+    /// Restrict matching to a viewport rectangle as COL,ROW,WIDTH,HEIGHT.
+    #[clap(long, value_name = "COL,ROW,WIDTH,HEIGHT", conflicts_with = "line")]
+    pub rect: Option<IpcTextRect>,
     #[clap(flatten)]
     pub common: IpcWaitCommon,
 }
@@ -1597,6 +1697,12 @@ pub enum IpcWaitCondition {
     Frame(IpcWaitFrame),
     VividTrack(IpcWaitVividTrack),
     Exit(IpcWaitCommon),
+    /// Block until the shell sits at a prompt. Requires OSC 133 shell integration; a shell
+    /// that never emits markers never resolves this wait.
+    Prompt(IpcWaitCommon),
+    /// Block until the running command finishes, reporting its exit code. Resolves on the
+    /// next finish after registration, never on a command that already finished.
+    CommandFinish(IpcWaitCommon),
 }
 
 /// Named Vivid track conditions. The IPC v2 wire retains its registered numeric values.
@@ -2082,6 +2188,107 @@ mod tests {
             message.message,
             SocketMessage::CloseWindow(IpcCloseWindow { window_id: None, force: false })
         );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn parse_semantic_waits() {
+        let options =
+            Options::try_parse_from(["vivido", "msg", "wait", "prompt", "--timeout", "5s"])
+                .unwrap();
+        let Some(Subcommands::Msg(message)) = options.subcommands else {
+            panic!("expected msg subcommand");
+        };
+        let SocketMessage::Wait(wait) = message.message else {
+            panic!("expected wait message");
+        };
+        assert_eq!(
+            wait.condition,
+            IpcWaitCondition::Prompt(IpcWaitCommon {
+                timeout: 5_000,
+                target: IpcTarget::default()
+            })
+        );
+
+        let options = Options::try_parse_from([
+            "vivido",
+            "msg",
+            "wait",
+            "command-finish",
+            "--window-id",
+            "3",
+            "--timeout",
+            "30s",
+        ])
+        .unwrap();
+        let Some(Subcommands::Msg(message)) = options.subcommands else {
+            panic!("expected msg subcommand");
+        };
+        let SocketMessage::Wait(wait) = message.message else {
+            panic!("expected wait message");
+        };
+        assert_eq!(
+            wait.condition,
+            IpcWaitCondition::CommandFinish(IpcWaitCommon {
+                timeout: 30_000,
+                target: IpcTarget { window_id: Some(3) },
+            })
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn parse_scoped_text_waits() {
+        let options =
+            Options::try_parse_from(["vivido", "msg", "wait", "text", "PS>", "--line", "-1"])
+                .unwrap();
+        let Some(Subcommands::Msg(message)) = options.subcommands else {
+            panic!("expected msg subcommand");
+        };
+        let SocketMessage::Wait(wait) = message.message else {
+            panic!("expected wait message");
+        };
+        let IpcWaitCondition::Text(text) = wait.condition else {
+            panic!("expected text wait");
+        };
+        assert_eq!(text.line, Some(-1));
+        assert_eq!(text.rect, None);
+
+        let options = Options::try_parse_from([
+            "vivido",
+            "msg",
+            "wait",
+            "text",
+            "Submit",
+            "--rect",
+            "40,12,6,1",
+            "--regex",
+        ])
+        .unwrap();
+        let Some(Subcommands::Msg(message)) = options.subcommands else {
+            panic!("expected msg subcommand");
+        };
+        let SocketMessage::Wait(wait) = message.message else {
+            panic!("expected wait message");
+        };
+        let IpcWaitCondition::Text(text) = wait.condition else {
+            panic!("expected text wait");
+        };
+        assert_eq!(text.rect, Some(IpcTextRect { col: 40, row: 12, width: 6, height: 1 }));
+        assert!(text.regex);
+
+        // A wait reads one scope: line and rect conflict.
+        assert!(
+            Options::try_parse_from([
+                "vivido", "msg", "wait", "text", "x", "--line", "2", "--rect", "0,0,4,4",
+            ])
+            .is_err()
+        );
+        assert!(
+            Options::try_parse_from(["vivido", "msg", "wait", "text", "x", "--rect", "0,0,0,4"])
+                .is_err()
+        );
+        assert!("10,10,80,24".parse::<IpcTextRect>().is_ok());
     }
 
     #[cfg(any(unix, windows))]

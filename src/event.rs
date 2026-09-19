@@ -55,7 +55,7 @@ use crate::terminal::vvte::ansi::NamedColor;
 #[cfg(any(unix, windows))]
 use crate::automation::{AutomationHub, SubscriptionRequest};
 #[cfg(any(unix, windows))]
-use crate::automation::{PendingWrite, WaitKind, Waiter};
+use crate::automation::{PendingWrite, TextScope, WaitKind, Waiter};
 #[cfg(any(unix, windows))]
 use crate::cli::ParsedOptions;
 use crate::cli::{Options as CliOptions, WindowOptions};
@@ -1868,6 +1868,11 @@ impl Processor {
                 };
                 if params.text.len() > 8192 {
                     Err(IpcError::new("limit_exceeded", "wait pattern exceeds 8 KiB"))
+                } else if params.line.is_some() && params.rect.is_some() {
+                    Err(IpcError::new(
+                        "invalid_params",
+                        "wait text accepts at most one of --line and --rect",
+                    ))
                 } else if params.regex {
                     match compile_regex(&params.text) {
                         Ok(()) => {
@@ -1878,6 +1883,7 @@ impl Processor {
                                     pattern: params.text,
                                     regex: true,
                                     after_screen: params.after_screen,
+                                    scope: text_scope(params.line, params.rect),
                                 },
                                 &request,
                             );
@@ -1893,6 +1899,7 @@ impl Processor {
                             pattern: params.text,
                             regex: false,
                             after_screen: params.after_screen,
+                            scope: text_scope(params.line, params.rect),
                         },
                         &request,
                     );
@@ -2050,6 +2057,48 @@ impl Processor {
                     params.target.window_id,
                     params.timeout,
                     WaitKind::Exit,
+                    &request,
+                );
+                return;
+            },
+            "wait_prompt" => {
+                let params: IpcWaitCommon = match decode_ipc_params(&request) {
+                    Ok(params) => params,
+                    Err(error) => {
+                        request.connection.error(request.id, error);
+                        return;
+                    },
+                };
+                self.register_wait(
+                    params.target.window_id,
+                    params.timeout,
+                    WaitKind::Prompt,
+                    &request,
+                );
+                return;
+            },
+            "wait_command_finish" => {
+                let params: IpcWaitCommon = match decode_ipc_params(&request) {
+                    Ok(params) => params,
+                    Err(error) => {
+                        request.connection.error(request.id, error);
+                        return;
+                    },
+                };
+                let target = match self.resolve_ipc_target(params.target.window_id) {
+                    Ok(target) => target,
+                    Err(error) => {
+                        request.connection.error(request.id, error);
+                        return;
+                    },
+                };
+                // Only a finish after this registration counts: a command that already
+                // finished must never resolve a wait that started after it.
+                let after_count = self.windows[&target].automation.shell.finished_count;
+                self.register_wait_for_target(
+                    target,
+                    params.timeout,
+                    WaitKind::CommandFinish { after_count, started: Instant::now() },
                     &request,
                 );
                 return;
@@ -2685,6 +2734,14 @@ impl Processor {
                         "timeout_ms": 2_000,
                         "background_input_available": true,
                     })),
+                    WaitKind::Prompt => IpcError::new(
+                        "timeout",
+                        "no shell prompt observed; the shell must emit OSC 133 integration markers",
+                    ),
+                    WaitKind::CommandFinish { .. } => IpcError::new(
+                        "timeout",
+                        "no command finished; type a command first in a shell emitting OSC 133 markers",
+                    ),
                     _ => IpcError::new("timeout", "IPC wait timed out"),
                 };
                 waiter.connection.error(waiter.request_id, error);
@@ -2692,23 +2749,47 @@ impl Processor {
             }
 
             let result = match &waiter.kind {
-                WaitKind::Text { pattern, regex, after_screen } => {
+                WaitKind::Text { pattern, regex, after_screen, scope } => {
                     let eligible = after_screen.is_none_or(|after| screen_sequence > after);
-                    if eligible
-                        && pattern_find(
-                            visible_text.get_or_insert_with(|| window.text(None)).as_bytes(),
-                            pattern.as_bytes(),
-                            *regex,
-                        )
-                        .is_some()
-                    {
-                        Some(Ok(serde_json::json!({
-                            "matched": true,
-                            "screen_sequence": screen_sequence,
-                        })))
+                    if eligible {
+                        // The full-viewport snapshot is shared across text waiters in one pass;
+                        // a scoped wait reads only its own rectangle instead.
+                        let haystack;
+                        let haystack = match scope {
+                            TextScope::Full => {
+                                visible_text.get_or_insert_with(|| window.text(None)).as_bytes()
+                            },
+                            scoped => {
+                                haystack = window.scoped_text(*scoped);
+                                haystack.as_bytes()
+                            },
+                        };
+                        pattern_find(haystack, pattern.as_bytes(), *regex).map(|_| {
+                            Ok(serde_json::json!({
+                                "matched": true,
+                                "screen_sequence": screen_sequence,
+                            }))
+                        })
                     } else {
                         None
                     }
+                },
+                WaitKind::Prompt => window.automation.shell.at_prompt().then(|| {
+                    Ok(serde_json::json!({
+                        "ready": true,
+                        "generation": window.automation.shell.command_generation,
+                    }))
+                }),
+                WaitKind::CommandFinish { after_count, started } => {
+                    let shell = &window.automation.shell;
+                    (shell.finished_count > *after_count).then(|| {
+                        Ok(serde_json::json!({
+                            "status": "completed",
+                            "exit_code": shell.last_exit_code,
+                            "elapsed_ms": started.elapsed().as_millis(),
+                            "generation": shell.command_generation,
+                        }))
+                    })
                 },
                 WaitKind::Output { pattern, regex, start_offset } => {
                     let transcript = window.automation.transcript.lock().unwrap();
@@ -2947,6 +3028,26 @@ fn compile_regex(pattern: &str) -> Result<(), IpcError> {
     regex_automata::meta::Regex::new(pattern)
         .map(|_| ())
         .map_err(|error| IpcError::new("regex_invalid", error.to_string()))
+}
+
+/// Translate `wait text` scope flags into a match scope.
+///
+/// The dispatcher rejects a request carrying both scopes; the line-first order here is only a
+/// deterministic fallback for direct wire callers.
+#[cfg(any(unix, windows))]
+fn text_scope(line: Option<i32>, rect: Option<crate::cli::IpcTextRect>) -> TextScope {
+    if let Some(line) = line {
+        return TextScope::Line(line);
+    }
+    if let Some(rect) = rect {
+        return TextScope::Rect {
+            col: rect.col,
+            row: rect.row,
+            width: rect.width,
+            height: rect.height,
+        };
+    }
+    TextScope::Full
 }
 
 #[cfg(any(unix, windows))]
@@ -3758,6 +3859,13 @@ impl Processor {
                 );
                 // The terminal itself holds the reported directory; there is no window state
                 // to update.
+            },
+            #[cfg(any(unix, windows))]
+            (EventType::Terminal(TerminalEvent::ShellIntegration(marker)), Some(window_id)) => {
+                if let Some(window) = self.windows.get_mut(window_id) {
+                    window.automation.shell.apply(marker);
+                }
+                self.evaluate_waiters(*window_id);
             },
             #[cfg(any(unix, windows))]
             (EventType::Terminal(TerminalEvent::Bell), Some(window_id)) => {
@@ -5587,6 +5695,9 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                     // The reported directory lives on the terminal; the IPC processor already
                     // emitted `directory_changed` before dropping the event.
                     TerminalEvent::WorkingDirectory(_) => (),
+                    // Shell markers fold into per-window automation state; the IPC
+                    // processor already applied the marker before dropping the event.
+                    TerminalEvent::ShellIntegration(_) => (),
                     TerminalEvent::Bell => {
                         // Set window urgency hint when window is not focused.
                         let focused = self.ctx.terminal.is_focused;

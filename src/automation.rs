@@ -171,8 +171,74 @@ pub struct AutomationWindowState {
     pub screen_metadata_hash: u64,
     pub transcript: Arc<Mutex<Transcript>>,
     pub exit_status: Option<ExitStatus>,
+    /// Shell prompt/command tracking folded from OSC 133 markers. Unknown — no marker ever
+    /// observed — until the shell emits integration sequences.
+    pub shell: CommandExecutionState,
     pub waiters: Vec<Waiter>,
     pub pending_writes: Vec<PendingWrite>,
+}
+
+/// Semantic shell state tracked from OSC 133 (FinalTerm/FTCS) integration markers.
+///
+/// A state update costs one event-loop turn per marker — shells emit a handful per command —
+/// and nothing at all when the shell emits no markers.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CommandExecutionState {
+    /// The shell drew a prompt and is not currently running a command.
+    pub in_prompt: bool,
+    /// A submitted command is running (between `B`/`C` and `D`).
+    pub command_running: bool,
+    /// Command line of the running command, when an emitter reports it inline.
+    pub last_command_line: Option<String>,
+    /// Exit code of the most recently finished command.
+    pub last_exit_code: Option<i32>,
+    /// Count of commands started; distinguishes one command from the next.
+    pub command_generation: u64,
+    /// Count of commands finished; a `command-finish` wait resolves on the next increment.
+    pub finished_count: u64,
+}
+
+impl CommandExecutionState {
+    /// Fold one shell-lifecycle marker into the tracked state.
+    pub fn apply(&mut self, marker: crate::osc_notification::ShellIntegrationMarker) {
+        use crate::osc_notification::ShellIntegrationMarker as Marker;
+        match marker {
+            Marker::PromptStart => {
+                self.in_prompt = true;
+                self.command_running = false;
+            },
+            Marker::CommandStart => {
+                self.in_prompt = false;
+                self.command_running = true;
+                self.last_command_line = None;
+                self.command_generation = self.command_generation.saturating_add(1);
+            },
+            Marker::CommandOutputStart => {
+                self.command_running = true;
+            },
+            Marker::CommandFinished { exit_code } => {
+                self.command_running = false;
+                self.last_exit_code = exit_code;
+                self.finished_count = self.finished_count.saturating_add(1);
+            },
+        }
+    }
+
+    /// Whether the shell is sitting at a prompt ready to accept input.
+    pub fn at_prompt(&self) -> bool {
+        self.in_prompt && !self.command_running
+    }
+}
+
+/// Viewport scope restricting a `wait text` match.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TextScope {
+    /// The whole visible viewport (the historical behavior).
+    Full,
+    /// One viewport row: `0` is the top row, `-1` the bottom row.
+    Line(i32),
+    /// A viewport rectangle: column, row, width, height, all zero-based from the top-left.
+    Rect { col: u16, row: u16, width: u16, height: u16 },
 }
 
 impl AutomationWindowState {
@@ -191,6 +257,7 @@ impl AutomationWindowState {
             screen_metadata_hash: 0,
             transcript,
             exit_status: None,
+            shell: CommandExecutionState::default(),
             waiters: Vec::new(),
             pending_writes: Vec::new(),
         }
@@ -235,6 +302,14 @@ pub enum WaitKind {
         pattern: String,
         regex: bool,
         after_screen: Option<u64>,
+        scope: TextScope,
+    },
+    /// Resolve when the shell sits at a prompt (`OSC 133;A` with no command running).
+    Prompt,
+    /// Resolve on the next command finish after registration, reporting its exit code.
+    CommandFinish {
+        after_count: u64,
+        started: Instant,
     },
     Output {
         pattern: Vec<u8>,
@@ -633,6 +708,38 @@ mod tests {
         // The guard that would have caught `directory_changed`: emitting a kind `subscribe` will
         // not accept means unfiltered subscribers see an event nobody can ask for by name.
         AutomationHub::default().emit(Some(1), "not_a_real_kind", serde_json::json!({}));
+    }
+
+    #[test]
+    fn shell_markers_fold_into_prompt_and_command_state() {
+        use crate::osc_notification::ShellIntegrationMarker as Marker;
+        let mut shell = CommandExecutionState::default();
+        assert!(!shell.at_prompt(), "unknown state is not a prompt");
+
+        shell.apply(Marker::PromptStart);
+        assert!(shell.at_prompt());
+        assert_eq!(shell.command_generation, 0);
+
+        shell.apply(Marker::CommandStart);
+        assert!(!shell.at_prompt());
+        assert!(shell.command_running);
+        assert_eq!(shell.command_generation, 1);
+
+        shell.apply(Marker::CommandOutputStart);
+        assert!(shell.command_running);
+
+        shell.apply(Marker::CommandFinished { exit_code: Some(2) });
+        assert!(!shell.command_running);
+        assert!(!shell.at_prompt(), "a finish is not a prompt until the next prompt marker");
+        assert_eq!(shell.last_exit_code, Some(2));
+        assert_eq!(shell.finished_count, 1);
+
+        // A second command advances the generation so waits can tell commands apart.
+        shell.apply(Marker::CommandStart);
+        shell.apply(Marker::CommandFinished { exit_code: None });
+        assert_eq!(shell.command_generation, 2);
+        assert_eq!(shell.finished_count, 2);
+        assert_eq!(shell.last_exit_code, None);
     }
 
     #[test]

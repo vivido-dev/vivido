@@ -632,6 +632,9 @@ impl State {
                 OscMessage::WorkingDirectory(report) => {
                     terminal.working_directory_report(report);
                 },
+                OscMessage::ShellIntegration(marker) => {
+                    terminal.shell_integration_report(marker);
+                },
             }
         }
 

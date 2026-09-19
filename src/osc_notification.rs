@@ -40,6 +40,24 @@ pub enum OscNotification {
 pub(crate) enum OscMessage {
     Notification(OscNotification),
     WorkingDirectory(OscWorkingDirectory),
+    ShellIntegration(ShellIntegrationMarker),
+}
+
+/// One FinalTerm/FTCS `OSC 133` shell-lifecycle marker.
+///
+/// Payloads stay tiny (`133;A`, `133;D;0`), so capturing them costs nothing beyond the
+/// terminator scan every other OSC body pays. Markers from a shell that never emits them
+/// simply never arrive, and waiting on them times out rather than guessing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShellIntegrationMarker {
+    /// `133;A`: the shell is drawing a prompt and will soon accept input.
+    PromptStart,
+    /// `133;B`: the user submitted a command; the shell is parsing it.
+    CommandStart,
+    /// `133;C`: the command spawned and its output is beginning.
+    CommandOutputStart,
+    /// `133;D[;<exit>]`: the command finished, optionally with an exit code.
+    CommandFinished { exit_code: Option<i32> },
 }
 
 /// A parsed OSC 7 `file://host/path` report; the consumer validates the host.
@@ -148,7 +166,7 @@ impl OscNotificationParser {
         messages
     }
 
-    /// Confirm a captured body is a real top-level OSC whose first parameter is 7, 9, or 99.
+    /// Confirm a captured body is a real top-level OSC whose first parameter is 7, 9, 99, or 133.
     ///
     /// The body is bounded by [`MAX_OSC_BYTES`] and the parser is reset first, so one sequence can
     /// never leak a dispatch into the decision made about the next one.
@@ -169,7 +187,8 @@ struct OscDispatch {
 
 impl Perform for OscDispatch {
     fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
-        self.dispatched = params.first().is_some_and(|param| matches!(*param, b"7" | b"9" | b"99"));
+        self.dispatched =
+            params.first().is_some_and(|param| matches!(*param, b"7" | b"9" | b"99" | b"133"));
     }
 }
 
@@ -264,15 +283,18 @@ impl OscCapture {
     }
 }
 
-/// Whether a body captured so far can still turn out to be a captured OSC 7, 9, or 99 message.
+/// Whether a body captured so far can still turn out to be a captured OSC 7, 9, 99, or 133
+/// message.
 ///
 /// This mirrors the prefixes [`parse_osc`] accepts, so discarding a body that fails it cannot
 /// suppress a message that would otherwise have been produced.
 fn may_be_captured(prefix: &[u8]) -> bool {
-    [b"7;".as_slice(), b"9;".as_slice(), b"99;".as_slice()].iter().any(|candidate| {
-        let shared = prefix.len().min(candidate.len());
-        prefix[..shared] == candidate[..shared]
-    })
+    [b"7;".as_slice(), b"9;".as_slice(), b"99;".as_slice(), b"133;".as_slice()].iter().any(
+        |candidate| {
+            let shared = prefix.len().min(candidate.len());
+            prefix[..shared] == candidate[..shared]
+        },
+    )
 }
 
 fn parse_osc(raw: &[u8]) -> Option<OscMessage> {
@@ -284,11 +306,44 @@ fn parse_osc(raw: &[u8]) -> Option<OscMessage> {
         return parse_legacy(message).map(OscNotification::Legacy).map(OscMessage::Notification);
     }
 
+    if let Some(marker) = raw.strip_prefix(b"133;") {
+        return parse_shell_integration(marker).map(OscMessage::ShellIntegration);
+    }
+
     let rest = raw.strip_prefix(b"99;")?;
     let separator = rest.iter().position(|&byte| byte == b';')?;
     parse_kitty(&rest[..separator], &rest[separator + 1..])
         .map(OscNotification::Kitty)
         .map(OscMessage::Notification)
+}
+
+/// Parse one `OSC 133` shell-lifecycle marker body (the bytes after `133;`).
+///
+/// Only the FinalTerm/FTCS single-letter markers are recognized; anything else — including a
+/// bare terminator with no marker — is not shell integration and yields no message.
+fn parse_shell_integration(marker: &[u8]) -> Option<ShellIntegrationMarker> {
+    let (kind, payload) = match marker.iter().position(|&byte| byte == b';') {
+        Some(separator) => (&marker[..separator], Some(&marker[separator + 1..])),
+        None => (marker, None),
+    };
+    match kind {
+        b"A" => Some(ShellIntegrationMarker::PromptStart),
+        b"B" => Some(ShellIntegrationMarker::CommandStart),
+        b"C" => Some(ShellIntegrationMarker::CommandOutputStart),
+        b"D" => {
+            let exit_code = payload
+                .filter(|payload| !payload.is_empty())
+                .and_then(|payload| std::str::from_utf8(payload).ok())
+                .and_then(|payload| payload.parse::<i32>().ok());
+            // A `D` with a non-numeric payload is malformed, not a finish without a code: a
+            // garbage exit code must never resolve `wait command-finish` as success.
+            if payload.is_some_and(|payload| !payload.is_empty()) && exit_code.is_none() {
+                return None;
+            }
+            Some(ShellIntegrationMarker::CommandFinished { exit_code })
+        },
+        _ => None,
+    }
 }
 
 /// Parse an OSC 7 `file://host/path` working-directory report.
@@ -1216,7 +1271,7 @@ mod tests {
             .into_iter()
             .filter_map(|message| match message {
                 OscMessage::Notification(notification) => Some(notification),
-                OscMessage::WorkingDirectory(_) => None,
+                OscMessage::WorkingDirectory(_) | OscMessage::ShellIntegration(_) => None,
             })
             .collect()
     }
@@ -1519,6 +1574,65 @@ mod tests {
     fn validates_identifiers() {
         assert!(parse(b"\x1b]99;i=../../bad;;hello\x1b\\").is_empty());
         assert_eq!(parse(b"\x1b]99;i=good_ID-1.2;;hello\x1b\\").len(), 1);
+    }
+
+    #[test]
+    fn shell_integration_markers_parse_with_both_terminators() {
+        use ShellIntegrationMarker as Marker;
+        // BEL and ST terminators both terminate, and surrounding output is ignored.
+        for terminator in [b"\x07".as_slice(), b"\x1b\\".as_slice()] {
+            let mut input = b"prompt$\x1b]133;A".to_vec();
+            input.extend_from_slice(terminator);
+            input.extend_from_slice(b"\x1b]133;B");
+            input.extend_from_slice(terminator);
+            input.extend_from_slice(b"echo hi\x1b]133;C");
+            input.extend_from_slice(terminator);
+            input.extend_from_slice(b"hi\x1b]133;D;3");
+            input.extend_from_slice(terminator);
+            let messages = parse_messages(&input);
+            assert_eq!(messages.len(), 4, "terminator {terminator:?}: {messages:?}");
+            assert!(
+                matches!(messages[0], OscMessage::ShellIntegration(Marker::PromptStart)),
+                "terminator {terminator:?}",
+            );
+            assert!(
+                matches!(messages[1], OscMessage::ShellIntegration(Marker::CommandStart)),
+                "terminator {terminator:?}",
+            );
+            assert!(
+                matches!(messages[2], OscMessage::ShellIntegration(Marker::CommandOutputStart)),
+                "terminator {terminator:?}",
+            );
+            match messages[3] {
+                OscMessage::ShellIntegration(Marker::CommandFinished { exit_code }) => {
+                    assert_eq!(exit_code, Some(3), "terminator {terminator:?}");
+                },
+                ref unexpected => panic!("terminator {terminator:?}: {unexpected:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn shell_integration_rejects_malformed_markers() {
+        // No marker letter, an unknown letter, and a non-numeric exit code are not
+        // integration events: garbage must never resolve a semantic wait.
+        for body in ["\x1b]133;\x07", "\x1b]133;Q\x07", "\x1b]133;D;ok\x07", "\x1b]1337;foo\x07"] {
+            assert!(
+                parse_messages(body.as_bytes()).is_empty(),
+                "malformed marker parsed: {body:?}"
+            );
+        }
+        // A bare finish without a code is still a finish.
+        match parse_messages(b"\x1b]133;D\x07").as_slice() {
+            [
+                OscMessage::ShellIntegration(ShellIntegrationMarker::CommandFinished {
+                    exit_code: None,
+                }),
+            ] => (),
+            unexpected => panic!("bare finish parsed as {unexpected:?}"),
+        }
+        // OSC 1 icon titles share the `1` prefix but must keep their old meaning.
+        assert!(parse_messages(b"\x1b]1;icon title\x07").is_empty());
     }
 
     #[test]

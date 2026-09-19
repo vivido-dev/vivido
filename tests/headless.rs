@@ -266,6 +266,166 @@ fn marker_program(marker: &str) -> Vec<String> {
     .collect();
 }
 
+/// A shell emitting OSC 133 markers drives semantic prompt/finish tracking.
+#[cfg(unix)]
+fn integration_program() -> Vec<String> {
+    vec![
+        String::from("sh"),
+        String::from("-c"),
+        String::from(
+            "printf '\\033]133;A\\a'; i=0; while true; do printf '\\033]133;B\\a'; sleep 2; echo \"WORK-$i\"; printf '\\033]133;C\\a'; echo \"OUT-$i\"; printf '\\033]133;D;0\\a'; sleep 2; printf '\\033]133;A\\a'; sleep 2; i=$((i+1)); done",
+        ),
+    ]
+}
+
+/// Windows ConPTY forwards unrecognized OSC sequences, so the same markers work there.
+#[cfg(windows)]
+fn integration_program() -> Vec<String> {
+    vec![
+        String::from("powershell.exe"),
+        String::from("-NoLogo"),
+        String::from("-NoProfile"),
+        String::from("-NonInteractive"),
+        String::from("-Command"),
+        String::from(
+            "$e=[char]27; $b=[char]7; $i=0; [Console]::Write(\"$e]133;A$b\"); while ($true) { [Console]::Write(\"$e]133;B$b\"); Start-Sleep -Seconds 2; Write-Output \"WORK-$i\"; [Console]::Write(\"$e]133;C$b\"); Write-Output \"OUT-$i\"; [Console]::Write(\"$e]133;D;0$b\"); Start-Sleep -Seconds 2; [Console]::Write(\"$e]133;A$b\"); Start-Sleep -Seconds 2; $i++ }",
+        ),
+    ]
+}
+
+/// Fixed screen content for deterministic scoped waits: no scrolling, no races.
+#[cfg(unix)]
+fn static_program() -> Vec<String> {
+    vec![
+        String::from("sh"),
+        String::from("-c"),
+        String::from("printf 'ROW0\\nROW1 STATUS-42\\nROW2\\n'; sleep 300"),
+    ]
+}
+
+#[cfg(windows)]
+fn static_program() -> Vec<String> {
+    vec![
+        String::from("powershell.exe"),
+        String::from("-NoLogo"),
+        String::from("-NoProfile"),
+        String::from("-NonInteractive"),
+        String::from("-Command"),
+        String::from(
+            "Write-Output 'ROW0'; Write-Output 'ROW1 STATUS-42'; Write-Output 'ROW2'; Start-Sleep -Seconds 300",
+        ),
+    ]
+}
+
+/// Semantic waits resolve on shell integration markers instead of screen scraping.
+#[test]
+#[ignore = "spawns processes and needs a wgpu adapter"]
+fn semantic_waits_follow_shell_integration_markers() {
+    let session = Session::start("shell", &integration_program());
+
+    // The prompt marker predates the wait: tracked state resolves it immediately.
+    let ready = session.msg(&["wait", "prompt", "--timeout", "10s"]);
+    assert!(ready.contains(r#""ready":true"#), "prompt wait: {ready}");
+
+    // The next finish resolves with its own exit code, never an earlier command's.
+    let finished = session.msg(&["wait", "command-finish", "--timeout", "15s"]);
+    assert!(finished.contains(r#""status":"completed""#), "finish wait: {finished}");
+    assert!(finished.contains(r#""exit_code":0"#), "finish wait: {finished}");
+
+    // A shell emitting no markers never resolves a semantic wait.
+    let plain = Session::start("plain", &shell_program());
+    let missing = plain.try_msg(&["wait", "prompt", "--timeout", "2s"]);
+    assert!(!missing.status.success(), "a markerless shell must not resolve wait prompt");
+}
+
+/// Scoped text waits read one row or rectangle instead of the whole viewport.
+#[test]
+#[ignore = "spawns processes and needs a wgpu adapter"]
+fn scoped_text_waits_restrict_matching() {
+    let session = Session::start("scoped", &static_program());
+
+    session.msg(&["wait", "text", "STATUS-42", "--line", "1", "--timeout", "10s"]);
+    session.msg(&["wait", "text", "STATUS", "--rect", "5,1,6,1", "--timeout", "10s"]);
+    session.msg(&["wait", "text", "STATUS-[0-9]+", "--regex", "--line", "1", "--timeout", "10s"]);
+
+    // The text is on screen but on another row: the scope must refuse it.
+    let wrong_row =
+        session.try_msg(&["wait", "text", "STATUS-42", "--line", "0", "--timeout", "2s"]);
+    assert!(!wrong_row.status.success(), "row scope matched outside its row");
+}
+
+/// run-plan asserts terminal state and result shapes, and exports JUnit for CI.
+#[test]
+#[ignore = "spawns processes and needs a wgpu adapter"]
+fn run_plan_asserts_state_and_writes_junit() {
+    let session = Session::start("plan", &shell_program());
+    let windows: serde_json::Value =
+        serde_json::from_str(&session.msg(&["list-windows"])).expect("window list JSON");
+    let window_id = windows["windows"][0]["window_id"].as_u64().expect("window ID");
+
+    #[cfg(unix)]
+    let command = "echo PLAN-ASSERT-99\n";
+    #[cfg(windows)]
+    let command = "Write-Output PLAN-ASSERT-99\r";
+    let plan = session.runtime.join("assert-plan.json");
+    fs::write(
+        &plan,
+        format!(
+            r#"{{"version":2,"name":"assert-e2e","steps":[
+            {{"id":"type","method":"typing","params":{{"text":{command:?}}}}},
+            {{"id":"see","method":"wait_text","params":{{"text":"PLAN-ASSERT-99"}},"assert":{{"text_contains":"PLAN-ASSERT-99","window_id":{window_id},"lines_from_bottom":30,"timeout_ms":15000}}}},
+            {{"id":"shape","method":"list_windows","assert":{{"result_pointer":"/windows/0/window_id","result_equals":{window_id}}}}}
+        ]}}"#
+        ),
+    )
+    .unwrap();
+    let report = session.runtime.join("junit.xml");
+    let output = session.try_msg(&[
+        "run-plan",
+        "--file",
+        plan.to_str().unwrap(),
+        "--report",
+        "junit",
+        "--output",
+        report.to_str().unwrap(),
+    ]);
+    assert!(
+        output.status.success(),
+        "run-plan failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let xml = fs::read_to_string(&report).unwrap();
+    assert!(xml.contains(r#"name="assert-e2e""#), "{xml}");
+    assert!(xml.contains(r#"tests="3" failures="0""#), "{xml}");
+    assert!(xml.contains(r#"name="see""#), "{xml}");
+
+    // A failing assertion fails the step and the suite, and the report says so.
+    let failing = session.runtime.join("failing-plan.json");
+    fs::write(
+        &failing,
+        format!(
+            r#"{{"version":2,"steps":[
+            {{"id":"miss","method":"ping","on_error":"continue","assert":{{"text_contains":"NEVER-PRINTED","window_id":{window_id},"timeout_ms":1000}}}}
+        ]}}"#
+        ),
+    )
+    .unwrap();
+    let failing_report = session.runtime.join("failing-junit.xml");
+    let failed = session.try_msg(&[
+        "run-plan",
+        "--file",
+        failing.to_str().unwrap(),
+        "--report",
+        "junit",
+        "--output",
+        failing_report.to_str().unwrap(),
+    ]);
+    assert!(!failed.status.success(), "a failing assertion must fail the plan");
+    let xml = fs::read_to_string(&failing_report).unwrap();
+    assert!(xml.contains(r#"tests="1" failures="1""#), "{xml}");
+    assert!(xml.contains("NEVER-PRINTED"), "{xml}");
+}
+
 /// The whole point: a session with no compositor still answers text and pixel queries.
 #[test]
 #[ignore = "spawns processes and needs a wgpu adapter"]

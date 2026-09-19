@@ -62,6 +62,14 @@ Request parameters are not repeated in trace events. `--dry-run` validates witho
 `--preflight` executes observation methods only and reports mutations or unavailable dependencies
 as skipped.
 
+Version 2 plans add an optional per-step `assert`, evaluated after a successful action and
+failing the step like an action error under the same `on_error` policy. A text assertion waits
+up to `timeout_ms` for `text_contains` in `window_id` (an ID or `{"$ref":alias}`), then checks
+the last `lines_from_bottom` rows; a result assertion requires the JSON Pointer
+`result_pointer` into the action result to equal `result_equals`. `--report junit --output
+FILE` additionally writes a JUnit XML suite (named by the plan `name`, else the file stem)
+for CI integration; the NDJSON events still go to stdout.
+
 ## Endpoint discovery and targeting
 
 The endpoint is an owner-only Unix socket with mode `0600` on Unix, and a named pipe with an
@@ -178,6 +186,12 @@ physical modifiers pressed.
 - `quit {}`: shuts the whole instance down, closing every window. For a headless session this is
   the graceful stop, and it lets the daemon remove its own endpoint and registry; `vivido
   kill-session` is the forceful alternative.
+- `close_window {"window_id":ID,"force":false}` / `vivido msg close-window [-w ID] [--force]`:
+  closes one window without stopping the instance, returning
+  `{"window_id":ID,"closed":true,"forced":bool}`. Graceful close exits the terminal through the
+  normal removal path; `--force` kills the child process group first for children that ignore
+  hangup. Closing the last window of a headed instance exits it; a headless session keeps
+  serving.
 - `unsubscribe {"subscription_id":ID}`: wire-only cancellation for a subscription on the same
   connection.
 - `create_window`: synchronously constructs a complete window and returns `{"window_id":ID}`.
@@ -382,8 +396,11 @@ a monotonic `event_sequence`.
 Wait methods use a 30-second CLI default. `timeout` is milliseconds on the wire and accepts 1 ms
 through 24 hours. CLI duration values accept bare milliseconds or `ms`, `s`, `m`, and `h` suffixes.
 
-- `wait_text`: params are `text`, `regex`, `after_screen`, and `common:{timeout,target}`. It searches
-  current visible text immediately unless `after_screen` requires a newer screen.
+- `wait_text`: params are `text`, `regex`, `after_screen`, an optional scope (`line` or
+  `rect`), and `common:{timeout,target}`. It searches current visible text immediately unless
+  `after_screen` requires a newer screen. `line` restricts matching to one viewport row (`0` is
+  the top, `-1` the bottom); `rect` restricts it to `COL,ROW,WIDTH,HEIGHT` from the visible
+  top-left. An out-of-range scope matches nothing and stays pending rather than erroring.
 - `wait_output`: params are `pattern`, mutually exclusive `regex`/`base64`, `after_offset`, and
   `common`. Without an offset it starts at the current output end and matches only future bytes.
   Matches may cross PTY read boundaries. An evicted explicit offset returns `sequence_gap`.
@@ -394,6 +411,12 @@ through 24 hours. CLI duration values accept bare milliseconds or `ms`, `s`, `m`
 - `wait_frame`: params are `after_frame` and `common`; omitted means the next presented frame.
 - `wait_exit`: params are `timeout` and `target`. Held windows with retained status return
   immediately; unheld windows complete from child exit before removal.
+- `wait_prompt`: params are `timeout` and `target`; returns `{"ready":true,"generation":N}` when
+  the shell sits at a prompt. `wait_command_finish`: params are `timeout` and `target`; resolves
+  on the next command finish after registration and returns
+  `{"status":"completed","exit_code":E,"elapsed_ms":M,"generation":N}`. Both require OSC 133
+  shell integration markers: a shell that never emits them never resolves these waits, and a
+  finish that already happened never resolves a later `wait_command_finish`.
 
 Regex patterns are limited to 8 KiB and use linear-time matching. Disconnecting cancels waits,
 pending tagged input, resize/focus requests, and subscriptions immediately.

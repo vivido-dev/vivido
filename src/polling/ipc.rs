@@ -20,7 +20,8 @@ use serde_json::{Value, json};
 
 use crate::cli::{
     IpcAutomationPlan, IpcAutomationPlanStep, IpcCapture, IpcMouseAction, IpcPlanErrorPolicy,
-    IpcRunPlan, IpcVividCommand, IpcWait, IpcWaitCondition, MessageOptions, Options, SocketMessage,
+    IpcPlanReport, IpcRunPlan, IpcVividCommand, IpcWait, IpcWaitCondition, MessageOptions, Options,
+    SocketMessage,
 };
 use crate::client_fault::{self, ClientFaultClass};
 use crate::event::{Event, EventSink, EventType};
@@ -124,6 +125,8 @@ pub const METHODS: &[&str] = &[
     "wait_screen_stable",
     "wait_frame",
     "wait_exit",
+    "wait_prompt",
+    "wait_command_finish",
     "quit",
     "wait_vivid_track",
     "transcript",
@@ -223,6 +226,8 @@ fn method_class(name: &str) -> (MethodClass, bool) {
         | "wait_screen_stable"
         | "wait_frame"
         | "wait_exit"
+        | "wait_prompt"
+        | "wait_command_finish"
         | "wait_vivid_track"
         | "transcript"
         | "subscribe"
@@ -864,7 +869,11 @@ fn bind_socket(path: &Path) -> io::Result<LocalListener> {
 }
 
 const AUTOMATION_PLAN_VERSION: u16 = 1;
+/// Declarative plans: the same method/params steps plus per-step `assert` checks.
+const AUTOMATION_PLAN_VERSION_2: u16 = 2;
 const MAX_AUTOMATION_PLAN_STEPS: usize = 256;
+/// Bounds for one assertion's observed-text excerpt in failure messages.
+const MAX_ASSERT_EXCERPT_CHARS: usize = 2_000;
 const MAX_PLAN_NAME_BYTES: usize = 64;
 
 struct AutomationClient {
@@ -960,10 +969,13 @@ fn collect_references(value: &Value, references: &mut Vec<String>) -> io::Result
 }
 
 fn validate_plan(plan: &IpcAutomationPlan, methods: &HashSet<String>) -> io::Result<()> {
-    if plan.version != AUTOMATION_PLAN_VERSION {
+    if plan.version != AUTOMATION_PLAN_VERSION && plan.version != AUTOMATION_PLAN_VERSION_2 {
         return Err(IoError::new(
             ErrorKind::InvalidInput,
-            format!("unsupported automation plan version {}", plan.version),
+            format!(
+                "unsupported automation plan version {}; expected {AUTOMATION_PLAN_VERSION} or {AUTOMATION_PLAN_VERSION_2}",
+                plan.version
+            ),
         ));
     }
     if plan.steps.is_empty() || plan.steps.len() > MAX_AUTOMATION_PLAN_STEPS {
@@ -1006,6 +1018,12 @@ fn validate_plan(plan: &IpcAutomationPlan, methods: &HashSet<String>) -> io::Res
                 ));
             }
         }
+        if let Some(assertion) = &step.assert {
+            validate_assertion(&step.id, assertion)?;
+            if let Some(window_id) = &assertion.window_id {
+                collect_references(window_id, &mut references)?;
+            }
+        }
         if let Some(condition) = &step.when {
             references.push(condition.reference.clone());
         }
@@ -1031,6 +1049,123 @@ fn validate_plan(plan: &IpcAutomationPlan, methods: &HashSet<String>) -> io::Res
         }
     }
     Ok(())
+}
+
+/// Validate one step assertion without executing anything.
+fn validate_assertion(step_id: &str, assertion: &crate::cli::IpcPlanAssertion) -> io::Result<()> {
+    let invalid = |reason: &str| {
+        IoError::new(
+            ErrorKind::InvalidInput,
+            format!("plan step {step_id:?} assertion is invalid: {reason}"),
+        )
+    };
+    if assertion.text_contains.as_ref().is_some_and(String::is_empty) {
+        return Err(invalid("text_contains must not be empty"));
+    }
+    if assertion.text_contains.is_some() && assertion.window_id.is_none() {
+        return Err(invalid("a text assertion needs window_id"));
+    }
+    if !(1..=86_400_000).contains(&assertion.timeout_ms) {
+        return Err(invalid("timeout_ms must be 1 ms through 24 hours"));
+    }
+    if assertion.lines_from_bottom.is_some_and(|rows| rows == 0 || rows > 1000) {
+        return Err(invalid("lines_from_bottom must be 1 through 1000"));
+    }
+    match (&assertion.result_pointer, &assertion.result_equals) {
+        (None, None) => {},
+        (Some(pointer), Some(_)) if pointer.is_empty() || pointer.starts_with('/') => {},
+        _ => {
+            return Err(invalid(
+                "result_pointer (a JSON Pointer) and result_equals must be given together",
+            ));
+        },
+    }
+    if assertion.text_contains.is_none() && assertion.result_equals.is_none() {
+        return Err(invalid("nothing to check: give text_contains or result_equals"));
+    }
+    Ok(())
+}
+
+/// Evaluate one step assertion against the live session after a successful action.
+fn evaluate_plan_assertion(
+    client: &mut AutomationClient,
+    aliases: &BTreeMap<String, Value>,
+    step_id: &str,
+    action: &Value,
+    assertion: &crate::cli::IpcPlanAssertion,
+) -> io::Result<()> {
+    if let (Some(pointer), Some(expected)) = (&assertion.result_pointer, &assertion.result_equals) {
+        let actual = if pointer.is_empty() { Some(action) } else { action.pointer(pointer) };
+        if actual != Some(expected) {
+            let observed =
+                actual.map(|actual| format!("{actual}")).unwrap_or_else(|| String::from("absent"));
+            return Err(IoError::other(format!(
+                "plan step {step_id:?} assertion failed: result{pointer:?} is {}, expected {expected}",
+                truncate_excerpt(&observed),
+            )));
+        }
+    }
+    if let Some(expected) = &assertion.text_contains {
+        let window_id = assertion
+            .window_id
+            .as_ref()
+            .map(|window_id| resolve_plan_references(window_id, aliases))
+            .transpose()?
+            .and_then(|window_id| window_id.as_u64())
+            .ok_or_else(|| {
+                IoError::new(
+                    ErrorKind::InvalidInput,
+                    format!("plan step {step_id:?} assertion window_id is not u64"),
+                )
+            })?;
+        let target = json!({"window_id": window_id});
+        // Wait on the full viewport, then check the scope: a match outside the requested
+        // rows must fail the assertion rather than silently pass it.
+        let wait = client.request(
+            "wait_text",
+            json!({"text": expected, "common": {"timeout": assertion.timeout_ms, "target": target}}),
+        );
+        if let Err(error) = wait {
+            let observed = client
+                .request(
+                    "get_text",
+                    json!({"rows": assertion.lines_from_bottom, "window_id": window_id}),
+                )
+                .ok()
+                .and_then(|reply| reply.get("text").and_then(Value::as_str).map(str::to_owned))
+                .unwrap_or_default();
+            return Err(IoError::other(format!(
+                "plan step {step_id:?} assertion failed: terminal never showed {expected:?} ({error}); observed: {:?}",
+                truncate_excerpt(&observed),
+            )));
+        }
+        let observed = client
+            .request(
+                "get_text",
+                json!({"rows": assertion.lines_from_bottom, "window_id": window_id}),
+            )?
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        if !observed.contains(expected) {
+            return Err(IoError::other(format!(
+                "plan step {step_id:?} assertion failed: {expected:?} matched outside the last {:?} rows; observed: {:?}",
+                assertion.lines_from_bottom,
+                truncate_excerpt(&observed),
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Bound failure excerpts so a fullscreen of unexpected output cannot flood the report.
+fn truncate_excerpt(text: &str) -> String {
+    if text.chars().count() <= MAX_ASSERT_EXCERPT_CHARS {
+        return text.to_owned();
+    }
+    let kept: String = text.chars().take(MAX_ASSERT_EXCERPT_CHARS).collect();
+    format!("{kept}…[truncated]")
 }
 
 fn resolve_plan_references(value: &Value, aliases: &BTreeMap<String, Value>) -> io::Result<Value> {
@@ -1100,6 +1235,28 @@ fn resolve_verification_window(
 
 fn run_plan(socket: Option<PathBuf>, target: Option<&str>, options: &IpcRunPlan) -> io::Result<()> {
     let plan = read_plan(options)?;
+    let junit = match (options.report, &options.output) {
+        (IpcPlanReport::Junit, None) => {
+            return Err(IoError::new(
+                ErrorKind::InvalidInput,
+                "--report junit requires --output PATH",
+            ));
+        },
+        (IpcPlanReport::Junit, Some(_)) if options.dry_run => {
+            return Err(IoError::new(
+                ErrorKind::InvalidInput,
+                "--report junit is only written for executed runs, not --dry-run",
+            ));
+        },
+        (IpcPlanReport::Ndjson, Some(_)) => {
+            return Err(IoError::new(
+                ErrorKind::InvalidInput,
+                "--output PATH requires --report junit",
+            ));
+        },
+        (IpcPlanReport::Junit, Some(path)) => Some(path.clone()),
+        (IpcPlanReport::Ndjson, None) => None,
+    };
     let mut client = AutomationClient::connect(socket, target)?;
     let capabilities = plan_capabilities(&client.hello)?;
     let methods =
@@ -1109,16 +1266,27 @@ fn run_plan(socket: Option<PathBuf>, target: Option<&str>, options: &IpcRunPlan)
         .iter()
         .map(|capability| (capability.name.as_str(), capability))
         .collect::<HashMap<_, _>>();
+    let suite = plan.name.clone().unwrap_or_else(|| {
+        options
+            .file
+            .as_ref()
+            .and_then(|file| file.file_stem())
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("vivido-plan")
+            .to_owned()
+    });
     let mut output = io::stdout().lock();
     write_plan_event(
         &mut output,
-        json!({"type":"plan_started","version":plan.version,"steps":plan.steps.len(),"mode":if options.dry_run {"dry_run"} else if options.preflight {"preflight"} else {"execute"}}),
+        json!({"type":"plan_started","version":plan.version,"name":suite,"steps":plan.steps.len(),"mode":if options.dry_run {"dry_run"} else if options.preflight {"preflight"} else {"execute"}}),
     )?;
 
     let mut aliases = BTreeMap::new();
     let mut failures = 0_u64;
+    let mut records = Vec::new();
     for step in &plan.steps {
         let capability = classes[step.method.as_str()];
+        let step_started = std::time::Instant::now();
         if options.dry_run {
             write_plan_event(
                 &mut output,
@@ -1131,6 +1299,7 @@ fn run_plan(socket: Option<PathBuf>, target: Option<&str>, options: &IpcRunPlan)
                 &mut output,
                 json!({"type":"step","id":step.id,"method":step.method,"class":capability.class,"mutating":true,"status":"skipped","reason":"preflight_mutation"}),
             )?;
+            records.push(PlanStepRecord::skipped(step, "preflight_mutation", &step_started));
             continue;
         }
         if options.preflight {
@@ -1147,6 +1316,11 @@ fn run_plan(socket: Option<PathBuf>, target: Option<&str>, options: &IpcRunPlan)
                     &mut output,
                     json!({"type":"step","id":step.id,"method":step.method,"status":"skipped","reason":"dependency_unavailable"}),
                 )?;
+                records.push(PlanStepRecord::skipped(
+                    step,
+                    "dependency_unavailable",
+                    &step_started,
+                ));
                 continue;
             }
         }
@@ -1157,6 +1331,7 @@ fn run_plan(socket: Option<PathBuf>, target: Option<&str>, options: &IpcRunPlan)
                 &mut output,
                 json!({"type":"step","id":step.id,"method":step.method,"status":"skipped","reason":"condition_false"}),
             )?;
+            records.push(PlanStepRecord::skipped(step, "condition_false", &step_started));
             continue;
         }
 
@@ -1207,7 +1382,7 @@ fn run_plan(socket: Option<PathBuf>, target: Option<&str>, options: &IpcRunPlan)
             Ok(result)
         })();
 
-        match execution {
+        let outcome = match execution {
             Ok(result) => {
                 let binding_source = result.get("action").unwrap_or(&result);
                 let binding_result = step.bind.iter().try_for_each(|(alias, pointer)| {
@@ -1226,40 +1401,49 @@ fn run_plan(socket: Option<PathBuf>, target: Option<&str>, options: &IpcRunPlan)
                     Ok::<_, io::Error>(())
                 });
                 match binding_result {
-                    Ok(()) => write_plan_event(
-                        &mut output,
-                        json!({"type":"step","id":step.id,"method":step.method,"class":capability.class,"mutating":capability.mutating,"status":"ok","result":result}),
-                    )?,
-                    Err(error) => {
-                        failures = failures.saturating_add(1);
-                        write_plan_event(
-                            &mut output,
-                            json!({"type":"step","id":step.id,"method":step.method,"status":"error","error":error.to_string()}),
-                        )?;
-                        if step.on_error == IpcPlanErrorPolicy::Abort {
-                            write_plan_event(
-                                &mut output,
-                                json!({"type":"plan_completed","status":"failed","failures":failures}),
-                            )?;
-                            return Err(IoError::other(format!(
-                                "automation plan failed while binding step {:?}",
-                                step.id
-                            )));
+                    Ok(()) => {
+                        if let Some(assertion) = &step.assert {
+                            let action = result.get("action").unwrap_or(&result);
+                            evaluate_plan_assertion(
+                                &mut client,
+                                &aliases,
+                                &step.id,
+                                action,
+                                assertion,
+                            )
+                            .map(|()| result)
+                            .map_err(|error| IoError::other(format!("assertion failed: {error}")))
+                        } else {
+                            Ok(result)
                         }
                     },
+                    Err(error) => Err(error),
                 }
+            },
+            Err(error) => Err(error),
+        };
+        match outcome {
+            Ok(result) => {
+                write_plan_event(
+                    &mut output,
+                    json!({"type":"step","id":step.id,"method":step.method,"class":capability.class,"mutating":capability.mutating,"status":"ok","result":result}),
+                )?;
+                records.push(PlanStepRecord::ok(step, &step_started));
             },
             Err(error) => {
                 failures = failures.saturating_add(1);
+                let message = error.to_string();
                 write_plan_event(
                     &mut output,
-                    json!({"type":"step","id":step.id,"method":step.method,"status":"error","error":error.to_string()}),
+                    json!({"type":"step","id":step.id,"method":step.method,"status":"error","error":message}),
                 )?;
+                records.push(PlanStepRecord::error(step, &message, &step_started));
                 if step.on_error == IpcPlanErrorPolicy::Abort {
                     write_plan_event(
                         &mut output,
                         json!({"type":"plan_completed","status":"failed","failures":failures}),
                     )?;
+                    write_junit_report(&junit, &suite, &records, failures)?;
                     return Err(IoError::other(format!(
                         "automation plan failed at step {:?}",
                         step.id
@@ -1273,11 +1457,124 @@ fn run_plan(socket: Option<PathBuf>, target: Option<&str>, options: &IpcRunPlan)
         &mut output,
         json!({"type":"plan_completed","status":if failures == 0 {"ok"} else {"completed_with_errors"},"failures":failures}),
     )?;
+    write_junit_report(&junit, &suite, &records, failures)?;
     if failures == 0 {
         Ok(())
     } else {
         Err(IoError::other("automation plan completed with errors"))
     }
+}
+
+/// One executed plan step as recorded for the JUnit report.
+struct PlanStepRecord {
+    id: String,
+    method: String,
+    elapsed_secs: f64,
+    outcome: PlanStepOutcome,
+}
+
+enum PlanStepOutcome {
+    Ok,
+    Error(String),
+    Skipped(String),
+}
+
+impl PlanStepRecord {
+    fn ok(step: &IpcAutomationPlanStep, started: &std::time::Instant) -> Self {
+        Self {
+            id: step.id.clone(),
+            method: step.method.clone(),
+            elapsed_secs: started.elapsed().as_secs_f64(),
+            outcome: PlanStepOutcome::Ok,
+        }
+    }
+
+    fn error(step: &IpcAutomationPlanStep, message: &str, started: &std::time::Instant) -> Self {
+        Self {
+            id: step.id.clone(),
+            method: step.method.clone(),
+            elapsed_secs: started.elapsed().as_secs_f64(),
+            outcome: PlanStepOutcome::Error(message.to_owned()),
+        }
+    }
+
+    fn skipped(step: &IpcAutomationPlanStep, reason: &str, started: &std::time::Instant) -> Self {
+        Self {
+            id: step.id.clone(),
+            method: step.method.clone(),
+            elapsed_secs: started.elapsed().as_secs_f64(),
+            outcome: PlanStepOutcome::Skipped(reason.to_owned()),
+        }
+    }
+}
+
+/// Write the JUnit XML report when `--report junit` was requested; otherwise a no-op.
+fn write_junit_report(
+    junit: &Option<PathBuf>,
+    suite: &str,
+    records: &[PlanStepRecord],
+    failures: u64,
+) -> io::Result<()> {
+    let Some(path) = junit else {
+        return Ok(());
+    };
+    let skipped = records
+        .iter()
+        .filter(|record| matches!(record.outcome, PlanStepOutcome::Skipped(_)))
+        .count();
+    let time: f64 = records.iter().map(|record| record.elapsed_secs).sum();
+    let mut xml = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<testsuite name=\"{}\" tests=\"{}\" failures=\"{failures}\" skipped=\"{skipped}\" time=\"{time:.3}\">\n",
+        junit_escape(suite),
+        records.len(),
+    );
+    for record in records {
+        xml.push_str(&format!(
+            "  <testcase classname=\"{}\" name=\"{}\" time=\"{:.3}\"",
+            junit_escape(&record.method),
+            junit_escape(&record.id),
+            record.elapsed_secs,
+        ));
+        match &record.outcome {
+            PlanStepOutcome::Ok => xml.push_str("/>\n"),
+            PlanStepOutcome::Error(message) => {
+                xml.push_str(&format!(
+                    ">\n    <failure message=\"{}\">{}</failure>\n  </testcase>\n",
+                    junit_escape(message),
+                    junit_escape(message),
+                ));
+            },
+            PlanStepOutcome::Skipped(reason) => {
+                xml.push_str(&format!(
+                    ">\n    <skipped message=\"{}\"/>\n  </testcase>\n",
+                    junit_escape(reason),
+                ));
+            },
+        }
+    }
+    xml.push_str("</testsuite>\n");
+    fs::write(path, xml).map_err(|error| {
+        IoError::new(
+            error.kind(),
+            format!("failed to write JUnit report {}: {error}", path.display()),
+        )
+    })
+}
+
+/// Escape text for JUnit XML attribute and element content.
+fn junit_escape(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&apos;"),
+            _ => escaped.push(c),
+        }
+    }
+    escaped
 }
 
 fn run_capture(
@@ -1623,6 +1920,10 @@ fn message_request(message: &SocketMessage) -> io::Result<(&'static str, Value)>
                 Ok(("wait_screen_stable", serialize_params(params)?))
             },
             IpcWaitCondition::Frame(params) => Ok(("wait_frame", serialize_params(params)?)),
+            IpcWaitCondition::Prompt(params) => Ok(("wait_prompt", serialize_params(params)?)),
+            IpcWaitCondition::CommandFinish(params) => {
+                Ok(("wait_command_finish", serialize_params(params)?))
+            },
             IpcWaitCondition::VividTrack(params) => Ok((
                 "wait_vivid_track",
                 json!({
@@ -2151,6 +2452,183 @@ mod tests {
     }
 
     #[test]
+    fn semantic_waits_are_advertised_observe_methods() {
+        for method in ["wait_prompt", "wait_command_finish"] {
+            assert!(METHODS.contains(&method), "{method} is not advertised");
+            assert_eq!(method_class(method), (MethodClass::Observe, false));
+        }
+
+        let prompt = SocketMessage::Wait(crate::cli::IpcWait {
+            condition: crate::cli::IpcWaitCondition::Prompt(crate::cli::IpcWaitCommon {
+                timeout: 5_000,
+                target: crate::cli::IpcTarget::default(),
+            }),
+        });
+        let (method, params) = message_request(&prompt).unwrap();
+        assert_eq!(method, "wait_prompt");
+        assert_eq!(params["timeout"], 5_000);
+
+        let finish = SocketMessage::Wait(crate::cli::IpcWait {
+            condition: crate::cli::IpcWaitCondition::CommandFinish(crate::cli::IpcWaitCommon {
+                timeout: 30_000,
+                target: crate::cli::IpcTarget { window_id: Some(3) },
+            }),
+        });
+        let (method, params) = message_request(&finish).unwrap();
+        assert_eq!(method, "wait_command_finish");
+        assert_eq!(params["target"]["window_id"], 3);
+
+        // Scopes travel with the text wait they restrict.
+        let scoped = SocketMessage::Wait(crate::cli::IpcWait {
+            condition: crate::cli::IpcWaitCondition::Text(crate::cli::IpcWaitText {
+                text: String::from("PS>"),
+                regex: false,
+                after_screen: None,
+                line: Some(-1),
+                rect: None,
+                common: crate::cli::IpcWaitCommon {
+                    timeout: 5_000,
+                    target: crate::cli::IpcTarget::default(),
+                },
+            }),
+        });
+        let (method, params) = message_request(&scoped).unwrap();
+        assert_eq!(method, "wait_text");
+        assert_eq!(params["line"], -1);
+        assert_eq!(params["rect"], Value::Null);
+    }
+
+    #[test]
+    fn plan_version_two_accepts_named_assertion_plans() {
+        let plan: IpcAutomationPlan = serde_json::from_value(json!({
+            "version": 2,
+            "name": "git-commit-verification",
+            "steps": [
+                {
+                    "id": "await_prompt",
+                    "method": "wait_prompt",
+                    "params": {"common": {"timeout": 5000, "target": {}}},
+                },
+                {
+                    "id": "assert_output",
+                    "method": "wait_text",
+                    "params": {"text": "On branch main"},
+                    "assert": {
+                        "text_contains": "On branch main",
+                        "window_id": 1,
+                        "lines_from_bottom": 10,
+                        "timeout_ms": 3000,
+                    },
+                },
+                {
+                    "id": "assert_shape",
+                    "method": "list_windows",
+                    "assert": {"result_pointer": "", "result_equals": {"windows": []}},
+                },
+            ]
+        }))
+        .unwrap();
+        assert_eq!(plan.name.as_deref(), Some("git-commit-verification"));
+        let methods =
+            ["wait_prompt", "wait_text", "list_windows"].into_iter().map(str::to_owned).collect();
+        validate_plan(&plan, &methods).unwrap();
+
+        // Version 1 plans without assertions keep validating unchanged.
+        let legacy: IpcAutomationPlan = serde_json::from_value(json!({
+            "version": 1,
+            "steps": [{"id": "windows", "method": "list_windows"}]
+        }))
+        .unwrap();
+        validate_plan(&legacy, &methods).unwrap();
+
+        assert!(
+            validate_plan(&IpcAutomationPlan { version: 3, name: None, steps: vec![] }, &methods,)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn plan_assertions_reject_empty_and_mismatched_checks() {
+        use crate::cli::IpcPlanAssertion;
+        let valid = IpcPlanAssertion {
+            text_contains: Some(String::from("done")),
+            window_id: Some(json!(1)),
+            timeout_ms: 5_000,
+            lines_from_bottom: Some(10),
+            result_pointer: None,
+            result_equals: None,
+        };
+        assert!(validate_assertion("ok", &valid).is_ok());
+
+        let missing_window = IpcPlanAssertion { window_id: None, ..valid.clone() };
+        assert!(validate_assertion("no-window", &missing_window).is_err());
+
+        let empty_text = IpcPlanAssertion { text_contains: Some(String::new()), ..valid.clone() };
+        assert!(validate_assertion("empty", &empty_text).is_err());
+
+        let nothing = IpcPlanAssertion {
+            text_contains: None,
+            window_id: None,
+            timeout_ms: 5_000,
+            lines_from_bottom: None,
+            result_pointer: None,
+            result_equals: None,
+        };
+        assert!(validate_assertion("nothing", &nothing).is_err());
+
+        let half_result = IpcPlanAssertion {
+            text_contains: None,
+            result_pointer: Some(String::from("/window_id")),
+            ..nothing.clone()
+        };
+        assert!(validate_assertion("half", &half_result).is_err());
+
+        let bad_pointer = IpcPlanAssertion {
+            result_pointer: Some(String::from("window_id")),
+            result_equals: Some(json!(1)),
+            ..nothing.clone()
+        };
+        assert!(validate_assertion("pointer", &bad_pointer).is_err());
+
+        let bad_rows = IpcPlanAssertion { lines_from_bottom: Some(0), ..valid.clone() };
+        assert!(validate_assertion("rows", &bad_rows).is_err());
+    }
+
+    #[test]
+    fn junit_report_escapes_and_counts_steps() {
+        assert_eq!(junit_escape("a&b<c>d\"e'f"), "a&amp;b&lt;c&gt;d&quot;e&apos;f");
+        assert_eq!(truncate_excerpt("short"), "short");
+        assert!(truncate_excerpt(&"x".repeat(3_000)).ends_with("[truncated]"));
+
+        let step = |id: &str| IpcAutomationPlanStep {
+            id: id.to_owned(),
+            method: String::from("typing"),
+            params: json!({}),
+            bind: BTreeMap::new(),
+            when: None,
+            on_error: IpcPlanErrorPolicy::Abort,
+            verify: None,
+            assert: None,
+        };
+        let started = std::time::Instant::now();
+        let records = [
+            PlanStepRecord::ok(&step("type<&>"), &started),
+            PlanStepRecord::error(&step("check"), "expected \"x\"", &started),
+            PlanStepRecord::skipped(&step("later"), "condition_false", &started),
+        ];
+        let path =
+            std::env::temp_dir().join(format!("vivido-junit-test-{}.xml", std::process::id()));
+        write_junit_report(&Some(path.clone()), "suite&<test>", &records, 1).unwrap();
+        let xml = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(xml.contains(r#"name="suite&amp;&lt;test&gt;""#), "{xml}");
+        assert!(xml.contains(r#"tests="3" failures="1" skipped="1""#), "{xml}");
+        assert!(xml.contains(r#"name="type&lt;&amp;&gt;""#), "{xml}");
+        assert!(xml.contains("<failure message=\"expected &quot;x&quot;\">"), "{xml}");
+        assert!(xml.contains("<skipped message=\"condition_false\"/>"), "{xml}");
+    }
+
+    #[test]
     fn ambiguous_sessions_name_every_candidate_newest_first() {
         let registry = |name: &str, pid: u32, start: u64| crate::session::SessionRegistry {
             schema: 1,
@@ -2303,8 +2781,11 @@ mod tests {
         assert!(validate_plan(&forward, &methods).is_err());
 
         let step = forward.steps[0].clone();
-        let oversized =
-            IpcAutomationPlan { version: 1, steps: vec![step; MAX_AUTOMATION_PLAN_STEPS + 1] };
+        let oversized = IpcAutomationPlan {
+            version: 1,
+            name: None,
+            steps: vec![step; MAX_AUTOMATION_PLAN_STEPS + 1],
+        };
         assert!(validate_plan(&oversized, &methods).is_err());
     }
 

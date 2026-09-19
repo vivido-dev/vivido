@@ -1132,6 +1132,20 @@ impl WindowContext {
         }
     }
 
+    /// Capture viewport text restricted to a wait scope, without styling or display overlays.
+    #[cfg(any(unix, windows))]
+    pub fn scoped_text(&self, scope: crate::automation::TextScope) -> String {
+        use crate::automation::TextScope as Scope;
+        let terminal = self.terminal.lock();
+        match scope {
+            Scope::Full => terminal.visible_text(),
+            Scope::Line(row) => terminal.viewport_line_text(row),
+            Scope::Rect { col, row, width, height } => {
+                terminal.viewport_rect_text(col, row, width, height)
+            },
+        }
+    }
+
     /// Build application-directed paste bytes with the same safety filtering as local paste.
     #[cfg(any(unix, windows))]
     pub fn application_paste(&self, text: &str) -> Vec<u8> {
@@ -1269,6 +1283,9 @@ impl WindowContext {
         if let Some(worker) = self.io_thread.take() {
             let _ = worker.join();
         }
+        // A fresh PTY means a fresh shell: stale prompt state would resolve semantic waits
+        // against a command line that no longer exists.
+        self.automation.shell = crate::automation::CommandExecutionState::default();
         self.terminal.lock().reset_client_state();
         self.display.set_vivid_scene(new_service.scene());
         self.vivid_service = new_service;
