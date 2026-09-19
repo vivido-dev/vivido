@@ -70,6 +70,14 @@ the last `lines_from_bottom` rows; a result assertion requires the JSON Pointer
 FILE` additionally writes a JUnit XML suite (named by the plan `name`, else the file stem)
 for CI integration; the NDJSON events still go to stdout.
 
+`vivido test --session NAME --file plan.json` runs a plan inside an ephemeral headless session
+of its own: it spawns the session (with `--headless-size` and an optional `-- SHELL...`
+program for the first window), executes with `run-plan` semantics, and shuts the session down
+afterwards. A failing run writes `<step>.grid.txt` and `<step>.screenshot.json` captures into
+`--artifacts-dir` (default `vivido-test-artifacts`), and `--keep-failed` leaves the failed
+session running with reattach instructions instead of tearing it down. The session name must
+not already exist; a generated `vivido-test-<pid>` name is used when `--session` is omitted.
+
 ## Endpoint discovery and targeting
 
 The endpoint is an owner-only Unix socket with mode `0600` on Unix, and a named pipe with an

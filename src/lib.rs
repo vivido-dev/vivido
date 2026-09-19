@@ -105,7 +105,7 @@ pub mod binary {
         pub use crate::polling::transport::{LocalListener, LocalStream};
 
         pub mod ipc {
-            pub use crate::polling::ipc::{request_once, send_message};
+            pub use crate::polling::ipc::{request_once, run_test, send_message};
         }
     }
 

@@ -217,6 +217,17 @@ impl std::str::FromStr for HeadlessSize {
     }
 }
 
+#[cfg(any(unix, windows))]
+impl HeadlessSize {
+    /// Render back to the `COLUMNSxLINES` / `WIDTHxHEIGHTpx` CLI form.
+    pub fn as_arg(&self) -> String {
+        match *self {
+            Self::Cells { columns, lines } => format!("{columns}x{lines}"),
+            Self::Pixels { width, height } => format!("{width}x{height}px"),
+        }
+    }
+}
+
 /// Parse the class CLI parameter.
 fn parse_class(input: &str) -> Result<Class, String> {
     let (general, instance) = match input.split_once(',') {
@@ -351,6 +362,51 @@ pub enum Subcommands {
         #[clap(short = 't', long = "target", value_name = "NAME")]
         target: String,
     },
+
+    /// Run an automation plan inside an ephemeral headless session, then tear it down.
+    Test(IpcTest),
+}
+
+/// Parameters to the `test` composite command: a plan plus a session to run it in.
+///
+/// The runner spawns a fresh headless session, executes the plan with `run-plan` semantics
+/// (NDJSON events on stdout, optional JUnit), captures a grid dump and screenshot metadata on
+/// failure, and shuts the session down — unless `--keep-failed` preserves a failed session for
+/// post-mortem inspection.
+#[cfg(any(unix, windows))]
+#[derive(Args, Debug, Clone, PartialEq, Eq)]
+pub struct IpcTest {
+    /// JSON plan file, using the `run-plan` schema. Omit this option or pass `-` for stdin.
+    #[clap(long, value_name = "PATH", value_hint = ValueHint::FilePath)]
+    pub file: Option<PathBuf>,
+
+    /// Session name. Must not already exist; defaults to `vivido-test-<pid>`.
+    #[clap(long, value_name = "NAME")]
+    pub session: Option<String>,
+
+    /// Size of the session window, as COLUMNSxLINES or WIDTHxHEIGHTpx.
+    #[clap(long, value_name = "SIZE", default_value = "100x30")]
+    pub headless_size: HeadlessSize,
+
+    /// Keep a failed session running and print how to reattach to it.
+    #[clap(long)]
+    pub keep_failed: bool,
+
+    /// Report format, as in `run-plan`. JUnit always writes `--output` too.
+    #[clap(long, value_enum, default_value = "ndjson")]
+    pub report: IpcPlanReport,
+
+    /// Destination file for `--report junit`.
+    #[clap(long, value_name = "PATH", value_hint = ValueHint::FilePath)]
+    pub output: Option<PathBuf>,
+
+    /// Directory for failure captures (`<step>.grid.txt`, `<step>.screenshot.json`).
+    #[clap(long, value_name = "DIR", value_hint = ValueHint::DirPath)]
+    pub artifacts_dir: Option<PathBuf>,
+
+    /// Shell program for the session's initial window; the headless default when omitted.
+    #[clap(last = true, value_name = "SHELL")]
+    pub shell: Vec<String>,
 }
 
 /// Options for listing discoverable Vivido instances.
@@ -918,12 +974,14 @@ pub struct IpcGetText {
     ///
     /// The current visible viewport is returned when this is omitted.
     #[clap(long, value_parser = clap::value_parser!(u16).range(1..=1000))]
+    #[serde(default)]
     pub rows: Option<u16>,
 
     /// Window ID for terminal text.
     ///
     /// The focused window is used when no ID is specified.
     #[clap(short, long, env = "VIVIDO_WINDOW_ID")]
+    #[serde(default)]
     pub window_id: Option<u64>,
 }
 
@@ -935,6 +993,7 @@ pub struct IpcScreenshot {
     ///
     /// The focused window is used when no ID is specified.
     #[clap(short, long, env = "VIVIDO_WINDOW_ID")]
+    #[serde(default)]
     pub window_id: Option<u64>,
 
     /// Print capture metadata together with the private PNG path.
@@ -949,6 +1008,7 @@ pub struct IpcScreenshot {
 pub struct IpcTarget {
     /// Window ID. The focused window is used when this is omitted.
     #[clap(short, long, env = "VIVIDO_WINDOW_ID")]
+    #[serde(default)]
     pub window_id: Option<u64>,
 }
 
@@ -958,6 +1018,7 @@ pub struct IpcTarget {
 pub struct IpcCloseWindow {
     /// Window ID. The focused window is used when this is omitted.
     #[clap(short, long, env = "VIVIDO_WINDOW_ID")]
+    #[serde(default)]
     pub window_id: Option<u64>,
 
     /// Kill the child process group first, for children that ignore hangup.
@@ -1624,14 +1685,18 @@ impl std::str::FromStr for IpcTextRect {
 pub struct IpcWaitText {
     pub text: String,
     #[clap(long)]
+    #[serde(default)]
     pub regex: bool,
     #[clap(long)]
+    #[serde(default)]
     pub after_screen: Option<u64>,
     /// Restrict matching to one viewport row: 0 is the top row, -1 the bottom row.
     #[clap(long, conflicts_with = "rect", allow_hyphen_values = true)]
+    #[serde(default)]
     pub line: Option<i32>,
     /// Restrict matching to a viewport rectangle as COL,ROW,WIDTH,HEIGHT.
     #[clap(long, value_name = "COL,ROW,WIDTH,HEIGHT", conflicts_with = "line")]
+    #[serde(default)]
     pub rect: Option<IpcTextRect>,
     #[clap(flatten)]
     pub common: IpcWaitCommon,
@@ -2188,6 +2253,60 @@ mod tests {
             message.message,
             SocketMessage::CloseWindow(IpcCloseWindow { window_id: None, force: false })
         );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn parse_test_runner() {
+        let options = Options::try_parse_from([
+            "vivido",
+            "test",
+            "--session",
+            "smoke",
+            "--keep-failed",
+            "--report",
+            "junit",
+            "--output",
+            "results.xml",
+            "--file",
+            "plan.json",
+            "--headless-size",
+            "120x40",
+            "--artifacts-dir",
+            "artifacts",
+            "--",
+            "sh",
+            "-c",
+            "echo hi",
+        ])
+        .unwrap();
+        let Some(Subcommands::Test(test)) = options.subcommands else {
+            panic!("expected test subcommand");
+        };
+        assert_eq!(
+            test,
+            IpcTest {
+                file: Some(PathBuf::from("plan.json")),
+                session: Some(String::from("smoke")),
+                headless_size: HeadlessSize::Cells { columns: 120, lines: 40 },
+                keep_failed: true,
+                report: IpcPlanReport::Junit,
+                output: Some(PathBuf::from("results.xml")),
+                artifacts_dir: Some(PathBuf::from("artifacts")),
+                shell: vec![String::from("sh"), String::from("-c"), String::from("echo hi"),],
+            }
+        );
+
+        // Defaults: generated session name, headless default shell, NDJSON report.
+        let options = Options::try_parse_from(["vivido", "test"]).unwrap();
+        let Some(Subcommands::Test(test)) = options.subcommands else {
+            panic!("expected test subcommand");
+        };
+        assert_eq!(test.session, None);
+        assert!(!test.keep_failed);
+        assert_eq!(test.report, IpcPlanReport::Ndjson);
+        assert_eq!(test.headless_size, HeadlessSize::Cells { columns: 100, lines: 30 });
+        assert!(test.shell.is_empty());
     }
 
     #[cfg(any(unix, windows))]

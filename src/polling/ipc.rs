@@ -19,9 +19,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::cli::{
-    IpcAutomationPlan, IpcAutomationPlanStep, IpcCapture, IpcMouseAction, IpcPlanErrorPolicy,
-    IpcPlanReport, IpcRunPlan, IpcVividCommand, IpcWait, IpcWaitCondition, MessageOptions, Options,
-    SocketMessage,
+    IpcAutomationPlan, IpcAutomationPlanStep, IpcCapture, IpcGetText, IpcMouseAction,
+    IpcPlanErrorPolicy, IpcPlanReport, IpcRunPlan, IpcScreenshot, IpcTest, IpcVividCommand,
+    IpcWait, IpcWaitCondition, MessageOptions, Options, SocketMessage,
 };
 use crate::client_fault::{self, ClientFaultClass};
 use crate::event::{Event, EventSink, EventType};
@@ -872,8 +872,8 @@ const AUTOMATION_PLAN_VERSION: u16 = 1;
 /// Declarative plans: the same method/params steps plus per-step `assert` checks.
 const AUTOMATION_PLAN_VERSION_2: u16 = 2;
 const MAX_AUTOMATION_PLAN_STEPS: usize = 256;
-/// Bounds for one assertion's observed-text excerpt in failure messages.
-const MAX_ASSERT_EXCERPT_CHARS: usize = 2_000;
+/// Bounds for failure excerpts (assertion observations, spawn stderr) in reports.
+const MAX_REPORT_EXCERPT_CHARS: usize = 2_000;
 const MAX_PLAN_NAME_BYTES: usize = 64;
 
 struct AutomationClient {
@@ -1161,10 +1161,10 @@ fn evaluate_plan_assertion(
 
 /// Bound failure excerpts so a fullscreen of unexpected output cannot flood the report.
 fn truncate_excerpt(text: &str) -> String {
-    if text.chars().count() <= MAX_ASSERT_EXCERPT_CHARS {
+    if text.chars().count() <= MAX_REPORT_EXCERPT_CHARS {
         return text.to_owned();
     }
-    let kept: String = text.chars().take(MAX_ASSERT_EXCERPT_CHARS).collect();
+    let kept: String = text.chars().take(MAX_REPORT_EXCERPT_CHARS).collect();
     format!("{kept}…[truncated]")
 }
 
@@ -1233,35 +1233,36 @@ fn resolve_verification_window(
     Ok(Some((window_id, verification.timeout, verification.screenshot)))
 }
 
-fn run_plan(socket: Option<PathBuf>, target: Option<&str>, options: &IpcRunPlan) -> io::Result<()> {
-    let plan = read_plan(options)?;
-    let junit = match (options.report, &options.output) {
-        (IpcPlanReport::Junit, None) => {
-            return Err(IoError::new(
-                ErrorKind::InvalidInput,
-                "--report junit requires --output PATH",
-            ));
-        },
-        (IpcPlanReport::Junit, Some(_)) if options.dry_run => {
-            return Err(IoError::new(
-                ErrorKind::InvalidInput,
-                "--report junit is only written for executed runs, not --dry-run",
-            ));
-        },
-        (IpcPlanReport::Ndjson, Some(_)) => {
-            return Err(IoError::new(
-                ErrorKind::InvalidInput,
-                "--output PATH requires --report junit",
-            ));
-        },
-        (IpcPlanReport::Junit, Some(path)) => Some(path.clone()),
-        (IpcPlanReport::Ndjson, None) => None,
+/// Execute an automation plan, returning the outcome plus per-step records for reports.
+///
+/// Records come back on every path — including abort-early failures — so callers can render
+/// JUnit or capture failure evidence without re-running the plan.
+fn run_plan(
+    socket: Option<PathBuf>,
+    target: Option<&str>,
+    options: &IpcRunPlan,
+) -> (io::Result<()>, Vec<PlanStepRecord>) {
+    let plan = match read_plan(options) {
+        Ok(plan) => plan,
+        Err(error) => return (Err(error), Vec::new()),
     };
-    let mut client = AutomationClient::connect(socket, target)?;
-    let capabilities = plan_capabilities(&client.hello)?;
+    let junit = match report_destination(options.report, &options.output, options.dry_run) {
+        Ok(destination) => destination,
+        Err(error) => return (Err(error), Vec::new()),
+    };
+    let mut client = match AutomationClient::connect(socket, target) {
+        Ok(client) => client,
+        Err(error) => return (Err(error), Vec::new()),
+    };
+    let capabilities = match plan_capabilities(&client.hello) {
+        Ok(capabilities) => capabilities,
+        Err(error) => return (Err(error), Vec::new()),
+    };
     let methods =
         capabilities.iter().map(|capability| capability.name.clone()).collect::<HashSet<_>>();
-    validate_plan(&plan, &methods)?;
+    if let Err(error) = validate_plan(&plan, &methods) {
+        return (Err(error), Vec::new());
+    }
     let classes = capabilities
         .iter()
         .map(|capability| (capability.name.as_str(), capability))
@@ -1276,10 +1277,12 @@ fn run_plan(socket: Option<PathBuf>, target: Option<&str>, options: &IpcRunPlan)
             .to_owned()
     });
     let mut output = io::stdout().lock();
-    write_plan_event(
+    if let Err(error) = write_plan_event(
         &mut output,
         json!({"type":"plan_started","version":plan.version,"name":suite,"steps":plan.steps.len(),"mode":if options.dry_run {"dry_run"} else if options.preflight {"preflight"} else {"execute"}}),
-    )?;
+    ) {
+        return (Err(error), Vec::new());
+    }
 
     let mut aliases = BTreeMap::new();
     let mut failures = 0_u64;
@@ -1288,34 +1291,46 @@ fn run_plan(socket: Option<PathBuf>, target: Option<&str>, options: &IpcRunPlan)
         let capability = classes[step.method.as_str()];
         let step_started = std::time::Instant::now();
         if options.dry_run {
-            write_plan_event(
+            if let Err(error) = write_plan_event(
                 &mut output,
                 json!({"type":"step","id":step.id,"method":step.method,"class":capability.class,"mutating":capability.mutating,"status":"planned"}),
-            )?;
+            ) {
+                return (Err(error), records);
+            }
             continue;
         }
         if options.preflight && capability.mutating {
-            write_plan_event(
+            if let Err(error) = write_plan_event(
                 &mut output,
                 json!({"type":"step","id":step.id,"method":step.method,"class":capability.class,"mutating":true,"status":"skipped","reason":"preflight_mutation"}),
-            )?;
+            ) {
+                return (Err(error), records);
+            }
             records.push(PlanStepRecord::skipped(step, "preflight_mutation", &step_started));
             continue;
         }
         if options.preflight {
             let mut references = Vec::new();
-            collect_references(&step.params, &mut references)?;
-            if let Some(verification) = &step.verify {
-                collect_references(&verification.window_id, &mut references)?;
+            if let Err(error) = collect_references(&step.params, &mut references).and_then(|()| {
+                match &step.verify {
+                    Some(verification) => {
+                        collect_references(&verification.window_id, &mut references)
+                    },
+                    None => Ok(()),
+                }
+            }) {
+                return (Err(error), records);
             }
             if let Some(condition) = &step.when {
                 references.push(condition.reference.clone());
             }
             if references.iter().any(|reference| !aliases.contains_key(reference)) {
-                write_plan_event(
+                if let Err(error) = write_plan_event(
                     &mut output,
                     json!({"type":"step","id":step.id,"method":step.method,"status":"skipped","reason":"dependency_unavailable"}),
-                )?;
+                ) {
+                    return (Err(error), records);
+                }
                 records.push(PlanStepRecord::skipped(
                     step,
                     "dependency_unavailable",
@@ -1327,10 +1342,12 @@ fn run_plan(socket: Option<PathBuf>, target: Option<&str>, options: &IpcRunPlan)
         if let Some(condition) = &step.when
             && aliases.get(&condition.reference) != Some(&condition.equals)
         {
-            write_plan_event(
+            if let Err(error) = write_plan_event(
                 &mut output,
                 json!({"type":"step","id":step.id,"method":step.method,"status":"skipped","reason":"condition_false"}),
-            )?;
+            ) {
+                return (Err(error), records);
+            }
             records.push(PlanStepRecord::skipped(step, "condition_false", &step_started));
             continue;
         }
@@ -1424,58 +1441,75 @@ fn run_plan(socket: Option<PathBuf>, target: Option<&str>, options: &IpcRunPlan)
         };
         match outcome {
             Ok(result) => {
-                write_plan_event(
+                if let Err(error) = write_plan_event(
                     &mut output,
                     json!({"type":"step","id":step.id,"method":step.method,"class":capability.class,"mutating":capability.mutating,"status":"ok","result":result}),
-                )?;
+                ) {
+                    return (Err(error), records);
+                }
                 records.push(PlanStepRecord::ok(step, &step_started));
             },
             Err(error) => {
                 failures = failures.saturating_add(1);
                 let message = error.to_string();
-                write_plan_event(
+                if let Err(error) = write_plan_event(
                     &mut output,
                     json!({"type":"step","id":step.id,"method":step.method,"status":"error","error":message}),
-                )?;
-                records.push(PlanStepRecord::error(step, &message, &step_started));
+                ) {
+                    return (Err(error), records);
+                }
+                let window = assert_window_id(step, &aliases);
+                records.push(PlanStepRecord::error(step, &message, window, &step_started));
                 if step.on_error == IpcPlanErrorPolicy::Abort {
-                    write_plan_event(
+                    if let Err(error) = write_plan_event(
                         &mut output,
                         json!({"type":"plan_completed","status":"failed","failures":failures}),
-                    )?;
-                    write_junit_report(&junit, &suite, &records, failures)?;
-                    return Err(IoError::other(format!(
-                        "automation plan failed at step {:?}",
-                        step.id
-                    )));
+                    ) {
+                        return (Err(error), records);
+                    }
+                    if let Err(error) = write_junit_report(&junit, &suite, &records, failures) {
+                        return (Err(error), records);
+                    }
+                    return (
+                        Err(IoError::other(format!(
+                            "automation plan failed at step {:?}",
+                            step.id
+                        ))),
+                        records,
+                    );
                 }
             },
         }
     }
 
-    write_plan_event(
+    if let Err(error) = write_plan_event(
         &mut output,
         json!({"type":"plan_completed","status":if failures == 0 {"ok"} else {"completed_with_errors"},"failures":failures}),
-    )?;
-    write_junit_report(&junit, &suite, &records, failures)?;
-    if failures == 0 {
+    ) {
+        return (Err(error), records);
+    }
+    if let Err(error) = write_junit_report(&junit, &suite, &records, failures) {
+        return (Err(error), records);
+    }
+    let outcome = if failures == 0 {
         Ok(())
     } else {
         Err(IoError::other("automation plan completed with errors"))
-    }
+    };
+    (outcome, records)
 }
 
-/// One executed plan step as recorded for the JUnit report.
-struct PlanStepRecord {
+/// One executed plan step as recorded for the JUnit report and failure captures.
+pub(crate) struct PlanStepRecord {
     id: String,
     method: String,
     elapsed_secs: f64,
     outcome: PlanStepOutcome,
 }
 
-enum PlanStepOutcome {
+pub(crate) enum PlanStepOutcome {
     Ok,
-    Error(String),
+    Error { message: String, window: Option<u64> },
     Skipped(String),
 }
 
@@ -1489,12 +1523,17 @@ impl PlanStepRecord {
         }
     }
 
-    fn error(step: &IpcAutomationPlanStep, message: &str, started: &std::time::Instant) -> Self {
+    fn error(
+        step: &IpcAutomationPlanStep,
+        message: &str,
+        window: Option<u64>,
+        started: &std::time::Instant,
+    ) -> Self {
         Self {
             id: step.id.clone(),
             method: step.method.clone(),
             elapsed_secs: started.elapsed().as_secs_f64(),
-            outcome: PlanStepOutcome::Error(message.to_owned()),
+            outcome: PlanStepOutcome::Error { message: message.to_owned(), window },
         }
     }
 
@@ -1505,6 +1544,44 @@ impl PlanStepRecord {
             elapsed_secs: started.elapsed().as_secs_f64(),
             outcome: PlanStepOutcome::Skipped(reason.to_owned()),
         }
+    }
+}
+
+/// Window an assertion reads, after resolving `$ref` aliases.
+///
+/// A step whose assertion has no window contributes no capture target; the runner then falls
+/// back to the session's first window.
+fn assert_window_id(
+    step: &IpcAutomationPlanStep,
+    aliases: &BTreeMap<String, Value>,
+) -> Option<u64> {
+    step.assert
+        .as_ref()?
+        .window_id
+        .as_ref()
+        .and_then(|window_id| resolve_plan_references(window_id, aliases).ok())
+        .and_then(|window_id| window_id.as_u64())
+}
+
+/// Validate `--report`/`--output` combinations shared by `run-plan` and `test`.
+fn report_destination(
+    report: IpcPlanReport,
+    output: &Option<PathBuf>,
+    dry_run: bool,
+) -> io::Result<Option<PathBuf>> {
+    match (report, output) {
+        (IpcPlanReport::Junit, None) => {
+            Err(IoError::new(ErrorKind::InvalidInput, "--report junit requires --output PATH"))
+        },
+        (IpcPlanReport::Junit, Some(_)) if dry_run => Err(IoError::new(
+            ErrorKind::InvalidInput,
+            "--report junit is only written for executed runs, not --dry-run",
+        )),
+        (IpcPlanReport::Ndjson, Some(_)) => {
+            Err(IoError::new(ErrorKind::InvalidInput, "--output PATH requires --report junit"))
+        },
+        (IpcPlanReport::Junit, Some(path)) => Ok(Some(path.clone())),
+        (IpcPlanReport::Ndjson, None) => Ok(None),
     }
 }
 
@@ -1537,7 +1614,7 @@ fn write_junit_report(
         ));
         match &record.outcome {
             PlanStepOutcome::Ok => xml.push_str("/>\n"),
-            PlanStepOutcome::Error(message) => {
+            PlanStepOutcome::Error { message, .. } => {
                 xml.push_str(&format!(
                     ">\n    <failure message=\"{}\">{}</failure>\n  </testcase>\n",
                     junit_escape(message),
@@ -1575,6 +1652,213 @@ fn junit_escape(text: &str) -> String {
         }
     }
     escaped
+}
+
+/// Run an automation plan inside an ephemeral headless session.
+///
+/// The runner owns the whole lifecycle: it validates options before spawning anything, starts a
+/// fresh session, executes the plan with `run-plan` semantics, captures failure evidence, and
+/// shuts the session down — unless `--keep-failed` preserves a failed session for inspection.
+/// Plan NDJSON events go to stdout; runner chatter goes to stderr so scripts can parse stdout.
+pub fn run_test(options: &IpcTest) -> io::Result<()> {
+    report_destination(options.report, &options.output, false)?;
+    let name = test_session_name(options.session.as_deref())?;
+    let socket = spawn_test_session(&name, options.headless_size, &options.shell)?;
+    eprintln!("vivido test: session {name:?} serving on {}", socket.display());
+    await_test_session(&name)?;
+    let plan = IpcRunPlan {
+        file: options.file.clone(),
+        dry_run: false,
+        preflight: false,
+        report: options.report,
+        output: options.output.clone(),
+    };
+    let (outcome, records) = run_plan(None, Some(&name), &plan);
+    if let Some(failed) =
+        records.iter().find(|record| matches!(record.outcome, PlanStepOutcome::Error { .. }))
+    {
+        capture_test_failure(&socket, &name, failed, test_artifacts_dir(options));
+    }
+    if outcome.is_ok() || !options.keep_failed {
+        quit_test_session(&socket, &name);
+    }
+    if outcome.is_err() && options.keep_failed {
+        eprintln!(
+            "vivido test: keeping failed session {name:?}; reattach with `vivido msg --target {name}` or `vivido kill-session --target {name}`"
+        );
+    }
+    outcome
+}
+
+/// Pick a fresh session name: the explicit one, or a process-scoped generated name.
+///
+/// An explicit name that already exists is an error — a test plan must never drive windows it
+/// did not create.
+fn test_session_name(explicit: Option<&str>) -> io::Result<String> {
+    if let Some(name) = explicit {
+        if crate::session::registered_instance(name).is_ok() {
+            return Err(IoError::new(
+                ErrorKind::AlreadyExists,
+                format!(
+                    "session {name:?} already exists; `vivido test` never reuses a live session"
+                ),
+            ));
+        }
+        return Ok(name.to_owned());
+    }
+    let pid = std::process::id();
+    for attempt in 0..100 {
+        let name = if attempt == 0 {
+            format!("vivido-test-{pid}")
+        } else {
+            format!("vivido-test-{pid}-{attempt}")
+        };
+        if crate::session::registered_instance(&name).is_err() {
+            return Ok(name);
+        }
+    }
+    Err(IoError::other("could not pick a fresh test session name"))
+}
+
+/// Spawn a detached headless session and return its socket path.
+///
+/// This mirrors the integration-test harness: the parent prints `VIVIDO_SOCKET=` and exits,
+/// so waiting on the child both bounds startup and surfaces spawn errors with stderr.
+fn spawn_test_session(
+    name: &str,
+    size: crate::cli::HeadlessSize,
+    shell: &[String],
+) -> io::Result<PathBuf> {
+    let exe = std::env::current_exe().map_err(|error| {
+        IoError::new(ErrorKind::NotFound, format!("cannot locate the vivido binary: {error}"))
+    })?;
+    let mut command = std::process::Command::new(exe);
+    command.args(["--headless", "--session", name, "--headless-size", &size.as_arg()]);
+    if !shell.is_empty() {
+        command.arg("-e").args(shell);
+    }
+    // The session must serve this run, not inherit a socket or session pointer from it.
+    command.env_remove("VIVIDO_SOCKET").env_remove("VIVIDO_SESSION");
+    let output = command.output().map_err(|error| {
+        IoError::new(ErrorKind::NotFound, format!("failed to spawn headless session: {error}"))
+    })?;
+    if !output.status.success() {
+        return Err(IoError::other(format!(
+            "headless session {name:?} failed to start: {}",
+            truncate_excerpt(&String::from_utf8_lossy(&output.stderr))
+        )));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("VIVIDO_SOCKET="))
+        .and_then(|line| line.split(';').next())
+        .map(PathBuf::from)
+        .ok_or_else(|| {
+            IoError::new(
+                ErrorKind::InvalidData,
+                format!("headless session {name:?} printed no VIVIDO_SOCKET: {stdout:?}"),
+            )
+        })
+}
+
+/// Wait until the spawned session answers `capabilities`.
+fn await_test_session(name: &str) -> io::Result<()> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        match request_once(None, Some(name), &SocketMessage::Capabilities) {
+            Ok(_) => return Ok(()),
+            Err(error) => {
+                if std::time::Instant::now() >= deadline {
+                    return Err(IoError::other(format!(
+                        "headless session {name:?} never became ready: {error}"
+                    )));
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            },
+        }
+    }
+}
+
+/// Shut a test session down; teardown trouble warns but never fails the run.
+fn quit_test_session(socket: &Path, name: &str) {
+    if let Err(error) =
+        request_once(Some(socket.to_owned()), None, &SocketMessage::Quit).map(|_| ())
+    {
+        eprintln!(
+            "vivido test: session {name:?} would not quit ({error}); remove it with `vivido kill-session --target {name}`"
+        );
+    }
+}
+
+fn test_artifacts_dir(options: &IpcTest) -> PathBuf {
+    options.artifacts_dir.clone().unwrap_or_else(|| PathBuf::from("vivido-test-artifacts"))
+}
+
+/// Capture failure evidence for the first failed step: grid text plus screenshot metadata.
+///
+/// Captures are best-effort: a capture that fails warns on stderr and never masks the plan
+/// error it was documenting.
+fn capture_test_failure(socket: &Path, session: &str, failed: &PlanStepRecord, dir: PathBuf) {
+    let window = failed_window(socket, failed);
+    let Some(window) = window else {
+        eprintln!(
+            "vivido test: step {:?} failed but the session has no window to capture",
+            failed.id
+        );
+        return;
+    };
+    if let Err(error) = fs::create_dir_all(&dir) {
+        eprintln!("vivido test: cannot create artifacts dir {}: {error}", dir.display());
+        return;
+    }
+    let request = |message: SocketMessage| {
+        request_once(Some(socket.to_owned()), None, &message).map(|(_, result)| result)
+    };
+    match request(SocketMessage::GetText(IpcGetText { window_id: Some(window), rows: Some(1000) }))
+        .map(|reply| reply.get("text").and_then(Value::as_str).unwrap_or_default().to_owned())
+    {
+        Ok(text) => {
+            let path = dir.join(format!("{}.grid.txt", failed.id));
+            if let Err(error) = fs::write(&path, text) {
+                eprintln!("vivido test: cannot write {}: {error}", path.display());
+            } else {
+                eprintln!("vivido test: grid dump for {:?} in {}", failed.id, path.display());
+            }
+        },
+        Err(error) => eprintln!("vivido test: grid capture for {:?} failed: {error}", failed.id),
+    }
+    match request(SocketMessage::Screenshot(IpcScreenshot { window_id: Some(window), json: true }))
+    {
+        Ok(reply) => {
+            let path = dir.join(format!("{}.screenshot.json", failed.id));
+            let document =
+                serde_json::to_string_pretty(&reply).unwrap_or_else(|_| reply.to_string());
+            if let Err(error) = fs::write(&path, document) {
+                eprintln!("vivido test: cannot write {}: {error}", path.display());
+            } else {
+                eprintln!(
+                    "vivido test: screenshot metadata for {:?} in {} (session {session:?})",
+                    failed.id,
+                    path.display()
+                );
+            }
+        },
+        Err(error) => {
+            eprintln!("vivido test: screenshot capture for {:?} failed: {error}", failed.id);
+        },
+    }
+}
+
+/// Window to capture: the failed assertion's window, else the session's first window.
+fn failed_window(socket: &Path, failed: &PlanStepRecord) -> Option<u64> {
+    if let PlanStepOutcome::Error { window: Some(window), .. } = failed.outcome {
+        return Some(window);
+    }
+    request_once(Some(socket.to_owned()), None, &SocketMessage::ListWindows)
+        .ok()
+        .and_then(|(_, reply)| reply.get("windows").and_then(Value::as_array)?.first().cloned())
+        .and_then(|window| window.get("window_id").and_then(Value::as_u64))
 }
 
 fn run_capture(
@@ -1625,7 +1909,8 @@ fn run_capture(
 /// Send one CLI command using a versioned protocol session.
 pub fn send_message(options: MessageOptions) -> io::Result<()> {
     if let SocketMessage::RunPlan(params) = &options.message {
-        return run_plan(options.socket, options.target.as_deref(), params);
+        let (outcome, _) = run_plan(options.socket, options.target.as_deref(), params);
+        return outcome;
     }
     if let SocketMessage::Capture(params) = &options.message {
         return run_capture(options.socket, options.target.as_deref(), params);
@@ -2496,6 +2781,19 @@ mod tests {
         assert_eq!(method, "wait_text");
         assert_eq!(params["line"], -1);
         assert_eq!(params["rect"], Value::Null);
+
+        // Hand-written wire JSON omits what it does not need: optional wait fields and an
+        // empty target decode to focused-window defaults rather than `invalid_params`.
+        let minimal: crate::cli::IpcWaitText = serde_json::from_value(json!({
+            "text": "ready",
+            "common": {"timeout": 1000, "target": {}},
+        }))
+        .unwrap();
+        assert!(!minimal.regex);
+        assert_eq!(minimal.after_screen, None);
+        assert_eq!(minimal.line, None);
+        assert_eq!(minimal.rect, None);
+        assert_eq!(minimal.common.target.window_id, None);
     }
 
     #[test]
@@ -2595,6 +2893,23 @@ mod tests {
     }
 
     #[test]
+    fn report_destinations_are_validated_before_any_session_exists() {
+        use crate::cli::IpcPlanReport::{Junit, Ndjson};
+        assert!(report_destination(Junit, &None, false).is_err());
+        assert!(report_destination(Junit, &Some(PathBuf::from("x.xml")), true).is_err());
+        assert!(report_destination(Ndjson, &Some(PathBuf::from("x.xml")), false).is_err());
+        assert_eq!(
+            report_destination(Junit, &Some(PathBuf::from("x.xml")), false).unwrap(),
+            Some(PathBuf::from("x.xml"))
+        );
+        assert_eq!(report_destination(Ndjson, &None, false).unwrap(), None);
+
+        // A generated session name is process-scoped and does not claim anything.
+        let name = test_session_name(None).unwrap();
+        assert!(name.starts_with("vivido-test-"), "{name}");
+    }
+
+    #[test]
     fn junit_report_escapes_and_counts_steps() {
         assert_eq!(junit_escape("a&b<c>d\"e'f"), "a&amp;b&lt;c&gt;d&quot;e&apos;f");
         assert_eq!(truncate_excerpt("short"), "short");
@@ -2613,7 +2928,7 @@ mod tests {
         let started = std::time::Instant::now();
         let records = [
             PlanStepRecord::ok(&step("type<&>"), &started),
-            PlanStepRecord::error(&step("check"), "expected \"x\"", &started),
+            PlanStepRecord::error(&step("check"), "expected \"x\"", Some(1), &started),
             PlanStepRecord::skipped(&step("later"), "condition_false", &started),
         ];
         let path =

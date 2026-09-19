@@ -31,7 +31,7 @@ use vivido::binary::{headless, logging, session};
 use vivido::cli::SocketMessage as ActivationSocketMessage;
 use vivido::cli::Subcommands;
 use vivido::cli::{
-    DebugBundleOptions, DoctorOptions, IpcDiagnose, IpcGetGrid, IpcScreenshot, IpcTarget,
+    DebugBundleOptions, DoctorOptions, IpcDiagnose, IpcGetGrid, IpcScreenshot, IpcTarget, IpcTest,
     IpcTranscript, ListOptions, MessageOptions, Options, SocketMessage,
 };
 use vivido::config;
@@ -71,6 +71,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some(Subcommands::Doctor(options)) => doctor(options)?,
         Some(Subcommands::DebugBundle(options)) => write_debug_bundle(options)?,
         Some(Subcommands::KillSession { target }) => session::terminate_session(&target)?,
+        Some(Subcommands::Test(options)) => run_test(options)?,
         // A headless run never builds a winit event loop, so it must branch before `vivido`.
         None if options.headless => headless::run(options)?,
         None => vivido(options)?,
@@ -88,6 +89,11 @@ fn msg(mut options: MessageOptions) -> Result<(), Box<dyn Error>> {
             env::var("XDG_ACTIVATION_TOKEN").or_else(|_| env::var("DESKTOP_STARTUP_ID")).ok();
     }
     ipc::send_message(options).map_err(|err| err.into())
+}
+
+/// `test` subcommand entrypoint: a plan inside an ephemeral headless session.
+fn run_test(options: IpcTest) -> Result<(), Box<dyn Error>> {
+    ipc::run_test(&options).map_err(|err| err.into())
 }
 
 fn list_instances(options: ListOptions) -> Result<(), Box<dyn Error>> {

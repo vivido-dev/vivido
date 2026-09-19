@@ -426,6 +426,119 @@ fn run_plan_asserts_state_and_writes_junit() {
     assert!(xml.contains("NEVER-PRINTED"), "{xml}");
 }
 
+/// `vivido test` runs a plan in an ephemeral session, reports JUnit, and tears down.
+#[test]
+#[ignore = "spawns processes and needs a wgpu adapter"]
+fn test_runner_executes_a_plan_and_tears_down() {
+    let runtime = test_runtime("runner");
+    let _ = fs::remove_dir_all(&runtime);
+    fs::create_dir_all(&runtime).expect("runtime directory");
+    set_private(&runtime);
+
+    #[cfg(unix)]
+    let latch = "echo RUNNER-SMOKE-7\n";
+    #[cfg(windows)]
+    let latch = "Write-Output 'RUNNER-SMOKE-7'\r";
+    let plan = runtime.join("smoke-plan.json");
+    fs::write(
+        &plan,
+        r#"{"version":1,"steps":[
+        {"id":"type","method":"typing","params":{"text":"LATCH"}},
+        {"id":"see","method":"wait_text","params":{"text":"RUNNER-SMOKE-7","common":{"timeout":15000,"target":{}}}}
+    ]}"#
+        .replace("LATCH", &latch.replace('\n', "\\n").replace('\r', "\\r")),
+    )
+    .unwrap();
+    let report = runtime.join("smoke-junit.xml");
+
+    let mut command = base_command(&runtime);
+    command.args([
+        "test",
+        "--session",
+        "runner-smoke",
+        "--file",
+        plan.to_str().unwrap(),
+        "--report",
+        "junit",
+        "--output",
+        report.to_str().unwrap(),
+    ]);
+    #[cfg(unix)]
+    command.args(["--", "sh"]);
+    #[cfg(windows)]
+    command.args(["--", "powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive"]);
+    let output = command.output().expect("run vivido test");
+    assert!(
+        output.status.success(),
+        "vivido test failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // Stdout stays machine-readable plan NDJSON even under the test runner.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains(r#""type":"plan_completed""#), "no plan events: {stdout}");
+    let xml = fs::read_to_string(&report).unwrap();
+    assert!(xml.contains(r#"tests="2" failures="0""#), "{xml}");
+
+    // The ephemeral session is gone: nothing to leak into the next run.
+    let mut list = base_command(&runtime);
+    list.arg("list");
+    let list = list.output().expect("run vivido list");
+    assert!(
+        !String::from_utf8_lossy(&list.stdout).contains("runner-smoke"),
+        "test session survived its passing run"
+    );
+
+    // A failing run captures evidence, keeps the session with --keep-failed, and still fails.
+    let failing = runtime.join("failing-plan.json");
+    fs::write(
+        &failing,
+        r#"{"version":1,"steps":[
+        {"id":"miss","method":"wait_text","params":{"text":"NEVER-PRINTED","common":{"timeout":1000,"target":{}}}}
+    ]}"#,
+    )
+    .unwrap();
+    let artifacts = runtime.join("artifacts");
+    let failing_report = runtime.join("failing-junit.xml");
+    let mut failed = base_command(&runtime);
+    failed.args([
+        "test",
+        "--session",
+        "runner-keep",
+        "--file",
+        failing.to_str().unwrap(),
+        "--report",
+        "junit",
+        "--output",
+        failing_report.to_str().unwrap(),
+        "--artifacts-dir",
+        artifacts.to_str().unwrap(),
+        "--keep-failed",
+    ]);
+    #[cfg(unix)]
+    failed.args(["--", "sh"]);
+    #[cfg(windows)]
+    failed.args(["--", "powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive"]);
+    let output = failed.output().expect("run failing vivido test");
+    assert!(!output.status.success(), "a failing plan must fail `vivido test`");
+    assert!(artifacts.join("miss.grid.txt").is_file(), "no grid capture");
+    assert!(artifacts.join("miss.screenshot.json").is_file(), "no screenshot capture");
+    let xml = fs::read_to_string(&failing_report).unwrap();
+    assert!(xml.contains(r#"tests="1" failures="1""#), "{xml}");
+
+    // The kept session is a real session: quit it explicitly to leave no residue.
+    let mut quit = base_command(&runtime);
+    quit.args(["kill-session", "--target", "runner-keep"]);
+    let quit = quit.output().expect("quit kept session");
+    assert!(quit.status.success(), "cannot quit kept session");
+    let mut list = base_command(&runtime);
+    list.arg("list");
+    let list = list.output().expect("run vivido list");
+    assert!(
+        !String::from_utf8_lossy(&list.stdout).contains("runner-keep"),
+        "kept session survived kill-session"
+    );
+}
+
 /// The whole point: a session with no compositor still answers text and pixel queries.
 #[test]
 #[ignore = "spawns processes and needs a wgpu adapter"]
