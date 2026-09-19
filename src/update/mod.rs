@@ -1,5 +1,6 @@
 //! Bounded, platform-aware in-app update discovery and download support.
 
+mod dialog;
 mod install;
 
 use std::error::Error;
@@ -18,6 +19,9 @@ use sha2::{Digest, Sha256};
 
 use crate::event::{Event, EventSink, EventType};
 
+#[cfg(any(windows, target_os = "macos"))]
+pub(crate) use dialog::information;
+pub(crate) use dialog::{DownloadChoice, choose_download, confirm_install};
 pub use install::launch_installer;
 
 const MANIFEST_LIMIT: u64 = 64 * 1024;
@@ -420,7 +424,7 @@ fn download_and_verify(
     cancel: &AtomicBool,
 ) -> Result<PathBuf, UpdateError> {
     validate(manifest)?;
-    if cancel.load(Ordering::Acquire) {
+    if cancel.load(Ordering::Relaxed) {
         return Err(UpdateError::Cancelled);
     }
 
@@ -452,7 +456,7 @@ fn download_and_verify(
     );
 
     loop {
-        if cancel.load(Ordering::Acquire) {
+        if cancel.load(Ordering::Relaxed) {
             return Err(UpdateError::Cancelled);
         }
         let count = reader.read(&mut buffer)?;

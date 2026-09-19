@@ -22,6 +22,7 @@ pub mod selection;
 pub mod serde_utils;
 pub mod terminal;
 pub mod ui_config;
+pub mod updates;
 pub mod window;
 
 mod bindings;
@@ -399,7 +400,18 @@ mod tests {
 
     #[test]
     fn empty_config() {
-        toml::from_str::<UiConfig>("").unwrap();
+        let config = toml::from_str::<UiConfig>("").unwrap();
+        assert!(config.updates.enabled);
+        assert!(config.updates.startup_check);
+    }
+
+    #[test]
+    fn updates_table_overrides_both_defaults() {
+        let config =
+            toml::from_str::<UiConfig>("[updates]\nenabled = false\nstartup_check = false\n")
+                .unwrap();
+        assert!(!config.updates.enabled);
+        assert!(!config.updates.startup_check);
     }
 
     #[test]

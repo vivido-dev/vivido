@@ -16,9 +16,9 @@ use std::os::unix::io::RawFd;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
-#[cfg(windows)]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
+use std::thread;
 use std::time::{Duration, Instant};
 use std::{env, f32, mem};
 
@@ -82,6 +82,7 @@ use crate::polling::ipc::{IpcConnection, IpcRequest};
 #[cfg(any(unix, windows))]
 use crate::polling::ipc::{IpcError, MAX_INPUT_BYTES, MAX_IPC_TEXT_BYTES, MethodCapability};
 use crate::scheduler::{Scheduler, TimerId, Topic};
+use crate::update::{self, DownloadChoice, UpdateEvent, UpdateManifest};
 use crate::vivid::VividService;
 #[cfg(windows)]
 use crate::window_context::is_latency_sensitive_window_event;
@@ -165,6 +166,18 @@ const HEADLESS_IDLE_WAIT: Duration = Duration::from_millis(100);
 /// Message-bar target used to replace transient file-drop hover and state messages.
 const FILE_DROP_MESSAGE_TARGET: &str = "vivid-file-drop";
 
+/// Message-bar target used to replace the current update status.
+const UPDATE_MESSAGE_TARGET: &str = "vivido-update";
+
+/// Delay before a quiet startup check, keeping update I/O off the startup path.
+const UPDATE_STARTUP_DELAY: Duration = Duration::from_secs(1);
+
+#[derive(Debug)]
+struct ReadyInstaller {
+    version: semver::Version,
+    path: PathBuf,
+}
+
 #[cfg(target_os = "macos")]
 #[derive(Debug, PartialEq, Eq)]
 enum MenuEffect {
@@ -221,6 +234,21 @@ fn schedule_message_timeout(
     );
 }
 
+fn update_progress_percent(downloaded: u64, total: u64) -> u64 {
+    if total == 0 {
+        return 0;
+    }
+    let percent = u128::from(downloaded).saturating_mul(100) / u128::from(total);
+    u64::try_from(percent.min(100)).expect("an update percentage at most 100 fits in u64")
+}
+
+fn update_available_message(version: &semver::Version, bytes: u64) -> String {
+    format!(
+        "Vivido {version} is available ({} MiB). Click to review the update.",
+        bytes.div_ceil(1024 * 1024)
+    )
+}
+
 /// The event processor.
 ///
 /// Stores some state from received events and dispatches actions when they are
@@ -252,6 +280,12 @@ pub struct Processor {
     shell_actions: VecDeque<crate::shell::ShellActionRequest>,
     cli_options: CliOptions,
     config: Rc<UiConfig>,
+    update_cancel: Arc<AtomicBool>,
+    update_manifest: Option<UpdateManifest>,
+    update_ready: Option<ReadyInstaller>,
+    update_check_in_flight: bool,
+    update_check_manual: bool,
+    update_download_in_flight: bool,
     /// Earliest time the headless loop may draw again. Unused in windowed mode.
     next_headless_draw: Instant,
 }
@@ -316,6 +350,12 @@ impl Processor {
             proxy,
             scheduler,
             config: Rc::new(config),
+            update_cancel: Arc::new(AtomicBool::new(false)),
+            update_manifest: None,
+            update_ready: None,
+            update_check_in_flight: false,
+            update_check_manual: false,
+            update_download_in_flight: false,
             clipboard,
             windows: Default::default(),
             #[cfg(any(unix, windows))]
@@ -2909,7 +2949,231 @@ impl Processor {
             return;
         }
 
+        if !self.cli_options.headless
+            && self.config.updates.enabled
+            && self.config.updates.startup_check
+        {
+            self.start_update_check(false, Some(UPDATE_STARTUP_DELAY));
+        }
+
         info!("Initialisation complete");
+    }
+
+    fn start_update_check(&mut self, manual: bool, delay: Option<Duration>) {
+        if !self.config.updates.enabled
+            || self.update_check_in_flight
+            || self.update_download_in_flight
+        {
+            return;
+        }
+
+        self.update_check_in_flight = true;
+        self.update_check_manual = manual;
+        if let Some(delay) = delay {
+            let sink = self.proxy.clone();
+            let cancel = Arc::clone(&self.update_cancel);
+            let spawn =
+                thread::Builder::new().name("vivido-update-delay".into()).spawn(move || {
+                    thread::sleep(delay);
+                    if !cancel.load(Ordering::Relaxed) {
+                        update::spawn_check(sink, manual);
+                    }
+                });
+            if let Err(error) = spawn {
+                self.update_check_in_flight = false;
+                self.update_check_manual = false;
+                if manual {
+                    self.show_update_information(
+                        "Vivido Update",
+                        &format!("Could not start the update check: {error}"),
+                    );
+                }
+            }
+        } else {
+            update::spawn_check(self.proxy.clone(), manual);
+        }
+    }
+
+    fn handle_update_event(&mut self, event: UpdateEvent) {
+        match event {
+            UpdateEvent::CheckRequested => self.start_update_check(true, None),
+            UpdateEvent::Available { manifest, version, bytes, notes_url: _, manual } => {
+                self.update_check_in_flight = false;
+                self.update_check_manual = false;
+                if manifest.version != version || manifest.asset.bytes != bytes {
+                    if manual {
+                        self.show_update_information(
+                            "Vivido Update",
+                            "The update response was internally inconsistent.",
+                        );
+                    }
+                    return;
+                }
+                if !manual && update::read_skipped_version().as_ref() == Some(&version) {
+                    return;
+                }
+
+                if self.update_ready.as_ref().is_some_and(|installer| installer.version != version)
+                {
+                    self.update_ready = None;
+                }
+                self.update_manifest = Some(*manifest);
+                if manual {
+                    self.handle_install_requested();
+                } else {
+                    self.replace_update_message(
+                        update_available_message(&version, bytes),
+                        MessageType::Info,
+                    );
+                }
+            },
+            UpdateEvent::UpToDate { current } => {
+                let manual = self.update_check_manual;
+                self.update_check_in_flight = false;
+                self.update_check_manual = false;
+                if manual {
+                    self.show_update_information(
+                        "Vivido Update",
+                        &format!("Vivido {current} is up to date."),
+                    );
+                }
+            },
+            UpdateEvent::Progress { version, downloaded, total } => {
+                self.update_download_in_flight = true;
+                let percent = update_progress_percent(downloaded, total);
+                self.replace_update_message(
+                    format!("Downloading Vivido {version} — {percent}%"),
+                    MessageType::Info,
+                );
+            },
+            UpdateEvent::Ready { version, path } => {
+                self.update_download_in_flight = false;
+                self.update_ready = Some(ReadyInstaller { version, path });
+                self.offer_ready_installer();
+            },
+            UpdateEvent::InstallRequested => self.handle_install_requested(),
+            UpdateEvent::Skip { version } => self.skip_update(version),
+            UpdateEvent::Failed { message, manual } => {
+                let was_downloading = self.update_download_in_flight;
+                self.update_check_in_flight = false;
+                self.update_check_manual = false;
+                self.update_download_in_flight = false;
+                if was_downloading && let Some(manifest) = self.update_manifest.as_ref() {
+                    let text = update_available_message(&manifest.version, manifest.asset.bytes);
+                    self.replace_update_message(text, MessageType::Info);
+                }
+                if manual {
+                    self.show_update_information("Vivido Update Failed", &message);
+                }
+            },
+        }
+    }
+
+    fn handle_install_requested(&mut self) {
+        if self.update_download_in_flight {
+            return;
+        }
+        let Some(manifest) = self.update_manifest.clone() else {
+            self.show_update_information(
+                "Vivido Update",
+                "No available update is ready to download.",
+            );
+            return;
+        };
+
+        if self.update_ready.as_ref().is_some_and(|installer| installer.version == manifest.version)
+        {
+            self.offer_ready_installer();
+            return;
+        }
+
+        match update::choose_download(&manifest.version) {
+            DownloadChoice::Download => {
+                self.update_cancel.store(false, Ordering::Relaxed);
+                self.update_download_in_flight = true;
+                update::spawn_download(
+                    self.proxy.clone(),
+                    manifest,
+                    Arc::clone(&self.update_cancel),
+                );
+            },
+            DownloadChoice::Skip => self.skip_update(manifest.version),
+            DownloadChoice::Cancel => {},
+        }
+    }
+
+    fn skip_update(&mut self, version: semver::Version) {
+        if let Err(error) = update::write_skipped_version(&version) {
+            self.show_update_information(
+                "Vivido Update",
+                &format!("Could not save the skipped version: {error}"),
+            );
+            return;
+        }
+
+        if self.update_manifest.as_ref().is_some_and(|manifest| manifest.version == version) {
+            self.update_manifest = None;
+        }
+        if self.update_ready.as_ref().is_some_and(|installer| installer.version == version) {
+            self.update_ready = None;
+        }
+        self.remove_update_message();
+    }
+
+    fn offer_ready_installer(&mut self) {
+        let Some(installer) = self.update_ready.as_ref() else { return };
+        let version = installer.version.clone();
+        let path = installer.path.clone();
+        if !update::confirm_install(&version) {
+            self.replace_update_message(
+                format!("Vivido {version} is downloaded and ready to install."),
+                MessageType::Info,
+            );
+            return;
+        }
+
+        match update::launch_installer(&path) {
+            Ok(()) => {
+                let _ = self.proxy.send_event(Event::new(EventType::Shutdown, None));
+            },
+            Err(error) => {
+                self.replace_update_message(
+                    format!("Vivido {version} is downloaded and ready to install."),
+                    MessageType::Info,
+                );
+                self.show_update_information(
+                    "Vivido Update Failed",
+                    &format!("Could not open the installer: {error}"),
+                );
+            },
+        }
+    }
+
+    fn replace_update_message(&mut self, text: String, ty: MessageType) {
+        for window in self.windows.values_mut() {
+            window.message_buffer.remove_target(UPDATE_MESSAGE_TARGET);
+            let mut message = Message::new(text.clone(), ty);
+            message.set_target(UPDATE_MESSAGE_TARGET.into());
+            window.message_buffer.push(message);
+            window.dirty = true;
+            window.display.window.request_redraw();
+        }
+    }
+
+    fn remove_update_message(&mut self) {
+        for window in self.windows.values_mut() {
+            window.message_buffer.remove_target(UPDATE_MESSAGE_TARGET);
+            window.dirty = true;
+            window.display.window.request_redraw();
+        }
+    }
+
+    fn show_update_information(&mut self, title: &str, message: &str) {
+        #[cfg(any(windows, target_os = "macos"))]
+        update::information(title, message);
+
+        #[cfg(not(any(windows, target_os = "macos")))]
+        self.replace_update_message(format!("{title}: {message}"), MessageType::Info);
     }
 
     /// Claim automation methods for the embedding host.
@@ -3361,9 +3625,13 @@ impl Processor {
                     );
                 }
             },
+            (EventType::Update(event), _) => self.handle_update_event(event),
             // Shutdown all windows.
             #[cfg(any(unix, windows))]
-            (EventType::Shutdown, _) => event_loop.exit(),
+            (EventType::Shutdown, _) => {
+                self.update_cancel.store(true, Ordering::Relaxed);
+                event_loop.exit();
+            },
             // Process events affecting all windows.
             (payload, None) => {
                 let event = WinitEvent::UserEvent(Event::new(payload, None));
@@ -3907,6 +4175,8 @@ impl Processor {
         if self.config.debug.print_events {
             info!("Exiting the event loop");
         }
+
+        self.update_cancel.store(true, Ordering::Relaxed);
 
         #[cfg(any(unix, windows))]
         for window in self.windows.values_mut() {
@@ -5989,6 +6259,29 @@ mod file_drop_message_tests {
         assert_eq!(
             buffer.message().and_then(|message| message.target()).map(String::as_str),
             Some(FILE_DROP_MESSAGE_TARGET)
+        );
+    }
+}
+
+#[cfg(test)]
+mod update_event_tests {
+    use semver::Version;
+
+    use super::{update_available_message, update_progress_percent};
+
+    #[test]
+    fn update_progress_is_bounded_and_handles_zero_total() {
+        assert_eq!(update_progress_percent(0, 0), 0);
+        assert_eq!(update_progress_percent(42, 100), 42);
+        assert_eq!(update_progress_percent(100, 100), 100);
+        assert_eq!(update_progress_percent(u64::MAX, 1), 100);
+    }
+
+    #[test]
+    fn update_notice_rounds_partial_mebibytes_up() {
+        assert_eq!(
+            update_available_message(&Version::new(1, 2, 3), 1024 * 1024 + 1),
+            "Vivido 1.2.3 is available (2 MiB). Click to review the update."
         );
     }
 }

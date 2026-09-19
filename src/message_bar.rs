@@ -22,6 +22,9 @@ pub struct Message {
 /// Purpose of the message.
 #[derive(Debug, Eq, PartialEq, Clone, Copy)]
 pub enum MessageType {
+    /// A persistent informational message.
+    Info,
+
     /// A message represents an error.
     Error,
 

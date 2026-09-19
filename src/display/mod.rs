@@ -882,6 +882,7 @@ impl Display {
                 let start_line = size_info.screen_lines() + search_offset;
                 let y = size_info.cell_height().mul_add(start_line as f32, size_info.padding_y());
                 let bg = match message.ty() {
+                    MessageType::Info => config.colors.normal.blue,
                     MessageType::Error => config.colors.normal.red,
                     MessageType::Warning => config.colors.normal.yellow,
                 };

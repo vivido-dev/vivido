@@ -30,6 +30,16 @@ live_config_reload = true
 ipc_socket = true
 
 # ─────────────────────────────────────────────────────────────────────────────
+# updates
+# ─────────────────────────────────────────────────────────────────────────────
+[updates]
+# Allow Vivido and embedding applications to check for suite updates.
+enabled = true
+
+# Check quietly after graphical startup. No installer is downloaded without a click.
+startup_check = true
+
+# ─────────────────────────────────────────────────────────────────────────────
 # message_bar
 # ─────────────────────────────────────────────────────────────────────────────
 [message_bar]
