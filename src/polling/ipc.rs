@@ -837,6 +837,19 @@ fn decode_request(frame: &[u8]) -> Result<RequestEnvelope, IpcError> {
         .map_err(|err| IpcError::new("invalid_request", format!("invalid IPC request: {err}")))
 }
 
+/// Concurrent ConPTY ceiling for `capabilities.limits`: the Windows desktop heap supports
+/// roughly 64 sessions per process, while other platforms have no ConPTY ceiling (null).
+fn max_conpty_windows() -> Value {
+    #[cfg(windows)]
+    {
+        json!(64)
+    }
+    #[cfg(not(windows))]
+    {
+        Value::Null
+    }
+}
+
 fn hello_result() -> Value {
     let instance = INSTANCE.get();
     json!({
@@ -867,6 +880,7 @@ fn hello_result() -> Value {
             "transcript_bytes_per_window": 1024 * 1024,
             "event_replay_bytes": 4 * 1024 * 1024,
             "event_replay_count": 4096,
+            "max_conpty_windows": max_conpty_windows(),
         }
     })
 }
@@ -4415,6 +4429,10 @@ mod tests {
         let hello = hello_result();
         assert_eq!(hello["protocol_version"], 2);
         assert_eq!(hello["limits"]["connections"], 32);
+        #[cfg(windows)]
+        assert_eq!(hello["limits"]["max_conpty_windows"], 64);
+        #[cfg(not(windows))]
+        assert!(hello["limits"]["max_conpty_windows"].is_null());
         assert!(hello["methods"].as_array().unwrap().iter().any(|value| value == "get_grid"));
         for method in [
             "vivid_sessions",

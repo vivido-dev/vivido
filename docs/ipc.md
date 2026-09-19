@@ -125,7 +125,9 @@ Every connection must begin with `hello`:
 ```
 
 The response advertises the server version, protocol version, whether this instance is headless,
-its optional session and `automation_name`, methods, event kinds, stable error codes, and limits:
+its optional session and `automation_name`, methods, event kinds, stable error codes, and limits
+(including `max_conpty_windows`: 64 on Windows, where the desktop heap bounds concurrent ConPTY
+sessions per process, and null where ConPTY does not exist):
 
 ```json
 {"version":2,"id":1,"ok":true,"result":{"server_version":"0.0.0","protocol_version":2,"headless":true,"session":"build","methods":[],"event_kinds":[],"limits":{}}}
