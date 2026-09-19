@@ -404,6 +404,13 @@ pub struct IpcTest {
     #[clap(long, value_name = "DIR", value_hint = ValueHint::DirPath)]
     pub artifacts_dir: Option<PathBuf>,
 
+    /// Set a plan variable, overriding the plan's `vars`. Repeatable as `--set KEY=VALUE`.
+    ///
+    /// Values appear in the runner's process arguments; prefer plan files or restricted
+    /// environments for secrets, which the plan masks in reports via `secrets` regardless.
+    #[clap(long = "set", value_name = "KEY=VALUE")]
+    pub set: Vec<String>,
+
     /// Shell program for the session's initial window; the headless default when omitted.
     #[clap(last = true, value_name = "SHELL")]
     pub shell: Vec<String>,
@@ -547,6 +554,9 @@ pub enum SocketMessage {
     /// Read terminal text.
     GetText(IpcGetText),
 
+    /// Find pattern matches with cell and pixel rectangles.
+    FindText(IpcFindText),
+
     /// Capture the last displayed terminal frame.
     Screenshot(IpcScreenshot),
 
@@ -653,6 +663,13 @@ pub struct IpcRunPlan {
     /// Destination file for `--report junit`.
     #[clap(long, value_name = "PATH", value_hint = ValueHint::FilePath)]
     pub output: Option<PathBuf>,
+
+    /// Set a plan variable, overriding the plan's `vars`. Repeatable as `--set KEY=VALUE`.
+    ///
+    /// Values appear in the runner's process arguments; prefer plan files or restricted
+    /// environments for secrets, which the plan masks in reports via `secrets` regardless.
+    #[clap(long = "set", value_name = "KEY=VALUE")]
+    pub set: Vec<String>,
 }
 
 /// Parameters to the client-side `capture` composite command.
@@ -695,6 +712,15 @@ pub struct IpcAutomationPlan {
     /// Suite name used by JUnit reports; defaults to the plan file stem.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// Named values substituted as `${name}` throughout the steps. `--set` overrides these.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub vars: BTreeMap<String, String>,
+    /// Variable names whose values are secrets: they are masked in reports and excerpts.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub secrets: Vec<String>,
+    /// Other plan files whose steps run first, resolved relative to this file.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub include: Vec<PathBuf>,
     pub steps: Vec<IpcAutomationPlanStep>,
 }
 
@@ -983,6 +1009,35 @@ pub struct IpcGetText {
     #[clap(short, long, env = "VIVIDO_WINDOW_ID")]
     #[serde(default)]
     pub window_id: Option<u64>,
+}
+
+/// Parameters to the `find-text` IPC subcommand.
+#[cfg(any(unix, windows))]
+#[derive(Args, Serialize, Deserialize, Default, Debug, Clone, PartialEq, Eq)]
+pub struct IpcFindText {
+    /// Literal text (or regular expression with `--regex`) to locate on the visible viewport.
+    #[clap(long)]
+    pub pattern: String,
+
+    /// Treat the pattern as a regular expression instead of literal text.
+    #[clap(long, default_value_t = false)]
+    #[serde(default)]
+    pub regex: bool,
+
+    /// Window ID to search. Every window is searched when omitted.
+    #[clap(short, long, env = "VIVIDO_WINDOW_ID")]
+    #[serde(default)]
+    pub window_id: Option<u64>,
+
+    /// Maximum matches returned per window, 1 through 100.
+    #[clap(long, default_value_t = 50, value_parser = clap::value_parser!(u16).range(1..=100))]
+    #[serde(default = "default_find_text_matches")]
+    pub max_matches: u16,
+}
+
+#[cfg(any(unix, windows))]
+const fn default_find_text_matches() -> u16 {
+    50
 }
 
 /// Parameters to the `screenshot` IPC subcommand.
@@ -2294,6 +2349,7 @@ mod tests {
                 output: Some(PathBuf::from("results.xml")),
                 artifacts_dir: Some(PathBuf::from("artifacts")),
                 shell: vec![String::from("sh"), String::from("-c"), String::from("echo hi"),],
+                set: Vec::new(),
             }
         );
 
@@ -2653,6 +2709,110 @@ mod tests {
     fn capture_rows_are_bounded() {
         assert!(Options::try_parse_from(["vivido", "msg", "get-text", "--rows", "0"]).is_err());
         assert!(Options::try_parse_from(["vivido", "msg", "get-text", "--rows", "1001"]).is_err());
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn parse_find_text_message() {
+        let options = Options::try_parse_from([
+            "vivido",
+            "msg",
+            "find-text",
+            "--pattern",
+            "Submit",
+            "--window-id",
+            "42",
+            "--regex",
+            "--max-matches",
+            "10",
+        ])
+        .unwrap();
+        let Some(Subcommands::Msg(message)) = options.subcommands else {
+            panic!("expected msg subcommand");
+        };
+        assert_eq!(
+            message.message,
+            SocketMessage::FindText(IpcFindText {
+                pattern: "Submit".to_owned(),
+                regex: true,
+                window_id: Some(42),
+                max_matches: 10,
+            })
+        );
+
+        // Defaults search literally across every window, fifty matches per window.
+        let options =
+            Options::try_parse_from(["vivido", "msg", "find-text", "--pattern", "x"]).unwrap();
+        let Some(Subcommands::Msg(message)) = options.subcommands else {
+            panic!("expected msg subcommand");
+        };
+        assert_eq!(
+            message.message,
+            SocketMessage::FindText(IpcFindText {
+                pattern: "x".to_owned(),
+                regex: false,
+                window_id: None,
+                max_matches: 50,
+            })
+        );
+
+        assert!(
+            Options::try_parse_from([
+                "vivido",
+                "msg",
+                "find-text",
+                "--pattern",
+                "x",
+                "--max-matches",
+                "0"
+            ])
+            .is_err()
+        );
+        assert!(
+            Options::try_parse_from([
+                "vivido",
+                "msg",
+                "find-text",
+                "--pattern",
+                "x",
+                "--max-matches",
+                "101"
+            ])
+            .is_err()
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn parse_plan_set_flags() {
+        let options = Options::try_parse_from([
+            "vivido",
+            "msg",
+            "run-plan",
+            "--file",
+            "plan.json",
+            "--set",
+            "USER=root",
+            "--set",
+            "TOKEN=hunter2",
+        ])
+        .unwrap();
+        let Some(Subcommands::Msg(message)) = options.subcommands else {
+            panic!("expected msg subcommand");
+        };
+        let SocketMessage::RunPlan(plan) = message.message else {
+            panic!("expected run-plan message");
+        };
+        assert_eq!(plan.file, Some(PathBuf::from("plan.json")));
+        assert_eq!(plan.set, ["USER=root".to_owned(), "TOKEN=hunter2".to_owned()]);
+
+        let options =
+            Options::try_parse_from(["vivido", "test", "--set", "A=1", "--", "sh"]).unwrap();
+        let Some(Subcommands::Test(test)) = options.subcommands else {
+            panic!("expected test subcommand");
+        };
+        assert_eq!(test.set, ["A=1".to_owned()]);
+        assert_eq!(test.shell, ["sh".to_owned()]);
     }
 
     #[cfg(any(unix, windows))]

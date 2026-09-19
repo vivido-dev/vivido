@@ -144,6 +144,31 @@ impl Notify for AutomationNotifier {
     }
 }
 
+/// One `find-text` match with cell and pixel rectangles.
+#[cfg(any(unix, windows))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FoundTextMatch {
+    /// Viewport row, zero-based from the visible top.
+    pub row: i32,
+    /// First covered cell column.
+    pub col_start: usize,
+    /// Last covered cell column (inclusive).
+    pub col_end: usize,
+    /// The matched text.
+    pub text: String,
+    /// Physical-pixel rectangles in the client area, matching mouse input coordinates.
+    pub pixel_x: u32,
+    pub pixel_y: u32,
+    pub pixel_width: u32,
+    pub pixel_height: u32,
+}
+
+/// Snap a client-area pixel metric to an integer coordinate.
+#[cfg(any(unix, windows))]
+fn snap_pixel(value: f32) -> u32 {
+    value.round().clamp(0.0, u32::MAX as f32) as u32
+}
+
 /// Event context for one individual Vivido window.
 pub struct WindowContext {
     pub message_buffer: MessageBuffer,
@@ -1076,6 +1101,12 @@ impl WindowContext {
         self.ipc_window_id
     }
 
+    /// Stable creation order, used to sort multi-window results deterministically.
+    #[cfg(any(unix, windows))]
+    pub fn creation_index(&self) -> u64 {
+        self.automation.creation_index
+    }
+
     /// Whether this terminal currently has keyboard focus.
     #[cfg(any(unix, windows))]
     pub fn is_focused(&self) -> bool {
@@ -1144,6 +1175,35 @@ impl WindowContext {
                 terminal.viewport_rect_text(col, row, width, height)
             },
         }
+    }
+
+    /// Search the visible viewport for a pattern, returning cell and pixel rectangles.
+    ///
+    /// Pixel rectangles share the client-area origin of mouse input, so a match center pipes
+    /// straight into a mouse click.
+    #[cfg(any(unix, windows))]
+    pub fn find_text(&self, needle: &[u8], regex: bool, max_matches: usize) -> Vec<FoundTextMatch> {
+        let terminal = self.terminal.lock();
+        let size = self.display.size_info;
+        terminal
+            .find_viewport_text(needle, regex, max_matches)
+            .into_iter()
+            .map(|found| {
+                let cells = found.col_end.saturating_sub(found.col_start).saturating_add(1) as f32;
+                FoundTextMatch {
+                    row: found.row,
+                    col_start: found.col_start,
+                    col_end: found.col_end,
+                    text: found.text,
+                    pixel_x: snap_pixel(
+                        size.padding_x() + found.col_start as f32 * size.cell_width(),
+                    ),
+                    pixel_y: snap_pixel(size.padding_y() + found.row as f32 * size.cell_height()),
+                    pixel_width: snap_pixel(cells * size.cell_width()).max(1),
+                    pixel_height: snap_pixel(size.cell_height()).max(1),
+                }
+            })
+            .collect()
     }
 
     /// Build application-directed paste bytes with the same safety filtering as local paste.

@@ -40,6 +40,15 @@ pub const MAX_REPLY_FRAME_BYTES: usize = 16 * 1024 * 1024;
 /// Maximum terminal text returned through IPC.
 pub const MAX_IPC_TEXT_BYTES: usize = MAX_REPLY_FRAME_BYTES;
 
+/// Maximum `find-text` pattern bytes.
+pub const MAX_FIND_TEXT_PATTERN_BYTES: usize = 1024;
+
+/// Maximum `find-text` matches collected from one window.
+pub const MAX_FIND_TEXT_MATCHES_PER_WINDOW: usize = 100;
+
+/// Maximum `find-text` matches across every searched window.
+pub const MAX_FIND_TEXT_MATCHES_TOTAL: usize = 200;
+
 /// Maximum accepted client connections.
 pub const MAX_CONNECTIONS: usize = 32;
 
@@ -50,7 +59,12 @@ pub const MAX_IN_FLIGHT_REQUESTS: usize = 64;
 pub const MAX_SUBSCRIPTIONS: usize = 32;
 
 /// Maximum queued events for one subscriber.
-pub const MAX_SUBSCRIBER_EVENTS: usize = 256;
+///
+/// Sized for agent bursts well above a thousand events: every queued frame is bounded by
+/// [`MAX_REPLY_FRAME_BYTES`], dead clients are reaped by [`IPC_WRITE_TIMEOUT`], and the
+/// [`AutomationHub`](crate::automation::AutomationHub) still reports the exact dropped
+/// `event_sequence` range through `overflow` envelopes when a client falls behind anyway.
+pub const MAX_SUBSCRIBER_EVENTS: usize = 2048;
 
 /// Maximum literal input/paste request.
 pub const MAX_INPUT_BYTES: usize = 1024 * 1024;
@@ -96,6 +110,7 @@ pub const METHODS: &[&str] = &[
     "get_config",
     "typing",
     "get_text",
+    "find_text",
     "screenshot",
     "key",
     "paste",
@@ -208,6 +223,7 @@ fn method_class(name: &str) -> (MethodClass, bool) {
         | "ping"
         | "get_config"
         | "get_text"
+        | "find_text"
         | "screenshot"
         | "list_windows"
         | "inspect"
@@ -920,23 +936,342 @@ fn validate_method_name(method: &str) -> io::Result<()> {
 }
 
 fn read_plan(options: &IpcRunPlan) -> io::Result<IpcAutomationPlan> {
-    let mut bytes = Vec::new();
     match options.file.as_deref() {
-        Some(path) if path != Path::new("-") => {
-            fs::File::open(path)?
-                .take((MAX_REQUEST_FRAME_BYTES + 1) as u64)
-                .read_to_end(&mut bytes)?;
-        },
+        Some(path) if path != Path::new("-") => load_plan_file(path, 0, &mut Vec::new()),
         _ => {
+            let mut bytes = Vec::new();
             io::stdin().take((MAX_REQUEST_FRAME_BYTES + 1) as u64).read_to_end(&mut bytes)?;
+            if bytes.len() > MAX_REQUEST_FRAME_BYTES {
+                return Err(IoError::new(ErrorKind::InvalidInput, "automation plan exceeds 1 MiB"));
+            }
+            let plan: IpcAutomationPlan = serde_json::from_slice(&bytes).map_err(|error| {
+                IoError::new(ErrorKind::InvalidInput, format!("invalid plan JSON: {error}"))
+            })?;
+            if !plan.include.is_empty() {
+                return Err(IoError::new(
+                    ErrorKind::InvalidInput,
+                    "plan includes require --file; standard input has no directory to resolve them",
+                ));
+            }
+            Ok(plan)
         },
-    };
+    }
+}
+
+/// Load one plan file, flattening `include` depth-first with cycle detection.
+///
+/// Included steps run first in include order; later includes and finally the including file
+/// itself override variables, while secret names union. Step IDs must still be unique after
+/// flattening, enforced by plan validation.
+fn load_plan_file(
+    path: &Path,
+    depth: usize,
+    stack: &mut Vec<PathBuf>,
+) -> io::Result<IpcAutomationPlan> {
+    if depth > MAX_PLAN_INCLUDE_DEPTH {
+        return Err(IoError::new(
+            ErrorKind::InvalidInput,
+            format!("plan includes nest deeper than {MAX_PLAN_INCLUDE_DEPTH}"),
+        ));
+    }
+    let canonical = std::fs::canonicalize(path).map_err(|error| {
+        IoError::new(
+            ErrorKind::InvalidInput,
+            format!("cannot load plan {}: {error}", path.display()),
+        )
+    })?;
+    if stack.contains(&canonical) {
+        return Err(IoError::new(
+            ErrorKind::InvalidInput,
+            format!("cyclic plan include of {}", path.display()),
+        ));
+    }
+    stack.push(canonical);
+    let result = load_plan_file_inner(path, depth, stack);
+    stack.pop();
+    result
+}
+
+fn load_plan_file_inner(
+    path: &Path,
+    depth: usize,
+    stack: &mut Vec<PathBuf>,
+) -> io::Result<IpcAutomationPlan> {
+    let mut bytes = Vec::new();
+    fs::File::open(path)?.take((MAX_REQUEST_FRAME_BYTES + 1) as u64).read_to_end(&mut bytes)?;
     if bytes.len() > MAX_REQUEST_FRAME_BYTES {
         return Err(IoError::new(ErrorKind::InvalidInput, "automation plan exceeds 1 MiB"));
     }
-    serde_json::from_slice(&bytes).map_err(|error| {
+    let mut plan: IpcAutomationPlan = serde_json::from_slice(&bytes).map_err(|error| {
         IoError::new(ErrorKind::InvalidInput, format!("invalid plan JSON: {error}"))
+    })?;
+    if plan.vars.len() > MAX_PLAN_VARS {
+        return Err(IoError::new(
+            ErrorKind::InvalidInput,
+            format!("automation plan exceeds {MAX_PLAN_VARS} variables"),
+        ));
+    }
+    let base = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut steps = Vec::new();
+    let mut vars = BTreeMap::new();
+    let mut secrets = Vec::new();
+    for include in std::mem::take(&mut plan.include) {
+        let child = load_plan_file(&base.join(include), depth + 1, stack)?;
+        steps.extend(child.steps);
+        vars.extend(child.vars);
+        for secret in child.secrets {
+            if !secrets.contains(&secret) {
+                secrets.push(secret);
+            }
+        }
+    }
+    steps.extend(plan.steps);
+    vars.extend(plan.vars);
+    for secret in plan.secrets {
+        if !secrets.contains(&secret) {
+            secrets.push(secret);
+        }
+    }
+    if vars.len() > MAX_PLAN_VARS {
+        return Err(IoError::new(
+            ErrorKind::InvalidInput,
+            format!("automation plan exceeds {MAX_PLAN_VARS} variables"),
+        ));
+    }
+    plan.steps = steps;
+    plan.vars = vars;
+    plan.secrets = secrets;
+    Ok(plan)
+}
+
+/// Maximum `include` nesting when loading an automation plan.
+const MAX_PLAN_INCLUDE_DEPTH: usize = 8;
+/// Maximum variables in one automation plan after `--set` overrides.
+const MAX_PLAN_VARS: usize = 256;
+/// Maximum bytes in one plan variable value.
+const MAX_PLAN_VAR_VALUE_BYTES: usize = 16 * 1024;
+/// Maximum secret names in one automation plan.
+const MAX_PLAN_SECRETS: usize = 64;
+
+/// Whether a plan variable name is usable inside `${...}` references.
+fn valid_plan_var_name(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    bytes.next().is_some_and(|first| first.is_ascii_alphabetic() || first == b'_')
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+}
+
+/// Parse `--set KEY=VALUE` bindings.
+fn parse_plan_set(sets: &[String]) -> io::Result<BTreeMap<String, String>> {
+    let mut vars = BTreeMap::new();
+    for set in sets {
+        let (key, value) = set.split_once('=').ok_or_else(|| {
+            IoError::new(ErrorKind::InvalidInput, format!("--set {set:?} must be KEY=VALUE"))
+        })?;
+        if !valid_plan_var_name(key) {
+            return Err(IoError::new(
+                ErrorKind::InvalidInput,
+                format!("--set has invalid variable name {key:?}"),
+            ));
+        }
+        if value.len() > MAX_PLAN_VAR_VALUE_BYTES {
+            return Err(IoError::new(
+                ErrorKind::InvalidInput,
+                format!("--set value for {key:?} exceeds 16 KiB"),
+            ));
+        }
+        vars.insert(key.to_owned(), value.to_owned());
+    }
+    Ok(vars)
+}
+
+/// Substitute `${name}` variables in one plan value, leaving `$ref` aliases alone.
+///
+/// `$ref` objects name step bindings, a separate namespace resolved at execution; touching
+/// them here would confuse bindings with variables.
+fn substitute_plan_vars(
+    value: &Value,
+    vars: &BTreeMap<String, String>,
+    step_id: &str,
+) -> io::Result<Value> {
+    match value {
+        Value::String(text) => substitute_plan_text(text, vars, step_id).map(Value::String),
+        Value::Array(values) => values
+            .iter()
+            .map(|value| substitute_plan_vars(value, vars, step_id))
+            .collect::<io::Result<Vec<_>>>()
+            .map(Value::Array),
+        Value::Object(map) if map.len() == 1 && map.contains_key("$ref") => Ok(value.clone()),
+        Value::Object(map) => map
+            .iter()
+            .map(|(key, value)| {
+                Ok((
+                    substitute_plan_text(key, vars, step_id)?,
+                    substitute_plan_vars(value, vars, step_id)?,
+                ))
+            })
+            .collect::<io::Result<serde_json::Map<_, _>>>()
+            .map(Value::Object),
+        _ => Ok(value.clone()),
+    }
+}
+
+/// Substitute `${name}` variables in one string.
+fn substitute_plan_text(
+    text: &str,
+    vars: &BTreeMap<String, String>,
+    step_id: &str,
+) -> io::Result<String> {
+    let mut substituted = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find("${") {
+        substituted.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        let end = after.find('}').ok_or_else(|| {
+            IoError::new(
+                ErrorKind::InvalidInput,
+                format!("step {step_id:?} has an unterminated variable reference"),
+            )
+        })?;
+        let name = &after[..end];
+        if !valid_plan_var_name(name) {
+            return Err(IoError::new(
+                ErrorKind::InvalidInput,
+                format!("step {step_id:?} has an invalid variable reference ${{{name}}}"),
+            ));
+        }
+        let value = vars.get(name).ok_or_else(|| {
+            IoError::new(
+                ErrorKind::InvalidInput,
+                format!("step {step_id:?} references unknown plan variable {name:?}"),
+            )
+        })?;
+        substituted.push_str(value);
+        rest = &after[end + 1..];
+    }
+    substituted.push_str(rest);
+    Ok(substituted)
+}
+
+/// Substitute variables in a typed step field via a JSON round trip.
+fn substitute_plan_field<T>(
+    field: &T,
+    vars: &BTreeMap<String, String>,
+    step_id: &str,
+) -> io::Result<T>
+where
+    T: serde::Serialize + serde::de::DeserializeOwned,
+{
+    let substituted =
+        substitute_plan_vars(&serde_json::to_value(field).map_err(IoError::other)?, vars, step_id)?;
+    serde_json::from_value(substituted).map_err(|error| {
+        IoError::new(
+            ErrorKind::InvalidInput,
+            format!("substituted field in step {step_id:?} is invalid: {error}"),
+        )
     })
+}
+
+/// Substitute variables in every user-string field of one plan step.
+///
+/// Method and step IDs stay literal, `$ref` objects and alias references keep the binding
+/// namespace, and everything else — params, assertions, conditions, bind pointers, and
+/// verification targets — resolves against plan `vars` with `--set` overrides.
+fn substitute_step_vars(
+    step: &IpcAutomationPlanStep,
+    vars: &BTreeMap<String, String>,
+) -> io::Result<IpcAutomationPlanStep> {
+    let mut step = step.clone();
+    step.params = substitute_plan_vars(&step.params, vars, &step.id)?;
+    if step.assert.is_some() {
+        step.assert =
+            Some(substitute_plan_field(step.assert.as_ref().expect("checked"), vars, &step.id)?);
+    }
+    if let Some(when) = &step.when {
+        step.when = Some(crate::cli::IpcPlanCondition {
+            reference: when.reference.clone(),
+            equals: substitute_plan_vars(&when.equals, vars, &step.id)?,
+        });
+    }
+    step.bind = step
+        .bind
+        .iter()
+        .map(|(alias, pointer)| Ok((alias.clone(), substitute_plan_text(pointer, vars, &step.id)?)))
+        .collect::<io::Result<_>>()?;
+    if step.verify.is_some() {
+        step.verify =
+            Some(substitute_plan_field(step.verify.as_ref().expect("checked"), vars, &step.id)?);
+    }
+    Ok(step)
+}
+
+/// Merge `--set` over plan `vars`, substitute every step, and collect secret values.
+///
+/// Returns the secret values for report redaction, longest first so overlapping values mask
+/// completely. Fails closed: an unknown secret name is an error rather than silently
+/// unredacted output.
+fn apply_plan_bindings(
+    plan: &mut IpcAutomationPlan,
+    sets: &BTreeMap<String, String>,
+) -> io::Result<Vec<String>> {
+    for (key, value) in plan.vars.iter().chain(sets.iter()) {
+        if !valid_plan_var_name(key) {
+            return Err(IoError::new(
+                ErrorKind::InvalidInput,
+                format!("plan has invalid variable name {key:?}"),
+            ));
+        }
+        if value.len() > MAX_PLAN_VAR_VALUE_BYTES {
+            return Err(IoError::new(
+                ErrorKind::InvalidInput,
+                format!("plan value for {key:?} exceeds 16 KiB"),
+            ));
+        }
+    }
+    if plan.vars.len() + sets.len() > MAX_PLAN_VARS {
+        return Err(IoError::new(
+            ErrorKind::InvalidInput,
+            format!("automation plan exceeds {MAX_PLAN_VARS} variables"),
+        ));
+    }
+    if plan.secrets.len() > MAX_PLAN_SECRETS {
+        return Err(IoError::new(
+            ErrorKind::InvalidInput,
+            format!("automation plan exceeds {MAX_PLAN_SECRETS} secrets"),
+        ));
+    }
+    let mut vars = plan.vars.clone();
+    vars.extend(sets.iter().map(|(key, value)| (key.clone(), value.clone())));
+    for name in &plan.secrets {
+        if !valid_plan_var_name(name) {
+            return Err(IoError::new(
+                ErrorKind::InvalidInput,
+                format!("plan has invalid secret name {name:?}"),
+            ));
+        }
+        if !vars.contains_key(name) {
+            return Err(IoError::new(
+                ErrorKind::InvalidInput,
+                format!("plan secret {name:?} has no value in vars or --set"),
+            ));
+        }
+    }
+    plan.steps = plan
+        .steps
+        .iter()
+        .map(|step| substitute_step_vars(step, &vars))
+        .collect::<io::Result<_>>()?;
+    plan.vars = vars;
+    let mut secrets: Vec<String> = plan
+        .secrets
+        .iter()
+        .filter_map(|name| plan.vars.get(name))
+        .filter(|value| !value.is_empty())
+        .cloned()
+        .collect();
+    secrets.sort();
+    secrets.dedup();
+    secrets.sort_by_key(|secret| std::cmp::Reverse(secret.len()));
+    Ok(secrets)
 }
 
 fn valid_plan_name(name: &str) -> bool {
@@ -1159,6 +1494,45 @@ fn evaluate_plan_assertion(
     Ok(())
 }
 
+/// Mask substituted for secret plan values in reports and excerpts.
+const PLAN_SECRET_MASK: &str = "***";
+
+/// Replace every secret value in reporting text with a fixed mask.
+///
+/// Empty values are skipped: masking the empty string would wedge the mask between every
+/// character. With no secrets this returns the text untouched, keeping secret-free plans on
+/// the exact previous code path.
+fn redact_secret_text(text: &str, secrets: &[String]) -> String {
+    if secrets.is_empty() {
+        return text.to_owned();
+    }
+    let mut redacted = text.to_owned();
+    for secret in secrets {
+        if secret.is_empty() {
+            continue;
+        }
+        redacted = redacted.replace(secret, PLAN_SECRET_MASK);
+    }
+    redacted
+}
+
+/// Replace every secret value inside a reported JSON document.
+fn redact_plan_value(value: &mut Value, secrets: &[String]) {
+    if secrets.is_empty() {
+        return;
+    }
+    match value {
+        Value::String(text) => *text = redact_secret_text(text, secrets),
+        Value::Array(values) => {
+            values.iter_mut().for_each(|value| redact_plan_value(value, secrets))
+        },
+        Value::Object(map) => {
+            map.values_mut().for_each(|value| redact_plan_value(value, secrets));
+        },
+        _ => {},
+    }
+}
+
 /// Bound failure excerpts so a fullscreen of unexpected output cannot flood the report.
 fn truncate_excerpt(text: &str) -> String {
     if text.chars().count() <= MAX_REPORT_EXCERPT_CHARS {
@@ -1242,8 +1616,16 @@ fn run_plan(
     target: Option<&str>,
     options: &IpcRunPlan,
 ) -> (io::Result<()>, Vec<PlanStepRecord>) {
-    let plan = match read_plan(options) {
+    let mut plan = match read_plan(options) {
         Ok(plan) => plan,
+        Err(error) => return (Err(error), Vec::new()),
+    };
+    let sets = match parse_plan_set(&options.set) {
+        Ok(sets) => sets,
+        Err(error) => return (Err(error), Vec::new()),
+    };
+    let secrets = match apply_plan_bindings(&mut plan, &sets) {
+        Ok(secrets) => secrets,
         Err(error) => return (Err(error), Vec::new()),
     };
     let junit = match report_destination(options.report, &options.output, options.dry_run) {
@@ -1440,7 +1822,10 @@ fn run_plan(
             Err(error) => Err(error),
         };
         match outcome {
-            Ok(result) => {
+            Ok(mut result) => {
+                // Action results echo terminal text, which replays anything the step typed:
+                // mask secrets before the result reaches NDJSON.
+                redact_plan_value(&mut result, &secrets);
                 if let Err(error) = write_plan_event(
                     &mut output,
                     json!({"type":"step","id":step.id,"method":step.method,"class":capability.class,"mutating":capability.mutating,"status":"ok","result":result}),
@@ -1451,7 +1836,9 @@ fn run_plan(
             },
             Err(error) => {
                 failures = failures.saturating_add(1);
-                let message = error.to_string();
+                // Assertion messages quote the expected plan text and the observed terminal
+                // text; either can carry a secret, so mask before reporting or recording.
+                let message = redact_secret_text(&error.to_string(), &secrets);
                 if let Err(error) = write_plan_event(
                     &mut output,
                     json!({"type":"step","id":step.id,"method":step.method,"status":"error","error":message}),
@@ -1672,6 +2059,7 @@ pub fn run_test(options: &IpcTest) -> io::Result<()> {
         preflight: false,
         report: options.report,
         output: options.output.clone(),
+        set: options.set.clone(),
     };
     let (outcome, records) = run_plan(None, Some(&name), &plan);
     if let Some(failed) =
@@ -2141,6 +2529,7 @@ fn message_request(message: &SocketMessage) -> io::Result<(&'static str, Value)>
         SocketMessage::GetConfig(params) => Ok(("get_config", serialize_params(params)?)),
         SocketMessage::Typing(params) => Ok(("typing", serialize_params(params)?)),
         SocketMessage::GetText(params) => Ok(("get_text", serialize_params(params)?)),
+        SocketMessage::FindText(params) => Ok(("find_text", serialize_params(params)?)),
         SocketMessage::Screenshot(params) => Ok(("screenshot", serialize_params(params)?)),
         SocketMessage::Capabilities | SocketMessage::RunPlan(_) | SocketMessage::Capture(_) => {
             unreachable!("client-only automation command")
@@ -2431,6 +2820,7 @@ fn write_cli_result(message: &SocketMessage, result: &Value) -> io::Result<()> {
         | SocketMessage::Wait(_)
         | SocketMessage::Transcript(_)
         | SocketMessage::DropFile(_)
+        | SocketMessage::FindText(_)
         | SocketMessage::Subscribe(_) => write_json_to(&mut stdout, result),
         SocketMessage::Typing(params) if params.report => write_json_to(&mut stdout, result),
         SocketMessage::Key(params) if params.report => write_json_to(&mut stdout, result),
@@ -2840,8 +3230,18 @@ mod tests {
         validate_plan(&legacy, &methods).unwrap();
 
         assert!(
-            validate_plan(&IpcAutomationPlan { version: 3, name: None, steps: vec![] }, &methods,)
-                .is_err()
+            validate_plan(
+                &IpcAutomationPlan {
+                    version: 3,
+                    name: None,
+                    vars: BTreeMap::new(),
+                    secrets: Vec::new(),
+                    include: Vec::new(),
+                    steps: vec![]
+                },
+                &methods,
+            )
+            .is_err()
         );
     }
 
@@ -2941,6 +3341,159 @@ mod tests {
         assert!(xml.contains(r#"name="type&lt;&amp;&gt;""#), "{xml}");
         assert!(xml.contains("<failure message=\"expected &quot;x&quot;\">"), "{xml}");
         assert!(xml.contains("<skipped message=\"condition_false\"/>"), "{xml}");
+    }
+
+    #[test]
+    fn plan_vars_substitute_leaving_refs_alone() {
+        use crate::cli::IpcAutomationPlan;
+
+        let mut plan: IpcAutomationPlan = serde_json::from_value(json!({
+            "version": 2,
+            "vars": {"user": "bot", "token": "s3cret"},
+            "secrets": ["token"],
+            "steps": [
+                {"id": "login", "method": "typing",
+                 "params": {"text": "user=${user} pass=${token}"}},
+                {"id": "use", "method": "inspect",
+                 "params": {"window_id": {"$ref": "win"}, "tag": "by-${user}"},
+                 "bind": {"win": "/window_id"}},
+            ],
+        }))
+        .unwrap();
+        let sets = parse_plan_set(&[String::from("user=root")]).unwrap();
+        let secrets = apply_plan_bindings(&mut plan, &sets).unwrap();
+
+        assert_eq!(secrets, [String::from("s3cret")]);
+        assert_eq!(plan.vars["user"], "root");
+        assert_eq!(plan.steps[0].params["text"], "user=root pass=s3cret");
+        // `$ref` aliases name step bindings, not variables, so they survive substitution.
+        assert_eq!(plan.steps[1].params["window_id"], json!({"$ref": "win"}));
+        assert_eq!(plan.steps[1].params["tag"], "by-root");
+    }
+
+    #[test]
+    fn plan_bindings_fail_closed() {
+        use crate::cli::IpcAutomationPlan;
+
+        let mut plan: IpcAutomationPlan = serde_json::from_value(json!({
+            "version": 1,
+            "steps": [{"id": "s", "method": "ping", "params": {"text": "hi ${missing}"}}],
+        }))
+        .unwrap();
+        assert!(apply_plan_bindings(&mut plan, &BTreeMap::new()).is_err());
+
+        let mut plan: IpcAutomationPlan = serde_json::from_value(json!({
+            "version": 1,
+            "vars": {"present": "yes"},
+            "secrets": ["absent"],
+            "steps": [{"id": "s", "method": "ping"}],
+        }))
+        .unwrap();
+        // A secret without a value would silently disable masking: reject it instead.
+        assert!(apply_plan_bindings(&mut plan, &BTreeMap::new()).is_err());
+
+        assert!(parse_plan_set(&[String::from("NO_EQUALS")]).is_err());
+        assert!(parse_plan_set(&[String::from("9bad=value")]).is_err());
+        assert!(parse_plan_set(&[String::from("good=value")]).is_ok());
+    }
+
+    #[test]
+    fn plan_secrets_are_masked_in_reports() {
+        // Longest first, so an overlapping value masks completely.
+        let mut ordered = [String::from("s3cret"), String::from("s3cret-long")].to_vec();
+        ordered.sort_by_key(|secret| std::cmp::Reverse(secret.len()));
+        assert_eq!(ordered, ["s3cret-long", "s3cret"]);
+
+        let mut value = json!({
+            "action": {"text": "pass=s3cret-long!"},
+            "nested": ["s3cret", 42, {"deep": "s3cret"}],
+        });
+        redact_plan_value(&mut value, &ordered);
+        assert_eq!(
+            value,
+            json!({
+                "action": {"text": "pass=***!"},
+                "nested": ["***", 42, {"deep": "***"}],
+            })
+        );
+
+        assert_eq!(redact_secret_text("nothing to hide", &ordered), "nothing to hide");
+        // Empty values never mask: masking "" would wedge *** between every character.
+        assert_eq!(redact_secret_text("abc", &[String::new()]), "abc");
+        // With no secrets the text keeps its exact previous code path.
+        assert_eq!(redact_secret_text("abc", &[]), "abc");
+    }
+
+    #[test]
+    fn plan_includes_flatten_in_order_with_cycle_detection() {
+        struct TestDir(PathBuf);
+        impl Drop for TestDir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let dir =
+            std::env::temp_dir().join(format!("vivido-plan-include-{}.d", std::process::id()));
+        let _guard = TestDir(dir.clone());
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let write = |name: &str, body: &str| std::fs::write(dir.join(name), body).unwrap();
+
+        write(
+            "a.json",
+            r#"{"version":2,"vars":{"a":"1","shared":"a"},
+            "steps":[{"id":"a","method":"ping"}]}"#,
+        );
+        write(
+            "b.json",
+            r#"{"version":2,"vars":{"b":"2","shared":"b"},
+            "steps":[{"id":"b","method":"ping"}]}"#,
+        );
+        write(
+            "base.json",
+            r#"{"version":2,"include":["a.json","b.json"],
+            "vars":{"shared":"base"},"steps":[{"id":"base","method":"ping"}]}"#,
+        );
+
+        let plan = load_plan_file(&dir.join("base.json"), 0, &mut Vec::new()).unwrap();
+        let ids: Vec<_> = plan.steps.iter().map(|step| step.id.as_str()).collect();
+        assert_eq!(ids, ["a", "b", "base"]);
+        // Later includes override earlier ones; the including file overrides everything.
+        assert_eq!(plan.vars["a"], "1");
+        assert_eq!(plan.vars["b"], "2");
+        assert_eq!(plan.vars["shared"], "base");
+
+        // A plan that includes itself, directly or mutually, is rejected.
+        write(
+            "self.json",
+            r#"{"version":2,"include":["self.json"],
+            "steps":[{"id":"s","method":"ping"}]}"#,
+        );
+        assert!(load_plan_file(&dir.join("self.json"), 0, &mut Vec::new()).is_err());
+        write(
+            "c.json",
+            r#"{"version":2,"include":["d.json"],
+            "steps":[{"id":"c","method":"ping"}]}"#,
+        );
+        write(
+            "d.json",
+            r#"{"version":2,"include":["c.json"],
+            "steps":[{"id":"d","method":"ping"}]}"#,
+        );
+        assert!(load_plan_file(&dir.join("c.json"), 0, &mut Vec::new()).is_err());
+
+        // Includes resolve relative to the including file, not the working directory.
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        write("sub/inner.json", r#"{"version":2,"steps":[{"id":"i","method":"ping"}]}"#);
+        write(
+            "outer.json",
+            r#"{"version":2,"include":["sub/inner.json"],
+            "steps":[{"id":"o","method":"ping"}]}"#,
+        );
+        let plan = load_plan_file(&dir.join("outer.json"), 0, &mut Vec::new()).unwrap();
+        let ids: Vec<_> = plan.steps.iter().map(|step| step.id.as_str()).collect();
+        assert_eq!(ids, ["i", "o"]);
     }
 
     #[test]
@@ -3099,6 +3652,9 @@ mod tests {
         let oversized = IpcAutomationPlan {
             version: 1,
             name: None,
+            vars: BTreeMap::new(),
+            secrets: Vec::new(),
+            include: Vec::new(),
             steps: vec![step; MAX_AUTOMATION_PLAN_STEPS + 1],
         };
         assert!(validate_plan(&oversized, &methods).is_err());
@@ -3215,6 +3771,103 @@ mod tests {
     }
 
     #[test]
+    fn thousand_event_burst_keeps_every_sequence() {
+        use crate::automation::{AutomationHub, SubscriptionRequest};
+        use std::collections::HashSet;
+        use std::time::Duration;
+
+        let (connection, output) = test_connection();
+        let mut hub = AutomationHub::default();
+        hub.subscribe(
+            connection,
+            1,
+            SubscriptionRequest {
+                target: None,
+                all_windows: true,
+                kinds: HashSet::new(),
+                since_event: None,
+                current_sequences: json!({}),
+            },
+        )
+        .unwrap();
+        // The subscribe acknowledgement is not part of the burst.
+        let _ = output.recv().unwrap();
+
+        const BURST: u64 = 1500;
+        for n in 1..=BURST {
+            hub.emit(Some(1), "bell", json!({"n": n}));
+        }
+        let mut sequences = Vec::with_capacity(BURST as usize);
+        for _ in 0..BURST {
+            // `recv_timeout`, never `recv`: a regression must fail, not hang the suite.
+            let frame =
+                output.recv_timeout(Duration::from_secs(5)).expect("burst frame was dropped");
+            let envelope: SubscriptionEventEnvelope = serde_json::from_slice(&frame.bytes).unwrap();
+            assert_ne!(
+                envelope.event.get("type").and_then(Value::as_str),
+                Some("overflow"),
+                "lost events inside a {BURST}-event burst",
+            );
+            sequences.push(envelope.event_sequence);
+        }
+        assert_eq!(sequences, (1..=BURST).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn saturated_subscriber_reports_dropped_range_in_overflow_envelope() {
+        use crate::automation::{AutomationHub, SubscriptionRequest};
+        use std::collections::HashSet;
+        use std::time::Duration;
+
+        let (connection, output) = test_connection();
+        let mut hub = AutomationHub::default();
+        hub.subscribe(
+            connection,
+            1,
+            SubscriptionRequest {
+                target: None,
+                all_windows: true,
+                kinds: HashSet::new(),
+                since_event: None,
+                current_sequences: json!({}),
+            },
+        )
+        .unwrap();
+        // The subscribe acknowledgement is not part of the burst.
+        output.recv_timeout(Duration::from_secs(5)).expect("subscribe acknowledgement");
+
+        // Fill every slot without draining: the subscriber is behind by design.
+        for _ in 0..MAX_SUBSCRIBER_EVENTS {
+            hub.emit(Some(1), "bell", json!({}));
+        }
+        // Beyond the bound events are dropped, never queued.
+        const DROPPED: u64 = 10;
+        for _ in 0..DROPPED {
+            hub.emit(Some(1), "bell", json!({}));
+        }
+        // Draining frees each frame's slot; the pending dropped range survives.
+        for _ in 0..MAX_SUBSCRIBER_EVENTS {
+            output.recv_timeout(Duration::from_secs(5)).expect("queued frame");
+        }
+        // The next emit flushes the pending overflow envelope ahead of its own event.
+        hub.emit(Some(1), "bell", json!({}));
+        let frame = output.recv_timeout(Duration::from_secs(5)).expect("overflow envelope");
+        let envelope: SubscriptionEventEnvelope = serde_json::from_slice(&frame.bytes).unwrap();
+        assert_eq!(envelope.event.get("type").and_then(Value::as_str), Some("overflow"));
+        let first_dropped = MAX_SUBSCRIBER_EVENTS as u64 + 1;
+        assert_eq!(envelope.event["data"]["first_dropped_sequence"].as_u64(), Some(first_dropped));
+        assert_eq!(
+            envelope.event["data"]["last_dropped_sequence"].as_u64(),
+            Some(first_dropped + DROPPED - 1)
+        );
+        // The triggering event itself still arrives, in sequence, right after.
+        let frame = output.recv_timeout(Duration::from_secs(5)).expect("event after overflow");
+        let envelope: SubscriptionEventEnvelope = serde_json::from_slice(&frame.bytes).unwrap();
+        assert_eq!(envelope.event.get("type").and_then(Value::as_str), Some("bell"));
+        assert_eq!(envelope.event_sequence, first_dropped + DROPPED);
+    }
+
+    #[test]
     fn subscription_queue_is_bounded_per_subscriber() {
         let (connection, output) = test_connection();
         let queued = Arc::new(AtomicUsize::new(0));
@@ -3249,6 +3902,23 @@ mod tests {
 
         drop(output.recv().unwrap());
         assert_eq!(queued.load(Ordering::Acquire), MAX_SUBSCRIBER_EVENTS - 1);
+    }
+
+    #[test]
+    fn find_text_is_an_advertised_observe_method() {
+        assert!(METHODS.contains(&"find_text"));
+        assert_eq!(method_class("find_text"), (MethodClass::Observe, false));
+
+        let (method, params) = message_request(&SocketMessage::FindText(crate::cli::IpcFindText {
+            pattern: String::from("Submit"),
+            regex: false,
+            window_id: None,
+            max_matches: 50,
+        }))
+        .unwrap();
+        assert_eq!(method, "find_text");
+        assert_eq!(params["pattern"], "Submit");
+        assert_eq!(params["max_matches"], 50);
     }
 
     #[test]

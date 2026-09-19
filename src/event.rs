@@ -728,6 +728,73 @@ impl Processor {
         }
     }
 
+    /// Search one named window, or every window in creation order, for a text pattern.
+    ///
+    /// An unnamed search covers all windows so agents can locate a control without knowing
+    /// which window owns it; creation order keeps the combined matches deterministic.
+    #[cfg(any(unix, windows))]
+    fn find_text_matches(
+        &self,
+        params: &crate::cli::IpcFindText,
+    ) -> Result<serde_json::Value, IpcError> {
+        if params.pattern.is_empty() {
+            return Err(IpcError::new("invalid_params", "pattern must not be empty"));
+        }
+        if params.pattern.len() > crate::polling::ipc::MAX_FIND_TEXT_PATTERN_BYTES {
+            return Err(IpcError::new("invalid_params", "pattern exceeds 1 KiB"));
+        }
+        if params.regex {
+            compile_regex(&params.pattern)?;
+        }
+        let targets = match params.window_id {
+            Some(requested) => vec![self.resolve_ipc_target(Some(requested))?],
+            None => {
+                let mut targets: Vec<_> = self
+                    .windows
+                    .iter()
+                    .map(|(id, window)| (window.creation_index(), *id))
+                    .collect();
+                targets.sort_by_key(|(index, _)| *index);
+                targets.into_iter().map(|(_, id)| id).collect()
+            },
+        };
+        let per_window = usize::from(
+            params
+                .max_matches
+                .clamp(1, crate::polling::ipc::MAX_FIND_TEXT_MATCHES_PER_WINDOW as u16),
+        );
+        let mut matches = Vec::new();
+        let mut truncated = false;
+        for target in targets {
+            let window = &self.windows[&target];
+            for found in window.find_text(params.pattern.as_bytes(), params.regex, per_window) {
+                if matches.len() >= crate::polling::ipc::MAX_FIND_TEXT_MATCHES_TOTAL {
+                    truncated = true;
+                    break;
+                }
+                matches.push(serde_json::json!({
+                    "window_id": window.ipc_window_id(),
+                    "text": found.text,
+                    "grid": {
+                        "row": found.row,
+                        "col_start": found.col_start,
+                        "col_end": found.col_end,
+                    },
+                    "pixels": {
+                        "x": found.pixel_x,
+                        "y": found.pixel_y,
+                        "width": found.pixel_width,
+                        "height": found.pixel_height,
+                    },
+                }));
+            }
+            if truncated {
+                break;
+            }
+        }
+        Ok(serde_json::json!({"matches": matches, "truncated": truncated}))
+    }
+
     #[cfg(any(unix, windows))]
     fn handle_ipc_request(&mut self, event_loop: LoopHandle<'_>, request: IpcRequest) {
         // A claimed method belongs to the embedding host, which answers it from its own state.
@@ -738,11 +805,11 @@ impl Processor {
         }
 
         use crate::cli::{
-            IpcCloseWindow, IpcConfig, IpcGetConfig, IpcGetGrid, IpcGetText, IpcInputRoute, IpcKey,
-            IpcMouse, IpcPaste, IpcResize, IpcScreenshot, IpcSetGeometry, IpcSetGeometryBatch,
-            IpcSetLevel, IpcSetVisible, IpcSignal, IpcSubscribe, IpcTarget, IpcTranscript,
-            IpcTyping, IpcWaitCommon, IpcWaitFrame, IpcWaitOutput, IpcWaitSequence, IpcWaitStable,
-            IpcWaitText, WindowOptions,
+            IpcCloseWindow, IpcConfig, IpcFindText, IpcGetConfig, IpcGetGrid, IpcGetText,
+            IpcInputRoute, IpcKey, IpcMouse, IpcPaste, IpcResize, IpcScreenshot, IpcSetGeometry,
+            IpcSetGeometryBatch, IpcSetLevel, IpcSetVisible, IpcSignal, IpcSubscribe, IpcTarget,
+            IpcTranscript, IpcTyping, IpcWaitCommon, IpcWaitFrame, IpcWaitOutput, IpcWaitSequence,
+            IpcWaitStable, IpcWaitText, WindowOptions,
         };
 
         let result = match request.method.as_str() {
@@ -1470,6 +1537,16 @@ impl Processor {
                         }
                     })
                 }
+            },
+            "find_text" => {
+                let params: IpcFindText = match decode_ipc_params(&request) {
+                    Ok(params) => params,
+                    Err(error) => {
+                        request.connection.error(request.id, error);
+                        return;
+                    },
+                };
+                self.find_text_matches(&params)
             },
             "screenshot" => {
                 let params: IpcScreenshot = match decode_ipc_params(&request) {

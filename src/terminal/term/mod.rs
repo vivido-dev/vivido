@@ -569,6 +569,83 @@ pub enum Osc52 {
     CopyPaste,
 }
 
+/// Byte span of row text and the cell column that produced it.
+///
+/// Spans are contiguous and sorted: skipped cells (tab runs, wide spacers) contribute no
+/// bytes, so every byte of the row string belongs to exactly one span.
+#[derive(Clone, Copy, Debug)]
+struct RowTextSpan {
+    /// Byte offset where this cell's text starts in the row string.
+    start: usize,
+    /// Byte offset where this cell's text ends.
+    end: usize,
+    /// Zero-based cell column of the producing cell.
+    col: usize,
+    /// Cells covered: 2 for a wide char, else 1.
+    width: usize,
+}
+
+/// A pattern match located on one viewport row.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ViewportTextMatch {
+    /// Viewport row, zero-based from the visible top.
+    pub row: i32,
+    /// First covered cell column.
+    pub col_start: usize,
+    /// Last covered cell column (inclusive).
+    pub col_end: usize,
+    /// The matched text.
+    pub text: String,
+}
+
+/// A literal or regex row pattern, compiled once per find call.
+enum RowMatcher<'a> {
+    Literal(&'a [u8]),
+    Regex(regex_automata::meta::Regex),
+}
+
+impl<'a> RowMatcher<'a> {
+    fn new(needle: &'a [u8], regex: bool) -> Option<Self> {
+        if regex {
+            let pattern = std::str::from_utf8(needle).ok()?;
+            regex_automata::meta::Regex::new(pattern).ok().map(Self::Regex)
+        } else {
+            Some(Self::Literal(needle))
+        }
+    }
+
+    /// Every non-overlapping match in one row, in order.
+    fn find_all(&self, haystack: &[u8]) -> Vec<(usize, usize)> {
+        match self {
+            Self::Literal(needle) => {
+                let mut matches = Vec::new();
+                let mut from = 0;
+                while from + needle.len() <= haystack.len() {
+                    let Some(relative) =
+                        haystack[from..].windows(needle.len()).position(|window| window == *needle)
+                    else {
+                        break;
+                    };
+                    let start = from + relative;
+                    matches.push((start, start + needle.len()));
+                    from = start + needle.len();
+                }
+                matches
+            },
+            Self::Regex(regex) => {
+                regex.find_iter(haystack).map(|found| (found.start(), found.end())).collect()
+            },
+        }
+    }
+}
+
+/// The span covering a row-text byte offset, if any.
+fn span_at(spans: &[RowTextSpan], offset: usize) -> Option<RowTextSpan> {
+    let index = spans.partition_point(|span| span.start <= offset).checked_sub(1)?;
+    let span = spans.get(index)?;
+    (offset < span.end).then_some(*span)
+}
+
 impl<T> Term<T> {
     #[inline]
     pub fn scroll_display(&mut self, scroll: Scroll)
@@ -944,10 +1021,75 @@ impl<T> Term<T> {
     fn line_to_string(
         &self,
         line: Line,
-        mut cols: Range<Column>,
+        cols: Range<Column>,
         include_wrapped_wide: bool,
     ) -> String {
+        self.line_to_string_with_spans(line, cols, include_wrapped_wide).0
+    }
+
+    /// Find every non-overlapping pattern match on the visible viewport.
+    ///
+    /// Rows are the same trimmed row text `wait text` matches against, so a waited-for string
+    /// is always findable here too, and each match carries its cell rectangle. Matching stays
+    /// within one viewport row: a match never spans a soft wrap, because a multi-row span has
+    /// no single cell rectangle to click. Zero-width regex matches are skipped for the same
+    /// reason. An empty pattern or an invalid regex yields no matches.
+    pub fn find_viewport_text(
+        &self,
+        needle: &[u8],
+        regex: bool,
+        max_matches: usize,
+    ) -> Vec<ViewportTextMatch> {
+        if needle.is_empty() || max_matches == 0 {
+            return Vec::new();
+        }
+        let matcher = RowMatcher::new(needle, regex);
+        let Some(matcher) = matcher else {
+            return Vec::new();
+        };
+
+        let mut matches = Vec::new();
+        for viewport_row in 0..self.screen_lines() as i32 {
+            let line = Line(-(self.grid.display_offset() as i32) + viewport_row);
+            let (full, spans) =
+                self.line_to_string_with_spans(line, Column(0)..self.last_column(), false);
+            let row = full.trim_end();
+            if row.is_empty() || spans.is_empty() {
+                continue;
+            }
+            for (start, end) in matcher.find_all(row.as_bytes()) {
+                if start == end {
+                    continue;
+                }
+                let (Some(first), Some(last)) =
+                    (span_at(&spans, start), end.checked_sub(1).and_then(|at| span_at(&spans, at)))
+                else {
+                    debug_assert!(false, "find match outside its row spans");
+                    continue;
+                };
+                matches.push(ViewportTextMatch {
+                    row: viewport_row,
+                    col_start: first.col,
+                    col_end: first.col.max(last.col + last.width - 1),
+                    text: row[start..end].to_owned(),
+                });
+                if matches.len() >= max_matches {
+                    return matches;
+                }
+            }
+        }
+        matches
+    }
+
+    /// Convert a single line in the grid to a String, recording which cell produced each byte.
+    fn line_to_string_with_spans(
+        &self,
+        line: Line,
+        mut cols: Range<Column>,
+        include_wrapped_wide: bool,
+    ) -> (String, Vec<RowTextSpan>) {
         let mut text = String::new();
+        let mut spans = Vec::new();
 
         let grid_line = &self.grid[line];
         let line_length = cmp::min(grid_line.line_length(), cols.end + 1);
@@ -975,6 +1117,7 @@ impl<T> Term<T> {
             }
 
             if !cell.flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER) {
+                let start = text.len();
                 // Push cells primary character.
                 text.push(cell.c);
 
@@ -982,6 +1125,12 @@ impl<T> Term<T> {
                 for c in cell.zerowidth().into_iter().flatten() {
                     text.push(*c);
                 }
+                spans.push(RowTextSpan {
+                    start,
+                    end: text.len(),
+                    col: column.0,
+                    width: if cell.flags.contains(Flags::WIDE_CHAR) { 2 } else { 1 },
+                });
             }
         }
 
@@ -1001,7 +1150,7 @@ impl<T> Term<T> {
             text.push(self.grid[line - 1i32][Column(0)].c);
         }
 
-        text
+        (text, spans)
     }
 
     /// Terminal content required for rendering.
@@ -3408,6 +3557,59 @@ mod tests {
         // Rectangles clamp to the viewport instead of reaching outside it.
         assert_eq!(term.viewport_rect_text(0, 2, 80, 5), "ROW2");
         assert_eq!(term.viewport_rect_text(80, 0, 4, 1), "");
+    }
+
+    #[test]
+    fn find_viewport_text_reports_cell_rectangles() {
+        let term = mock_term("Submit form\nCancel");
+
+        let matches = term.find_viewport_text(b"Submit", false, 10);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].row, 0);
+        assert_eq!(matches[0].col_start, 0);
+        assert_eq!(matches[0].col_end, 5);
+        assert_eq!(matches[0].text, "Submit");
+
+        let matches = term.find_viewport_text(b"Cancel", false, 10);
+        assert_eq!(matches.len(), 1);
+        assert_eq!((matches[0].row, matches[0].col_start, matches[0].col_end), (1, 0, 5));
+    }
+
+    #[test]
+    fn find_viewport_text_maps_wide_chars_to_two_cells() {
+        let term = mock_term("今Submit");
+
+        // The wide char covers columns 0-1, so "Submit" starts at column 2.
+        let matches = term.find_viewport_text(b"Submit", false, 10);
+        assert_eq!(matches.len(), 1);
+        assert_eq!((matches[0].col_start, matches[0].col_end), (2, 7));
+
+        // A match ending on the wide char covers both of its cells.
+        let matches = term.find_viewport_text("今".as_bytes(), false, 10);
+        assert_eq!(matches.len(), 1);
+        assert_eq!((matches[0].col_start, matches[0].col_end), (0, 1));
+    }
+
+    #[test]
+    fn find_viewport_text_enumerates_literal_and_regex_matches() {
+        let term = mock_term("foo bar foo\nstatus=1234");
+
+        let literal: Vec<_> = term
+            .find_viewport_text(b"foo", false, 10)
+            .into_iter()
+            .map(|found| (found.row, found.col_start, found.col_end))
+            .collect();
+        assert_eq!(literal, [(0, 0, 2), (0, 8, 10)]);
+
+        let regex = term.find_viewport_text(br"status=\d+", true, 10);
+        assert_eq!(regex.len(), 1);
+        assert_eq!((regex[0].row, regex[0].col_start, regex[0].col_end), (1, 0, 10));
+        assert_eq!(regex[0].text, "status=1234");
+
+        assert_eq!(term.find_viewport_text(b"foo", false, 1).len(), 1);
+        assert!(term.find_viewport_text(b"", false, 10).is_empty());
+        assert!(term.find_viewport_text(b"(", true, 10).is_empty());
+        assert!(term.find_viewport_text(b"missing", false, 10).is_empty());
     }
 
     #[test]
