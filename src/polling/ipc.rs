@@ -1629,7 +1629,7 @@ fn run_plan(
         Ok(secrets) => secrets,
         Err(error) => return (Err(error), Vec::new()),
     };
-    let junit = match report_destination(options.report, &options.output, options.dry_run) {
+    let file_report = match report_destination(options.report, &options.output, options.dry_run) {
         Ok(destination) => destination,
         Err(error) => return (Err(error), Vec::new()),
     };
@@ -1891,7 +1891,9 @@ fn run_plan(
                     ) {
                         return (Err(error), records);
                     }
-                    if let Err(error) = write_junit_report(&junit, &suite, &records, failures) {
+                    if let Err(error) =
+                        write_file_report(options.report, &file_report, &suite, &records, failures)
+                    {
                         return (Err(error), records);
                     }
                     return (
@@ -1912,7 +1914,8 @@ fn run_plan(
     ) {
         return (Err(error), records);
     }
-    if let Err(error) = write_junit_report(&junit, &suite, &records, failures) {
+    if let Err(error) = write_file_report(options.report, &file_report, &suite, &records, failures)
+    {
         return (Err(error), records);
     }
     let outcome = if failures == 0 {
@@ -1923,7 +1926,7 @@ fn run_plan(
     (outcome, records)
 }
 
-/// One executed plan step as recorded for the JUnit report and failure captures.
+/// One executed plan step as recorded for the JUnit/SARIF report and failure captures.
 pub(crate) struct PlanStepRecord {
     id: String,
     method: String,
@@ -1994,18 +1997,35 @@ fn report_destination(
     dry_run: bool,
 ) -> io::Result<Option<PathBuf>> {
     match (report, output) {
-        (IpcPlanReport::Junit, None) => {
-            Err(IoError::new(ErrorKind::InvalidInput, "--report junit requires --output PATH"))
-        },
-        (IpcPlanReport::Junit, Some(_)) if dry_run => Err(IoError::new(
+        (IpcPlanReport::Junit | IpcPlanReport::Sarif, None) => Err(IoError::new(
             ErrorKind::InvalidInput,
-            "--report junit is only written for executed runs, not --dry-run",
+            "--report junit/sarif requires --output PATH",
         )),
-        (IpcPlanReport::Ndjson, Some(_)) => {
-            Err(IoError::new(ErrorKind::InvalidInput, "--output PATH requires --report junit"))
-        },
-        (IpcPlanReport::Junit, Some(path)) => Ok(Some(path.clone())),
+        (IpcPlanReport::Junit | IpcPlanReport::Sarif, Some(_)) if dry_run => Err(IoError::new(
+            ErrorKind::InvalidInput,
+            "--report junit/sarif is only written for executed runs, not --dry-run",
+        )),
+        (IpcPlanReport::Ndjson, Some(_)) => Err(IoError::new(
+            ErrorKind::InvalidInput,
+            "--output PATH requires --report junit or --report sarif",
+        )),
+        (IpcPlanReport::Junit | IpcPlanReport::Sarif, Some(path)) => Ok(Some(path.clone())),
         (IpcPlanReport::Ndjson, None) => Ok(None),
+    }
+}
+
+/// Write the file report requested by `--report` (JUnit or SARIF); otherwise a no-op.
+fn write_file_report(
+    report: IpcPlanReport,
+    path: &Option<PathBuf>,
+    suite: &str,
+    records: &[PlanStepRecord],
+    failures: u64,
+) -> io::Result<()> {
+    match report {
+        IpcPlanReport::Junit => write_junit_report(path, suite, records, failures),
+        IpcPlanReport::Sarif => write_sarif_report(path, suite, records, failures),
+        IpcPlanReport::Ndjson => Ok(()),
     }
 }
 
@@ -2076,6 +2096,78 @@ fn junit_escape(text: &str) -> String {
         }
     }
     escaped
+}
+
+/// Write the SARIF 2.1.0 report when `--report sarif` was requested; otherwise a no-op.
+///
+/// Every executed step becomes one result: failed steps are `error`/`fail`, skipped steps
+/// are `none`/`notApplicable`, and passing steps are `none`/`pass`. Rules are derived from
+/// the distinct step methods so each result can name the automation method it covers.
+fn write_sarif_report(
+    sarif: &Option<PathBuf>,
+    suite: &str,
+    records: &[PlanStepRecord],
+    failures: u64,
+) -> io::Result<()> {
+    let Some(path) = sarif else {
+        return Ok(());
+    };
+    let mut methods = Vec::new();
+    for record in records {
+        if !methods.contains(&record.method) {
+            methods.push(record.method.clone());
+        }
+    }
+    let rules = methods
+        .iter()
+        .map(|method| {
+            json!({
+                "id": method,
+                "shortDescription": {"text": format!("vivido plan step ({method})")},
+            })
+        })
+        .collect::<Vec<_>>();
+    let results = records
+        .iter()
+        .map(|record| {
+            let index = methods.iter().position(|method| *method == record.method);
+            let (level, kind, message) = match &record.outcome {
+                PlanStepOutcome::Ok => ("none", "pass", String::from("ok")),
+                PlanStepOutcome::Error { message, .. } => ("error", "fail", message.clone()),
+                PlanStepOutcome::Skipped(reason) => ("none", "notApplicable", reason.clone()),
+            };
+            json!({
+                "ruleId": record.method,
+                "ruleIndex": index,
+                "level": level,
+                "kind": kind,
+                "message": {"text": message},
+                "properties": {"stepId": record.id},
+            })
+        })
+        .collect::<Vec<_>>();
+    let log = json!({
+        "version": "2.1.0",
+        "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+        "runs": [{
+            "tool": {"driver": {
+                "name": "vivido",
+                "version": env!("CARGO_PKG_VERSION"),
+                "informationUri": "https://vivido.dev",
+                "rules": rules,
+            }},
+            "results": results,
+            "invocations": [{"executionSuccessful": failures == 0}],
+            "properties": {"suite": suite},
+        }],
+    });
+    let text = serde_json::to_string_pretty(&log).map_err(IoError::other)?;
+    fs::write(path, format!("{text}\n")).map_err(|error| {
+        IoError::new(
+            error.kind(),
+            format!("failed to write SARIF report {}: {error}", path.display()),
+        )
+    })
 }
 
 /// Run an automation plan inside an ephemeral headless session.
@@ -3456,13 +3548,19 @@ mod tests {
 
     #[test]
     fn report_destinations_are_validated_before_any_session_exists() {
-        use crate::cli::IpcPlanReport::{Junit, Ndjson};
+        use crate::cli::IpcPlanReport::{Junit, Ndjson, Sarif};
         assert!(report_destination(Junit, &None, false).is_err());
         assert!(report_destination(Junit, &Some(PathBuf::from("x.xml")), true).is_err());
         assert!(report_destination(Ndjson, &Some(PathBuf::from("x.xml")), false).is_err());
+        assert!(report_destination(Sarif, &None, false).is_err());
+        assert!(report_destination(Sarif, &Some(PathBuf::from("x.sarif")), true).is_err());
         assert_eq!(
             report_destination(Junit, &Some(PathBuf::from("x.xml")), false).unwrap(),
             Some(PathBuf::from("x.xml"))
+        );
+        assert_eq!(
+            report_destination(Sarif, &Some(PathBuf::from("x.sarif")), false).unwrap(),
+            Some(PathBuf::from("x.sarif"))
         );
         assert_eq!(report_destination(Ndjson, &None, false).unwrap(), None);
 
@@ -3503,6 +3601,58 @@ mod tests {
         assert!(xml.contains(r#"name="type&lt;&amp;&gt;""#), "{xml}");
         assert!(xml.contains("<failure message=\"expected &quot;x&quot;\">"), "{xml}");
         assert!(xml.contains("<skipped message=\"condition_false\"/>"), "{xml}");
+    }
+
+    #[test]
+    fn sarif_report_marks_failures_passes_and_skips() {
+        let step = |id: &str, method: &str| IpcAutomationPlanStep {
+            id: id.to_owned(),
+            method: method.to_owned(),
+            params: json!({}),
+            bind: BTreeMap::new(),
+            when: None,
+            on_error: IpcPlanErrorPolicy::Abort,
+            verify: None,
+            assert: None,
+        };
+        let started = std::time::Instant::now();
+        let records = [
+            PlanStepRecord::ok(&step("type", "typing"), &started),
+            PlanStepRecord::error(&step("check", "get-text"), "expected \"x\"", Some(1), &started),
+            PlanStepRecord::skipped(&step("later", "typing"), "condition_false", &started),
+        ];
+        let path =
+            std::env::temp_dir().join(format!("vivido-sarif-test-{}.sarif", std::process::id()));
+        write_sarif_report(&Some(path.clone()), "suite", &records, 1).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let log: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(log["version"], "2.1.0");
+        let run = &log["runs"][0];
+        assert_eq!(run["tool"]["driver"]["name"], "vivido");
+        // One rule per distinct step method.
+        let rules = run["tool"]["driver"]["rules"].as_array().unwrap();
+        assert_eq!(rules.len(), 2);
+        assert!(rules.iter().any(|rule| rule["id"] == "typing"));
+        assert!(rules.iter().any(|rule| rule["id"] == "get-text"));
+        let results = run["results"].as_array().unwrap();
+        assert_eq!(results.len(), 3);
+        let failed =
+            results.iter().find(|result| result["properties"]["stepId"] == "check").unwrap();
+        assert_eq!(failed["level"], "error");
+        assert_eq!(failed["kind"], "fail");
+        assert_eq!(failed["ruleId"], "get-text");
+        assert_eq!(failed["message"]["text"], "expected \"x\"");
+        let passed =
+            results.iter().find(|result| result["properties"]["stepId"] == "type").unwrap();
+        assert_eq!(passed["level"], "none");
+        assert_eq!(passed["kind"], "pass");
+        let skipped =
+            results.iter().find(|result| result["properties"]["stepId"] == "later").unwrap();
+        assert_eq!(skipped["level"], "none");
+        assert_eq!(skipped["kind"], "notApplicable");
+        assert_eq!(run["invocations"][0]["executionSuccessful"], false);
+        assert_eq!(run["properties"]["suite"], "suite");
     }
 
     #[test]

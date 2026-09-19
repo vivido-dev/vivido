@@ -370,7 +370,7 @@ pub enum Subcommands {
 /// Parameters to the `test` composite command: a plan plus a session to run it in.
 ///
 /// The runner spawns a fresh headless session, executes the plan with `run-plan` semantics
-/// (NDJSON events on stdout, optional JUnit), captures a grid dump and screenshot metadata on
+/// (NDJSON events on stdout, optional JUnit/SARIF), captures a grid dump and screenshot metadata on
 /// failure, and shuts the session down — unless `--keep-failed` preserves a failed session for
 /// post-mortem inspection.
 #[cfg(any(unix, windows))]
@@ -392,11 +392,11 @@ pub struct IpcTest {
     #[clap(long)]
     pub keep_failed: bool,
 
-    /// Report format, as in `run-plan`. JUnit always writes `--output` too.
+    /// Report format, as in `run-plan`. JUnit and SARIF always write `--output` too.
     #[clap(long, value_enum, default_value = "ndjson")]
     pub report: IpcPlanReport,
 
-    /// Destination file for `--report junit`.
+    /// Destination file for `--report junit` or `--report sarif`.
     #[clap(long, value_name = "PATH", value_hint = ValueHint::FilePath)]
     pub output: Option<PathBuf>,
 
@@ -647,6 +647,8 @@ pub enum IpcPlanReport {
     Ndjson,
     /// JUnit XML suite written to `--output`, in addition to the NDJSON events.
     Junit,
+    /// SARIF 2.1.0 log written to `--output`, in addition to the NDJSON events.
+    Sarif,
 }
 
 /// Parameters to the client-side `run-plan` composite command.
@@ -665,11 +667,12 @@ pub struct IpcRunPlan {
     #[clap(long, conflicts_with = "dry_run")]
     pub preflight: bool,
 
-    /// Report format. JUnit always writes `--output` and keeps the NDJSON events on stdout.
+    /// Report format. JUnit and SARIF always write `--output` and keep the NDJSON events
+    /// on stdout.
     #[clap(long, value_enum, default_value = "ndjson")]
     pub report: IpcPlanReport,
 
-    /// Destination file for `--report junit`.
+    /// Destination file for `--report junit` or `--report sarif`.
     #[clap(long, value_name = "PATH", value_hint = ValueHint::FilePath)]
     pub output: Option<PathBuf>,
 
@@ -724,7 +727,7 @@ pub struct IpcCapture {
 #[serde(deny_unknown_fields)]
 pub struct IpcAutomationPlan {
     pub version: u16,
-    /// Suite name used by JUnit reports; defaults to the plan file stem.
+    /// Suite name used by JUnit/SARIF reports; defaults to the plan file stem.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     /// Named values substituted as `${name}` throughout the steps. `--set` overrides these.

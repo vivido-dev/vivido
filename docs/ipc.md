@@ -67,8 +67,10 @@ failing the step like an action error under the same `on_error` policy. A text a
 up to `timeout_ms` for `text_contains` in `window_id` (an ID or `{"$ref":alias}`), then checks
 the last `lines_from_bottom` rows; a result assertion requires the JSON Pointer
 `result_pointer` into the action result to equal `result_equals`. `--report junit --output
-FILE` additionally writes a JUnit XML suite (named by the plan `name`, else the file stem)
-for CI integration; the NDJSON events still go to stdout.
+FILE` additionally writes a JUnit XML suite (named by the plan `name`, else the file stem),
+and `--report sarif --output FILE` writes a SARIF 2.1.0 log with one result per step
+(failed steps are `error`/`fail`, skipped steps `none`/`notApplicable`), for CI integration;
+the NDJSON events still go to stdout.
 
 `vivido test --session NAME --file plan.json` runs a plan inside an ephemeral headless session
 of its own: it spawns the session (with `--headless-size` and an optional `-- SHELL...`
@@ -341,8 +343,10 @@ waiting until it disconnects, the same as any unanswered request.
   frame position, process state, and current screen/frame/output sequences.
 - `inspect {"window_id":ID}` returns the list entry plus cell dimensions, scale, scrollback,
   display offset, primary/alternate screen, terminal mode names, cursor, selection, shell PID,
-  foreground process group, optional executable basename/current directory, echo state, exit
-  status, global event sequence, and effective automation limits. It never returns process
+  live PTY telemetry (`pty_state`, session-wide `conpty_handles`, `system_memory_mb`, and
+  `active_waiters_count`), foreground process group, optional executable basename/current
+  directory, echo state, exit status, global event sequence, and effective automation limits.
+  It never returns process
   arguments, environment values, Vivid root/resume secrets, channel authenticators, or derived
   capabilities. `current_directory` prefers the shell's OSC 7 report when its host is this
   machine and falls back to the foreground-process probe; over Windows OSC 7 is the only

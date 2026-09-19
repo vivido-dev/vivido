@@ -748,6 +748,13 @@ impl Processor {
         }
     }
 
+    /// Windows whose child process is still running. Reported as `conpty_handles` in
+    /// `inspect`: ConPTY sessions exhaust desktop heap around 64 concurrent windows per
+    /// process, so the live-terminal count is the gauge automation watches.
+    fn live_pty_count(&self) -> usize {
+        self.windows.values().filter(|window| window.automation.exit_status.is_none()).count()
+    }
+
     /// Search one named window, or every window in creation order, for a text pattern.
     ///
     /// An unnamed search covers all windows so agents can locate a control without knowing
@@ -1642,7 +1649,8 @@ impl Processor {
                     },
                 };
                 self.resolve_ipc_target(params.window_id).map(|target| {
-                    self.windows[&target].automation_inspect(self.automation.event_sequence())
+                    self.windows[&target]
+                        .automation_inspect(self.automation.event_sequence(), self.live_pty_count())
                 })
             },
             "diagnose" => {
@@ -1668,6 +1676,7 @@ impl Processor {
                         self.windows[&target].automation_diagnose(
                             self.automation.event_sequence(),
                             params.trace_limit,
+                            self.live_pty_count(),
                         )
                     })
                 }

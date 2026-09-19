@@ -2337,7 +2337,7 @@ impl WindowContext {
 
     /// Detailed, secret-free terminal/window inspection.
     #[cfg(any(unix, windows))]
-    pub fn automation_inspect(&self, event_sequence: u64) -> Value {
+    pub fn automation_inspect(&self, event_sequence: u64, live_pty_count: usize) -> Value {
         let terminal = self.terminal.lock();
         let grid = terminal.grid();
         let size = self.display.size_info;
@@ -2392,6 +2392,10 @@ impl WindowContext {
             "cursor": {"line": cursor.line.0, "column": cursor.column.0},
             "selection": selection.map(selection_json),
             "shell_pid": self.shell_pid,
+            "pty_state": if self.automation.exit_status.is_some() { "exited" } else { "running" },
+            "active_waiters_count": self.automation.waiters.len(),
+            "system_memory_mb": process_memory_mb(),
+            "conpty_handles": live_pty_count,
             "foreground_process_group_id": foreground_pgid,
             "executable": executable,
             "current_directory": current_directory,
@@ -2579,7 +2583,12 @@ impl WindowContext {
     }
 
     #[cfg(any(unix, windows))]
-    pub fn automation_diagnose(&self, event_sequence: u64, trace_limit: u16) -> Value {
+    pub fn automation_diagnose(
+        &self,
+        event_sequence: u64,
+        trace_limit: u16,
+        live_pty_count: usize,
+    ) -> Value {
         let sessions = self.automation_vivid_sessions();
         let surfaces = self.automation_vivid_surfaces();
         let tracks = self.automation_vivid_tracks();
@@ -2602,7 +2611,7 @@ impl WindowContext {
                 "screen_sequence": self.automation.screen_sequence,
                 "frame_sequence": self.automation.frame_sequence,
             },
-            "window": self.automation_inspect(event_sequence),
+            "window": self.automation_inspect(event_sequence, live_pty_count),
             "renderer": {
                 "frame_sequence": self.automation.frame_sequence,
                 "has_presented_frame": self.automation.frame_sequence != 0,
@@ -3180,6 +3189,49 @@ fn selection_json(selection: crate::terminal::selection::SelectionRange) -> Valu
     })
 }
 
+/// Current process working set in MiB, rounded to one decimal for `inspect` telemetry.
+#[cfg(any(unix, windows))]
+fn process_memory_mb() -> Option<f64> {
+    #[cfg(unix)]
+    {
+        // SAFETY: `usage` is a plain zeroed struct that `getrusage` fills before the
+        // return value is checked; no other thread observes the intermediate state.
+        let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
+        let ok = unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) == 0 };
+        if !ok {
+            return None;
+        }
+        let usage = unsafe { usage.assume_init() };
+        if usage.ru_maxrss <= 0 {
+            return None;
+        }
+        // `ru_maxrss` is kilobytes on Linux and most Unixes, but bytes on macOS.
+        #[cfg(target_os = "macos")]
+        let mib = usage.ru_maxrss as f64 / 1_048_576.0;
+        #[cfg(not(target_os = "macos"))]
+        let mib = usage.ru_maxrss as f64 / 1_024.0;
+        Some((mib * 10.0).round() / 10.0)
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::ProcessStatus::{
+            GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+        };
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        // SAFETY: `counters` is sized and versioned via `cb` exactly as the API requires,
+        // and the current-process pseudo-handle needs no cleanup.
+        unsafe {
+            let mut counters = std::mem::zeroed::<PROCESS_MEMORY_COUNTERS>();
+            counters.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+            if GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, counters.cb) == 0 {
+                return None;
+            }
+            let mib = counters.WorkingSetSize as f64 / 1_048_576.0;
+            Some((mib * 10.0).round() / 10.0)
+        }
+    }
+}
+
 #[cfg(any(unix, windows))]
 fn exit_status_json(status: Option<&std::process::ExitStatus>) -> Value {
     match status {
@@ -3632,6 +3684,8 @@ mod vivid_environment_tests {
     #[cfg(any(unix, windows))]
     use super::assign_ipc_window_id;
     use super::configure_vivid_pty_environment;
+    #[cfg(any(unix, windows))]
+    use super::process_memory_mb;
     #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
     use super::terminal_accessibility_focused;
     #[cfg(any(unix, windows))]
@@ -3665,6 +3719,13 @@ mod vivid_environment_tests {
         assert!(!ui_paste_needs_action_context(false, false));
         assert!(ui_paste_needs_action_context(true, false));
         assert!(ui_paste_needs_action_context(false, true));
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn process_memory_reports_a_positive_working_set() {
+        let mib = process_memory_mb().expect("the working-set query succeeds on this platform");
+        assert!(mib > 0.0, "{mib}");
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
