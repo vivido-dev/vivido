@@ -343,6 +343,22 @@ pub fn installed_config() -> Option<PathBuf> {
     first_existing_windows_config(windows_config_candidates(user_profile, dirs::config_dir()))
 }
 
+/// Return the per-user directory for Vivido configuration and state.
+#[cfg(not(windows))]
+pub fn config_dir() -> Option<PathBuf> {
+    xdg::BaseDirectories::with_prefix("vivido").get_config_home()
+}
+
+/// Return the per-user directory for Vivido configuration and state.
+#[cfg(windows)]
+pub fn config_dir() -> Option<PathBuf> {
+    env::var_os("USERPROFILE")
+        .map(PathBuf::from)
+        .or_else(home::home_dir)
+        .map(|home| home.join(".config").join("vivido"))
+        .or_else(|| dirs::config_dir().map(|directory| directory.join("vivido")))
+}
+
 #[cfg(any(windows, test))]
 fn first_existing_windows_config(candidates: Vec<PathBuf>) -> Option<PathBuf> {
     candidates.into_iter().find(|path| path.exists())

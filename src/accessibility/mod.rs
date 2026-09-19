@@ -58,6 +58,7 @@ pub(crate) struct AccessibleCharacter {
 
 impl AccessibleCharacter {
     /// UTF-16 range widened for the platform accessibility APIs, which index in `usize`.
+    #[cfg(target_os = "macos")]
     pub fn utf16_range(&self) -> Range<usize> {
         self.utf16.start as usize..self.utf16.end as usize
     }

@@ -4068,6 +4068,7 @@ impl EventSink {
 #[derive(Debug, Clone)]
 pub enum EventType {
     Terminal(TerminalEvent),
+    Update(crate::update::UpdateEvent),
     VividFrame,
     ConfigReload(PathBuf),
     Message(Message),
@@ -5340,6 +5341,7 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                 | EventType::AutomationTick
                 | EventType::Shutdown => (),
                 EventType::Message(_)
+                | EventType::Update(_)
                 | EventType::MessageTimeout(_)
                 | EventType::ConfigReload(_)
                 | EventType::CreateWindow(_)

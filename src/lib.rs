@@ -37,6 +37,7 @@ mod session;
 pub mod shell;
 mod string;
 pub mod terminal;
+pub mod update;
 mod vivid;
 pub mod window_context;
 
