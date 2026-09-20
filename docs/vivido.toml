@@ -116,6 +116,10 @@ history = 10000
 # Lines scrolled per wheel/step increment.
 multiplier = 3
 
+# Show the overlay scrollbar while scrolling, dragging it, or hovering its gutter.
+# Never shown on the alternate screen or over pane overlays.
+# scrollbar = true
+
 # ─────────────────────────────────────────────────────────────────────────────
 # font
 # ─────────────────────────────────────────────────────────────────────────────

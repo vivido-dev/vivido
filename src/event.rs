@@ -6332,6 +6332,11 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                     WindowEvent::CursorLeft { .. } => {
                         self.ctx.mouse.inside_text_area = false;
 
+                        if self.ctx.display().scrollbar.set_hover(Instant::now(), false) {
+                            *self.ctx.dirty = true;
+                            self.ctx.window().request_redraw();
+                        }
+
                         if self.ctx.display().highlighted_hint.is_some() {
                             *self.ctx.dirty = true;
                         }

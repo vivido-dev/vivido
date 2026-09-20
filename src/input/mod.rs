@@ -467,6 +467,26 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
     #[inline]
     pub fn mouse_moved(&mut self, position: PhysicalPosition<f64>) {
         let size_info = self.ctx.size_info();
+        let scrollbar_scale = self.ctx.display().window.scale_factor as f32;
+
+        // A scrollbar drag owns the pointer: track it ahead of pane overlays so a host
+        // gesture never leaks into producer UI mid-drag.
+        if self.ctx.display().scrollbar.dragging() {
+            let x = position.x.max(0.) as usize;
+            let y = position.y.max(0.) as usize;
+            self.ctx.mouse_mut().x = x;
+            self.ctx.mouse_mut().y = y;
+            if let Some(target) =
+                self.ctx.display().scrollbar.drag_target(&size_info, scrollbar_scale, y as f32)
+            {
+                let current = self.ctx.terminal().grid().display_offset();
+                if target != current {
+                    self.ctx.scroll(Scroll::Delta(target as i32 - current as i32));
+                }
+            }
+            return;
+        }
+
         let overlay_modifiers = crate::vivid::hid::modifiers(self.ctx.modifiers().state());
         if (size_info.contains_point(position.x.max(0.) as usize, position.y.max(0.) as usize)
             || self.ctx.overlay_capturing())
@@ -493,6 +513,20 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
         let y = y.clamp(0, size_info.height() as i32 - 1) as usize;
         self.ctx.mouse_mut().x = x;
         self.ctx.mouse_mut().y = y;
+
+        // Hovering the gutter reveals the scrollbar. This runs on every move because the
+        // cell tracking below early-returns while the pointer stays inside one cell.
+        let scrollbar_hovered = {
+            let scrollbar = &mut self.ctx.display().scrollbar;
+            let inside = scrollbar.contains_point(&size_info, scrollbar_scale, x as f32, y as f32);
+            scrollbar.set_hover(Instant::now(), inside)
+        };
+        if scrollbar_hovered {
+            self.ctx.mark_dirty();
+            // The frame pump may be idle in quiescence; a bare dirty flag waits for a frame
+            // timer that is not scheduled, so request the redraw explicitly.
+            self.ctx.window().request_redraw();
+        }
 
         let inside_text_area = size_info.contains_point(x, y);
         let cell_side = self.cell_side(x);
@@ -1042,6 +1076,41 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
         {
             return;
         }
+
+        // The scrollbar is host chrome: presses on its gutter drag the scrollback instead
+        // of selecting, reporting to the application, or hitting mouse bindings.
+        if button == MouseButton::Left {
+            let size_info = self.ctx.size_info();
+            let scrollbar_scale = self.ctx.display().window.scale_factor as f32;
+            let (mouse_x, mouse_y) = (self.ctx.mouse().x, self.ctx.mouse().y);
+            let drag_starting = state == ElementState::Pressed
+                && self.ctx.display().scrollbar.contains_point(
+                    &size_info,
+                    scrollbar_scale,
+                    mouse_x as f32,
+                    mouse_y as f32,
+                );
+            let drag_ending =
+                state == ElementState::Released && self.ctx.display().scrollbar.dragging();
+            if drag_starting || drag_ending {
+                self.ctx.mouse_mut().left_button_state = state;
+                let scrollbar = &mut self.ctx.display().scrollbar;
+                if drag_starting {
+                    scrollbar.begin_drag(
+                        Instant::now(),
+                        &size_info,
+                        scrollbar_scale,
+                        mouse_y as f32,
+                    );
+                } else {
+                    scrollbar.end_drag(Instant::now());
+                }
+                self.ctx.mark_dirty();
+                self.ctx.window().request_redraw();
+                return;
+            }
+        }
+
         match button {
             MouseButton::Left => self.ctx.mouse_mut().left_button_state = state,
             MouseButton::Middle => self.ctx.mouse_mut().middle_button_state = state,

@@ -9,7 +9,7 @@ use log::info;
 use parking_lot::MutexGuard;
 use serde::{Deserialize, Serialize};
 use unicode_width::UnicodeWidthChar;
-use vello::kurbo::Affine;
+use vello::kurbo::{Affine, RoundedRect};
 use vello::peniko::{Color, Fill};
 use vello::{Glyph, Scene};
 use winit::dpi::PhysicalSize;
@@ -41,6 +41,7 @@ use crate::display::hint::{HintMatch, HintState};
 use crate::display::meter::Meter;
 use crate::display::rects::{RenderLine, RenderLines, RenderRect, paint_rect, paint_rects};
 use crate::display::renderer::{EmbeddedFrame, SceneRenderer};
+use crate::display::scrollbar::{ScrollbarModel, ScrollbarState, THUMB_ALPHA, THUMB_COLOR};
 use crate::display::text::{TerminalTextStyle, TextMetrics, TextSystem, color_from_rgb};
 use crate::display::window::Window;
 use crate::event::{Event, EventType, Mouse, SearchState};
@@ -65,6 +66,7 @@ mod damage;
 mod media;
 mod meter;
 mod overlay;
+mod scrollbar;
 #[cfg(windows)]
 mod windows_live_move;
 
@@ -326,6 +328,7 @@ pub struct Display {
     highlighted_hint_age: usize,
     pub cursor_hidden: bool,
     pub visual_bell: VisualBell,
+    pub scrollbar: ScrollbarState,
     pub colors: List,
     pub hint_state: HintState,
     pub pending_update: DisplayUpdate,
@@ -374,6 +377,7 @@ impl Display {
     fn invalidate_cached_scene(&mut self) {
         self.cached_scene = None;
         self.vivid_frame_requested = false;
+        self.scrollbar.record_drawn(None);
     }
 
     pub fn set_vivid_scene(&mut self, scene: crate::vivid::scene::SharedScene) {
@@ -485,6 +489,7 @@ impl Display {
             highlighted_hint_age: Default::default(),
             cursor_hidden: Default::default(),
             visual_bell: VisualBell::from(&config.bell),
+            scrollbar: ScrollbarState::new(),
             colors: List::from(&config.colors),
             hint_state,
             pending_update: Default::default(),
@@ -670,6 +675,21 @@ impl Display {
 
         let size_info = self.size_info;
         let early_display_offset = terminal.grid().display_offset();
+        let scrollbar_history = terminal.grid().history_size();
+        let scrollbar_model = ScrollbarModel {
+            applicable: config.scrolling.scrollbar
+                && !terminal.mode().contains(TermMode::ALT_SCREEN)
+                && scrollbar_history > 0,
+            display_offset: early_display_offset,
+            history: scrollbar_history,
+            screen_lines: terminal.grid().screen_lines(),
+        };
+        // Sampled here rather than from any one scroll call site so every display-offset
+        // change — wheel, keyboard, search jumps — wakes the scrollbar.
+        self.scrollbar.observe(Instant::now(), scrollbar_model);
+        let scrollbar_scale = self.window.scale_factor as f32;
+        let scrollbar_visual =
+            self.scrollbar.visual_at(Instant::now(), &size_info, scrollbar_scale);
         let prepared_media = self.scene_renderer.prepare_media(&size_info, early_display_offset);
         let media_generation = prepared_media.as_ref().map_or(0, |media| media.image_generation);
         let _media_changed = prepared_media.as_ref().is_some_and(|media| media.changed);
@@ -683,7 +703,9 @@ impl Display {
             && self.visual_bell.intensity() == 0.
             && !self.hint_state.active()
             && search_state.regex().is_none()
-            && !self.damage_tracker.debug;
+            && !self.damage_tracker.debug
+            // The cached scene must show exactly the scrollbar visual this frame would.
+            && self.scrollbar.drawn_visual() == scrollbar_visual;
         if can_reuse_scene {
             self.cached_scene_frames = self.cached_scene_frames.saturating_add(1);
             drop(terminal);
@@ -818,6 +840,10 @@ impl Display {
             }
             if search_state.regex().is_some() {
                 self.draw_line_indicator(&mut scene, config, total_lines, None, display_offset);
+            }
+
+            if let Some((intensity, ..)) = scrollbar_visual {
+                self.draw_scrollbar(&mut scene, intensity, scrollbar_scale);
             }
 
             let visual_bell_intensity = self.visual_bell.intensity();
@@ -971,6 +997,7 @@ impl Display {
             self.cached_microphone_label = mic_label;
             self.cached_media_generation = media_generation;
             self.cached_base_color = base_color;
+            self.scrollbar.record_drawn(scrollbar_visual);
         }
         self.vivid_frame_requested = false;
 
@@ -983,6 +1010,9 @@ impl Display {
         self.invalidate_cached_scene();
         self.damage_tracker.debug = config.debug.highlight_damage;
         self.visual_bell.update_config(&config.bell);
+        if !config.scrolling.scrollbar {
+            self.scrollbar.hide();
+        }
         self.colors = List::from(&config.colors);
     }
 
@@ -1453,6 +1483,39 @@ impl Display {
         if obstructed_column.is_none_or(|obstructed_column| obstructed_column < column) {
             self.paint_string_cells(scene, point, fg, bg, &text);
         }
+    }
+
+    /// Draw the overlay scrollbar thumb at `intensity` and damage its gutter.
+    fn draw_scrollbar(&mut self, scene: &mut Scene, intensity: f32, scale_factor: f32) {
+        let geometry = self.scrollbar.geometry(&self.size_info, scale_factor);
+        let Some(thumb) = geometry.thumb else {
+            return;
+        };
+
+        let shape = RoundedRect::new(
+            thumb.x as f64,
+            thumb.top as f64,
+            (thumb.x + thumb.width) as f64,
+            (thumb.top + thumb.height) as f64,
+            (thumb.width / 2.) as f64,
+        );
+        let alpha = (THUMB_ALPHA * intensity * 255.) as u8;
+        scene.fill(
+            Fill::NonZero,
+            Affine::IDENTITY,
+            Color::from_rgba8(THUMB_COLOR.0, THUMB_COLOR.1, THUMB_COLOR.2, alpha),
+            None,
+            &shape,
+        );
+
+        // The gutter is a few pixels wide; damaging it in full covers thumb moves and fades.
+        self.damage_tracker.frame().add_viewport_rect(
+            &self.size_info,
+            geometry.x as i32,
+            geometry.y as i32,
+            geometry.width as i32,
+            geometry.height as i32,
+        );
     }
 
     fn highlight_damage(&self, render_rects: &mut Vec<RenderRect>) {

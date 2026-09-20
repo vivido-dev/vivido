@@ -9,12 +9,15 @@ pub const MAX_SCROLLBACK_LINES: u32 = 100_000;
 pub struct Scrolling {
     pub multiplier: u8,
 
+    /// Show the transient overlay scrollbar for the scrollback.
+    pub scrollbar: bool,
+
     history: ScrollingHistory,
 }
 
 impl Default for Scrolling {
     fn default() -> Self {
-        Self { multiplier: 3, history: Default::default() }
+        Self { multiplier: 3, scrollbar: true, history: Default::default() }
     }
 }
 
@@ -50,5 +53,5 @@ impl<'de> Deserialize<'de> for ScrollingHistory {
     }
 }
 
-impl_config_deserialize!(Scrolling { multiplier, history });
+impl_config_deserialize!(Scrolling { multiplier, scrollbar, history });
 impl_serde_replace!(ScrollingHistory);
