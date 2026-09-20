@@ -13,6 +13,7 @@ use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Child, Command};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use std::{env, ptr};
 
 use libc::{F_GETFL, F_SETFL, O_NONBLOCK, TIOCSCTTY, c_int, fcntl};
@@ -303,6 +304,27 @@ pub fn from_fd(config: &Options, window_id: u64, master: OwnedFd, slave: OwnedFd
     }
 }
 
+/// Grace period for the PTY child to exit after SIGHUP before SIGKILL escalation.
+const GRACEFUL_REAP_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Grace period for the PTY child to be reaped after SIGKILL before giving up.
+const FORCEFUL_REAP_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Poll interval while waiting for the PTY child to exit.
+const REAP_POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+/// Poll `try_wait` until `timeout` elapses; returns true when the child was reaped.
+fn reap_child(child: &mut Child, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        match child.try_wait() {
+            Ok(Some(_)) | Err(_) => return true,
+            Ok(None) => std::thread::sleep(REAP_POLL_INTERVAL),
+        }
+    }
+    matches!(child.try_wait(), Ok(Some(_)) | Err(_))
+}
+
 impl Drop for Pty {
     fn drop(&mut self) {
         // Make sure the PTY is terminated properly.
@@ -313,7 +335,15 @@ impl Drop for Pty {
         // Clear signal-hook handler.
         unregister_signal(self.sig_id);
 
-        let _ = self.child.wait();
+        // Reap with a bound, then escalate to SIGKILL: on macOS the login-wrapped
+        // shell can wedge uninterruptibly in concurrent session teardown, and
+        // shutdown must never hang on a child that outlives SIGHUP. A child that
+        // even SIGKILL cannot reap is left for init; exit proceeds regardless.
+        if reap_child(&mut self.child, GRACEFUL_REAP_TIMEOUT) {
+            return;
+        }
+        let _ = self.child.kill();
+        reap_child(&mut self.child, FORCEFUL_REAP_TIMEOUT);
     }
 }
 
@@ -451,4 +481,70 @@ fn login_interpreter_runs_compatible_shells_themselves() {
     assert_eq!(login_interpreter("/bin/bash"), "/bin/bash");
     assert_eq!(login_interpreter("/usr/local/bin/fish"), "/bin/zsh");
     assert_eq!(login_interpreter("/bin/sh"), "/bin/zsh");
+}
+
+#[test]
+fn pty_drop_reaps_hup_ignoring_child_without_hanging() {
+    use std::io::Read;
+
+    use crate::terminal::tty::Shell;
+
+    // Arrange: a child that survives SIGHUP (`trap ''` persists across exec).
+    let options = Options {
+        shell: Some(Shell::new(
+            String::from("/bin/sh"),
+            vec![String::from("-c"), String::from("trap '' HUP; echo READY; exec sleep 30")],
+        )),
+        ..Default::default()
+    };
+    let size = WindowSize { num_lines: 24, num_cols: 80, cell_width: 8, cell_height: 16 };
+    let pty = new(&options, size, 0).expect("spawn HUP-ignoring shell");
+    let pid = pty.child().id();
+
+    // Wait for READY so the trap is installed before SIGHUP can race it.
+    let mut output = Vec::new();
+    let ready_deadline = Instant::now() + Duration::from_secs(5);
+    let mut reader = pty.file().try_clone().expect("clone pty master");
+    while !output.windows(b"READY".len()).any(|window| window == b"READY") {
+        assert!(Instant::now() < ready_deadline, "child never became ready");
+        let mut chunk = [0u8; 64];
+        match reader.read(&mut chunk) {
+            Ok(0) => panic!("child exited before becoming ready"),
+            Ok(n) => output.extend_from_slice(&chunk[..n]),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(20));
+            },
+            Err(error) => panic!("pty read failed: {error}"),
+        }
+    }
+
+    // Act: dropping the PTY must not block on the surviving child.
+    let start = Instant::now();
+    drop(pty);
+    let elapsed = start.elapsed();
+
+    // Assert: waited out the graceful timeout, then SIGKILL escalation reaped it —
+    // well before the 30s sleep. The lower bound proves the test really exercised
+    // the escalation path instead of winning a spawn race.
+    assert!(
+        elapsed >= Duration::from_millis(1500),
+        "child died before escalation could be tested: {elapsed:?}"
+    );
+    assert!(elapsed < Duration::from_secs(15), "pty drop hung: {elapsed:?}");
+    assert_process_gone(pid);
+}
+
+/// Poll `kill(pid, 0)` until the process is gone; fails after a bounded wait.
+#[cfg(test)]
+fn assert_process_gone(pid: u32) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        // SAFETY: signal 0 performs only existence/permission checks.
+        let gone = unsafe { libc::kill(pid as libc::pid_t, 0) } != 0;
+        if gone {
+            return;
+        }
+        assert!(Instant::now() < deadline, "child {pid} survived pty drop");
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
