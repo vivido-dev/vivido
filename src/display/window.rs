@@ -716,9 +716,11 @@ impl Window {
         }
     }
 
-    /// Whether the native window is currently minimized.
+    /// Whether the native resize currently being dispatched represents a minimized window.
+    #[cfg(windows)]
     pub(crate) fn is_minimized(&self) -> bool {
-        self.backend.winit().and_then(|window| window.is_minimized()).unwrap_or(false)
+        let Some(RawWindowHandle::Win32(handle)) = self.raw_window_handle() else { return false };
+        super::windows_live_move::is_minimized(handle.hwnd.get() as *mut std::ffi::c_void)
     }
 
     /// Set whether the windowing system may resize the window through user interaction.

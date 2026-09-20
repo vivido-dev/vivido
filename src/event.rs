@@ -3939,9 +3939,12 @@ impl Processor {
 
         if let WindowEvent::Resized(size) = &event {
             // Windows can report a nonzero thumbnail-sized client area while the window is
-            // minimized. Reject it while handling the native event, before batching can observe
-            // a later restored state and forward the stale size to ConPTY.
-            let minimized = cfg!(windows) && window_context.display.window.is_minimized();
+            // minimized. The native subclass records SIZE_MINIMIZED before winit synchronously
+            // dispatches this event; `IsIconic` is not yet reliable at this point.
+            #[cfg(windows)]
+            let minimized = window_context.display.window.is_minimized();
+            #[cfg(not(windows))]
+            let minimized = false;
             if !is_renderable_resize(*size, minimized) {
                 return;
             }
