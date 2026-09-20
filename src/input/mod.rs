@@ -487,6 +487,39 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
             return;
         }
 
+        let (raw_x, raw_y): (i32, i32) = position.into();
+        let x = raw_x.clamp(0, size_info.width() as i32 - 1) as usize;
+        let y = raw_y.clamp(0, size_info.height() as i32 - 1) as usize;
+
+        // The wider invisible interaction strip is host chrome. Keep pointer motion in it away
+        // from terminal selection, application mouse reporting, and producer overlays. An overlay
+        // which already owns a gesture keeps its capture until release.
+        let scrollbar_inside = !self.ctx.overlay_capturing()
+            && self.ctx.display().scrollbar.contains_point(
+                &size_info,
+                scrollbar_scale,
+                position.x as f32,
+                position.y as f32,
+            );
+        let scrollbar_hover_changed =
+            self.ctx.display().scrollbar.set_hover(Instant::now(), scrollbar_inside);
+        if scrollbar_hover_changed {
+            self.ctx.mark_dirty();
+            // The frame pump may be idle in quiescence; a bare dirty flag waits for a frame
+            // timer that is not scheduled, so request the redraw explicitly.
+            self.ctx.window().request_redraw();
+        }
+        if scrollbar_inside {
+            let mouse = self.ctx.mouse_mut();
+            mouse.x = x;
+            mouse.y = y;
+            mouse.inside_text_area = false;
+            mouse.hint_highlight_dirty = true;
+            mouse.block_hint_launcher = true;
+            self.ctx.window().set_mouse_cursor(CursorIcon::Default);
+            return;
+        }
+
         let overlay_modifiers = crate::vivid::hid::modifiers(self.ctx.modifiers().state());
         if (size_info.contains_point(position.x.max(0.) as usize, position.y.max(0.) as usize)
             || self.ctx.overlay_capturing())
@@ -497,36 +530,19 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
             return;
         }
 
-        let (x, y) = position.into();
         let old_pixel = (self.ctx.mouse().x, self.ctx.mouse().y);
 
         let lmb_pressed = self.ctx.mouse().left_button_state == ElementState::Pressed;
         let rmb_pressed = self.ctx.mouse().right_button_state == ElementState::Pressed;
         if !self.ctx.selection_is_empty() && (lmb_pressed || rmb_pressed) {
-            self.update_selection_scrolling(y);
+            self.update_selection_scrolling(raw_y);
         }
 
         let display_offset = self.ctx.terminal().grid().display_offset();
         let old_point = self.ctx.mouse().point(&size_info, display_offset);
 
-        let x = x.clamp(0, size_info.width() as i32 - 1) as usize;
-        let y = y.clamp(0, size_info.height() as i32 - 1) as usize;
         self.ctx.mouse_mut().x = x;
         self.ctx.mouse_mut().y = y;
-
-        // Hovering the gutter reveals the scrollbar. This runs on every move because the
-        // cell tracking below early-returns while the pointer stays inside one cell.
-        let scrollbar_hovered = {
-            let scrollbar = &mut self.ctx.display().scrollbar;
-            let inside = scrollbar.contains_point(&size_info, scrollbar_scale, x as f32, y as f32);
-            scrollbar.set_hover(Instant::now(), inside)
-        };
-        if scrollbar_hovered {
-            self.ctx.mark_dirty();
-            // The frame pump may be idle in quiescence; a bare dirty flag waits for a frame
-            // timer that is not scheduled, so request the redraw explicitly.
-            self.ctx.window().request_redraw();
-        }
 
         let inside_text_area = size_info.contains_point(x, y);
         let cell_side = self.cell_side(x);
@@ -1062,28 +1078,15 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
     }
 
     pub fn mouse_input(&mut self, state: ElementState, button: MouseButton) {
-        let overlay_modifiers = crate::vivid::hid::modifiers(self.ctx.modifiers().state());
-        if let Some(overlay_button) = crate::vivid::hid::button(button)
-            && (self.ctx.size_info().contains_point(self.ctx.mouse().x, self.ctx.mouse().y)
-                || self.ctx.overlay_capturing())
-            && self.ctx.overlay_pointer(
-                self.ctx.mouse().x as f64,
-                self.ctx.mouse().y as f64,
-                Some((overlay_button, state == ElementState::Pressed)),
-                overlay_modifiers,
-                None,
-            )
-        {
-            return;
-        }
-
-        // The scrollbar is host chrome: presses on its gutter drag the scrollback instead
-        // of selecting, reporting to the application, or hitting mouse bindings.
+        // The scrollbar is host chrome: presses on its invisible interaction strip drag the
+        // scrollback instead of selecting, reporting to the application, or hitting overlays and
+        // mouse bindings. An overlay which already captured a gesture keeps priority until release.
         if button == MouseButton::Left {
             let size_info = self.ctx.size_info();
             let scrollbar_scale = self.ctx.display().window.scale_factor as f32;
             let (mouse_x, mouse_y) = (self.ctx.mouse().x, self.ctx.mouse().y);
             let drag_starting = state == ElementState::Pressed
+                && !self.ctx.overlay_capturing()
                 && self.ctx.display().scrollbar.contains_point(
                     &size_info,
                     scrollbar_scale,
@@ -1109,6 +1112,21 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
                 self.ctx.window().request_redraw();
                 return;
             }
+        }
+
+        let overlay_modifiers = crate::vivid::hid::modifiers(self.ctx.modifiers().state());
+        if let Some(overlay_button) = crate::vivid::hid::button(button)
+            && (self.ctx.size_info().contains_point(self.ctx.mouse().x, self.ctx.mouse().y)
+                || self.ctx.overlay_capturing())
+            && self.ctx.overlay_pointer(
+                self.ctx.mouse().x as f64,
+                self.ctx.mouse().y as f64,
+                Some((overlay_button, state == ElementState::Pressed)),
+                overlay_modifiers,
+                None,
+            )
+        {
+            return;
         }
 
         match button {

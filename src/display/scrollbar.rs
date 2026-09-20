@@ -16,6 +16,11 @@ use crate::display::SizeInfo;
 
 /// Width of the scrollbar gutter, in logical pixels.
 pub const GUTTER_WIDTH: f32 = 8.;
+/// Width reserved inside the terminal's right edge for scrollbar interaction.
+///
+/// The hit surface extends through any right padding to the window edge, while the painted gutter
+/// remains [`GUTTER_WIDTH`] wide.
+const INTERACTION_WIDTH: f32 = 16.;
 /// Gap between the gutter edge and the thumb, in logical pixels.
 const TRACK_INSET: f32 = 1.;
 /// Shortest the thumb may get, in logical pixels.
@@ -45,11 +50,14 @@ pub struct ScrollbarModel {
 /// Scrollbar geometry in physical pixels.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct ScrollbarGeometry {
-    /// The gutter strip: the hover and drag hit area.
+    /// The narrow gutter which contains the painted thumb.
     pub x: f32,
     pub y: f32,
     pub width: f32,
     pub height: f32,
+    /// The wider, invisible hover and drag surface extending to the window's right edge.
+    pub interaction_x: f32,
+    pub interaction_width: f32,
     /// The thumb inside the gutter; `None` when there is nothing to scroll.
     pub thumb: Option<ThumbGeometry>,
 }
@@ -64,9 +72,12 @@ pub struct ThumbGeometry {
 }
 
 impl ScrollbarGeometry {
-    /// Whether a physical-pixel point lies over the gutter.
+    /// Whether a physical-pixel point lies over the invisible interaction surface.
     pub fn contains(&self, x: f32, y: f32) -> bool {
-        x >= self.x && x <= self.x + self.width && y >= self.y && y <= self.y + self.height
+        x >= self.interaction_x
+            && x <= self.interaction_x + self.interaction_width
+            && y >= self.y
+            && y <= self.y + self.height
     }
 }
 
@@ -148,11 +159,15 @@ impl ScrollbarState {
     /// Compute the scrollbar geometry in physical pixels.
     pub fn geometry(&self, size_info: &SizeInfo, scale_factor: f32) -> ScrollbarGeometry {
         let gutter = GUTTER_WIDTH * scale_factor;
+        let terminal_right = size_info.width() - size_info.padding_x();
+        let interaction_x = (terminal_right - INTERACTION_WIDTH * scale_factor).max(0.);
         ScrollbarGeometry {
-            x: size_info.width() - size_info.padding_x() - gutter,
+            x: terminal_right - gutter,
             y: size_info.padding_y(),
             width: gutter,
             height: size_info.cell_height() * self.model.screen_lines as f32,
+            interaction_x,
+            interaction_width: size_info.width() - interaction_x,
             thumb: self.thumb_geometry(size_info, scale_factor),
         }
     }
@@ -224,7 +239,7 @@ impl ScrollbarState {
         self.dragging
     }
 
-    /// Whether a physical-pixel point is over the scrollbar gutter.
+    /// Whether a physical-pixel point is over the scrollbar interaction surface.
     pub fn contains_point(&self, size_info: &SizeInfo, scale_factor: f32, x: f32, y: f32) -> bool {
         self.model.applicable && self.geometry(size_info, scale_factor).contains(x, y)
     }
@@ -441,6 +456,22 @@ mod tests {
 
         state.observe(Instant::now(), ScrollbarModel { applicable: false, ..model(100, 0) });
         assert!(!state.contains_point(&size, 1., geometry.x + 1., geometry.y + 10.));
+    }
+
+    #[test]
+    fn interaction_surface_is_wider_than_the_painted_gutter() {
+        let size = size_info();
+        let mut state = ScrollbarState::new();
+        state.observe(Instant::now(), model(100, 0));
+        let geometry = state.geometry(&size, 1.);
+
+        assert_eq!(geometry.width, GUTTER_WIDTH);
+        assert_eq!(geometry.interaction_x, 380.);
+        assert_eq!(geometry.interaction_width, 20.);
+        assert!(geometry.interaction_x < geometry.x);
+        assert!(geometry.contains(geometry.x - 1., geometry.y + 10.));
+        assert!(geometry.contains(size.width() - 1., geometry.y + 10.));
+        assert!(!geometry.contains(geometry.interaction_x - 1., geometry.y + 10.));
     }
 
     #[test]
