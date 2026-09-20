@@ -169,10 +169,12 @@ impl ScrollbarState {
         }
 
         // The thumb covers the share of the document the viewport shows, never shorter than
-        // the minimum and never taller than the track.
+        // the minimum when the track can hold it, and never taller than the track. Windows can
+        // briefly report a one-row surface while restoring a minimized window.
         let total = (model.history + model.screen_lines) as f32;
         let proportional = model.screen_lines as f32 / total * track_height;
-        let height = proportional.clamp(MIN_THUMB_HEIGHT * scale_factor, track_height);
+        let minimum = (MIN_THUMB_HEIGHT * scale_factor).min(track_height);
+        let height = proportional.clamp(minimum, track_height);
 
         // display_offset counts up from the bottom, so the thumb rides it inverted.
         let scrollable = track_height - height;
@@ -342,6 +344,22 @@ mod tests {
         let mut state = ScrollbarState::new();
         state.observe(Instant::now(), model(1, 0));
         assert!(thumb(&state).height <= 600.);
+    }
+
+    #[test]
+    fn thumb_shrinks_to_fit_restore_sized_track() {
+        let size = SizeInfo::new(400., 24., 10., 24., 0., 0., false);
+        let mut state = ScrollbarState::new();
+        state.observe(
+            Instant::now(),
+            ScrollbarModel { applicable: true, display_offset: 0, history: 100, screen_lines: 1 },
+        );
+
+        let thumb = state
+            .geometry(&size, 1.25)
+            .thumb
+            .expect("a one-row track with history still has a thumb");
+        assert!((thumb.height - 24.).abs() < 1e-4);
     }
 
     #[test]
