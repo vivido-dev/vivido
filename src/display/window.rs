@@ -716,6 +716,11 @@ impl Window {
         }
     }
 
+    /// Whether the native window is currently minimized.
+    pub(crate) fn is_minimized(&self) -> bool {
+        self.backend.winit().and_then(|window| window.is_minimized()).unwrap_or(false)
+    }
+
     /// Set whether the windowing system may resize the window through user interaction.
     ///
     /// Programmatic resizing keeps working either way; this only removes the system-owned

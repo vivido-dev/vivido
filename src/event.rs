@@ -3937,6 +3937,16 @@ impl Processor {
             None => return,
         };
 
+        if let WindowEvent::Resized(size) = &event {
+            // Windows can report a nonzero thumbnail-sized client area while the window is
+            // minimized. Reject it while handling the native event, before batching can observe
+            // a later restored state and forward the stale size to ConPTY.
+            let minimized = cfg!(windows) && window_context.display.window.is_minimized();
+            if !is_renderable_resize(*size, minimized) {
+                return;
+            }
+        }
+
         let is_redraw = matches!(event, WindowEvent::RedrawRequested);
         #[cfg(windows)]
         let is_latency_sensitive = is_latency_sensitive_window_event(&event);
@@ -6203,13 +6213,6 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                         display_update_pending.set_font(font.with_size(self.ctx.display.font_size));
                     },
                     WindowEvent::Resized(size) => {
-                        // Ignore resize events to zero in any dimension, to avoid issues with Winit
-                        // and the ConPTY. A 0x0 resize will also occur when the window is minimized
-                        // on Windows.
-                        if !is_renderable_resize(size) {
-                            return;
-                        }
-
                         self.ctx.display.pending_update.set_dimensions(size);
                     },
                     WindowEvent::KeyboardInput { event, is_synthetic: false, .. } => {
@@ -6415,8 +6418,8 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
     }
 }
 
-fn is_renderable_resize(size: PhysicalSize<u32>) -> bool {
-    size.width != 0 && size.height != 0
+fn is_renderable_resize(size: PhysicalSize<u32>, minimized: bool) -> bool {
+    !minimized && size.width != 0 && size.height != 0
 }
 
 #[derive(Debug, Clone)]
@@ -6850,10 +6853,16 @@ mod window_resize_tests {
 
     #[test]
     fn monitor_move_resize_sequence_accepts_physical_size_and_ignores_zero_axes() {
-        assert!(is_renderable_resize(PhysicalSize::new(2560, 1600)));
-        assert!(!is_renderable_resize(PhysicalSize::new(0, 1600)));
-        assert!(!is_renderable_resize(PhysicalSize::new(2560, 0)));
-        assert!(!is_renderable_resize(PhysicalSize::new(0, 0)));
+        assert!(is_renderable_resize(PhysicalSize::new(2560, 1600), false));
+        assert!(!is_renderable_resize(PhysicalSize::new(0, 1600), false));
+        assert!(!is_renderable_resize(PhysicalSize::new(2560, 0), false));
+        assert!(!is_renderable_resize(PhysicalSize::new(0, 0), false));
+    }
+
+    #[test]
+    fn minimized_windows_ignore_nonzero_thumbnail_resizes() {
+        assert!(!is_renderable_resize(PhysicalSize::new(160, 24), true));
+        assert!(is_renderable_resize(PhysicalSize::new(160, 24), false));
     }
 }
 
