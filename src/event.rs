@@ -264,6 +264,22 @@ const EPHEMERAL_LINGER: Duration = Duration::from_secs(30);
 #[cfg(any(unix, windows))]
 const EPHEMERAL_LAUNCHER_POLL: Duration = Duration::from_secs(1);
 
+/// Largest `wait` timeout a client may ask for, in milliseconds (24 hours).
+#[cfg(any(unix, windows))]
+const MAX_IPC_WAIT_TIMEOUT_MS: u64 = 86_400_000;
+
+/// How many exited windows `wait exit` remembers for waits that arrive after teardown.
+#[cfg(any(unix, windows))]
+const MAX_EXIT_RECORDS: usize = 16;
+
+/// How long an exited window satisfies a late `wait exit`.
+///
+/// The race being covered lasts milliseconds — a client round trip between the exit and
+/// the wait — so a minute is generous without letting a stale exit answer for a window
+/// the caller started waiting on much later.
+#[cfg(any(unix, windows))]
+const EXIT_RECORD_TTL: Duration = Duration::from_secs(60);
+
 /// Pure `--ephemeral` teardown decision, so the trigger matrix stays unit-testable.
 #[cfg(any(unix, windows))]
 fn ephemeral_exit_due(now: Instant, quiescent_since: Option<Instant>, launcher_dead: bool) -> bool {
@@ -351,6 +367,20 @@ fn launcher_is_alive(pid: u32) -> bool {
     }
 }
 
+/// The exit a window took with it when teardown removed it.
+///
+/// Unix delivers PTY EOF within milliseconds of the child reaping, so a `wait exit`
+/// issued from a separate client connection routinely arrives after its window is
+/// already gone. Recording the exit lets that wait report the truth instead of
+/// `window_not_found`.
+#[cfg(any(unix, windows))]
+#[derive(Copy, Clone, Debug)]
+struct WindowExitRecord {
+    window_id: u64,
+    status: std::process::ExitStatus,
+    exited_at: Instant,
+}
+
 /// The event processor.
 ///
 /// Stores some state from received events and dispatches actions when they are
@@ -377,6 +407,13 @@ pub struct Processor {
     /// One scheduled pointer gesture per target window.
     #[cfg(any(unix, windows))]
     paced_gestures: HashMap<WindowId, PacedGesture, RandomState>,
+    /// Recently exited windows and how they exited, oldest first.
+    ///
+    /// A `wait exit` that arrives after its window is already gone answers from here
+    /// instead of failing resolution. Bounded by [`MAX_EXIT_RECORDS`] and
+    /// [`EXIT_RECORD_TTL`]; a live window always wins over a record.
+    #[cfg(any(unix, windows))]
+    exit_records: VecDeque<WindowExitRecord>,
     /// Live IPC connection IDs, tracked so an `--ephemeral` session can tear itself down
     /// once its last client is gone.
     #[cfg(any(unix, windows))]
@@ -490,6 +527,8 @@ impl Processor {
             #[cfg(any(unix, windows))]
             paced_gestures: Default::default(),
             #[cfg(any(unix, windows))]
+            exit_records: VecDeque::new(),
+            #[cfg(any(unix, windows))]
             ipc_connections: Default::default(),
             #[cfg(any(unix, windows))]
             ephemeral_client_seen: false,
@@ -531,6 +570,8 @@ impl Processor {
         #[cfg(not(any(unix, windows)))]
         let ipc_window_id = u64::from(platform_id);
         self.windows.insert(platform_id, window_context);
+        #[cfg(any(unix, windows))]
+        self.invalidate_exit_record(ipc_window_id);
 
         #[cfg(any(unix, windows))]
         self.automation.emit(
@@ -601,6 +642,8 @@ impl Processor {
         #[cfg(not(any(unix, windows)))]
         let ipc_window_id = u64::from(platform_id);
         self.windows.insert(platform_id, window_context);
+        #[cfg(any(unix, windows))]
+        self.invalidate_exit_record(ipc_window_id);
         #[cfg(any(unix, windows))]
         self.automation.emit(
             Some(ipc_window_id),
@@ -2383,12 +2426,7 @@ impl Processor {
                         return;
                     },
                 };
-                self.register_wait(
-                    params.target.window_id,
-                    params.timeout,
-                    WaitKind::Exit,
-                    &request,
-                );
+                self.register_exit_wait(params.target.window_id, params.timeout, &request);
                 return;
             },
             "wait_prompt" => {
@@ -2859,7 +2897,7 @@ impl Processor {
         kind: WaitKind,
         request: &IpcRequest,
     ) {
-        if !(1..=86_400_000).contains(&timeout_ms) {
+        if !(1..=MAX_IPC_WAIT_TIMEOUT_MS).contains(&timeout_ms) {
             request.connection.error(
                 request.id,
                 IpcError::new("invalid_params", "timeout must be 1 ms through 24 hours"),
@@ -2874,6 +2912,91 @@ impl Processor {
         });
         self.evaluate_waiters(target);
         self.schedule_automation_timer(target);
+    }
+
+    /// Register an exit wait, completing immediately when the window already exited.
+    ///
+    /// A child that exits just before `wait exit` arrives leaves no window behind to
+    /// wait on: Unix delivers PTY EOF within milliseconds of the reaping, so teardown
+    /// usually wins the race against a wait issued from a separate client connection.
+    /// Answering from the recorded exit keeps that wait truthful. A window that never
+    /// ran still fails resolution, and an ambiguous unqualified wait still must name
+    /// its window.
+    #[cfg(any(unix, windows))]
+    fn register_exit_wait(
+        &mut self,
+        requested: Option<u64>,
+        timeout_ms: u64,
+        request: &IpcRequest,
+    ) {
+        if !(1..=MAX_IPC_WAIT_TIMEOUT_MS).contains(&timeout_ms) {
+            request.connection.error(
+                request.id,
+                IpcError::new("invalid_params", "timeout must be 1 ms through 24 hours"),
+            );
+            return;
+        }
+        if self.resolve_ipc_target(requested).is_err() {
+            self.prune_exit_records();
+            let exited = match requested {
+                Some(window_id) => {
+                    self.exit_records.iter().find(|record| record.window_id == window_id)
+                },
+                // Without a named window there is nothing left to wait on only when no
+                // window remains at all: resolution already failed, so any live window
+                // means the request was ambiguous rather than already satisfied.
+                None if self.windows.is_empty() => self.exit_records.back(),
+                None => None,
+            };
+            if let Some(record) = exited {
+                request.connection.reply(request.id, exit_wait_reply(record.status));
+                return;
+            }
+        }
+        self.register_wait(requested, timeout_ms, WaitKind::Exit, request);
+    }
+
+    /// Remember a window's exit for `wait exit` calls that arrive after teardown.
+    ///
+    /// Only exits with a known status are recorded: a window removed before its child
+    /// reported (a forced close racing the reaper) keeps the previous
+    /// `window_not_found` rather than answering with a status that was never observed.
+    #[cfg(any(unix, windows))]
+    fn record_window_exit(&mut self, window_id: u64, status: std::process::ExitStatus) {
+        self.prune_exit_records();
+        // A reclaimed numeric ID starts a new generation: the fresh exit supersedes any
+        // record the previous generation left behind.
+        self.exit_records.retain(|record| record.window_id != window_id);
+        self.exit_records.push_back(WindowExitRecord {
+            window_id,
+            status,
+            exited_at: Instant::now(),
+        });
+        while self.exit_records.len() > MAX_EXIT_RECORDS {
+            self.exit_records.pop_front();
+        }
+    }
+
+    /// Drop exit records older than [`EXIT_RECORD_TTL`].
+    #[cfg(any(unix, windows))]
+    fn prune_exit_records(&mut self) {
+        let now = Instant::now();
+        while self
+            .exit_records
+            .front()
+            .is_some_and(|record| now.duration_since(record.exited_at) > EXIT_RECORD_TTL)
+        {
+            self.exit_records.pop_front();
+        }
+    }
+
+    /// Forget a previous generation's exit when its numeric ID is claimed again.
+    ///
+    /// A late `wait exit` must answer for the window that just exited, never for an
+    /// earlier window that happened to carry the same claimed ID.
+    #[cfg(any(unix, windows))]
+    fn invalidate_exit_record(&mut self, window_id: u64) {
+        self.exit_records.retain(|record| record.window_id != window_id);
     }
 
     #[cfg(any(unix, windows))]
@@ -3215,14 +3338,7 @@ impl Processor {
                         .is_some_and(|events| !events.is_empty())
                         .then_some(Ok(batch))
                 },
-                WaitKind::Exit => exit_status.map(|status| {
-                    Ok(serde_json::json!({
-                        "exited": true,
-                        "code": status.code(),
-                        "signal": exit_signal(&status),
-                        "core_dumped": exit_core_dumped(&status),
-                    }))
-                }),
+                WaitKind::Exit => exit_status.map(|status| Ok(exit_wait_reply(status))),
                 WaitKind::Resize {
                     columns,
                     rows,
@@ -3337,6 +3453,17 @@ impl Processor {
             }
         }
     }
+}
+
+/// The `wait exit` success payload for a known exit status.
+#[cfg(any(unix, windows))]
+fn exit_wait_reply(status: std::process::ExitStatus) -> serde_json::Value {
+    serde_json::json!({
+        "exited": true,
+        "code": status.code(),
+        "signal": exit_signal(&status),
+        "core_dumped": exit_core_dumped(&status),
+    })
 }
 
 #[cfg(any(unix, windows))]
@@ -4519,6 +4646,9 @@ impl Processor {
                 #[cfg(any(unix, windows))]
                 {
                     let ipc_window_id = window_context.ipc_window_id();
+                    if let Some(status) = window_context.automation.exit_status {
+                        self.record_window_exit(ipc_window_id, status);
+                    }
                     window_context.fail_automation_requests("pty_closed", "terminal window closed");
                     self.automation.emit(
                         Some(ipc_window_id),
@@ -6985,5 +7115,123 @@ mod ephemeral_tests {
     fn launcher_probes_observe_the_current_process() {
         assert_ne!(launcher_parent_pid(), 0, "every test process has a parent");
         assert!(launcher_is_alive(std::process::id()), "the test process is alive");
+    }
+}
+
+#[cfg(all(test, any(unix, windows)))]
+mod exit_wait_tests {
+    use serde_json::json;
+
+    use super::*;
+    use crate::polling::ipc::{ResponseEnvelope, test_connection};
+
+    fn headless_processor() -> Processor {
+        let (proxy, _receiver) = EventSink::headless();
+        Processor::new_headless(UiConfig::default(), CliOptions::default(), proxy)
+    }
+
+    fn loop_handle() -> LoopHandle<'static> {
+        LoopHandle::Embedded { size: PhysicalSize::new(80, 24), scale_factor: 1.0 }
+    }
+
+    fn wait_exit(
+        connection: &crate::polling::ipc::IpcConnection,
+        id: u64,
+        window_id: Option<u64>,
+    ) -> IpcRequest {
+        let target =
+            window_id.map_or_else(|| json!({}), |window_id| json!({ "window_id": window_id }));
+        IpcRequest {
+            connection: connection.clone(),
+            id,
+            method: String::from("wait_exit"),
+            params: json!({ "timeout": 5_000, "target": target }),
+        }
+    }
+
+    fn exit_status(code: i32) -> std::process::ExitStatus {
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            std::process::ExitStatus::from_raw(code << 8)
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::ExitStatusExt;
+            std::process::ExitStatus::from_raw(code as u32)
+        }
+    }
+
+    fn reply(frames: &mpsc::Receiver<crate::polling::ipc::OutputFrame>) -> ResponseEnvelope {
+        let frame = frames.recv().expect("wait_exit must answer immediately");
+        serde_json::from_slice(frame.bytes()).expect("the reply is a response envelope")
+    }
+
+    /// A `wait exit` that arrives after its window is already gone reports the exit.
+    #[test]
+    fn wait_exit_answers_from_the_record_after_its_window_is_gone() {
+        let mut processor = headless_processor();
+        processor.record_window_exit(1, exit_status(3));
+        let (connection, frames) = test_connection();
+
+        processor.handle_ipc_request(loop_handle(), wait_exit(&connection, 1, Some(1)));
+        let named = reply(&frames);
+        assert!(named.ok, "a recorded exit must succeed: {named:?}");
+        let result = named.result.expect("success carries a result");
+        assert_eq!(result["exited"], json!(true));
+        assert_eq!(result["code"], json!(3));
+
+        // An unqualified wait with no window left answers from the latest exit too.
+        processor.handle_ipc_request(loop_handle(), wait_exit(&connection, 2, None));
+        let unqualified = reply(&frames);
+        assert!(unqualified.ok, "an unqualified late wait must succeed: {unqualified:?}");
+        let result = unqualified.result.expect("success carries a result");
+        assert_eq!(result["code"], json!(3));
+    }
+
+    /// A window that never ran is still refused, never mistaken for an exit.
+    #[test]
+    fn wait_exit_still_refuses_windows_that_never_ran() {
+        let mut processor = headless_processor();
+        processor.record_window_exit(1, exit_status(0));
+        let (connection, frames) = test_connection();
+
+        processor.handle_ipc_request(loop_handle(), wait_exit(&connection, 1, Some(424_242)));
+        let refused = reply(&frames);
+        assert!(!refused.ok, "an unknown window must not read as exited");
+        assert_eq!(refused.error.expect("failure carries an error").code, "window_not_found");
+    }
+
+    /// Reclaiming a numeric ID drops the previous generation's exit.
+    #[test]
+    fn a_reclaimed_window_id_drops_the_previous_generations_exit() {
+        let mut processor = headless_processor();
+        processor.record_window_exit(5, exit_status(0));
+        processor.invalidate_exit_record(5);
+        let (connection, frames) = test_connection();
+
+        processor.handle_ipc_request(loop_handle(), wait_exit(&connection, 1, Some(5)));
+        let refused = reply(&frames);
+        assert!(!refused.ok, "a superseded exit must not answer");
+        assert_eq!(refused.error.expect("failure carries an error").code, "window_not_found");
+    }
+
+    /// Exit records are bounded: the oldest falls off the end.
+    #[test]
+    fn exit_records_keep_only_the_most_recent_windows() {
+        let mut processor = headless_processor();
+        for id in 0..=MAX_EXIT_RECORDS as u64 {
+            processor.record_window_exit(id, exit_status(0));
+        }
+        let (connection, frames) = test_connection();
+
+        processor.handle_ipc_request(loop_handle(), wait_exit(&connection, 1, Some(0)));
+        assert!(!reply(&frames).ok, "the oldest record must have been evicted");
+
+        processor.handle_ipc_request(
+            loop_handle(),
+            wait_exit(&connection, 2, Some(MAX_EXIT_RECORDS as u64)),
+        );
+        assert!(reply(&frames).ok, "the newest record must still answer");
     }
 }

@@ -803,6 +803,50 @@ fn tearing_down_one_session_leaves_the_other_untouched() {
     assert!(!listed.contains("iso-one"), "the dead session was not reaped: {listed:?}");
 }
 
+/// A program that exits at once, so teardown wins the race against any later wait.
+#[cfg(unix)]
+fn exit_program() -> Vec<String> {
+    ["sh", "-c", "exit 3"].into_iter().map(String::from).collect()
+}
+
+#[cfg(windows)]
+fn exit_program() -> Vec<String> {
+    ["powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "exit 3"]
+        .into_iter()
+        .map(String::from)
+        .collect()
+}
+
+/// `wait exit` reports the exit even when the window is already gone.
+#[test]
+#[ignore = "spawns processes and needs a wgpu adapter"]
+fn wait_exit_succeeds_when_the_window_already_exited() {
+    let session = Session::start("gone", &exit_program());
+
+    // The child exits immediately; wait until teardown has removed its window so the
+    // waits below deterministically arrive after the removal.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let windows = session.msg(&["list-windows"]);
+        if !windows.contains(r#""window_id""#) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "exited window never left: {windows}");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    let named = session.msg(&["wait", "exit", "--timeout", "10s", "--window-id", "1"]);
+    assert!(named.contains(r#""exited":true"#), "named late wait: {named}");
+    assert!(named.contains(r#""code":3"#), "the recorded exit code: {named}");
+
+    let unqualified = session.msg(&["wait", "exit", "--timeout", "10s"]);
+    assert!(unqualified.contains(r#""exited":true"#), "unqualified late wait: {unqualified}");
+
+    // A window that never ran is still refused, never mistaken for an exit.
+    let missing = session.try_msg(&["wait", "exit", "--timeout", "2s", "--window-id", "424242"]);
+    assert!(!missing.status.success(), "an unknown window must not read as exited");
+}
+
 /// A session name must never escape the runtime directory.
 #[test]
 fn session_names_that_escape_the_runtime_directory_are_refused() {

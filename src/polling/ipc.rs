@@ -532,6 +532,14 @@ pub(crate) struct OutputFrame {
     _event_slot: Option<EventQueueSlot>,
 }
 
+impl OutputFrame {
+    /// The serialized frame, so tests in other modules can assert on replies.
+    #[cfg(test)]
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
 struct EventQueueSlot(Arc<AtomicUsize>);
 
 impl EventQueueSlot {
