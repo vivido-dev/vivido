@@ -2,7 +2,9 @@
 
 use semver::Version;
 
-/// Result of the download confirmation dialog.
+/// Result of the download confirmation dialog. Linux always answers `Cancel` because the suite
+/// does not ship a Linux installer, so the other variants are only constructed off Linux.
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DownloadChoice {
     Download,

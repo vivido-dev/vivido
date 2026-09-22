@@ -37,6 +37,7 @@ desktop\:"\`desktop-surface-v1\`\: a virtual desktop in logical pixels, with no 
 '(--daemon)--ref-test[Generates ref test]' \
 '--headless[Run with no window and no compositor, serving IPC in the background]' \
 '--foreground[Keep a headless instance attached to this terminal instead of detaching]' \
+'--ephemeral[Tear the headless session down when its launcher is gone or its last IPC client disconnects, so background test runs never leak sessions. Requires \`--headless\`]' \
 '(-v)*-q[Reduces the level of verbosity (the min level is -qq)]' \
 '(-q)*-v[Increases the level of verbosity (the max level is -vvv)]' \
 '--daemon[Do not spawn an initial window]' \
@@ -59,8 +60,8 @@ desktop\:"\`desktop-surface-v1\`\: a virtual desktop in logical pixels, with no 
 _arguments "${_arguments_options[@]}" : \
 '-s+[IPC endpoint override (a filesystem path on Unix, a named-pipe path on Windows)]:SOCKET:_files' \
 '--socket=[IPC endpoint override (a filesystem path on Unix, a named-pipe path on Windows)]:SOCKET:_files' \
-'(-s --socket)-t+[Name of the headless session to talk to \[default\: \$VIVIDO_SESSION, else the only session\]]:NAME:_default' \
-'(-s --socket)--target=[Name of the headless session to talk to \[default\: \$VIVIDO_SESSION, else the only session\]]:NAME:_default' \
+'(-s --socket)-t+[Name of the session to talk to \[default\: \$VIVIDO_SESSION or \$VIVIDA_TARGET, else the only session\]]:NAME:_default' \
+'(-s --socket)--target=[Name of the session to talk to \[default\: \$VIVIDO_SESSION or \$VIVIDA_TARGET, else the only session\]]:NAME:_default' \
 '-h[Print help]' \
 '--help[Print help]' \
 ":: :_vivido__subcmd__msg_commands" \
@@ -91,6 +92,16 @@ desktop\:"\`desktop-surface-v1\`\: a virtual desktop in logical pixels, with no 
 '--hold[Remain open after child process exit]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(close-window)
+_arguments "${_arguments_options[@]}" : \
+'-w+[Window ID. The focused window is used when this is omitted]:WINDOW_ID:_default' \
+'--window-id=[Window ID. The focused window is used when this is omitted]:WINDOW_ID:_default' \
+'-f[Kill the child process group first, for children that ignore hangup]' \
+'--force[Kill the child process group first, for children that ignore hangup]' \
+'-h[Print help]' \
+'--help[Print help]' \
 && ret=0
 ;;
 (quit)
@@ -159,6 +170,27 @@ _arguments "${_arguments_options[@]}" : \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
 ;;
+(find-text)
+_arguments "${_arguments_options[@]}" : \
+'--pattern=[Literal text (or regular expression with \`--regex\`) to locate on the visible viewport]:PATTERN:_default' \
+'-w+[Window ID to search. Every window is searched when omitted]:WINDOW_ID:_default' \
+'--window-id=[Window ID to search. Every window is searched when omitted]:WINDOW_ID:_default' \
+'--max-matches=[Maximum matches returned per window, 1 through 100]:MAX_MATCHES:_default' \
+'--regex[Treat the pattern as a regular expression instead of literal text]' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(exec)
+_arguments "${_arguments_options[@]}" : \
+'--command=[Shell command to run in the target window'\''s working directory]:COMMAND:_default' \
+'-w+[Window whose working directory scopes the command]:WINDOW_ID:_default' \
+'--window-id=[Window whose working directory scopes the command]:WINDOW_ID:_default' \
+'--timeout=[Maximum wait for completion]:TIMEOUT:_default' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
 (screenshot)
 _arguments "${_arguments_options[@]}" : \
 '-w+[Window ID for the screenshot]:WINDOW_ID:_default' \
@@ -177,10 +209,16 @@ _arguments "${_arguments_options[@]}" : \
 (run-plan)
 _arguments "${_arguments_options[@]}" : \
 '--file=[JSON plan file. Omit this option or pass \`-\` to read standard input]:PATH:_files' \
+'--report=[Report format. JUnit and SARIF always write \`--output\` and keep the NDJSON events on stdout]:REPORT:((ndjson\:"NDJSON step events on stdout (the historical output)"
+junit\:"JUnit XML suite written to \`--output\`, in addition to the NDJSON events"
+sarif\:"SARIF 2.1.0 log written to \`--output\`, in addition to the NDJSON events"))' \
+'--output=[Destination file for \`--report junit\` or \`--report sarif\`]:PATH:_files' \
+'*--set=[Set a plan variable, overriding the plan'\''s \`vars\`. Repeatable as \`--set KEY=VALUE\`]:KEY=VALUE:_default' \
+'--on-failure-dump=[Write a diagnostic bundle per failed step (frame.png, grid.json, transcript.bin, presenter_trace.json, metadata.json). Secrets are masked in text artifacts; pixel data in frame.png is not]:DIR:_files -/' \
 '(--preflight)--dry-run[Validate the plan and advertised methods without executing any step]' \
 '(--dry-run)--preflight[Execute observation steps only and report mutating steps as skipped]' \
-'-h[Print help]' \
-'--help[Print help]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
 ;;
 (capture)
@@ -702,6 +740,8 @@ _arguments "${_arguments_options[@]}" : \
             (text)
 _arguments "${_arguments_options[@]}" : \
 '--after-screen=[]:AFTER_SCREEN:_default' \
+'(--rect)--line=[Restrict matching to one viewport row\: 0 is the top row, -1 the bottom row]:LINE:_default' \
+'(--line)--rect=[Restrict matching to a viewport rectangle as COL,ROW,WIDTH,HEIGHT]:COL,ROW,WIDTH,HEIGHT:_default' \
 '--timeout=[Maximum wait (for example 500ms, 30s, 2m, or 1h)]:TIMEOUT:_default' \
 '-w+[Window ID. The focused window is used when this is omitted]:WINDOW_ID:_default' \
 '--window-id=[Window ID. The focused window is used when this is omitted]:WINDOW_ID:_default' \
@@ -780,6 +820,24 @@ _arguments "${_arguments_options[@]}" : \
 '--help[Print help]' \
 && ret=0
 ;;
+(prompt)
+_arguments "${_arguments_options[@]}" : \
+'--timeout=[Maximum wait (for example 500ms, 30s, 2m, or 1h)]:TIMEOUT:_default' \
+'-w+[Window ID. The focused window is used when this is omitted]:WINDOW_ID:_default' \
+'--window-id=[Window ID. The focused window is used when this is omitted]:WINDOW_ID:_default' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(command-finish)
+_arguments "${_arguments_options[@]}" : \
+'--timeout=[Maximum wait (for example 500ms, 30s, 2m, or 1h)]:TIMEOUT:_default' \
+'-w+[Window ID. The focused window is used when this is omitted]:WINDOW_ID:_default' \
+'--window-id=[Window ID. The focused window is used when this is omitted]:WINDOW_ID:_default' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
 (help)
 _arguments "${_arguments_options[@]}" : \
 ":: :_vivido__subcmd__msg__subcmd__wait__subcmd__help_commands" \
@@ -817,6 +875,14 @@ _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
 (exit)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(prompt)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(command-finish)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
@@ -870,6 +936,10 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
+(close-window)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
 (quit)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
@@ -899,6 +969,14 @@ _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
 (get-text)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(find-text)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(exec)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
@@ -1102,6 +1180,14 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
+(prompt)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(command-finish)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
         esac
     ;;
 esac
@@ -1164,6 +1250,24 @@ _arguments "${_arguments_options[@]}" : \
 '--help[Print help]' \
 && ret=0
 ;;
+(test)
+_arguments "${_arguments_options[@]}" : \
+'--file=[JSON plan file, using the \`run-plan\` schema. Omit this option or pass \`-\` for stdin]:PATH:_files' \
+'--session=[Session name. Must not already exist; defaults to \`vivido-test-<pid>\`]:NAME:_default' \
+'--headless-size=[Size of the session window, as COLUMNSxLINES or WIDTHxHEIGHTpx]:SIZE:_default' \
+'--report=[Report format, as in \`run-plan\`. JUnit and SARIF always write \`--output\` too]:REPORT:((ndjson\:"NDJSON step events on stdout (the historical output)"
+junit\:"JUnit XML suite written to \`--output\`, in addition to the NDJSON events"
+sarif\:"SARIF 2.1.0 log written to \`--output\`, in addition to the NDJSON events"))' \
+'--output=[Destination file for \`--report junit\` or \`--report sarif\`]:PATH:_files' \
+'--artifacts-dir=[Directory for failure captures (\`<step>.grid.txt\`, \`<step>.screenshot.json\`)]:DIR:_files -/' \
+'*--set=[Set a plan variable, overriding the plan'\''s \`vars\`. Repeatable as \`--set KEY=VALUE\`]:KEY=VALUE:_default' \
+'--on-failure-dump=[Write a diagnostic bundle per failed step (frame.png, grid.json, transcript.bin, presenter_trace.json, metadata.json). Secrets are masked in text artifacts; pixel data in frame.png is not]:DIR:_files -/' \
+'--keep-failed[Keep a failed session running and print how to reattach to it]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+'*::shell -- Shell program for the session'\''s initial window; the headless default when omitted:_default' \
+&& ret=0
+;;
 (help)
 _arguments "${_arguments_options[@]}" : \
 ":: :_vivido__subcmd__help_commands" \
@@ -1189,6 +1293,10 @@ _arguments "${_arguments_options[@]}" : \
         curcontext="${curcontext%:*:*}:vivido-help-msg-command-$line[1]:"
         case $line[1] in
             (create-window)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(close-window)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
@@ -1221,6 +1329,14 @@ _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
 (get-text)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(find-text)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(exec)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
@@ -1424,6 +1540,14 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
+(prompt)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(command-finish)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
         esac
     ;;
 esac
@@ -1456,6 +1580,10 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
+(test)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
 (help)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
@@ -1477,6 +1605,7 @@ _vivido_commands() {
 'doctor:Check discovery, IPC, rendering, and presenter health' \
 'debug-bundle:Write a bounded, versioned diagnostic ZIP bundle' \
 'kill-session:Shut down a headless session' \
+'test:Run an automation plan inside an ephemeral headless session, then tear it down' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'vivido commands' commands "$@"
@@ -1499,6 +1628,7 @@ _vivido__subcmd__help_commands() {
 'doctor:Check discovery, IPC, rendering, and presenter health' \
 'debug-bundle:Write a bounded, versioned diagnostic ZIP bundle' \
 'kill-session:Shut down a headless session' \
+'test:Run an automation plan inside an ephemeral headless session, then tear it down' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'vivido help commands' commands "$@"
@@ -1532,6 +1662,7 @@ _vivido__subcmd__help__subcmd__list_commands() {
 _vivido__subcmd__help__subcmd__msg_commands() {
     local commands; commands=(
 'create-window:Create a new window in the same Vivido process' \
+'close-window:Close one window, terminating its terminal without stopping the instance' \
 'quit:Shut down the Vivido instance, closing every window' \
 'ping:Check IPC liveness' \
 'reset-terminal:Reset parser and client-controlled terminal state for one window' \
@@ -1540,6 +1671,8 @@ _vivido__subcmd__help__subcmd__msg_commands() {
 'get-config:Read runtime Vivido configuration' \
 'typing:Type literal text into a terminal' \
 'get-text:Read terminal text' \
+'find-text:Find pattern matches with cell and pixel rectangles' \
+'exec:Run one shell command in a window'\''s working directory and report its result' \
 'screenshot:Capture the last displayed terminal frame' \
 'capabilities:Print supported automation methods, events, and limits' \
 'run-plan:Execute a bounded JSON automation plan over one IPC connection' \
@@ -1575,6 +1708,11 @@ _vivido__subcmd__help__subcmd__msg__subcmd__capture_commands() {
     local commands; commands=()
     _describe -t commands 'vivido help msg capture commands' commands "$@"
 }
+(( $+functions[_vivido__subcmd__help__subcmd__msg__subcmd__close-window_commands] )) ||
+_vivido__subcmd__help__subcmd__msg__subcmd__close-window_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido help msg close-window commands' commands "$@"
+}
 (( $+functions[_vivido__subcmd__help__subcmd__msg__subcmd__config_commands] )) ||
 _vivido__subcmd__help__subcmd__msg__subcmd__config_commands() {
     local commands; commands=()
@@ -1594,6 +1732,16 @@ _vivido__subcmd__help__subcmd__msg__subcmd__diagnose_commands() {
 _vivido__subcmd__help__subcmd__msg__subcmd__drop-file_commands() {
     local commands; commands=()
     _describe -t commands 'vivido help msg drop-file commands' commands "$@"
+}
+(( $+functions[_vivido__subcmd__help__subcmd__msg__subcmd__exec_commands] )) ||
+_vivido__subcmd__help__subcmd__msg__subcmd__exec_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido help msg exec commands' commands "$@"
+}
+(( $+functions[_vivido__subcmd__help__subcmd__msg__subcmd__find-text_commands] )) ||
+_vivido__subcmd__help__subcmd__msg__subcmd__find-text_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido help msg find-text commands' commands "$@"
 }
 (( $+functions[_vivido__subcmd__help__subcmd__msg__subcmd__focus_commands] )) ||
 _vivido__subcmd__help__subcmd__msg__subcmd__focus_commands() {
@@ -1817,8 +1965,15 @@ _vivido__subcmd__help__subcmd__msg__subcmd__wait_commands() {
 'frame:Frame wait parameters' \
 'vivid-track:Parameters for a generation-scoped Vivid track wait' \
 'exit:Common timeout for wait commands, represented as milliseconds on the wire' \
+'prompt:Block until the shell sits at a prompt. Requires OSC 133 shell integration; a shell that never emits markers never resolves this wait' \
+'command-finish:Block until the running command finishes, reporting its exit code. Resolves on the next finish after registration, never on a command that already finished' \
     )
     _describe -t commands 'vivido help msg wait commands' commands "$@"
+}
+(( $+functions[_vivido__subcmd__help__subcmd__msg__subcmd__wait__subcmd__command-finish_commands] )) ||
+_vivido__subcmd__help__subcmd__msg__subcmd__wait__subcmd__command-finish_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido help msg wait command-finish commands' commands "$@"
 }
 (( $+functions[_vivido__subcmd__help__subcmd__msg__subcmd__wait__subcmd__exit_commands] )) ||
 _vivido__subcmd__help__subcmd__msg__subcmd__wait__subcmd__exit_commands() {
@@ -1834,6 +1989,11 @@ _vivido__subcmd__help__subcmd__msg__subcmd__wait__subcmd__frame_commands() {
 _vivido__subcmd__help__subcmd__msg__subcmd__wait__subcmd__output_commands() {
     local commands; commands=()
     _describe -t commands 'vivido help msg wait output commands' commands "$@"
+}
+(( $+functions[_vivido__subcmd__help__subcmd__msg__subcmd__wait__subcmd__prompt_commands] )) ||
+_vivido__subcmd__help__subcmd__msg__subcmd__wait__subcmd__prompt_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido help msg wait prompt commands' commands "$@"
 }
 (( $+functions[_vivido__subcmd__help__subcmd__msg__subcmd__wait__subcmd__screen-change_commands] )) ||
 _vivido__subcmd__help__subcmd__msg__subcmd__wait__subcmd__screen-change_commands() {
@@ -1855,6 +2015,11 @@ _vivido__subcmd__help__subcmd__msg__subcmd__wait__subcmd__vivid-track_commands()
     local commands; commands=()
     _describe -t commands 'vivido help msg wait vivid-track commands' commands "$@"
 }
+(( $+functions[_vivido__subcmd__help__subcmd__test_commands] )) ||
+_vivido__subcmd__help__subcmd__test_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido help test commands' commands "$@"
+}
 (( $+functions[_vivido__subcmd__kill-session_commands] )) ||
 _vivido__subcmd__kill-session_commands() {
     local commands; commands=()
@@ -1869,6 +2034,7 @@ _vivido__subcmd__list_commands() {
 _vivido__subcmd__msg_commands() {
     local commands; commands=(
 'create-window:Create a new window in the same Vivido process' \
+'close-window:Close one window, terminating its terminal without stopping the instance' \
 'quit:Shut down the Vivido instance, closing every window' \
 'ping:Check IPC liveness' \
 'reset-terminal:Reset parser and client-controlled terminal state for one window' \
@@ -1877,6 +2043,8 @@ _vivido__subcmd__msg_commands() {
 'get-config:Read runtime Vivido configuration' \
 'typing:Type literal text into a terminal' \
 'get-text:Read terminal text' \
+'find-text:Find pattern matches with cell and pixel rectangles' \
+'exec:Run one shell command in a window'\''s working directory and report its result' \
 'screenshot:Capture the last displayed terminal frame' \
 'capabilities:Print supported automation methods, events, and limits' \
 'run-plan:Execute a bounded JSON automation plan over one IPC connection' \
@@ -1913,6 +2081,11 @@ _vivido__subcmd__msg__subcmd__capture_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg capture commands' commands "$@"
 }
+(( $+functions[_vivido__subcmd__msg__subcmd__close-window_commands] )) ||
+_vivido__subcmd__msg__subcmd__close-window_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg close-window commands' commands "$@"
+}
 (( $+functions[_vivido__subcmd__msg__subcmd__config_commands] )) ||
 _vivido__subcmd__msg__subcmd__config_commands() {
     local commands; commands=()
@@ -1932,6 +2105,16 @@ _vivido__subcmd__msg__subcmd__diagnose_commands() {
 _vivido__subcmd__msg__subcmd__drop-file_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg drop-file commands' commands "$@"
+}
+(( $+functions[_vivido__subcmd__msg__subcmd__exec_commands] )) ||
+_vivido__subcmd__msg__subcmd__exec_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg exec commands' commands "$@"
+}
+(( $+functions[_vivido__subcmd__msg__subcmd__find-text_commands] )) ||
+_vivido__subcmd__msg__subcmd__find-text_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg find-text commands' commands "$@"
 }
 (( $+functions[_vivido__subcmd__msg__subcmd__focus_commands] )) ||
 _vivido__subcmd__msg__subcmd__focus_commands() {
@@ -1957,6 +2140,7 @@ _vivido__subcmd__msg__subcmd__get-text_commands() {
 _vivido__subcmd__msg__subcmd__help_commands() {
     local commands; commands=(
 'create-window:Create a new window in the same Vivido process' \
+'close-window:Close one window, terminating its terminal without stopping the instance' \
 'quit:Shut down the Vivido instance, closing every window' \
 'ping:Check IPC liveness' \
 'reset-terminal:Reset parser and client-controlled terminal state for one window' \
@@ -1965,6 +2149,8 @@ _vivido__subcmd__msg__subcmd__help_commands() {
 'get-config:Read runtime Vivido configuration' \
 'typing:Type literal text into a terminal' \
 'get-text:Read terminal text' \
+'find-text:Find pattern matches with cell and pixel rectangles' \
+'exec:Run one shell command in a window'\''s working directory and report its result' \
 'screenshot:Capture the last displayed terminal frame' \
 'capabilities:Print supported automation methods, events, and limits' \
 'run-plan:Execute a bounded JSON automation plan over one IPC connection' \
@@ -2001,6 +2187,11 @@ _vivido__subcmd__msg__subcmd__help__subcmd__capture_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg help capture commands' commands "$@"
 }
+(( $+functions[_vivido__subcmd__msg__subcmd__help__subcmd__close-window_commands] )) ||
+_vivido__subcmd__msg__subcmd__help__subcmd__close-window_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg help close-window commands' commands "$@"
+}
 (( $+functions[_vivido__subcmd__msg__subcmd__help__subcmd__config_commands] )) ||
 _vivido__subcmd__msg__subcmd__help__subcmd__config_commands() {
     local commands; commands=()
@@ -2020,6 +2211,16 @@ _vivido__subcmd__msg__subcmd__help__subcmd__diagnose_commands() {
 _vivido__subcmd__msg__subcmd__help__subcmd__drop-file_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg help drop-file commands' commands "$@"
+}
+(( $+functions[_vivido__subcmd__msg__subcmd__help__subcmd__exec_commands] )) ||
+_vivido__subcmd__msg__subcmd__help__subcmd__exec_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg help exec commands' commands "$@"
+}
+(( $+functions[_vivido__subcmd__msg__subcmd__help__subcmd__find-text_commands] )) ||
+_vivido__subcmd__msg__subcmd__help__subcmd__find-text_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg help find-text commands' commands "$@"
 }
 (( $+functions[_vivido__subcmd__msg__subcmd__help__subcmd__focus_commands] )) ||
 _vivido__subcmd__msg__subcmd__help__subcmd__focus_commands() {
@@ -2248,8 +2449,15 @@ _vivido__subcmd__msg__subcmd__help__subcmd__wait_commands() {
 'frame:Frame wait parameters' \
 'vivid-track:Parameters for a generation-scoped Vivid track wait' \
 'exit:Common timeout for wait commands, represented as milliseconds on the wire' \
+'prompt:Block until the shell sits at a prompt. Requires OSC 133 shell integration; a shell that never emits markers never resolves this wait' \
+'command-finish:Block until the running command finishes, reporting its exit code. Resolves on the next finish after registration, never on a command that already finished' \
     )
     _describe -t commands 'vivido msg help wait commands' commands "$@"
+}
+(( $+functions[_vivido__subcmd__msg__subcmd__help__subcmd__wait__subcmd__command-finish_commands] )) ||
+_vivido__subcmd__msg__subcmd__help__subcmd__wait__subcmd__command-finish_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg help wait command-finish commands' commands "$@"
 }
 (( $+functions[_vivido__subcmd__msg__subcmd__help__subcmd__wait__subcmd__exit_commands] )) ||
 _vivido__subcmd__msg__subcmd__help__subcmd__wait__subcmd__exit_commands() {
@@ -2265,6 +2473,11 @@ _vivido__subcmd__msg__subcmd__help__subcmd__wait__subcmd__frame_commands() {
 _vivido__subcmd__msg__subcmd__help__subcmd__wait__subcmd__output_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg help wait output commands' commands "$@"
+}
+(( $+functions[_vivido__subcmd__msg__subcmd__help__subcmd__wait__subcmd__prompt_commands] )) ||
+_vivido__subcmd__msg__subcmd__help__subcmd__wait__subcmd__prompt_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg help wait prompt commands' commands "$@"
 }
 (( $+functions[_vivido__subcmd__msg__subcmd__help__subcmd__wait__subcmd__screen-change_commands] )) ||
 _vivido__subcmd__msg__subcmd__help__subcmd__wait__subcmd__screen-change_commands() {
@@ -2604,9 +2817,16 @@ _vivido__subcmd__msg__subcmd__wait_commands() {
 'frame:Frame wait parameters' \
 'vivid-track:Parameters for a generation-scoped Vivid track wait' \
 'exit:Common timeout for wait commands, represented as milliseconds on the wire' \
+'prompt:Block until the shell sits at a prompt. Requires OSC 133 shell integration; a shell that never emits markers never resolves this wait' \
+'command-finish:Block until the running command finishes, reporting its exit code. Resolves on the next finish after registration, never on a command that already finished' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'vivido msg wait commands' commands "$@"
+}
+(( $+functions[_vivido__subcmd__msg__subcmd__wait__subcmd__command-finish_commands] )) ||
+_vivido__subcmd__msg__subcmd__wait__subcmd__command-finish_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg wait command-finish commands' commands "$@"
 }
 (( $+functions[_vivido__subcmd__msg__subcmd__wait__subcmd__exit_commands] )) ||
 _vivido__subcmd__msg__subcmd__wait__subcmd__exit_commands() {
@@ -2628,9 +2848,16 @@ _vivido__subcmd__msg__subcmd__wait__subcmd__help_commands() {
 'frame:Frame wait parameters' \
 'vivid-track:Parameters for a generation-scoped Vivid track wait' \
 'exit:Common timeout for wait commands, represented as milliseconds on the wire' \
+'prompt:Block until the shell sits at a prompt. Requires OSC 133 shell integration; a shell that never emits markers never resolves this wait' \
+'command-finish:Block until the running command finishes, reporting its exit code. Resolves on the next finish after registration, never on a command that already finished' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'vivido msg wait help commands' commands "$@"
+}
+(( $+functions[_vivido__subcmd__msg__subcmd__wait__subcmd__help__subcmd__command-finish_commands] )) ||
+_vivido__subcmd__msg__subcmd__wait__subcmd__help__subcmd__command-finish_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg wait help command-finish commands' commands "$@"
 }
 (( $+functions[_vivido__subcmd__msg__subcmd__wait__subcmd__help__subcmd__exit_commands] )) ||
 _vivido__subcmd__msg__subcmd__wait__subcmd__help__subcmd__exit_commands() {
@@ -2651,6 +2878,11 @@ _vivido__subcmd__msg__subcmd__wait__subcmd__help__subcmd__help_commands() {
 _vivido__subcmd__msg__subcmd__wait__subcmd__help__subcmd__output_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg wait help output commands' commands "$@"
+}
+(( $+functions[_vivido__subcmd__msg__subcmd__wait__subcmd__help__subcmd__prompt_commands] )) ||
+_vivido__subcmd__msg__subcmd__wait__subcmd__help__subcmd__prompt_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg wait help prompt commands' commands "$@"
 }
 (( $+functions[_vivido__subcmd__msg__subcmd__wait__subcmd__help__subcmd__screen-change_commands] )) ||
 _vivido__subcmd__msg__subcmd__wait__subcmd__help__subcmd__screen-change_commands() {
@@ -2677,6 +2909,11 @@ _vivido__subcmd__msg__subcmd__wait__subcmd__output_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg wait output commands' commands "$@"
 }
+(( $+functions[_vivido__subcmd__msg__subcmd__wait__subcmd__prompt_commands] )) ||
+_vivido__subcmd__msg__subcmd__wait__subcmd__prompt_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido msg wait prompt commands' commands "$@"
+}
 (( $+functions[_vivido__subcmd__msg__subcmd__wait__subcmd__screen-change_commands] )) ||
 _vivido__subcmd__msg__subcmd__wait__subcmd__screen-change_commands() {
     local commands; commands=()
@@ -2696,6 +2933,11 @@ _vivido__subcmd__msg__subcmd__wait__subcmd__text_commands() {
 _vivido__subcmd__msg__subcmd__wait__subcmd__vivid-track_commands() {
     local commands; commands=()
     _describe -t commands 'vivido msg wait vivid-track commands' commands "$@"
+}
+(( $+functions[_vivido__subcmd__test_commands] )) ||
+_vivido__subcmd__test_commands() {
+    local commands; commands=()
+    _describe -t commands 'vivido test commands' commands "$@"
 }
 
 if [ "$funcstack[1]" = "_vivido" ]; then

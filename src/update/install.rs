@@ -3,6 +3,8 @@
 use std::io;
 use std::path::Path;
 
+// Only the platform installers and their test doubles return update errors.
+#[cfg(any(test, windows, target_os = "macos"))]
 use super::UpdateError;
 
 #[cfg(target_os = "macos")]

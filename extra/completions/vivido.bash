@@ -34,6 +34,9 @@ _vivido() {
             vivido,msg)
                 cmd="vivido__subcmd__msg"
                 ;;
+            vivido,test)
+                cmd="vivido__subcmd__test"
+                ;;
             vivido__subcmd__help,debug-bundle)
                 cmd="vivido__subcmd__help__subcmd__debug__subcmd__bundle"
                 ;;
@@ -52,11 +55,17 @@ _vivido() {
             vivido__subcmd__help,msg)
                 cmd="vivido__subcmd__help__subcmd__msg"
                 ;;
+            vivido__subcmd__help,test)
+                cmd="vivido__subcmd__help__subcmd__test"
+                ;;
             vivido__subcmd__help__subcmd__msg,capabilities)
                 cmd="vivido__subcmd__help__subcmd__msg__subcmd__capabilities"
                 ;;
             vivido__subcmd__help__subcmd__msg,capture)
                 cmd="vivido__subcmd__help__subcmd__msg__subcmd__capture"
+                ;;
+            vivido__subcmd__help__subcmd__msg,close-window)
+                cmd="vivido__subcmd__help__subcmd__msg__subcmd__close__subcmd__window"
                 ;;
             vivido__subcmd__help__subcmd__msg,config)
                 cmd="vivido__subcmd__help__subcmd__msg__subcmd__config"
@@ -69,6 +78,12 @@ _vivido() {
                 ;;
             vivido__subcmd__help__subcmd__msg,drop-file)
                 cmd="vivido__subcmd__help__subcmd__msg__subcmd__drop__subcmd__file"
+                ;;
+            vivido__subcmd__help__subcmd__msg,exec)
+                cmd="vivido__subcmd__help__subcmd__msg__subcmd__exec"
+                ;;
+            vivido__subcmd__help__subcmd__msg,find-text)
+                cmd="vivido__subcmd__help__subcmd__msg__subcmd__find__subcmd__text"
                 ;;
             vivido__subcmd__help__subcmd__msg,focus)
                 cmd="vivido__subcmd__help__subcmd__msg__subcmd__focus"
@@ -190,6 +205,9 @@ _vivido() {
             vivido__subcmd__help__subcmd__msg__subcmd__vivid,tracks)
                 cmd="vivido__subcmd__help__subcmd__msg__subcmd__vivid__subcmd__tracks"
                 ;;
+            vivido__subcmd__help__subcmd__msg__subcmd__wait,command-finish)
+                cmd="vivido__subcmd__help__subcmd__msg__subcmd__wait__subcmd__command__subcmd__finish"
+                ;;
             vivido__subcmd__help__subcmd__msg__subcmd__wait,exit)
                 cmd="vivido__subcmd__help__subcmd__msg__subcmd__wait__subcmd__exit"
                 ;;
@@ -198,6 +216,9 @@ _vivido() {
                 ;;
             vivido__subcmd__help__subcmd__msg__subcmd__wait,output)
                 cmd="vivido__subcmd__help__subcmd__msg__subcmd__wait__subcmd__output"
+                ;;
+            vivido__subcmd__help__subcmd__msg__subcmd__wait,prompt)
+                cmd="vivido__subcmd__help__subcmd__msg__subcmd__wait__subcmd__prompt"
                 ;;
             vivido__subcmd__help__subcmd__msg__subcmd__wait,screen-change)
                 cmd="vivido__subcmd__help__subcmd__msg__subcmd__wait__subcmd__screen__subcmd__change"
@@ -217,6 +238,9 @@ _vivido() {
             vivido__subcmd__msg,capture)
                 cmd="vivido__subcmd__msg__subcmd__capture"
                 ;;
+            vivido__subcmd__msg,close-window)
+                cmd="vivido__subcmd__msg__subcmd__close__subcmd__window"
+                ;;
             vivido__subcmd__msg,config)
                 cmd="vivido__subcmd__msg__subcmd__config"
                 ;;
@@ -228,6 +252,12 @@ _vivido() {
                 ;;
             vivido__subcmd__msg,drop-file)
                 cmd="vivido__subcmd__msg__subcmd__drop__subcmd__file"
+                ;;
+            vivido__subcmd__msg,exec)
+                cmd="vivido__subcmd__msg__subcmd__exec"
+                ;;
+            vivido__subcmd__msg,find-text)
+                cmd="vivido__subcmd__msg__subcmd__find__subcmd__text"
                 ;;
             vivido__subcmd__msg,focus)
                 cmd="vivido__subcmd__msg__subcmd__focus"
@@ -313,6 +343,9 @@ _vivido() {
             vivido__subcmd__msg__subcmd__help,capture)
                 cmd="vivido__subcmd__msg__subcmd__help__subcmd__capture"
                 ;;
+            vivido__subcmd__msg__subcmd__help,close-window)
+                cmd="vivido__subcmd__msg__subcmd__help__subcmd__close__subcmd__window"
+                ;;
             vivido__subcmd__msg__subcmd__help,config)
                 cmd="vivido__subcmd__msg__subcmd__help__subcmd__config"
                 ;;
@@ -324,6 +357,12 @@ _vivido() {
                 ;;
             vivido__subcmd__msg__subcmd__help,drop-file)
                 cmd="vivido__subcmd__msg__subcmd__help__subcmd__drop__subcmd__file"
+                ;;
+            vivido__subcmd__msg__subcmd__help,exec)
+                cmd="vivido__subcmd__msg__subcmd__help__subcmd__exec"
+                ;;
+            vivido__subcmd__msg__subcmd__help,find-text)
+                cmd="vivido__subcmd__msg__subcmd__help__subcmd__find__subcmd__text"
                 ;;
             vivido__subcmd__msg__subcmd__help,focus)
                 cmd="vivido__subcmd__msg__subcmd__help__subcmd__focus"
@@ -448,6 +487,9 @@ _vivido() {
             vivido__subcmd__msg__subcmd__help__subcmd__vivid,tracks)
                 cmd="vivido__subcmd__msg__subcmd__help__subcmd__vivid__subcmd__tracks"
                 ;;
+            vivido__subcmd__msg__subcmd__help__subcmd__wait,command-finish)
+                cmd="vivido__subcmd__msg__subcmd__help__subcmd__wait__subcmd__command__subcmd__finish"
+                ;;
             vivido__subcmd__msg__subcmd__help__subcmd__wait,exit)
                 cmd="vivido__subcmd__msg__subcmd__help__subcmd__wait__subcmd__exit"
                 ;;
@@ -456,6 +498,9 @@ _vivido() {
                 ;;
             vivido__subcmd__msg__subcmd__help__subcmd__wait,output)
                 cmd="vivido__subcmd__msg__subcmd__help__subcmd__wait__subcmd__output"
+                ;;
+            vivido__subcmd__msg__subcmd__help__subcmd__wait,prompt)
+                cmd="vivido__subcmd__msg__subcmd__help__subcmd__wait__subcmd__prompt"
                 ;;
             vivido__subcmd__msg__subcmd__help__subcmd__wait,screen-change)
                 cmd="vivido__subcmd__msg__subcmd__help__subcmd__wait__subcmd__screen__subcmd__change"
@@ -571,6 +616,9 @@ _vivido() {
             vivido__subcmd__msg__subcmd__vivid__subcmd__help,tracks)
                 cmd="vivido__subcmd__msg__subcmd__vivid__subcmd__help__subcmd__tracks"
                 ;;
+            vivido__subcmd__msg__subcmd__wait,command-finish)
+                cmd="vivido__subcmd__msg__subcmd__wait__subcmd__command__subcmd__finish"
+                ;;
             vivido__subcmd__msg__subcmd__wait,exit)
                 cmd="vivido__subcmd__msg__subcmd__wait__subcmd__exit"
                 ;;
@@ -582,6 +630,9 @@ _vivido() {
                 ;;
             vivido__subcmd__msg__subcmd__wait,output)
                 cmd="vivido__subcmd__msg__subcmd__wait__subcmd__output"
+                ;;
+            vivido__subcmd__msg__subcmd__wait,prompt)
+                cmd="vivido__subcmd__msg__subcmd__wait__subcmd__prompt"
                 ;;
             vivido__subcmd__msg__subcmd__wait,screen-change)
                 cmd="vivido__subcmd__msg__subcmd__wait__subcmd__screen__subcmd__change"
@@ -595,6 +646,9 @@ _vivido() {
             vivido__subcmd__msg__subcmd__wait,vivid-track)
                 cmd="vivido__subcmd__msg__subcmd__wait__subcmd__vivid__subcmd__track"
                 ;;
+            vivido__subcmd__msg__subcmd__wait__subcmd__help,command-finish)
+                cmd="vivido__subcmd__msg__subcmd__wait__subcmd__help__subcmd__command__subcmd__finish"
+                ;;
             vivido__subcmd__msg__subcmd__wait__subcmd__help,exit)
                 cmd="vivido__subcmd__msg__subcmd__wait__subcmd__help__subcmd__exit"
                 ;;
@@ -606,6 +660,9 @@ _vivido() {
                 ;;
             vivido__subcmd__msg__subcmd__wait__subcmd__help,output)
                 cmd="vivido__subcmd__msg__subcmd__wait__subcmd__help__subcmd__output"
+                ;;
+            vivido__subcmd__msg__subcmd__wait__subcmd__help,prompt)
+                cmd="vivido__subcmd__msg__subcmd__wait__subcmd__help__subcmd__prompt"
                 ;;
             vivido__subcmd__msg__subcmd__wait__subcmd__help,screen-change)
                 cmd="vivido__subcmd__msg__subcmd__wait__subcmd__help__subcmd__screen__subcmd__change"
@@ -626,7 +683,7 @@ _vivido() {
 
     case "${cmd}" in
         vivido)
-            opts="-s -q -v -w -e -T -o -h -V --print-events --ref-test --config-file --socket --headless --session --automation-name --foreground --headless-size --daemon --vivid-target --window-id --no-activate --working-directory --hold --command --title --class --option --help --version msg list doctor debug-bundle kill-session help"
+            opts="-s -q -v -w -e -T -o -h -V --print-events --ref-test --config-file --socket --headless --session --automation-name --foreground --ephemeral --headless-size --daemon --vivid-target --window-id --no-activate --working-directory --hold --command --title --class --option --help --version msg list doctor debug-bundle kill-session test help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 1 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -811,7 +868,7 @@ _vivido() {
             return 0
             ;;
         vivido__subcmd__help)
-            opts="msg list doctor debug-bundle kill-session help"
+            opts="msg list doctor debug-bundle kill-session test help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -895,7 +952,7 @@ _vivido() {
             return 0
             ;;
         vivido__subcmd__help__subcmd__msg)
-            opts="create-window quit ping reset-terminal restart-terminal config get-config typing get-text screenshot capabilities run-plan capture key paste drop-file mouse resize set-geometry set-visible set-level focus signal list-windows inspect diagnose vivid get-grid wait transcript subscribe"
+            opts="create-window close-window quit ping reset-terminal restart-terminal config get-config typing get-text find-text exec screenshot capabilities run-plan capture key paste drop-file mouse resize set-geometry set-visible set-level focus signal list-windows inspect diagnose vivid get-grid wait transcript subscribe"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -923,6 +980,20 @@ _vivido() {
             return 0
             ;;
         vivido__subcmd__help__subcmd__msg__subcmd__capture)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        vivido__subcmd__help__subcmd__msg__subcmd__close__subcmd__window)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
@@ -979,6 +1050,34 @@ _vivido() {
             return 0
             ;;
         vivido__subcmd__help__subcmd__msg__subcmd__drop__subcmd__file)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        vivido__subcmd__help__subcmd__msg__subcmd__exec)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        vivido__subcmd__help__subcmd__msg__subcmd__find__subcmd__text)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
@@ -1539,8 +1638,22 @@ _vivido() {
             return 0
             ;;
         vivido__subcmd__help__subcmd__msg__subcmd__wait)
-            opts="text output screen-change screen-stable frame vivid-track exit"
+            opts="text output screen-change screen-stable frame vivid-track exit prompt command-finish"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        vivido__subcmd__help__subcmd__msg__subcmd__wait__subcmd__command__subcmd__finish)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 5 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
             fi
@@ -1581,6 +1694,20 @@ _vivido() {
             return 0
             ;;
         vivido__subcmd__help__subcmd__msg__subcmd__wait__subcmd__output)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 5 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        vivido__subcmd__help__subcmd__msg__subcmd__wait__subcmd__prompt)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 5 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
@@ -1650,6 +1777,20 @@ _vivido() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
+        vivido__subcmd__help__subcmd__test)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
         vivido__subcmd__kill__subcmd__session)
             opts="-t -h --target --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
@@ -1687,7 +1828,7 @@ _vivido() {
             return 0
             ;;
         vivido__subcmd__msg)
-            opts="-s -t -h --socket --target --help create-window quit ping reset-terminal restart-terminal config get-config typing get-text screenshot capabilities run-plan capture key paste drop-file mouse resize set-geometry set-visible set-level focus signal list-windows inspect diagnose vivid get-grid wait transcript subscribe help"
+            opts="-s -t -h --socket --target --help create-window close-window quit ping reset-terminal restart-terminal config get-config typing get-text find-text exec screenshot capabilities run-plan capture key paste drop-file mouse resize set-geometry set-visible set-level focus signal list-windows inspect diagnose vivid get-grid wait transcript subscribe help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -1776,6 +1917,28 @@ _vivido() {
                     return 0
                     ;;
                 --timeout)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        vivido__subcmd__msg__subcmd__close__subcmd__window)
+            opts="-w -f -h --window-id --force --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --window-id)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                -w)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
@@ -1933,6 +2096,66 @@ _vivido() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
+        vivido__subcmd__msg__subcmd__exec)
+            opts="-w -h --command --window-id --timeout --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --command)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --window-id)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                -w)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --timeout)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        vivido__subcmd__msg__subcmd__find__subcmd__text)
+            opts="-w -h --pattern --regex --window-id --max-matches --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --pattern)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --window-id)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                -w)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --max-matches)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
         vivido__subcmd__msg__subcmd__focus)
             opts="-w -h --window-id --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
@@ -2038,7 +2261,7 @@ _vivido() {
             return 0
             ;;
         vivido__subcmd__msg__subcmd__help)
-            opts="create-window quit ping reset-terminal restart-terminal config get-config typing get-text screenshot capabilities run-plan capture key paste drop-file mouse resize set-geometry set-visible set-level focus signal list-windows inspect diagnose vivid get-grid wait transcript subscribe help"
+            opts="create-window close-window quit ping reset-terminal restart-terminal config get-config typing get-text find-text exec screenshot capabilities run-plan capture key paste drop-file mouse resize set-geometry set-visible set-level focus signal list-windows inspect diagnose vivid get-grid wait transcript subscribe help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -2066,6 +2289,20 @@ _vivido() {
             return 0
             ;;
         vivido__subcmd__msg__subcmd__help__subcmd__capture)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        vivido__subcmd__msg__subcmd__help__subcmd__close__subcmd__window)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
@@ -2122,6 +2359,34 @@ _vivido() {
             return 0
             ;;
         vivido__subcmd__msg__subcmd__help__subcmd__drop__subcmd__file)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        vivido__subcmd__msg__subcmd__help__subcmd__exec)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        vivido__subcmd__msg__subcmd__help__subcmd__find__subcmd__text)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
@@ -2696,8 +2961,22 @@ _vivido() {
             return 0
             ;;
         vivido__subcmd__msg__subcmd__help__subcmd__wait)
-            opts="text output screen-change screen-stable frame vivid-track exit"
+            opts="text output screen-change screen-stable frame vivid-track exit prompt command-finish"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        vivido__subcmd__msg__subcmd__help__subcmd__wait__subcmd__command__subcmd__finish)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 5 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
             fi
@@ -2738,6 +3017,20 @@ _vivido() {
             return 0
             ;;
         vivido__subcmd__msg__subcmd__help__subcmd__wait__subcmd__output)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 5 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        vivido__subcmd__msg__subcmd__help__subcmd__wait__subcmd__prompt)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 5 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
@@ -3620,7 +3913,7 @@ _vivido() {
             return 0
             ;;
         vivido__subcmd__msg__subcmd__run__subcmd__plan)
-            opts="-h --file --dry-run --preflight --help"
+            opts="-h --file --dry-run --preflight --report --output --set --on-failure-dump --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -3638,6 +3931,36 @@ _vivido() {
                     fi
                     if [[ "${BASH_VERSINFO[0]}" -ge 4 ]]; then
                         compopt -o filenames
+                    fi
+                    return 0
+                    ;;
+                --report)
+                    COMPREPLY=($(compgen -W "ndjson junit sarif" -- "${cur}"))
+                    return 0
+                    ;;
+                --output)
+                    local oldifs
+                    if [ -n "${IFS+x}" ]; then
+                        oldifs="$IFS"
+                    fi
+                    IFS=$'\n'
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    if [ -n "${oldifs+x}" ]; then
+                        IFS="$oldifs"
+                    fi
+                    if [[ "${BASH_VERSINFO[0]}" -ge 4 ]]; then
+                        compopt -o filenames
+                    fi
+                    return 0
+                    ;;
+                --set)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --on-failure-dump)
+                    COMPREPLY=()
+                    if [[ "${BASH_VERSINFO[0]}" -ge 4 ]]; then
+                        compopt -o plusdirs
                     fi
                     return 0
                     ;;
@@ -4235,12 +4558,38 @@ _vivido() {
             return 0
             ;;
         vivido__subcmd__msg__subcmd__wait)
-            opts="-h --help text output screen-change screen-stable frame vivid-track exit help"
+            opts="-h --help text output screen-change screen-stable frame vivid-track exit prompt command-finish help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
             fi
             case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        vivido__subcmd__msg__subcmd__wait__subcmd__command__subcmd__finish)
+            opts="-w -h --timeout --window-id --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --timeout)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --window-id)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                -w)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
                 *)
                     COMPREPLY=()
                     ;;
@@ -4305,8 +4654,22 @@ _vivido() {
             return 0
             ;;
         vivido__subcmd__msg__subcmd__wait__subcmd__help)
-            opts="text output screen-change screen-stable frame vivid-track exit help"
+            opts="text output screen-change screen-stable frame vivid-track exit prompt command-finish help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        vivido__subcmd__msg__subcmd__wait__subcmd__help__subcmd__command__subcmd__finish)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 5 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
             fi
@@ -4361,6 +4724,20 @@ _vivido() {
             return 0
             ;;
         vivido__subcmd__msg__subcmd__wait__subcmd__help__subcmd__output)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 5 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        vivido__subcmd__msg__subcmd__wait__subcmd__help__subcmd__prompt)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 5 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
@@ -4460,6 +4837,32 @@ _vivido() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
+        vivido__subcmd__msg__subcmd__wait__subcmd__prompt)
+            opts="-w -h --timeout --window-id --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --timeout)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --window-id)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                -w)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
         vivido__subcmd__msg__subcmd__wait__subcmd__screen__subcmd__change)
             opts="-w -h --after-screen --timeout --window-id --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
@@ -4525,13 +4928,21 @@ _vivido() {
             return 0
             ;;
         vivido__subcmd__msg__subcmd__wait__subcmd__text)
-            opts="-w -h --regex --after-screen --timeout --window-id --help"
+            opts="-w -h --regex --after-screen --line --rect --timeout --window-id --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
             fi
             case "${prev}" in
                 --after-screen)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --line)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --rect)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
@@ -4595,6 +5006,80 @@ _vivido() {
                     ;;
                 -w)
                     COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        vivido__subcmd__test)
+            opts="-h --file --session --headless-size --keep-failed --report --output --artifacts-dir --set --on-failure-dump --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --file)
+                    local oldifs
+                    if [ -n "${IFS+x}" ]; then
+                        oldifs="$IFS"
+                    fi
+                    IFS=$'\n'
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    if [ -n "${oldifs+x}" ]; then
+                        IFS="$oldifs"
+                    fi
+                    if [[ "${BASH_VERSINFO[0]}" -ge 4 ]]; then
+                        compopt -o filenames
+                    fi
+                    return 0
+                    ;;
+                --session)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --headless-size)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --report)
+                    COMPREPLY=($(compgen -W "ndjson junit sarif" -- "${cur}"))
+                    return 0
+                    ;;
+                --output)
+                    local oldifs
+                    if [ -n "${IFS+x}" ]; then
+                        oldifs="$IFS"
+                    fi
+                    IFS=$'\n'
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    if [ -n "${oldifs+x}" ]; then
+                        IFS="$oldifs"
+                    fi
+                    if [[ "${BASH_VERSINFO[0]}" -ge 4 ]]; then
+                        compopt -o filenames
+                    fi
+                    return 0
+                    ;;
+                --artifacts-dir)
+                    COMPREPLY=()
+                    if [[ "${BASH_VERSINFO[0]}" -ge 4 ]]; then
+                        compopt -o plusdirs
+                    fi
+                    return 0
+                    ;;
+                --set)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --on-failure-dump)
+                    COMPREPLY=()
+                    if [[ "${BASH_VERSINFO[0]}" -ge 4 ]]; then
+                        compopt -o plusdirs
+                    fi
                     return 0
                     ;;
                 *)
