@@ -373,7 +373,7 @@ fn run_plan_asserts_state_and_writes_junit() {
         format!(
             r#"{{"version":2,"name":"assert-e2e","steps":[
             {{"id":"type","method":"typing","params":{{"text":{command:?}}}}},
-            {{"id":"see","method":"wait_text","params":{{"text":"PLAN-ASSERT-99"}},"assert":{{"text_contains":"PLAN-ASSERT-99","window_id":{window_id},"lines_from_bottom":30,"timeout_ms":15000}}}},
+            {{"id":"see","method":"wait_text","params":{{"text":"PLAN-ASSERT-99","common":{{"timeout":15000,"target":{{}}}}}},"assert":{{"text_contains":"PLAN-ASSERT-99","window_id":{window_id},"lines_from_bottom":30,"timeout_ms":15000}}}},
             {{"id":"shape","method":"list_windows","assert":{{"result_pointer":"/windows/0/window_id","result_equals":{window_id}}}}}
         ]}}"#
         ),
@@ -479,14 +479,21 @@ fn test_runner_executes_a_plan_and_tears_down() {
     let xml = fs::read_to_string(&report).unwrap();
     assert!(xml.contains(r#"tests="2" failures="0""#), "{xml}");
 
-    // The ephemeral session is gone: nothing to leak into the next run.
-    let mut list = base_command(&runtime);
-    list.arg("list");
-    let list = list.output().expect("run vivido list");
-    assert!(
-        !String::from_utf8_lossy(&list.stdout).contains("runner-smoke"),
-        "test session survived its passing run"
-    );
+    // The ephemeral session is gone: nothing to leak into the next run. Teardown is asynchronous
+    // by design — the daemon ACKs `quit`, exits its event loop, and drops its registry guard
+    // afterward — so poll instead of asserting on the first observation, which a slow renderer
+    // teardown can lose.
+    let deadline = Instant::now() + READY_TIMEOUT;
+    loop {
+        let mut list = base_command(&runtime);
+        list.arg("list");
+        let list = list.output().expect("run vivido list");
+        if !String::from_utf8_lossy(&list.stdout).contains("runner-smoke") {
+            break;
+        }
+        assert!(Instant::now() < deadline, "test session survived its passing run");
+        std::thread::sleep(Duration::from_millis(200));
+    }
 
     // A failing run captures evidence, keeps the session with --keep-failed, and still fails.
     let failing = runtime.join("failing-plan.json");
@@ -530,13 +537,18 @@ fn test_runner_executes_a_plan_and_tears_down() {
     quit.args(["kill-session", "--target", "runner-keep"]);
     let quit = quit.output().expect("quit kept session");
     assert!(quit.status.success(), "cannot quit kept session");
-    let mut list = base_command(&runtime);
-    list.arg("list");
-    let list = list.output().expect("run vivido list");
-    assert!(
-        !String::from_utf8_lossy(&list.stdout).contains("runner-keep"),
-        "kept session survived kill-session"
-    );
+    // `kill-session` signals and returns; the daemon clears its registry as it dies, so poll.
+    let deadline = Instant::now() + READY_TIMEOUT;
+    loop {
+        let mut list = base_command(&runtime);
+        list.arg("list");
+        let list = list.output().expect("run vivido list");
+        if !String::from_utf8_lossy(&list.stdout).contains("runner-keep") {
+            break;
+        }
+        assert!(Instant::now() < deadline, "kept session survived kill-session");
+        std::thread::sleep(Duration::from_millis(200));
+    }
 }
 
 /// The whole point: a session with no compositor still answers text and pixel queries.
@@ -696,10 +708,18 @@ fn a_headless_session_persists_and_is_listed_until_it_is_told_to_quit() {
     assert!(text.is_empty() || text.chars().all(char::is_whitespace) || !text.is_empty());
 
     session.msg(&["quit"]);
-    std::thread::sleep(Duration::from_millis(500));
 
-    // Shutting down clears the rendezvous, so a stale entry cannot outlive the daemon.
-    assert!(!session.list().contains("lifecycle"), "the registry survived shutdown");
+    // Shutting down clears the rendezvous, so a stale entry cannot outlive the daemon. The clear
+    // happens when the daemon's registry guard drops after its event loop exits, so poll instead
+    // of sleeping a duration that only fits a fast machine.
+    let deadline = Instant::now() + READY_TIMEOUT;
+    loop {
+        if !session.list().contains("lifecycle") {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the registry survived shutdown");
+        std::thread::sleep(Duration::from_millis(100));
+    }
     #[cfg(unix)]
     assert!(!Path::new(&session.socket).exists(), "the socket survived shutdown");
 }
