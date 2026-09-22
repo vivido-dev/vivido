@@ -508,6 +508,14 @@ impl Window {
         }
     }
 
+    /// Apply host geometry while preserving the requested top-left position.
+    pub fn set_geometry(&self, position: PhysicalPosition<i32>, size: PhysicalSize<u32>) {
+        // AppKit preserves the bottom-left origin when resizing a borderless NSWindow.
+        // Positioning first would shift the top edge by the height delta on macOS.
+        self.request_inner_size(size);
+        self.set_outer_position(position);
+    }
+
     /// Physical screen position of the window's outer frame.
     ///
     /// [`None`] when the windowing system refuses to report one.
@@ -552,9 +560,13 @@ impl Window {
     pub fn order_front_without_focus(&self) {
         let Some(window) = self.ns_window() else { return };
 
-        // `orderFrontRegardless` also works across applications, which `orderFront:` does not do
-        // while another application is active — exactly the case a pane is created in.
-        window.orderFrontRegardless();
+        if let Some(parent) = window.parentWindow() {
+            // A pane belongs above its host, even when the host is behind another app.
+            // `orderFrontRegardless` raises it above that app on every layout refresh.
+            window.orderWindow_relativeTo(NSWindowOrderingMode::Above, parent.windowNumber());
+        } else {
+            window.orderFrontRegardless();
+        }
     }
 
     /// The `NSWindow` this window is drawn into, if a windowing system backs it at all.

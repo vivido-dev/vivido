@@ -28,6 +28,10 @@ path = "src/bin/vvssh.rs"
 name = "macos_tabs"
 harness = false
 
+[[test]]
+name = "macos_panes"
+harness = false
+
 [dependencies]
 ahash = { version = "0.8", features = ["no-rng"] }
 hashbrown = { version = "0.15", default-features = false }
