@@ -2,11 +2,15 @@
 
 ## Terminal throughput comparison
 
+<img width="1910" height="1074" alt="Screenshot 2026-09-22 at 10 52 07 PM" src="https://github.com/user-attachments/assets/0c451c1e-f8c9-49cc-94b9-378f824582b1" />
+
+The measurement was recorded and available on [youtube](https://youtu.be/vswkj2AqZGc)
+
 Measured with `kitten __benchmark__` [source](https://github.com/kovidgoyal/kitty/blob/master/tools/cmd/benchmark/main.go).
 
 It works by dumping large amounts of data of different types into the tty device and measuring how fast the terminal parses and responds to it.
 
-Results in MB/s — higher is better.
+**Results** (in MB/s — higher is better)
 
 | Terminal  | ASCII | Unicode | CSI codes | Long escape codes | Images  | Average |
 |-----------|-------|---------|-----------|-------------------|---------|---------|
