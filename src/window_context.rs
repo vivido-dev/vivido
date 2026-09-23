@@ -312,17 +312,19 @@ const SCREENSHOT_READBACK_TIMEOUT: Duration = Duration::from_secs(5);
 ///
 /// Wheel input is intentionally latency-sensitive: a freely spinning wheel can keep the native
 /// message queue busy indefinitely, so neither `AboutToWait` nor a scheduled `Frame` user event is
-/// guaranteed to run promptly. Windows keyboard, IME, and pointer events must also flush
-/// immediately. Staged keyboard events have not reached the child yet, while staged pointer events
-/// have not updated selection state. The native redraw request still coalesces outstanding paints.
+/// guaranteed to run promptly. Keyboard, IME, and focus events must also flush immediately on
+/// macOS and Windows. Staged keyboard events have not reached the child yet, while staged focus
+/// events have not updated IME state. Windows pointer events also update selection state. The
+/// native redraw request still coalesces outstanding paints.
 pub(crate) fn is_latency_sensitive_window_event(event: &WindowEvent) -> bool {
     match event {
         WindowEvent::MouseWheel { .. } => cfg!(any(target_os = "linux", target_os = "windows")),
-        #[cfg(windows)]
+        #[cfg(any(target_os = "macos", windows))]
         WindowEvent::KeyboardInput { is_synthetic: false, .. }
         | WindowEvent::Ime(_)
-        | WindowEvent::MouseInput { .. }
-        | WindowEvent::CursorMoved { .. } => true,
+        | WindowEvent::Focused(_) => true,
+        #[cfg(windows)]
+        WindowEvent::MouseInput { .. } | WindowEvent::CursorMoved { .. } => true,
         _ => false,
     }
 }
@@ -904,9 +906,9 @@ impl WindowContext {
 
                 // Continue to process all pending events.
             },
-            // Windows keyboard, IME, and pointer input and a freely spinning wheel can keep the
-            // platform message queue non-empty, preventing `AboutToWait` from arriving. Flush all
-            // staged input on each latency-sensitive event so it takes effect without an idle turn.
+            // Keyboard, IME, and focus input must not wait for an idle turn. On Windows, pointer
+            // input and a freely spinning wheel can also keep the native message queue busy.
+            // Flush all staged input on each latency-sensitive event.
             event if flush_staged_input => {
                 self.event_queue.push(event);
             },
@@ -3705,18 +3707,20 @@ mod vivid_environment_tests {
     };
     #[cfg(any(unix, windows))]
     use super::{ResolvedMousePosition, append_mouse_report};
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
     use super::{flushes_staged_input, is_latency_sensitive_input};
     use std::collections::HashMap;
     #[cfg(windows)]
     use std::path::PathBuf;
     #[cfg(any(unix, windows))]
     use winit::dpi::PhysicalPosition;
-    #[cfg(windows)]
+    #[cfg(any(target_os = "macos", windows))]
     use winit::event::Ime;
     #[cfg(any(target_os = "linux", target_os = "windows"))]
-    use winit::event::{DeviceId, Event as WinitEvent, MouseScrollDelta, TouchPhase, WindowEvent};
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    use winit::event::{DeviceId, MouseScrollDelta, TouchPhase};
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    use winit::event::{Event as WinitEvent, WindowEvent};
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
     use winit::window::WindowId;
 
     #[cfg(any(unix, windows))]
@@ -3809,16 +3813,20 @@ mod vivid_environment_tests {
         assert!(is_latency_sensitive_input(&event));
     }
 
-    #[cfg(windows)]
+    #[cfg(any(target_os = "macos", windows))]
     #[test]
-    fn windows_text_input_flushes_staged_input_without_waiting_for_idle() {
-        let event = WinitEvent::WindowEvent {
-            window_id: WindowId::dummy(),
-            event: WindowEvent::Ime(Ime::Commit("echo hello".into())),
-        };
+    fn text_and_focus_input_flush_staged_input_without_waiting_for_idle() {
+        for window_event in [
+            WindowEvent::Ime(Ime::Commit("echo hello".into())),
+            WindowEvent::Focused(false),
+            WindowEvent::Focused(true),
+        ] {
+            let event =
+                WinitEvent::WindowEvent { window_id: WindowId::dummy(), event: window_event };
 
-        assert!(flushes_staged_input(&event));
-        assert!(is_latency_sensitive_input(&event));
+            assert!(flushes_staged_input(&event));
+            assert!(is_latency_sensitive_input(&event));
+        }
     }
 
     #[cfg(windows)]
