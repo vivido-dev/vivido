@@ -621,6 +621,51 @@ fn typing_drives_the_shell_in_a_headless_session() {
     assert!(text.contains("RESULT-42"), "the shell never ran the typed command: {text}");
 }
 
+/// A clearing click leaves an empty selection anchor. Dragging the scrollbar must not expand it.
+#[cfg(unix)]
+#[test]
+#[ignore = "spawns processes and needs a wgpu adapter"]
+fn scrollbar_drag_after_clearing_selection_does_not_select_text() {
+    let session = Session::start("scrollbar-selection", &shell_program());
+    session.msg(&["typing", "seq 300\n"]);
+    session.msg(&["wait", "text", "299"]);
+
+    let inspect = || -> serde_json::Value {
+        serde_json::from_str(&session.msg(&["inspect"])).expect("inspect JSON")
+    };
+    let state = inspect();
+    assert!(state["scrollback_size"].as_u64().unwrap_or(0) > 0, "{state}");
+    let width = state["window"]["pixels"]["width"].as_u64().expect("client width");
+    let height = state["window"]["pixels"]["height"].as_u64().expect("client height");
+    let text_y = height / 2;
+    let text_start = format!("{},{}", width / 4, text_y);
+    let text_end = format!("{},{}", width / 2, text_y);
+    session.msg(&["mouse", "path", "--route", "ui", "--point", &text_start, &text_end]);
+    assert!(!inspect()["selection"].is_null(), "text drag should select");
+
+    session.msg(&[
+        "mouse",
+        "click",
+        "--route",
+        "ui",
+        "--button",
+        "left",
+        "--x",
+        &(width / 3).to_string(),
+        "--y",
+        &text_y.to_string(),
+    ]);
+    assert!(inspect()["selection"].is_null(), "click should clear the highlight");
+
+    let scrollbar_x = width - 4;
+    let scrollbar_start = format!("{},{}", scrollbar_x, height * 3 / 4);
+    let scrollbar_end = format!("{},{}", scrollbar_x, height / 4);
+    session.msg(&["mouse", "path", "--route", "ui", "--point", &scrollbar_start, &scrollbar_end]);
+    let state = inspect();
+    assert!(state["selection"].is_null(), "scrollbar drag selected text: {state}");
+    assert!(state["display_offset"].as_u64().unwrap_or(0) > 0, "scrollbar did not scroll: {state}");
+}
+
 /// A misbehaving full-screen client can be recovered without replacing the host process.
 #[test]
 #[ignore = "spawns processes and needs a wgpu adapter"]

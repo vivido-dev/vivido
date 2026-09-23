@@ -5309,9 +5309,11 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
             self.search_state.display_offset_delta += lines_changed;
         }
 
-        // Update selection.
-        if self.mouse.left_button_state == ElementState::Pressed
-            || self.mouse.right_button_state == ElementState::Pressed
+        // Scrolling extends a held text selection, but a scrollbar drag owns the mouse button.
+        // A clearing click can leave an empty selection anchor which must not grow during the drag.
+        if !self.display.scrollbar.dragging()
+            && (self.mouse.left_button_state == ElementState::Pressed
+                || self.mouse.right_button_state == ElementState::Pressed)
         {
             let display_offset = self.terminal.grid().display_offset();
             let point = self.mouse.point(&self.size_info(), display_offset);
