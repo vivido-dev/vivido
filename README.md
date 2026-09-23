@@ -28,6 +28,15 @@ window, right between the text. Stop `scp`-ing files around just to glance at a 
 the bundled `vvssh` brings the same rich media to your remote boxes, with drag-and-drop file
 transfer into the bargain.
 
+### First-class on Windows
+
+Windows is a first-class platform for Vivido, not a port. You get the same GPU speed, inline media,
+and agent automation as on macOS, running natively on DirectX 12 and Windows' built-in ConPTY.
+PowerShell and every installed WSL distribution sit side by side as tabs in one window, and WSL
+shells get `TERM=vivido` and true color automatically. `vivido msg` and headless sessions work the
+same way they do on macOS and Linux, over an owner-only named pipe. The signed installer sets up
+PowerShell 7, WSL with Ubuntu, and your PATH in one go. See [Using Vivido on Windows](docs/windows.md).
+
 ### Accessible by design
 
 Screen readers get real text geometry, caret position, and scrollback on macOS — not a rasterized

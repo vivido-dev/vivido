@@ -320,19 +320,6 @@ audio. Run `vvssh --help`; perform the remote-forwarding test only against a con
 
 Run these cases only in a disposable VM or test account.
 
-### Legacy config migration
-
-Before installation, ensure the new config does not exist and place a recognizable TOML file at
-`%APPDATA%\vivido\vivido.toml`. Install the MSI and compare the two files:
-
-```powershell
-$legacyConfig = Join-Path $env:APPDATA 'vivido\vivido.toml'
-$newConfig = Join-Path $env:USERPROFILE 'vivido\vivido.toml'
-Get-FileHash -Algorithm SHA256 -LiteralPath $legacyConfig, $newConfig
-```
-
-The hashes must match. Repair and uninstall must leave the new file unchanged.
-
 ### Live vvmux uninstall refusal
 
 Create a detached session, then attempt uninstall:
