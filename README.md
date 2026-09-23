@@ -15,7 +15,7 @@ window. One terminal, built for the two users who share it: you and your agent.
 
 ### Speed you can feel
 
-Vivido is one of the fastest terminal, ([see benchmark](docs/benchmarks.md) vivido is the fastest on benchmark average).
+Vivido is one of the fastest terminals, ([see benchmark](docs/benchmarks.md), vivido is the fastest on benchmark average).
 
 Text is rendered on the GPU through [wgpu](https://github.com/gfx-rs/wgpu),
 riding Metal on macOS, DirectX 12 on Windows, and Vulkan on Linux.
