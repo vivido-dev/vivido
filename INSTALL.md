@@ -50,7 +50,9 @@ The consumer EXE also installs PowerShell 7 LTS when absent and provisions WSL w
 standalone MSI is intended for managed systems where those prerequisites already exist. See
 [`windows/README.md`](windows/README.md) for signing, packaging, silent-install, and release steps.
 See [`windows/LOCAL-TESTING.md`](windows/LOCAL-TESTING.md) for a complete local Windows build and
-installation-verification procedure.
+installation-verification procedure. See [Using Vivido on Windows](docs/windows.md) for the
+PowerShell and WSL shortcuts, installing the `vivido` terminfo entry inside WSL, and other
+Windows-specific notes.
 
 Build from a Visual Studio Developer Command Prompt with the Rust MSVC toolchain:
 
