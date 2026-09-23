@@ -13,7 +13,7 @@ use crate::terminal::grid::{Dimensions, GridCell, Indexed};
 use crate::terminal::index::{Boundary, Column, Line, Point, Side};
 use crate::terminal::term::Term;
 use crate::terminal::term::cell::{Cell, Flags};
-use crate::terminal::vte::ansi::CursorShape;
+use crate::terminal::vvte::ansi::CursorShape;
 
 /// A Point and side within that point.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]

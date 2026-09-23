@@ -30,6 +30,16 @@ live_config_reload = true
 ipc_socket = true
 
 # ─────────────────────────────────────────────────────────────────────────────
+# updates
+# ─────────────────────────────────────────────────────────────────────────────
+[updates]
+# Allow Vivido and embedding applications to check for suite updates.
+enabled = true
+
+# Check quietly after graphical startup. No installer is downloaded without a click.
+startup_check = true
+
+# ─────────────────────────────────────────────────────────────────────────────
 # message_bar
 # ─────────────────────────────────────────────────────────────────────────────
 [message_bar]
@@ -105,6 +115,10 @@ history = 10000
 
 # Lines scrolled per wheel/step increment.
 multiplier = 3
+
+# Show the overlay scrollbar while scrolling, dragging it, or hovering its gutter.
+# Never shown on the alternate screen or over pane overlays.
+# scrollbar = true
 
 # ─────────────────────────────────────────────────────────────────────────────
 # font
@@ -333,7 +347,7 @@ command = "xdg-open"          # Linux
 # IncreaseFontSize, DecreaseFontSize, ResetFontSize, Scroll*{LineUp,PageDown,ToTop,…},
 # SearchForward, SearchBackward, ToggleFullscreen, ToggleMaximized, SpawnNewInstance,
 # CreateNewWindow, CreateNewTab, SelectNextTab, SelectPreviousTab, SelectTab1…SelectTab9,
-# SelectLastTab, Quit, Hide, Minimize, ClearHistory, ReceiveChar, None, …
+# SelectLastTab, CheckForUpdates, Quit, Hide, Minimize, ClearHistory, ReceiveChar, None, …
 # (See configuration.md for the complete list. Vivido has no vi-mode actions.)
 
 # [[keyboard.bindings]]

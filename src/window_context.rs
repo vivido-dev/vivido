@@ -20,9 +20,12 @@ use std::sync::Arc;
 #[cfg(any(unix, windows))]
 use std::sync::Mutex;
 #[cfg(windows)]
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
+#[cfg(any(unix, windows))]
+use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(windows)]
 use std::sync::mpsc::{self, SyncSender, TrySendError};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 #[cfg(any(unix, windows))]
@@ -53,15 +56,15 @@ use crate::terminal::index::Direction;
 #[cfg(any(unix, windows))]
 use crate::terminal::index::{Column, Line};
 use crate::terminal::sync::FairMutex;
-use crate::terminal::term::Term;
 #[cfg(any(unix, windows))]
 use crate::terminal::term::TermMode;
 #[cfg(any(unix, windows))]
 use crate::terminal::term::cell::Flags;
 use crate::terminal::term::test::TermSize;
+use crate::terminal::term::{ClipboardType, Term};
 use crate::terminal::tty;
 #[cfg(any(unix, windows))]
-use crate::terminal::vte::ansi::{Color, NamedColor};
+use crate::terminal::vvte::ansi::{Color, NamedColor};
 
 #[cfg(any(unix, windows))]
 use crate::automation::{AutomationWindowState, Transcript};
@@ -71,6 +74,7 @@ use crate::cli::{
     IpcMousePosition, IpcSignalName,
 };
 use crate::cli::{ParsedOptions, VividTarget, WindowOptions};
+use crate::client_fault::{ClientFault, ClientHealth};
 use crate::clipboard::Clipboard;
 use crate::config::UiConfig;
 use crate::display::Display;
@@ -78,6 +82,7 @@ use crate::display::Display;
 use crate::display::ScreenshotReadback;
 #[cfg(any(unix, windows))]
 use crate::display::color::{DIM_FACTOR, Rgb};
+use crate::display::window::initial_theme;
 use crate::event::{
     ActionContext, Event, EventProxy, EventSink, EventType, LoopHandle, Mouse, SearchState,
     TouchPurpose,
@@ -101,7 +106,20 @@ use crate::vivid::scene::TrackWaitEvaluation;
 #[cfg(any(unix, windows))]
 type AutomationResize = (u32, u32, Option<(u16, u16)>);
 
+type PtyWorker =
+    JoinHandle<(PtyEventLoop<tty::Pty, EventProxy>, crate::terminal::event_loop::State)>;
+
 const VIVID_RESIZE_SETTLE_DELAY: Duration = Duration::from_millis(120);
+
+#[cfg(any(unix, windows))]
+fn ui_paste_needs_action_context(search_active: bool, overlay_focused: bool) -> bool {
+    search_active || overlay_focused
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+fn terminal_accessibility_focused(terminal_focused: bool, overlay_focused: bool) -> bool {
+    terminal_focused && !overlay_focused
+}
 
 /// Maximum delay between directly presented frames during continuous Windows input or PTY output.
 #[cfg(windows)]
@@ -124,6 +142,31 @@ impl Notify for AutomationNotifier {
         self.0.borrow_mut().extend_from_slice(bytes.into().as_ref());
         Ok(())
     }
+}
+
+/// One `find-text` match with cell and pixel rectangles.
+#[cfg(any(unix, windows))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FoundTextMatch {
+    /// Viewport row, zero-based from the visible top.
+    pub row: i32,
+    /// First covered cell column.
+    pub col_start: usize,
+    /// Last covered cell column (inclusive).
+    pub col_end: usize,
+    /// The matched text.
+    pub text: String,
+    /// Physical-pixel rectangles in the client area, matching mouse input coordinates.
+    pub pixel_x: u32,
+    pub pixel_y: u32,
+    pub pixel_width: u32,
+    pub pixel_height: u32,
+}
+
+/// Snap a client-area pixel metric to an integer coordinate.
+#[cfg(any(unix, windows))]
+fn snap_pixel(value: f32) -> u32 {
+    value.round().clamp(0.0, u32::MAX as f32) as u32
 }
 
 /// Event context for one individual Vivido window.
@@ -157,6 +200,9 @@ pub struct WindowContext {
     window_config: ParsedOptions,
     config: Rc<UiConfig>,
     vivid_service: VividService,
+    vivid_target: VividTarget,
+    restart_pty_config: tty::Options,
+    io_thread: Option<PtyWorker>,
     vivid_resize_settled: Option<u64>,
     #[cfg(any(unix, windows))]
     ipc_window_id: u64,
@@ -166,6 +212,32 @@ pub struct WindowContext {
     screenshot_busy: bool,
     #[cfg(any(unix, windows))]
     pub automation: AutomationWindowState,
+    client_health: ClientHealth,
+    last_client_fault: Option<ClientFault>,
+}
+
+/// The next public window ID this process will hand out.
+///
+/// Small and monotonic, rather than the winit window ID this used to be. A public window ID is
+/// also an agent-mesh address segment, and an address index is a `u32`; winit IDs on Wayland start
+/// at 2^63, so every pane published an address that could not parse and no agent could bind from
+/// inside one. Nothing converts this value back into a `WindowId` — every lookup searches for it —
+/// so its only requirements are that it is unique within the process and never reused.
+#[cfg(any(unix, windows))]
+static NEXT_IPC_WINDOW_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Resolve a window's public ID, honoring one the caller named.
+#[cfg(any(unix, windows))]
+fn assign_ipc_window_id(requested: Option<u64>) -> u64 {
+    match requested {
+        // A caller that names its own ID keeps it, and the counter steps past it so a later
+        // automatic ID cannot collide with one that was claimed explicitly.
+        Some(id) => {
+            NEXT_IPC_WINDOW_ID.fetch_max(id.saturating_add(1), Ordering::Relaxed);
+            id
+        },
+        None => NEXT_IPC_WINDOW_ID.fetch_add(1, Ordering::Relaxed),
+    }
 }
 
 /// Active Windows wake for the final update accumulated by the direct-draw rate limiter.
@@ -240,17 +312,19 @@ const SCREENSHOT_READBACK_TIMEOUT: Duration = Duration::from_secs(5);
 ///
 /// Wheel input is intentionally latency-sensitive: a freely spinning wheel can keep the native
 /// message queue busy indefinitely, so neither `AboutToWait` nor a scheduled `Frame` user event is
-/// guaranteed to run promptly. Windows keyboard, IME, and pointer events must also flush
-/// immediately. Staged keyboard events have not reached the child yet, while staged pointer events
-/// have not updated selection state. The native redraw request still coalesces outstanding paints.
+/// guaranteed to run promptly. Keyboard, IME, and focus events must also flush immediately on
+/// macOS and Windows. Staged keyboard events have not reached the child yet, while staged focus
+/// events have not updated IME state. Windows pointer events also update selection state. The
+/// native redraw request still coalesces outstanding paints.
 pub(crate) fn is_latency_sensitive_window_event(event: &WindowEvent) -> bool {
     match event {
         WindowEvent::MouseWheel { .. } => cfg!(any(target_os = "linux", target_os = "windows")),
-        #[cfg(windows)]
+        #[cfg(any(target_os = "macos", windows))]
         WindowEvent::KeyboardInput { is_synthetic: false, .. }
         | WindowEvent::Ime(_)
-        | WindowEvent::MouseInput { .. }
-        | WindowEvent::CursorMoved { .. } => true,
+        | WindowEvent::Focused(_) => true,
+        #[cfg(windows)]
+        WindowEvent::MouseInput { .. } | WindowEvent::CursorMoved { .. } => true,
         _ => false,
     }
 }
@@ -360,10 +434,12 @@ impl WindowContext {
     ) -> Result<Self, Box<dyn Error>> {
         let mut pty_config = config.pty_config();
         options.terminal_options.override_pty_config(&mut pty_config);
+        let restart_pty_config = pty_config.clone();
+        let vivid_target = options.vivid_target;
 
         let preserve_title = options.window_identity.title.is_some();
         #[cfg(any(unix, windows))]
-        let ipc_window_id = options.ipc_window_id.unwrap_or_else(|| display.window.id().into());
+        let ipc_window_id = assign_ipc_window_id(options.ipc_window_id);
 
         info!(
             "PTY dimensions: {:?} x {:?}",
@@ -398,6 +474,12 @@ impl WindowContext {
                 service.root_secret(),
                 ipc_window_id,
             );
+            service.update_overlay_viewport(
+                f64::from(display.size_info.width()),
+                f64::from(display.size_info.height()),
+                display.window.scale_factor,
+            );
+            service.set_overlay_font(config.font.clone());
             display.set_vivid_scene(service.scene());
             service
         };
@@ -411,24 +493,44 @@ impl WindowContext {
         let terminal = Arc::new(FairMutex::new(terminal));
 
         #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
-        let accessibility = if terminal_document_enabled() {
-            let snapshot = AccessibilitySnapshot::new(
-                &terminal.lock(),
-                display.size_info,
-                display.window.title(),
-            );
+        let accessibility = {
+            let document = terminal_document_enabled();
+            let snapshot = if document {
+                AccessibilitySnapshot::new(
+                    &terminal.lock(),
+                    display.size_info,
+                    display.window.title(),
+                )
+            } else {
+                AccessibilitySnapshot::window(
+                    display.size_info,
+                    display.window.title(),
+                    terminal.lock().is_focused,
+                )
+            };
+            let accessibility_target =
+                if document { options.vivid_target } else { VividTarget::Desktop };
+            // An assistive-technology request arrives on the platform's own thread; this hands
+            // it to the presenter, which owns the lane that reaches the application. The AppKit
+            // adapter builds its own tree, so only the AccessKit backends take the callback.
+            #[cfg(any(target_os = "linux", target_os = "windows"))]
+            let invoke = vivid_service.accessibility_actions();
             #[cfg(target_os = "macos")]
             let state = (!display.window.is_headless() && !display.window.is_embedded())
-                .then(|| AccessibilityState::new(&display.window, options.vivid_target, snapshot));
+                .then(|| AccessibilityState::new(&display.window, accessibility_target, snapshot));
             #[cfg(any(target_os = "linux", target_os = "windows"))]
             let state = event_loop_handle.winit().and_then(|event_loop| {
                 display.window.winit_window().map(|window| {
-                    AccessibilityState::new(event_loop, window, options.vivid_target, snapshot)
+                    AccessibilityState::new(
+                        event_loop,
+                        window,
+                        accessibility_target,
+                        snapshot,
+                        invoke.callback(),
+                    )
                 })
             });
             state
-        } else {
-            None
         };
 
         // Map only after any enabled native accessibility adapter has been installed.
@@ -475,7 +577,7 @@ impl WindowContext {
         let loop_tx = event_loop.channel();
 
         // Kick off the I/O thread.
-        let _io_thread = event_loop.spawn();
+        let io_thread = event_loop.spawn();
 
         // Start cursor blinking, in case `Focused` isn't sent on startup.
         if config.cursor.style().blinking {
@@ -513,6 +615,9 @@ impl WindowContext {
             touch: Default::default(),
             dirty: Default::default(),
             vivid_service,
+            vivid_target,
+            restart_pty_config,
+            io_thread: Some(io_thread),
             vivid_resize_settled: None,
             #[cfg(any(unix, windows))]
             ipc_window_id,
@@ -522,6 +627,8 @@ impl WindowContext {
             screenshot_busy: false,
             #[cfg(any(unix, windows))]
             automation: AutomationWindowState::new(0, transcript),
+            client_health: ClientHealth::Healthy,
+            last_client_fault: None,
         })
     }
 
@@ -536,6 +643,7 @@ impl WindowContext {
         self.terminal.lock().set_options(self.config.term_options());
         self.notifications.set_enabled(self.config.terminal.osc_notifications);
         self.vivid_service.set_remote_drop_paste(self.config.file_drop.paste_remote_path);
+        self.vivid_service.set_overlay_font(self.config.font.clone());
 
         // Reload cursor if its thickness has changed.
         if (old_config.cursor.thickness() - self.config.cursor.thickness()).abs() > f32::EPSILON {
@@ -554,7 +662,7 @@ impl WindowContext {
         }
 
         // Always reload the theme to account for auto-theme switching.
-        self.display.window.set_theme(self.config.window.theme());
+        self.display.window.set_theme(initial_theme(&self.config));
 
         // Update display if either padding options or resize increments were changed.
         let window_config = &old_config.window;
@@ -634,6 +742,17 @@ impl WindowContext {
         self.update_config(config);
     }
 
+    /// Release window-sized GPU memory after this window has stayed hidden.
+    ///
+    /// Scheduled by the occlusion handler. Re-checked here because the window may have been shown
+    /// again between the timer being set and it firing.
+    pub fn release_while_hidden(&mut self) {
+        if !self.occluded {
+            return;
+        }
+        self.display.release_while_hidden();
+    }
+
     /// Draw the window.
     pub fn draw(&mut self, scheduler: &mut Scheduler) -> bool {
         self.display.window.requested_redraw = false;
@@ -648,8 +767,23 @@ impl WindowContext {
         // Force the display to process any pending display update.
         self.display.process_renderer_update();
 
-        // Request immediate re-draw if visual bell animation is not finished yet.
-        if !self.display.visual_bell.completed() {
+        // Redraw the window.
+        let terminal = self.terminal.lock();
+        let presented = self.display.draw(
+            terminal,
+            scheduler,
+            &self.message_buffer,
+            &self.config,
+            &mut self.search_state,
+        );
+
+        // Request immediate re-draw if the visual bell or scrollbar animation is not done
+        // yet. This must run after the draw: the scrollbar wakes inside it, when the
+        // terminal's display offset is sampled, so checking earlier would miss the wake
+        // frame and let the fade stall after a single presentation.
+        if !self.display.visual_bell.completed()
+            || self.display.scrollbar.is_animating_at(Instant::now())
+        {
             // We can get an OS redraw which bypasses Vivido's frame throttling, thus
             // marking the window as dirty when we don't have frame yet.
             if self.display.window.has_frame {
@@ -659,15 +793,11 @@ impl WindowContext {
             }
         }
 
-        // Redraw the window.
-        let terminal = self.terminal.lock();
-        self.display.draw(
-            terminal,
-            scheduler,
-            &self.message_buffer,
-            &self.config,
-            &mut self.search_state,
-        )
+        let area = self.vivid_service.overlay_editor_area().map(|(x, y, w, h)| {
+            (winit::dpi::PhysicalPosition::new(x, y), winit::dpi::PhysicalSize::new(w, h))
+        });
+        self.display.window.set_overlay_ime_area(area);
+        presented
     }
 
     /// Present latency-sensitive state without waiting for Windows to synthesize `WM_PAINT`.
@@ -776,9 +906,9 @@ impl WindowContext {
 
                 // Continue to process all pending events.
             },
-            // Windows keyboard, IME, and pointer input and a freely spinning wheel can keep the
-            // platform message queue non-empty, preventing `AboutToWait` from arriving. Flush all
-            // staged input on each latency-sensitive event so it takes effect without an idle turn.
+            // Keyboard, IME, and focus input must not wait for an idle turn. On Windows, pointer
+            // input and a freely spinning wheel can also keep the native message queue busy.
+            // Flush all staged input on each latency-sensitive event.
             event if flush_staged_input => {
                 self.event_queue.push(event);
             },
@@ -786,6 +916,12 @@ impl WindowContext {
                 self.event_queue.push(event);
                 return;
             },
+        }
+
+        // An overlay only reaches the clipboard through here: it asks, the host validates, and
+        // the thread that owns the clipboard performs the write.
+        for text in self.vivid_service.take_overlay_clipboard() {
+            clipboard.store(ClipboardType::Clipboard, text);
         }
 
         let mut terminal = self.terminal.lock();
@@ -860,6 +996,11 @@ impl WindowContext {
 
             self.dirty = true;
             let changed = self.vivid_service.update_metrics(self.display.size_info.into());
+            self.vivid_service.update_overlay_viewport(
+                f64::from(self.display.size_info.width()),
+                f64::from(self.display.size_info.height()),
+                self.display.window.scale_factor,
+            );
             if let Some(generation) = changed {
                 let window_id = self.id();
                 let timer_id = TimerId::new(Topic::VividResizeSettled, window_id);
@@ -920,14 +1061,27 @@ impl WindowContext {
             .or_else(|| self.probed_working_directory())
     }
 
+    /// Current directory for display, preserving the shell's namespace (including WSL paths).
+    /// This path need not be usable as a native process launch directory.
+    pub fn display_directory(&self) -> Option<PathBuf> {
+        self.terminal
+            .lock()
+            .working_directory()
+            .map(PathBuf::from)
+            .or_else(|| self.probed_working_directory())
+    }
+
     /// Immutable accessibility state for composition by a containing shell.
     #[cfg(target_os = "linux")]
     pub(crate) fn accessibility_snapshot(&self) -> AccessibilitySnapshot {
-        AccessibilitySnapshot::new(
+        let mut snapshot = AccessibilitySnapshot::new(
             &self.terminal.lock(),
             self.display.size_info,
             self.display.window.title(),
-        )
+        );
+        snapshot.focused =
+            terminal_accessibility_focused(snapshot.focused, self.vivid_service.overlay_focused());
+        snapshot
     }
 
     /// Current terminal content size in physical pixels.
@@ -955,10 +1109,28 @@ impl WindowContext {
         self.ipc_window_id
     }
 
+    /// Stable creation order, used to sort multi-window results deterministically.
+    #[cfg(any(unix, windows))]
+    pub fn creation_index(&self) -> u64 {
+        self.automation.creation_index
+    }
+
     /// Whether this terminal currently has keyboard focus.
     #[cfg(any(unix, windows))]
     pub fn is_focused(&self) -> bool {
         self.terminal.lock().is_focused
+    }
+
+    /// Apply keyboard focus selected by this window's native or offscreen host.
+    #[cfg(any(unix, windows))]
+    pub fn set_automation_focused(&mut self, focused: bool) {
+        self.terminal.lock().is_focused = focused;
+    }
+
+    /// Health of the untrusted client currently attached to this pane.
+    #[cfg(any(unix, windows))]
+    pub fn client_health(&self) -> ClientHealth {
+        self.client_health
     }
 
     /// Write bytes and notify the main event loop after the PTY master accepted all of them.
@@ -1005,6 +1177,49 @@ impl WindowContext {
         }
     }
 
+    /// Capture viewport text restricted to a wait scope, without styling or display overlays.
+    #[cfg(any(unix, windows))]
+    pub fn scoped_text(&self, scope: crate::automation::TextScope) -> String {
+        use crate::automation::TextScope as Scope;
+        let terminal = self.terminal.lock();
+        match scope {
+            Scope::Full => terminal.visible_text(),
+            Scope::Line(row) => terminal.viewport_line_text(row),
+            Scope::Rect { col, row, width, height } => {
+                terminal.viewport_rect_text(col, row, width, height)
+            },
+        }
+    }
+
+    /// Search the visible viewport for a pattern, returning cell and pixel rectangles.
+    ///
+    /// Pixel rectangles share the client-area origin of mouse input, so a match center pipes
+    /// straight into a mouse click.
+    #[cfg(any(unix, windows))]
+    pub fn find_text(&self, needle: &[u8], regex: bool, max_matches: usize) -> Vec<FoundTextMatch> {
+        let terminal = self.terminal.lock();
+        let size = self.display.size_info;
+        terminal
+            .find_viewport_text(needle, regex, max_matches)
+            .into_iter()
+            .map(|found| {
+                let cells = found.col_end.saturating_sub(found.col_start).saturating_add(1) as f32;
+                FoundTextMatch {
+                    row: found.row,
+                    col_start: found.col_start,
+                    col_end: found.col_end,
+                    text: found.text,
+                    pixel_x: snap_pixel(
+                        size.padding_x() + found.col_start as f32 * size.cell_width(),
+                    ),
+                    pixel_y: snap_pixel(size.padding_y() + found.row as f32 * size.cell_height()),
+                    pixel_width: snap_pixel(cells * size.cell_width()).max(1),
+                    pixel_height: snap_pixel(size.cell_height()).max(1),
+                }
+            })
+            .collect()
+    }
+
     /// Build application-directed paste bytes with the same safety filtering as local paste.
     #[cfg(any(unix, windows))]
     pub fn application_paste(&self, text: &str) -> Vec<u8> {
@@ -1031,7 +1246,10 @@ impl WindowContext {
         clipboard: &mut Clipboard,
         scheduler: &mut Scheduler,
     ) -> Vec<u8> {
-        if self.search_state.regex().is_none() {
+        if !ui_paste_needs_action_context(
+            self.search_state.regex().is_some(),
+            self.vivid_service.overlay_focused(),
+        ) {
             return self.application_paste(text);
         }
 
@@ -1074,6 +1292,107 @@ impl WindowContext {
     #[cfg(any(unix, windows))]
     pub fn terminal_mode(&self) -> TermMode {
         *self.terminal.lock().mode()
+    }
+
+    /// Queue a deterministic reset of parser and client-controlled terminal state.
+    #[cfg(any(unix, windows))]
+    pub fn reset_terminal_client(&mut self, completion: u64) -> Result<(), IpcError> {
+        if self.io_thread.as_ref().is_none_or(JoinHandle::is_finished) {
+            return Err(IpcError::new("pty_closed", "terminal PTY worker has exited"));
+        }
+        self.notifier.0.send(Msg::ResetClient { completion }).map_err(|error| {
+            IpcError::new("pty_closed", format!("failed to reset terminal: {error}"))
+        })?;
+        self.vivid_service.disconnect_clients();
+        self.client_health = ClientHealth::Recovering;
+        Ok(())
+    }
+
+    /// Replace this pane's PTY and Vivid service without changing its window or stable IPC ID.
+    #[cfg(any(unix, windows))]
+    pub fn restart_terminal_client(&mut self) -> Result<(), IpcError> {
+        let mut pty_config = self.restart_pty_config.clone();
+        let new_service = match self.vivid_target {
+            VividTarget::Terminal => VividService::start(
+                self.display.size_info.into(),
+                self.event_proxy.clone(),
+                self.config.file_drop.paste_remote_path,
+            ),
+            VividTarget::Desktop => {
+                VividService::start_desktop(self.display.size_info.into(), self.event_proxy.clone())
+            },
+        }
+        .map_err(|error| {
+            IpcError::new("invalid_state", format!("failed to restart Vivid service: {error}"))
+        })?;
+        configure_vivid_pty_environment(
+            &mut pty_config.env,
+            new_service.control_endpoint(),
+            new_service.root_secret(),
+            self.ipc_window_id,
+        );
+        let pty = tty::new(&pty_config, self.display.size_info.into(), self.ipc_window_id)
+            .map_err(|error| {
+                IpcError::new("invalid_state", format!("failed to restart PTY: {error}"))
+            })?;
+        #[cfg(not(windows))]
+        let master_fd = pty.file().as_raw_fd();
+        #[cfg(not(windows))]
+        let shell_pid = pty.child().id();
+        #[cfg(windows)]
+        let shell_pid = pty.child_watcher().pid().map_or(0, std::num::NonZeroU32::get);
+        let event_loop = PtyEventLoop::new(
+            Arc::clone(&self.terminal),
+            self.event_proxy.clone(),
+            pty,
+            pty_config.drain_on_exit,
+            self.config.debug.ref_test,
+            self.automation.transcript.clone(),
+        )
+        .map_err(|error| {
+            IpcError::new("invalid_state", format!("failed to restart PTY worker: {error}"))
+        })?;
+
+        let _ = self.notifier.0.send(Msg::Shutdown);
+        if let Some(worker) = self.io_thread.take() {
+            let _ = worker.join();
+        }
+        // A fresh PTY means a fresh shell: stale prompt state would resolve semantic waits
+        // against a command line that no longer exists.
+        self.automation.shell = crate::automation::CommandExecutionState::default();
+        self.terminal.lock().reset_client_state();
+        self.display.set_vivid_scene(new_service.scene());
+        self.vivid_service = new_service;
+        self.vivid_service.set_overlay_font(self.config.font.clone());
+        self.vivid_service.update_overlay_viewport(
+            f64::from(self.display.size_info.width()),
+            f64::from(self.display.size_info.height()),
+            self.display.window.scale_factor,
+        );
+        #[cfg(not(windows))]
+        {
+            self.master_fd = master_fd;
+        }
+        self.shell_pid = shell_pid;
+        self.notifier = Notifier(event_loop.channel());
+        self.io_thread = Some(event_loop.spawn());
+        self.automation.exit_status = None;
+        self.complete_client_reset();
+        Ok(())
+    }
+
+    #[cfg(any(unix, windows))]
+    pub(crate) fn record_client_fault(&mut self, fault: ClientFault, quarantined: bool) {
+        if quarantined {
+            self.client_health = ClientHealth::Quarantined;
+        }
+        self.last_client_fault = Some(fault);
+    }
+
+    #[cfg(any(unix, windows))]
+    pub(crate) fn complete_client_reset(&mut self) {
+        self.client_health = ClientHealth::Healthy;
+        self.dirty = true;
     }
 
     /// Process a neutral key through Vivido's normal UI input processor.
@@ -1953,9 +2272,6 @@ impl WindowContext {
     /// Publish a coalesced read-only accessibility snapshot.
     #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
     pub fn sync_accessibility(&mut self) {
-        if !terminal_document_enabled() {
-            return;
-        }
         let Some(accessibility) = &mut self.accessibility else { return };
 
         // A retained terminal document carries per-cell text geometry for the entire scrollback.
@@ -1968,11 +2284,22 @@ impl WindowContext {
         }
 
         let terminal = self.terminal.lock();
-        let snapshot = AccessibilitySnapshot::new(
-            &terminal,
-            self.display.size_info,
-            self.display.window.title(),
-        );
+        let mut snapshot = if terminal_document_enabled() {
+            AccessibilitySnapshot::new(
+                &terminal,
+                self.display.size_info,
+                self.display.window.title(),
+            )
+        } else {
+            AccessibilitySnapshot::window(
+                self.display.size_info,
+                self.display.window.title(),
+                terminal.is_focused,
+            )
+        };
+        snapshot.semantics = self.vivid_service.overlay_semantics();
+        snapshot.focused =
+            terminal_accessibility_focused(snapshot.focused, self.vivid_service.overlay_focused());
         drop(terminal);
         accessibility.update(snapshot);
     }
@@ -2006,6 +2333,8 @@ impl WindowContext {
             "padding": {"x": size.padding_x(), "y": size.padding_y()},
             "position": position.map(|position| json_value!({"x": position.x, "y": position.y})),
             "process": exit_status_json(self.automation.exit_status.as_ref()),
+            "client_health": self.client_health.as_str(),
+            "last_client_fault": self.last_client_fault.as_ref().map(client_fault_json),
             "sequences": {
                 "screen": self.automation.screen_sequence,
                 "frame": self.automation.frame_sequence,
@@ -2016,7 +2345,7 @@ impl WindowContext {
 
     /// Detailed, secret-free terminal/window inspection.
     #[cfg(any(unix, windows))]
-    pub fn automation_inspect(&self, event_sequence: u64) -> Value {
+    pub fn automation_inspect(&self, event_sequence: u64, live_pty_count: usize) -> Value {
         let terminal = self.terminal.lock();
         let grid = terminal.grid();
         let size = self.display.size_info;
@@ -2049,12 +2378,20 @@ impl WindowContext {
         };
         #[cfg(windows)]
         let echo = None::<bool>;
-        let (text_scene_builds, cached_scene_frames, media_metrics) =
+        #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+        let native_accessibility = self.accessibility.is_some();
+        #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+        let native_accessibility = false;
+        let (text_scene_builds, cached_scene_frames, media_metrics, overlay_metrics) =
             self.display.optimization_metrics();
 
         json_value!({
             "window": self.automation_summary_with_terminal(&terminal),
             "cell": {"width": size.cell_width(), "height": size.cell_height()},
+            "ime_cursor_area": self.display.window.ime_area().map(|(overlay,position,size)| json_value!({
+                "source": if overlay {"overlay"} else {"terminal"},
+                "x":position.x,"y":position.y,"width":size.width,"height":size.height,
+            })),
             "scale_factor": self.display.window.scale_factor,
             "scrollback_size": grid.history_size(),
             "display_offset": grid.display_offset(),
@@ -2063,13 +2400,30 @@ impl WindowContext {
             "cursor": {"line": cursor.line.0, "column": cursor.column.0},
             "selection": selection.map(selection_json),
             "shell_pid": self.shell_pid,
+            "pty_state": if self.automation.exit_status.is_some() { "exited" } else { "running" },
+            "active_waiters_count": self.automation.waiters.len(),
+            "system_memory_mb": process_memory_mb(),
+            "conpty_handles": live_pty_count,
             "foreground_process_group_id": foreground_pgid,
             "executable": executable,
             "current_directory": current_directory,
             "echo": echo,
             "exit_status": exit_status_json(self.automation.exit_status.as_ref()),
             "event_sequence": event_sequence,
+            "client_health": self.client_health.as_str(),
+            "last_client_fault": self.last_client_fault.as_ref().map(client_fault_json),
             "vivid_streaming": self.vivid_service.automation_streaming_metrics(),
+            "vivid_overlay": self.vivid_service.automation_overlay_metrics(),
+            "accessibility": {
+                "native_adapter": native_accessibility,
+                "terminal_document": terminal_document_enabled(),
+                "terminal_focused": terminal_accessibility_focused(
+                    terminal.is_focused,
+                    self.vivid_service.overlay_focused(),
+                ),
+                // Whether an overlay has published a semantic tree for what it is showing.
+                "overlay_semantics": self.vivid_service.overlay_semantics().is_some(),
+            },
             "render_optimization": {
                 "text_scene_builds": text_scene_builds,
                 "cached_scene_frames": cached_scene_frames,
@@ -2078,6 +2432,9 @@ impl WindowContext {
                 "uploaded_frames": media_metrics.frames,
                 "uploaded_pixels": media_metrics.uploaded_pixels,
                 "full_frame_pixels": media_metrics.full_frame_pixels,
+                "overlay_render_passes": overlay_metrics.render_passes,
+                "overlay_skipped_passes": overlay_metrics.skipped_passes,
+                "overlay_target_allocations": overlay_metrics.target_allocations,
             },
             "limits": {
                 "transcript_bytes": crate::automation::TRANSCRIPT_CAPACITY,
@@ -2234,7 +2591,12 @@ impl WindowContext {
     }
 
     #[cfg(any(unix, windows))]
-    pub fn automation_diagnose(&self, event_sequence: u64, trace_limit: u16) -> Value {
+    pub fn automation_diagnose(
+        &self,
+        event_sequence: u64,
+        trace_limit: u16,
+        live_pty_count: usize,
+    ) -> Value {
         let sessions = self.automation_vivid_sessions();
         let surfaces = self.automation_vivid_surfaces();
         let tracks = self.automation_vivid_tracks();
@@ -2257,7 +2619,7 @@ impl WindowContext {
                 "screen_sequence": self.automation.screen_sequence,
                 "frame_sequence": self.automation.frame_sequence,
             },
-            "window": self.automation_inspect(event_sequence),
+            "window": self.automation_inspect(event_sequence, live_pty_count),
             "renderer": {
                 "frame_sequence": self.automation.frame_sequence,
                 "has_presented_frame": self.automation.frame_sequence != 0,
@@ -2276,6 +2638,41 @@ impl WindowContext {
                 ),
             },
         })
+    }
+
+    /// Start a file drop for an owner-only automation request (`vivido msg drop-file`).
+    ///
+    /// `at` names a cell to drop onto; its centre is hit-tested exactly as a pointer drop would
+    /// be, so a surface with its own binding receives it.
+    pub(crate) fn automation_drop_file(
+        &self,
+        path: &std::path::Path,
+        at: Option<(u16, u16)>,
+        type_path: bool,
+    ) -> Result<
+        (crate::vivid::file_drop::DropHandle, String, u64),
+        crate::vivid::file_drop::LocalDropDisposition,
+    > {
+        let size = self.display.size_info;
+        let display_offset = self.terminal.lock().grid().display_offset();
+        let pixel = at.map(|(column, row)| {
+            let x = size.padding_x() + (f32::from(column) + 0.5) * size.cell_width();
+            let y = size.padding_y() + (f32::from(row) + 0.5) * size.cell_height();
+            (x as usize, y as usize)
+        });
+        self.vivid_service.automation_drop_file(
+            path,
+            pixel.map(|(x, y)| (x, y, &size, display_offset)),
+            type_path,
+        )
+    }
+
+    /// Where an automation file drop has got to.
+    pub(crate) fn automation_drop_state(
+        &self,
+        handle: crate::vivid::file_drop::DropHandle,
+    ) -> crate::vivid::file_drop::AutomationDropState {
+        self.vivid_service.automation_drop_state(handle)
     }
 
     #[cfg(any(unix, windows))]
@@ -2689,9 +3086,34 @@ fn configure_vivid_pty_environment(
     root_secret: &str,
     window_id: u64,
 ) {
+    environment
+        .entry("TERM".into())
+        .or_insert_with(|| std::env::var("TERM").unwrap_or_else(|_| "vivido".into()));
+    environment
+        .entry("COLORTERM".into())
+        .or_insert_with(|| std::env::var("COLORTERM").unwrap_or_else(|_| "truecolor".into()));
     environment.insert("VIVID_ENDPOINT_CONTROL".into(), control_endpoint.into());
     environment.insert("VIVID_ROOT_SECRET".into(), root_secret.into());
     environment.insert("VIVIDO_WINDOW_ID".into(), window_id.to_string());
+    // Ambient agent-mesh coordinates, so an agent started in this window can address agents in
+    // other windows and other runtimes. Vivido links no mesh crate and opens no store; these three
+    // strings are the whole integration. A window id survives being moved, which is what makes it
+    // the addressable part (`w`) rather than any position in a tab strip.
+    environment.insert("AGENT_MESH_RUNTIME".into(), crate::session::runtime_kind().into());
+    if let Some(instance) = crate::session::instance_name() {
+        environment.insert("AGENT_MESH_INSTANCE".into(), instance.into());
+    }
+    // An address index is a one-based `u32`. Ids this process assigns always fit, but a caller may
+    // name any `u64` with `--ipc-window-id`. Publish nothing rather than an address that cannot
+    // parse: a window with no position still binds and is still reachable by alias, whereas an
+    // unparsable address fails the bind outright and takes the whole mailbox with it.
+    if (1..=u64::from(u32::MAX)).contains(&window_id) {
+        environment.insert("AGENT_MESH_ADDRESS".into(), format!("w{window_id}"));
+    }
+    environment.insert(
+        "VIVIDO_INPUT_TRANSPORT".into(),
+        if cfg!(windows) { "win32-console" } else { "pty-bytes" }.into(),
+    );
     // ConPTY strips APC control strings before they reach Vivido's terminal parser. Producers
     // must therefore emit the bounded printable marker form that the Windows PTY scanner removes
     // and authenticates before ordinary terminal parsing.
@@ -2721,7 +3143,7 @@ fn vivid_wslenv(inherited: &str) -> String {
     // WSLENV makes WSL create that variable with an empty value when this window does not offer
     // the lane. Producers correctly reject a present-but-empty endpoint as malformed instead of
     // applying the missing-lane fallback.
-    const MANAGED: [&str; 7] = [
+    const MANAGED: [&str; 10] = [
         "VIVID_ENDPOINT_CONTROL",
         "VIVID_ENDPOINT_INTERACTIVE",
         "VIVID_ENDPOINT_REALTIME",
@@ -2729,12 +3151,18 @@ fn vivid_wslenv(inherited: &str) -> String {
         "VIVID_ROOT_SECRET",
         "VIVID_ANCHOR_TRANSPORT",
         "VIVIDO_WINDOW_ID",
+        "VIVIDO_INPUT_TRANSPORT",
+        "TERM",
+        "COLORTERM",
     ];
-    const EXPORTED: [&str; 4] = [
+    const EXPORTED: [&str; 7] = [
         "VIVID_ENDPOINT_CONTROL",
         "VIVID_ROOT_SECRET",
         "VIVID_ANCHOR_TRANSPORT",
         "VIVIDO_WINDOW_ID",
+        "VIVIDO_INPUT_TRANSPORT",
+        "TERM",
+        "COLORTERM",
     ];
 
     let mut entries = inherited
@@ -2754,6 +3182,9 @@ impl Drop for WindowContext {
     fn drop(&mut self) {
         // Shutdown the terminal's PTY.
         let _ = self.notifier.0.send(Msg::Shutdown);
+        if let Some(worker) = self.io_thread.take() {
+            let _ = worker.join();
+        }
     }
 }
 
@@ -2764,6 +3195,49 @@ fn selection_json(selection: crate::terminal::selection::SelectionRange) -> Valu
         "end": {"line": selection.end.line.0, "column": selection.end.column.0},
         "block": selection.is_block,
     })
+}
+
+/// Current process working set in MiB, rounded to one decimal for `inspect` telemetry.
+#[cfg(any(unix, windows))]
+fn process_memory_mb() -> Option<f64> {
+    #[cfg(unix)]
+    {
+        // SAFETY: `usage` is a plain zeroed struct that `getrusage` fills before the
+        // return value is checked; no other thread observes the intermediate state.
+        let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
+        let ok = unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) == 0 };
+        if !ok {
+            return None;
+        }
+        let usage = unsafe { usage.assume_init() };
+        if usage.ru_maxrss <= 0 {
+            return None;
+        }
+        // `ru_maxrss` is kilobytes on Linux and most Unixes, but bytes on macOS.
+        #[cfg(target_os = "macos")]
+        let mib = usage.ru_maxrss as f64 / 1_048_576.0;
+        #[cfg(not(target_os = "macos"))]
+        let mib = usage.ru_maxrss as f64 / 1_024.0;
+        Some((mib * 10.0).round() / 10.0)
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::ProcessStatus::{
+            GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+        };
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        // SAFETY: `counters` is sized and versioned via `cb` exactly as the API requires,
+        // and the current-process pseudo-handle needs no cleanup.
+        unsafe {
+            let mut counters = std::mem::zeroed::<PROCESS_MEMORY_COUNTERS>();
+            counters.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+            if GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, counters.cb) == 0 {
+                return None;
+            }
+            let mib = counters.WorkingSetSize as f64 / 1_048_576.0;
+            Some((mib * 10.0).round() / 10.0)
+        }
+    }
 }
 
 #[cfg(any(unix, windows))]
@@ -2777,6 +3251,15 @@ fn exit_status_json(status: Option<&std::process::ExitStatus>) -> Value {
         }),
         None => json_value!({"state": "running"}),
     }
+}
+
+#[cfg(any(unix, windows))]
+fn client_fault_json(fault: &ClientFault) -> Value {
+    json_value!({
+        "fault_id": fault.id,
+        "class": fault.class.as_str(),
+        "diagnostic": fault.diagnostic,
+    })
 }
 
 #[cfg(unix)]
@@ -2866,6 +3349,8 @@ fn vivid_track_status_json(window_id: u64, status: &crate::vivid::scene::TrackSt
             "audio_rebases": status.metrics.audio_rebases,
         },
         "playback": {
+            "clock_pts_us": status.playback_position_pts_us,
+            "paused": status.playback_paused,
             "state": if status.configuration.mode as u64 == 2 { "timed" } else { "live" },
             "media_epoch": status.state.media_epoch,
         },
@@ -3204,7 +3689,15 @@ fn hash_color<H: Hasher>(color: Option<Color>, hasher: &mut H) {
 
 #[cfg(test)]
 mod vivid_environment_tests {
+    #[cfg(any(unix, windows))]
+    use super::assign_ipc_window_id;
     use super::configure_vivid_pty_environment;
+    #[cfg(any(unix, windows))]
+    use super::process_memory_mb;
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    use super::terminal_accessibility_focused;
+    #[cfg(any(unix, windows))]
+    use super::ui_paste_needs_action_context;
     #[cfg(windows)]
     use super::vivid_wslenv;
     #[cfg(windows)]
@@ -3214,19 +3707,44 @@ mod vivid_environment_tests {
     };
     #[cfg(any(unix, windows))]
     use super::{ResolvedMousePosition, append_mouse_report};
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
     use super::{flushes_staged_input, is_latency_sensitive_input};
     use std::collections::HashMap;
     #[cfg(windows)]
     use std::path::PathBuf;
     #[cfg(any(unix, windows))]
     use winit::dpi::PhysicalPosition;
-    #[cfg(windows)]
+    #[cfg(any(target_os = "macos", windows))]
     use winit::event::Ime;
     #[cfg(any(target_os = "linux", target_os = "windows"))]
-    use winit::event::{DeviceId, Event as WinitEvent, MouseScrollDelta, TouchPhase, WindowEvent};
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    use winit::event::{DeviceId, MouseScrollDelta, TouchPhase};
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    use winit::event::{Event as WinitEvent, WindowEvent};
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
     use winit::window::WindowId;
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn ui_paste_routes_through_a_focused_overlay() {
+        assert!(!ui_paste_needs_action_context(false, false));
+        assert!(ui_paste_needs_action_context(true, false));
+        assert!(ui_paste_needs_action_context(false, true));
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn process_memory_reports_a_positive_working_set() {
+        let mib = process_memory_mb().expect("the working-set query succeeds on this platform");
+        assert!(mib > 0.0, "{mib}");
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    #[test]
+    fn overlay_focus_suppresses_terminal_accessibility_focus() {
+        assert!(terminal_accessibility_focused(true, false));
+        assert!(!terminal_accessibility_focused(true, true));
+        assert!(!terminal_accessibility_focused(false, false));
+    }
 
     #[cfg(any(unix, windows))]
     #[test]
@@ -3295,16 +3813,20 @@ mod vivid_environment_tests {
         assert!(is_latency_sensitive_input(&event));
     }
 
-    #[cfg(windows)]
+    #[cfg(any(target_os = "macos", windows))]
     #[test]
-    fn windows_text_input_flushes_staged_input_without_waiting_for_idle() {
-        let event = WinitEvent::WindowEvent {
-            window_id: WindowId::dummy(),
-            event: WindowEvent::Ime(Ime::Commit("echo hello".into())),
-        };
+    fn text_and_focus_input_flush_staged_input_without_waiting_for_idle() {
+        for window_event in [
+            WindowEvent::Ime(Ime::Commit("echo hello".into())),
+            WindowEvent::Focused(false),
+            WindowEvent::Focused(true),
+        ] {
+            let event =
+                WinitEvent::WindowEvent { window_id: WindowId::dummy(), event: window_event };
 
-        assert!(flushes_staged_input(&event));
-        assert!(is_latency_sensitive_input(&event));
+            assert!(flushes_staged_input(&event));
+            assert!(is_latency_sensitive_input(&event));
+        }
     }
 
     #[cfg(windows)]
@@ -3386,10 +3908,82 @@ mod vivid_environment_tests {
         );
         assert_eq!(environment.get("VIVID_ROOT_SECRET").map(String::as_str), Some("secret"));
         assert_eq!(environment.get("VIVIDO_WINDOW_ID").map(String::as_str), Some("42"));
+        assert_eq!(
+            environment.get("VIVIDO_INPUT_TRANSPORT").map(String::as_str),
+            Some(if cfg!(windows) { "win32-console" } else { "pty-bytes" })
+        );
+        assert!(environment.contains_key("TERM"));
+        assert!(environment.contains_key("COLORTERM"));
         #[cfg(windows)]
         assert_eq!(environment.get("VIVID_ANCHOR_TRANSPORT").map(String::as_str), Some("conpty"));
         #[cfg(not(windows))]
         assert!(!environment.contains_key("VIVID_ANCHOR_TRANSPORT"));
+    }
+
+    #[test]
+    fn child_preserves_custom_term_environment() {
+        let mut environment = HashMap::new();
+        environment.insert("TERM".into(), "custom-term".into());
+        environment.insert("COLORTERM".into(), "custom-color".into());
+        configure_vivid_pty_environment(&mut environment, "tcp:127.0.0.1:1", "secret", 42);
+
+        assert_eq!(environment.get("TERM").map(String::as_str), Some("custom-term"));
+        assert_eq!(environment.get("COLORTERM").map(String::as_str), Some("custom-color"));
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn public_window_ids_are_small_and_monotonic() {
+        // The counter is process-global and other tests share it, so compare, never assert values.
+        let first = assign_ipc_window_id(None);
+        let second = assign_ipc_window_id(None);
+
+        assert!(second > first, "ids advance: {first} then {second}");
+        assert!(
+            u32::try_from(second).is_ok(),
+            "an id must fit an agent-mesh address index, got {second}"
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn a_claimed_window_id_is_kept_and_never_handed_out_again() {
+        let claimed = assign_ipc_window_id(None) + 5_000;
+
+        assert_eq!(assign_ipc_window_id(Some(claimed)), claimed, "a named id is honored");
+        assert!(
+            assign_ipc_window_id(None) > claimed,
+            "the counter steps past a claimed id so it cannot be assigned twice"
+        );
+    }
+
+    #[test]
+    fn child_receives_a_mesh_address_only_when_the_id_can_be_one() {
+        let mut environment = HashMap::new();
+        configure_vivid_pty_environment(&mut environment, "tcp:127.0.0.1:1", "secret", 7);
+        assert_eq!(environment.get("AGENT_MESH_ADDRESS").map(String::as_str), Some("w7"));
+
+        // Winit ids used to land here, and an address index is a one-based `u32`. Publishing one
+        // that cannot parse failed `vvagent bind` outright rather than costing only the position.
+        for unaddressable in [0, u64::from(u32::MAX) + 1, 9_223_372_036_854_775_808] {
+            let mut environment = HashMap::new();
+            configure_vivid_pty_environment(
+                &mut environment,
+                "tcp:127.0.0.1:1",
+                "secret",
+                unaddressable,
+            );
+
+            assert_eq!(
+                environment.get("VIVIDO_WINDOW_ID").map(String::as_str),
+                Some(unaddressable.to_string().as_str()),
+                "the window stays addressable by automation"
+            );
+            assert!(
+                !environment.contains_key("AGENT_MESH_ADDRESS"),
+                "{unaddressable} cannot be an address index, so no address is published"
+            );
+        }
     }
 
     #[cfg(windows)]
@@ -3398,10 +3992,10 @@ mod vivid_environment_tests {
         assert_eq!(
             vivid_wslenv(
                 "GOPATH/p:VIVID_ROOT_SECRET/w:VIVID_ENDPOINT_BULK/u::CARGO_HOME/p:\
-                 VIVID_ENDPOINT_CONTROL/l:VIVIDO_WINDOW_ID/w"
+                 VIVID_ENDPOINT_CONTROL/l:VIVIDO_WINDOW_ID/w:TERM/w:COLORTERM/w"
             ),
             "GOPATH/p:CARGO_HOME/p:VIVID_ENDPOINT_CONTROL/u:VIVID_ROOT_SECRET/u:\
-             VIVID_ANCHOR_TRANSPORT/u:VIVIDO_WINDOW_ID/u"
+             VIVID_ANCHOR_TRANSPORT/u:VIVIDO_WINDOW_ID/u:VIVIDO_INPUT_TRANSPORT/u:TERM/u:COLORTERM/u"
         );
     }
 }

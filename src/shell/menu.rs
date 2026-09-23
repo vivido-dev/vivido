@@ -1,4 +1,4 @@
-//! Dropdown anchored to the tab strip's `+` button.
+//! Dropdown anchored to the tab strip's `˅` button.
 //!
 //! The menu is renderer-independent: it lays itself out against a [`TextSystem`], answers hit tests
 //! and keyboard motion, and paints into a [`Scene`] at a caller-chosen offset. Linux draws that
@@ -25,7 +25,7 @@ const MAX_WIDTH_LOGICAL: f64 = 360.0;
 /// Cap height of the 13px UI font, used to centre a label in its row.
 const LABEL_HEIGHT_LOGICAL: f64 = 17.0;
 
-/// An open `+` menu, positioned in the chrome window's physical coordinates.
+/// An open launch menu, positioned in the chrome window's physical coordinates.
 #[derive(Clone, Debug)]
 pub struct NewTabMenu {
     entries: Vec<LaunchEntry>,

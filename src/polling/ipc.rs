@@ -19,9 +19,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::cli::{
-    IpcAutomationPlan, IpcAutomationPlanStep, IpcCapture, IpcMouseAction, IpcPlanErrorPolicy,
-    IpcRunPlan, IpcVividCommand, IpcWait, IpcWaitCondition, MessageOptions, Options, SocketMessage,
+    IpcAutomationPlan, IpcAutomationPlanStep, IpcCapture, IpcGetText, IpcMouseAction,
+    IpcPlanErrorPolicy, IpcPlanReport, IpcRunPlan, IpcScreenshot, IpcTest, IpcVividCommand,
+    IpcWait, IpcWaitCondition, MessageOptions, Options, SocketMessage,
 };
+use crate::client_fault::{self, ClientFaultClass};
 use crate::event::{Event, EventSink, EventType};
 use crate::polling::transport::{LocalListener, LocalStream};
 use crate::terminal::thread;
@@ -38,6 +40,15 @@ pub const MAX_REPLY_FRAME_BYTES: usize = 16 * 1024 * 1024;
 /// Maximum terminal text returned through IPC.
 pub const MAX_IPC_TEXT_BYTES: usize = MAX_REPLY_FRAME_BYTES;
 
+/// Maximum `find-text` pattern bytes.
+pub const MAX_FIND_TEXT_PATTERN_BYTES: usize = 1024;
+
+/// Maximum `find-text` matches collected from one window.
+pub const MAX_FIND_TEXT_MATCHES_PER_WINDOW: usize = 100;
+
+/// Maximum `find-text` matches across every searched window.
+pub const MAX_FIND_TEXT_MATCHES_TOTAL: usize = 200;
+
 /// Maximum accepted client connections.
 pub const MAX_CONNECTIONS: usize = 32;
 
@@ -48,7 +59,12 @@ pub const MAX_IN_FLIGHT_REQUESTS: usize = 64;
 pub const MAX_SUBSCRIPTIONS: usize = 32;
 
 /// Maximum queued events for one subscriber.
-pub const MAX_SUBSCRIBER_EVENTS: usize = 256;
+///
+/// Sized for agent bursts well above a thousand events: every queued frame is bounded by
+/// [`MAX_REPLY_FRAME_BYTES`], dead clients are reaped by [`IPC_WRITE_TIMEOUT`], and the
+/// [`AutomationHub`](crate::automation::AutomationHub) still reports the exact dropped
+/// `event_sequence` range through `overflow` envelopes when a client falls behind anyway.
+pub const MAX_SUBSCRIBER_EVENTS: usize = 2048;
 
 /// Maximum literal input/paste request.
 pub const MAX_INPUT_BYTES: usize = 1024 * 1024;
@@ -58,6 +74,9 @@ const VIVIDO_SOCKET_ENV: &str = "VIVIDO_SOCKET";
 
 /// Environment variable naming the headless session a client should reach.
 const VIVIDO_SESSION_ENV: &str = "VIVIDO_SESSION";
+
+/// Vivida-side spelling of [`VIVIDO_SESSION_ENV`], honored by the same discovery.
+const VIVIDA_TARGET_ENV: &str = "VIVIDA_TARGET";
 
 /// How this instance describes itself in the `hello` capability document.
 ///
@@ -82,15 +101,20 @@ const IPC_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 pub const METHODS: &[&str] = &[
     "hello",
     "ping",
+    "reset_terminal",
+    "restart_terminal",
     "unsubscribe",
     "create_window",
+    "close_window",
     "config",
     "get_config",
     "typing",
     "get_text",
+    "find_text",
     "screenshot",
     "key",
     "paste",
+    "drop_file",
     "mouse",
     "resize",
     "set_geometry",
@@ -99,6 +123,7 @@ pub const METHODS: &[&str] = &[
     "set_level",
     "focus",
     "signal",
+    "exec",
     "list_windows",
     "inspect",
     "diagnose",
@@ -116,6 +141,8 @@ pub const METHODS: &[&str] = &[
     "wait_screen_stable",
     "wait_frame",
     "wait_exit",
+    "wait_prompt",
+    "wait_command_finish",
     "quit",
     "wait_vivid_track",
     "transcript",
@@ -197,6 +224,7 @@ fn method_class(name: &str) -> (MethodClass, bool) {
         | "ping"
         | "get_config"
         | "get_text"
+        | "find_text"
         | "screenshot"
         | "list_windows"
         | "inspect"
@@ -215,16 +243,20 @@ fn method_class(name: &str) -> (MethodClass, bool) {
         | "wait_screen_stable"
         | "wait_frame"
         | "wait_exit"
+        | "wait_prompt"
+        | "wait_command_finish"
         | "wait_vivid_track"
         | "transcript"
         | "subscribe"
         | "unsubscribe" => (MethodClass::Observe, false),
-        "typing" | "key" | "paste" | "mouse" => (MethodClass::Input, true),
+        "typing" | "key" | "paste" | "mouse" | "drop_file" => (MethodClass::Input, true),
         "create_window" | "resize" | "set_geometry" | "set_geometry_batch" | "set_visible"
         | "set_level" => (MethodClass::Window, true),
         "config" => (MethodClass::Config, true),
-        "focus" | "signal" => (MethodClass::Process, true),
-        "quit" => (MethodClass::Lifecycle, true),
+        "focus" | "signal" | "exec" => (MethodClass::Process, true),
+        "quit" | "reset_terminal" | "restart_terminal" | "close_window" => {
+            (MethodClass::Lifecycle, true)
+        },
         _ => (MethodClass::Extension, true),
     }
 }
@@ -257,11 +289,16 @@ fn advertised_method_capabilities() -> Vec<MethodCapability> {
 }
 
 /// Event kinds advertised by the protocol handshake.
+///
+/// This is also the `subscribe` allowlist, so a kind missing here is one no client can ask for even
+/// though the event loop still delivers it to unfiltered subscriptions. `AutomationHub::emit_payload`
+/// debug-asserts against this list to keep the two from drifting apart again.
 pub const EVENT_KINDS: &[&str] = &[
     "screen_changed",
     "output",
     "frame_presented",
     "title_changed",
+    "directory_changed",
     "focus_changed",
     "resized",
     "moved",
@@ -269,6 +306,8 @@ pub const EVENT_KINDS: &[&str] = &[
     "child_exit",
     "window_created",
     "window_closed",
+    "client_fault",
+    "client_recovered",
     "overflow",
 ];
 
@@ -327,12 +366,29 @@ impl ResponseEnvelope {
 /// Subscription event envelope.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct SubscriptionEventEnvelope {
+    /// The protocol version, the same one requests and responses carry.
+    ///
+    /// This was a literal `1` written when the protocol was version 1, and it stayed behind when
+    /// the protocol moved to 2 — so an event frame disagreed with every other frame on the same
+    /// connection. [`SubscriptionEventEnvelope::new`] is the only place it is set.
     pub version: u16,
     pub subscription_id: u64,
     pub event_sequence: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub window_id: Option<u64>,
     pub event: Value,
+}
+
+impl SubscriptionEventEnvelope {
+    /// An event frame for the current protocol version.
+    pub fn new(
+        subscription_id: u64,
+        event_sequence: u64,
+        window_id: Option<u64>,
+        event: Value,
+    ) -> Self {
+        Self { version: PROTOCOL_VERSION, subscription_id, event_sequence, window_id, event }
+    }
 }
 
 /// A request delivered to the main UI event loop.
@@ -476,6 +532,14 @@ pub(crate) struct OutputFrame {
     _event_slot: Option<EventQueueSlot>,
 }
 
+impl OutputFrame {
+    /// The serialized frame, so tests in other modules can assert on replies.
+    #[cfg(test)]
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
 struct EventQueueSlot(Arc<AtomicUsize>);
 
 impl EventQueueSlot {
@@ -612,13 +676,19 @@ fn spawn_connection(
     });
     let writer_inner = Arc::downgrade(&inner);
     thread::spawn_named("IPC writer", move || {
-        let mut writer = writer;
-        let _ = writer.set_write_timeout(Some(IPC_WRITE_TIMEOUT));
-        while let Ok(frame) = output_rx.recv() {
-            if writer.write_all(&frame.bytes).and_then(|()| writer.flush()).is_err() {
-                let _ = writer.shutdown();
-                break;
-            }
+        let result =
+            client_fault::catch(ClientFaultClass::Ipc, "IPC writer worker panicked", || {
+                let mut writer = writer;
+                let _ = writer.set_write_timeout(Some(IPC_WRITE_TIMEOUT));
+                while let Ok(frame) = output_rx.recv() {
+                    if writer.write_all(&frame.bytes).and_then(|()| writer.flush()).is_err() {
+                        let _ = writer.shutdown();
+                        break;
+                    }
+                }
+            });
+        if let Err(fault) = result {
+            error!("contained IPC writer fault {}", fault.id);
         }
         if let Some(writer_inner) = writer_inner.upgrade() {
             writer_inner.alive.store(false, Ordering::Release);
@@ -627,8 +697,15 @@ fn spawn_connection(
 
     thread::spawn_named("IPC reader", move || {
         let _guard = guard;
+        let _ = event_proxy.send_event(Event::new(EventType::IpcConnect(connection_id), None));
         let connection = IpcConnection { inner };
-        run_connection(stream, connection.clone(), &event_proxy);
+        let result =
+            client_fault::catch(ClientFaultClass::Ipc, "IPC reader worker panicked", || {
+                run_connection(stream, connection.clone(), &event_proxy)
+            });
+        if let Err(fault) = result {
+            error!("contained IPC reader fault {}", fault.id);
+        }
         connection.inner.alive.store(false, Ordering::Release);
         let _ = event_proxy.send_event(Event::new(EventType::IpcDisconnect(connection_id), None));
     });
@@ -768,6 +845,19 @@ fn decode_request(frame: &[u8]) -> Result<RequestEnvelope, IpcError> {
         .map_err(|err| IpcError::new("invalid_request", format!("invalid IPC request: {err}")))
 }
 
+/// Concurrent ConPTY ceiling for `capabilities.limits`: the Windows desktop heap supports
+/// roughly 64 sessions per process, while other platforms have no ConPTY ceiling (null).
+fn max_conpty_windows() -> Value {
+    #[cfg(windows)]
+    {
+        json!(64)
+    }
+    #[cfg(not(windows))]
+    {
+        Value::Null
+    }
+}
+
 fn hello_result() -> Value {
     let instance = INSTANCE.get();
     json!({
@@ -785,8 +875,8 @@ fn hello_result() -> Value {
             "unsupported_version", "invalid_request", "invalid_params",
             "duplicate_request_id", "limit_exceeded", "window_not_found",
             "no_focused_window", "unsupported", "timeout", "sequence_gap", "pty_closed",
-            "resize_mismatch", "focus_denied", "regex_invalid", "subscription_overflow",
-            "invalid_state"
+            "resize_mismatch", "focus_denied", "regex_invalid", "subscription_overflow", "exec_failed",
+            "invalid_state", "client_fault"
         ],
         "limits": {
             "request_frame_bytes": MAX_REQUEST_FRAME_BYTES,
@@ -798,6 +888,7 @@ fn hello_result() -> Value {
             "transcript_bytes_per_window": 1024 * 1024,
             "event_replay_bytes": 4 * 1024 * 1024,
             "event_replay_count": 4096,
+            "max_conpty_windows": max_conpty_windows(),
         }
     })
 }
@@ -818,7 +909,11 @@ fn bind_socket(path: &Path) -> io::Result<LocalListener> {
 }
 
 const AUTOMATION_PLAN_VERSION: u16 = 1;
+/// Declarative plans: the same method/params steps plus per-step `assert` checks.
+const AUTOMATION_PLAN_VERSION_2: u16 = 2;
 const MAX_AUTOMATION_PLAN_STEPS: usize = 256;
+/// Bounds for failure excerpts (assertion observations, spawn stderr) in reports.
+const MAX_REPORT_EXCERPT_CHARS: usize = 2_000;
 const MAX_PLAN_NAME_BYTES: usize = 64;
 
 struct AutomationClient {
@@ -865,23 +960,342 @@ fn validate_method_name(method: &str) -> io::Result<()> {
 }
 
 fn read_plan(options: &IpcRunPlan) -> io::Result<IpcAutomationPlan> {
-    let mut bytes = Vec::new();
     match options.file.as_deref() {
-        Some(path) if path != Path::new("-") => {
-            fs::File::open(path)?
-                .take((MAX_REQUEST_FRAME_BYTES + 1) as u64)
-                .read_to_end(&mut bytes)?;
-        },
+        Some(path) if path != Path::new("-") => load_plan_file(path, 0, &mut Vec::new()),
         _ => {
+            let mut bytes = Vec::new();
             io::stdin().take((MAX_REQUEST_FRAME_BYTES + 1) as u64).read_to_end(&mut bytes)?;
+            if bytes.len() > MAX_REQUEST_FRAME_BYTES {
+                return Err(IoError::new(ErrorKind::InvalidInput, "automation plan exceeds 1 MiB"));
+            }
+            let plan: IpcAutomationPlan = serde_json::from_slice(&bytes).map_err(|error| {
+                IoError::new(ErrorKind::InvalidInput, format!("invalid plan JSON: {error}"))
+            })?;
+            if !plan.include.is_empty() {
+                return Err(IoError::new(
+                    ErrorKind::InvalidInput,
+                    "plan includes require --file; standard input has no directory to resolve them",
+                ));
+            }
+            Ok(plan)
         },
-    };
+    }
+}
+
+/// Load one plan file, flattening `include` depth-first with cycle detection.
+///
+/// Included steps run first in include order; later includes and finally the including file
+/// itself override variables, while secret names union. Step IDs must still be unique after
+/// flattening, enforced by plan validation.
+fn load_plan_file(
+    path: &Path,
+    depth: usize,
+    stack: &mut Vec<PathBuf>,
+) -> io::Result<IpcAutomationPlan> {
+    if depth > MAX_PLAN_INCLUDE_DEPTH {
+        return Err(IoError::new(
+            ErrorKind::InvalidInput,
+            format!("plan includes nest deeper than {MAX_PLAN_INCLUDE_DEPTH}"),
+        ));
+    }
+    let canonical = std::fs::canonicalize(path).map_err(|error| {
+        IoError::new(
+            ErrorKind::InvalidInput,
+            format!("cannot load plan {}: {error}", path.display()),
+        )
+    })?;
+    if stack.contains(&canonical) {
+        return Err(IoError::new(
+            ErrorKind::InvalidInput,
+            format!("cyclic plan include of {}", path.display()),
+        ));
+    }
+    stack.push(canonical);
+    let result = load_plan_file_inner(path, depth, stack);
+    stack.pop();
+    result
+}
+
+fn load_plan_file_inner(
+    path: &Path,
+    depth: usize,
+    stack: &mut Vec<PathBuf>,
+) -> io::Result<IpcAutomationPlan> {
+    let mut bytes = Vec::new();
+    fs::File::open(path)?.take((MAX_REQUEST_FRAME_BYTES + 1) as u64).read_to_end(&mut bytes)?;
     if bytes.len() > MAX_REQUEST_FRAME_BYTES {
         return Err(IoError::new(ErrorKind::InvalidInput, "automation plan exceeds 1 MiB"));
     }
-    serde_json::from_slice(&bytes).map_err(|error| {
+    let mut plan: IpcAutomationPlan = serde_json::from_slice(&bytes).map_err(|error| {
         IoError::new(ErrorKind::InvalidInput, format!("invalid plan JSON: {error}"))
+    })?;
+    if plan.vars.len() > MAX_PLAN_VARS {
+        return Err(IoError::new(
+            ErrorKind::InvalidInput,
+            format!("automation plan exceeds {MAX_PLAN_VARS} variables"),
+        ));
+    }
+    let base = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut steps = Vec::new();
+    let mut vars = BTreeMap::new();
+    let mut secrets = Vec::new();
+    for include in std::mem::take(&mut plan.include) {
+        let child = load_plan_file(&base.join(include), depth + 1, stack)?;
+        steps.extend(child.steps);
+        vars.extend(child.vars);
+        for secret in child.secrets {
+            if !secrets.contains(&secret) {
+                secrets.push(secret);
+            }
+        }
+    }
+    steps.extend(plan.steps);
+    vars.extend(plan.vars);
+    for secret in plan.secrets {
+        if !secrets.contains(&secret) {
+            secrets.push(secret);
+        }
+    }
+    if vars.len() > MAX_PLAN_VARS {
+        return Err(IoError::new(
+            ErrorKind::InvalidInput,
+            format!("automation plan exceeds {MAX_PLAN_VARS} variables"),
+        ));
+    }
+    plan.steps = steps;
+    plan.vars = vars;
+    plan.secrets = secrets;
+    Ok(plan)
+}
+
+/// Maximum `include` nesting when loading an automation plan.
+const MAX_PLAN_INCLUDE_DEPTH: usize = 8;
+/// Maximum variables in one automation plan after `--set` overrides.
+const MAX_PLAN_VARS: usize = 256;
+/// Maximum bytes in one plan variable value.
+const MAX_PLAN_VAR_VALUE_BYTES: usize = 16 * 1024;
+/// Maximum secret names in one automation plan.
+const MAX_PLAN_SECRETS: usize = 64;
+
+/// Whether a plan variable name is usable inside `${...}` references.
+fn valid_plan_var_name(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    bytes.next().is_some_and(|first| first.is_ascii_alphabetic() || first == b'_')
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+}
+
+/// Parse `--set KEY=VALUE` bindings.
+fn parse_plan_set(sets: &[String]) -> io::Result<BTreeMap<String, String>> {
+    let mut vars = BTreeMap::new();
+    for set in sets {
+        let (key, value) = set.split_once('=').ok_or_else(|| {
+            IoError::new(ErrorKind::InvalidInput, format!("--set {set:?} must be KEY=VALUE"))
+        })?;
+        if !valid_plan_var_name(key) {
+            return Err(IoError::new(
+                ErrorKind::InvalidInput,
+                format!("--set has invalid variable name {key:?}"),
+            ));
+        }
+        if value.len() > MAX_PLAN_VAR_VALUE_BYTES {
+            return Err(IoError::new(
+                ErrorKind::InvalidInput,
+                format!("--set value for {key:?} exceeds 16 KiB"),
+            ));
+        }
+        vars.insert(key.to_owned(), value.to_owned());
+    }
+    Ok(vars)
+}
+
+/// Substitute `${name}` variables in one plan value, leaving `$ref` aliases alone.
+///
+/// `$ref` objects name step bindings, a separate namespace resolved at execution; touching
+/// them here would confuse bindings with variables.
+fn substitute_plan_vars(
+    value: &Value,
+    vars: &BTreeMap<String, String>,
+    step_id: &str,
+) -> io::Result<Value> {
+    match value {
+        Value::String(text) => substitute_plan_text(text, vars, step_id).map(Value::String),
+        Value::Array(values) => values
+            .iter()
+            .map(|value| substitute_plan_vars(value, vars, step_id))
+            .collect::<io::Result<Vec<_>>>()
+            .map(Value::Array),
+        Value::Object(map) if map.len() == 1 && map.contains_key("$ref") => Ok(value.clone()),
+        Value::Object(map) => map
+            .iter()
+            .map(|(key, value)| {
+                Ok((
+                    substitute_plan_text(key, vars, step_id)?,
+                    substitute_plan_vars(value, vars, step_id)?,
+                ))
+            })
+            .collect::<io::Result<serde_json::Map<_, _>>>()
+            .map(Value::Object),
+        _ => Ok(value.clone()),
+    }
+}
+
+/// Substitute `${name}` variables in one string.
+fn substitute_plan_text(
+    text: &str,
+    vars: &BTreeMap<String, String>,
+    step_id: &str,
+) -> io::Result<String> {
+    let mut substituted = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find("${") {
+        substituted.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        let end = after.find('}').ok_or_else(|| {
+            IoError::new(
+                ErrorKind::InvalidInput,
+                format!("step {step_id:?} has an unterminated variable reference"),
+            )
+        })?;
+        let name = &after[..end];
+        if !valid_plan_var_name(name) {
+            return Err(IoError::new(
+                ErrorKind::InvalidInput,
+                format!("step {step_id:?} has an invalid variable reference ${{{name}}}"),
+            ));
+        }
+        let value = vars.get(name).ok_or_else(|| {
+            IoError::new(
+                ErrorKind::InvalidInput,
+                format!("step {step_id:?} references unknown plan variable {name:?}"),
+            )
+        })?;
+        substituted.push_str(value);
+        rest = &after[end + 1..];
+    }
+    substituted.push_str(rest);
+    Ok(substituted)
+}
+
+/// Substitute variables in a typed step field via a JSON round trip.
+fn substitute_plan_field<T>(
+    field: &T,
+    vars: &BTreeMap<String, String>,
+    step_id: &str,
+) -> io::Result<T>
+where
+    T: serde::Serialize + serde::de::DeserializeOwned,
+{
+    let substituted =
+        substitute_plan_vars(&serde_json::to_value(field).map_err(IoError::other)?, vars, step_id)?;
+    serde_json::from_value(substituted).map_err(|error| {
+        IoError::new(
+            ErrorKind::InvalidInput,
+            format!("substituted field in step {step_id:?} is invalid: {error}"),
+        )
     })
+}
+
+/// Substitute variables in every user-string field of one plan step.
+///
+/// Method and step IDs stay literal, `$ref` objects and alias references keep the binding
+/// namespace, and everything else — params, assertions, conditions, bind pointers, and
+/// verification targets — resolves against plan `vars` with `--set` overrides.
+fn substitute_step_vars(
+    step: &IpcAutomationPlanStep,
+    vars: &BTreeMap<String, String>,
+) -> io::Result<IpcAutomationPlanStep> {
+    let mut step = step.clone();
+    step.params = substitute_plan_vars(&step.params, vars, &step.id)?;
+    if step.assert.is_some() {
+        step.assert =
+            Some(substitute_plan_field(step.assert.as_ref().expect("checked"), vars, &step.id)?);
+    }
+    if let Some(when) = &step.when {
+        step.when = Some(crate::cli::IpcPlanCondition {
+            reference: when.reference.clone(),
+            equals: substitute_plan_vars(&when.equals, vars, &step.id)?,
+        });
+    }
+    step.bind = step
+        .bind
+        .iter()
+        .map(|(alias, pointer)| Ok((alias.clone(), substitute_plan_text(pointer, vars, &step.id)?)))
+        .collect::<io::Result<_>>()?;
+    if step.verify.is_some() {
+        step.verify =
+            Some(substitute_plan_field(step.verify.as_ref().expect("checked"), vars, &step.id)?);
+    }
+    Ok(step)
+}
+
+/// Merge `--set` over plan `vars`, substitute every step, and collect secret values.
+///
+/// Returns the secret values for report redaction, longest first so overlapping values mask
+/// completely. Fails closed: an unknown secret name is an error rather than silently
+/// unredacted output.
+fn apply_plan_bindings(
+    plan: &mut IpcAutomationPlan,
+    sets: &BTreeMap<String, String>,
+) -> io::Result<Vec<String>> {
+    for (key, value) in plan.vars.iter().chain(sets.iter()) {
+        if !valid_plan_var_name(key) {
+            return Err(IoError::new(
+                ErrorKind::InvalidInput,
+                format!("plan has invalid variable name {key:?}"),
+            ));
+        }
+        if value.len() > MAX_PLAN_VAR_VALUE_BYTES {
+            return Err(IoError::new(
+                ErrorKind::InvalidInput,
+                format!("plan value for {key:?} exceeds 16 KiB"),
+            ));
+        }
+    }
+    if plan.vars.len() + sets.len() > MAX_PLAN_VARS {
+        return Err(IoError::new(
+            ErrorKind::InvalidInput,
+            format!("automation plan exceeds {MAX_PLAN_VARS} variables"),
+        ));
+    }
+    if plan.secrets.len() > MAX_PLAN_SECRETS {
+        return Err(IoError::new(
+            ErrorKind::InvalidInput,
+            format!("automation plan exceeds {MAX_PLAN_SECRETS} secrets"),
+        ));
+    }
+    let mut vars = plan.vars.clone();
+    vars.extend(sets.iter().map(|(key, value)| (key.clone(), value.clone())));
+    for name in &plan.secrets {
+        if !valid_plan_var_name(name) {
+            return Err(IoError::new(
+                ErrorKind::InvalidInput,
+                format!("plan has invalid secret name {name:?}"),
+            ));
+        }
+        if !vars.contains_key(name) {
+            return Err(IoError::new(
+                ErrorKind::InvalidInput,
+                format!("plan secret {name:?} has no value in vars or --set"),
+            ));
+        }
+    }
+    plan.steps = plan
+        .steps
+        .iter()
+        .map(|step| substitute_step_vars(step, &vars))
+        .collect::<io::Result<_>>()?;
+    plan.vars = vars;
+    let mut secrets: Vec<String> = plan
+        .secrets
+        .iter()
+        .filter_map(|name| plan.vars.get(name))
+        .filter(|value| !value.is_empty())
+        .cloned()
+        .collect();
+    secrets.sort();
+    secrets.dedup();
+    secrets.sort_by_key(|secret| std::cmp::Reverse(secret.len()));
+    Ok(secrets)
 }
 
 fn valid_plan_name(name: &str) -> bool {
@@ -914,10 +1328,13 @@ fn collect_references(value: &Value, references: &mut Vec<String>) -> io::Result
 }
 
 fn validate_plan(plan: &IpcAutomationPlan, methods: &HashSet<String>) -> io::Result<()> {
-    if plan.version != AUTOMATION_PLAN_VERSION {
+    if plan.version != AUTOMATION_PLAN_VERSION && plan.version != AUTOMATION_PLAN_VERSION_2 {
         return Err(IoError::new(
             ErrorKind::InvalidInput,
-            format!("unsupported automation plan version {}", plan.version),
+            format!(
+                "unsupported automation plan version {}; expected {AUTOMATION_PLAN_VERSION} or {AUTOMATION_PLAN_VERSION_2}",
+                plan.version
+            ),
         ));
     }
     if plan.steps.is_empty() || plan.steps.len() > MAX_AUTOMATION_PLAN_STEPS {
@@ -960,6 +1377,12 @@ fn validate_plan(plan: &IpcAutomationPlan, methods: &HashSet<String>) -> io::Res
                 ));
             }
         }
+        if let Some(assertion) = &step.assert {
+            validate_assertion(&step.id, assertion)?;
+            if let Some(window_id) = &assertion.window_id {
+                collect_references(window_id, &mut references)?;
+            }
+        }
         if let Some(condition) = &step.when {
             references.push(condition.reference.clone());
         }
@@ -985,6 +1408,162 @@ fn validate_plan(plan: &IpcAutomationPlan, methods: &HashSet<String>) -> io::Res
         }
     }
     Ok(())
+}
+
+/// Validate one step assertion without executing anything.
+fn validate_assertion(step_id: &str, assertion: &crate::cli::IpcPlanAssertion) -> io::Result<()> {
+    let invalid = |reason: &str| {
+        IoError::new(
+            ErrorKind::InvalidInput,
+            format!("plan step {step_id:?} assertion is invalid: {reason}"),
+        )
+    };
+    if assertion.text_contains.as_ref().is_some_and(String::is_empty) {
+        return Err(invalid("text_contains must not be empty"));
+    }
+    if assertion.text_contains.is_some() && assertion.window_id.is_none() {
+        return Err(invalid("a text assertion needs window_id"));
+    }
+    if !(1..=86_400_000).contains(&assertion.timeout_ms) {
+        return Err(invalid("timeout_ms must be 1 ms through 24 hours"));
+    }
+    if assertion.lines_from_bottom.is_some_and(|rows| rows == 0 || rows > 1000) {
+        return Err(invalid("lines_from_bottom must be 1 through 1000"));
+    }
+    match (&assertion.result_pointer, &assertion.result_equals) {
+        (None, None) => {},
+        (Some(pointer), Some(_)) if pointer.is_empty() || pointer.starts_with('/') => {},
+        _ => {
+            return Err(invalid(
+                "result_pointer (a JSON Pointer) and result_equals must be given together",
+            ));
+        },
+    }
+    if assertion.text_contains.is_none() && assertion.result_equals.is_none() {
+        return Err(invalid("nothing to check: give text_contains or result_equals"));
+    }
+    Ok(())
+}
+
+/// Evaluate one step assertion against the live session after a successful action.
+fn evaluate_plan_assertion(
+    client: &mut AutomationClient,
+    aliases: &BTreeMap<String, Value>,
+    step_id: &str,
+    action: &Value,
+    assertion: &crate::cli::IpcPlanAssertion,
+) -> io::Result<()> {
+    if let (Some(pointer), Some(expected)) = (&assertion.result_pointer, &assertion.result_equals) {
+        let actual = if pointer.is_empty() { Some(action) } else { action.pointer(pointer) };
+        if actual != Some(expected) {
+            let observed =
+                actual.map(|actual| format!("{actual}")).unwrap_or_else(|| String::from("absent"));
+            return Err(IoError::other(format!(
+                "plan step {step_id:?} assertion failed: result{pointer:?} is {}, expected {expected}",
+                truncate_excerpt(&observed),
+            )));
+        }
+    }
+    if let Some(expected) = &assertion.text_contains {
+        let window_id = assertion
+            .window_id
+            .as_ref()
+            .map(|window_id| resolve_plan_references(window_id, aliases))
+            .transpose()?
+            .and_then(|window_id| window_id.as_u64())
+            .ok_or_else(|| {
+                IoError::new(
+                    ErrorKind::InvalidInput,
+                    format!("plan step {step_id:?} assertion window_id is not u64"),
+                )
+            })?;
+        let target = json!({"window_id": window_id});
+        // Wait on the full viewport, then check the scope: a match outside the requested
+        // rows must fail the assertion rather than silently pass it.
+        let wait = client.request(
+            "wait_text",
+            json!({"text": expected, "common": {"timeout": assertion.timeout_ms, "target": target}}),
+        );
+        if let Err(error) = wait {
+            let observed = client
+                .request(
+                    "get_text",
+                    json!({"rows": assertion.lines_from_bottom, "window_id": window_id}),
+                )
+                .ok()
+                .and_then(|reply| reply.get("text").and_then(Value::as_str).map(str::to_owned))
+                .unwrap_or_default();
+            return Err(IoError::other(format!(
+                "plan step {step_id:?} assertion failed: terminal never showed {expected:?} ({error}); observed: {:?}",
+                truncate_excerpt(&observed),
+            )));
+        }
+        let observed = client
+            .request(
+                "get_text",
+                json!({"rows": assertion.lines_from_bottom, "window_id": window_id}),
+            )?
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        if !observed.contains(expected) {
+            return Err(IoError::other(format!(
+                "plan step {step_id:?} assertion failed: {expected:?} matched outside the last {:?} rows; observed: {:?}",
+                assertion.lines_from_bottom,
+                truncate_excerpt(&observed),
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Mask substituted for secret plan values in reports and excerpts.
+const PLAN_SECRET_MASK: &str = "***";
+
+/// Replace every secret value in reporting text with a fixed mask.
+///
+/// Empty values are skipped: masking the empty string would wedge the mask between every
+/// character. With no secrets this returns the text untouched, keeping secret-free plans on
+/// the exact previous code path.
+fn redact_secret_text(text: &str, secrets: &[String]) -> String {
+    if secrets.is_empty() {
+        return text.to_owned();
+    }
+    let mut redacted = text.to_owned();
+    for secret in secrets {
+        if secret.is_empty() {
+            continue;
+        }
+        redacted = redacted.replace(secret, PLAN_SECRET_MASK);
+    }
+    redacted
+}
+
+/// Replace every secret value inside a reported JSON document.
+fn redact_plan_value(value: &mut Value, secrets: &[String]) {
+    if secrets.is_empty() {
+        return;
+    }
+    match value {
+        Value::String(text) => *text = redact_secret_text(text, secrets),
+        Value::Array(values) => {
+            values.iter_mut().for_each(|value| redact_plan_value(value, secrets))
+        },
+        Value::Object(map) => {
+            map.values_mut().for_each(|value| redact_plan_value(value, secrets));
+        },
+        _ => {},
+    }
+}
+
+/// Bound failure excerpts so a fullscreen of unexpected output cannot flood the report.
+fn truncate_excerpt(text: &str) -> String {
+    if text.chars().count() <= MAX_REPORT_EXCERPT_CHARS {
+        return text.to_owned();
+    }
+    let kept: String = text.chars().take(MAX_REPORT_EXCERPT_CHARS).collect();
+    format!("{kept}…[truncated]")
 }
 
 fn resolve_plan_references(value: &Value, aliases: &BTreeMap<String, Value>) -> io::Result<Value> {
@@ -1052,65 +1631,130 @@ fn resolve_verification_window(
     Ok(Some((window_id, verification.timeout, verification.screenshot)))
 }
 
-fn run_plan(socket: Option<PathBuf>, target: Option<&str>, options: &IpcRunPlan) -> io::Result<()> {
-    let plan = read_plan(options)?;
-    let mut client = AutomationClient::connect(socket, target)?;
-    let capabilities = plan_capabilities(&client.hello)?;
+/// Execute an automation plan, returning the outcome plus per-step records for reports.
+///
+/// Records come back on every path — including abort-early failures — so callers can render
+/// JUnit or capture failure evidence without re-running the plan.
+fn run_plan(
+    socket: Option<PathBuf>,
+    target: Option<&str>,
+    options: &IpcRunPlan,
+) -> (io::Result<()>, Vec<PlanStepRecord>) {
+    let mut plan = match read_plan(options) {
+        Ok(plan) => plan,
+        Err(error) => return (Err(error), Vec::new()),
+    };
+    let sets = match parse_plan_set(&options.set) {
+        Ok(sets) => sets,
+        Err(error) => return (Err(error), Vec::new()),
+    };
+    let secrets = match apply_plan_bindings(&mut plan, &sets) {
+        Ok(secrets) => secrets,
+        Err(error) => return (Err(error), Vec::new()),
+    };
+    let file_report = match report_destination(options.report, &options.output, options.dry_run) {
+        Ok(destination) => destination,
+        Err(error) => return (Err(error), Vec::new()),
+    };
+    let mut client = match AutomationClient::connect(socket, target) {
+        Ok(client) => client,
+        Err(error) => return (Err(error), Vec::new()),
+    };
+    let capabilities = match plan_capabilities(&client.hello) {
+        Ok(capabilities) => capabilities,
+        Err(error) => return (Err(error), Vec::new()),
+    };
     let methods =
         capabilities.iter().map(|capability| capability.name.clone()).collect::<HashSet<_>>();
-    validate_plan(&plan, &methods)?;
+    if let Err(error) = validate_plan(&plan, &methods) {
+        return (Err(error), Vec::new());
+    }
     let classes = capabilities
         .iter()
         .map(|capability| (capability.name.as_str(), capability))
         .collect::<HashMap<_, _>>();
+    let suite = plan.name.clone().unwrap_or_else(|| {
+        options
+            .file
+            .as_ref()
+            .and_then(|file| file.file_stem())
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("vivido-plan")
+            .to_owned()
+    });
     let mut output = io::stdout().lock();
-    write_plan_event(
+    if let Err(error) = write_plan_event(
         &mut output,
-        json!({"type":"plan_started","version":plan.version,"steps":plan.steps.len(),"mode":if options.dry_run {"dry_run"} else if options.preflight {"preflight"} else {"execute"}}),
-    )?;
+        json!({"type":"plan_started","version":plan.version,"name":suite,"steps":plan.steps.len(),"mode":if options.dry_run {"dry_run"} else if options.preflight {"preflight"} else {"execute"}}),
+    ) {
+        return (Err(error), Vec::new());
+    }
 
     let mut aliases = BTreeMap::new();
     let mut failures = 0_u64;
+    let mut records = Vec::new();
     for step in &plan.steps {
         let capability = classes[step.method.as_str()];
+        let step_started = std::time::Instant::now();
         if options.dry_run {
-            write_plan_event(
+            if let Err(error) = write_plan_event(
                 &mut output,
                 json!({"type":"step","id":step.id,"method":step.method,"class":capability.class,"mutating":capability.mutating,"status":"planned"}),
-            )?;
+            ) {
+                return (Err(error), records);
+            }
             continue;
         }
         if options.preflight && capability.mutating {
-            write_plan_event(
+            if let Err(error) = write_plan_event(
                 &mut output,
                 json!({"type":"step","id":step.id,"method":step.method,"class":capability.class,"mutating":true,"status":"skipped","reason":"preflight_mutation"}),
-            )?;
+            ) {
+                return (Err(error), records);
+            }
+            records.push(PlanStepRecord::skipped(step, "preflight_mutation", &step_started));
             continue;
         }
         if options.preflight {
             let mut references = Vec::new();
-            collect_references(&step.params, &mut references)?;
-            if let Some(verification) = &step.verify {
-                collect_references(&verification.window_id, &mut references)?;
+            if let Err(error) = collect_references(&step.params, &mut references).and_then(|()| {
+                match &step.verify {
+                    Some(verification) => {
+                        collect_references(&verification.window_id, &mut references)
+                    },
+                    None => Ok(()),
+                }
+            }) {
+                return (Err(error), records);
             }
             if let Some(condition) = &step.when {
                 references.push(condition.reference.clone());
             }
             if references.iter().any(|reference| !aliases.contains_key(reference)) {
-                write_plan_event(
+                if let Err(error) = write_plan_event(
                     &mut output,
                     json!({"type":"step","id":step.id,"method":step.method,"status":"skipped","reason":"dependency_unavailable"}),
-                )?;
+                ) {
+                    return (Err(error), records);
+                }
+                records.push(PlanStepRecord::skipped(
+                    step,
+                    "dependency_unavailable",
+                    &step_started,
+                ));
                 continue;
             }
         }
         if let Some(condition) = &step.when
             && aliases.get(&condition.reference) != Some(&condition.equals)
         {
-            write_plan_event(
+            if let Err(error) = write_plan_event(
                 &mut output,
                 json!({"type":"step","id":step.id,"method":step.method,"status":"skipped","reason":"condition_false"}),
-            )?;
+            ) {
+                return (Err(error), records);
+            }
+            records.push(PlanStepRecord::skipped(step, "condition_false", &step_started));
             continue;
         }
 
@@ -1161,7 +1805,7 @@ fn run_plan(socket: Option<PathBuf>, target: Option<&str>, options: &IpcRunPlan)
             Ok(result)
         })();
 
-        match execution {
+        let outcome = match execution {
             Ok(result) => {
                 let binding_source = result.get("action").unwrap_or(&result);
                 let binding_result = step.bind.iter().try_for_each(|(alias, pointer)| {
@@ -1180,58 +1824,693 @@ fn run_plan(socket: Option<PathBuf>, target: Option<&str>, options: &IpcRunPlan)
                     Ok::<_, io::Error>(())
                 });
                 match binding_result {
-                    Ok(()) => write_plan_event(
-                        &mut output,
-                        json!({"type":"step","id":step.id,"method":step.method,"class":capability.class,"mutating":capability.mutating,"status":"ok","result":result}),
-                    )?,
-                    Err(error) => {
-                        failures = failures.saturating_add(1);
-                        write_plan_event(
-                            &mut output,
-                            json!({"type":"step","id":step.id,"method":step.method,"status":"error","error":error.to_string()}),
-                        )?;
-                        if step.on_error == IpcPlanErrorPolicy::Abort {
-                            write_plan_event(
-                                &mut output,
-                                json!({"type":"plan_completed","status":"failed","failures":failures}),
-                            )?;
-                            return Err(IoError::other(format!(
-                                "automation plan failed while binding step {:?}",
-                                step.id
-                            )));
+                    Ok(()) => {
+                        if let Some(assertion) = &step.assert {
+                            let action = result.get("action").unwrap_or(&result);
+                            evaluate_plan_assertion(
+                                &mut client,
+                                &aliases,
+                                &step.id,
+                                action,
+                                assertion,
+                            )
+                            .map(|()| result)
+                            .map_err(|error| IoError::other(format!("assertion failed: {error}")))
+                        } else {
+                            Ok(result)
                         }
                     },
+                    Err(error) => Err(error),
                 }
+            },
+            Err(error) => Err(error),
+        };
+        match outcome {
+            Ok(mut result) => {
+                // Action results echo terminal text, which replays anything the step typed:
+                // mask secrets before the result reaches NDJSON.
+                redact_plan_value(&mut result, &secrets);
+                if let Err(error) = write_plan_event(
+                    &mut output,
+                    json!({"type":"step","id":step.id,"method":step.method,"class":capability.class,"mutating":capability.mutating,"status":"ok","result":result}),
+                ) {
+                    return (Err(error), records);
+                }
+                records.push(PlanStepRecord::ok(step, &step_started));
             },
             Err(error) => {
                 failures = failures.saturating_add(1);
-                write_plan_event(
+                // Assertion messages quote the expected plan text and the observed terminal
+                // text; either can carry a secret, so mask before reporting or recording.
+                let message = redact_secret_text(&error.to_string(), &secrets);
+                if let Err(error) = write_plan_event(
                     &mut output,
-                    json!({"type":"step","id":step.id,"method":step.method,"status":"error","error":error.to_string()}),
-                )?;
+                    json!({"type":"step","id":step.id,"method":step.method,"status":"error","error":message}),
+                ) {
+                    return (Err(error), records);
+                }
+                if let Some(dir) = &options.on_failure_dump {
+                    let window = assert_window_id(step, &aliases).or_else(|| {
+                        client
+                            .request("list_windows", json!({}))
+                            .ok()
+                            .and_then(|reply| {
+                                reply.get("windows").and_then(Value::as_array)?.first().cloned()
+                            })
+                            .and_then(|window| window.get("window_id").and_then(Value::as_u64))
+                    });
+                    match window {
+                        Some(window) => {
+                            let files = write_failure_dump(
+                                &mut client,
+                                dir,
+                                &step.id,
+                                &step.method,
+                                window,
+                                &message,
+                                &secrets,
+                            );
+                            if !files.is_empty()
+                                && let Err(error) = write_plan_event(
+                                    &mut output,
+                                    json!({"type":"failure_dump","id":step.id,"dir":dir,"files":files}),
+                                )
+                            {
+                                return (Err(error), records);
+                            }
+                        },
+                        None => eprintln!(
+                            "run-plan: step {:?} failed but the session has no window to dump",
+                            step.id
+                        ),
+                    }
+                }
+                let window = assert_window_id(step, &aliases);
+                records.push(PlanStepRecord::error(step, &message, window, &step_started));
                 if step.on_error == IpcPlanErrorPolicy::Abort {
-                    write_plan_event(
+                    if let Err(error) = write_plan_event(
                         &mut output,
                         json!({"type":"plan_completed","status":"failed","failures":failures}),
-                    )?;
-                    return Err(IoError::other(format!(
-                        "automation plan failed at step {:?}",
-                        step.id
-                    )));
+                    ) {
+                        return (Err(error), records);
+                    }
+                    if let Err(error) =
+                        write_file_report(options.report, &file_report, &suite, &records, failures)
+                    {
+                        return (Err(error), records);
+                    }
+                    return (
+                        Err(IoError::other(format!(
+                            "automation plan failed at step {:?}",
+                            step.id
+                        ))),
+                        records,
+                    );
                 }
             },
         }
     }
 
-    write_plan_event(
+    if let Err(error) = write_plan_event(
         &mut output,
         json!({"type":"plan_completed","status":if failures == 0 {"ok"} else {"completed_with_errors"},"failures":failures}),
-    )?;
-    if failures == 0 {
+    ) {
+        return (Err(error), records);
+    }
+    if let Err(error) = write_file_report(options.report, &file_report, &suite, &records, failures)
+    {
+        return (Err(error), records);
+    }
+    let outcome = if failures == 0 {
         Ok(())
     } else {
         Err(IoError::other("automation plan completed with errors"))
+    };
+    (outcome, records)
+}
+
+/// One executed plan step as recorded for the JUnit/SARIF report and failure captures.
+pub(crate) struct PlanStepRecord {
+    id: String,
+    method: String,
+    elapsed_secs: f64,
+    outcome: PlanStepOutcome,
+}
+
+pub(crate) enum PlanStepOutcome {
+    Ok,
+    Error { message: String, window: Option<u64> },
+    Skipped(String),
+}
+
+impl PlanStepRecord {
+    fn ok(step: &IpcAutomationPlanStep, started: &std::time::Instant) -> Self {
+        Self {
+            id: step.id.clone(),
+            method: step.method.clone(),
+            elapsed_secs: started.elapsed().as_secs_f64(),
+            outcome: PlanStepOutcome::Ok,
+        }
     }
+
+    fn error(
+        step: &IpcAutomationPlanStep,
+        message: &str,
+        window: Option<u64>,
+        started: &std::time::Instant,
+    ) -> Self {
+        Self {
+            id: step.id.clone(),
+            method: step.method.clone(),
+            elapsed_secs: started.elapsed().as_secs_f64(),
+            outcome: PlanStepOutcome::Error { message: message.to_owned(), window },
+        }
+    }
+
+    fn skipped(step: &IpcAutomationPlanStep, reason: &str, started: &std::time::Instant) -> Self {
+        Self {
+            id: step.id.clone(),
+            method: step.method.clone(),
+            elapsed_secs: started.elapsed().as_secs_f64(),
+            outcome: PlanStepOutcome::Skipped(reason.to_owned()),
+        }
+    }
+}
+
+/// Window an assertion reads, after resolving `$ref` aliases.
+///
+/// A step whose assertion has no window contributes no capture target; the runner then falls
+/// back to the session's first window.
+fn assert_window_id(
+    step: &IpcAutomationPlanStep,
+    aliases: &BTreeMap<String, Value>,
+) -> Option<u64> {
+    step.assert
+        .as_ref()?
+        .window_id
+        .as_ref()
+        .and_then(|window_id| resolve_plan_references(window_id, aliases).ok())
+        .and_then(|window_id| window_id.as_u64())
+}
+
+/// Validate `--report`/`--output` combinations shared by `run-plan` and `test`.
+fn report_destination(
+    report: IpcPlanReport,
+    output: &Option<PathBuf>,
+    dry_run: bool,
+) -> io::Result<Option<PathBuf>> {
+    match (report, output) {
+        (IpcPlanReport::Junit | IpcPlanReport::Sarif, None) => Err(IoError::new(
+            ErrorKind::InvalidInput,
+            "--report junit/sarif requires --output PATH",
+        )),
+        (IpcPlanReport::Junit | IpcPlanReport::Sarif, Some(_)) if dry_run => Err(IoError::new(
+            ErrorKind::InvalidInput,
+            "--report junit/sarif is only written for executed runs, not --dry-run",
+        )),
+        (IpcPlanReport::Ndjson, Some(_)) => Err(IoError::new(
+            ErrorKind::InvalidInput,
+            "--output PATH requires --report junit or --report sarif",
+        )),
+        (IpcPlanReport::Junit | IpcPlanReport::Sarif, Some(path)) => Ok(Some(path.clone())),
+        (IpcPlanReport::Ndjson, None) => Ok(None),
+    }
+}
+
+/// Write the file report requested by `--report` (JUnit or SARIF); otherwise a no-op.
+fn write_file_report(
+    report: IpcPlanReport,
+    path: &Option<PathBuf>,
+    suite: &str,
+    records: &[PlanStepRecord],
+    failures: u64,
+) -> io::Result<()> {
+    match report {
+        IpcPlanReport::Junit => write_junit_report(path, suite, records, failures),
+        IpcPlanReport::Sarif => write_sarif_report(path, suite, records, failures),
+        IpcPlanReport::Ndjson => Ok(()),
+    }
+}
+
+/// Write the JUnit XML report when `--report junit` was requested; otherwise a no-op.
+fn write_junit_report(
+    junit: &Option<PathBuf>,
+    suite: &str,
+    records: &[PlanStepRecord],
+    failures: u64,
+) -> io::Result<()> {
+    let Some(path) = junit else {
+        return Ok(());
+    };
+    let skipped = records
+        .iter()
+        .filter(|record| matches!(record.outcome, PlanStepOutcome::Skipped(_)))
+        .count();
+    let time: f64 = records.iter().map(|record| record.elapsed_secs).sum();
+    let mut xml = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<testsuite name=\"{}\" tests=\"{}\" failures=\"{failures}\" skipped=\"{skipped}\" time=\"{time:.3}\">\n",
+        junit_escape(suite),
+        records.len(),
+    );
+    for record in records {
+        xml.push_str(&format!(
+            "  <testcase classname=\"{}\" name=\"{}\" time=\"{:.3}\"",
+            junit_escape(&record.method),
+            junit_escape(&record.id),
+            record.elapsed_secs,
+        ));
+        match &record.outcome {
+            PlanStepOutcome::Ok => xml.push_str("/>\n"),
+            PlanStepOutcome::Error { message, .. } => {
+                xml.push_str(&format!(
+                    ">\n    <failure message=\"{}\">{}</failure>\n  </testcase>\n",
+                    junit_escape(message),
+                    junit_escape(message),
+                ));
+            },
+            PlanStepOutcome::Skipped(reason) => {
+                xml.push_str(&format!(
+                    ">\n    <skipped message=\"{}\"/>\n  </testcase>\n",
+                    junit_escape(reason),
+                ));
+            },
+        }
+    }
+    xml.push_str("</testsuite>\n");
+    fs::write(path, xml).map_err(|error| {
+        IoError::new(
+            error.kind(),
+            format!("failed to write JUnit report {}: {error}", path.display()),
+        )
+    })
+}
+
+/// Escape text for JUnit XML attribute and element content.
+fn junit_escape(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&apos;"),
+            _ => escaped.push(c),
+        }
+    }
+    escaped
+}
+
+/// Write the SARIF 2.1.0 report when `--report sarif` was requested; otherwise a no-op.
+///
+/// Every executed step becomes one result: failed steps are `error`/`fail`, skipped steps
+/// are `none`/`notApplicable`, and passing steps are `none`/`pass`. Rules are derived from
+/// the distinct step methods so each result can name the automation method it covers.
+fn write_sarif_report(
+    sarif: &Option<PathBuf>,
+    suite: &str,
+    records: &[PlanStepRecord],
+    failures: u64,
+) -> io::Result<()> {
+    let Some(path) = sarif else {
+        return Ok(());
+    };
+    let mut methods = Vec::new();
+    for record in records {
+        if !methods.contains(&record.method) {
+            methods.push(record.method.clone());
+        }
+    }
+    let rules = methods
+        .iter()
+        .map(|method| {
+            json!({
+                "id": method,
+                "shortDescription": {"text": format!("vivido plan step ({method})")},
+            })
+        })
+        .collect::<Vec<_>>();
+    let results = records
+        .iter()
+        .map(|record| {
+            let index = methods.iter().position(|method| *method == record.method);
+            let (level, kind, message) = match &record.outcome {
+                PlanStepOutcome::Ok => ("none", "pass", String::from("ok")),
+                PlanStepOutcome::Error { message, .. } => ("error", "fail", message.clone()),
+                PlanStepOutcome::Skipped(reason) => ("none", "notApplicable", reason.clone()),
+            };
+            json!({
+                "ruleId": record.method,
+                "ruleIndex": index,
+                "level": level,
+                "kind": kind,
+                "message": {"text": message},
+                "properties": {"stepId": record.id},
+            })
+        })
+        .collect::<Vec<_>>();
+    let log = json!({
+        "version": "2.1.0",
+        "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+        "runs": [{
+            "tool": {"driver": {
+                "name": "vivido",
+                "version": env!("CARGO_PKG_VERSION"),
+                "informationUri": "https://vivido.dev",
+                "rules": rules,
+            }},
+            "results": results,
+            "invocations": [{"executionSuccessful": failures == 0}],
+            "properties": {"suite": suite},
+        }],
+    });
+    let text = serde_json::to_string_pretty(&log).map_err(IoError::other)?;
+    fs::write(path, format!("{text}\n")).map_err(|error| {
+        IoError::new(
+            error.kind(),
+            format!("failed to write SARIF report {}: {error}", path.display()),
+        )
+    })
+}
+
+/// Run an automation plan inside an ephemeral headless session.
+///
+/// The runner owns the whole lifecycle: it validates options before spawning anything, starts a
+/// fresh session, executes the plan with `run-plan` semantics, captures failure evidence, and
+/// shuts the session down — unless `--keep-failed` preserves a failed session for inspection.
+/// Plan NDJSON events go to stdout; runner chatter goes to stderr so scripts can parse stdout.
+pub fn run_test(options: &IpcTest) -> io::Result<()> {
+    report_destination(options.report, &options.output, false)?;
+    let name = test_session_name(options.session.as_deref())?;
+    let socket = spawn_test_session(&name, options.headless_size, &options.shell)?;
+    eprintln!("vivido test: session {name:?} serving on {}", socket.display());
+    await_test_session(&name)?;
+    let plan = IpcRunPlan {
+        file: options.file.clone(),
+        dry_run: false,
+        preflight: false,
+        report: options.report,
+        output: options.output.clone(),
+        set: options.set.clone(),
+        on_failure_dump: options.on_failure_dump.clone(),
+    };
+    let (outcome, records) = run_plan(None, Some(&name), &plan);
+    if let Some(failed) =
+        records.iter().find(|record| matches!(record.outcome, PlanStepOutcome::Error { .. }))
+    {
+        capture_test_failure(&socket, &name, failed, test_artifacts_dir(options));
+    }
+    if outcome.is_ok() || !options.keep_failed {
+        quit_test_session(&socket, &name);
+    }
+    if outcome.is_err() && options.keep_failed {
+        eprintln!(
+            "vivido test: keeping failed session {name:?}; reattach with `vivido msg --target {name}` or `vivido kill-session --target {name}`"
+        );
+    }
+    outcome
+}
+
+/// Pick a fresh session name: the explicit one, or a process-scoped generated name.
+///
+/// An explicit name that already exists is an error — a test plan must never drive windows it
+/// did not create.
+fn test_session_name(explicit: Option<&str>) -> io::Result<String> {
+    if let Some(name) = explicit {
+        if crate::session::registered_instance(name).is_ok() {
+            return Err(IoError::new(
+                ErrorKind::AlreadyExists,
+                format!(
+                    "session {name:?} already exists; `vivido test` never reuses a live session"
+                ),
+            ));
+        }
+        return Ok(name.to_owned());
+    }
+    let pid = std::process::id();
+    for attempt in 0..100 {
+        let name = if attempt == 0 {
+            format!("vivido-test-{pid}")
+        } else {
+            format!("vivido-test-{pid}-{attempt}")
+        };
+        if crate::session::registered_instance(&name).is_err() {
+            return Ok(name);
+        }
+    }
+    Err(IoError::other("could not pick a fresh test session name"))
+}
+
+/// Spawn a detached headless session and return its socket path.
+///
+/// This mirrors the integration-test harness: the parent prints `VIVIDO_SOCKET=` and exits,
+/// so waiting on the child both bounds startup and surfaces spawn errors with stderr.
+fn spawn_test_session(
+    name: &str,
+    size: crate::cli::HeadlessSize,
+    shell: &[String],
+) -> io::Result<PathBuf> {
+    let exe = std::env::current_exe().map_err(|error| {
+        IoError::new(ErrorKind::NotFound, format!("cannot locate the vivido binary: {error}"))
+    })?;
+    let mut command = std::process::Command::new(exe);
+    command.args(["--headless", "--session", name, "--headless-size", &size.as_arg()]);
+    if !shell.is_empty() {
+        command.arg("-e").args(shell);
+    }
+    // The session must serve this run, not inherit a socket or session pointer from it.
+    command.env_remove("VIVIDO_SOCKET").env_remove("VIVIDO_SESSION");
+    let output = command.output().map_err(|error| {
+        IoError::new(ErrorKind::NotFound, format!("failed to spawn headless session: {error}"))
+    })?;
+    if !output.status.success() {
+        return Err(IoError::other(format!(
+            "headless session {name:?} failed to start: {}",
+            truncate_excerpt(&String::from_utf8_lossy(&output.stderr))
+        )));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("VIVIDO_SOCKET="))
+        .and_then(|line| line.split(';').next())
+        .map(PathBuf::from)
+        .ok_or_else(|| {
+            IoError::new(
+                ErrorKind::InvalidData,
+                format!("headless session {name:?} printed no VIVIDO_SOCKET: {stdout:?}"),
+            )
+        })
+}
+
+/// Wait until the spawned session answers `capabilities`.
+fn await_test_session(name: &str) -> io::Result<()> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        match request_once(None, Some(name), &SocketMessage::Capabilities) {
+            Ok(_) => return Ok(()),
+            Err(error) => {
+                if std::time::Instant::now() >= deadline {
+                    return Err(IoError::other(format!(
+                        "headless session {name:?} never became ready: {error}"
+                    )));
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            },
+        }
+    }
+}
+
+/// Shut a test session down; teardown trouble warns but never fails the run.
+fn quit_test_session(socket: &Path, name: &str) {
+    if let Err(error) =
+        request_once(Some(socket.to_owned()), None, &SocketMessage::Quit).map(|_| ())
+    {
+        eprintln!(
+            "vivido test: session {name:?} would not quit ({error}); remove it with `vivido kill-session --target {name}`"
+        );
+    }
+}
+
+fn test_artifacts_dir(options: &IpcTest) -> PathBuf {
+    options.artifacts_dir.clone().unwrap_or_else(|| PathBuf::from("vivido-test-artifacts"))
+}
+
+/// Capture failure evidence for the first failed step: grid text plus screenshot metadata.
+///
+/// Captures are best-effort: a capture that fails warns on stderr and never masks the plan
+/// error it was documenting.
+fn capture_test_failure(socket: &Path, session: &str, failed: &PlanStepRecord, dir: PathBuf) {
+    let window = failed_window(socket, failed);
+    let Some(window) = window else {
+        eprintln!(
+            "vivido test: step {:?} failed but the session has no window to capture",
+            failed.id
+        );
+        return;
+    };
+    if let Err(error) = fs::create_dir_all(&dir) {
+        eprintln!("vivido test: cannot create artifacts dir {}: {error}", dir.display());
+        return;
+    }
+    let request = |message: SocketMessage| {
+        request_once(Some(socket.to_owned()), None, &message).map(|(_, result)| result)
+    };
+    match request(SocketMessage::GetText(IpcGetText { window_id: Some(window), rows: Some(1000) }))
+        .map(|reply| reply.get("text").and_then(Value::as_str).unwrap_or_default().to_owned())
+    {
+        Ok(text) => {
+            let path = dir.join(format!("{}.grid.txt", failed.id));
+            if let Err(error) = fs::write(&path, text) {
+                eprintln!("vivido test: cannot write {}: {error}", path.display());
+            } else {
+                eprintln!("vivido test: grid dump for {:?} in {}", failed.id, path.display());
+            }
+        },
+        Err(error) => eprintln!("vivido test: grid capture for {:?} failed: {error}", failed.id),
+    }
+    match request(SocketMessage::Screenshot(IpcScreenshot { window_id: Some(window), json: true }))
+    {
+        Ok(reply) => {
+            let path = dir.join(format!("{}.screenshot.json", failed.id));
+            let document =
+                serde_json::to_string_pretty(&reply).unwrap_or_else(|_| reply.to_string());
+            if let Err(error) = fs::write(&path, document) {
+                eprintln!("vivido test: cannot write {}: {error}", path.display());
+            } else {
+                eprintln!(
+                    "vivido test: screenshot metadata for {:?} in {} (session {session:?})",
+                    failed.id,
+                    path.display()
+                );
+            }
+        },
+        Err(error) => {
+            eprintln!("vivido test: screenshot capture for {:?} failed: {error}", failed.id);
+        },
+    }
+}
+
+/// Replace secret byte strings with `***` in raw dumps.
+fn sanitize_bytes(bytes: Vec<u8>, secrets: &[String]) -> Vec<u8> {
+    if secrets.is_empty() {
+        return bytes;
+    }
+    let mut bytes = bytes;
+    for secret in secrets {
+        if secret.is_empty() {
+            continue;
+        }
+        let needle = secret.as_bytes();
+        let mut sanitized = Vec::with_capacity(bytes.len());
+        let mut rest = bytes.as_slice();
+        while let Some(at) = rest.windows(needle.len()).position(|window| window == needle) {
+            sanitized.extend_from_slice(&rest[..at]);
+            sanitized.extend_from_slice(PLAN_SECRET_MASK.as_bytes());
+            rest = &rest[at + needle.len()..];
+        }
+        sanitized.extend_from_slice(rest);
+        bytes = sanitized;
+    }
+    bytes
+}
+
+/// Write the `--on-failure-dump` bundle for one failed step: frame PNG, redacted grid JSON,
+/// sanitized raw transcript, presenter trace, and metadata.
+///
+/// Best-effort throughout: every failure warns on stderr and the bundle keeps what it got,
+/// never masking the plan error it documents. Returns the file names actually written.
+fn write_failure_dump(
+    client: &mut AutomationClient,
+    dir: &Path,
+    step_id: &str,
+    method: &str,
+    window_id: u64,
+    message: &str,
+    secrets: &[String],
+) -> Vec<String> {
+    let mut written = Vec::new();
+    if let Err(error) = fs::create_dir_all(dir) {
+        eprintln!("run-plan: cannot create failure dump dir {}: {error}", dir.display());
+        return written;
+    }
+    let path = |name: &str| dir.join(format!("{step_id}.{name}"));
+    let mut write_file = |name: &str, bytes: &[u8]| match fs::write(path(name), bytes) {
+        Ok(()) => written.push(format!("{step_id}.{name}")),
+        Err(error) => {
+            eprintln!("run-plan: cannot write failure dump {}: {error}", path(name).display());
+        },
+    };
+    // Step IDs are restricted to ASCII alphanumerics, `_`, and `-`, so the file names are safe.
+    match client.request("screenshot", json!({"window_id": window_id})) {
+        Ok(reply) => match reply.get("path").and_then(Value::as_str) {
+            Some(tmp) => match fs::read(tmp) {
+                Ok(bytes) => {
+                    write_file("frame.png", &bytes);
+                    let _ = fs::remove_file(tmp);
+                },
+                Err(error) => eprintln!("run-plan: cannot read screenshot {tmp}: {error}"),
+            },
+            None => eprintln!("run-plan: screenshot reply is missing its path"),
+        },
+        Err(error) => eprintln!("run-plan: failure dump screenshot failed: {error}"),
+    }
+    match client.request("get_grid", json!({"window_id": window_id})) {
+        Ok(mut grid) => {
+            redact_plan_value(&mut grid, secrets);
+            write_file(
+                "grid.json",
+                &serde_json::to_vec_pretty(&grid).unwrap_or_else(|_| grid.to_string().into_bytes()),
+            );
+        },
+        Err(error) => eprintln!("run-plan: failure dump grid failed: {error}"),
+    }
+    match client.request(
+        "transcript",
+        json!({"max_bytes": 1_048_576, "raw": true, "target": {"window_id": window_id}}),
+    ) {
+        Ok(reply) => match reply.get("data").and_then(Value::as_str) {
+            Some(encoded) => {
+                use base64::engine::Engine as _;
+                match base64::engine::general_purpose::STANDARD.decode(encoded) {
+                    Ok(bytes) => write_file("transcript.bin", &sanitize_bytes(bytes, secrets)),
+                    Err(error) => eprintln!("run-plan: transcript dump is not base64: {error}"),
+                }
+            },
+            None => eprintln!("run-plan: transcript reply is missing bounded data"),
+        },
+        Err(error) => eprintln!("run-plan: failure dump transcript failed: {error}"),
+    }
+    match client.request("vivid_trace", json!({"window_id": window_id, "tail": true, "limit": 128}))
+    {
+        Ok(trace) => write_file(
+            "presenter_trace.json",
+            &serde_json::to_vec_pretty(&trace).unwrap_or_else(|_| trace.to_string().into_bytes()),
+        ),
+        Err(error) => eprintln!("run-plan: presenter trace unavailable for failure dump: {error}"),
+    }
+    write_file(
+        "metadata.json",
+        &serde_json::to_vec_pretty(&json!({
+            "window_id": window_id,
+            "step_id": step_id,
+            "method": method,
+            "error": message,
+        }))
+        .unwrap_or_default(),
+    );
+    written
+}
+
+/// Window to capture: the failed assertion's window, else the session's first window.
+fn failed_window(socket: &Path, failed: &PlanStepRecord) -> Option<u64> {
+    if let PlanStepOutcome::Error { window: Some(window), .. } = failed.outcome {
+        return Some(window);
+    }
+    request_once(Some(socket.to_owned()), None, &SocketMessage::ListWindows)
+        .ok()
+        .and_then(|(_, reply)| reply.get("windows").and_then(Value::as_array)?.first().cloned())
+        .and_then(|window| window.get("window_id").and_then(Value::as_u64))
 }
 
 fn run_capture(
@@ -1282,7 +2561,8 @@ fn run_capture(
 /// Send one CLI command using a versioned protocol session.
 pub fn send_message(options: MessageOptions) -> io::Result<()> {
     if let SocketMessage::RunPlan(params) = &options.message {
-        return run_plan(options.socket, options.target.as_deref(), params);
+        let (outcome, _) = run_plan(options.socket, options.target.as_deref(), params);
+        return outcome;
     }
     if let SocketMessage::Capture(params) = &options.message {
         return run_capture(options.socket, options.target.as_deref(), params);
@@ -1502,18 +2782,31 @@ fn read_client_frame<R: BufRead>(reader: &mut R) -> io::Result<Option<Vec<u8>>> 
 fn message_request(message: &SocketMessage) -> io::Result<(&'static str, Value)> {
     match message {
         SocketMessage::CreateWindow(params) => Ok(("create_window", serialize_params(params)?)),
+        SocketMessage::CloseWindow(params) => Ok(("close_window", serialize_params(params)?)),
         SocketMessage::Quit => Ok(("quit", Value::Object(Default::default()))),
         SocketMessage::Ping => Ok(("ping", json!({}))),
+        SocketMessage::ResetTerminal(params) => Ok(("reset_terminal", serialize_params(params)?)),
+        SocketMessage::RestartTerminal(params) => {
+            Ok(("restart_terminal", serialize_params(params)?))
+        },
         SocketMessage::Config(params) => Ok(("config", serialize_params(params)?)),
         SocketMessage::GetConfig(params) => Ok(("get_config", serialize_params(params)?)),
         SocketMessage::Typing(params) => Ok(("typing", serialize_params(params)?)),
         SocketMessage::GetText(params) => Ok(("get_text", serialize_params(params)?)),
+        SocketMessage::FindText(params) => Ok(("find_text", serialize_params(params)?)),
+        SocketMessage::Exec(params) => Ok(("exec", serialize_params(params)?)),
         SocketMessage::Screenshot(params) => Ok(("screenshot", serialize_params(params)?)),
         SocketMessage::Capabilities | SocketMessage::RunPlan(_) | SocketMessage::Capture(_) => {
             unreachable!("client-only automation command")
         },
         SocketMessage::Key(params) => Ok(("key", serialize_params(params)?)),
         SocketMessage::Paste(params) => Ok(("paste", serialize_params(params)?)),
+        SocketMessage::DropFile(params) => {
+            // The file is opened by the Vivido process, whose working directory is not ours.
+            let mut params = params.clone();
+            params.path = std::path::absolute(&params.path)?;
+            Ok(("drop_file", serialize_params(&params)?))
+        },
         SocketMessage::Mouse(params) => Ok(("mouse", serialize_params(params)?)),
         SocketMessage::Resize(params) => Ok(("resize", serialize_params(params)?)),
         SocketMessage::SetGeometry(params) => Ok(("set_geometry", serialize_params(params)?)),
@@ -1566,6 +2859,10 @@ fn message_request(message: &SocketMessage) -> io::Result<(&'static str, Value)>
                 Ok(("wait_screen_stable", serialize_params(params)?))
             },
             IpcWaitCondition::Frame(params) => Ok(("wait_frame", serialize_params(params)?)),
+            IpcWaitCondition::Prompt(params) => Ok(("wait_prompt", serialize_params(params)?)),
+            IpcWaitCondition::CommandFinish(params) => {
+                Ok(("wait_command_finish", serialize_params(params)?))
+            },
             IpcWaitCondition::VividTrack(params) => Ok((
                 "wait_vivid_track",
                 json!({
@@ -1623,6 +2920,17 @@ fn validate_message(message: &SocketMessage) -> io::Result<()> {
         && params.rows.is_some_and(|rows| rows == 0 || rows > 1000)
     {
         return Err(IoError::new(ErrorKind::InvalidInput, "row count must be between 1 and 1000"));
+    }
+    if let SocketMessage::Exec(params) = message {
+        if params.command.len() > crate::exec::MAX_EXEC_COMMAND_BYTES {
+            return Err(IoError::new(ErrorKind::InvalidInput, "exec command exceeds 64 KiB"));
+        }
+        if params.timeout == 0 || params.timeout > crate::exec::MAX_EXEC_TIMEOUT_MS {
+            return Err(IoError::new(
+                ErrorKind::InvalidInput,
+                "exec timeout must be 1 ms through 24 hours",
+            ));
+        }
     }
     if let SocketMessage::Resize(params) = message
         && !matches!(
@@ -1777,6 +3085,9 @@ fn write_cli_result(message: &SocketMessage, result: &Value) -> io::Result<()> {
         | SocketMessage::RunPlan(_)
         | SocketMessage::Capture(_)
         | SocketMessage::Ping
+        | SocketMessage::ResetTerminal(_)
+        | SocketMessage::RestartTerminal(_)
+        | SocketMessage::CloseWindow(_)
         | SocketMessage::ListWindows
         | SocketMessage::Inspect(_)
         | SocketMessage::Diagnose(_)
@@ -1784,6 +3095,9 @@ fn write_cli_result(message: &SocketMessage, result: &Value) -> io::Result<()> {
         | SocketMessage::GetGrid(_)
         | SocketMessage::Wait(_)
         | SocketMessage::Transcript(_)
+        | SocketMessage::DropFile(_)
+        | SocketMessage::FindText(_)
+        | SocketMessage::Exec(_)
         | SocketMessage::Subscribe(_) => write_json_to(&mut stdout, result),
         SocketMessage::Typing(params) if params.report => write_json_to(&mut stdout, result),
         SocketMessage::Key(params) if params.report => write_json_to(&mut stdout, result),
@@ -1913,7 +3227,11 @@ fn find_socket(socket_path: Option<PathBuf>, target: Option<&str>) -> io::Result
     }
 
     // An explicitly named session must never silently fall through to a different instance.
-    if let Some(target) = target.map(str::to_owned).or_else(|| env::var(VIVIDO_SESSION_ENV).ok()) {
+    if let Some(target) = target
+        .map(str::to_owned)
+        .or_else(|| env::var(VIVIDO_SESSION_ENV).ok())
+        .or_else(|| env::var(VIVIDA_TARGET_ENV).ok())
+    {
         let registry = crate::session::registered_instance(&target)?;
         return connect_checked(&registry.socket).map_err(|err| {
             IoError::new(err.kind(), format!("no running Vivido instance named {target:?}"))
@@ -1926,9 +3244,9 @@ fn find_socket(socket_path: Option<PathBuf>, target: Option<&str>) -> io::Result
         return Ok(socket);
     }
 
-    // A single live headless session is unambiguous, so an unqualified `msg` should reach it.
-    if let Ok(sessions) = crate::session::list_registries()
-        && let [session] = sessions.as_slice()
+    let sessions = crate::session::list_registries().unwrap_or_default();
+    // A single live session is unambiguous, so an unqualified `msg` should reach it.
+    if let [session] = sessions.as_slice()
         && let Ok(socket) = connect_checked(&session.socket)
     {
         return Ok(socket);
@@ -1963,7 +3281,51 @@ fn find_socket(socket_path: Option<PathBuf>, target: Option<&str>) -> io::Result
         }
     }
 
+    if sessions.len() > 1 {
+        return Err(ambiguous_sessions_error(&sessions));
+    }
     Err(IoError::new(ErrorKind::NotFound, "no socket found"))
+}
+
+/// Comparable process start for one registry entry.
+///
+/// Every live instance on a machine reports the same platform variant, so comparing the raw
+/// start value orders sessions oldest-first even though the units differ per platform.
+fn session_birth_rank(session: &crate::session::SessionRegistry) -> u64 {
+    match session.process_birth {
+        crate::session::ProcessBirth::Linux { start_ticks } => start_ticks,
+        crate::session::ProcessBirth::Macos { start_micros } => start_micros,
+        crate::session::ProcessBirth::Windows { creation_time } => creation_time,
+    }
+}
+
+/// Actionable error when an unqualified `msg` matches more than one live session.
+///
+/// The candidates are listed newest-first so the session a tester just started — the usual
+/// intended target — is named first, but no session is picked silently: routing a mutating
+/// command at the wrong instance is worse than refusing.
+fn ambiguous_sessions_error(sessions: &[crate::session::SessionRegistry]) -> IoError {
+    let mut sessions = sessions.to_vec();
+    sessions.sort_by(|left, right| {
+        session_birth_rank(right)
+            .cmp(&session_birth_rank(left))
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    let candidates = sessions
+        .iter()
+        .map(|session| {
+            format!("{:?} (pid {}, {})", session.name, session.pid, session.socket.display())
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    IoError::new(
+        ErrorKind::NotFound,
+        format!(
+            "multiple Vivido sessions found, newest first: {candidates}; \
+             specify --target NAME or --socket PATH, \
+             or set {VIVIDO_SESSION_ENV} or {VIVIDA_TARGET_ENV}"
+        ),
+    )
 }
 
 /// File prefix matching sockets on the current display server.
@@ -1997,6 +3359,530 @@ pub(crate) fn test_connection() -> (IpcConnection, mpsc::Receiver<OutputFrame>) 
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn drop_file_is_an_advertised_input_method_that_sends_an_absolute_path() {
+        assert!(METHODS.contains(&"drop_file"));
+        assert_eq!(method_class("drop_file"), (MethodClass::Input, true));
+
+        // The Vivido process opens the file, and its working directory is not the client's.
+        let message = SocketMessage::DropFile(crate::cli::IpcDropFile {
+            path: "relative/firmware.bin".into(),
+            at: None,
+            type_path: false,
+            timeout: 1_000,
+            target: crate::cli::IpcTarget { window_id: Some(3) },
+        });
+        let (method, params) = message_request(&message).unwrap();
+        assert_eq!(method, "drop_file");
+        let sent = std::path::PathBuf::from(params["path"].as_str().unwrap());
+        assert!(sent.is_absolute());
+        assert_eq!(sent, std::env::current_dir().unwrap().join("relative/firmware.bin"));
+        assert!(params.get("at").is_none());
+        assert_eq!(params["target"]["window_id"], 3, "nested, exactly as `paste` sends it");
+    }
+
+    #[test]
+    fn close_window_is_an_advertised_lifecycle_method() {
+        assert!(METHODS.contains(&"close_window"));
+        assert_eq!(method_class("close_window"), (MethodClass::Lifecycle, true));
+
+        let message = SocketMessage::CloseWindow(crate::cli::IpcCloseWindow {
+            window_id: Some(2),
+            force: true,
+        });
+        let (method, params) = message_request(&message).unwrap();
+        assert_eq!(method, "close_window");
+        assert_eq!(params["window_id"], 2);
+        assert_eq!(params["force"], true);
+
+        // The force flag is server-bound: omitting it must still decode, defaulting to graceful.
+        let decoded: crate::cli::IpcCloseWindow =
+            serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(decoded.window_id, None);
+        assert!(!decoded.force);
+    }
+
+    #[test]
+    fn semantic_waits_are_advertised_observe_methods() {
+        for method in ["wait_prompt", "wait_command_finish"] {
+            assert!(METHODS.contains(&method), "{method} is not advertised");
+            assert_eq!(method_class(method), (MethodClass::Observe, false));
+        }
+
+        let prompt = SocketMessage::Wait(crate::cli::IpcWait {
+            condition: crate::cli::IpcWaitCondition::Prompt(crate::cli::IpcWaitCommon {
+                timeout: 5_000,
+                target: crate::cli::IpcTarget::default(),
+            }),
+        });
+        let (method, params) = message_request(&prompt).unwrap();
+        assert_eq!(method, "wait_prompt");
+        assert_eq!(params["timeout"], 5_000);
+
+        let finish = SocketMessage::Wait(crate::cli::IpcWait {
+            condition: crate::cli::IpcWaitCondition::CommandFinish(crate::cli::IpcWaitCommon {
+                timeout: 30_000,
+                target: crate::cli::IpcTarget { window_id: Some(3) },
+            }),
+        });
+        let (method, params) = message_request(&finish).unwrap();
+        assert_eq!(method, "wait_command_finish");
+        assert_eq!(params["target"]["window_id"], 3);
+
+        // Scopes travel with the text wait they restrict.
+        let scoped = SocketMessage::Wait(crate::cli::IpcWait {
+            condition: crate::cli::IpcWaitCondition::Text(crate::cli::IpcWaitText {
+                text: String::from("PS>"),
+                regex: false,
+                after_screen: None,
+                line: Some(-1),
+                rect: None,
+                common: crate::cli::IpcWaitCommon {
+                    timeout: 5_000,
+                    target: crate::cli::IpcTarget::default(),
+                },
+            }),
+        });
+        let (method, params) = message_request(&scoped).unwrap();
+        assert_eq!(method, "wait_text");
+        assert_eq!(params["line"], -1);
+        assert_eq!(params["rect"], Value::Null);
+
+        // Hand-written wire JSON omits what it does not need: optional wait fields and an
+        // empty target decode to focused-window defaults rather than `invalid_params`.
+        let minimal: crate::cli::IpcWaitText = serde_json::from_value(json!({
+            "text": "ready",
+            "common": {"timeout": 1000, "target": {}},
+        }))
+        .unwrap();
+        assert!(!minimal.regex);
+        assert_eq!(minimal.after_screen, None);
+        assert_eq!(minimal.line, None);
+        assert_eq!(minimal.rect, None);
+        assert_eq!(minimal.common.target.window_id, None);
+    }
+
+    #[test]
+    fn plan_version_two_accepts_named_assertion_plans() {
+        let plan: IpcAutomationPlan = serde_json::from_value(json!({
+            "version": 2,
+            "name": "git-commit-verification",
+            "steps": [
+                {
+                    "id": "await_prompt",
+                    "method": "wait_prompt",
+                    "params": {"common": {"timeout": 5000, "target": {}}},
+                },
+                {
+                    "id": "assert_output",
+                    "method": "wait_text",
+                    "params": {"text": "On branch main"},
+                    "assert": {
+                        "text_contains": "On branch main",
+                        "window_id": 1,
+                        "lines_from_bottom": 10,
+                        "timeout_ms": 3000,
+                    },
+                },
+                {
+                    "id": "assert_shape",
+                    "method": "list_windows",
+                    "assert": {"result_pointer": "", "result_equals": {"windows": []}},
+                },
+            ]
+        }))
+        .unwrap();
+        assert_eq!(plan.name.as_deref(), Some("git-commit-verification"));
+        let methods =
+            ["wait_prompt", "wait_text", "list_windows"].into_iter().map(str::to_owned).collect();
+        validate_plan(&plan, &methods).unwrap();
+
+        // Version 1 plans without assertions keep validating unchanged.
+        let legacy: IpcAutomationPlan = serde_json::from_value(json!({
+            "version": 1,
+            "steps": [{"id": "windows", "method": "list_windows"}]
+        }))
+        .unwrap();
+        validate_plan(&legacy, &methods).unwrap();
+
+        assert!(
+            validate_plan(
+                &IpcAutomationPlan {
+                    version: 3,
+                    name: None,
+                    vars: BTreeMap::new(),
+                    secrets: Vec::new(),
+                    include: Vec::new(),
+                    steps: vec![]
+                },
+                &methods,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn plan_assertions_reject_empty_and_mismatched_checks() {
+        use crate::cli::IpcPlanAssertion;
+        let valid = IpcPlanAssertion {
+            text_contains: Some(String::from("done")),
+            window_id: Some(json!(1)),
+            timeout_ms: 5_000,
+            lines_from_bottom: Some(10),
+            result_pointer: None,
+            result_equals: None,
+        };
+        assert!(validate_assertion("ok", &valid).is_ok());
+
+        let missing_window = IpcPlanAssertion { window_id: None, ..valid.clone() };
+        assert!(validate_assertion("no-window", &missing_window).is_err());
+
+        let empty_text = IpcPlanAssertion { text_contains: Some(String::new()), ..valid.clone() };
+        assert!(validate_assertion("empty", &empty_text).is_err());
+
+        let nothing = IpcPlanAssertion {
+            text_contains: None,
+            window_id: None,
+            timeout_ms: 5_000,
+            lines_from_bottom: None,
+            result_pointer: None,
+            result_equals: None,
+        };
+        assert!(validate_assertion("nothing", &nothing).is_err());
+
+        let half_result = IpcPlanAssertion {
+            text_contains: None,
+            result_pointer: Some(String::from("/window_id")),
+            ..nothing.clone()
+        };
+        assert!(validate_assertion("half", &half_result).is_err());
+
+        let bad_pointer = IpcPlanAssertion {
+            result_pointer: Some(String::from("window_id")),
+            result_equals: Some(json!(1)),
+            ..nothing.clone()
+        };
+        assert!(validate_assertion("pointer", &bad_pointer).is_err());
+
+        let bad_rows = IpcPlanAssertion { lines_from_bottom: Some(0), ..valid.clone() };
+        assert!(validate_assertion("rows", &bad_rows).is_err());
+    }
+
+    #[test]
+    fn report_destinations_are_validated_before_any_session_exists() {
+        use crate::cli::IpcPlanReport::{Junit, Ndjson, Sarif};
+        assert!(report_destination(Junit, &None, false).is_err());
+        assert!(report_destination(Junit, &Some(PathBuf::from("x.xml")), true).is_err());
+        assert!(report_destination(Ndjson, &Some(PathBuf::from("x.xml")), false).is_err());
+        assert!(report_destination(Sarif, &None, false).is_err());
+        assert!(report_destination(Sarif, &Some(PathBuf::from("x.sarif")), true).is_err());
+        assert_eq!(
+            report_destination(Junit, &Some(PathBuf::from("x.xml")), false).unwrap(),
+            Some(PathBuf::from("x.xml"))
+        );
+        assert_eq!(
+            report_destination(Sarif, &Some(PathBuf::from("x.sarif")), false).unwrap(),
+            Some(PathBuf::from("x.sarif"))
+        );
+        assert_eq!(report_destination(Ndjson, &None, false).unwrap(), None);
+
+        // A generated session name is process-scoped and does not claim anything.
+        let name = test_session_name(None).unwrap();
+        assert!(name.starts_with("vivido-test-"), "{name}");
+    }
+
+    #[test]
+    fn junit_report_escapes_and_counts_steps() {
+        assert_eq!(junit_escape("a&b<c>d\"e'f"), "a&amp;b&lt;c&gt;d&quot;e&apos;f");
+        assert_eq!(truncate_excerpt("short"), "short");
+        assert!(truncate_excerpt(&"x".repeat(3_000)).ends_with("[truncated]"));
+
+        let step = |id: &str| IpcAutomationPlanStep {
+            id: id.to_owned(),
+            method: String::from("typing"),
+            params: json!({}),
+            bind: BTreeMap::new(),
+            when: None,
+            on_error: IpcPlanErrorPolicy::Abort,
+            verify: None,
+            assert: None,
+        };
+        let started = std::time::Instant::now();
+        let records = [
+            PlanStepRecord::ok(&step("type<&>"), &started),
+            PlanStepRecord::error(&step("check"), "expected \"x\"", Some(1), &started),
+            PlanStepRecord::skipped(&step("later"), "condition_false", &started),
+        ];
+        let path =
+            std::env::temp_dir().join(format!("vivido-junit-test-{}.xml", std::process::id()));
+        write_junit_report(&Some(path.clone()), "suite&<test>", &records, 1).unwrap();
+        let xml = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(xml.contains(r#"name="suite&amp;&lt;test&gt;""#), "{xml}");
+        assert!(xml.contains(r#"tests="3" failures="1" skipped="1""#), "{xml}");
+        assert!(xml.contains(r#"name="type&lt;&amp;&gt;""#), "{xml}");
+        assert!(xml.contains("<failure message=\"expected &quot;x&quot;\">"), "{xml}");
+        assert!(xml.contains("<skipped message=\"condition_false\"/>"), "{xml}");
+    }
+
+    #[test]
+    fn sarif_report_marks_failures_passes_and_skips() {
+        let step = |id: &str, method: &str| IpcAutomationPlanStep {
+            id: id.to_owned(),
+            method: method.to_owned(),
+            params: json!({}),
+            bind: BTreeMap::new(),
+            when: None,
+            on_error: IpcPlanErrorPolicy::Abort,
+            verify: None,
+            assert: None,
+        };
+        let started = std::time::Instant::now();
+        let records = [
+            PlanStepRecord::ok(&step("type", "typing"), &started),
+            PlanStepRecord::error(&step("check", "get-text"), "expected \"x\"", Some(1), &started),
+            PlanStepRecord::skipped(&step("later", "typing"), "condition_false", &started),
+        ];
+        let path =
+            std::env::temp_dir().join(format!("vivido-sarif-test-{}.sarif", std::process::id()));
+        write_sarif_report(&Some(path.clone()), "suite", &records, 1).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let log: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(log["version"], "2.1.0");
+        let run = &log["runs"][0];
+        assert_eq!(run["tool"]["driver"]["name"], "vivido");
+        // One rule per distinct step method.
+        let rules = run["tool"]["driver"]["rules"].as_array().unwrap();
+        assert_eq!(rules.len(), 2);
+        assert!(rules.iter().any(|rule| rule["id"] == "typing"));
+        assert!(rules.iter().any(|rule| rule["id"] == "get-text"));
+        let results = run["results"].as_array().unwrap();
+        assert_eq!(results.len(), 3);
+        let failed =
+            results.iter().find(|result| result["properties"]["stepId"] == "check").unwrap();
+        assert_eq!(failed["level"], "error");
+        assert_eq!(failed["kind"], "fail");
+        assert_eq!(failed["ruleId"], "get-text");
+        assert_eq!(failed["message"]["text"], "expected \"x\"");
+        let passed =
+            results.iter().find(|result| result["properties"]["stepId"] == "type").unwrap();
+        assert_eq!(passed["level"], "none");
+        assert_eq!(passed["kind"], "pass");
+        let skipped =
+            results.iter().find(|result| result["properties"]["stepId"] == "later").unwrap();
+        assert_eq!(skipped["level"], "none");
+        assert_eq!(skipped["kind"], "notApplicable");
+        assert_eq!(run["invocations"][0]["executionSuccessful"], false);
+        assert_eq!(run["properties"]["suite"], "suite");
+    }
+
+    #[test]
+    fn plan_vars_substitute_leaving_refs_alone() {
+        use crate::cli::IpcAutomationPlan;
+
+        let mut plan: IpcAutomationPlan = serde_json::from_value(json!({
+            "version": 2,
+            "vars": {"user": "bot", "token": "s3cret"},
+            "secrets": ["token"],
+            "steps": [
+                {"id": "login", "method": "typing",
+                 "params": {"text": "user=${user} pass=${token}"}},
+                {"id": "use", "method": "inspect",
+                 "params": {"window_id": {"$ref": "win"}, "tag": "by-${user}"},
+                 "bind": {"win": "/window_id"}},
+            ],
+        }))
+        .unwrap();
+        let sets = parse_plan_set(&[String::from("user=root")]).unwrap();
+        let secrets = apply_plan_bindings(&mut plan, &sets).unwrap();
+
+        assert_eq!(secrets, [String::from("s3cret")]);
+        assert_eq!(plan.vars["user"], "root");
+        assert_eq!(plan.steps[0].params["text"], "user=root pass=s3cret");
+        // `$ref` aliases name step bindings, not variables, so they survive substitution.
+        assert_eq!(plan.steps[1].params["window_id"], json!({"$ref": "win"}));
+        assert_eq!(plan.steps[1].params["tag"], "by-root");
+    }
+
+    #[test]
+    fn plan_bindings_fail_closed() {
+        use crate::cli::IpcAutomationPlan;
+
+        let mut plan: IpcAutomationPlan = serde_json::from_value(json!({
+            "version": 1,
+            "steps": [{"id": "s", "method": "ping", "params": {"text": "hi ${missing}"}}],
+        }))
+        .unwrap();
+        assert!(apply_plan_bindings(&mut plan, &BTreeMap::new()).is_err());
+
+        let mut plan: IpcAutomationPlan = serde_json::from_value(json!({
+            "version": 1,
+            "vars": {"present": "yes"},
+            "secrets": ["absent"],
+            "steps": [{"id": "s", "method": "ping"}],
+        }))
+        .unwrap();
+        // A secret without a value would silently disable masking: reject it instead.
+        assert!(apply_plan_bindings(&mut plan, &BTreeMap::new()).is_err());
+
+        assert!(parse_plan_set(&[String::from("NO_EQUALS")]).is_err());
+        assert!(parse_plan_set(&[String::from("9bad=value")]).is_err());
+        assert!(parse_plan_set(&[String::from("good=value")]).is_ok());
+    }
+
+    #[test]
+    fn plan_secrets_are_masked_in_reports() {
+        // Longest first, so an overlapping value masks completely.
+        let mut ordered = [String::from("s3cret"), String::from("s3cret-long")].to_vec();
+        ordered.sort_by_key(|secret| std::cmp::Reverse(secret.len()));
+        assert_eq!(ordered, ["s3cret-long", "s3cret"]);
+
+        let mut value = json!({
+            "action": {"text": "pass=s3cret-long!"},
+            "nested": ["s3cret", 42, {"deep": "s3cret"}],
+        });
+        redact_plan_value(&mut value, &ordered);
+        assert_eq!(
+            value,
+            json!({
+                "action": {"text": "pass=***!"},
+                "nested": ["***", 42, {"deep": "***"}],
+            })
+        );
+
+        assert_eq!(sanitize_bytes(b"pass=s3cret!".to_vec(), &ordered), b"pass=***!".to_vec());
+        assert_eq!(sanitize_bytes(b"plain".to_vec(), &[]), b"plain".to_vec());
+        assert_eq!(sanitize_bytes(b"abc".to_vec(), &[String::new()]), b"abc".to_vec());
+
+        assert_eq!(redact_secret_text("nothing to hide", &ordered), "nothing to hide");
+        // Empty values never mask: masking "" would wedge *** between every character.
+        assert_eq!(redact_secret_text("abc", &[String::new()]), "abc");
+        // With no secrets the text keeps its exact previous code path.
+        assert_eq!(redact_secret_text("abc", &[]), "abc");
+    }
+
+    #[test]
+    fn plan_includes_flatten_in_order_with_cycle_detection() {
+        struct TestDir(PathBuf);
+        impl Drop for TestDir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let dir =
+            std::env::temp_dir().join(format!("vivido-plan-include-{}.d", std::process::id()));
+        let _guard = TestDir(dir.clone());
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let write = |name: &str, body: &str| std::fs::write(dir.join(name), body).unwrap();
+
+        write(
+            "a.json",
+            r#"{"version":2,"vars":{"a":"1","shared":"a"},
+            "steps":[{"id":"a","method":"ping"}]}"#,
+        );
+        write(
+            "b.json",
+            r#"{"version":2,"vars":{"b":"2","shared":"b"},
+            "steps":[{"id":"b","method":"ping"}]}"#,
+        );
+        write(
+            "base.json",
+            r#"{"version":2,"include":["a.json","b.json"],
+            "vars":{"shared":"base"},"steps":[{"id":"base","method":"ping"}]}"#,
+        );
+
+        let plan = load_plan_file(&dir.join("base.json"), 0, &mut Vec::new()).unwrap();
+        let ids: Vec<_> = plan.steps.iter().map(|step| step.id.as_str()).collect();
+        assert_eq!(ids, ["a", "b", "base"]);
+        // Later includes override earlier ones; the including file overrides everything.
+        assert_eq!(plan.vars["a"], "1");
+        assert_eq!(plan.vars["b"], "2");
+        assert_eq!(plan.vars["shared"], "base");
+
+        // A plan that includes itself, directly or mutually, is rejected.
+        write(
+            "self.json",
+            r#"{"version":2,"include":["self.json"],
+            "steps":[{"id":"s","method":"ping"}]}"#,
+        );
+        assert!(load_plan_file(&dir.join("self.json"), 0, &mut Vec::new()).is_err());
+        write(
+            "c.json",
+            r#"{"version":2,"include":["d.json"],
+            "steps":[{"id":"c","method":"ping"}]}"#,
+        );
+        write(
+            "d.json",
+            r#"{"version":2,"include":["c.json"],
+            "steps":[{"id":"d","method":"ping"}]}"#,
+        );
+        assert!(load_plan_file(&dir.join("c.json"), 0, &mut Vec::new()).is_err());
+
+        // Includes resolve relative to the including file, not the working directory.
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        write("sub/inner.json", r#"{"version":2,"steps":[{"id":"i","method":"ping"}]}"#);
+        write(
+            "outer.json",
+            r#"{"version":2,"include":["sub/inner.json"],
+            "steps":[{"id":"o","method":"ping"}]}"#,
+        );
+        let plan = load_plan_file(&dir.join("outer.json"), 0, &mut Vec::new()).unwrap();
+        let ids: Vec<_> = plan.steps.iter().map(|step| step.id.as_str()).collect();
+        assert_eq!(ids, ["i", "o"]);
+    }
+
+    #[test]
+    fn ambiguous_sessions_name_every_candidate_newest_first() {
+        let registry = |name: &str, pid: u32, start: u64| crate::session::SessionRegistry {
+            schema: 1,
+            name: name.to_owned(),
+            pid,
+            instance_nonce: String::from("nonce"),
+            vivido_version: String::from("test"),
+            protocol_version: 2,
+            endpoint_id: String::from("endpoint"),
+            process_birth: crate::session::ProcessBirth::Linux { start_ticks: start },
+            socket: std::path::PathBuf::from(format!("/tmp/{name}.sock")),
+            headless: true,
+            columns: 80,
+            lines: 24,
+        };
+        let sessions = [registry("hl-old", 100, 10), registry("hl-new", 200, 20)];
+        let error = ambiguous_sessions_error(&sessions);
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        let message = error.to_string();
+        assert!(message.contains("\"hl-old\""), "every candidate is named: {message}");
+        assert!(message.contains("\"hl-new\""), "every candidate is named: {message}");
+        assert!(message.contains("--target"), "the fix is actionable: {message}");
+        assert!(
+            message.find("\"hl-new\"").unwrap() < message.find("\"hl-old\"").unwrap(),
+            "newest session is listed first: {message}"
+        );
+    }
+
+    #[test]
+    fn every_emitted_event_kind_is_advertised() {
+        // `EVENT_KINDS` is both the handshake advertisement and the `subscribe` allowlist, so a
+        // kind missing from it is delivered to unfiltered subscriptions and rejected when asked for
+        // by name. `directory_changed` was in exactly that state: emitted on OSC 7, documented in
+        // `docs/ipc.md`, and unreachable. `AutomationHub::emit_payload` now debug-asserts against
+        // this list; this pins the kind that was missing and the list's shape.
+        assert!(
+            EVENT_KINDS.contains(&"directory_changed"),
+            "OSC 7 emits directory_changed, so a client must be able to subscribe to it"
+        );
+
+        let mut sorted = EVENT_KINDS.to_vec();
+        sorted.sort_unstable();
+        let unique = sorted.len();
+        sorted.dedup();
+        assert_eq!(sorted.len(), unique, "an advertised kind is listed twice");
+    }
+
     #[cfg(windows)]
     use std::io::Read;
     use std::io::{BufReader, Write};
@@ -2004,10 +3890,48 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     #[cfg(unix)]
     use std::os::unix::io::AsRawFd;
+    use std::sync::{Mutex, MutexGuard};
 
     use serde_json::json;
 
     use super::*;
+
+    /// Serializes the tests that touch the process-wide claimed-method registries.
+    ///
+    /// `HOST_METHODS` and `HOST_METHOD_CAPABILITIES` are process-wide because the handshake is
+    /// answered on the listener thread while claiming happens on the main loop. Tests run in
+    /// threads of one process, so two that publish would otherwise read each other's claims —
+    /// and each clearing up after itself would clear the other's state as well.
+    static CLAIMED_REGISTRY: Mutex<()> = Mutex::new(());
+
+    /// Exclusive use of the claimed-method registries, empty at both ends.
+    ///
+    /// Held for the whole of any test that publishes or reads the advertised set, so what such a
+    /// test sees is only ever what it put there.
+    struct ClaimedMethods(#[allow(dead_code)] MutexGuard<'static, ()>);
+
+    impl ClaimedMethods {
+        fn acquire() -> Self {
+            // A test that panicked while holding this poisoned the lock. The registries are
+            // emptied on both ends regardless, so one failure is not a reason to fail every test
+            // that runs after it.
+            let guard = CLAIMED_REGISTRY.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let claimed = Self(guard);
+            claimed.empty();
+            claimed
+        }
+
+        fn empty(&self) {
+            publish_host_methods([].iter());
+            publish_host_method_capabilities(&[]);
+        }
+    }
+
+    impl Drop for ClaimedMethods {
+        fn drop(&mut self) {
+            self.empty();
+        }
+    }
 
     #[test]
     fn bounded_plan_accepts_backward_only_alias_references() {
@@ -2064,13 +3988,20 @@ mod tests {
         assert!(validate_plan(&forward, &methods).is_err());
 
         let step = forward.steps[0].clone();
-        let oversized =
-            IpcAutomationPlan { version: 1, steps: vec![step; MAX_AUTOMATION_PLAN_STEPS + 1] };
+        let oversized = IpcAutomationPlan {
+            version: 1,
+            name: None,
+            vars: BTreeMap::new(),
+            secrets: Vec::new(),
+            include: Vec::new(),
+            steps: vec![step; MAX_AUTOMATION_PLAN_STEPS + 1],
+        };
         assert!(validate_plan(&oversized, &methods).is_err());
     }
 
     #[test]
     fn handshake_classifies_standard_and_host_methods() {
+        let _claimed = ClaimedMethods::acquire();
         let descriptors = [MethodCapability::host("vivida_layout", MethodClass::Observe, false)];
         publish_host_methods([String::from("vivida_layout")].iter());
         publish_host_method_capabilities(&descriptors);
@@ -2082,8 +4013,6 @@ mod tests {
                 && !capability.host_claimed
         }));
         assert!(capabilities.iter().any(|capability| capability == &descriptors[0]));
-        publish_host_methods([].iter());
-        publish_host_method_capabilities(&[]);
     }
 
     #[test]
@@ -2181,6 +4110,103 @@ mod tests {
     }
 
     #[test]
+    fn thousand_event_burst_keeps_every_sequence() {
+        use crate::automation::{AutomationHub, SubscriptionRequest};
+        use std::collections::HashSet;
+        use std::time::Duration;
+
+        let (connection, output) = test_connection();
+        let mut hub = AutomationHub::default();
+        hub.subscribe(
+            connection,
+            1,
+            SubscriptionRequest {
+                target: None,
+                all_windows: true,
+                kinds: HashSet::new(),
+                since_event: None,
+                current_sequences: json!({}),
+            },
+        )
+        .unwrap();
+        // The subscribe acknowledgement is not part of the burst.
+        let _ = output.recv().unwrap();
+
+        const BURST: u64 = 1500;
+        for n in 1..=BURST {
+            hub.emit(Some(1), "bell", json!({"n": n}));
+        }
+        let mut sequences = Vec::with_capacity(BURST as usize);
+        for _ in 0..BURST {
+            // `recv_timeout`, never `recv`: a regression must fail, not hang the suite.
+            let frame =
+                output.recv_timeout(Duration::from_secs(5)).expect("burst frame was dropped");
+            let envelope: SubscriptionEventEnvelope = serde_json::from_slice(&frame.bytes).unwrap();
+            assert_ne!(
+                envelope.event.get("type").and_then(Value::as_str),
+                Some("overflow"),
+                "lost events inside a {BURST}-event burst",
+            );
+            sequences.push(envelope.event_sequence);
+        }
+        assert_eq!(sequences, (1..=BURST).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn saturated_subscriber_reports_dropped_range_in_overflow_envelope() {
+        use crate::automation::{AutomationHub, SubscriptionRequest};
+        use std::collections::HashSet;
+        use std::time::Duration;
+
+        let (connection, output) = test_connection();
+        let mut hub = AutomationHub::default();
+        hub.subscribe(
+            connection,
+            1,
+            SubscriptionRequest {
+                target: None,
+                all_windows: true,
+                kinds: HashSet::new(),
+                since_event: None,
+                current_sequences: json!({}),
+            },
+        )
+        .unwrap();
+        // The subscribe acknowledgement is not part of the burst.
+        output.recv_timeout(Duration::from_secs(5)).expect("subscribe acknowledgement");
+
+        // Fill every slot without draining: the subscriber is behind by design.
+        for _ in 0..MAX_SUBSCRIBER_EVENTS {
+            hub.emit(Some(1), "bell", json!({}));
+        }
+        // Beyond the bound events are dropped, never queued.
+        const DROPPED: u64 = 10;
+        for _ in 0..DROPPED {
+            hub.emit(Some(1), "bell", json!({}));
+        }
+        // Draining frees each frame's slot; the pending dropped range survives.
+        for _ in 0..MAX_SUBSCRIBER_EVENTS {
+            output.recv_timeout(Duration::from_secs(5)).expect("queued frame");
+        }
+        // The next emit flushes the pending overflow envelope ahead of its own event.
+        hub.emit(Some(1), "bell", json!({}));
+        let frame = output.recv_timeout(Duration::from_secs(5)).expect("overflow envelope");
+        let envelope: SubscriptionEventEnvelope = serde_json::from_slice(&frame.bytes).unwrap();
+        assert_eq!(envelope.event.get("type").and_then(Value::as_str), Some("overflow"));
+        let first_dropped = MAX_SUBSCRIBER_EVENTS as u64 + 1;
+        assert_eq!(envelope.event["data"]["first_dropped_sequence"].as_u64(), Some(first_dropped));
+        assert_eq!(
+            envelope.event["data"]["last_dropped_sequence"].as_u64(),
+            Some(first_dropped + DROPPED - 1)
+        );
+        // The triggering event itself still arrives, in sequence, right after.
+        let frame = output.recv_timeout(Duration::from_secs(5)).expect("event after overflow");
+        let envelope: SubscriptionEventEnvelope = serde_json::from_slice(&frame.bytes).unwrap();
+        assert_eq!(envelope.event.get("type").and_then(Value::as_str), Some("bell"));
+        assert_eq!(envelope.event_sequence, first_dropped + DROPPED);
+    }
+
+    #[test]
     fn subscription_queue_is_bounded_per_subscriber() {
         let (connection, output) = test_connection();
         let queued = Arc::new(AtomicUsize::new(0));
@@ -2215,6 +4241,56 @@ mod tests {
 
         drop(output.recv().unwrap());
         assert_eq!(queued.load(Ordering::Acquire), MAX_SUBSCRIBER_EVENTS - 1);
+    }
+
+    #[test]
+    fn exec_is_an_advertised_process_method() {
+        assert!(METHODS.contains(&"exec"));
+        assert_eq!(method_class("exec"), (MethodClass::Process, true));
+
+        let (method, params) = message_request(&SocketMessage::Exec(crate::cli::IpcExec {
+            command: String::from("cargo check"),
+            window_id: Some(1),
+            timeout: 60_000,
+        }))
+        .unwrap();
+        assert_eq!(method, "exec");
+        assert_eq!(params["command"], "cargo check");
+        assert_eq!(params["timeout"], 60_000);
+
+        assert!(
+            validate_message(&SocketMessage::Exec(crate::cli::IpcExec {
+                command: String::from("ok"),
+                window_id: None,
+                timeout: 0,
+            }))
+            .is_err()
+        );
+        assert!(
+            validate_message(&SocketMessage::Exec(crate::cli::IpcExec {
+                command: "x".repeat(crate::exec::MAX_EXEC_COMMAND_BYTES + 1),
+                window_id: None,
+                timeout: 1_000,
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn find_text_is_an_advertised_observe_method() {
+        assert!(METHODS.contains(&"find_text"));
+        assert_eq!(method_class("find_text"), (MethodClass::Observe, false));
+
+        let (method, params) = message_request(&SocketMessage::FindText(crate::cli::IpcFindText {
+            pattern: String::from("Submit"),
+            regex: false,
+            window_id: None,
+            max_matches: 50,
+        }))
+        .unwrap();
+        assert_eq!(method, "find_text");
+        assert_eq!(params["pattern"], "Submit");
+        assert_eq!(params["max_matches"], 50);
     }
 
     #[test]
@@ -2355,9 +4431,16 @@ mod tests {
 
     #[test]
     fn hello_advertises_required_limits() {
+        // This reads the advertised method set, which a test publishing into it would change
+        // underneath it.
+        let _claimed = ClaimedMethods::acquire();
         let hello = hello_result();
         assert_eq!(hello["protocol_version"], 2);
         assert_eq!(hello["limits"]["connections"], 32);
+        #[cfg(windows)]
+        assert_eq!(hello["limits"]["max_conpty_windows"], 64);
+        #[cfg(not(windows))]
+        assert!(hello["limits"]["max_conpty_windows"].is_null());
         assert!(hello["methods"].as_array().unwrap().iter().any(|value| value == "get_grid"));
         for method in [
             "vivid_sessions",
@@ -2383,6 +4466,7 @@ mod tests {
 
     #[test]
     fn hello_advertises_host_claimed_methods_beside_vivido_own() {
+        let _claimed = ClaimedMethods::acquire();
         let claimed = [String::from("vvbox_list_tabs"), String::from("create_window")];
         publish_host_methods(claimed.iter());
 

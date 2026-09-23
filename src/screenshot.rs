@@ -100,7 +100,7 @@ fn compact_and_unpremultiply(pixels: &mut ScreenshotPixels) -> IoResult<()> {
     }
     pixels.bytes.truncate(compact_length);
 
-    for pixel in pixels.bytes.chunks_exact_mut(4) {
+    for pixel in pixels.bytes.as_chunks_mut::<4>().0 {
         let alpha = u16::from(pixel[3]);
         if alpha == 0 {
             pixel[..3].fill(0);

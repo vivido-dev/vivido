@@ -161,6 +161,7 @@ pub struct TerminalTarget {
 impl TerminalTarget {
     const PROFILES: &'static [&'static str] = &[
         registry::AUDIO_GAIN,
+        registry::AUDIO_INPUT,
         registry::CORE_CONTROL,
         registry::FILE_DROP,
         // Offered only when the config option is on; see `ServiceShared::offered_profiles`.
@@ -168,6 +169,7 @@ impl TerminalTarget {
         registry::LIVE_MEDIA,
         registry::OBSERVABILITY,
         registry::TERMINAL_SURFACE,
+        registry::TIMED_MEDIA_SYNC,
         registry::TIMED_MEDIA,
         registry::WEB_CARRIER,
     ];
@@ -360,6 +362,7 @@ impl DesktopTarget {
         registry::FILE_DROP,
         registry::LIVE_MEDIA,
         registry::OBSERVABILITY,
+        registry::TIMED_MEDIA_SYNC,
         registry::TIMED_MEDIA,
         registry::WEB_CARRIER,
     ];

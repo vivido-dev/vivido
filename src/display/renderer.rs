@@ -136,6 +136,7 @@ pub struct SceneRenderer {
     valid_target: bool,
     max_surface_dimension: u32,
     media: VividMediaRenderer,
+    overlays: super::overlay::OverlayRenderer,
     /// Rounds the finished frame's corners. Built only for a window which draws its own frame.
     corners: Option<CornerMask>,
     /// Physical corner radius applied to the finished frame; zero leaves the corners square.
@@ -147,6 +148,8 @@ pub struct SceneRenderer {
     /// Whether `render_target` holds a frame. Screenshots read that texture, not the swapchain,
     /// so this is set by both the windowed and the offscreen path.
     has_rendered_frame: bool,
+    /// Whether the window-sized GPU memory has been handed back while the window is hidden.
+    hidden_released: bool,
 }
 
 #[cfg(windows)]
@@ -164,6 +167,8 @@ impl WindowsComposition {
             unreachable!("Windows can only create Win32 window handles");
         };
         let hwnd = windows::Win32::Foundation::HWND(handle.hwnd.get() as *mut std::ffi::c_void);
+        // SAFETY: this native window was obtained on its owning event-loop thread.
+        unsafe { super::windows_live_move::install(hwnd.0) }?;
 
         let device: IDCompositionDevice = unsafe { DCompositionCreateDevice2(None::<&IUnknown>) }?;
         // Put the visual above any HWND client/child content. The HWND itself has no redirection
@@ -378,12 +383,14 @@ impl SceneRenderer {
             valid_target,
             max_surface_dimension,
             media,
+            overlays: Default::default(),
             corners: None,
             corner_radius: 0.0,
             render_target,
             render_target_view,
             target_size,
             has_rendered_frame: false,
+            hidden_released: false,
         })
     }
 
@@ -425,13 +432,58 @@ impl SceneRenderer {
         }
 
         if let (Some(context), Some(surface)) = (&self.context, &mut self.surface) {
-            context.0.borrow().context.resize_surface(surface, size.width, size.height);
+            reconfigure_surface(&context.0.borrow().context, surface, size.width, size.height);
         }
         (self.render_target, self.render_target_view) =
             create_render_target(&self.device, size.width, size.height);
         self.target_size = size;
         self.valid_target = true;
         self.has_rendered_frame = false;
+        self.hidden_released = false;
+    }
+
+    /// Hand back the window-sized GPU memory a hidden window cannot use.
+    ///
+    /// A background tab holds a full swapchain plus the media and overlay compositing targets, all
+    /// sized to the window and all unreachable until it is shown again. The swapchain is the
+    /// expensive part: three drawables at the window size, 75 MB for a 2920x2184 Retina window.
+    /// Shrinking the surface to 1x1 releases them without needing the window handle back, which
+    /// `SceneRenderer` does not keep.
+    ///
+    /// `render_target` deliberately stays: screenshots read that texture rather than the swapchain
+    /// (see `begin_screenshot`), so releasing it would make `screenshot` fail for exactly the
+    /// background tabs automation tends to ask about.
+    pub fn release_while_hidden(&mut self) {
+        if self.hidden_released || self.surface.is_none() {
+            return;
+        }
+
+        {
+            let mut renderer = self.renderer.borrow_mut();
+            self.media.clear_target(&mut renderer);
+            self.overlays.clear(&mut renderer);
+        }
+
+        if let (Some(context), Some(surface)) = (&self.context, &mut self.surface) {
+            reconfigure_surface(&context.0.borrow().context, surface, 1, 1);
+        }
+
+        self.hidden_released = true;
+    }
+
+    /// Undo [`Self::release_while_hidden`], restoring the swapchain to the window size.
+    ///
+    /// Called from the draw path rather than from a reveal event, so a frame can never be painted
+    /// against a 1x1 swapchain no matter which order the platform reports occlusion in.
+    pub fn restore_after_hidden(&mut self) {
+        if !self.hidden_released {
+            return;
+        }
+
+        self.hidden_released = false;
+        // Rebuilds the swapchain at `target_size`; the media and overlay targets are rebuilt
+        // lazily by their own `ensure_target` calls on the next frame.
+        self.resize(self.target_size);
     }
 
     pub fn clamp_render_size(&self, size: PhysicalSize<u32>) -> PhysicalSize<u32> {
@@ -452,6 +504,8 @@ impl SceneRenderer {
     }
 
     pub fn set_vivid_scene(&mut self, scene: crate::vivid::scene::SharedScene) {
+        self.overlays.clear(&mut self.renderer.borrow_mut());
+        self.overlays.scene = Some(scene.clone());
         self.media.set_scene(scene);
     }
 
@@ -463,13 +517,44 @@ impl SceneRenderer {
         self.media.source_upload_metrics()
     }
 
+    pub(crate) fn overlay_metrics(&self) -> super::overlay::OverlayRenderMetrics {
+        self.overlays.metrics()
+    }
+
     pub fn prepare_media(
         &mut self,
         size: &SizeInfo,
         display_offset: usize,
     ) -> Option<super::media::PreparedMedia> {
         let mut renderer = self.renderer.borrow_mut();
-        self.media.draw(&self.device, &self.queue, &mut renderer, size, display_offset)
+        let media = self.media.draw(&self.device, &self.queue, &mut renderer, size, display_offset);
+        let (overlay, changed) = match self.overlays.draw(
+            &self.device,
+            &self.queue,
+            &mut renderer,
+            size.width() as u32,
+            size.height() as u32,
+        ) {
+            Ok(result) => result,
+            Err(error) => {
+                log::warn!("overlay rendering failed: {error}");
+                self.overlays.finish(false);
+                return media;
+            },
+        };
+        if media.is_none() && overlay.is_none() {
+            return None;
+        }
+        let mut media = media.unwrap_or(super::media::PreparedMedia {
+            layers: [None, None, None],
+            overlay: None,
+            image_generation: 0,
+            changed: false,
+        });
+        media.overlay = overlay;
+        media.changed |= changed;
+        media.image_generation = media.image_generation.wrapping_add(self.overlays.generation);
+        Some(media)
     }
 
     pub fn render(&mut self, scene: &Scene, base_color: Color) -> Result<bool, Error> {
@@ -505,7 +590,8 @@ impl SceneRenderer {
                 },
                 wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Outdated => {
                     if let (Some(context), Some(surface)) = (&self.context, &mut self.surface) {
-                        context.0.borrow().context.resize_surface(
+                        reconfigure_surface(
+                            &context.0.borrow().context,
                             surface,
                             width.max(1),
                             height.max(1),
@@ -518,16 +604,7 @@ impl SceneRenderer {
             None => None,
         };
 
-        self.renderer
-            .borrow_mut()
-            .render_to_texture(
-                &self.device,
-                &self.queue,
-                scene,
-                &self.render_target_view,
-                &RenderParams { base_color, width, height, antialiasing_method: AaConfig::Msaa8 },
-            )
-            .map_err(Error::Render)?;
+        self.paint_scene(scene, base_color, width, height)?;
 
         if !frames.is_empty() {
             let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -593,6 +670,7 @@ impl SceneRenderer {
         }
 
         self.has_rendered_frame = true;
+        self.overlays.finish(true);
         Ok(true)
     }
 
@@ -752,9 +830,141 @@ fn frame_copy_regions(
     regions
 }
 
+impl SceneRenderer {
+    /// Rasterize `scene` into the render target.
+    ///
+    /// Normally this is Vello's synchronous path. Under `vello-bump-probe` it takes the async path
+    /// instead, which is the only one that reads the bump allocators back, and records the result.
+    fn paint_scene(
+        &mut self,
+        scene: &Scene,
+        base_color: Color,
+        width: u32,
+        height: u32,
+    ) -> Result<(), Error> {
+        let params =
+            RenderParams { base_color, width, height, antialiasing_method: AaConfig::Msaa8 };
+
+        #[cfg(not(feature = "vello-bump-probe"))]
+        {
+            self.renderer
+                .borrow_mut()
+                .render_to_texture(
+                    &self.device,
+                    &self.queue,
+                    scene,
+                    &self.render_target_view,
+                    &params,
+                )
+                .map_err(Error::Render)
+        }
+
+        #[cfg(feature = "vello-bump-probe")]
+        {
+            // `block_on` alone deadlocks here: the readback's `map_async` only completes while the
+            // device is polled, which is what Vello's own helper does between polls of the future.
+            #[expect(deprecated, reason = "the only path that reads the bump allocators back")]
+            let bump = vello::util::block_on_wgpu(
+                &self.device.clone(),
+                self.renderer.borrow_mut().render_to_texture_async(
+                    &self.device,
+                    &self.queue,
+                    scene,
+                    &self.render_target_view,
+                    &params,
+                    vello::low_level::DebugLayers::none(),
+                ),
+            )
+            .map_err(Error::Render)?;
+            match bump {
+                Some(bump) => bump_probe::record(&bump),
+                None => log::info!(target: "vivido", "bump probe: render returned no allocators"),
+            }
+            Ok(())
+        }
+    }
+}
+
 impl Drop for SceneRenderer {
     fn drop(&mut self) {
         self.media.clear_target(&mut self.renderer.borrow_mut());
+        self.overlays.clear(&mut self.renderer.borrow_mut());
+    }
+}
+
+/// Peak bump-allocator usage observed across every frame this process has painted.
+///
+/// Vello sizes its bump buffers from constants, not from the scene, so the only way to know what a
+/// terminal actually needs is to read the allocators back and watch the high-water mark. Recorded
+/// only under `vello-bump-probe`; see `vendor/vello_encoding/src/config.rs` for what the numbers
+/// are used for.
+#[cfg(feature = "vello-bump-probe")]
+pub mod bump_probe {
+    use std::sync::Mutex;
+
+    use vello::low_level::BumpAllocators;
+
+    /// The per-buffer maxima, in elements, as `BumpAllocators` reports them.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct Peak {
+        pub frames: u64,
+        pub failed: u32,
+        pub binning: u32,
+        pub ptcl: u32,
+        pub tile: u32,
+        pub seg_counts: u32,
+        pub segments: u32,
+        pub blend: u32,
+        pub lines: u32,
+    }
+
+    static PEAK: Mutex<Peak> = Mutex::new(Peak {
+        frames: 0,
+        failed: 0,
+        binning: 0,
+        ptcl: 0,
+        tile: 0,
+        seg_counts: 0,
+        segments: 0,
+        blend: 0,
+        lines: 0,
+    });
+
+    pub(super) fn record(bump: &BumpAllocators) {
+        let Ok(mut peak) = PEAK.lock() else { return };
+        peak.frames += 1;
+        // `failed` is a bitfield: keep every stage that ever ran out.
+        peak.failed |= bump.failed;
+        peak.binning = peak.binning.max(bump.binning);
+        peak.ptcl = peak.ptcl.max(bump.ptcl);
+        peak.tile = peak.tile.max(bump.tile);
+        peak.seg_counts = peak.seg_counts.max(bump.seg_counts);
+        peak.segments = peak.segments.max(bump.segments);
+        peak.blend = peak.blend.max(bump.blend);
+        peak.lines = peak.lines.max(bump.lines);
+
+        // Reported periodically so a measurement run does not have to end cleanly to yield data.
+        if peak.frames.is_multiple_of(30) {
+            log::info!(
+                target: "vivido",
+                "peak after {} frames: failed={:#x} lines={} segments={} seg_counts={} tile={} \
+                 ptcl={} binning={} blend={}",
+                peak.frames,
+                peak.failed,
+                peak.lines,
+                peak.segments,
+                peak.seg_counts,
+                peak.tile,
+                peak.ptcl,
+                peak.binning,
+                peak.blend,
+            );
+        }
+    }
+
+    /// The high-water mark so far. Never resets, so a caller can sample it at any point.
+    pub fn peak() -> Peak {
+        PEAK.lock().map(|peak| *peak).unwrap_or_default()
     }
 }
 
@@ -798,7 +1008,13 @@ fn create_window_surface(
         alpha_mode,
         view_formats: Vec::new(),
     };
-    let (target_texture, target_view) = create_render_target(&handle.device, width, height);
+    // Vello's `RenderSurface` carries an intermediate texture for callers that let it own the
+    // render target. Vivido does not: it paints into `SceneRenderer::render_target`, which also
+    // carries COPY_SRC, COPY_DST and RENDER_ATTACHMENT so screenshots and embedded panes can read
+    // and write it, none of which Vello's texture has. Vello's copy was never read, yet it was
+    // allocated at full window size and reallocated on every resize — a second full-window RGBA8
+    // texture per window, 25 MB at 2920x2184. A 1x1 stand-in keeps the field satisfied.
+    let (target_texture, target_view) = create_render_target(&handle.device, 1, 1);
     let blitter = if alpha_mode == wgpu::CompositeAlphaMode::PreMultiplied {
         wgpu::util::TextureBlitterBuilder::new(&handle.device, format)
             .blend_state(premultiply_blend_state())
@@ -883,6 +1099,22 @@ fn clamp_render_size(size: PhysicalSize<u32>, max_dimension: u32) -> PhysicalSiz
     PhysicalSize::new(size.width.min(max_dimension), size.height.min(max_dimension))
 }
 
+/// Resize the swapchain without disturbing Vello's unused intermediate texture.
+///
+/// `RenderContext::resize_surface` would also reallocate `RenderSurface::target_texture` at the new
+/// size. Vivido never renders to it (see `create_window_surface`), so letting Vello resize it means
+/// a full-window RGBA8 texture allocated and thrown away on every resize.
+fn reconfigure_surface(
+    context: &RenderContext,
+    surface: &mut RenderSurface<'static>,
+    width: u32,
+    height: u32,
+) {
+    surface.config.width = width;
+    surface.config.height = height;
+    context.configure_surface(surface);
+}
+
 fn create_render_target(
     device: &wgpu::Device,
     width: u32,
@@ -952,45 +1184,190 @@ fn premultiply_blend_state() -> wgpu::BlendState {
     }
 }
 
+/// Keep native GPU initialization, rendering, and teardown serialized across test modules.
+/// Some drivers fault when separate tests create devices concurrently in one process.
+#[cfg(test)]
+pub(crate) fn gpu_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static GPU: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    GPU.lock().unwrap_or_else(|err| err.into_inner())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         RenderSource, SceneRenderer, SharedRenderContext, clamp_render_size, embedded_copy_extent,
-        frame_copy_regions, offscreen_device, premultiply_blend_state, screenshot_layout,
-        shutdown_window_render_context, surface_alpha_mode, window_render_context,
+        frame_copy_regions, gpu_test_lock as gpu_lock, offscreen_device, premultiply_blend_state,
+        screenshot_layout, shutdown_window_render_context, surface_alpha_mode,
+        window_render_context,
     };
     use std::rc::Rc;
-    use std::sync::{Mutex, MutexGuard};
 
     use vello::peniko::Color;
     use vello::wgpu::CompositeAlphaMode;
     use vello::{Scene, kurbo};
     use winit::dpi::{PhysicalPosition, PhysicalSize};
 
-    /// Serializes tests that create a wgpu device.
+    /// Measure what a full-screen terminal actually asks of Vello's bump allocators.
     ///
-    /// Several drivers fault when two devices are created concurrently in one process, and the
-    /// test harness runs tests on parallel threads by default.
-    static GPU: Mutex<()> = Mutex::new(());
+    /// Vello sizes those buffers from constants, so the only way to justify changing them is to
+    /// read the allocators back on a scene at least as heavy as anything a terminal can draw. This
+    /// renders a completely full grid at the largest window size we support on this display class:
+    /// every cell carries a distinct glyph and its own background rect, which is denser than real
+    /// terminal output ever is.
+    ///
+    /// Requires the `vello-bump-probe` feature, which is the only way Vello reports the counts:
+    ///
+    /// ```sh
+    /// cargo test --release --features vello-bump-probe -- --ignored --nocapture bump
+    /// ```
+    #[test]
+    #[ignore = "needs a wgpu adapter and the vello-bump-probe feature"]
+    #[cfg(feature = "vello-bump-probe")]
+    fn a_full_terminal_grid_fits_the_bump_buffers() {
+        use crate::config::font::Font;
+        use crate::display::color::Rgb;
+        use crate::display::text::TextSystem;
+
+        let _guard = gpu_lock();
+
+        // A 2920x2184 surface with a 7x17 cell is 417 columns by 128 rows: the densest grid a
+        // Retina window of this size can hold. Override with `VIVIDO_BUMP_SIZE=WIDTHxHEIGHT` to
+        // check a larger display, which is what decides whether the buffers are big enough.
+        let size = std::env::var("VIVIDO_BUMP_SIZE")
+            .ok()
+            .and_then(|spec| {
+                let (width, height) = spec.split_once('x')?;
+                Some(PhysicalSize::new(width.parse().ok()?, height.parse().ok()?))
+            })
+            .unwrap_or(PhysicalSize::new(2920, 2184));
+        let (cell_width, cell_height) = (7.0_f32, 17.0_f32);
+        let columns = (size.width as f32 / cell_width) as usize;
+        let rows = (size.height as f32 / cell_height) as usize;
+
+        let mut renderer =
+            SceneRenderer::new(RenderSource::Offscreen, size, false).expect("offscreen renderer");
+        let mut text = TextSystem::new(Font::default());
+        let mut scene = Scene::new();
+
+        for row in 0..rows {
+            let y = row as f32 * cell_height;
+            // One background rect per cell, which is the worst case: a real frame merges runs of
+            // equal background into far fewer rects. `VIVIDO_BUMP_NO_RECTS=1` drops them, which
+            // brackets how much of the cost is glyph outlines alone.
+            for column in 0..columns {
+                if std::env::var_os("VIVIDO_BUMP_NO_RECTS").is_some() {
+                    break;
+                }
+                scene.fill(
+                    vello::peniko::Fill::NonZero,
+                    kurbo::Affine::IDENTITY,
+                    Color::from_rgb8(20, 20, 30),
+                    None,
+                    &kurbo::Rect::new(
+                        f64::from(column as f32 * cell_width),
+                        f64::from(y),
+                        f64::from((column + 1) as f32 * cell_width),
+                        f64::from(y + cell_height),
+                    ),
+                );
+            }
+            // Printable ASCII cycled so neighbouring rows never share a shaped run.
+            let line: String = (0..columns)
+                .map(|column| char::from(33 + ((row * columns + column) % 94) as u8))
+                .collect();
+            text.paint_text(&mut scene, &line, (0.0, y), Rgb::new(200, 200, 200), false);
+        }
+
+        renderer.render(&scene, Color::BLACK).expect("render");
+
+        let peak = super::bump_probe::peak();
+        println!(
+            "bump peak over {} frame(s) at {}x{} ({columns}x{rows} cells): failed={:#x} \
+             lines={} segments={} seg_counts={} tile={} ptcl={} binning={} blend={}",
+            peak.frames,
+            size.width,
+            size.height,
+            peak.failed,
+            peak.lines,
+            peak.segments,
+            peak.seg_counts,
+            peak.tile,
+            peak.ptcl,
+            peak.binning,
+            peak.blend,
+        );
+
+        assert!(peak.frames > 0, "the probe saw no frames, so the numbers mean nothing");
+        assert_eq!(peak.failed, 0, "a full terminal grid overran Vello's bump buffers: {peak:?}",);
+    }
+
+    #[test]
+    fn a_renderer_without_a_swapchain_ignores_the_hidden_release() {
+        // Offscreen and embedded renderers have no swapchain to hand back, and they keep
+        // rendering while their window is hidden — vvbox panes and headless capture both rely on
+        // that. The release path must be inert for them rather than tearing down a live target.
+        let _gpu = gpu_lock();
+        if offscreen_device().is_err() {
+            eprintln!("Skipping hidden-release test: no wgpu adapter");
+            return;
+        }
+
+        let size = PhysicalSize::new(64, 32);
+        let mut renderer =
+            SceneRenderer::new(RenderSource::Offscreen, size, false).expect("offscreen renderer");
+        renderer.render(&Scene::new(), Color::BLACK).expect("first render");
+        assert!(renderer.has_rendered_frame());
+
+        renderer.release_while_hidden();
+        // `render_target` must survive: `begin_screenshot` reads it, so a background pane would
+        // otherwise start answering `screenshot` with NoPresentedFrame.
+        assert!(
+            renderer.has_rendered_frame(),
+            "releasing a hidden window must not discard the frame screenshots read",
+        );
+
+        renderer.restore_after_hidden();
+        renderer.render(&Scene::new(), Color::BLACK).expect("render after release and restore");
+        assert!(renderer.has_rendered_frame());
+    }
+
+    #[test]
+    fn resizing_clears_the_hidden_release_state() {
+        // `restore_after_hidden` routes through `resize`, so a resize arriving first must leave the
+        // renderer in the restored state rather than waiting for a restore that never comes.
+        let _gpu = gpu_lock();
+        if offscreen_device().is_err() {
+            eprintln!("Skipping hidden-release resize test: no wgpu adapter");
+            return;
+        }
+
+        let mut renderer =
+            SceneRenderer::new(RenderSource::Offscreen, PhysicalSize::new(32, 16), false)
+                .expect("offscreen renderer");
+        renderer.hidden_released = true;
+        renderer.resize(PhysicalSize::new(48, 24));
+
+        assert!(!renderer.hidden_released, "a resize leaves the window ready to paint");
+        renderer.render(&Scene::new(), Color::BLACK).expect("render after resize");
+    }
 
     #[test]
     fn window_renderers_reuse_the_thread_render_context() {
+        let _gpu = gpu_lock();
         let first = window_render_context();
         let second = window_render_context();
         assert!(Rc::ptr_eq(&first.0, &second.0));
+        shutdown_window_render_context();
     }
 
     #[test]
     fn shutting_down_window_render_context_allows_clean_recreation() {
+        let _gpu = gpu_lock();
         let first = window_render_context();
         shutdown_window_render_context();
         let second = window_render_context();
         assert!(!Rc::ptr_eq(&first.0, &second.0));
         shutdown_window_render_context();
-    }
-
-    fn gpu_lock() -> MutexGuard<'static, ()> {
-        GPU.lock().unwrap_or_else(|err| err.into_inner())
     }
 
     #[test]
@@ -1054,6 +1431,273 @@ mod tests {
                 "row {row} was not the rendered colour"
             );
         }
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn media_text_layers_have_separate_gpu_targets() {
+        use crate::vivid::scene::{Frame, RgbaBuffer, SharedScene};
+        use std::sync::Arc;
+        use vivid_protocol::{
+            cbor::Value,
+            identity::{PresenterInstanceId, SessionIdentity},
+            messages::LaneClass,
+            revision::{ChannelGeneration, SurfaceRevision, TargetGeneration},
+            scene::{Fit, SceneNode},
+            surface::{CoordinateModel, SurfaceDefinition, SurfaceDescriptor},
+            track::{MILESTONE_OUTPUT_READY, TrackMode},
+        };
+        let _gpu = gpu_lock();
+        if offscreen_device().is_err() {
+            eprintln!("Skipping layer rendering test: no wgpu adapter");
+            return;
+        }
+        let shared = SharedScene::for_test();
+        let owner = SessionIdentity::new(PresenterInstanceId([77; 16]), 1).unwrap();
+        let context = owner.context(1).unwrap();
+        shared.register_session(owner, TargetGeneration::ONE).unwrap();
+        for layer in 0..3_u64 {
+            let surface = context.surface(layer + 1).unwrap();
+            let track = surface.track(1).unwrap();
+            shared
+                .create_surface(
+                    surface,
+                    SurfaceDefinition {
+                        context_id: 1,
+                        surface_id: layer + 1,
+                        semantic_profile: vivid_protocol::registry::TERMINAL_CONTENT.into(),
+                        coordinate_model: CoordinateModel::TerminalContentCells,
+                        logical_width: 2,
+                        logical_height: 2,
+                        scale_numerator: 1,
+                        scale_denominator: 1,
+                        rotation: 0,
+                        descriptor: SurfaceDescriptor {
+                            role: vivid_protocol::surface::SurfaceRole::Figure,
+                            title: String::new(),
+                            semantic_content_revision: 0,
+                            semantic_availability: 0,
+                            locator_hint: String::new(),
+                        },
+                        policy: 0,
+                        profile_parameters: vec![],
+                    },
+                )
+                .unwrap();
+            let config = vivid_sdk::TrackBuilder::detached(
+                1,
+                layer + 1,
+                3,
+                TrackMode::Live,
+                LaneClass::Bulk,
+            )
+            .raster(1, 1)
+            .unwrap()
+            .build(
+                &vivid_protocol::resource::ResourceContract::new(
+                    [u64::MAX; vivid_protocol::resource::RESOURCE_COUNT],
+                ),
+                1,
+            )
+            .unwrap();
+            shared.create_track(track, config).unwrap();
+            shared.accept_channel(track, ChannelGeneration::ONE, 4096, 8).unwrap();
+            shared
+                .publish_frame(
+                    track,
+                    ChannelGeneration::ONE,
+                    80,
+                    1,
+                    1,
+                    true,
+                    2,
+                    Frame {
+                        frame_id: 1,
+                        pts_us: 0,
+                        width: 1,
+                        height: 1,
+                        sar_num: 1,
+                        sar_den: 1,
+                        alpha_mode: 1,
+                        rgba: Arc::new(RgbaBuffer::new(vec![255, 0, 0, 255])),
+                        damage: None,
+                    },
+                )
+                .unwrap();
+            shared
+                .activate_tracks(
+                    surface,
+                    SurfaceRevision::ONE,
+                    &[(3, 1, ChannelGeneration::ONE, MILESTONE_OUTPUT_READY)],
+                )
+                .unwrap();
+            shared.begin_transaction(context, layer + 1).unwrap();
+            shared
+                .queue_node_create(
+                    context,
+                    layer + 1,
+                    SceneNode {
+                        owning_context_id: 1,
+                        node_id: layer + 1,
+                        surface_context_id: 1,
+                        surface_id: layer + 1,
+                        geometry: vec![
+                            (0, Value::Unsigned(1)),
+                            (1, Value::Unsigned((layer * 2) << 32)),
+                            (2, Value::Unsigned(0)),
+                            (3, Value::Unsigned(2 << 32)),
+                            (4, Value::Unsigned(2 << 32)),
+                            (5, Value::Unsigned(layer)),
+                        ],
+                        fit: Fit::Contain,
+                        linear_sampling: false,
+                        z_index: 0,
+                        visible: true,
+                        opacity: u16::MAX,
+                        clip: None,
+                    },
+                )
+                .unwrap();
+            shared.commit_transaction(context, layer + 1, TargetGeneration::ONE, None).unwrap();
+        }
+        let mut renderer =
+            SceneRenderer::new(RenderSource::Offscreen, PhysicalSize::new(64, 32), false).unwrap();
+        renderer.set_vivid_scene(shared);
+        let size = crate::display::SizeInfo::new(64., 32., 8., 8., 0., 0., false);
+        let media = renderer.prepare_media(&size, 0).unwrap();
+        assert!(media.layers.iter().all(Option::is_some));
+        let mut scene = Scene::new();
+        scene.draw_image(media.layers[0].as_ref().unwrap(), kurbo::Affine::IDENTITY);
+        scene.fill(
+            vello::peniko::Fill::NonZero,
+            kurbo::Affine::IDENTITY,
+            Color::from_rgb8(0, 0, 255),
+            None,
+            &kurbo::Rect::new(0., 0., 64., 32.),
+        );
+        scene.draw_image(media.layers[1].as_ref().unwrap(), kurbo::Affine::IDENTITY);
+        // Opaque glyph/cursor coverage between normal and above-text media.
+        for x in [4., 20., 36.] {
+            scene.fill(
+                vello::peniko::Fill::NonZero,
+                kurbo::Affine::IDENTITY,
+                Color::from_rgb8(0, 255, 0),
+                None,
+                &kurbo::Rect::new(x, 4., x + 8., 12.),
+            );
+        }
+        scene.draw_image(media.layers[2].as_ref().unwrap(), kurbo::Affine::IDENTITY);
+        renderer.render(&scene, Color::BLACK).unwrap();
+        let readback = renderer.begin_screenshot().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let pixels = loop {
+            if let Some(pixels) = renderer.poll_screenshot(&readback).unwrap() {
+                break pixels;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        };
+        let pixel = |x: usize, y: usize| {
+            let offset = y * pixels.padded_bytes_per_row as usize + x * 4;
+            &pixels.bytes[offset..offset + 4]
+        };
+        assert_eq!(pixel(1, 1), [0, 0, 255, 255], "layer zero belongs below cell backgrounds");
+        assert_eq!(pixel(17, 1), [255, 0, 0, 255], "layer one belongs above cell backgrounds");
+        assert_eq!(pixel(24, 8), [0, 255, 0, 255], "layer one belongs below glyph/cursor coverage");
+        assert_eq!(pixel(40, 8), [255, 0, 0, 255], "layer two belongs above glyph/cursor coverage");
+        let uploads = renderer.media_metrics().uploaded_pixels;
+        assert!(!renderer.prepare_media(&size, 0).unwrap().changed);
+        assert_eq!(renderer.media_metrics().uploaded_pixels, uploads);
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn portable_vector_scene_renders_and_hit_tests_the_same_transform_and_clip() {
+        use std::collections::BTreeMap;
+        use vivid_protocol::vector::{
+            Brush, Canvas, Color as WireColor, Command, GradientStop, HitRole, Path, Point, Rect,
+            Transform,
+        };
+
+        let _gpu = gpu_lock();
+        if offscreen_device().is_err() {
+            eprintln!("Skipping vector rendering test: no wgpu adapter");
+            return;
+        }
+        let mut renderer =
+            SceneRenderer::new(RenderSource::Offscreen, PhysicalSize::new(64, 64), false).unwrap();
+        let mut canvas = Canvas::new();
+        canvas.push(Command::Save).unwrap();
+        canvas.push(Command::Transform(Transform::new([1., 0., 0., 1., 8., 8.]).unwrap())).unwrap();
+        let clip = Path::rectangle(Rect::new(0., 0., 32., 32.).unwrap()).unwrap();
+        canvas.push(Command::Clip(clip.clone())).unwrap();
+        canvas
+            .fill(
+                Path::rectangle(Rect::new(0., 0., 48., 48.).unwrap()).unwrap(),
+                Brush::Linear {
+                    start: Point::new(0., 0.).unwrap(),
+                    end: Point::new(32., 0.).unwrap(),
+                    stops: vec![
+                        GradientStop { offset: 0, color: WireColor(0xff0000ff) },
+                        GradientStop { offset: 65535, color: WireColor(0x0000ffff) },
+                    ],
+                    color_space: vivid_protocol::vector::ColorSpace::Srgb,
+                },
+            )
+            .unwrap();
+        canvas
+            .push(Command::Hit {
+                id: u64::MAX,
+                path: clip,
+                role: HitRole::Drag,
+                cursor: Some(vivid_protocol::vector::CursorShape::Move),
+            })
+            .unwrap();
+        canvas
+            .push(Command::Hit {
+                id: 2,
+                path: Path::ellipse(Rect::new(12., 12., 8., 8.).unwrap()).unwrap(),
+                role: HitRole::Transparent,
+                cursor: None,
+            })
+            .unwrap();
+        canvas.push(Command::Restore).unwrap();
+        let mut text = crate::display::text::TextSystem::new(crate::config::font::Font::default());
+        let compiled =
+            crate::display::vector::compile(&canvas, &mut text, &BTreeMap::new()).unwrap();
+        // The compiled region carries the cursor its command declared.
+        assert_eq!(
+            compiled.hit(Point::new(10., 10.).unwrap()),
+            Some(vivid_protocol::vector::HitRegion {
+                id: u64::MAX,
+                role: HitRole::Drag,
+                cursor: Some(vivid_protocol::vector::CursorShape::Move),
+            })
+        );
+        assert_eq!(compiled.hit(Point::new(24., 24.).unwrap()), None);
+        assert_eq!(compiled.hit(Point::new(41., 10.).unwrap()), None);
+        renderer.render(&compiled.scene, Color::from_rgb8(255, 255, 255)).unwrap();
+        let readback = renderer.begin_screenshot().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let pixels = loop {
+            if let Some(pixels) = renderer.poll_screenshot(&readback).unwrap() {
+                break pixels;
+            }
+            assert!(std::time::Instant::now() < deadline, "GPU readback timed out");
+            std::thread::yield_now();
+        };
+        let pixel = |x: usize, y: usize| {
+            let offset = y * pixels.padded_bytes_per_row as usize + x * 4;
+            &pixels.bytes[offset..offset + 4]
+        };
+        assert_eq!(pixel(4, 4), [255, 255, 255, 255]);
+        assert_eq!(pixel(41, 10), [255, 255, 255, 255]);
+        assert!(pixel(10, 10)[0] > pixel(10, 10)[2]);
+        assert!(pixel(37, 10)[2] > pixel(37, 10)[0]);
+        // Moving/rescaling a cached scene does not require compilation or text shaping.
+        let mut moved = Scene::new();
+        moved.append(&compiled.scene, Some(kurbo::Affine::scale(0.5)));
+        assert!(renderer.render(&moved, Color::from_rgb8(255, 255, 255)).unwrap());
     }
 
     #[cfg(any(unix, windows))]

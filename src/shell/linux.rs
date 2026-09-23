@@ -37,11 +37,11 @@ impl PaneHost for NativePaneHost {
         options.no_activate = true;
         options.terminal_options.working_directory = Some(cwd.to_owned());
         let chrome_size = self.chrome.inner_size();
-        Ok(WindowId::from(processor.create_embedded_window(
+        processor.create_embedded_pane(
             PhysicalSize::new(chrome_size.width.max(160), chrome_size.height.max(80)),
             self.chrome.scale_factor(),
             options,
-        )?))
+        )
     }
 
     fn create_pane_with_options(
@@ -52,11 +52,11 @@ impl PaneHost for NativePaneHost {
     ) -> Result<WindowId, Box<dyn Error>> {
         options.no_activate = true;
         let size = self.chrome.inner_size();
-        Ok(WindowId::from(processor.create_embedded_window(
+        processor.create_embedded_pane(
             PhysicalSize::new(size.width.max(160), size.height.max(80)),
             self.chrome.scale_factor(),
             options,
-        )?))
+        )
     }
 
     fn move_pane(&self, processor: &mut Processor, pane: WindowId, rect: PhysicalRect) {

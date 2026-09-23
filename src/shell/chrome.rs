@@ -3,9 +3,9 @@
 use std::sync::Arc;
 
 use vello::Scene;
-use vello::kurbo::{Affine, Rect};
+use vello::kurbo::{Affine, BezPath, Rect, Stroke};
 use vello::peniko::{Color, Fill};
-use winit::dpi::PhysicalSize;
+use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::window::Window;
 
 use crate::config::UiConfig;
@@ -57,9 +57,19 @@ pub struct ChromeHitMap {
     pub previous: PhysicalRect,
     pub next: PhysicalRect,
     pub new_tab: PhysicalRect,
+    pub new_tab_menu: PhysicalRect,
     pub minimize: PhysicalRect,
     pub maximize: PhysicalRect,
     pub close: PhysicalRect,
+}
+
+impl ChromeHitMap {
+    pub fn hovered_tab_action(&self, cursor: Option<PhysicalPosition<f64>>) -> Option<usize> {
+        let cursor = cursor?;
+        [self.new_tab, self.new_tab_menu]
+            .iter()
+            .position(|bounds| bounds.contains(cursor.x, cursor.y))
+    }
 }
 
 pub fn compute_layout(size: PhysicalSize<u32>, scale: f64) -> ChromeLayout {
@@ -116,7 +126,7 @@ impl ChromeRenderer {
         }
     }
 
-    /// Lay a `+` menu out with the chrome's own text system and scale factor.
+    /// Lay a launch menu out with the chrome's own text system and scale factor.
     pub fn layout_menu(
         &mut self,
         entries: Vec<LaunchEntry>,
@@ -126,7 +136,7 @@ impl ChromeRenderer {
         NewTabMenu::new(entries, anchor, bounds, &mut self.text, self.scale)
     }
 
-    /// Draw the chrome, optionally with an open `+` menu floating over the pane area.
+    /// Draw the chrome, optionally with an open launch menu floating over the pane area.
     pub fn render(
         &mut self,
         size: PhysicalSize<u32>,
@@ -134,6 +144,7 @@ impl ChromeRenderer {
         draw_controls: bool,
         frames: &[EmbeddedFramePlacement<'_>],
         menu: Option<&NewTabMenu>,
+        cursor: Option<PhysicalPosition<f64>>,
     ) -> Result<(ChromeLayout, ChromeHitMap, bool), Error> {
         let scale = self.scale;
         #[cfg(target_os = "linux")]
@@ -179,6 +190,7 @@ impl ChromeRenderer {
                 height: layout.tab_bar.height,
             },
             &mut hits,
+            cursor,
         );
 
         // Windows presents the menu in its own child window above the pane HWND, so only the
@@ -222,13 +234,14 @@ impl ChromeRenderer {
         tabs: &mut Tabs,
         area: PhysicalRect,
         hits: &mut ChromeHitMap,
+        cursor: Option<PhysicalPosition<f64>>,
     ) {
         let scale = self.scale;
         let new_width = (NEW_TAB_LOGICAL * scale).round() as u32;
         let overflow_width = (OVERFLOW_LOGICAL * scale).round() as u32;
         let minimum = (MIN_TAB_WIDTH_LOGICAL * scale).round() as u32;
         let preferred = (TAB_WIDTH_LOGICAL * scale).round() as u32;
-        let base_width = area.width.saturating_sub(new_width);
+        let base_width = area.width.saturating_sub(new_width.saturating_mul(2));
         let all_capacity = usize::try_from(base_width / minimum.max(1)).unwrap_or_default().max(1);
         let overflow = tabs.as_slice().len() > all_capacity;
         let reserved_overflow = if overflow { overflow_width.saturating_mul(2) } else { 0 };
@@ -306,13 +319,14 @@ impl ChromeRenderer {
             width: new_width.min(u32::try_from(area.right().saturating_sub(x)).unwrap_or_default()),
             height: area.height,
         };
-        self.text.paint_text(
-            scene,
-            "+",
-            (x as f32 + 10.0 * scale as f32, 8.0 * scale as f32),
-            ACCENT,
-            true,
-        );
+        x = hits.new_tab.right();
+        hits.new_tab_menu = PhysicalRect {
+            x,
+            y: 0,
+            width: new_width.min(u32::try_from(area.right().saturating_sub(x)).unwrap_or_default()),
+            height: area.height,
+        };
+        paint_tab_actions(scene, hits, cursor, scale);
     }
 }
 
@@ -389,6 +403,68 @@ pub(super) fn text_system(config: &UiConfig, scale: f64) -> TextSystem {
 
 fn rect(rect: PhysicalRect, color: Rgb) -> RenderRect {
     RenderRect::new(rect.x as f32, rect.y as f32, rect.width as f32, rect.height as f32, color, 1.0)
+}
+
+/// Draw both tab actions around the same visual center, independent of font metrics.
+fn paint_tab_actions(
+    scene: &mut Scene,
+    hits: &ChromeHitMap,
+    cursor: Option<PhysicalPosition<f64>>,
+    scale: f64,
+) {
+    let hovered = hits.hovered_tab_action(cursor);
+    for (index, bounds) in [hits.new_tab, hits.new_tab_menu].into_iter().enumerate() {
+        if bounds.width == 0 || bounds.height == 0 {
+            continue;
+        }
+        let clip = Rect::new(
+            f64::from(bounds.x),
+            f64::from(bounds.y),
+            f64::from(bounds.right()),
+            f64::from(bounds.bottom()),
+        );
+        scene.push_clip_layer(Fill::NonZero, Affine::IDENTITY, &clip);
+        if hovered == Some(index) {
+            paint_rects(scene, [rect(bounds, ACTIVE)]);
+        }
+        let cx = f64::from(bounds.x) + f64::from(bounds.width) / 2.0;
+        let cy = f64::from(bounds.y) + f64::from(bounds.height) / 2.0;
+        let half = 4.0 * scale;
+        let mut icon = BezPath::new();
+        if index == 0 {
+            icon.move_to((cx - half, cy));
+            icon.line_to((cx + half, cy));
+            icon.move_to((cx, cy - half));
+            icon.line_to((cx, cy + half));
+        } else {
+            icon.move_to((cx - half, cy - half / 2.0));
+            icon.line_to((cx, cy + half / 2.0));
+            icon.line_to((cx + half, cy - half / 2.0));
+        }
+        scene.stroke(
+            &Stroke::new(1.5 * scale),
+            Affine::IDENTITY,
+            Color::from_rgb8(ACCENT.r, ACCENT.g, ACCENT.b),
+            None,
+            &icon,
+        );
+        scene.pop_layer();
+    }
+    if hits.new_tab.width > 0 && hits.new_tab_menu.width > 0 {
+        let bounds = hits.new_tab_menu;
+        let inset = (9.0 * scale).min(f64::from(bounds.height) / 2.0);
+        paint_rects(
+            scene,
+            [RenderRect::new(
+                bounds.x as f32,
+                bounds.y as f32 + inset as f32,
+                scale.max(1.0) as f32,
+                (f64::from(bounds.height) - 2.0 * inset) as f32,
+                BORDER,
+                1.0,
+            )],
+        );
+    }
 }
 
 #[cfg(test)]

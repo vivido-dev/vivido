@@ -179,8 +179,8 @@ define_class!(
                 .lines
                 .iter()
                 .flat_map(|line| &line.characters)
-                .find(|character| character.utf16.contains(&index))
-                .map(|character| to_ns_range(&character.utf16))
+                .find(|character| character.utf16_range().contains(&index))
+                .map(|character| to_ns_range(&character.utf16_range()))
                 .unwrap_or_else(|| NSRange::new(index.min(snapshot.text.encode_utf16().count()), 0))
         }
 
@@ -213,7 +213,7 @@ define_class!(
                     let right_distance = (point.x as f32 - right.x).abs();
                     left_distance.total_cmp(&right_distance)
                 })
-                .map(|character| to_ns_range(&character.utf16))
+                .map(|character| to_ns_range(&character.utf16_range()))
                 .unwrap_or_default()
         }
 
@@ -267,7 +267,8 @@ impl TerminalElement {
         let mut max_y = f32::MIN;
         for line in &snapshot.lines {
             for character in &line.characters {
-                if character.utf16.start < range.end && character.utf16.end > range.start {
+                let utf16 = character.utf16_range();
+                if utf16.start < range.end && utf16.end > range.start {
                     min_x = min_x.min(character.x);
                     min_y = min_y.min(line.y);
                     max_x = max_x.max(character.x + character.width.max(snapshot.cell_width));

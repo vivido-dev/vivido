@@ -128,7 +128,8 @@ pub struct SourceUploadMetrics {
 
 #[derive(Debug, Clone)]
 pub struct PreparedMedia {
-    pub image: ImageData,
+    pub layers: [Option<ImageData>; 3],
+    pub overlay: Option<ImageData>,
     pub image_generation: u64,
     pub changed: bool,
 }
@@ -151,7 +152,7 @@ pub struct VividMediaRenderer {
     vertex_capacity_quads: usize,
     reported_item_overflow: bool,
     tracks: HashMap<TrackKey, SourceTexture>,
-    target: Option<MediaTarget>,
+    targets: [Option<MediaTarget>; 3],
     scene: Option<SharedScene>,
     capture_redactions: Vec<CaptureRedaction>,
     source_upload_metrics: SourceUploadMetrics,
@@ -261,7 +262,7 @@ impl VividMediaRenderer {
             vertex_capacity_quads: INITIAL_QUADS,
             reported_item_overflow: false,
             tracks: HashMap::new(),
-            target: None,
+            targets: [None, None, None],
             scene: None,
             capture_redactions: Vec::new(),
             source_upload_metrics: SourceUploadMetrics::default(),
@@ -303,8 +304,10 @@ impl VividMediaRenderer {
     }
 
     pub fn clear_target(&mut self, renderer: &mut Renderer) {
-        if let Some(target) = self.target.take() {
-            renderer.unregister_texture(target.image);
+        for target in &mut self.targets {
+            if let Some(target) = target.take() {
+                renderer.unregister_texture(target.image);
+            }
         }
         self.last_snapshot = None;
     }
@@ -336,8 +339,12 @@ impl VividMediaRenderer {
         if self.last_snapshot == Some(snapshot_key) {
             self.source_upload_metrics.skipped_passes =
                 self.source_upload_metrics.skipped_passes.saturating_add(1);
-            return self.target.as_ref().map(|target| PreparedMedia {
-                image: target.image.clone(),
+            return Some(PreparedMedia {
+                overlay: None,
+                layers: self
+                    .targets
+                    .each_ref()
+                    .map(|target| target.as_ref().map(|t| t.image.clone())),
                 image_generation: self.image_generation,
                 changed: false,
             });
@@ -345,7 +352,7 @@ impl VividMediaRenderer {
         // The target owns what a placement unit means: cells for a terminal, logical pixels for a
         // desktop. The renderer only needs the conversion.
         let placement_scale = scene.target().placement_scale(size);
-        if items.is_empty() && self.target.is_none() {
+        if items.is_empty() && self.targets.iter().all(Option::is_none) {
             // An empty scene is usually a momentary one — everything hidden while a producer
             // redraws — so the textures are retained on the same terms as any other frame in which
             // a track does not render.
@@ -356,7 +363,13 @@ impl VividMediaRenderer {
                 self.source_upload_metrics.skipped_passes.saturating_add(1);
             return None;
         }
-        self.ensure_target(device, renderer, width, height);
+        for layer in 0..3 {
+            if self.targets[layer].is_some()
+                || items.iter().any(|item| item.text_layer == layer as u64)
+            {
+                self.ensure_target(device, renderer, width, height, layer);
+            }
+        }
 
         self.rendered.clear();
         self.rendered.extend(items.iter().enumerate().filter_map(|(index, item)| {
@@ -409,11 +422,11 @@ impl VividMediaRenderer {
             queue.write_buffer(&self.vertex_buffer, 0, bytemuck::cast_slice(&self.vertex_data));
         }
 
-        let target = self.target.as_ref().expect("media target initialized");
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("vivido.vivid.encoder"),
         });
-        {
+        for (layer, target) in self.targets.iter().enumerate() {
+            let Some(target) = target else { continue };
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("vivido.vivid.pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -434,6 +447,9 @@ impl VividMediaRenderer {
             pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
             for (index, (item_index, _)) in self.rendered.iter().enumerate() {
                 let item = &items[*item_index];
+                if item.text_layer != layer as u64 {
+                    continue;
+                }
                 if let Some(track) = self.tracks.get(&item.track_key) {
                     pass.set_bind_group(0, &track.bind_group, &[]);
                     let start = (index * 6) as u32;
@@ -466,10 +482,13 @@ impl VividMediaRenderer {
                 ),
             }
         }
-        renderer.mark_override_image_dirty(&target.image);
+        for target in self.targets.iter().flatten() {
+            renderer.mark_override_image_dirty(&target.image);
+        }
         self.last_snapshot = Some(snapshot_key);
         Some(PreparedMedia {
-            image: target.image.clone(),
+            overlay: None,
+            layers: self.targets.each_ref().map(|target| target.as_ref().map(|t| t.image.clone())),
             image_generation: self.image_generation,
             changed: true,
         })
@@ -683,17 +702,19 @@ impl VividMediaRenderer {
         renderer: &mut Renderer,
         width: u32,
         height: u32,
+        layer: usize,
     ) {
         let width = width.clamp(1, 8192);
         let height = height.clamp(1, 8192);
-        if self
-            .target
+        if self.targets[layer]
             .as_ref()
             .is_some_and(|target| target.width == width && target.height == height)
         {
             return;
         }
-        self.clear_target(renderer);
+        if let Some(target) = self.targets[layer].take() {
+            renderer.unregister_texture(target.image);
+        }
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("vivido.vivid.target"),
             size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
@@ -707,7 +728,7 @@ impl VividMediaRenderer {
         let view = texture.create_view(&Default::default());
         let mut image = renderer.register_texture(texture.clone());
         image.alpha_type = ImageAlphaType::AlphaPremultiplied;
-        self.target = Some(MediaTarget { _texture: texture, view, image, width, height });
+        self.targets[layer] = Some(MediaTarget { _texture: texture, view, image, width, height });
         self.image_generation = self.image_generation.wrapping_add(1);
     }
 }

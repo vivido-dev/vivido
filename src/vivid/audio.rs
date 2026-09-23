@@ -24,6 +24,22 @@ const PACKET_TIME_BASE: AVRational = AVRational { num: 1, den: 1_000_000 };
 // reserve large enough to bridge those stalls; linked video is discarded when it falls behind.
 const RING_BUFFER_SECONDS: usize = 2;
 const PREBUFFER_MILLISECONDS: u64 = 100;
+/// The least a live track may ask to be buffered before the device starts draining.
+///
+/// Whatever the ring holds when playback begins is delay the listener keeps for the rest of the
+/// stream, so a live producer's declared target latency is honored — but a couple of device
+/// periods have to stay in hand or the very first callback underruns and every one after it
+/// chases the producer.
+const MINIMUM_LIVE_PREBUFFER_US: u64 = 20_000;
+/// How much reserve a live track earns back each time its declared target proved too tight.
+///
+/// A declared target is the producer's estimate of its own link. It cannot know what the link
+/// actually does, and a reserve that is too shallow does not fail gracefully: the ring runs dry,
+/// the device renders silence the producer never sent, and nothing in a live stream ever refills
+/// it. Growing on the evidence — an underrun that really happened — costs the tight target only on
+/// links that could not hold it, and is bounded by [`PREBUFFER_MILLISECONDS`], so the worst case is
+/// the reserve this presenter would have used anyway.
+const LIVE_PREBUFFER_STEP_US: u64 = 20_000;
 /// The most a live stream will be delayed to line sound up with picture. Past this the session is
 /// no longer interactive, and the honest answer is a lower encoder target, not more buffering.
 ///
@@ -88,6 +104,14 @@ struct Shared {
     /// The delay the hold is currently implementing, so it can be measured and adjusted.
     live_delay_us: AtomicU64,
     prebuffer_samples: AtomicU64,
+    /// Playback starts at exactly `prebuffer_samples`, discarding whatever piled up beyond it.
+    ///
+    /// Also marks the reserve as one this presenter tightened, and so may give back on evidence.
+    trim_to_prebuffer: AtomicBool,
+    /// What one underrun earns a tightened live reserve back, in samples.
+    prebuffer_step_samples: u64,
+    /// The deepest a tightened live reserve may grow back to: this presenter's own default.
+    prebuffer_ceiling_samples: u64,
     /// Queued-sample count observed at a resume PLAY.
     ///
     /// Control and realtime media may use independent transports. Retained audio alone must not
@@ -167,6 +191,17 @@ impl AudioOutput {
                     .saturating_mul(PREBUFFER_MILLISECONDS)
                     / 1_000,
             ),
+            trim_to_prebuffer: AtomicBool::new(false),
+            prebuffer_step_samples: samples_for_duration(
+                config.sample_rate,
+                config.channels,
+                LIVE_PREBUFFER_STEP_US,
+            ),
+            prebuffer_ceiling_samples: samples_for_duration(
+                config.sample_rate,
+                config.channels,
+                PREBUFFER_MILLISECONDS * 1_000,
+            ),
             resume_queued_samples: AtomicU64::new(0),
             resume_waiting_for_audio: AtomicBool::new(false),
             ring_capacity_samples: u64::try_from(ring_capacity_samples).unwrap_or(u64::MAX),
@@ -233,6 +268,13 @@ impl AudioOutput {
             gap_silence_samples: AtomicU64::new(0),
             live_delay_us: AtomicU64::new(0),
             prebuffer_samples: AtomicU64::new(0),
+            trim_to_prebuffer: AtomicBool::new(false),
+            prebuffer_step_samples: samples_for_duration(48_000, 2, LIVE_PREBUFFER_STEP_US),
+            prebuffer_ceiling_samples: samples_for_duration(
+                48_000,
+                2,
+                PREBUFFER_MILLISECONDS * 1_000,
+            ),
             resume_queued_samples: AtomicU64::new(0),
             resume_waiting_for_audio: AtomicBool::new(false),
             ring_capacity_samples: 32,
@@ -253,6 +295,31 @@ impl AudioOutput {
             sample_rate: 48_000,
             channels: 2,
         })
+    }
+
+    /// A device-free sink that runs the production callback against a bounded ring.
+    #[cfg(test)]
+    pub(super) fn test_clocked_output(generation: u64) -> Arc<Self> {
+        let mut output = Arc::try_unwrap(Self::test_output()).ok().unwrap();
+        let capacity = 48_000 * 2 * RING_BUFFER_SECONDS;
+        let shared = Arc::get_mut(&mut output.shared).unwrap();
+        shared.ring_capacity_samples = capacity as u64;
+        shared.channel_generation.store(generation, Ordering::SeqCst);
+        let (producer, mut consumer) = HeapRb::<f32>::new(capacity).split();
+        output.producer = Mutex::new(producer);
+        let weak = Arc::downgrade(&output.shared);
+        thread::spawn(move || {
+            let mut samples = [0.0_f32; 960];
+            loop {
+                thread::sleep(Duration::from_millis(10));
+                let Some(shared) = weak.upgrade() else { break };
+                if shared.stopped.load(Ordering::SeqCst) {
+                    break;
+                }
+                render_audio(&mut samples, &mut consumer, &shared);
+            }
+        });
+        Arc::new(output)
     }
 
     #[cfg(test)]
@@ -309,6 +376,28 @@ impl AudioOutput {
         self.shared.enabled.store(true, Ordering::SeqCst);
     }
 
+    /// Size the startup reserve for a live track from the target latency it declared.
+    ///
+    /// A live track never issues PLAY, so without this it keeps the conservative
+    /// [`PREBUFFER_MILLISECONDS`] default meant for a stream whose pacing is unknown. That reserve
+    /// is not just a startup cost: the device drains at exactly the rate the producer fills it, so
+    /// whatever is queued when the first callback runs stays queued, and the listener hears every
+    /// millisecond of it as delay for the rest of the stream. A producer that declares a tighter
+    /// target — an interactive one sending its own mixer output — gets the delay it asked for.
+    ///
+    /// Zero is "no target stated", not "no delay wanted", and keeps the default. The declared
+    /// value can only lower the reserve from that default, never raise it, so a producer cannot
+    /// talk this presenter into holding more sound than it would have held anyway.
+    pub fn configure_live(&self, target_latency_us: u64) {
+        if target_latency_us == 0 {
+            return;
+        }
+        let target_us =
+            target_latency_us.clamp(MINIMUM_LIVE_PREBUFFER_US, PREBUFFER_MILLISECONDS * 1_000);
+        self.shared.prebuffer_samples.store(self.samples_for(target_us), Ordering::SeqCst);
+        self.shared.trim_to_prebuffer.store(true, Ordering::SeqCst);
+    }
+
     pub fn set_gain(&self, gain: AudioGain) {
         self.shared.gain_bits.store(gain.as_f32().to_bits(), Ordering::SeqCst);
     }
@@ -341,6 +430,7 @@ impl AudioOutput {
             Ordering::SeqCst,
         );
         self.shared.prebuffered.store(false, Ordering::SeqCst);
+        self.shared.trim_to_prebuffer.store(false, Ordering::SeqCst);
         *self.shared.play_configured_at.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
             Some(Instant::now());
         *self.shared.clock_progress.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
@@ -349,6 +439,10 @@ impl AudioOutput {
                 observed_at: Instant::now(),
             };
         self.realign_timeline();
+    }
+
+    pub fn ready_to_start(&self) -> bool {
+        audio_prebuffer_ready(&self.shared)
     }
 
     pub fn pause(&self) {
@@ -467,6 +561,24 @@ impl AudioOutput {
                 )
     }
 
+    /// Audio-master position remains observable while paused or waiting for prebuffer.
+    pub fn clock_pts(&self) -> Option<i64> {
+        let origin = self.shared.timeline_origin_us.load(Ordering::SeqCst);
+        (origin != UNSET_PTS).then(|| {
+            rendered_pts_us(
+                origin,
+                self.shared.rendered_samples.load(Ordering::SeqCst),
+                self.sample_rate,
+                self.channels,
+            )
+        })
+    }
+
+    #[cfg(test)]
+    pub(super) fn enabled_for_test(&self) -> bool {
+        self.shared.enabled.load(Ordering::SeqCst)
+    }
+
     /// The media PTS currently leaving the device, or `None` before playback is running.
     pub fn rendered_pts(&self) -> Option<i64> {
         if !self.shared.enabled.load(Ordering::SeqCst)
@@ -556,10 +668,7 @@ impl AudioOutput {
     }
 
     fn samples_for(&self, duration_us: u64) -> u64 {
-        u64::from(self.sample_rate)
-            .saturating_mul(u64::from(self.channels))
-            .saturating_mul(duration_us)
-            / 1_000_000
+        samples_for_duration(self.sample_rate, self.channels, duration_us)
     }
 
     /// Cover a gap in the encoded audio timeline without interrupting playback.
@@ -733,6 +842,11 @@ impl ChannelAudioOutput {
     }
 }
 
+fn samples_for_duration(sample_rate: u32, channels: u16, duration_us: u64) -> u64 {
+    u64::from(sample_rate).saturating_mul(u64::from(channels)).saturating_mul(duration_us)
+        / 1_000_000
+}
+
 fn retired_channel() -> io::Error {
     io::Error::new(io::ErrorKind::Interrupted, "retired audio channel generation")
 }
@@ -770,6 +884,52 @@ fn discard_stale_samples<C: Consumer<Item = f32>>(shared: &Shared, consumer: &mu
     discarded
 }
 
+/// Start a live stream at the reserve it asked for, not at whatever the device's start-up cost it.
+///
+/// The gate only says *at least* the target is buffered. A device takes tens of milliseconds to
+/// deliver its first callback and the producer fills the ring throughout, so playback routinely
+/// begins several times deeper than the track asked for — and it stays there, because from then on
+/// the device drains at exactly the rate the producer fills. The overshoot has never been heard and
+/// would only ever be heard late, so it is dropped once, here, where the delay is still nothing but
+/// queue depth. The clock advances with it: the next audible sample really is that much further
+/// into the timeline.
+fn trim_to_live_prebuffer<C: Consumer<Item = f32>>(shared: &Shared, consumer: &mut C) {
+    if !shared.trim_to_prebuffer.load(Ordering::SeqCst) {
+        return;
+    }
+    let buffered = shared
+        .queued_samples
+        .load(Ordering::SeqCst)
+        .saturating_sub(shared.played_samples.load(Ordering::SeqCst));
+    let excess = buffered.saturating_sub(shared.prebuffer_samples.load(Ordering::SeqCst));
+    if excess == 0 {
+        return;
+    }
+    let removed = consumer.skip(usize::try_from(excess).unwrap_or(usize::MAX)) as u64;
+    shared.played_samples.fetch_add(removed, Ordering::SeqCst);
+    shared.rendered_samples.fetch_add(removed, Ordering::SeqCst);
+}
+
+/// Give a tightened live reserve back one step after the link proved it too shallow.
+///
+/// Returns whether the reserve grew. At the ceiling it does not, and the output is left to behave
+/// exactly as it did before any of this: a reserve that deep is the one this presenter would have
+/// chosen on its own, so there is nothing left to learn and re-gating would only trade a short
+/// gap for a longer one.
+fn grow_live_prebuffer(shared: &Shared) -> bool {
+    let current = shared.prebuffer_samples.load(Ordering::SeqCst);
+    if current >= shared.prebuffer_ceiling_samples {
+        return false;
+    }
+    let grown =
+        current.saturating_add(shared.prebuffer_step_samples).min(shared.prebuffer_ceiling_samples);
+    shared.prebuffer_samples.store(grown, Ordering::SeqCst);
+    // Rebuild to the new depth rather than play on from an empty ring, which would underrun again
+    // on the next callback and every one after it.
+    shared.prebuffered.store(false, Ordering::SeqCst);
+    true
+}
+
 fn audio_prebuffer_ready(shared: &Shared) -> bool {
     let queued = shared.queued_samples.load(Ordering::SeqCst);
     let buffered = queued.saturating_sub(shared.played_samples.load(Ordering::SeqCst));
@@ -796,72 +956,88 @@ where
     device
         .build_output_stream(
             *config,
-            move |output: &mut [T], _| {
-                if discard_stale_samples(&shared, &mut consumer) > 0 {
-                    output.fill_with(|| T::from_sample(0.0));
-                    return;
-                }
-                if !shared.enabled.load(Ordering::SeqCst) {
-                    output.fill_with(|| T::from_sample(0.0));
-                    return;
-                }
-                if !shared.prebuffered.load(Ordering::SeqCst) {
-                    if !audio_prebuffer_ready(&shared) {
-                        output.fill_with(|| T::from_sample(0.0));
-                        return;
-                    }
-                    shared.resume_waiting_for_audio.store(false, Ordering::SeqCst);
-                    shared.prebuffered.store(true, Ordering::SeqCst);
-                }
-                let mut played = 0_u64;
-                // Media time only advances for samples that actually carried the timeline: real
-                // audio, and the leading silence that stands in for timeline before the first
-                // packet. An underrun renders silence the producer never sent, and a hold is delay
-                // that has not happened yet — counting either would run the clock ahead of the
-                // media and make every linked video frame look late for the rest of the session.
-                let mut rendered = 0_u64;
-                let gain = f32::from_bits(shared.gain_bits.load(Ordering::SeqCst));
-                for sample in output {
-                    if shared
-                        .hold_silence_samples
-                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
-                            remaining.checked_sub(1)
-                        })
-                        .is_ok()
-                    {
-                        *sample = T::from_sample(0.0);
-                        continue;
-                    }
-                    let emit_silence = shared
-                        .gap_silence_samples
-                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
-                            remaining.checked_sub(1)
-                        })
-                        .is_ok()
-                        || shared
-                            .leading_silence_samples
-                            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
-                                remaining.checked_sub(1)
-                            })
-                            .is_ok();
-                    if emit_silence {
-                        *sample = T::from_sample(0.0);
-                        rendered += 1;
-                    } else if let Some(value) = consumer.try_pop() {
-                        *sample = T::from_sample((value * gain).clamp(-1.0, 1.0));
-                        played += 1;
-                        rendered += 1;
-                    } else {
-                        *sample = T::from_sample(0.0);
-                    }
-                }
-                shared.played_samples.fetch_add(played, Ordering::SeqCst);
-                shared.rendered_samples.fetch_add(rendered, Ordering::SeqCst);
-            },
+            move |output: &mut [T], _| render_audio(output, &mut consumer, &shared),
             move |error| error_shared.set_error(format!("audio output stream error: {error}")),
             None,
         )
         .map_err(|error| io::Error::other(format!("could not build audio output: {error}")))
+}
+
+fn render_audio<T, C>(output: &mut [T], consumer: &mut C, shared: &Shared)
+where
+    T: SizedSample + FromSample<f32>,
+    C: Consumer<Item = f32>,
+{
+    if discard_stale_samples(shared, consumer) > 0 {
+        output.fill_with(|| T::from_sample(0.0));
+        return;
+    }
+    if !shared.enabled.load(Ordering::SeqCst) {
+        output.fill_with(|| T::from_sample(0.0));
+        return;
+    }
+    if !shared.prebuffered.load(Ordering::SeqCst) {
+        if !audio_prebuffer_ready(shared) {
+            output.fill_with(|| T::from_sample(0.0));
+            return;
+        }
+        trim_to_live_prebuffer(shared, consumer);
+        shared.resume_waiting_for_audio.store(false, Ordering::SeqCst);
+        shared.prebuffered.store(true, Ordering::SeqCst);
+    }
+    let mut played = 0_u64;
+    // Media time only advances for samples that actually carried the timeline: real
+    // audio, and the leading silence that stands in for timeline before the first
+    // packet. An underrun renders silence the producer never sent, and a hold is delay
+    // that has not happened yet — counting either would run the clock ahead of the
+    // media and make every linked video frame look late for the rest of the session.
+    let mut rendered = 0_u64;
+    // Whether this callback wanted media the ring did not have. Accumulated locally:
+    // this runs once per sample, and the reserve is only revisited once per callback.
+    let mut underran = false;
+    let gain = f32::from_bits(shared.gain_bits.load(Ordering::SeqCst));
+    for sample in output {
+        if shared
+            .hold_silence_samples
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| remaining.checked_sub(1))
+            .is_ok()
+        {
+            *sample = T::from_sample(0.0);
+            continue;
+        }
+        let emit_silence = shared
+            .gap_silence_samples
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| remaining.checked_sub(1))
+            .is_ok()
+            || shared
+                .leading_silence_samples
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok();
+        if emit_silence {
+            *sample = T::from_sample(0.0);
+            rendered += 1;
+        } else if let Some(value) = consumer.try_pop() {
+            *sample = T::from_sample((value * gain).clamp(-1.0, 1.0));
+            played += 1;
+            rendered += 1;
+        } else {
+            *sample = T::from_sample(0.0);
+            underran = true;
+        }
+    }
+    shared.played_samples.fetch_add(played, Ordering::SeqCst);
+    shared.rendered_samples.fetch_add(rendered, Ordering::SeqCst);
+    // A reserve this presenter tightened on the producer's word, and which the link
+    // then failed to hold, earns a step back. A stream that has finished decoding has
+    // simply run out and has nothing to learn from.
+    if underran
+        && shared.trim_to_prebuffer.load(Ordering::SeqCst)
+        && !shared.decode_done.load(Ordering::SeqCst)
+    {
+        grow_live_prebuffer(shared);
+    }
 }
 
 pub struct AudioDecoder {
@@ -1232,6 +1408,61 @@ fn check_ffmpeg(context: &str, result: c_int) -> io::Result<()> {
     if result < 0 { Err(ffmpeg_error(context, result)) } else { Ok(()) }
 }
 
+/// Worker-owned mono float to 48 kHz s16 microphone resampler.
+pub(super) struct CaptureResampler(*mut c_void);
+
+impl CaptureResampler {
+    pub fn new(rate: u32) -> io::Result<Self> {
+        let rate = c_int::try_from(rate).map_err(|_| invalid("capture rate too large"))?;
+        let mut result = Self(ptr::null_mut());
+        let mut mono = AVChannelLayout::default();
+        // SAFETY: mono is initialized storage; FFmpeg initializes and releases its layout.
+        unsafe { av_channel_layout_default(&mut mono, 1) };
+        // SAFETY: layouts live through the call; result owns the returned context exclusively.
+        let status = unsafe {
+            swr_alloc_set_opts2(
+                &mut result.0,
+                &mono,
+                1,
+                48_000,
+                &mono,
+                AV_SAMPLE_FMT_FLT,
+                rate,
+                0,
+                ptr::null_mut(),
+            )
+        };
+        // SAFETY: mono was initialized above and is no longer referenced by swr.
+        unsafe { av_channel_layout_uninit(&mut mono) };
+        check_ffmpeg("could not allocate microphone resampler", status)?;
+        // SAFETY: the allocation succeeded and result exclusively owns the context.
+        check_ffmpeg("could not initialize microphone resampler", unsafe { swr_init(result.0) })?;
+        Ok(result)
+    }
+
+    pub fn convert(&mut self, input: &[f32], output: &mut [i16]) -> io::Result<usize> {
+        let count = c_int::try_from(input.len()).map_err(|_| invalid("capture input too large"))?;
+        let capacity =
+            c_int::try_from(output.len()).map_err(|_| invalid("capture output too large"))?;
+        let source = [input.as_ptr().cast::<u8>()];
+        let mut destination = [output.as_mut_ptr().cast::<u8>()];
+        // SAFETY: both mono interleaved buffers have the declared sample capacity; the context
+        // is initialized, exclusively borrowed, and configured for float input / i16 output.
+        let count = unsafe {
+            swr_convert(self.0, destination.as_mut_ptr(), capacity, source.as_ptr(), count)
+        };
+        check_ffmpeg("could not resample microphone", count)?;
+        Ok(count as usize)
+    }
+}
+
+impl Drop for CaptureResampler {
+    fn drop(&mut self) {
+        // SAFETY: this wrapper owns the allocation, and swr_free accepts null on failed setup.
+        unsafe { swr_free(&mut self.0) };
+    }
+}
+
 fn ffmpeg_error(context: &str, code: c_int) -> io::Error {
     let mut buffer: [c_char; 256] = [0; 256];
     let description = if unsafe { av_strerror(code, buffer.as_mut_ptr(), buffer.len()) } == 0 {
@@ -1322,6 +1553,7 @@ unsafe extern "C" {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ringbuf::traits::Observer;
     use vivid_protocol::media::ParsedAudioPacket;
     use vivid_protocol::track::AudioConfiguration;
 
@@ -1349,6 +1581,115 @@ mod tests {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .is_none()
         );
+    }
+
+    #[test]
+    fn a_live_track_is_buffered_to_the_target_latency_it_declared() {
+        let output = AudioOutput::test_output();
+        // 48 kHz stereo: 40 ms is 3,840 samples, 100 ms is 9,600.
+        output.configure_live(40_000);
+        assert_eq!(output.shared.prebuffer_samples.load(Ordering::SeqCst), 3_840);
+
+        // A target below the floor, and one above the presenter's own default, are both bounded.
+        output.configure_live(1);
+        assert_eq!(output.shared.prebuffer_samples.load(Ordering::SeqCst), 1_920);
+        output.configure_live(5_000_000);
+        assert_eq!(output.shared.prebuffer_samples.load(Ordering::SeqCst), 9_600);
+    }
+
+    #[test]
+    fn a_live_track_stating_no_target_keeps_the_default_reserve_untrimmed() {
+        let output = AudioOutput::test_output();
+        output.shared.prebuffer_samples.store(9_600, Ordering::SeqCst);
+        output.configure_live(0);
+        assert_eq!(output.shared.prebuffer_samples.load(Ordering::SeqCst), 9_600);
+
+        // Nothing is discarded either: a producer that stated no target gets the conservative
+        // reserve it would have got before, however deep the device start-up let it grow.
+        let (mut producer, mut consumer) = HeapRb::<f32>::new(32_768).split();
+        let buffered = producer.push_slice(&[0.5; 32_768]) as u64;
+        output.shared.queued_samples.store(buffered, Ordering::SeqCst);
+        trim_to_live_prebuffer(&output.shared, &mut consumer);
+        assert_eq!(output.shared.played_samples.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn live_playback_starts_at_the_declared_reserve_however_deep_the_device_filled() {
+        let output = AudioOutput::test_output();
+        output.configure_live(40_000);
+        let (mut producer, mut consumer) = HeapRb::<f32>::new(32_768).split();
+        // A device that takes 250 ms to deliver its first callback leaves the ring six times
+        // deeper than the track asked for, and every extra sample is permanent delay.
+        let buffered = producer.push_slice(&[0.5; 24_000]) as u64;
+        output.shared.queued_samples.store(buffered, Ordering::SeqCst);
+
+        trim_to_live_prebuffer(&output.shared, &mut consumer);
+
+        let excess = buffered - 3_840;
+        assert_eq!(output.shared.played_samples.load(Ordering::SeqCst), excess);
+        // The clock advances with the drop: the next audible sample is that much further in.
+        assert_eq!(output.shared.rendered_samples.load(Ordering::SeqCst), excess);
+        assert_eq!(consumer.occupied_len() as u64, 3_840);
+
+        // Nothing more is taken once playback is at its reserve.
+        trim_to_live_prebuffer(&output.shared, &mut consumer);
+        assert_eq!(output.shared.played_samples.load(Ordering::SeqCst), excess);
+    }
+
+    #[test]
+    fn timed_playback_keeps_every_sample_play_asked_it_to_buffer() {
+        let output = AudioOutput::test_output();
+        // A live generation may precede a timed one on the same device output.
+        output.configure_live(40_000);
+        output.configure_play(0, 100_000);
+        let (mut producer, mut consumer) = HeapRb::<f32>::new(32_768).split();
+        let buffered = producer.push_slice(&[0.5; 24_000]) as u64;
+        output.shared.queued_samples.store(buffered, Ordering::SeqCst);
+
+        trim_to_live_prebuffer(&output.shared, &mut consumer);
+
+        assert_eq!(output.shared.played_samples.load(Ordering::SeqCst), 0);
+        assert_eq!(consumer.occupied_len() as u64, buffered);
+    }
+
+    #[test]
+    fn a_live_reserve_the_link_could_not_hold_grows_back_toward_the_default() {
+        let output = AudioOutput::test_output();
+        output.configure_live(40_000);
+        output.shared.prebuffered.store(true, Ordering::SeqCst);
+
+        // 48 kHz stereo: one 20 ms step is 1,920 samples, the 100 ms ceiling is 9,600.
+        assert!(grow_live_prebuffer(&output.shared));
+        assert_eq!(output.shared.prebuffer_samples.load(Ordering::SeqCst), 5_760);
+        // Growing re-gates, so the reserve is actually rebuilt instead of underrunning again.
+        assert!(!output.shared.prebuffered.load(Ordering::SeqCst));
+
+        for expected in [7_680, 9_600] {
+            assert!(grow_live_prebuffer(&output.shared));
+            assert_eq!(output.shared.prebuffer_samples.load(Ordering::SeqCst), expected);
+        }
+
+        // At the ceiling the output is left exactly as it behaved before live targets existed:
+        // the reserve stops growing and an underrun no longer re-gates.
+        output.shared.prebuffered.store(true, Ordering::SeqCst);
+        assert!(!grow_live_prebuffer(&output.shared));
+        assert_eq!(output.shared.prebuffer_samples.load(Ordering::SeqCst), 9_600);
+        assert!(output.shared.prebuffered.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn a_reserve_this_presenter_did_not_tighten_is_never_grown_or_trimmed() {
+        // Timed playback owns its own reserve through PLAY, and a live producer that stated no
+        // target keeps the default. Neither is a reserve this presenter chose, so neither is one
+        // it may revisit: the underrun path is gated on the same flag the trim is.
+        let timed = AudioOutput::test_output();
+        timed.configure_live(40_000);
+        timed.configure_play(0, 100_000);
+        assert!(!timed.shared.trim_to_prebuffer.load(Ordering::SeqCst));
+
+        let untargeted = AudioOutput::test_output();
+        untargeted.configure_live(0);
+        assert!(!untargeted.shared.trim_to_prebuffer.load(Ordering::SeqCst));
     }
 
     #[test]

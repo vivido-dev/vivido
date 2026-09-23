@@ -2,20 +2,23 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use accesskit::{
-    ActionHandler, ActionRequest, ActivationHandler, DeactivationHandler, Node, NodeId, Rect, Role,
-    TextPosition, TextSelection, TreeId, TreeInfo, TreeUpdate,
+    Action, ActionHandler, ActionRequest, ActivationHandler, DeactivationHandler, Node, NodeId,
+    Rect, Role, TextPosition, TextSelection, Toggled, TreeId, TreeInfo, TreeUpdate,
 };
 use accesskit_winit::Adapter;
+use vivid_protocol::overlay::AccessibleAction;
 use winit::event::WindowEvent;
 use winit::event_loop::ActiveEventLoop;
 use winit::window::Window;
 
-use super::AccessibilitySnapshot;
+use super::{AccessibilitySnapshot, OverlaySemantics};
 use crate::cli::VividTarget;
 
 const WINDOW_ID: NodeId = NodeId(1);
 const TERMINAL_ID: NodeId = NodeId(2);
 const FIRST_LINE_ID: u64 = 16;
+/// Application semantic nodes start well above any line index a terminal could reach.
+const FIRST_OVERLAY_ID: u64 = 1 << 32;
 
 struct Activation {
     latest: Arc<Mutex<TreeUpdate>>,
@@ -29,10 +32,59 @@ impl ActivationHandler for Activation {
     }
 }
 
-struct ReadOnlyActions;
+/// Forwards an assistive-technology request to the application that owns the node.
+///
+/// The adapter runs on the platform's accessibility thread, so the handler cannot touch window
+/// state; it carries a callback that hands the request to the presenter, which owns the lane.
+struct ForwardingActions {
+    /// The tree the last update published, so a platform node ID can be mapped back to the
+    /// application's own node ID and the window that published it.
+    latest: Arc<Mutex<Option<OverlaySemantics>>>,
+    invoke:
+        Arc<dyn Fn(vivid_protocol::identity::SurfaceIdentity, u64, AccessibleAction) + Send + Sync>,
+}
 
-impl ActionHandler for ReadOnlyActions {
-    fn do_action(&mut self, _request: ActionRequest) {}
+impl ActionHandler for ForwardingActions {
+    fn do_action(&mut self, request: ActionRequest) {
+        let Some(action) = accessible_action(request.action) else {
+            return;
+        };
+        let Ok(latest) = self.latest.lock() else {
+            return;
+        };
+        let Some(semantics) = latest.as_ref() else {
+            return;
+        };
+        let Some(index) = request
+            .target_node
+            .0
+            .checked_sub(FIRST_OVERLAY_ID)
+            .and_then(|index| usize::try_from(index).ok())
+        else {
+            // A request for the window or terminal node is the host's own, not an application's.
+            return;
+        };
+        let Some(node) = semantics.nodes.get(index) else {
+            return;
+        };
+        (self.invoke)(semantics.window, node.id, action);
+    }
+}
+
+/// AccessKit's action onto the protocol's closed set. An action the profile does not offer is
+/// dropped rather than guessed at.
+fn accessible_action(action: Action) -> Option<AccessibleAction> {
+    Some(match action {
+        // Activation arrives as a click for a button and as a focus request for most else; both
+        // mean the node's own default action to the application that asked for one.
+        Action::Click => AccessibleAction::Default,
+        Action::Focus => AccessibleAction::Focus,
+        Action::Increment => AccessibleAction::Increment,
+        Action::Decrement => AccessibleAction::Decrement,
+        Action::Expand => AccessibleAction::Expand,
+        Action::Collapse => AccessibleAction::Collapse,
+        _ => return None,
+    })
 }
 
 struct Deactivation {
@@ -51,6 +103,8 @@ pub(crate) struct AccessibilityState {
     latest: Arc<Mutex<TreeUpdate>>,
     target: VividTarget,
     last_snapshot: AccessibilitySnapshot,
+    /// The application tree the last update published, for mapping an incoming action back.
+    published: Arc<Mutex<Option<OverlaySemantics>>>,
 }
 
 impl AccessibilityState {
@@ -59,18 +113,22 @@ impl AccessibilityState {
         window: &Window,
         target: VividTarget,
         snapshot: AccessibilitySnapshot,
+        invoke: Arc<
+            dyn Fn(vivid_protocol::identity::SurfaceIdentity, u64, AccessibleAction) + Send + Sync,
+        >,
     ) -> Self {
         let initial = build_tree(&snapshot, target);
         let latest = Arc::new(Mutex::new(initial));
+        let published = Arc::new(Mutex::new(snapshot.semantics.clone()));
         let active = Arc::new(AtomicBool::new(false));
         let adapter = Adapter::with_direct_handlers(
             event_loop,
             window,
             Activation { latest: Arc::clone(&latest), active: Arc::clone(&active) },
-            ReadOnlyActions,
+            ForwardingActions { latest: Arc::clone(&published), invoke },
             Deactivation { active: Arc::clone(&active) },
         );
-        Self { adapter, active, latest, target, last_snapshot: snapshot }
+        Self { adapter, active, latest, target, last_snapshot: snapshot, published }
     }
 
     pub(crate) fn process_event(&mut self, window: &Window, event: &WindowEvent) {
@@ -88,6 +146,7 @@ impl AccessibilityState {
             return;
         }
         let update = build_tree(&snapshot, self.target);
+        *self.published.lock().expect("published semantics") = snapshot.semantics.clone();
         self.last_snapshot = snapshot;
         *self.latest.lock().unwrap() = update.clone();
         if self.active.load(Ordering::Acquire) {
@@ -170,8 +229,112 @@ fn build_tree(snapshot: &AccessibilitySnapshot, target: VividTarget) -> TreeUpda
         }
     }
 
+    // An application's own tree hangs beneath the window, so assistive technology reads it
+    // alongside the terminal rather than instead of it.
+    if let Some(semantics) = &snapshot.semantics {
+        let mut children = root.children().to_vec();
+        children.extend((0..semantics.nodes.len()).map(overlay_id));
+        root.set_children(children);
+        for (index, node) in semantics.nodes.iter().enumerate() {
+            let mut accessible = Node::new(overlay_role(node.role));
+            if !node.label.is_empty() {
+                accessible.set_label(node.label.clone());
+            }
+            accessible.set_bounds(Rect {
+                x0: node.bounds.origin.x.get(),
+                y0: node.bounds.origin.y.get(),
+                x1: node.bounds.origin.x.get() + node.bounds.width.get(),
+                y1: node.bounds.origin.y.get() + node.bounds.height.get(),
+            });
+            if node.disabled {
+                accessible.set_disabled();
+            }
+            if let Some(level) = node.level {
+                accessible.set_level(usize::from(level));
+            }
+            if let Some([position, size]) = node.set {
+                accessible.set_position_in_set(usize::from(position));
+                accessible.set_size_of_set(usize::from(size));
+            }
+            if let Some(toggled) = node.toggled {
+                use vivid_protocol::overlay::Toggled as SemanticToggled;
+                accessible.set_toggled(match toggled {
+                    SemanticToggled::Off => Toggled::False,
+                    SemanticToggled::On => Toggled::True,
+                    SemanticToggled::Mixed => Toggled::Mixed,
+                });
+            }
+            if let Some([value, minimum, maximum]) = node.numeric {
+                accessible.set_numeric_value(value.get());
+                accessible.set_min_numeric_value(minimum.get());
+                accessible.set_max_numeric_value(maximum.get());
+            }
+            for action in &node.actions {
+                accessible.add_action(overlay_action(*action));
+            }
+            // A leaf is not expandable, and saying so stops a screen reader offering to expand it.
+            if node.children.is_empty() {
+                accessible.set_children([]);
+            } else {
+                accessible.set_children(
+                    node.children.iter().map(|c| overlay_id(*c as usize)).collect::<Vec<_>>(),
+                );
+            }
+            nodes.push((overlay_id(index), accessible));
+        }
+    }
+
     nodes.push((WINDOW_ID, root));
     TreeUpdate { nodes, tree: Some(TreeInfo::new(WINDOW_ID)), tree_id: TreeId::ROOT, focus }
+}
+
+/// Application node IDs live above the terminal's line IDs so the two spaces cannot collide.
+fn overlay_id(index: usize) -> NodeId {
+    NodeId(FIRST_OVERLAY_ID.saturating_add(u64::try_from(index).unwrap_or(u64::MAX)))
+}
+
+/// The protocol's closed role set onto AccessKit's. Every role has a target, so a producer's
+/// choice is never silently downgraded to something generic.
+fn overlay_role(role: vivid_protocol::overlay::SemanticRole) -> Role {
+    use vivid_protocol::overlay::SemanticRole as Semantic;
+    match role {
+        Semantic::Generic => Role::GenericContainer,
+        Semantic::Application => Role::Application,
+        Semantic::Group => Role::Group,
+        Semantic::Heading => Role::Heading,
+        Semantic::Text => Role::Label,
+        Semantic::Button => Role::Button,
+        Semantic::Switch => Role::Switch,
+        Semantic::CheckBox => Role::CheckBox,
+        Semantic::RadioButton => Role::RadioButton,
+        Semantic::TextInput => Role::TextInput,
+        Semantic::Slider => Role::Slider,
+        Semantic::SpinButton => Role::SpinButton,
+        Semantic::ProgressIndicator => Role::ProgressIndicator,
+        Semantic::List => Role::List,
+        Semantic::ListItem => Role::ListItem,
+        Semantic::Image => Role::Image,
+        Semantic::Link => Role::Link,
+        Semantic::Dialog => Role::Dialog,
+        Semantic::Tab => Role::Tab,
+        Semantic::Separator => Role::Splitter,
+    }
+}
+
+fn overlay_action(action: vivid_protocol::overlay::AccessibleAction) -> Action {
+    use vivid_protocol::overlay::AccessibleAction as Accessible;
+    match action {
+        // Activation arrives as a click, so a node that asks to be activatable advertises one.
+        // Every variant has a target here: the set was trimmed to what a toolkit can honor
+        // rather than carrying an action a host would have to silently ignore.
+        Accessible::Default => Action::Click,
+        Accessible::Focus => Action::Focus,
+        Accessible::Click => Action::Click,
+        Accessible::Increment => Action::Increment,
+        Accessible::Decrement => Action::Decrement,
+        Accessible::Expand => Action::Expand,
+        Accessible::Collapse => Action::Collapse,
+    }
 }
 
 fn text_selection(snapshot: &AccessibilitySnapshot) -> TextSelection {

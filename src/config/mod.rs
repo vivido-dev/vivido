@@ -22,6 +22,7 @@ pub mod selection;
 pub mod serde_utils;
 pub mod terminal;
 pub mod ui_config;
+pub mod updates;
 pub mod window;
 
 mod bindings;
@@ -343,6 +344,22 @@ pub fn installed_config() -> Option<PathBuf> {
     first_existing_windows_config(windows_config_candidates(user_profile, dirs::config_dir()))
 }
 
+/// Return the per-user directory for Vivido configuration and state.
+#[cfg(not(windows))]
+pub fn config_dir() -> Option<PathBuf> {
+    xdg::BaseDirectories::with_prefix("vivido").get_config_home()
+}
+
+/// Return the per-user directory for Vivido configuration and state.
+#[cfg(windows)]
+pub fn config_dir() -> Option<PathBuf> {
+    env::var_os("USERPROFILE")
+        .map(PathBuf::from)
+        .or_else(home::home_dir)
+        .map(|home| home.join(".config").join("vivido"))
+        .or_else(|| dirs::config_dir().map(|directory| directory.join("vivido")))
+}
+
 #[cfg(any(windows, test))]
 fn first_existing_windows_config(candidates: Vec<PathBuf>) -> Option<PathBuf> {
     candidates.into_iter().find(|path| path.exists())
@@ -383,7 +400,18 @@ mod tests {
 
     #[test]
     fn empty_config() {
-        toml::from_str::<UiConfig>("").unwrap();
+        let config = toml::from_str::<UiConfig>("").unwrap();
+        assert!(config.updates.enabled);
+        assert!(config.updates.startup_check);
+    }
+
+    #[test]
+    fn updates_table_overrides_both_defaults() {
+        let config =
+            toml::from_str::<UiConfig>("[updates]\nenabled = false\nstartup_check = false\n")
+                .unwrap();
+        assert!(!config.updates.enabled);
+        assert!(!config.updates.startup_check);
     }
 
     #[test]
@@ -416,6 +444,15 @@ mod tests {
             crate::display::color::CellRgb::Rgb(crate::display::color::Rgb::new(1, 2, 3))
         );
         assert_eq!(config.colors.cursor.background, crate::display::color::CellRgb::CellForeground);
+    }
+
+    #[test]
+    fn scrollbar_defaults_on_and_can_be_disabled() {
+        let config = toml::from_str::<UiConfig>("").unwrap();
+        assert!(config.scrolling.scrollbar);
+
+        let config = toml::from_str::<UiConfig>("[scrolling]\nscrollbar = false\n").unwrap();
+        assert!(!config.scrolling.scrollbar);
     }
 
     #[test]

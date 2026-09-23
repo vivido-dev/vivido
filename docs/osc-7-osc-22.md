@@ -42,6 +42,15 @@ pointer shape such as `progress` during long operations.
 
 ## Consumers
 
+- Interactive `pwsh` and Windows PowerShell launches install an OSC 7 prompt hook after profiles
+  load. It calls the existing prompt and reports the current filesystem directory at each prompt;
+  profile files are not edited. Explicit scripts, commands, and noninteractive launches are left
+  unchanged.
+
+- `WindowContext::display_directory` preserves the shell-reported namespace for labels, including
+  WSL paths such as `/home/dev/project` that Windows cannot use as native launch directories.
+  Vivida refreshes automatic tab labels from this value as directory reports arrive.
+
 - `WindowContext::current_directory` (IPC `inspect`'s `current_directory`) prefers the OSC 7
   path and falls back to the foreground-process probe. `automation_inspect` reads the value
   through its already-held terminal lock — the terminal mutex is not reentrant.

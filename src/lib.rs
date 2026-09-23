@@ -11,6 +11,7 @@ compile_error!(r#"the "wayland" feature must be enabled on Linux and other Unix 
 mod accessibility;
 mod automation;
 pub mod cli;
+mod client_fault;
 mod clipboard;
 #[macro_use]
 mod config_derive;
@@ -18,6 +19,7 @@ pub mod config;
 mod daemon;
 pub mod display;
 pub mod event;
+mod exec;
 mod headless;
 mod input;
 mod logging;
@@ -36,14 +38,18 @@ mod session;
 pub mod shell;
 mod string;
 pub mod terminal;
+pub mod update;
 mod vivid;
 pub mod window_context;
 
 #[cfg(any(target_os = "macos", windows))]
 pub use crate::cli::ParentWindowHandle;
 pub use crate::cli::WindowOptions;
+pub use crate::client_fault::{ClientFault, ClientFaultClass, ClientHealth};
 pub use crate::display::window::Window;
-pub use crate::event::{Event, EventSink, EventType, LoopHandle, Processor};
+pub use crate::event::{Event, EventSink, EventType, HeadlessLoop, LoopHandle, Processor};
+#[cfg(target_os = "macos")]
+pub use crate::macos::menu::MenuCommand as MacOsMenuCommand;
 pub use crate::serde_replace::SerdeReplace;
 pub use crate::terminal::tty;
 pub use crate::window_context::WindowContext;
@@ -100,13 +106,15 @@ pub mod binary {
         pub use crate::polling::transport::{LocalListener, LocalStream};
 
         pub mod ipc {
-            pub use crate::polling::ipc::{request_once, send_message};
+            pub use crate::polling::ipc::{request_once, run_test, send_message};
         }
     }
 
     pub mod session {
         pub use crate::session::{
-            RegistryGuard, SessionPaths, list_registries, print_sessions, terminate_session,
+            RegistryGuard, SessionPaths, list_registries, print_sessions, publish_instance_name,
+            publish_runtime_kind, scrub_inherited_mesh_environment, start_mesh_watcher,
+            terminate_session,
         };
     }
 }

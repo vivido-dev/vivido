@@ -1,4 +1,4 @@
-//! Child window which presents the `+` menu above a Windows pane.
+//! Child window which presents the launch menu above a Windows pane.
 //!
 //! Panes are real child windows of the chrome (`super::windows::NativePaneHost`) and always compose
 //! above the chrome's own DirectComposition content, so a menu painted into the chrome scene would
@@ -94,7 +94,7 @@ impl MenuWindow {
     ///
     /// Focus is what makes `Esc`, arrow keys, and dismiss-on-focus-loss work; the chrome hands it
     /// back to the active pane when the menu closes. Only `SetFocus` is used: the chrome is already
-    /// the foreground window when a right-click opens a menu, and re-activating it would bounce
+    /// the foreground window when a click opens a menu, and re-activating it would bounce
     /// focus straight back to the pane through the chrome's own activation handler.
     pub(super) fn show(&mut self, menu: &NewTabMenu) {
         let rect = menu.rect();

@@ -22,6 +22,104 @@ use sha2::{Digest, Sha256};
 use crate::polling::ipc::PROTOCOL_VERSION;
 
 const REGISTRY_SCHEMA: u32 = 1;
+
+/// This process' automation instance name, published once at startup.
+///
+/// Windows need it to tell a child which Vivido instance it is in, and threading it through window
+/// construction would touch every call site for one string that never changes after startup.
+static INSTANCE_NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// The runtime kind this process presents to the agent mesh.
+///
+/// Vivido embedded in a host — Vivida, vvbox — is not addressed as Vivido: the host owns the
+/// spaces and tabs a window sits in, so it owns the identity too. The host publishes its own kind
+/// here and windows inherit it.
+static RUNTIME_KIND: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Record the name this process registered under. Called once, before any window exists.
+pub fn publish_instance_name(name: &str) {
+    let _ = INSTANCE_NAME.set(name.to_owned());
+}
+
+/// Drop agent-mesh coordinates inherited from a pane this process was launched in.
+///
+/// A window writes its coordinates as *overrides* on the child's environment, so any key it does
+/// not write falls through from this process. Vivido started from inside another Vivido or Vivida
+/// pane would otherwise hand its own panes the launching pane's instance and address — not merely
+/// stale, but pointing at a different runtime instance, which is worse than having none.
+///
+/// # Safety
+///
+/// Call before any thread is started. Removing an environment variable is not thread-safe.
+pub unsafe fn scrub_inherited_mesh_environment() {
+    for key in ["AGENT_MESH_RUNTIME", "AGENT_MESH_INSTANCE", "AGENT_MESH_ADDRESS"] {
+        unsafe { std::env::remove_var(key) };
+    }
+}
+
+/// Start the optional mesh worker off the UI thread. Its parent leash owns its lifetime;
+/// this runtime never opens the mesh database or waits for provider control calls.
+pub fn start_mesh_watcher() {
+    if std::env::var("AGENT_MESH_WATCH").as_deref() == Ok("off") {
+        return;
+    }
+    let Some(instance) = instance_name() else { return };
+    let kind = runtime_kind();
+    let _ = std::thread::Builder::new().name("agent-mesh".into()).spawn(move || {
+        let program = std::env::var_os("AGENT_MESH_BIN").unwrap_or_else(|| "vvagent".into());
+        let mut command = std::process::Command::new(program);
+        command.args([
+            "watch",
+            "--runtime",
+            kind,
+            "--instance",
+            instance,
+            "--parent-pid",
+            &std::process::id().to_string(),
+        ]);
+        if kind == "vivida"
+            && let Ok(exe) = std::env::current_exe()
+        {
+            let executable = exe.to_string_lossy();
+            #[cfg(windows)]
+            let executable = format!("\"{executable}\"");
+            #[cfg(unix)]
+            let executable = format!("'{}'", executable.replace('\'', "'\\''"));
+            command.args(["--reconcile", &format!("{executable} msg --target {instance} layout")]);
+        }
+        command
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        }
+        match command.spawn() {
+            Ok(mut child) => {
+                let _ = child.wait();
+            },
+            Err(error) if error.kind() == io::ErrorKind::NotFound => (),
+            Err(error) => log::warn!("Could not start agent mesh watcher: {error}"),
+        }
+    });
+}
+
+/// Record the runtime kind an embedding host presents. Defaults to Vivido when unset.
+pub fn publish_runtime_kind(kind: &str) {
+    let _ = RUNTIME_KIND.set(kind.to_owned());
+}
+
+/// The agent-mesh runtime kind for this process.
+pub fn runtime_kind() -> &'static str {
+    RUNTIME_KIND.get().map(String::as_str).unwrap_or("vivido")
+}
+
+/// The name `vivido msg --target` addresses this process by, if it has one.
+pub fn instance_name() -> Option<&'static str> {
+    INSTANCE_NAME.get().map(String::as_str)
+}
 const MAX_REGISTRY_BYTES: u64 = 16 * 1024;
 const MAX_SESSION_NAME: usize = 64;
 

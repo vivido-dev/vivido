@@ -26,6 +26,7 @@ use vivid_protocol::identity::TrackIdentity;
 use vivid_protocol::messages;
 use vivid_protocol::revision::ChannelGeneration;
 
+use crate::client_fault::{self, ClientFaultClass};
 use crate::vivid::audio::AudioOutput;
 use crate::vivid::scene::{SharedScene, TrackWaitEvaluation};
 use crate::vivid::transport::{ReadShutdown, Writer};
@@ -56,6 +57,7 @@ struct EgressQueue {
 /// block on a socket — the PTY parser, the winit UI thread, a track channel, another session's
 /// actor — only ever queue here.
 pub(crate) struct Egress {
+    cancel: Option<ReadShutdown>,
     queue: Mutex<EgressQueue>,
     ready: Condvar,
     overflowed: AtomicBool,
@@ -70,6 +72,7 @@ pub(crate) struct Egress {
 impl Egress {
     pub(crate) fn start(writer: Arc<Writer>, name: &'static str) -> io::Result<Arc<Self>> {
         let egress = Arc::new(Self {
+            cancel: Some(writer.shutdown_handle()),
             queue: Mutex::new(EgressQueue {
                 records: VecDeque::new(),
                 closed: false,
@@ -83,7 +86,16 @@ impl Egress {
         });
         let worker = {
             let egress = egress.clone();
-            thread::Builder::new().name(name.into()).spawn(move || egress.run(writer))?
+            thread::Builder::new().name(name.into()).spawn(move || {
+                let result = client_fault::catch(
+                    ClientFaultClass::Vivid,
+                    "Vivid egress worker panicked",
+                    || egress.run(writer),
+                );
+                if let Err(fault) = result {
+                    log::error!("contained Vivid egress fault {}", fault.id);
+                }
+            })?
         };
         *egress.worker.lock().expect("egress worker") = Some(worker);
         Ok(egress)
@@ -110,6 +122,7 @@ impl Egress {
     #[cfg(test)]
     fn detached() -> Arc<Self> {
         Arc::new(Self {
+            cancel: None,
             queue: Mutex::new(EgressQueue {
                 records: VecDeque::new(),
                 closed: false,
@@ -165,6 +178,15 @@ impl Egress {
     pub(crate) fn join(&self) {
         let worker = self.worker.lock().expect("egress worker").take();
         if let Some(worker) = worker {
+            let deadline = Instant::now() + Duration::from_millis(250);
+            while !worker.is_finished() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(2));
+            }
+            if !worker.is_finished()
+                && let Some(cancel) = &self.cancel
+            {
+                cancel.stop();
+            }
             let _ = worker.join();
         }
     }
@@ -222,6 +244,7 @@ pub(crate) enum Pending {
         condition: u64,
         value: Option<u64>,
         deadline: Instant,
+        completion_output: Option<Arc<AudioOutput>>,
     },
     /// `DRAIN`: audio completes only after EOS, decoder flush, and queued device samples.
     AudioDrain {
@@ -335,81 +358,90 @@ impl PendingSet {
                     condition,
                     value,
                     deadline,
-                } => match scene.evaluate_track_wait(*identity, *generation, *condition, *value) {
-                    TrackWaitEvaluation::Satisfied(satisfied) => {
-                        resolved.push((
-                            messages::WAIT_SATISFIED,
-                            *object_id,
-                            crate::vivid::wait_satisfied_body(
-                                *request_id,
-                                *identity,
-                                *condition,
-                                satisfied,
-                            ),
-                        ));
-                        false
-                    },
-                    TrackWaitEvaluation::NotFound => {
-                        resolved.push((
-                            messages::ERROR,
-                            *object_id,
-                            error_body(
-                                *request_id,
-                                messages::ERROR_NOT_FOUND,
-                                "track does not exist",
-                            ),
-                        ));
-                        false
-                    },
-                    TrackWaitEvaluation::Lost => {
-                        resolved.push((
-                            messages::ERROR,
-                            *object_id,
-                            error_body(
-                                *request_id,
-                                messages::ERROR_BAD_STATE,
-                                "track was lost while waiting",
-                            ),
-                        ));
-                        false
-                    },
-                    TrackWaitEvaluation::StaleGeneration => {
-                        resolved.push((
-                            messages::ERROR,
-                            *object_id,
-                            error_body(
-                                *request_id,
-                                messages::ERROR_STALE_CHANNEL_GENERATION,
-                                "track wait names a stale channel generation",
-                            ),
-                        ));
-                        false
-                    },
-                    TrackWaitEvaluation::NotVisible => {
-                        resolved.push((
-                            messages::ERROR,
-                            *object_id,
-                            error_body(
-                                *request_id,
-                                messages::ERROR_NOT_VISIBLE,
-                                "track has no eligible visible placement",
-                            ),
-                        ));
-                        false
-                    },
-                    TrackWaitEvaluation::Pending if now < *deadline => true,
-                    TrackWaitEvaluation::Pending => {
-                        resolved.push((
-                            messages::ERROR,
-                            *object_id,
-                            error_body(
-                                *request_id,
-                                messages::ERROR_TIMEOUT,
-                                "track wait timed out",
-                            ),
-                        ));
-                        false
-                    },
+                    completion_output,
+                } => {
+                    if completion_output
+                        .as_ref()
+                        .is_some_and(|output| matches!(output.poll_drained(), Some(Ok(()))))
+                    {
+                        let _ = scene.mark_buffered_ended(*identity, *generation);
+                    }
+                    match scene.evaluate_track_wait(*identity, *generation, *condition, *value) {
+                        TrackWaitEvaluation::Satisfied(satisfied) => {
+                            resolved.push((
+                                messages::WAIT_SATISFIED,
+                                *object_id,
+                                crate::vivid::wait_satisfied_body(
+                                    *request_id,
+                                    *identity,
+                                    *condition,
+                                    satisfied,
+                                ),
+                            ));
+                            false
+                        },
+                        TrackWaitEvaluation::NotFound => {
+                            resolved.push((
+                                messages::ERROR,
+                                *object_id,
+                                error_body(
+                                    *request_id,
+                                    messages::ERROR_NOT_FOUND,
+                                    "track does not exist",
+                                ),
+                            ));
+                            false
+                        },
+                        TrackWaitEvaluation::Lost => {
+                            resolved.push((
+                                messages::ERROR,
+                                *object_id,
+                                error_body(
+                                    *request_id,
+                                    messages::ERROR_BAD_STATE,
+                                    "track was lost while waiting",
+                                ),
+                            ));
+                            false
+                        },
+                        TrackWaitEvaluation::StaleGeneration => {
+                            resolved.push((
+                                messages::ERROR,
+                                *object_id,
+                                error_body(
+                                    *request_id,
+                                    messages::ERROR_STALE_CHANNEL_GENERATION,
+                                    "track wait names a stale channel generation",
+                                ),
+                            ));
+                            false
+                        },
+                        TrackWaitEvaluation::NotVisible => {
+                            resolved.push((
+                                messages::ERROR,
+                                *object_id,
+                                error_body(
+                                    *request_id,
+                                    messages::ERROR_NOT_VISIBLE,
+                                    "track has no eligible visible placement",
+                                ),
+                            ));
+                            false
+                        },
+                        TrackWaitEvaluation::Pending if now < *deadline => true,
+                        TrackWaitEvaluation::Pending => {
+                            resolved.push((
+                                messages::ERROR,
+                                *object_id,
+                                error_body(
+                                    *request_id,
+                                    messages::ERROR_TIMEOUT,
+                                    "track wait timed out",
+                                ),
+                            ));
+                            false
+                        },
+                    }
                 },
                 Pending::AudioDrain { request_id, object_id, identity, generation, output } => {
                     match output.poll_drained() {
@@ -485,6 +517,7 @@ mod tests {
 
     fn wait(request_id: u64) -> Pending {
         Pending::TrackWait {
+            completion_output: None,
             request_id,
             object_id: 1,
             identity: track(),
@@ -525,6 +558,7 @@ mod tests {
         let mut pending = PendingSet::new(4, 4);
         pending
             .register(Pending::TrackWait {
+                completion_output: None,
                 request_id: 1,
                 object_id: 1,
                 identity: track(),

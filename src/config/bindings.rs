@@ -83,6 +83,10 @@ impl<T: Eq> Binding<T> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
+    /// Enable or mute the selected remote microphone.
+    ToggleMicrophone,
+    /// Mute and select the next prepared remote microphone.
+    NextMicrophone,
     /// Write an escape sequence.
     Esc(String),
 
@@ -115,6 +119,12 @@ pub enum Action {
 
     /// Reset font size to the config value.
     ResetFontSize,
+
+    /// Open the host-owned terminal recovery prompt.
+    TerminalRecovery,
+
+    /// Check for a Vivido update.
+    CheckForUpdates,
 
     /// Scroll exactly one page up.
     ScrollPageUp,
@@ -350,6 +360,8 @@ pub fn default_key_bindings() -> Vec<KeyBinding> {
     let mut bindings = bindings!(
         KeyBinding;
         Copy; Action::Copy;
+        "m", ModifiersState::CONTROL | ModifiersState::SHIFT; Action::ToggleMicrophone;
+        "n", ModifiersState::CONTROL | ModifiersState::SHIFT; Action::NextMicrophone;
         Paste; Action::Paste;
         "l",       ModifiersState::CONTROL; Action::ClearLogNotice;
         "l",       ModifiersState::CONTROL; Action::ReceiveChar;
@@ -387,6 +399,7 @@ pub fn default_key_bindings() -> Vec<KeyBinding> {
         Enter,                              +BindingMode::SEARCH; SearchAction::SearchConfirm;
         F3,                                 +BindingMode::SEARCH; SearchAction::SearchFocusNext;
         F3, ModifiersState::SHIFT,          +BindingMode::SEARCH; SearchAction::SearchFocusPrevious;
+        F12, ModifiersState::CONTROL | ModifiersState::SHIFT; Action::TerminalRecovery;
     );
 
     bindings.extend(platform_key_bindings());
@@ -402,6 +415,7 @@ fn common_keybindings() -> Vec<KeyBinding> {
         "f",    ModifiersState::CONTROL | ModifiersState::SHIFT, ~BindingMode::SEARCH;                   Action::SearchForward;
         "b",    ModifiersState::CONTROL | ModifiersState::SHIFT, ~BindingMode::SEARCH;                   Action::SearchBackward;
         "t",    ModifiersState::CONTROL | ModifiersState::SHIFT;                                         Action::CreateNewTab;
+        "u",    ModifiersState::CONTROL | ModifiersState::SHIFT;                                         Action::CheckForUpdates;
         "w",    ModifiersState::CONTROL | ModifiersState::SHIFT;                                         Action::Quit;
         Tab,    ModifiersState::CONTROL;                                                                  Action::SelectNextTab;
         Tab,    ModifiersState::CONTROL | ModifiersState::SHIFT;                                          Action::SelectPreviousTab;
@@ -1088,6 +1102,8 @@ impl_config_deserialize_enum!(Action {
     IncreaseFontSize,
     DecreaseFontSize,
     ResetFontSize,
+    TerminalRecovery,
+    CheckForUpdates,
     ScrollPageUp,
     ScrollPageDown,
     ScrollHalfPageUp,
@@ -1438,6 +1454,18 @@ mod tests {
                 binding.trigger == trigger && binding.mods == mods && binding.action == action
             }));
         }
+    }
+
+    #[test]
+    fn non_macos_update_check_uses_ctrl_shift_u() {
+        let trigger =
+            BindingKey::Keycode { key: Key::Character("u".into()), location: KeyLocation::Any };
+
+        assert!(common_keybindings().iter().any(|binding| {
+            binding.trigger == trigger
+                && binding.mods == ModifiersState::CONTROL | ModifiersState::SHIFT
+                && binding.action == Action::CheckForUpdates
+        }));
     }
 
     #[test]

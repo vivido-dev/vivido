@@ -34,6 +34,7 @@ use crate::config::mouse::Mouse;
 use crate::config::scrolling::Scrolling;
 use crate::config::selection::Selection;
 use crate::config::terminal::Terminal;
+use crate::config::updates::Updates;
 use crate::config::window::WindowConfig;
 
 /// Regex used for the default URL hint.
@@ -91,6 +92,9 @@ pub struct UiConfig {
 
     /// Warning and error message bar configuration.
     pub message_bar: MessageBar,
+
+    /// In-app update discovery configuration.
+    pub updates: Updates,
 
     /// Keyboard configuration.
     keyboard: Keyboard,
@@ -676,6 +680,7 @@ impl_config_deserialize!(UiConfig {
     terminal,
     file_drop,
     message_bar,
+    updates,
     keyboard,
     shell: option_deprecated("use terminal.shell instead"),
     import: option_deprecated("use general.import instead"),

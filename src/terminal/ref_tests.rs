@@ -12,7 +12,7 @@ use crate::terminal::index::{Column, Line};
 use crate::terminal::term::cell::Cell;
 use crate::terminal::term::test::TermSize;
 use crate::terminal::term::{Config, Term};
-use crate::terminal::vte::ansi;
+use crate::terminal::vvte::ansi;
 
 macro_rules! ref_tests {
     ($($name:ident)*) => {

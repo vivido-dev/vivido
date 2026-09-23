@@ -162,6 +162,35 @@ fn test_iter() {
 }
 
 #[test]
+fn narrowing_a_row_hands_back_its_old_width() {
+    // `Row::shrink` splits the tail off into a new row, which leaves the source's capacity at the
+    // width it used to have. Across a full scrollback that is the larger share of the grid.
+    let mut row = Row::<Cell>::new(400);
+    assert!(row.inner_capacity() >= 400);
+
+    row.shrink(80);
+
+    assert_eq!(row.len(), 80);
+    assert!(
+        row.inner_capacity() < 400,
+        "a row narrowed by 5x keeps capacity for its old width: {}",
+        row.inner_capacity(),
+    );
+}
+
+#[test]
+fn narrowing_a_row_slightly_does_not_reallocate() {
+    // Dragging a window narrower arrives a column at a time. Reclaiming on every step would
+    // rebuild the whole scrollback repeatedly, so small trims deliberately keep their capacity.
+    let mut row = Row::<Cell>::new(400);
+    let before = row.inner_capacity();
+
+    row.shrink(399);
+
+    assert_eq!(row.inner_capacity(), before, "a one-column trim is not worth a reallocation");
+}
+
+#[test]
 fn shrink_reflow() {
     let mut grid = Grid::<Cell>::new(1, 5, 2);
     grid[Line(0)][Column(0)] = cell('1');

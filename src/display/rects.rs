@@ -51,16 +51,24 @@ pub enum RectKind {
 impl RenderLine {
     pub fn rects(&self, metrics: &TextMetrics, size: &SizeInfo, flag: Flags) -> Vec<RenderRect> {
         let mut rects = Vec::new();
+        self.push_rects_into(&mut rects, metrics, size, flag);
+        rects
+    }
 
+    pub fn push_rects_into(
+        &self,
+        rects: &mut Vec<RenderRect>,
+        metrics: &TextMetrics,
+        size: &SizeInfo,
+        flag: Flags,
+    ) {
         let mut start = self.start;
         while start.line < self.end.line {
             let end = Point::new(start.line, size.last_column());
-            Self::push_rects(&mut rects, metrics, size, flag, start, end, self.color);
+            Self::push_rects(rects, metrics, size, flag, start, end, self.color);
             start = Point::new(start.line + 1, Column(0));
         }
-        Self::push_rects(&mut rects, metrics, size, flag, start, self.end, self.color);
-
-        rects
+        Self::push_rects(rects, metrics, size, flag, start, self.end, self.color);
     }
 
     fn push_rects(
@@ -178,7 +186,7 @@ impl RenderLines {
         for (index, lines) in self.inner.iter().enumerate() {
             let flag = LINE_FLAGS[index];
             for line in lines {
-                rects.extend(line.rects(metrics, size, flag));
+                line.push_rects_into(&mut rects, metrics, size, flag);
             }
         }
         rects

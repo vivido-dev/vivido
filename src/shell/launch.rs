@@ -1,4 +1,4 @@
-//! Launch choices offered by the tab strip's `+` menu.
+//! Launch choices offered by the tab strip's launch menu.
 //!
 //! Presentation lives in [`super::menu`]; this module only answers *what* the current platform can
 //! start. Keeping the two apart means a future source of entries — configured profiles, remote
@@ -6,7 +6,7 @@
 
 use crate::config::ui_config::Program;
 
-/// What choosing a `+` menu entry does.
+/// What choosing a launch menu entry does.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LaunchAction {
     /// Open a tab; `None` runs the configured shell, as a plain `+` click does.
@@ -15,7 +15,7 @@ pub enum LaunchAction {
     NewWindow,
 }
 
-/// One row of the `+` menu.
+/// One row of the launch menu.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LaunchEntry {
     pub label: String,
@@ -28,11 +28,11 @@ impl LaunchEntry {
     }
 }
 
-/// Entries the `+` menu offers on this platform.
+/// Entries the launch menu offers on this platform.
 ///
 /// Probing costs a process spawn on Windows, so callers build this once and keep the result rather
 /// than rebuilding it per menu open.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub fn entries() -> Vec<LaunchEntry> {
     vec![
         LaunchEntry::new("New Tab", LaunchAction::NewTab(None)),
@@ -40,7 +40,7 @@ pub fn entries() -> Vec<LaunchEntry> {
     ]
 }
 
-/// Entries the `+` menu offers on this platform.
+/// Entries the launch menu offers on this platform.
 ///
 /// PowerShell and every installed WSL distribution, each as its own tab. Probing costs a process
 /// spawn, so callers build this once and keep the result rather than rebuilding it per menu open.
@@ -142,7 +142,9 @@ fn decode_console_output(stdout: &[u8]) -> String {
         return String::from_utf8_lossy(stdout).into_owned();
     }
     let units = stdout
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
         .collect::<Vec<_>>();
     String::from_utf16_lossy(&units)
@@ -175,9 +177,9 @@ mod tests {
         assert!(parse_wsl_distributions(&utf16le("\r\n \r\n")).is_empty());
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
-    fn linux_offers_a_tab_and_a_window() {
+    fn unix_desktop_offers_a_tab_and_a_window() {
         let entries = entries();
 
         assert_eq!(entries.len(), 2);

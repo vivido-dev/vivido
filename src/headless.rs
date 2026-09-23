@@ -109,6 +109,13 @@ fn serve(
         unsafe { env::set_var(key, value) };
     }
 
+    // A headless session is a runtime instance like any other: its windows are addressable, and an
+    // agent in one can be woken. Publish the name before the first window is built, since that is
+    // where a pane reads it. SAFETY: no thread has been started yet.
+    unsafe { crate::session::scrub_inherited_mesh_environment() };
+    crate::session::publish_instance_name(&session);
+    crate::session::start_mesh_watcher();
+
     // Bind the IPC socket before publishing the registry: a client that finds a registry must find
     // a socket it can actually connect to.
     let handle = IoListener::spawn(&config, &options, proxy.clone())?;
@@ -116,6 +123,8 @@ fn serve(
     let _ = &handle;
 
     let headless_loop = HeadlessLoop::new(pixel_size, HEADLESS_SCALE_FACTOR);
+    let ephemeral = options.ephemeral;
+    let foreground = options.foreground;
     let mut processor = Processor::new_headless(config, options, proxy);
 
     // Build the window before publishing, so the registry records the geometry the session
@@ -133,6 +142,12 @@ fn serve(
     match readiness {
         Some(readiness) => readiness.success(&socket, &session),
         None => print_endpoint(&socket, &session),
+    }
+
+    // A foreground ephemeral session watches its launcher: the parent here is the process
+    // that started this instance, so its death means nobody will ever use the session again.
+    if ephemeral && foreground {
+        processor.set_ephemeral_launcher(crate::event::launcher_parent_pid());
     }
 
     let result = processor.run_headless(&events, &headless_loop);

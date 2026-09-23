@@ -3,11 +3,12 @@ use std::fmt::{self, Debug, Formatter};
 use std::process::ExitStatus;
 use std::sync::Arc;
 
+use crate::client_fault::ClientFault;
 use crate::osc_notification::OscNotification;
 use crate::terminal::event_loop::EventLoopSendError;
 use crate::terminal::graphics::GraphicsCommand;
 use crate::terminal::term::ClipboardType;
-use crate::terminal::vte::ansi::Rgb;
+use crate::terminal::vvte::ansi::Rgb;
 
 /// Terminal event.
 ///
@@ -26,6 +27,9 @@ pub enum Event {
 
     /// Local working directory reported with OSC 7.
     WorkingDirectory(String),
+
+    /// Shell-lifecycle marker reported with OSC 133.
+    ShellIntegration(crate::osc_notification::ShellIntegrationMarker),
 
     /// Request to store a text string in the clipboard.
     ClipboardStore(ClipboardType, String),
@@ -66,6 +70,16 @@ pub enum Event {
     #[cfg(any(unix, windows))]
     PtyResizeComplete(u64),
 
+    /// A host-requested client-state reset was applied by the PTY worker.
+    #[cfg(any(unix, windows))]
+    ClientResetComplete(u64),
+
+    /// Untrusted terminal work failed and this pane was quarantined.
+    ClientFault(ClientFault),
+
+    /// The user invoked the host-owned terminal recovery prompt.
+    RecoveryPrompt,
+
     /// Terminal bell ring.
     Bell,
 
@@ -104,6 +118,7 @@ impl Debug for Event {
             Event::PtyWrite(text) => write!(f, "PtyWrite({text})"),
             Event::Title(title) => write!(f, "Title({title})"),
             Event::WorkingDirectory(path) => write!(f, "WorkingDirectory({path})"),
+            Event::ShellIntegration(marker) => write!(f, "ShellIntegration({marker:?})"),
             Event::CursorBlinkingChange => write!(f, "CursorBlinkingChange"),
             Event::MouseCursorDirty => write!(f, "MouseCursorDirty"),
             Event::ResetTitle => write!(f, "ResetTitle"),
@@ -114,6 +129,16 @@ impl Debug for Event {
             Event::PtyWriteComplete(token) => write!(f, "PtyWriteComplete({token})"),
             #[cfg(any(unix, windows))]
             Event::PtyResizeComplete(token) => write!(f, "PtyResizeComplete({token})"),
+            #[cfg(any(unix, windows))]
+            Event::ClientResetComplete(token) => write!(f, "ClientResetComplete({token})"),
+            Event::ClientFault(fault) => write!(
+                f,
+                "ClientFault({}, {}, {})",
+                fault.id,
+                fault.class.as_str(),
+                fault.diagnostic
+            ),
+            Event::RecoveryPrompt => write!(f, "RecoveryPrompt"),
             Event::Bell => write!(f, "Bell"),
             Event::DesktopNotification(_) => write!(f, "DesktopNotification"),
             Event::Graphics(command) => write!(f, "Graphics({command:?})"),

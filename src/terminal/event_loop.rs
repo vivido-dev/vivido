@@ -25,7 +25,9 @@ use crate::terminal::event::{self, Event, EventListener, WindowSize};
 use crate::terminal::sync::FairMutex;
 use crate::terminal::term::Term;
 use crate::terminal::{thread, tty};
-use vte::ansi;
+use vvte::ansi;
+
+use crate::client_fault::{self, ClientFault, ClientFaultClass};
 
 /// Max bytes to read from the PTY before forced terminal synchronization.
 pub(crate) const READ_BUFFER_SIZE: usize = 0x10_0000;
@@ -52,6 +54,10 @@ pub enum Msg {
         #[cfg(any(unix, windows))]
         completion: Option<u64>,
     },
+
+    /// Reset parser and client-controlled terminal state, resuming a quarantined pane.
+    #[cfg(any(unix, windows))]
+    ResetClient { completion: u64 },
 }
 
 /// The main event loop.
@@ -108,7 +114,7 @@ where
     /// Drain the channel.
     ///
     /// Returns `false` when a shutdown message was received.
-    fn drain_recv_channel(&mut self, state: &mut State) -> bool {
+    fn drain_recv_channel(&mut self, state: &mut State, quarantined: &mut bool) -> bool {
         while let Some(msg) = self.rx.recv() {
             match msg {
                 Msg::Input {
@@ -116,11 +122,15 @@ where
                     #[cfg(any(unix, windows))]
                     completion,
                 } => {
-                    state.write_list.push_back(PendingInput {
-                        bytes,
-                        #[cfg(any(unix, windows))]
-                        completion,
-                    });
+                    // A quarantined pane retains its last safe frame, but client traffic must not
+                    // continue accumulating behind the fault boundary.
+                    if !*quarantined {
+                        state.write_list.push_back(PendingInput {
+                            bytes,
+                            #[cfg(any(unix, windows))]
+                            completion,
+                        });
+                    }
                 },
                 Msg::Resize {
                     window_size,
@@ -132,6 +142,14 @@ where
                     if let Some(token) = completion {
                         self.event_proxy.send_event(Event::PtyResizeComplete(token));
                     }
+                },
+                #[cfg(any(unix, windows))]
+                Msg::ResetClient { completion } => {
+                    state.reset_client_state();
+                    self.terminal.lock().reset_client_state();
+                    *quarantined = false;
+                    self.event_proxy.send_event(Event::ClientResetComplete(completion));
+                    self.event_proxy.send_event(Event::Wakeup);
                 },
                 Msg::Shutdown => return false,
             }
@@ -257,10 +275,12 @@ where
     pub fn spawn(mut self) -> JoinHandle<(Self, State)> {
         thread::spawn_named("PTY reader", move || {
             let mut state = State::default();
-            let mut buf = [0u8; READ_BUFFER_SIZE];
+            let mut buf = vec![0u8; READ_BUFFER_SIZE].into_boxed_slice();
 
             let poll_opts = PollMode::Level;
             let mut interest = PollingEvent::readable(0);
+            let mut quarantined = false;
+            let mut registered = true;
 
             // Register TTY through EventedRW interface.
             if let Err(err) = unsafe { self.pty.register(&self.poll, interest, poll_opts) } {
@@ -301,8 +321,26 @@ where
                 }
 
                 // Handle channel events, if there are any.
-                if !self.drain_recv_channel(&mut state) {
+                if !self.drain_recv_channel(&mut state, &mut quarantined) {
                     break;
+                }
+
+                if !registered && !quarantined {
+                    match unsafe { self.pty.register(&self.poll, interest, poll_opts) } {
+                        Ok(()) => registered = true,
+                        Err(error) => {
+                            let fault = ClientFault::new(
+                                ClientFaultClass::PtyIo,
+                                "failed to resume quarantined PTY",
+                            );
+                            error!("contained client fault {}: {error}", fault.id);
+                            self.event_proxy.send_event(Event::ClientFault(fault));
+                            quarantined = true;
+                        },
+                    }
+                }
+                if quarantined {
+                    continue;
                 }
 
                 for event in events.iter() {
@@ -329,28 +367,83 @@ where
                                 continue;
                             }
 
-                            if event.readable
-                                && let Err(err) = self.pty_read(&mut state, &mut buf, pipe.as_mut())
-                            {
-                                // On Linux, a `read` on the master side of a PTY can fail
-                                // with `EIO` if the client side hangs up.  In that case,
-                                // just loop back round for the inevitable `Exited` event.
-                                // This sucks, but checking the process is either racy or
-                                // blocking.
-                                #[cfg(target_os = "linux")]
-                                if err.raw_os_error() == Some(libc::EIO) {
-                                    continue;
+                            if event.readable {
+                                let read = client_fault::catch(
+                                    ClientFaultClass::TerminalParser,
+                                    "terminal output parser panicked",
+                                    || self.pty_read(&mut state, &mut buf, pipe.as_mut()),
+                                );
+                                let failure = match read {
+                                    Ok(Ok(())) => None,
+                                    Ok(Err(err)) => Some((ClientFaultClass::PtyIo, err)),
+                                    Err(fault) => {
+                                        error!(
+                                            "contained client fault {} ({})",
+                                            fault.id,
+                                            fault.class.as_str()
+                                        );
+                                        self.event_proxy.send_event(Event::ClientFault(fault));
+                                        quarantined = true;
+                                        None
+                                    },
+                                };
+                                if quarantined {
+                                    let _ = self.pty.deregister(&self.poll);
+                                    registered = false;
+                                    break;
                                 }
+                                if let Some((class, err)) = failure {
+                                    // On Linux, a `read` on the master side of a PTY can fail
+                                    // with `EIO` if the client side hangs up.  In that case,
+                                    // just loop back round for the inevitable `Exited` event.
+                                    // This sucks, but checking the process is either racy or
+                                    // blocking.
+                                    #[cfg(target_os = "linux")]
+                                    if err.raw_os_error() == Some(libc::EIO) {
+                                        continue;
+                                    }
 
-                                error!("Error reading from PTY in event loop: {err}");
-                                break 'event_loop;
+                                    let fault = ClientFault::new(class, "terminal PTY read failed");
+                                    error!("contained client fault {}: {err}", fault.id);
+                                    self.event_proxy.send_event(Event::ClientFault(fault));
+                                    quarantined = true;
+                                    let _ = self.pty.deregister(&self.poll);
+                                    registered = false;
+                                    break;
+                                }
                             }
 
-                            if event.writable
-                                && let Err(err) = self.pty_write(&mut state)
-                            {
-                                error!("Error writing to PTY in event loop: {err}");
-                                break 'event_loop;
+                            if event.writable {
+                                match client_fault::catch(
+                                    ClientFaultClass::PtyIo,
+                                    "terminal PTY writer panicked",
+                                    || self.pty_write(&mut state),
+                                ) {
+                                    Ok(Ok(())) => {},
+                                    Ok(Err(err)) => {
+                                        let fault = ClientFault::new(
+                                            ClientFaultClass::PtyIo,
+                                            "terminal PTY write failed",
+                                        );
+                                        error!("contained client fault {}: {err}", fault.id);
+                                        self.event_proxy.send_event(Event::ClientFault(fault));
+                                        quarantined = true;
+                                    },
+                                    Err(fault) => {
+                                        error!(
+                                            "contained client fault {} ({})",
+                                            fault.id,
+                                            fault.class.as_str()
+                                        );
+                                        self.event_proxy.send_event(Event::ClientFault(fault));
+                                        quarantined = true;
+                                    },
+                                }
+                                if quarantined {
+                                    let _ = self.pty.deregister(&self.poll);
+                                    registered = false;
+                                    break;
+                                }
                             }
                         },
                         _ => (),
@@ -370,8 +463,18 @@ where
                 // another waker. Re-registering posts the next packet for the still-readable pipe;
                 // native pollers remain level-triggered and only need updates when interest
                 // changes.
-                if write_interest_changed || cfg!(windows) {
-                    self.pty.reregister(&self.poll, interest, poll_opts).unwrap();
+                if (write_interest_changed || cfg!(windows))
+                    && let Err(err) = self.pty.reregister(&self.poll, interest, poll_opts)
+                {
+                    let fault = ClientFault::new(
+                        ClientFaultClass::PtyIo,
+                        "terminal PTY registration failed",
+                    );
+                    error!("contained client fault {}: {err}", fault.id);
+                    self.event_proxy.send_event(Event::ClientFault(fault));
+                    quarantined = true;
+                    let _ = self.pty.deregister(&self.poll);
+                    registered = false;
                 }
             }
 
@@ -484,6 +587,37 @@ pub struct State {
 }
 
 impl State {
+    /// Exercise the complete input pipeline in presenter integration tests.
+    #[cfg(test)]
+    pub(crate) fn advance_test_chunks<T: EventListener>(
+        &mut self,
+        terminal: &mut Term<T>,
+        chunks: impl IntoIterator<Item = impl AsRef<[u8]>>,
+    ) {
+        #[cfg(any(unix, windows))]
+        let transcript = Arc::new(Mutex::new(Transcript::default()));
+        for chunk in chunks {
+            self.advance(
+                terminal,
+                chunk.as_ref(),
+                #[cfg(any(unix, windows))]
+                &transcript,
+            );
+        }
+    }
+
+    fn reset_client_state(&mut self) {
+        self.write_list.clear();
+        self.writing = None;
+        self.parser = Default::default();
+        self.osc_notifications = Default::default();
+        self.vivid_markers = Default::default();
+        #[cfg(any(unix, windows))]
+        {
+            self.output_range = None;
+        }
+    }
+
     fn advance<T: EventListener>(
         &mut self,
         terminal: &mut Term<T>,
@@ -497,6 +631,9 @@ impl State {
                 },
                 OscMessage::WorkingDirectory(report) => {
                     terminal.working_directory_report(report);
+                },
+                OscMessage::ShellIntegration(marker) => {
+                    terminal.shell_integration_report(marker);
                 },
             }
         }
@@ -589,6 +726,7 @@ const CONPTY_VIVID_MARKER: VividMarkerEnvelope = VividMarkerEnvelope {
     payload_skip: 0,
     pass_to_terminal: false,
 };
+#[cfg(test)]
 const VIVID_MARKER_ENVELOPES: [VividMarkerEnvelope; 2] = [APC_VIVID_MARKER, CONPTY_VIVID_MARKER];
 
 /// One span of scanned PTY bytes: ordinary terminal data, or one authenticated anchor marker.
@@ -635,57 +773,91 @@ where
     F: FnMut(VividChunk<'_>),
 {
     let mut cursor = 0;
+    let mut text_start = 0;
+    // Cache each search independently: a rejected candidate must not cause another scan of the
+    // remainder for the other envelope. Searching for APC's two-byte prefix also skips ordinary
+    // CSI/OSC escapes without inspecting each one in the marker loop.
+    let mut apc_start = find_bytes(buf, b"\x1b_");
+    let mut conpty_start = memchr::memchr(b'V', buf);
 
     loop {
-        let Some((relative_start, envelope)) = find_marker_envelope(&buf[cursor..]) else {
-            let keep = VIVID_MARKER_ENVELOPES
-                .iter()
-                .map(|envelope| partial_prefix_len(&buf[cursor..], envelope.prefix))
-                .max()
-                .unwrap_or(0);
-            let end = buf.len().saturating_sub(keep);
-            emit_bytes(emit, &buf[cursor..end]);
-            return end;
+        if apc_start.is_some_and(|start| start < cursor) {
+            apc_start = find_bytes(&buf[cursor..], b"\x1b_").map(|start| cursor + start);
+        }
+        if conpty_start.is_some_and(|start| start < cursor) {
+            conpty_start = memchr::memchr(b'V', &buf[cursor..]).map(|start| cursor + start);
+        }
+        let (start, envelope) = match (apc_start, conpty_start) {
+            (Some(apc), Some(conpty)) if apc < conpty => (apc, APC_VIVID_MARKER),
+            (_, Some(conpty)) => (conpty, CONPTY_VIVID_MARKER),
+            (Some(apc), None) => (apc, APC_VIVID_MARKER),
+            (None, None) => {
+                // The first APC prefix byte can straddle reads.
+                let keep = usize::from(buf[cursor..].ends_with(b"\x1b"));
+                let end = buf.len() - keep;
+                emit_bytes(emit, &buf[text_start..end]);
+                return end;
+            },
         };
-        let start = cursor + relative_start;
-        emit_bytes(emit, &buf[cursor..start]);
+        if envelope.payload_skip != 0 && !buf[start..].starts_with(envelope.prefix) {
+            if envelope.prefix.starts_with(&buf[start..]) {
+                emit_bytes(emit, &buf[text_start..start]);
+                return start;
+            }
+            cursor = start + 1;
+            continue;
+        }
+        if envelope.payload_skip == 0 {
+            use vivid_protocol::anchor::conpty::{self, Scan};
+            match conpty::scan(&buf[start..]) {
+                Scan::Complete { consumed, body } => {
+                    let end = start + consumed;
+                    emit_bytes(emit, &buf[text_start..start]);
+                    emit(VividChunk::Marker {
+                        raw: &buf[start..end],
+                        marker: &body,
+                        pass_to_terminal: false,
+                    });
+                    cursor = end;
+                    text_start = end;
+                },
+                Scan::Incomplete => {
+                    emit_bytes(emit, &buf[text_start..start]);
+                    return start;
+                },
+                Scan::Invalid => cursor = start + 1,
+            }
+            continue;
+        }
         let payload_start = start + envelope.payload_skip;
         let terminator_search = start + envelope.prefix.len();
 
-        let Some(relative_end) = find_bytes(&buf[terminator_search..], envelope.terminator) else {
+        // Search only the bounded marker candidate, not the entire remaining PTY read.
+        let candidate_end = start + (buf.len() - start).min(MAX_VIVID_MARKER_BYTES);
+        let Some(relative_end) =
+            find_bytes(&buf[terminator_search..candidate_end], envelope.terminator)
+        else {
             if buf.len() - start > MAX_VIVID_MARKER_BYTES {
-                emit_bytes(emit, &buf[start..start + envelope.prefix.len()]);
                 cursor = start + envelope.prefix.len();
                 continue;
             }
+            emit_bytes(emit, &buf[text_start..start]);
             return start;
         };
 
         let terminator = terminator_search + relative_end;
         let end = terminator + envelope.terminator.len();
-        if end - start > MAX_VIVID_MARKER_BYTES {
-            emit_bytes(emit, &buf[start..start + envelope.prefix.len()]);
-            cursor = start + envelope.prefix.len();
-            continue;
-        }
-
-        match std::str::from_utf8(&buf[payload_start..terminator]) {
-            Ok(marker) => emit(VividChunk::Marker {
+        if let Ok(marker) = std::str::from_utf8(&buf[payload_start..terminator]) {
+            emit_bytes(emit, &buf[text_start..start]);
+            emit(VividChunk::Marker {
                 raw: &buf[start..end],
                 marker,
                 pass_to_terminal: envelope.pass_to_terminal,
-            }),
-            Err(_) => emit_bytes(emit, &buf[start..end]),
+            });
+            text_start = end;
         }
         cursor = end;
     }
-}
-
-fn find_marker_envelope(bytes: &[u8]) -> Option<(usize, VividMarkerEnvelope)> {
-    VIVID_MARKER_ENVELOPES
-        .iter()
-        .filter_map(|envelope| find_bytes(bytes, envelope.prefix).map(|start| (start, *envelope)))
-        .min_by_key(|(start, _)| *start)
 }
 
 fn emit_bytes<F>(emit: &mut F, bytes: &[u8])
@@ -703,10 +875,6 @@ where
 /// directly in the throughput of ordinary terminal traffic.
 fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     memmem::find(haystack, needle)
-}
-
-fn partial_prefix_len(bytes: &[u8], prefix: &[u8]) -> usize {
-    (1..prefix.len()).rev().find(|&length| bytes.ends_with(&prefix[..length])).unwrap_or(0)
 }
 
 impl Writing {
@@ -767,6 +935,10 @@ impl<T> PeekableReceiver<T> {
 }
 
 #[cfg(test)]
+#[path = "parser_benchmark.rs"]
+mod parser_benchmark;
+
+#[cfg(test)]
 mod vivid_marker_tests {
     use super::*;
 
@@ -825,6 +997,34 @@ mod vivid_marker_tests {
     }
 
     #[test]
+    fn conpty_wraps_inside_every_part_of_the_envelope_are_zero_width() {
+        let marker = format!("{MARKER_BODY};VIVID-END");
+        for insertion in 1..marker.len() {
+            let input = format!(
+                "before{}\r\n\x1b[23;40H{}{}after",
+                &marker[..insertion],
+                char::from(marker.as_bytes()[insertion - 1]),
+                &marker[insertion..]
+            );
+            let mut scanner = VividMarkerScanner::default();
+            let mut text = Vec::new();
+            let mut markers = Vec::new();
+            for byte in input.bytes() {
+                scanner.push(&[byte], &mut |chunk| match chunk {
+                    VividChunk::Bytes(bytes) => text.extend_from_slice(bytes),
+                    VividChunk::Marker { marker, pass_to_terminal, .. } => {
+                        assert!(!pass_to_terminal);
+                        markers.push(marker.to_owned());
+                    },
+                });
+            }
+            assert_eq!(text, b"beforeafter");
+            assert_eq!(markers, [MARKER_BODY]);
+            assert!(scanner.pending.is_empty());
+        }
+    }
+
+    #[test]
     fn oversized_candidates_are_left_to_the_terminal_parser() {
         for envelope in VIVID_MARKER_ENVELOPES {
             let mut input = envelope.prefix.to_vec();
@@ -835,5 +1035,132 @@ mod vivid_marker_tests {
                 assert!(matches!(chunk, VividChunk::Bytes(_)));
             });
         }
+    }
+
+    #[test]
+    fn rejected_marker_candidates_stay_in_one_borrowed_text_span() {
+        // Ordinary ASCII and kitty-style OSC payloads must not split at every `V` or escape.
+        let ascii = b"V text VV VIVID;no marker \x1b[31mred\x1b[m \x1b_not-an-anchor ";
+        let mut input = ascii.repeat(2048);
+        input.extend_from_slice(b"\x1b]6;");
+        input.extend_from_slice(&ascii.repeat(2048));
+        input.push(7);
+        let mut scanner = VividMarkerScanner::default();
+        let mut spans = 0;
+        scanner.push(&input, &mut |chunk| {
+            let VividChunk::Bytes(bytes) = chunk else { panic!("unexpected marker") };
+            assert_eq!(bytes, input);
+            assert_eq!(bytes.as_ptr(), input.as_ptr());
+            spans += 1;
+        });
+        assert_eq!(spans, 1);
+        assert!(scanner.pending.is_empty());
+    }
+
+    #[test]
+    fn rejected_candidates_around_markers_preserve_text_and_order() {
+        let before = b"VV \x1b[31m \x1b_invalid ";
+        let after = b"VV \x1b[m ";
+        for envelope in VIVID_MARKER_ENVELOPES {
+            let mut input = before.to_vec();
+            input.extend_from_slice(envelope.prefix);
+            input.extend_from_slice(MARKER_PAYLOAD);
+            input.extend_from_slice(envelope.terminator);
+            input.extend_from_slice(after);
+            for split in 0..=input.len() {
+                let mut scanner = VividMarkerScanner::default();
+                let mut text = Vec::new();
+                let mut markers = 0;
+                let mut emit = |chunk: VividChunk<'_>| match chunk {
+                    VividChunk::Bytes(bytes) => text.extend_from_slice(bytes),
+                    VividChunk::Marker { marker, .. } => {
+                        assert_eq!(text, before);
+                        assert_eq!(marker, MARKER_BODY);
+                        markers += 1;
+                    },
+                };
+                scanner.push(&input[..split], &mut emit);
+                scanner.push(&input[split..], &mut emit);
+                assert_eq!(text, [before.as_slice(), after.as_slice()].concat());
+                assert_eq!(markers, 1);
+                assert!(scanner.pending.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn apc_size_limit_and_invalid_utf8_preserve_stream_bytes() {
+        for len in [MAX_VIVID_MARKER_BYTES - 1, MAX_VIVID_MARKER_BYTES, MAX_VIVID_MARKER_BYTES + 1]
+        {
+            for valid_utf8 in [false, true] {
+                let mut input = APC_VIVID_MARKER.prefix.to_vec();
+                input.resize(len - 2, if valid_utf8 { b'x' } else { 0xff });
+                input.extend_from_slice(APC_VIVID_MARKER.terminator);
+                for split in 0..=input.len() {
+                    let mut scanner = VividMarkerScanner::default();
+                    let mut text = Vec::new();
+                    let mut markers = 0;
+                    let mut emit = |chunk: VividChunk<'_>| match chunk {
+                        VividChunk::Bytes(bytes) => text.extend_from_slice(bytes),
+                        VividChunk::Marker { raw, .. } => {
+                            assert_eq!(raw, input);
+                            markers += 1;
+                        },
+                    };
+                    scanner.push(&input[..split], &mut emit);
+                    scanner.push(&input[split..], &mut emit);
+                    if valid_utf8 && len <= MAX_VIVID_MARKER_BYTES {
+                        assert_eq!(markers, 1);
+                        assert!(text.is_empty());
+                    } else {
+                        assert_eq!(markers, 0);
+                        assert_eq!(text, input);
+                    }
+                    assert!(scanner.pending.is_empty());
+                }
+            }
+        }
+
+        let mut input = APC_VIVID_MARKER.prefix.to_vec();
+        input.resize(MAX_VIVID_MARKER_BYTES, b'x');
+        let mut scanner = VividMarkerScanner::default();
+        scanner.push(&input, &mut |_| panic!("candidate released before the size limit"));
+        assert_eq!(scanner.pending, input);
+        let mut text = Vec::new();
+        scanner.push(b"!", &mut |chunk| {
+            let VividChunk::Bytes(bytes) = chunk else { panic!("unexpected marker") };
+            text.extend_from_slice(bytes);
+        });
+        input.push(b'!');
+        assert_eq!(text, input);
+        assert!(scanner.pending.is_empty());
+    }
+
+    #[test]
+    fn reset_discards_partial_parsers_and_pending_client_input() {
+        let mut state = State::default();
+        state.vivid_markers.push(b"\x1b_VIVID;3;partial", &mut |_| {});
+        state.write_list.push_back(PendingInput {
+            bytes: Cow::Borrowed(b"pending"),
+            #[cfg(any(unix, windows))]
+            completion: Some(7),
+        });
+        state.writing = Some(Writing::new(PendingInput {
+            bytes: Cow::Borrowed(b"writing"),
+            #[cfg(any(unix, windows))]
+            completion: Some(8),
+        }));
+        #[cfg(any(unix, windows))]
+        {
+            state.output_range = Some((1, 2));
+        }
+
+        state.reset_client_state();
+
+        assert!(state.vivid_markers.pending.is_empty());
+        assert!(state.write_list.is_empty());
+        assert!(state.writing.is_none());
+        #[cfg(any(unix, windows))]
+        assert!(state.output_range.is_none());
     }
 }

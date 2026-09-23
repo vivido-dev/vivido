@@ -9,6 +9,8 @@ use std::os::unix::net::UnixStream as LocalStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+#[cfg(windows)]
+use windows_sys::Win32::Networking::WinSock::{POLLRDNORM, POLLWRNORM};
 
 use vivid_protocol::wire::{
     ConnectionKind, HEADER_SIZE, PREFACE_SIZE, Preface, PrefaceClassification, RECORD_KNOWN_FLAGS,
@@ -26,10 +28,10 @@ use vivid_protocol::{CONTROL_MAX_RECORD_BODY, HARD_MAX_RECORD_BODY};
 /// never timed out for being idle.
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Windows does not reliably wake a blocking `recv` when another cloned `TcpStream` handle calls
-/// `shutdown`. Polling keeps both explicit reader cancellation and pre-handshake eviction bounded.
+/// Windows does not reliably wake blocking socket I/O on shutdown. Readiness polling bounds
+/// cancellation while nonblocking reads and writes preserve partial-record progress.
 #[cfg(windows)]
-const WINDOWS_READ_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const WINDOWS_IO_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// How much of a record body is made room for at a time.
 ///
@@ -55,7 +57,7 @@ impl Reader {
         #[cfg(unix)]
         stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
         #[cfg(windows)]
-        stream.set_read_timeout(Some(WINDOWS_READ_POLL_INTERVAL))?;
+        stream.set_read_timeout(Some(WINDOWS_IO_POLL_INTERVAL))?;
         #[cfg(windows)]
         let cancelled = Arc::new(AtomicBool::new(false));
         let mut bytes = [0_u8; PREFACE_SIZE];
@@ -80,6 +82,8 @@ impl Reader {
             },
         };
         let maximum = preface.initiator_tx_body_limit.min(HARD_MAX_RECORD_BODY);
+        #[cfg(windows)]
+        stream.set_nonblocking(true)?;
         Ok((
             Self {
                 stream: Arc::new(stream),
@@ -105,13 +109,16 @@ impl Reader {
     ///
     /// An established session may legitimately stay silent for hours, so the deadline covers only
     /// the records before `HELLO`/`CHANNEL_OPEN`/`LANE_OPEN` has been accepted. On Windows the
-    /// short polling timeout stays in place: it is what makes [`ReadShutdown`] able to wake a
-    /// parked reader, not a deadline.
+    /// readiness polling stays in place so [`ReadShutdown`] can stop a parked reader.
     pub fn finish_handshake(&mut self) -> io::Result<()> {
         self.handshake_deadline = None;
         #[cfg(unix)]
         self.stream.set_read_timeout(None)?;
         Ok(())
+    }
+
+    pub fn set_write_timeout(&self, timeout: Duration) -> io::Result<()> {
+        self.stream.set_write_timeout(Some(timeout))
     }
 
     /// Bound inactivity on a dedicated transfer connection after authentication.
@@ -252,8 +259,11 @@ impl Reader {
     }
 
     pub fn writer(&self, kind: ConnectionKind) -> io::Result<Writer> {
+        self.stream.set_write_timeout(Some(Duration::from_secs(2)))?;
         Ok(Writer {
+            shutdown: self.shutdown_handle()?,
             inner: Mutex::new(WriterInner {
+                failed: false,
                 stream: self.stream.clone(),
                 maximum: if kind == ConnectionKind::Control {
                     CONTROL_MAX_RECORD_BODY
@@ -301,6 +311,12 @@ fn read_exact_interruptibly(
     mut bytes: &mut [u8],
 ) -> io::Result<()> {
     while !bytes.is_empty() {
+        if cancelled.load(Ordering::Acquire) {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "reader stopped"));
+        }
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Err(handshake_expired());
+        }
         let mut stream = stream;
         match stream.read(bytes) {
             Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
@@ -308,15 +324,31 @@ fn read_exact_interruptibly(
             Err(error)
                 if matches!(error.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock) =>
             {
-                if cancelled.load(Ordering::Acquire) {
-                    return Err(io::Error::new(io::ErrorKind::Interrupted, "reader stopped"));
-                }
-                if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-                    return Err(handshake_expired());
-                }
+                wait_socket_ready(stream, POLLRDNORM, deadline)?;
             },
             Err(error) => return Err(error),
         }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn wait_socket_ready(
+    stream: &LocalStream,
+    events: i16,
+    deadline: Option<Instant>,
+) -> io::Result<()> {
+    use std::os::windows::io::AsRawSocket;
+    use windows_sys::Win32::Networking::WinSock::{WSAGetLastError, WSAPOLLFD, WSAPoll};
+
+    let timeout = deadline.map_or(WINDOWS_IO_POLL_INTERVAL, |deadline| {
+        deadline.saturating_duration_since(Instant::now()).min(WINDOWS_IO_POLL_INTERVAL)
+    });
+    let mut descriptor = WSAPOLLFD { fd: stream.as_raw_socket() as _, events, revents: 0 };
+    // SAFETY: the borrowed socket remains live and descriptor is one writable polling entry.
+    if unsafe { WSAPoll(&mut descriptor, 1, timeout.as_millis() as i32) } < 0 {
+        // SAFETY: WSAGetLastError has no preconditions and is read on the calling thread.
+        return Err(io::Error::from_raw_os_error(unsafe { WSAGetLastError() }));
     }
     Ok(())
 }
@@ -364,16 +396,22 @@ fn handshake_expired() -> io::Error {
 }
 
 pub struct Writer {
+    shutdown: ReadShutdown,
     inner: Mutex<WriterInner>,
 }
 
 struct WriterInner {
+    failed: bool,
     stream: Arc<LocalStream>,
     maximum: u32,
     sequence: u64,
 }
 
 impl Writer {
+    pub fn shutdown_handle(&self) -> ReadShutdown {
+        self.shutdown.clone()
+    }
+
     pub fn set_maximum(&self, maximum: u32) -> io::Result<()> {
         if maximum == 0 || maximum > HARD_MAX_RECORD_BODY {
             return Err(io::Error::new(
@@ -389,12 +427,30 @@ impl Writer {
         self.write_record_parts(record_type, object_id, &[body])
     }
 
+    pub fn write_record_sequenced(
+        &self,
+        record_type: u16,
+        object_id: u64,
+        body: &[u8],
+    ) -> io::Result<u64> {
+        self.write_parts_sequenced(record_type, object_id, &[body])
+    }
+
     pub fn write_record_parts(
         &self,
         record_type: u16,
         object_id: u64,
         parts: &[&[u8]],
     ) -> io::Result<()> {
+        self.write_parts_sequenced(record_type, object_id, parts).map(|_| ())
+    }
+
+    fn write_parts_sequenced(
+        &self,
+        record_type: u16,
+        object_id: u64,
+        parts: &[&[u8]],
+    ) -> io::Result<u64> {
         let body_length = parts.iter().try_fold(0_usize, |total, part| {
             total.checked_add(part.len()).ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidInput, "record body length overflows")
@@ -403,40 +459,71 @@ impl Writer {
         let body_length = u32::try_from(body_length)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "record body exceeds u32"))?;
         let mut inner = self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if inner.failed {
+            return Err(io::Error::new(io::ErrorKind::BrokenPipe, "Vivid writer failed"));
+        }
         if body_length > inner.maximum || body_length > HARD_MAX_RECORD_BODY {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "outgoing Vivid record exceeds the accepted body limit",
             ));
         }
-        inner.sequence = inner.sequence.checked_add(1).ok_or_else(|| {
+        let sequence = inner.sequence.checked_add(1).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidData, "outgoing sequence exhausted")
         })?;
-        let header = RecordHeader {
-            body_length,
-            record_type,
-            flags: 0,
-            object_id,
-            sequence: inner.sequence,
-        };
+        let header = RecordHeader { body_length, record_type, flags: 0, object_id, sequence };
         let mut stream = inner.stream.as_ref();
-        write_parts(&mut stream, &header.encode(), parts)?;
-        stream.flush()
+        if let Err(error) = write_parts(&mut stream, &header.encode(), parts, &self.shutdown)
+            .and_then(|()| stream.flush())
+        {
+            inner.failed = true;
+            self.shutdown.stop();
+            return Err(error);
+        }
+        inner.sequence = sequence;
+        Ok(inner.sequence)
     }
 }
 
-fn write_parts(stream: &mut &LocalStream, header: &[u8], parts: &[&[u8]]) -> io::Result<()> {
+fn write_parts(
+    stream: &mut &LocalStream,
+    header: &[u8],
+    parts: &[&[u8]],
+    _shutdown: &ReadShutdown,
+) -> io::Result<()> {
+    #[cfg(windows)]
+    let deadline = stream.write_timeout()?.and_then(|timeout| Instant::now().checked_add(timeout));
     let mut buffers = Vec::with_capacity(parts.len() + 1);
     buffers.push(IoSlice::new(header));
     buffers.extend(parts.iter().map(|part| IoSlice::new(part)));
     let mut index = 0;
     let mut offset = 0;
     while index < buffers.len() {
+        #[cfg(windows)]
+        {
+            if _shutdown.cancelled.load(Ordering::Acquire) {
+                return Err(io::Error::new(io::ErrorKind::BrokenPipe, "writer stopped"));
+            }
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "Vivid record write timed out",
+                ));
+            }
+        }
         let current = &buffers[index..];
         let mut adjusted = Vec::with_capacity(current.len());
         adjusted.push(IoSlice::new(&current[0][offset..]));
         adjusted.extend(current[1..].iter().map(|slice| IoSlice::new(slice)));
-        let written = stream.write_vectored(&adjusted)?;
+        let written = match stream.write_vectored(&adjusted) {
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            #[cfg(windows)]
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                wait_socket_ready(stream, POLLWRNORM, deadline)?;
+                continue;
+            },
+            result => result?,
+        };
         if written == 0 {
             return Err(io::Error::new(io::ErrorKind::WriteZero, "failed to write Vivid record"));
         }
@@ -645,4 +732,5 @@ mod tests {
         client.read_to_end(&mut bytes).unwrap();
         assert_eq!(bytes, vivid_protocol::wire::unsupported_version_record());
     }
+    include!("transport_regressions.rs");
 }

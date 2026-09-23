@@ -16,9 +16,9 @@ use std::os::unix::io::RawFd;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
-#[cfg(windows)]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
+use std::thread;
 use std::time::{Duration, Instant};
 use std::{env, f32, mem};
 
@@ -27,6 +27,10 @@ use log::{debug, error, info, warn};
 use parking_lot::Mutex;
 #[cfg(any(unix, windows))]
 use serde::de::DeserializeOwned;
+#[cfg(windows)]
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    IDNO, IDYES, MB_ICONWARNING, MB_SETFOREGROUND, MB_TASKMODAL, MB_YESNOCANCEL, MessageBoxW,
+};
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
 use winit::event::{
@@ -44,12 +48,14 @@ use crate::terminal::index::{Boundary, Column, Direction, Line, Point, Side};
 use crate::terminal::selection::{Selection, SelectionType};
 use crate::terminal::term::search::{Match, RegexSearch};
 use crate::terminal::term::{self, ClipboardType, Term, TermMode};
-use crate::terminal::vte::ansi::NamedColor;
+#[cfg(windows)]
+use crate::terminal::tty::windows::win32_string;
+use crate::terminal::vvte::ansi::NamedColor;
 
 #[cfg(any(unix, windows))]
 use crate::automation::{AutomationHub, SubscriptionRequest};
 #[cfg(any(unix, windows))]
-use crate::automation::{PendingWrite, WaitKind, Waiter};
+use crate::automation::{PendingWrite, TextScope, WaitKind, Waiter};
 #[cfg(any(unix, windows))]
 use crate::cli::ParsedOptions;
 use crate::cli::{Options as CliOptions, WindowOptions};
@@ -76,6 +82,7 @@ use crate::polling::ipc::{IpcConnection, IpcRequest};
 #[cfg(any(unix, windows))]
 use crate::polling::ipc::{IpcError, MAX_INPUT_BYTES, MAX_IPC_TEXT_BYTES, MethodCapability};
 use crate::scheduler::{Scheduler, TimerId, Topic};
+use crate::update::{self, DownloadChoice, UpdateEvent, UpdateManifest};
 use crate::vivid::VividService;
 #[cfg(windows)]
 use crate::window_context::is_latency_sensitive_window_event;
@@ -89,6 +96,12 @@ const MAX_SEARCH_WHILE_TYPING: Option<usize> = Some(1000);
 
 /// Maximum number of search terms stored in the history.
 const MAX_SEARCH_HISTORY_SIZE: usize = 255;
+
+/// How long a window stays hidden before its window-sized GPU memory is released.
+///
+/// Long enough that flipping between tabs does not churn the swapchain, short enough that a tab
+/// left in the background stops costing a full set of window-sized targets.
+const HIDDEN_RELEASE_DELAY: Duration = Duration::from_secs(5);
 
 #[cfg(any(unix, windows))]
 struct PacedGesture {
@@ -153,6 +166,21 @@ const HEADLESS_IDLE_WAIT: Duration = Duration::from_millis(100);
 /// Message-bar target used to replace transient file-drop hover and state messages.
 const FILE_DROP_MESSAGE_TARGET: &str = "vivid-file-drop";
 
+/// Message-bar target used to replace the current update status.
+pub(crate) const UPDATE_MESSAGE_TARGET: &str = "vivido-update";
+
+/// Message-bar target used for non-actionable update status on platforms without dialogs.
+const UPDATE_INFORMATION_MESSAGE_TARGET: &str = "vivido-update-information";
+
+/// Delay before a quiet startup check, keeping update I/O off the startup path.
+const UPDATE_STARTUP_DELAY: Duration = Duration::from_secs(1);
+
+#[derive(Debug)]
+struct ReadyInstaller {
+    version: semver::Version,
+    path: PathBuf,
+}
+
 #[cfg(target_os = "macos")]
 #[derive(Debug, PartialEq, Eq)]
 enum MenuEffect {
@@ -169,6 +197,7 @@ fn menu_effect(command: MenuCommand) -> MenuEffect {
         MenuCommand::Paste => MenuEffect::Action(Action::Paste),
         MenuCommand::Find => MenuEffect::Action(Action::SearchForward),
         MenuCommand::Clear => MenuEffect::Clear,
+        MenuCommand::CheckForUpdates => MenuEffect::Action(Action::CheckForUpdates),
     }
 }
 
@@ -209,6 +238,149 @@ fn schedule_message_timeout(
     );
 }
 
+fn update_progress_percent(downloaded: u64, total: u64) -> u64 {
+    if total == 0 {
+        return 0;
+    }
+    let percent = u128::from(downloaded).saturating_mul(100) / u128::from(total);
+    u64::try_from(percent.min(100)).expect("an update percentage at most 100 fits in u64")
+}
+
+fn update_available_message(version: &semver::Version, bytes: u64) -> String {
+    format!(
+        "Vivido {version} is available ({} MiB). Click to review the update.",
+        bytes.div_ceil(1024 * 1024)
+    )
+}
+
+/// How long an `--ephemeral` session survives after its last client disconnects.
+///
+/// The linger tolerates the gaps between one-shot client commands (each `msg` invocation is
+/// its own connection); teardown still fires promptly on the scale of leaked sessions.
+#[cfg(any(unix, windows))]
+const EPHEMERAL_LINGER: Duration = Duration::from_secs(30);
+
+/// How often a foreground `--ephemeral` session polls its launcher for liveness.
+#[cfg(any(unix, windows))]
+const EPHEMERAL_LAUNCHER_POLL: Duration = Duration::from_secs(1);
+
+/// Largest `wait` timeout a client may ask for, in milliseconds (24 hours).
+#[cfg(any(unix, windows))]
+const MAX_IPC_WAIT_TIMEOUT_MS: u64 = 86_400_000;
+
+/// How many exited windows `wait exit` remembers for waits that arrive after teardown.
+#[cfg(any(unix, windows))]
+const MAX_EXIT_RECORDS: usize = 16;
+
+/// How long an exited window satisfies a late `wait exit`.
+///
+/// The race being covered lasts milliseconds — a client round trip between the exit and
+/// the wait — so a minute is generous without letting a stale exit answer for a window
+/// the caller started waiting on much later.
+#[cfg(any(unix, windows))]
+const EXIT_RECORD_TTL: Duration = Duration::from_secs(60);
+
+/// Pure `--ephemeral` teardown decision, so the trigger matrix stays unit-testable.
+#[cfg(any(unix, windows))]
+fn ephemeral_exit_due(now: Instant, quiescent_since: Option<Instant>, launcher_dead: bool) -> bool {
+    launcher_dead
+        || quiescent_since
+            .is_some_and(|since| now.saturating_duration_since(since) >= EPHEMERAL_LINGER)
+}
+
+/// PID of the process that launched this instance, watched by a foreground `--ephemeral`
+/// session. Falls back to 0 (never a live launcher) when the PID does not fit.
+#[cfg(any(unix, windows))]
+pub(crate) fn launcher_parent_pid() -> u32 {
+    #[cfg(unix)]
+    {
+        // SAFETY: `getppid` takes no arguments and always succeeds.
+        u32::try_from(unsafe { libc::getppid() }).unwrap_or(0)
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+            CreateToolhelp32Snapshot, PROCESSENTRY32, Process32First, Process32Next,
+            TH32CS_SNAPPROCESS,
+        };
+        // SAFETY: the snapshot handle is checked before use and always closed; `entry`
+        // is a plain struct the API fills after `dwSize` versions it.
+        unsafe {
+            let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+            if snapshot == INVALID_HANDLE_VALUE {
+                return 0;
+            }
+            let own = std::process::id();
+            let mut entry = PROCESSENTRY32 {
+                dwSize: std::mem::size_of::<PROCESSENTRY32>() as u32,
+                ..Default::default()
+            };
+            let mut parent = 0;
+            if Process32First(snapshot, &mut entry) != 0 {
+                loop {
+                    if entry.th32ProcessID == own {
+                        parent = entry.th32ParentProcessID;
+                        break;
+                    }
+                    if Process32Next(snapshot, &mut entry) == 0 {
+                        break;
+                    }
+                }
+            }
+            CloseHandle(snapshot);
+            parent
+        }
+    }
+}
+
+/// Whether a watched launcher PID still names a live process.
+///
+/// An unopenable PID counts as alive: access errors must not tear down a live session, so
+/// only a definitive exit triggers teardown. PID reuse can delay teardown at most until
+/// the recycled PID exits.
+#[cfg(any(unix, windows))]
+fn launcher_is_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        // SAFETY: signal 0 performs only error checking, never delivering a signal.
+        i32::try_from(pid).is_ok_and(|raw| unsafe { libc::kill(raw, 0) == 0 })
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::{
+            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        // SAFETY: the handle is checked before use and always closed; `code` is a plain
+        // `u32` the API fills, and 259 is `STILL_ACTIVE`.
+        unsafe {
+            let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if handle.is_null() {
+                return true;
+            }
+            let mut code = 0u32;
+            let alive = GetExitCodeProcess(handle, &mut code) == 0 || code == 259;
+            CloseHandle(handle);
+            alive
+        }
+    }
+}
+
+/// The exit a window took with it when teardown removed it.
+///
+/// Unix delivers PTY EOF within milliseconds of the child reaping, so a `wait exit`
+/// issued from a separate client connection routinely arrives after its window is
+/// already gone. Recording the exit lets that wait report the truth instead of
+/// `window_not_found`.
+#[cfg(any(unix, windows))]
+#[derive(Copy, Clone, Debug)]
+struct WindowExitRecord {
+    window_id: u64,
+    status: std::process::ExitStatus,
+    exited_at: Instant,
+}
+
 /// The event processor.
 ///
 /// Stores some state from received events and dispatches actions when they are
@@ -235,11 +407,43 @@ pub struct Processor {
     /// One scheduled pointer gesture per target window.
     #[cfg(any(unix, windows))]
     paced_gestures: HashMap<WindowId, PacedGesture, RandomState>,
+    /// Recently exited windows and how they exited, oldest first.
+    ///
+    /// A `wait exit` that arrives after its window is already gone answers from here
+    /// instead of failing resolution. Bounded by [`MAX_EXIT_RECORDS`] and
+    /// [`EXIT_RECORD_TTL`]; a live window always wins over a record.
+    #[cfg(any(unix, windows))]
+    exit_records: VecDeque<WindowExitRecord>,
+    /// Live IPC connection IDs, tracked so an `--ephemeral` session can tear itself down
+    /// once its last client is gone.
+    #[cfg(any(unix, windows))]
+    ipc_connections: HashSet<u64, RandomState>,
+    /// Whether an IPC client has ever connected; arms `--ephemeral` disconnect teardown so
+    /// a session that nobody reached yet is not torn down before its first client.
+    #[cfg(any(unix, windows))]
+    ephemeral_client_seen: bool,
+    /// When the last client left an `--ephemeral` session; teardown fires after a linger
+    /// that tolerates the gaps between one-shot client commands.
+    #[cfg(any(unix, windows))]
+    ephemeral_quiescent_since: Option<Instant>,
+    /// Launcher PID watched by a foreground `--ephemeral` session; teardown fires promptly
+    /// when it dies, even if no client ever connected.
+    #[cfg(any(unix, windows))]
+    ephemeral_launcher: Option<u32>,
+    /// Last launcher-liveness check; the OS is polled at most once per second.
+    #[cfg(any(unix, windows))]
+    ephemeral_launcher_checked: Instant,
     /// Bounded window-management requests waiting for an embedding chrome.
     #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     shell_actions: VecDeque<crate::shell::ShellActionRequest>,
     cli_options: CliOptions,
     config: Rc<UiConfig>,
+    update_cancel: Arc<AtomicBool>,
+    update_manifest: Option<UpdateManifest>,
+    update_ready: Option<ReadyInstaller>,
+    update_check_in_flight: bool,
+    update_check_manual: bool,
+    update_download_in_flight: bool,
     /// Earliest time the headless loop may draw again. Unused in windowed mode.
     next_headless_draw: Instant,
 }
@@ -304,6 +508,12 @@ impl Processor {
             proxy,
             scheduler,
             config: Rc::new(config),
+            update_cancel: Arc::new(AtomicBool::new(false)),
+            update_manifest: None,
+            update_ready: None,
+            update_check_in_flight: false,
+            update_check_manual: false,
+            update_download_in_flight: false,
             clipboard,
             windows: Default::default(),
             #[cfg(any(unix, windows))]
@@ -316,6 +526,18 @@ impl Processor {
             host_requests: Vec::new(),
             #[cfg(any(unix, windows))]
             paced_gestures: Default::default(),
+            #[cfg(any(unix, windows))]
+            exit_records: VecDeque::new(),
+            #[cfg(any(unix, windows))]
+            ipc_connections: Default::default(),
+            #[cfg(any(unix, windows))]
+            ephemeral_client_seen: false,
+            #[cfg(any(unix, windows))]
+            ephemeral_quiescent_since: None,
+            #[cfg(any(unix, windows))]
+            ephemeral_launcher: None,
+            #[cfg(any(unix, windows))]
+            ephemeral_launcher_checked: Instant::now(),
             #[cfg(any(target_os = "linux", target_os = "macos", windows))]
             shell_actions: VecDeque::new(),
             config_monitor,
@@ -348,6 +570,8 @@ impl Processor {
         #[cfg(not(any(unix, windows)))]
         let ipc_window_id = u64::from(platform_id);
         self.windows.insert(platform_id, window_context);
+        #[cfg(any(unix, windows))]
+        self.invalidate_exit_record(ipc_window_id);
 
         #[cfg(any(unix, windows))]
         self.automation.emit(
@@ -419,12 +643,62 @@ impl Processor {
         let ipc_window_id = u64::from(platform_id);
         self.windows.insert(platform_id, window_context);
         #[cfg(any(unix, windows))]
+        self.invalidate_exit_record(ipc_window_id);
+        #[cfg(any(unix, windows))]
         self.automation.emit(
             Some(ipc_window_id),
             "window_created",
             serde_json::json!({"window_id": ipc_window_id}),
         );
         Ok(ipc_window_id)
+    }
+
+    /// Reset parser and client-controlled state for a stable IPC window ID.
+    #[cfg(any(unix, windows))]
+    pub fn reset_terminal(&mut self, ipc_window_id: u64) -> Result<u64, IpcError> {
+        let platform_id = self
+            .windows
+            .iter()
+            .find_map(|(id, window)| (window.ipc_window_id() == ipc_window_id).then_some(*id))
+            .ok_or_else(|| IpcError::new("window_not_found", "terminal window does not exist"))?;
+        let completion = self.automation.next_write_token();
+        self.windows
+            .get_mut(&platform_id)
+            .ok_or_else(|| IpcError::new("window_not_found", "terminal window disappeared"))?
+            .reset_terminal_client(completion)?;
+        Ok(completion)
+    }
+
+    /// Replace a pane's PTY and Vivid service while keeping its window and IPC identity.
+    #[cfg(any(unix, windows))]
+    pub fn restart_terminal(&mut self, ipc_window_id: u64) -> Result<(), IpcError> {
+        let window = self
+            .windows
+            .values_mut()
+            .find(|window| window.ipc_window_id() == ipc_window_id)
+            .ok_or_else(|| IpcError::new("window_not_found", "terminal window does not exist"))?;
+        window.restart_terminal_client()
+    }
+
+    /// Close one window, terminating its terminal while the instance keeps serving.
+    ///
+    /// The graceful path releases the PTY hold and exits the terminal, so the window leaves
+    /// through the normal `TerminalEvent::Exit` cleanup: pending automation requests fail with
+    /// `pty_closed`, `window_closed` is emitted, and only a headed instance that lost its last
+    /// window exits. With `force`, the child process group is killed first so a child ignoring
+    /// hangup cannot outlive its window; a kill that fails — the child is already gone — never
+    /// blocks the close.
+    #[cfg(any(unix, windows))]
+    pub fn close_window(&mut self, target: WindowId, force: bool) -> Result<(), IpcError> {
+        let window = self
+            .windows
+            .get_mut(&target)
+            .ok_or_else(|| IpcError::new("window_not_found", "terminal window does not exist"))?;
+        if force {
+            let _ = window.signal_process_group(crate::cli::IpcSignalName::Kill);
+        }
+        window.request_close();
+        Ok(())
     }
 
     /// Look up one terminal window without exposing the processor's window map.
@@ -485,35 +759,61 @@ impl Processor {
         events: &mpsc::Receiver<Event>,
         headless: &HeadlessLoop,
     ) -> Result<(), Box<dyn Error>> {
-        let handle = LoopHandle::Headless(headless);
-
-        while !headless.exiting() {
-            // Block until the scheduler's next deadline, then drain everything already queued so
-            // a burst of PTY output costs one pass rather than one pass per event.
-            match events.recv_timeout(self.headless_wait()) {
-                Ok(event) => self.on_user_event(handle, event),
-                Err(mpsc::RecvTimeoutError::Timeout) => (),
-                // Every sender is gone, so nothing can wake this loop again.
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
-            }
-            while !headless.exiting()
-                && let Ok(event) = events.try_recv()
-            {
-                self.on_user_event(handle, event);
-            }
-
-            if headless.exiting() {
-                break;
-            }
-
-            // Same per-iteration bookkeeping winit drives through `AboutToWait`.
-            self.on_about_to_wait(handle);
-
-            self.draw_headless(handle);
-        }
-
+        while self.pump_headless(events, headless) {}
         self.on_exiting();
         Ok(())
+    }
+
+    /// Run one headless iteration: a single blocking wait plus per-turn bookkeeping.
+    ///
+    /// Returns false when the loop must stop (exit requested or every sender gone), so an
+    /// embedding host can interleave its own dispatch on the same thread between pumps.
+    /// Finish with [`Self::finish_headless`] to run the shutdown bookkeeping `run_headless`
+    /// performs after its loop.
+    pub fn pump_headless(
+        &mut self,
+        events: &mpsc::Receiver<Event>,
+        headless: &HeadlessLoop,
+    ) -> bool {
+        let handle = LoopHandle::Headless(headless);
+        if headless.exiting() {
+            return false;
+        }
+        // Block until the scheduler's next deadline, then drain everything already queued so
+        // a burst of PTY output costs one pass rather than one pass per event.
+        match events.recv_timeout(self.headless_wait()) {
+            Ok(event) => self.on_user_event(handle, event),
+            Err(mpsc::RecvTimeoutError::Timeout) => (),
+            // Every sender is gone, so nothing can wake this loop again.
+            Err(mpsc::RecvTimeoutError::Disconnected) => return false,
+        }
+        while !headless.exiting()
+            && let Ok(event) = events.try_recv()
+        {
+            self.on_user_event(handle, event);
+        }
+
+        if headless.exiting() {
+            return false;
+        }
+
+        // Same per-iteration bookkeeping winit drives through `AboutToWait`.
+        self.on_about_to_wait(handle);
+
+        #[cfg(any(unix, windows))]
+        self.poll_ephemeral_teardown();
+        if headless.exiting() {
+            return false;
+        }
+
+        self.draw_headless(handle);
+        true
+    }
+
+    /// Shut down after a [`Self::pump_headless`] loop: fail pending automation requests and
+    /// release windows, exactly as `run_headless` does when its loop ends.
+    pub fn finish_headless(&mut self) {
+        self.on_exiting();
     }
 
     /// How long the headless loop may block before it must run again.
@@ -531,6 +831,13 @@ impl Processor {
         let deadline = match (scheduled, draw_deadline) {
             (Some(scheduled), Some(draw)) => Some(scheduled.min(draw)),
             (scheduled, draw) => scheduled.or(draw),
+        };
+
+        // An armed linger or a due launcher check must wake the loop even when idle.
+        #[cfg(any(unix, windows))]
+        let deadline = match (deadline, self.ephemeral_wake()) {
+            (Some(deadline), Some(wake)) => Some(deadline.min(wake)),
+            (deadline, wake) => deadline.or(wake),
         };
 
         match deadline {
@@ -624,6 +931,129 @@ impl Processor {
         }
     }
 
+    /// Windows whose child process is still running. Reported as `conpty_handles` in
+    /// `inspect`: ConPTY sessions exhaust desktop heap around 64 concurrent windows per
+    /// process, so the live-terminal count is the gauge automation watches.
+    fn live_pty_count(&self) -> usize {
+        self.windows.values().filter(|window| window.automation.exit_status.is_none()).count()
+    }
+
+    /// Record the launcher a foreground `--ephemeral` session watches. A daemon reparented
+    /// by detaching has no meaningful launcher, so detached sessions leave this unset and
+    /// rely on disconnect teardown alone.
+    #[cfg(any(unix, windows))]
+    pub fn set_ephemeral_launcher(&mut self, pid: u32) {
+        self.ephemeral_launcher = Some(pid);
+    }
+
+    /// Ask once per pump whether an `--ephemeral` session must shut down, and request it.
+    ///
+    /// Teardown fires when the last client has been gone for the linger (which tolerates the
+    /// gaps between one-shot client commands) or when the watched launcher is dead. Shutdown
+    /// itself flows through the ordinary event so windows, children, sockets, and the
+    /// registry are cleaned up exactly as for `quit`.
+    #[cfg(any(unix, windows))]
+    fn poll_ephemeral_teardown(&mut self) {
+        if !self.cli_options.ephemeral {
+            return;
+        }
+        let now = Instant::now();
+        let launcher_dead = match self.ephemeral_launcher {
+            Some(pid)
+                if now.duration_since(self.ephemeral_launcher_checked)
+                    >= EPHEMERAL_LAUNCHER_POLL =>
+            {
+                self.ephemeral_launcher_checked = now;
+                !launcher_is_alive(pid)
+            },
+            _ => false,
+        };
+        if ephemeral_exit_due(now, self.ephemeral_quiescent_since, launcher_dead) {
+            let _ = self.proxy.send_event(Event::new(EventType::Shutdown, None));
+        }
+    }
+
+    /// Earliest instant the headless loop must wake for `--ephemeral` bookkeeping: an armed
+    /// linger deadline, or the next launcher-liveness poll.
+    #[cfg(any(unix, windows))]
+    fn ephemeral_wake(&self) -> Option<Instant> {
+        let linger = self.ephemeral_quiescent_since.map(|since| since + EPHEMERAL_LINGER);
+        let launcher = self
+            .ephemeral_launcher
+            .map(|_| self.ephemeral_launcher_checked + EPHEMERAL_LAUNCHER_POLL);
+        match (linger, launcher) {
+            (Some(linger), Some(launcher)) => Some(linger.min(launcher)),
+            (linger, launcher) => linger.or(launcher),
+        }
+    }
+
+    /// Search one named window, or every window in creation order, for a text pattern.
+    ///
+    /// An unnamed search covers all windows so agents can locate a control without knowing
+    /// which window owns it; creation order keeps the combined matches deterministic.
+    #[cfg(any(unix, windows))]
+    fn find_text_matches(
+        &self,
+        params: &crate::cli::IpcFindText,
+    ) -> Result<serde_json::Value, IpcError> {
+        if params.pattern.is_empty() {
+            return Err(IpcError::new("invalid_params", "pattern must not be empty"));
+        }
+        if params.pattern.len() > crate::polling::ipc::MAX_FIND_TEXT_PATTERN_BYTES {
+            return Err(IpcError::new("invalid_params", "pattern exceeds 1 KiB"));
+        }
+        if params.regex {
+            compile_regex(&params.pattern)?;
+        }
+        let targets = match params.window_id {
+            Some(requested) => vec![self.resolve_ipc_target(Some(requested))?],
+            None => {
+                let mut targets: Vec<_> = self
+                    .windows
+                    .iter()
+                    .map(|(id, window)| (window.creation_index(), *id))
+                    .collect();
+                targets.sort_by_key(|(index, _)| *index);
+                targets.into_iter().map(|(_, id)| id).collect()
+            },
+        };
+        let per_window = usize::from(
+            params
+                .max_matches
+                .clamp(1, crate::polling::ipc::MAX_FIND_TEXT_MATCHES_PER_WINDOW as u16),
+        );
+        let mut matches = Vec::new();
+        let mut truncated = false;
+        for target in targets {
+            let window = &self.windows[&target];
+            for found in window.find_text(params.pattern.as_bytes(), params.regex, per_window) {
+                if matches.len() >= crate::polling::ipc::MAX_FIND_TEXT_MATCHES_TOTAL {
+                    truncated = true;
+                    break;
+                }
+                matches.push(serde_json::json!({
+                    "window_id": window.ipc_window_id(),
+                    "text": found.text,
+                    "grid": {
+                        "row": found.row,
+                        "col_start": found.col_start,
+                        "col_end": found.col_end,
+                    },
+                    "pixels": {
+                        "x": found.pixel_x,
+                        "y": found.pixel_y,
+                        "width": found.pixel_width,
+                        "height": found.pixel_height,
+                    },
+                }));
+            }
+            if truncated {
+                break;
+            }
+        }
+        Ok(serde_json::json!({"matches": matches, "truncated": truncated}))
+    }
+
     #[cfg(any(unix, windows))]
     fn handle_ipc_request(&mut self, event_loop: LoopHandle<'_>, request: IpcRequest) {
         // A claimed method belongs to the embedding host, which answers it from its own state.
@@ -634,17 +1064,50 @@ impl Processor {
         }
 
         use crate::cli::{
-            IpcConfig, IpcGetConfig, IpcGetGrid, IpcGetText, IpcInputRoute, IpcKey, IpcMouse,
-            IpcPaste, IpcResize, IpcScreenshot, IpcSetGeometry, IpcSetGeometryBatch, IpcSetLevel,
-            IpcSetVisible, IpcSignal, IpcSubscribe, IpcTarget, IpcTranscript, IpcTyping,
-            IpcWaitCommon, IpcWaitFrame, IpcWaitOutput, IpcWaitSequence, IpcWaitStable,
-            IpcWaitText, WindowOptions,
+            IpcCloseWindow, IpcConfig, IpcExec, IpcFindText, IpcGetConfig, IpcGetGrid, IpcGetText,
+            IpcInputRoute, IpcKey, IpcMouse, IpcPaste, IpcResize, IpcScreenshot, IpcSetGeometry,
+            IpcSetGeometryBatch, IpcSetLevel, IpcSetVisible, IpcSignal, IpcSubscribe, IpcTarget,
+            IpcTranscript, IpcTyping, IpcWaitCommon, IpcWaitFrame, IpcWaitOutput, IpcWaitSequence,
+            IpcWaitStable, IpcWaitText, WindowOptions,
         };
 
         let result = match request.method.as_str() {
             "ping" => {
                 request.connection.reply(request.id, serde_json::json!({"pong": true}));
                 return;
+            },
+            "reset_terminal" => {
+                let params: IpcTarget = match decode_ipc_params(&request) {
+                    Ok(params) => params,
+                    Err(error) => {
+                        request.connection.error(request.id, error);
+                        return;
+                    },
+                };
+                self.resolve_ipc_target(params.window_id).and_then(|target| {
+                    let window_id = self.windows[&target].ipc_window_id();
+                    self.reset_terminal(window_id).map(|completion| {
+                        serde_json::json!({
+                            "window_id": window_id,
+                            "completion": completion,
+                            "accepted": true,
+                        })
+                    })
+                })
+            },
+            "restart_terminal" => {
+                let params: IpcTarget = match decode_ipc_params(&request) {
+                    Ok(params) => params,
+                    Err(error) => {
+                        request.connection.error(request.id, error);
+                        return;
+                    },
+                };
+                self.resolve_ipc_target(params.window_id).and_then(|target| {
+                    let window_id = self.windows[&target].ipc_window_id();
+                    self.restart_terminal(window_id)
+                        .map(|()| serde_json::json!({"window_id": window_id, "restarted": true}))
+                })
             },
             // A headless instance outlives its last window, so it needs an explicit way to stop.
             "quit" => {
@@ -700,6 +1163,25 @@ impl Processor {
                     ),
                 }
                 return;
+            },
+            "close_window" => {
+                let params: IpcCloseWindow = match decode_ipc_params(&request) {
+                    Ok(params) => params,
+                    Err(error) => {
+                        request.connection.error(request.id, error);
+                        return;
+                    },
+                };
+                self.resolve_ipc_target(params.window_id).and_then(|target| {
+                    let window_id = self.windows[&target].ipc_window_id();
+                    self.close_window(target, params.force).map(|()| {
+                        serde_json::json!({
+                            "window_id": window_id,
+                            "closed": true,
+                            "forced": params.force,
+                        })
+                    })
+                })
             },
             "config" => {
                 let params: IpcConfig = match decode_ipc_params(&request) {
@@ -911,6 +1393,84 @@ impl Processor {
                     }
                     return;
                 }
+            },
+            "drop_file" => {
+                let params: crate::cli::IpcDropFile = match decode_ipc_params(&request) {
+                    Ok(params) => params,
+                    Err(error) => {
+                        request.connection.error(request.id, error);
+                        return;
+                    },
+                };
+                let target = match self.resolve_ipc_target(params.target.window_id) {
+                    Ok(target) => target,
+                    Err(error) => {
+                        request.connection.error(request.id, error);
+                        return;
+                    },
+                };
+                if !params.path.is_absolute() {
+                    request.connection.error(
+                        request.id,
+                        IpcError::new("invalid_params", "drop-file needs an absolute path"),
+                    );
+                    return;
+                }
+                if !(1..=86_400_000).contains(&params.timeout) {
+                    request.connection.error(
+                        request.id,
+                        IpcError::new("invalid_params", "timeout must be 1 ms through 24 hours"),
+                    );
+                    return;
+                }
+                let window = self.windows.get_mut(&target).unwrap();
+                match window.automation_drop_file(&params.path, params.at, params.type_path) {
+                    Ok((handle, name, length)) => {
+                        // The trusted indication a drag shows: automation does not make a transfer
+                        // silent (spec file-drop §7).
+                        replace_file_drop_message(
+                            &mut window.message_buffer,
+                            format!(
+                                "Automation is copying {name} ({length} bytes) to the remote receiver"
+                            ),
+                            MessageType::Warning,
+                        );
+                        window.dirty = true;
+                        window.display.window.request_redraw();
+                        window.automation.waiters.push(Waiter {
+                            connection: request.connection.clone(),
+                            request_id: request.id,
+                            deadline: Instant::now() + Duration::from_millis(params.timeout),
+                            kind: WaitKind::FileDrop { handle },
+                        });
+                        self.evaluate_waiters(target);
+                        self.schedule_automation_timer(target);
+                    },
+                    Err(refused) => {
+                        use crate::vivid::file_drop::{LocalDropDisposition, TOO_MANY_PENDING};
+                        let error = match refused {
+                            // No fallback to typing the local path, which is what an unbound drag
+                            // does: an automation caller asked for a copy, not for text.
+                            LocalDropDisposition::NoBinding => IpcError::new(
+                                "no_file_drop_binding",
+                                "no receiver is bound to this window; is vvreceive running on the \
+                                 remote host?",
+                            ),
+                            LocalDropDisposition::Rejected(TOO_MANY_PENDING) => IpcError::new(
+                                "busy",
+                                "the receiver already has as many drops pending as it accepts",
+                            ),
+                            LocalDropDisposition::Rejected(reason) => {
+                                IpcError::new("file_drop_rejected", reason)
+                            },
+                            LocalDropDisposition::Offered => {
+                                IpcError::new("internal", "an offered drop was reported refused")
+                            },
+                        };
+                        request.connection.error(request.id, error);
+                    },
+                }
+                return;
             },
             "mouse" => {
                 let params: IpcMouse = match decode_ipc_params(&request) {
@@ -1237,6 +1797,51 @@ impl Processor {
                     })
                 }
             },
+            "find_text" => {
+                let params: IpcFindText = match decode_ipc_params(&request) {
+                    Ok(params) => params,
+                    Err(error) => {
+                        request.connection.error(request.id, error);
+                        return;
+                    },
+                };
+                self.find_text_matches(&params)
+            },
+            "exec" => {
+                let params: IpcExec = match decode_ipc_params(&request) {
+                    Ok(params) => params,
+                    Err(error) => {
+                        request.connection.error(request.id, error);
+                        return;
+                    },
+                };
+                if params.command.is_empty() {
+                    Err(IpcError::new("invalid_params", "command must not be empty"))
+                } else if params.command.len() > crate::exec::MAX_EXEC_COMMAND_BYTES {
+                    Err(IpcError::new("invalid_params", "command exceeds 64 KiB"))
+                } else if params.timeout == 0 || params.timeout > crate::exec::MAX_EXEC_TIMEOUT_MS {
+                    Err(IpcError::new("invalid_params", "timeout must be 1 ms through 24 hours"))
+                } else {
+                    match self.resolve_ipc_target(params.window_id) {
+                        Ok(target) => {
+                            // The worker owns the whole wait: the event loop stays responsive
+                            // while the command runs, and the reply arrives when it completes.
+                            let cwd = self.windows[&target].current_directory();
+                            match crate::exec::spawn_exec_command(
+                                request.connection.clone(),
+                                request.id,
+                                params.command,
+                                cwd,
+                                params.timeout,
+                            ) {
+                                Ok(()) => return,
+                                Err(error) => Err(IpcError::new("exec_failed", error.to_string())),
+                            }
+                        },
+                        Err(error) => Err(error),
+                    }
+                }
+            },
             "screenshot" => {
                 let params: IpcScreenshot = match decode_ipc_params(&request) {
                     Ok(params) => params,
@@ -1276,7 +1881,8 @@ impl Processor {
                     },
                 };
                 self.resolve_ipc_target(params.window_id).map(|target| {
-                    self.windows[&target].automation_inspect(self.automation.event_sequence())
+                    self.windows[&target]
+                        .automation_inspect(self.automation.event_sequence(), self.live_pty_count())
                 })
             },
             "diagnose" => {
@@ -1302,6 +1908,7 @@ impl Processor {
                         self.windows[&target].automation_diagnose(
                             self.automation.event_sequence(),
                             params.trace_limit,
+                            self.live_pty_count(),
                         )
                     })
                 }
@@ -1634,6 +2241,11 @@ impl Processor {
                 };
                 if params.text.len() > 8192 {
                     Err(IpcError::new("limit_exceeded", "wait pattern exceeds 8 KiB"))
+                } else if params.line.is_some() && params.rect.is_some() {
+                    Err(IpcError::new(
+                        "invalid_params",
+                        "wait text accepts at most one of --line and --rect",
+                    ))
                 } else if params.regex {
                     match compile_regex(&params.text) {
                         Ok(()) => {
@@ -1644,6 +2256,7 @@ impl Processor {
                                     pattern: params.text,
                                     regex: true,
                                     after_screen: params.after_screen,
+                                    scope: text_scope(params.line, params.rect),
                                 },
                                 &request,
                             );
@@ -1659,6 +2272,7 @@ impl Processor {
                             pattern: params.text,
                             regex: false,
                             after_screen: params.after_screen,
+                            scope: text_scope(params.line, params.rect),
                         },
                         &request,
                     );
@@ -1812,10 +2426,47 @@ impl Processor {
                         return;
                     },
                 };
+                self.register_exit_wait(params.target.window_id, params.timeout, &request);
+                return;
+            },
+            "wait_prompt" => {
+                let params: IpcWaitCommon = match decode_ipc_params(&request) {
+                    Ok(params) => params,
+                    Err(error) => {
+                        request.connection.error(request.id, error);
+                        return;
+                    },
+                };
                 self.register_wait(
                     params.target.window_id,
                     params.timeout,
-                    WaitKind::Exit,
+                    WaitKind::Prompt,
+                    &request,
+                );
+                return;
+            },
+            "wait_command_finish" => {
+                let params: IpcWaitCommon = match decode_ipc_params(&request) {
+                    Ok(params) => params,
+                    Err(error) => {
+                        request.connection.error(request.id, error);
+                        return;
+                    },
+                };
+                let target = match self.resolve_ipc_target(params.target.window_id) {
+                    Ok(target) => target,
+                    Err(error) => {
+                        request.connection.error(request.id, error);
+                        return;
+                    },
+                };
+                // Only a finish after this registration counts: a command that already
+                // finished must never resolve a wait that started after it.
+                let after_count = self.windows[&target].automation.shell.finished_count;
+                self.register_wait_for_target(
+                    target,
+                    params.timeout,
+                    WaitKind::CommandFinish { after_count, started: Instant::now() },
                     &request,
                 );
                 return;
@@ -2166,6 +2817,13 @@ impl Processor {
         };
         let token = self.automation.next_write_token();
         let window = self.windows.get_mut(&target).unwrap();
+        if window.client_health() != crate::ClientHealth::Healthy {
+            request.connection.error(
+                request.id,
+                IpcError::new("client_fault", "terminal client is quarantined or recovering"),
+            );
+            return;
+        }
         let length = bytes.len();
         if let Err(error) = window.write_to_pty_with_completion(bytes, token) {
             warn!("failed to queue IPC terminal input: {error}");
@@ -2199,6 +2857,13 @@ impl Processor {
             }
         }
         self.automation.disconnect(connection_id);
+        self.ipc_connections.remove(&connection_id);
+        if self.cli_options.ephemeral
+            && self.ephemeral_client_seen
+            && self.ipc_connections.is_empty()
+        {
+            self.ephemeral_quiescent_since.get_or_insert(Instant::now());
+        }
         for window in self.windows.values_mut() {
             if window.cancel_automation_connection(connection_id) {
                 self.scheduler.unschedule(TimerId::new(Topic::ScreenshotReadback, window.id()));
@@ -2232,7 +2897,7 @@ impl Processor {
         kind: WaitKind,
         request: &IpcRequest,
     ) {
-        if !(1..=86_400_000).contains(&timeout_ms) {
+        if !(1..=MAX_IPC_WAIT_TIMEOUT_MS).contains(&timeout_ms) {
             request.connection.error(
                 request.id,
                 IpcError::new("invalid_params", "timeout must be 1 ms through 24 hours"),
@@ -2247,6 +2912,91 @@ impl Processor {
         });
         self.evaluate_waiters(target);
         self.schedule_automation_timer(target);
+    }
+
+    /// Register an exit wait, completing immediately when the window already exited.
+    ///
+    /// A child that exits just before `wait exit` arrives leaves no window behind to
+    /// wait on: Unix delivers PTY EOF within milliseconds of the reaping, so teardown
+    /// usually wins the race against a wait issued from a separate client connection.
+    /// Answering from the recorded exit keeps that wait truthful. A window that never
+    /// ran still fails resolution, and an ambiguous unqualified wait still must name
+    /// its window.
+    #[cfg(any(unix, windows))]
+    fn register_exit_wait(
+        &mut self,
+        requested: Option<u64>,
+        timeout_ms: u64,
+        request: &IpcRequest,
+    ) {
+        if !(1..=MAX_IPC_WAIT_TIMEOUT_MS).contains(&timeout_ms) {
+            request.connection.error(
+                request.id,
+                IpcError::new("invalid_params", "timeout must be 1 ms through 24 hours"),
+            );
+            return;
+        }
+        if self.resolve_ipc_target(requested).is_err() {
+            self.prune_exit_records();
+            let exited = match requested {
+                Some(window_id) => {
+                    self.exit_records.iter().find(|record| record.window_id == window_id)
+                },
+                // Without a named window there is nothing left to wait on only when no
+                // window remains at all: resolution already failed, so any live window
+                // means the request was ambiguous rather than already satisfied.
+                None if self.windows.is_empty() => self.exit_records.back(),
+                None => None,
+            };
+            if let Some(record) = exited {
+                request.connection.reply(request.id, exit_wait_reply(record.status));
+                return;
+            }
+        }
+        self.register_wait(requested, timeout_ms, WaitKind::Exit, request);
+    }
+
+    /// Remember a window's exit for `wait exit` calls that arrive after teardown.
+    ///
+    /// Only exits with a known status are recorded: a window removed before its child
+    /// reported (a forced close racing the reaper) keeps the previous
+    /// `window_not_found` rather than answering with a status that was never observed.
+    #[cfg(any(unix, windows))]
+    fn record_window_exit(&mut self, window_id: u64, status: std::process::ExitStatus) {
+        self.prune_exit_records();
+        // A reclaimed numeric ID starts a new generation: the fresh exit supersedes any
+        // record the previous generation left behind.
+        self.exit_records.retain(|record| record.window_id != window_id);
+        self.exit_records.push_back(WindowExitRecord {
+            window_id,
+            status,
+            exited_at: Instant::now(),
+        });
+        while self.exit_records.len() > MAX_EXIT_RECORDS {
+            self.exit_records.pop_front();
+        }
+    }
+
+    /// Drop exit records older than [`EXIT_RECORD_TTL`].
+    #[cfg(any(unix, windows))]
+    fn prune_exit_records(&mut self) {
+        let now = Instant::now();
+        while self
+            .exit_records
+            .front()
+            .is_some_and(|record| now.duration_since(record.exited_at) > EXIT_RECORD_TTL)
+        {
+            self.exit_records.pop_front();
+        }
+    }
+
+    /// Forget a previous generation's exit when its numeric ID is claimed again.
+    ///
+    /// A late `wait exit` must answer for the window that just exited, never for an
+    /// earlier window that happened to carry the same claimed ID.
+    #[cfg(any(unix, windows))]
+    fn invalidate_exit_record(&mut self, window_id: u64) {
+        self.exit_records.retain(|record| record.window_id != window_id);
     }
 
     #[cfg(any(unix, windows))]
@@ -2444,6 +3194,14 @@ impl Processor {
                         "timeout_ms": 2_000,
                         "background_input_available": true,
                     })),
+                    WaitKind::Prompt => IpcError::new(
+                        "timeout",
+                        "no shell prompt observed; the shell must emit OSC 133 integration markers",
+                    ),
+                    WaitKind::CommandFinish { .. } => IpcError::new(
+                        "timeout",
+                        "no command finished; type a command first in a shell emitting OSC 133 markers",
+                    ),
                     _ => IpcError::new("timeout", "IPC wait timed out"),
                 };
                 waiter.connection.error(waiter.request_id, error);
@@ -2451,23 +3209,47 @@ impl Processor {
             }
 
             let result = match &waiter.kind {
-                WaitKind::Text { pattern, regex, after_screen } => {
+                WaitKind::Text { pattern, regex, after_screen, scope } => {
                     let eligible = after_screen.is_none_or(|after| screen_sequence > after);
-                    if eligible
-                        && pattern_find(
-                            visible_text.get_or_insert_with(|| window.text(None)).as_bytes(),
-                            pattern.as_bytes(),
-                            *regex,
-                        )
-                        .is_some()
-                    {
-                        Some(Ok(serde_json::json!({
-                            "matched": true,
-                            "screen_sequence": screen_sequence,
-                        })))
+                    if eligible {
+                        // The full-viewport snapshot is shared across text waiters in one pass;
+                        // a scoped wait reads only its own rectangle instead.
+                        let haystack;
+                        let haystack = match scope {
+                            TextScope::Full => {
+                                visible_text.get_or_insert_with(|| window.text(None)).as_bytes()
+                            },
+                            scoped => {
+                                haystack = window.scoped_text(*scoped);
+                                haystack.as_bytes()
+                            },
+                        };
+                        pattern_find(haystack, pattern.as_bytes(), *regex).map(|_| {
+                            Ok(serde_json::json!({
+                                "matched": true,
+                                "screen_sequence": screen_sequence,
+                            }))
+                        })
                     } else {
                         None
                     }
+                },
+                WaitKind::Prompt => window.automation.shell.at_prompt().then(|| {
+                    Ok(serde_json::json!({
+                        "ready": true,
+                        "generation": window.automation.shell.command_generation,
+                    }))
+                }),
+                WaitKind::CommandFinish { after_count, started } => {
+                    let shell = &window.automation.shell;
+                    (shell.finished_count > *after_count).then(|| {
+                        Ok(serde_json::json!({
+                            "status": "completed",
+                            "exit_code": shell.last_exit_code,
+                            "elapsed_ms": started.elapsed().as_millis(),
+                            "generation": shell.command_generation,
+                        }))
+                    })
                 },
                 WaitKind::Output { pattern, regex, start_offset } => {
                     let transcript = window.automation.transcript.lock().unwrap();
@@ -2556,14 +3338,7 @@ impl Processor {
                         .is_some_and(|events| !events.is_empty())
                         .then_some(Ok(batch))
                 },
-                WaitKind::Exit => exit_status.map(|status| {
-                    Ok(serde_json::json!({
-                        "exited": true,
-                        "code": status.code(),
-                        "signal": exit_signal(&status),
-                        "core_dumped": exit_core_dumped(&status),
-                    }))
-                }),
+                WaitKind::Exit => exit_status.map(|status| Ok(exit_wait_reply(status))),
                 WaitKind::Resize {
                     columns,
                     rows,
@@ -2617,6 +3392,58 @@ impl Processor {
                     (window.automation.focus_confirmation > *after_focus && window.is_focused())
                         .then(|| Ok(serde_json::json!({"focused": true})))
                 },
+                WaitKind::FileDrop { handle } => {
+                    use crate::vivid::file_drop::AutomationDropState;
+                    use vivid_protocol::file_drop::FileResultCode;
+                    let answer = match window.automation_drop_state(*handle) {
+                        AutomationDropState::Pending => None,
+                        AutomationDropState::Finished(outcome) => {
+                            let result = match outcome.result {
+                                FileResultCode::Committed => "committed",
+                                FileResultCode::AlreadyCommitted => "already_committed",
+                                FileResultCode::Rejected => "rejected",
+                                FileResultCode::Cancelled => "cancelled",
+                                FileResultCode::HashMismatch => "hash_mismatch",
+                                FileResultCode::IoError => "io_error",
+                            };
+                            Some(match outcome.result {
+                                FileResultCode::Committed | FileResultCode::AlreadyCommitted => {
+                                    Ok(serde_json::json!({
+                                        "result": result,
+                                        "basename": outcome.final_name,
+                                        "bytes": outcome.committed_length,
+                                        "sha256": outcome.sha256.map(|digest| {
+                                            digest.iter().map(|byte| format!("{byte:02x}"))
+                                                .collect::<String>()
+                                        }),
+                                        // Only to this caller, which started the drop; never in
+                                        // status, diagnostics, or logs (spec file-drop §8).
+                                        "remote_path": outcome.remote_path,
+                                    }))
+                                },
+                                _ => Err(IpcError::new(
+                                    "file_drop_failed",
+                                    format!("the receiver reported the drop {result}"),
+                                )
+                                .with_data(serde_json::json!({"result": result}))),
+                            })
+                        },
+                        AutomationDropState::Cancelled => Some(Err(IpcError::new(
+                            "file_drop_cancelled",
+                            "the drop was cancelled or timed out before the receiver finished",
+                        ))),
+                        AutomationDropState::Lost => Some(Err(IpcError::new(
+                            "file_drop_lost",
+                            "the receiver went away before it reported a result",
+                        ))),
+                    };
+                    if answer.is_some() {
+                        window.message_buffer.remove_target(FILE_DROP_MESSAGE_TARGET);
+                        window.dirty = true;
+                        window.display.window.request_redraw();
+                    }
+                    answer
+                },
             };
 
             match result {
@@ -2626,6 +3453,17 @@ impl Processor {
             }
         }
     }
+}
+
+/// The `wait exit` success payload for a known exit status.
+#[cfg(any(unix, windows))]
+fn exit_wait_reply(status: std::process::ExitStatus) -> serde_json::Value {
+    serde_json::json!({
+        "exited": true,
+        "code": status.code(),
+        "signal": exit_signal(&status),
+        "core_dumped": exit_core_dumped(&status),
+    })
 }
 
 #[cfg(any(unix, windows))]
@@ -2654,6 +3492,26 @@ fn compile_regex(pattern: &str) -> Result<(), IpcError> {
     regex_automata::meta::Regex::new(pattern)
         .map(|_| ())
         .map_err(|error| IpcError::new("regex_invalid", error.to_string()))
+}
+
+/// Translate `wait text` scope flags into a match scope.
+///
+/// The dispatcher rejects a request carrying both scopes; the line-first order here is only a
+/// deterministic fallback for direct wire callers.
+#[cfg(any(unix, windows))]
+fn text_scope(line: Option<i32>, rect: Option<crate::cli::IpcTextRect>) -> TextScope {
+    if let Some(line) = line {
+        return TextScope::Line(line);
+    }
+    if let Some(rect) = rect {
+        return TextScope::Rect {
+            col: rect.col,
+            row: rect.row,
+            width: rect.width,
+            height: rect.height,
+        };
+    }
+    TextScope::Full
 }
 
 #[cfg(any(unix, windows))]
@@ -2700,7 +3558,244 @@ impl Processor {
             return;
         }
 
+        if !self.cli_options.headless {
+            self.start_quiet_update_check();
+        }
+
         info!("Initialisation complete");
+    }
+
+    /// Start the configured quiet update check for a graphical embedding host.
+    pub fn start_quiet_update_check(&mut self) {
+        if self.config.updates.enabled && self.config.updates.startup_check {
+            self.start_update_check(false, Some(UPDATE_STARTUP_DELAY));
+        }
+    }
+
+    fn start_update_check(&mut self, manual: bool, delay: Option<Duration>) {
+        if !self.config.updates.enabled
+            || self.update_check_in_flight
+            || self.update_download_in_flight
+        {
+            return;
+        }
+
+        self.update_check_in_flight = true;
+        self.update_check_manual = manual;
+        if let Some(delay) = delay {
+            let sink = self.proxy.clone();
+            let cancel = Arc::clone(&self.update_cancel);
+            let spawn =
+                thread::Builder::new().name("vivido-update-delay".into()).spawn(move || {
+                    thread::sleep(delay);
+                    if !cancel.load(Ordering::Relaxed) {
+                        update::spawn_check(sink, manual);
+                    }
+                });
+            if let Err(error) = spawn {
+                self.update_check_in_flight = false;
+                self.update_check_manual = false;
+                if manual {
+                    self.show_update_information(
+                        "Vivido Update",
+                        &format!("Could not start the update check: {error}"),
+                    );
+                }
+            }
+        } else {
+            update::spawn_check(self.proxy.clone(), manual);
+        }
+    }
+
+    fn handle_update_event(&mut self, event: UpdateEvent) {
+        match event {
+            UpdateEvent::CheckRequested => self.start_update_check(true, None),
+            UpdateEvent::Available { manifest, version, bytes, notes_url: _, manual } => {
+                self.update_check_in_flight = false;
+                self.update_check_manual = false;
+                if manifest.version != version || manifest.asset.bytes != bytes {
+                    if manual {
+                        self.show_update_information(
+                            "Vivido Update",
+                            "The update response was internally inconsistent.",
+                        );
+                    }
+                    return;
+                }
+                if !manual && update::read_skipped_version().as_ref() == Some(&version) {
+                    return;
+                }
+
+                if self.update_ready.as_ref().is_some_and(|installer| installer.version != version)
+                {
+                    self.update_ready = None;
+                }
+                self.update_manifest = Some(*manifest);
+                if manual {
+                    self.handle_install_requested();
+                } else {
+                    self.replace_update_message(
+                        update_available_message(&version, bytes),
+                        MessageType::Info,
+                    );
+                }
+            },
+            UpdateEvent::UpToDate { current } => {
+                let manual = self.update_check_manual;
+                self.update_check_in_flight = false;
+                self.update_check_manual = false;
+                if manual {
+                    self.show_update_information(
+                        "Vivido Update",
+                        &format!("Vivido {current} is up to date."),
+                    );
+                }
+            },
+            UpdateEvent::Progress { version, downloaded, total } => {
+                self.update_download_in_flight = true;
+                let percent = update_progress_percent(downloaded, total);
+                self.replace_update_message(
+                    format!("Downloading Vivido {version} — {percent}%"),
+                    MessageType::Info,
+                );
+            },
+            UpdateEvent::Ready { version, path } => {
+                self.update_download_in_flight = false;
+                self.update_ready = Some(ReadyInstaller { version, path });
+                self.offer_ready_installer();
+            },
+            UpdateEvent::InstallRequested => self.handle_install_requested(),
+            UpdateEvent::Skip { version } => self.skip_update(version),
+            UpdateEvent::Failed { message, manual } => {
+                let was_downloading = self.update_download_in_flight;
+                self.update_check_in_flight = false;
+                self.update_check_manual = false;
+                self.update_download_in_flight = false;
+                if was_downloading && let Some(manifest) = self.update_manifest.as_ref() {
+                    let text = update_available_message(&manifest.version, manifest.asset.bytes);
+                    self.replace_update_message(text, MessageType::Info);
+                }
+                if manual {
+                    self.show_update_information("Vivido Update Failed", &message);
+                }
+            },
+        }
+    }
+
+    fn handle_install_requested(&mut self) {
+        if self.update_download_in_flight {
+            return;
+        }
+        let Some(manifest) = self.update_manifest.clone() else {
+            self.show_update_information(
+                "Vivido Update",
+                "No available update is ready to download.",
+            );
+            return;
+        };
+
+        if self.update_ready.as_ref().is_some_and(|installer| installer.version == manifest.version)
+        {
+            self.offer_ready_installer();
+            return;
+        }
+
+        match update::choose_download(&manifest.version) {
+            DownloadChoice::Download => {
+                self.update_cancel.store(false, Ordering::Relaxed);
+                self.update_download_in_flight = true;
+                update::spawn_download(
+                    self.proxy.clone(),
+                    manifest,
+                    Arc::clone(&self.update_cancel),
+                );
+            },
+            DownloadChoice::Skip => self.skip_update(manifest.version),
+            DownloadChoice::Cancel => {},
+        }
+    }
+
+    fn skip_update(&mut self, version: semver::Version) {
+        if let Err(error) = update::write_skipped_version(&version) {
+            self.show_update_information(
+                "Vivido Update",
+                &format!("Could not save the skipped version: {error}"),
+            );
+            return;
+        }
+
+        if self.update_manifest.as_ref().is_some_and(|manifest| manifest.version == version) {
+            self.update_manifest = None;
+        }
+        if self.update_ready.as_ref().is_some_and(|installer| installer.version == version) {
+            self.update_ready = None;
+        }
+        self.remove_update_message();
+    }
+
+    fn offer_ready_installer(&mut self) {
+        let Some(installer) = self.update_ready.as_ref() else { return };
+        let version = installer.version.clone();
+        let path = installer.path.clone();
+        if !update::confirm_install(&version) {
+            self.replace_update_message(
+                format!("Vivido {version} is downloaded and ready to install."),
+                MessageType::Info,
+            );
+            return;
+        }
+
+        match update::launch_installer(&path) {
+            Ok(()) => {
+                let _ = self.proxy.send_event(Event::new(EventType::Shutdown, None));
+            },
+            Err(error) => {
+                self.replace_update_message(
+                    format!("Vivido {version} is downloaded and ready to install."),
+                    MessageType::Info,
+                );
+                self.show_update_information(
+                    "Vivido Update Failed",
+                    &format!("Could not open the installer: {error}"),
+                );
+            },
+        }
+    }
+
+    fn replace_update_message(&mut self, text: String, ty: MessageType) {
+        for window in self.windows.values_mut() {
+            window.message_buffer.remove_target(UPDATE_MESSAGE_TARGET);
+            window.message_buffer.remove_target(UPDATE_INFORMATION_MESSAGE_TARGET);
+            let mut message = Message::new(text.clone(), ty);
+            message.set_target(UPDATE_MESSAGE_TARGET.into());
+            window.message_buffer.push(message);
+            window.dirty = true;
+            window.display.window.request_redraw();
+        }
+    }
+
+    fn remove_update_message(&mut self) {
+        for window in self.windows.values_mut() {
+            window.message_buffer.remove_target(UPDATE_MESSAGE_TARGET);
+            window.dirty = true;
+            window.display.window.request_redraw();
+        }
+    }
+
+    fn show_update_information(&mut self, title: &str, message: &str) {
+        #[cfg(any(windows, target_os = "macos"))]
+        update::information(title, message);
+
+        #[cfg(not(any(windows, target_os = "macos")))]
+        for window in self.windows.values_mut() {
+            window.message_buffer.remove_target(UPDATE_MESSAGE_TARGET);
+            window.message_buffer.remove_target(UPDATE_INFORMATION_MESSAGE_TARGET);
+            let mut notice = Message::new(format!("{title}: {message}"), MessageType::Info);
+            notice.set_target(UPDATE_INFORMATION_MESSAGE_TARGET.into());
+            window.message_buffer.push(notice);
+            window.dirty = true;
+            window.display.window.request_redraw();
+        }
     }
 
     /// Claim automation methods for the embedding host.
@@ -2767,6 +3862,46 @@ impl Processor {
         self.create_window(LoopHandle::Embedded { size, scale_factor }, options)
     }
 
+    /// The platform window a public window ID refers to.
+    ///
+    /// A public ID is assigned independently of the windowing system's ID. The two are not
+    /// interchangeable: casting one to the other names a window that does not exist, which a host
+    /// sees as a pane that was never attached.
+    #[cfg(any(unix, windows))]
+    pub fn platform_window_id(&self, ipc_window_id: u64) -> Option<WindowId> {
+        self.windows
+            .iter()
+            .find_map(|(id, window)| (window.ipc_window_id() == ipc_window_id).then_some(*id))
+    }
+
+    /// Create an embedded window and return the platform window it became.
+    ///
+    /// Hosts arrange panes by platform window, so returning the public ID here would hand every
+    /// caller a value it has to convert — which is where casting it crept in.
+    #[cfg(any(unix, windows))]
+    pub fn create_embedded_pane(
+        &mut self,
+        size: PhysicalSize<u32>,
+        scale_factor: f64,
+        options: WindowOptions,
+    ) -> Result<WindowId, Box<dyn Error>> {
+        let public = self.create_embedded_window(size, scale_factor, options)?;
+        self.platform_window_id(public)
+            .ok_or_else(|| String::from("new pane is missing from the window set").into())
+    }
+
+    /// Create a window through the event loop and return the platform window it became.
+    #[cfg(any(unix, windows))]
+    pub fn create_hosted_pane(
+        &mut self,
+        handle: LoopHandle<'_>,
+        options: WindowOptions,
+    ) -> Result<WindowId, Box<dyn Error>> {
+        let public = self.create_window(handle, options)?;
+        self.platform_window_id(public)
+            .ok_or_else(|| String::from("new pane is missing from the window set").into())
+    }
+
     /// Deliver one host-translated event to an embedded terminal.
     pub fn handle_embedded_window_event(&mut self, window_id: WindowId, event: WindowEvent) {
         self.on_window_event(
@@ -2786,6 +3921,31 @@ impl Processor {
         }
         window.display.window.request_inner_size(size);
         self.handle_embedded_window_event(window_id, WindowEvent::Resized(size));
+    }
+
+    /// Resize a headless window from an embedding host and reflow its grid and PTY.
+    ///
+    /// Headed resizes arrive from the compositor as `Resized`; headless windows have no
+    /// compositor, so this runs the same automation-geometry handshake the `set_geometry`
+    /// IPC path uses and delivers the reflow event directly.
+    #[cfg(any(unix, windows))]
+    pub fn resize_headless_window(
+        &mut self,
+        handle: LoopHandle<'_>,
+        window_id: WindowId,
+        size: PhysicalSize<u32>,
+    ) -> Result<serde_json::Value, IpcError> {
+        let result = self
+            .windows
+            .get(&window_id)
+            .ok_or_else(|| {
+                IpcError::new("window_not_found", "pane is missing from the window set")
+            })?
+            .request_automation_geometry(None, None, Some(size.width), Some(size.height));
+        if result.is_ok() && self.windows[&window_id].display.window.is_headless() {
+            self.on_window_event(handle, window_id, WindowEvent::Resized(size));
+        }
+        result
     }
 
     /// Show or hide an embedded terminal without changing any other window's lifecycle state.
@@ -2904,6 +4064,19 @@ impl Processor {
             None => return,
         };
 
+        if let WindowEvent::Resized(size) = &event {
+            // Windows can report a nonzero thumbnail-sized client area while the window is
+            // minimized. The native subclass records SIZE_MINIMIZED before winit synchronously
+            // dispatches this event; `IsIconic` is not yet reliable at this point.
+            #[cfg(windows)]
+            let minimized = window_context.display.window.is_minimized();
+            #[cfg(not(windows))]
+            let minimized = false;
+            if !is_renderable_resize(*size, minimized) {
+                return;
+            }
+        }
+
         let is_redraw = matches!(event, WindowEvent::RedrawRequested);
         #[cfg(windows)]
         let is_latency_sensitive = is_latency_sensitive_window_event(&event);
@@ -2993,6 +4166,13 @@ impl Processor {
             (EventType::HostWakeup, _) => (),
             #[cfg(any(unix, windows))]
             (EventType::IpcRequest(request), _) => self.handle_ipc_request(event_loop, request),
+            #[cfg(any(unix, windows))]
+            (EventType::IpcConnect(connection_id), _) => {
+                self.ipc_connections.insert(connection_id);
+                // A live client cancels a pending linger teardown.
+                self.ephemeral_client_seen = true;
+                self.ephemeral_quiescent_since = None;
+            },
             #[cfg(any(unix, windows))]
             (EventType::IpcDisconnect(connection_id), _) => {
                 self.handle_ipc_disconnect(event_loop, connection_id);
@@ -3112,9 +4292,13 @@ impl Processor {
                     );
                 }
             },
+            (EventType::Update(event), _) => self.handle_update_event(event),
             // Shutdown all windows.
             #[cfg(any(unix, windows))]
-            (EventType::Shutdown, _) => event_loop.exit(),
+            (EventType::Shutdown, _) => {
+                self.update_cancel.store(true, Ordering::Relaxed);
+                event_loop.exit();
+            },
             // Process events affecting all windows.
             (payload, None) => {
                 let event = WinitEvent::UserEvent(Event::new(payload, None));
@@ -3184,6 +4368,13 @@ impl Processor {
                 );
                 // The terminal itself holds the reported directory; there is no window state
                 // to update.
+            },
+            #[cfg(any(unix, windows))]
+            (EventType::Terminal(TerminalEvent::ShellIntegration(marker)), Some(window_id)) => {
+                if let Some(window) = self.windows.get_mut(window_id) {
+                    window.automation.shell.apply(marker);
+                }
+                self.evaluate_waiters(*window_id);
             },
             #[cfg(any(unix, windows))]
             (EventType::Terminal(TerminalEvent::Bell), Some(window_id)) => {
@@ -3313,6 +4504,100 @@ impl Processor {
                 self.evaluate_waiters(*window_id);
                 self.schedule_automation_timer(*window_id);
             },
+            #[cfg(any(unix, windows))]
+            (EventType::Terminal(TerminalEvent::RecoveryPrompt), Some(window_id)) => {
+                let Some(ipc_window_id) =
+                    self.windows.get(window_id).map(WindowContext::ipc_window_id)
+                else {
+                    return;
+                };
+                #[cfg(windows)]
+                {
+                    let message = win32_string(
+                        "Recover this terminal pane?\n\nYes: Reset Terminal\nNo: Restart Terminal\nCancel: Keep the pane unchanged",
+                    );
+                    let title = win32_string("Vivido Terminal Recovery");
+                    let choice = unsafe {
+                        MessageBoxW(
+                            std::ptr::null_mut(),
+                            message.as_ptr(),
+                            title.as_ptr(),
+                            MB_ICONWARNING | MB_YESNOCANCEL | MB_SETFOREGROUND | MB_TASKMODAL,
+                        )
+                    };
+                    let result = match choice {
+                        IDYES => self.reset_terminal(ipc_window_id).map(|_| ()),
+                        IDNO => self.restart_terminal(ipc_window_id),
+                        _ => Ok(()),
+                    };
+                    if let Err(error) = result
+                        && let Some(window) = self.windows.get_mut(window_id)
+                    {
+                        window.message_buffer.push(Message::new(error.message, MessageType::Error));
+                        window.dirty = true;
+                        window.display.window.request_redraw();
+                    }
+                }
+                #[cfg(not(windows))]
+                if let Some(window) = self.windows.get_mut(window_id) {
+                    window.message_buffer.push(Message::new(
+                        format!(
+                            "Terminal recovery: run `vivido msg reset-terminal --window-id {ipc_window_id}` or `vivido msg restart-terminal --window-id {ipc_window_id}`."
+                        ),
+                        MessageType::Warning,
+                    ));
+                    window.dirty = true;
+                    window.display.window.request_redraw();
+                }
+            },
+            #[cfg(any(unix, windows))]
+            (EventType::Terminal(TerminalEvent::ClientResetComplete(token)), Some(window_id)) => {
+                if let Some(window) = self.windows.get_mut(window_id) {
+                    window.complete_client_reset();
+                    self.automation.emit(
+                        Some(window.ipc_window_id()),
+                        "client_recovered",
+                        serde_json::json!({"completion": token}),
+                    );
+                    window.display.window.request_redraw();
+                }
+                self.evaluate_waiters(*window_id);
+            },
+            #[cfg(any(unix, windows))]
+            (EventType::Terminal(TerminalEvent::ClientFault(fault)), Some(window_id)) => {
+                if let Some(window) = self.windows.get_mut(window_id) {
+                    let ipc_window_id = window.ipc_window_id();
+                    let quarantined = matches!(
+                        fault.class,
+                        crate::ClientFaultClass::TerminalParser | crate::ClientFaultClass::PtyIo
+                    );
+                    window.record_client_fault(fault.clone(), quarantined);
+                    if quarantined {
+                        window.fail_automation_requests(
+                            "client_fault",
+                            "terminal client was quarantined after an internal fault",
+                        );
+                        window.message_buffer.push(Message::new(
+                            format!(
+                                "Terminal client quarantined (fault {}). Use `vivido msg reset-terminal --window-id {ipc_window_id}` to recover.",
+                                fault.id
+                            ),
+                            MessageType::Error,
+                        ));
+                        window.dirty = true;
+                        window.display.window.request_redraw();
+                    }
+                    self.automation.emit(
+                        Some(ipc_window_id),
+                        "client_fault",
+                        serde_json::json!({
+                            "fault_id": fault.id,
+                            "class": fault.class.as_str(),
+                            "quarantined": quarantined,
+                        }),
+                    );
+                }
+            },
             (EventType::VividFrame, Some(window_id)) => {
                 if let Some(window_context) = self.windows.get_mut(window_id) {
                     window_context.acknowledge_vivid_frame();
@@ -3361,6 +4646,9 @@ impl Processor {
                 #[cfg(any(unix, windows))]
                 {
                     let ipc_window_id = window_context.ipc_window_id();
+                    if let Some(status) = window_context.automation.exit_status {
+                        self.record_window_exit(ipc_window_id, status);
+                    }
                     window_context.fail_automation_requests("pty_closed", "terminal window closed");
                     self.automation.emit(
                         Some(ipc_window_id),
@@ -3463,6 +4751,11 @@ impl Processor {
                     window_context.retry_renderer(&mut self.scheduler);
                 }
             },
+            (EventType::HiddenRelease, Some(window_id)) => {
+                if let Some(window_context) = self.windows.get_mut(window_id) {
+                    window_context.release_while_hidden();
+                }
+            },
             (EventType::VividResizeSettled(generation), Some(window_id)) => {
                 if let Some(window_context) = self.windows.get_mut(window_id) {
                     window_context.settle_vivid_resize(generation);
@@ -3516,22 +4809,19 @@ impl Processor {
             for window_id in &window_ids {
                 self.apply_automation_confirmations(*window_id);
             }
+            // The event carries the changed row indices, which is what `docs/ipc.md` documents as
+            // "current row replacements". It also carried a whole rendered grid, which no client in
+            // this repository reads, which is absent from the documented payload, and which a
+            // client that missed history is told to fetch with `get-grid` instead. Building it here
+            // meant rendering and retaining the viewport as JSON on every screen change even with
+            // nobody subscribed; the retained trees dominated the process heap.
             let mut changes = Vec::new();
-            for (platform_id, window) in &mut self.windows {
+            for window in self.windows.values_mut() {
                 if let Some((screen_sequence, rows)) = window.sync_automation_screen() {
-                    let grid = window
-                        .automation_grid(None, None, Some(screen_sequence.saturating_sub(1)))
-                        .ok();
-                    changes.push((
-                        *platform_id,
-                        window.ipc_window_id(),
-                        screen_sequence,
-                        rows,
-                        grid,
-                    ));
+                    changes.push((window.ipc_window_id(), screen_sequence, rows));
                 }
             }
-            for (_platform_id, window_id, screen_sequence, rows, grid) in changes {
+            for (window_id, screen_sequence, rows) in changes {
                 let full = rows.is_none();
                 self.automation.emit(
                     Some(window_id),
@@ -3540,7 +4830,6 @@ impl Processor {
                         "screen_sequence": screen_sequence,
                         "full": full,
                         "rows": rows,
-                        "grid": grid,
                     }),
                 );
             }
@@ -3563,6 +4852,8 @@ impl Processor {
         if self.config.debug.print_events {
             info!("Exiting the event loop");
         }
+
+        self.update_cancel.store(true, Ordering::Relaxed);
 
         #[cfg(any(unix, windows))]
         for window in self.windows.values_mut() {
@@ -3588,6 +4879,11 @@ pub struct Event {
 }
 
 impl Event {
+    /// Inspect an event before forwarding it to the terminal processor.
+    pub fn payload(&self) -> &EventType {
+        &self.payload
+    }
+
     pub fn new<I: Into<Option<WindowId>>>(payload: EventType, window_id: I) -> Self {
         Self { window_id: window_id.into(), payload }
     }
@@ -3719,18 +5015,20 @@ impl EventSink {
 #[derive(Debug, Clone)]
 pub enum EventType {
     Terminal(TerminalEvent),
+    Update(crate::update::UpdateEvent),
     VividFrame,
     ConfigReload(PathBuf),
     Message(Message),
     Scroll(Scroll),
     CreateWindow(WindowOptions),
     #[cfg(target_os = "macos")]
-    #[allow(private_interfaces)]
     MacOsMenu(MenuCommand),
     #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     ShellAction(crate::shell::ShellAction),
     #[cfg(any(unix, windows))]
     IpcRequest(IpcRequest),
+    #[cfg(any(unix, windows))]
+    IpcConnect(u64),
     #[cfg(any(unix, windows))]
     IpcDisconnect(u64),
     #[cfg(any(unix, windows))]
@@ -3752,6 +5050,8 @@ pub enum EventType {
     #[cfg(windows)]
     TerminalVividBatch,
     RendererRecovery,
+    /// A window has been hidden long enough to give its GPU memory back.
+    HiddenRelease,
     VividResizeSettled(u64),
     /// Dismiss the warning that was visible when this timer was scheduled.
     MessageTimeout(Message),
@@ -3873,8 +5173,42 @@ pub struct ActionContext<'a, N, T> {
 }
 
 impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionContext<'a, N, T> {
+    fn toggle_microphone(&self) {
+        self.vivid_service.toggle_microphone();
+    }
+    fn next_microphone(&self) {
+        self.vivid_service.next_microphone();
+    }
     fn send_desktop_input(&self, event: vivid_protocol::input::InputEvent) -> bool {
         self.vivid_service.send_input(event)
+    }
+    fn overlay_cursor(&self) -> Option<winit::window::CursorIcon> {
+        self.vivid_service.overlay_cursor()
+    }
+    fn overlay_capturing(&self) -> bool {
+        self.vivid_service.overlay_capturing()
+    }
+    fn overlay_keyboard(&self, event: vivid_protocol::overlay::Event, escape: bool) -> bool {
+        self.vivid_service.overlay_keyboard(event, escape)
+    }
+    fn overlay_pointer(
+        &self,
+        x: f64,
+        y: f64,
+        button: Option<(u16, bool)>,
+        modifiers: u32,
+        pressure: Option<f64>,
+    ) -> bool {
+        self.vivid_service.overlay_pointer(x, y, button, modifiers, pressure)
+    }
+    fn overlay_wheel(
+        &self,
+        x: f64,
+        y: f64,
+        scroll: crate::vivid::overlay::ScrollInput,
+        modifiers: u32,
+    ) -> bool {
+        self.vivid_service.overlay_wheel(x, y, scroll, modifiers)
     }
 
     fn paste_clipboard_media(&mut self) -> bool {
@@ -3975,9 +5309,11 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
             self.search_state.display_offset_delta += lines_changed;
         }
 
-        // Update selection.
-        if self.mouse.left_button_state == ElementState::Pressed
-            || self.mouse.right_button_state == ElementState::Pressed
+        // Scrolling extends a held text selection, but a scrollbar drag owns the mouse button.
+        // A clearing click can leave an empty selection anchor which must not grow during the drag.
+        if !self.display.scrollbar.dragging()
+            && (self.mouse.left_button_state == ElementState::Pressed
+                || self.mouse.right_button_state == ElementState::Pressed)
         {
             let display_offset = self.terminal.grid().display_offset();
             let point = self.mouse.point(&self.size_info(), display_offset);
@@ -4166,6 +5502,24 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
         self.display
             .pending_update
             .set_font(self.config.font.clone().with_size(self.display.font_size));
+    }
+
+    fn terminal_recovery(&mut self) {
+        let _ = self
+            .event_proxy
+            .send_event(Event::new(EventType::Terminal(TerminalEvent::RecoveryPrompt), None));
+    }
+
+    fn check_for_updates(&self) {
+        let _ = self
+            .event_proxy
+            .send_event(Event::new(EventType::Update(UpdateEvent::CheckRequested), None));
+    }
+
+    fn install_update(&self) {
+        let _ = self
+            .event_proxy
+            .send_event(Event::new(EventType::Update(UpdateEvent::InstallRequested), None));
     }
 
     #[inline]
@@ -4427,6 +5781,11 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
 
     /// Paste a text into the terminal.
     fn paste(&mut self, text: &str, bracketed: bool) {
+        if !self.search_active()
+            && self.overlay_keyboard(vivid_protocol::overlay::Event::Text(text.to_owned()), false)
+        {
+            return;
+        }
         if self.search_active() {
             for c in text.chars() {
                 self.search_input(c);
@@ -4852,6 +6211,9 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                     // The reported directory lives on the terminal; the IPC processor already
                     // emitted `directory_changed` before dropping the event.
                     TerminalEvent::WorkingDirectory(_) => (),
+                    // Shell markers fold into per-window automation state; the IPC
+                    // processor already applied the marker before dropping the event.
+                    TerminalEvent::ShellIntegration(_) => (),
                     TerminalEvent::Bell => {
                         // Set window urgency hint when window is not focused.
                         let focused = self.ctx.terminal.is_focused;
@@ -4932,22 +6294,28 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                     #[cfg(any(unix, windows))]
                     TerminalEvent::PtyOutput { .. }
                     | TerminalEvent::PtyWriteComplete(_)
-                    | TerminalEvent::PtyResizeComplete(_) => (),
+                    | TerminalEvent::PtyResizeComplete(_)
+                    | TerminalEvent::ClientResetComplete(_)
+                    | TerminalEvent::ClientFault(_)
+                    | TerminalEvent::RecoveryPrompt => (),
                 },
                 #[cfg(any(unix, windows))]
                 EventType::IpcRequest(_)
+                | EventType::IpcConnect(_)
                 | EventType::IpcDisconnect(_)
                 | EventType::ScreenshotReadback
                 | EventType::ScreenshotComplete
                 | EventType::AutomationTick
                 | EventType::Shutdown => (),
                 EventType::Message(_)
+                | EventType::Update(_)
                 | EventType::MessageTimeout(_)
                 | EventType::ConfigReload(_)
                 | EventType::CreateWindow(_)
                 | EventType::NotificationActivated
                 | EventType::Frame
                 | EventType::RendererRecovery
+                | EventType::HiddenRelease
                 | EventType::HostWakeup
                 | EventType::VividResizeSettled(_) => (),
                 #[cfg(windows)]
@@ -4980,13 +6348,6 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                         display_update_pending.set_font(font.with_size(self.ctx.display.font_size));
                     },
                     WindowEvent::Resized(size) => {
-                        // Ignore resize events to zero in any dimension, to avoid issues with Winit
-                        // and the ConPTY. A 0x0 resize will also occur when the window is minimized
-                        // on Windows.
-                        if !is_renderable_resize(size) {
-                            return;
-                        }
-
                         self.ctx.display.pending_update.set_dimensions(size);
                     },
                     WindowEvent::KeyboardInput { event, is_synthetic: false, .. } => {
@@ -5007,6 +6368,7 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                     },
                     WindowEvent::Touch(touch) => self.touch(touch),
                     WindowEvent::Focused(is_focused) => {
+                        self.ctx.vivid_service.overlay_focus(is_focused);
                         self.ctx.terminal.is_focused = is_focused;
 
                         // When the unfocused hollow is used we must redraw on focus change.
@@ -5031,6 +6393,21 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                             !occluded,
                             self.ctx.terminal.grid().display_offset(),
                         );
+
+                        // A hidden window keeps a full swapchain and a set of window-sized
+                        // compositing targets it cannot use. Give them back once it is clear the
+                        // window is staying hidden, rather than on every flicker of occlusion.
+                        let timer_id =
+                            TimerId::new(Topic::HiddenRelease, self.ctx.display.window.id());
+                        self.ctx.scheduler.unschedule(timer_id);
+                        if occluded {
+                            self.ctx.scheduler.schedule(
+                                Event::new(EventType::HiddenRelease, self.ctx.display.window.id()),
+                                HIDDEN_RELEASE_DELAY,
+                                false,
+                                timer_id,
+                            );
+                        }
                     },
                     WindowEvent::DroppedFile(path) => {
                         // A drop supersedes the hover overlay. Leaving it at the front of the
@@ -5093,18 +6470,45 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                     WindowEvent::CursorLeft { .. } => {
                         self.ctx.mouse.inside_text_area = false;
 
+                        if self.ctx.display().scrollbar.set_hover(Instant::now(), false) {
+                            *self.ctx.dirty = true;
+                            self.ctx.window().request_redraw();
+                        }
+
                         if self.ctx.display().highlighted_hint.is_some() {
                             *self.ctx.dirty = true;
                         }
                     },
                     WindowEvent::Ime(ime) => match ime {
                         Ime::Commit(text) => {
+                            if !self.ctx.search_active()
+                                && self.ctx.overlay_keyboard(
+                                    vivid_protocol::overlay::Event::Text(text.clone()),
+                                    false,
+                                )
+                            {
+                                return;
+                            }
                             *self.ctx.dirty = true;
                             // Don't use bracketed paste for single char input.
                             self.ctx.paste(&text, text.chars().count() > 1);
                             self.ctx.update_cursor_blinking();
                         },
                         Ime::Preedit(text, cursor_offset) => {
+                            let selection = cursor_offset.and_then(|(start, end)| {
+                                Some((u32::try_from(start).ok()?, u32::try_from(end).ok()?))
+                            });
+                            if !self.ctx.search_active()
+                                && self.ctx.overlay_keyboard(
+                                    vivid_protocol::overlay::Event::Ime {
+                                        preedit: text.clone(),
+                                        selection,
+                                    },
+                                    false,
+                                )
+                            {
+                                return;
+                            }
                             let preedit =
                                 (!text.is_empty()).then(|| Preedit::new(text, cursor_offset));
 
@@ -5149,8 +6553,8 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
     }
 }
 
-fn is_renderable_resize(size: PhysicalSize<u32>) -> bool {
-    size.width != 0 && size.height != 0
+fn is_renderable_resize(size: PhysicalSize<u32>, minimized: bool) -> bool {
+    !minimized && size.width != 0 && size.height != 0
 }
 
 #[derive(Debug, Clone)]
@@ -5555,16 +6959,45 @@ mod file_drop_message_tests {
 }
 
 #[cfg(test)]
+mod update_event_tests {
+    use semver::Version;
+
+    use super::{update_available_message, update_progress_percent};
+
+    #[test]
+    fn update_progress_is_bounded_and_handles_zero_total() {
+        assert_eq!(update_progress_percent(0, 0), 0);
+        assert_eq!(update_progress_percent(42, 100), 42);
+        assert_eq!(update_progress_percent(100, 100), 100);
+        assert_eq!(update_progress_percent(u64::MAX, 1), 100);
+    }
+
+    #[test]
+    fn update_notice_rounds_partial_mebibytes_up() {
+        assert_eq!(
+            update_available_message(&Version::new(1, 2, 3), 1024 * 1024 + 1),
+            "Vivido 1.2.3 is available (2 MiB). Click to review the update."
+        );
+    }
+}
+
+#[cfg(test)]
 mod window_resize_tests {
     use super::is_renderable_resize;
     use winit::dpi::PhysicalSize;
 
     #[test]
     fn monitor_move_resize_sequence_accepts_physical_size_and_ignores_zero_axes() {
-        assert!(is_renderable_resize(PhysicalSize::new(2560, 1600)));
-        assert!(!is_renderable_resize(PhysicalSize::new(0, 1600)));
-        assert!(!is_renderable_resize(PhysicalSize::new(2560, 0)));
-        assert!(!is_renderable_resize(PhysicalSize::new(0, 0)));
+        assert!(is_renderable_resize(PhysicalSize::new(2560, 1600), false));
+        assert!(!is_renderable_resize(PhysicalSize::new(0, 1600), false));
+        assert!(!is_renderable_resize(PhysicalSize::new(2560, 0), false));
+        assert!(!is_renderable_resize(PhysicalSize::new(0, 0), false));
+    }
+
+    #[test]
+    fn minimized_windows_ignore_nonzero_thumbnail_resizes() {
+        assert!(!is_renderable_resize(PhysicalSize::new(160, 24), true));
+        assert!(is_renderable_resize(PhysicalSize::new(160, 24), false));
     }
 }
 
@@ -5580,6 +7013,7 @@ mod macos_menu_tests {
             (MenuCommand::Copy, Action::Copy),
             (MenuCommand::Paste, Action::Paste),
             (MenuCommand::Find, Action::SearchForward),
+            (MenuCommand::CheckForUpdates, Action::CheckForUpdates),
         ];
 
         for (command, action) in expected {
@@ -5654,5 +7088,152 @@ mod host_claim_tests {
         assert!(processor.take_host_requests().is_empty());
 
         crate::polling::ipc::publish_host_methods([].iter());
+    }
+}
+
+#[cfg(all(test, any(unix, windows)))]
+mod ephemeral_tests {
+    use super::{EPHEMERAL_LINGER, ephemeral_exit_due, launcher_is_alive, launcher_parent_pid};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn teardown_triggers_cover_linger_and_launcher_death() {
+        let now = Instant::now();
+        let linger_ago = |secs: u64| now.checked_sub(Duration::from_secs(secs));
+        // A dead launcher always tears down, even with clients still connected.
+        assert!(ephemeral_exit_due(now, None, true));
+        assert!(ephemeral_exit_due(now, linger_ago(0), true));
+        // A fresh disconnection is still inside the linger.
+        assert!(!ephemeral_exit_due(now, linger_ago(0), false));
+        assert!(!ephemeral_exit_due(now, linger_ago(EPHEMERAL_LINGER.as_secs() - 1), false));
+        // An expired linger tears down without any launcher signal.
+        assert!(ephemeral_exit_due(now, linger_ago(EPHEMERAL_LINGER.as_secs()), false));
+        assert!(ephemeral_exit_due(now, linger_ago(EPHEMERAL_LINGER.as_secs() + 1), false));
+        // Nothing connected, launcher alive: the session stays up.
+        assert!(!ephemeral_exit_due(now, None, false));
+    }
+
+    #[test]
+    fn launcher_probes_observe_the_current_process() {
+        assert_ne!(launcher_parent_pid(), 0, "every test process has a parent");
+        assert!(launcher_is_alive(std::process::id()), "the test process is alive");
+    }
+}
+
+#[cfg(all(test, any(unix, windows)))]
+mod exit_wait_tests {
+    use serde_json::json;
+
+    use super::*;
+    use crate::polling::ipc::{ResponseEnvelope, test_connection};
+
+    fn headless_processor() -> Processor {
+        let (proxy, _receiver) = EventSink::headless();
+        Processor::new_headless(UiConfig::default(), CliOptions::default(), proxy)
+    }
+
+    fn loop_handle() -> LoopHandle<'static> {
+        LoopHandle::Embedded { size: PhysicalSize::new(80, 24), scale_factor: 1.0 }
+    }
+
+    fn wait_exit(
+        connection: &crate::polling::ipc::IpcConnection,
+        id: u64,
+        window_id: Option<u64>,
+    ) -> IpcRequest {
+        let target =
+            window_id.map_or_else(|| json!({}), |window_id| json!({ "window_id": window_id }));
+        IpcRequest {
+            connection: connection.clone(),
+            id,
+            method: String::from("wait_exit"),
+            params: json!({ "timeout": 5_000, "target": target }),
+        }
+    }
+
+    fn exit_status(code: i32) -> std::process::ExitStatus {
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            std::process::ExitStatus::from_raw(code << 8)
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::ExitStatusExt;
+            std::process::ExitStatus::from_raw(code as u32)
+        }
+    }
+
+    fn reply(frames: &mpsc::Receiver<crate::polling::ipc::OutputFrame>) -> ResponseEnvelope {
+        let frame = frames.recv().expect("wait_exit must answer immediately");
+        serde_json::from_slice(frame.bytes()).expect("the reply is a response envelope")
+    }
+
+    /// A `wait exit` that arrives after its window is already gone reports the exit.
+    #[test]
+    fn wait_exit_answers_from_the_record_after_its_window_is_gone() {
+        let mut processor = headless_processor();
+        processor.record_window_exit(1, exit_status(3));
+        let (connection, frames) = test_connection();
+
+        processor.handle_ipc_request(loop_handle(), wait_exit(&connection, 1, Some(1)));
+        let named = reply(&frames);
+        assert!(named.ok, "a recorded exit must succeed: {named:?}");
+        let result = named.result.expect("success carries a result");
+        assert_eq!(result["exited"], json!(true));
+        assert_eq!(result["code"], json!(3));
+
+        // An unqualified wait with no window left answers from the latest exit too.
+        processor.handle_ipc_request(loop_handle(), wait_exit(&connection, 2, None));
+        let unqualified = reply(&frames);
+        assert!(unqualified.ok, "an unqualified late wait must succeed: {unqualified:?}");
+        let result = unqualified.result.expect("success carries a result");
+        assert_eq!(result["code"], json!(3));
+    }
+
+    /// A window that never ran is still refused, never mistaken for an exit.
+    #[test]
+    fn wait_exit_still_refuses_windows_that_never_ran() {
+        let mut processor = headless_processor();
+        processor.record_window_exit(1, exit_status(0));
+        let (connection, frames) = test_connection();
+
+        processor.handle_ipc_request(loop_handle(), wait_exit(&connection, 1, Some(424_242)));
+        let refused = reply(&frames);
+        assert!(!refused.ok, "an unknown window must not read as exited");
+        assert_eq!(refused.error.expect("failure carries an error").code, "window_not_found");
+    }
+
+    /// Reclaiming a numeric ID drops the previous generation's exit.
+    #[test]
+    fn a_reclaimed_window_id_drops_the_previous_generations_exit() {
+        let mut processor = headless_processor();
+        processor.record_window_exit(5, exit_status(0));
+        processor.invalidate_exit_record(5);
+        let (connection, frames) = test_connection();
+
+        processor.handle_ipc_request(loop_handle(), wait_exit(&connection, 1, Some(5)));
+        let refused = reply(&frames);
+        assert!(!refused.ok, "a superseded exit must not answer");
+        assert_eq!(refused.error.expect("failure carries an error").code, "window_not_found");
+    }
+
+    /// Exit records are bounded: the oldest falls off the end.
+    #[test]
+    fn exit_records_keep_only_the_most_recent_windows() {
+        let mut processor = headless_processor();
+        for id in 0..=MAX_EXIT_RECORDS as u64 {
+            processor.record_window_exit(id, exit_status(0));
+        }
+        let (connection, frames) = test_connection();
+
+        processor.handle_ipc_request(loop_handle(), wait_exit(&connection, 1, Some(0)));
+        assert!(!reply(&frames).ok, "the oldest record must have been evicted");
+
+        processor.handle_ipc_request(
+            loop_handle(),
+            wait_exit(&connection, 2, Some(MAX_EXIT_RECORDS as u64)),
+        );
+        assert!(reply(&frames).ok, "the newest record must still answer");
     }
 }

@@ -29,6 +29,11 @@ struct Session {
 impl Session {
     /// Start a detached headless session running `program`.
     fn start(name: &str, program: &[String]) -> Session {
+        Session::start_with_env(name, program, &[])
+    }
+
+    /// Start a session with extra environment, for testing what a daemon inherits.
+    fn start_with_env(name: &str, program: &[String], environment: &[(&str, &str)]) -> Session {
         // Unix sockets cap the whole path at ~108 bytes, so the runtime root must stay short.
         let runtime = test_runtime(name);
         let _ = fs::remove_dir_all(&runtime);
@@ -36,6 +41,9 @@ impl Session {
         set_private(&runtime);
 
         let mut command = base_command(&runtime);
+        for (key, value) in environment {
+            command.env(key, value);
+        }
         command.args(["--headless", "--session", name, "--headless-size", "100x30"]);
         command.arg("-e").args(program);
 
@@ -183,6 +191,61 @@ fn shell_program() -> Vec<String> {
         .collect()
 }
 
+/// Report the mesh coordinates a pane inherited, then keep the pane alive.
+#[cfg(unix)]
+fn mesh_report_program() -> Vec<String> {
+    ["sh", "-c", "echo \"MESH ${AGENT_MESH_INSTANCE-unset} ${AGENT_MESH_ADDRESS-unset}\"; exec sh"]
+        .into_iter()
+        .map(String::from)
+        .collect()
+}
+
+#[cfg(unix)]
+#[test]
+#[ignore = "spawns processes and needs a wgpu adapter"]
+fn a_pane_inherits_this_sessions_mesh_coordinates_and_not_the_launchers() {
+    // A window writes its coordinates as overrides, so anything it does not write falls through
+    // from the daemon. Started from inside another pane, a session used to hand its own panes the
+    // launching pane's instance and address — pointing at a different runtime instance entirely.
+    let session = Session::start_with_env(
+        "mesh",
+        &mesh_report_program(),
+        &[
+            ("AGENT_MESH_INSTANCE", "launching-pane"),
+            ("AGENT_MESH_ADDRESS", "w99"),
+            // The watcher is a separate concern and needs `vvagent` on PATH.
+            ("AGENT_MESH_WATCH", "off"),
+        ],
+    );
+
+    session.msg(&["wait", "text", "MESH ", "--window-id", "1"]);
+    let text = session.msg(&["get-text", "--window-id", "1"]);
+    assert!(
+        text.contains("MESH mesh w1"),
+        "a pane takes this session's name and its own window: {text:?}"
+    );
+    assert!(!text.contains("launching-pane"), "the launcher's instance must not leak: {text:?}");
+    assert!(!text.contains("w99"), "the launcher's address must not leak: {text:?}");
+
+    // An address index is a one-based `u32`. A claimed ID outside it has no mesh position, and
+    // publishing nothing must beat leaving the inherited value in place.
+    let mut create = vec![
+        String::from("create-window"),
+        String::from("--window-id"),
+        String::from("9223372036854775808"),
+        String::from("-e"),
+    ];
+    create.extend(mesh_report_program());
+    let claimed = session.msg(&create);
+    let claimed: u64 = claimed.trim().parse().expect("create-window returns a window id");
+    assert_eq!(claimed, 9_223_372_036_854_775_808);
+
+    let claimed = claimed.to_string();
+    session.msg(&["wait", "text", "MESH ", "--window-id", &claimed]);
+    let text = session.msg(&["get-text", "--window-id", &claimed]);
+    assert!(text.contains("MESH mesh unset"), "no address rather than a stale one: {text:?}");
+}
+
 fn marker_program(marker: &str) -> Vec<String> {
     #[cfg(unix)]
     return ["sh", "-c", &format!("echo {marker}; exec sh")]
@@ -201,6 +264,291 @@ fn marker_program(marker: &str) -> Vec<String> {
     ]
     .into_iter()
     .collect();
+}
+
+/// A shell emitting OSC 133 markers drives semantic prompt/finish tracking.
+#[cfg(unix)]
+fn integration_program() -> Vec<String> {
+    vec![
+        String::from("sh"),
+        String::from("-c"),
+        String::from(
+            "printf '\\033]133;A\\a'; i=0; while true; do printf '\\033]133;B\\a'; sleep 2; echo \"WORK-$i\"; printf '\\033]133;C\\a'; echo \"OUT-$i\"; printf '\\033]133;D;0\\a'; sleep 2; printf '\\033]133;A\\a'; sleep 2; i=$((i+1)); done",
+        ),
+    ]
+}
+
+/// Windows ConPTY forwards unrecognized OSC sequences, so the same markers work there.
+#[cfg(windows)]
+fn integration_program() -> Vec<String> {
+    vec![
+        String::from("powershell.exe"),
+        String::from("-NoLogo"),
+        String::from("-NoProfile"),
+        String::from("-NonInteractive"),
+        String::from("-Command"),
+        String::from(
+            "$e=[char]27; $b=[char]7; $i=0; [Console]::Write(\"$e]133;A$b\"); while ($true) { [Console]::Write(\"$e]133;B$b\"); Start-Sleep -Seconds 2; Write-Output \"WORK-$i\"; [Console]::Write(\"$e]133;C$b\"); Write-Output \"OUT-$i\"; [Console]::Write(\"$e]133;D;0$b\"); Start-Sleep -Seconds 2; [Console]::Write(\"$e]133;A$b\"); Start-Sleep -Seconds 2; $i++ }",
+        ),
+    ]
+}
+
+/// Fixed screen content for deterministic scoped waits: no scrolling, no races.
+#[cfg(unix)]
+fn static_program() -> Vec<String> {
+    vec![
+        String::from("sh"),
+        String::from("-c"),
+        String::from("printf 'ROW0\\nROW1 STATUS-42\\nROW2\\n'; sleep 300"),
+    ]
+}
+
+#[cfg(windows)]
+fn static_program() -> Vec<String> {
+    vec![
+        String::from("powershell.exe"),
+        String::from("-NoLogo"),
+        String::from("-NoProfile"),
+        String::from("-NonInteractive"),
+        String::from("-Command"),
+        String::from(
+            "Write-Output 'ROW0'; Write-Output 'ROW1 STATUS-42'; Write-Output 'ROW2'; Start-Sleep -Seconds 300",
+        ),
+    ]
+}
+
+/// Semantic waits resolve on shell integration markers instead of screen scraping.
+#[test]
+#[ignore = "spawns processes and needs a wgpu adapter"]
+fn semantic_waits_follow_shell_integration_markers() {
+    let session = Session::start("shell", &integration_program());
+
+    // The prompt marker predates the wait: tracked state resolves it immediately.
+    let ready = session.msg(&["wait", "prompt", "--timeout", "10s"]);
+    assert!(ready.contains(r#""ready":true"#), "prompt wait: {ready}");
+
+    // The next finish resolves with its own exit code, never an earlier command's.
+    let finished = session.msg(&["wait", "command-finish", "--timeout", "15s"]);
+    assert!(finished.contains(r#""status":"completed""#), "finish wait: {finished}");
+    assert!(finished.contains(r#""exit_code":0"#), "finish wait: {finished}");
+
+    // A shell emitting no markers never resolves a semantic wait.
+    let plain = Session::start("plain", &shell_program());
+    let missing = plain.try_msg(&["wait", "prompt", "--timeout", "2s"]);
+    assert!(!missing.status.success(), "a markerless shell must not resolve wait prompt");
+}
+
+/// Scoped text waits read one row or rectangle instead of the whole viewport.
+#[test]
+#[ignore = "spawns processes and needs a wgpu adapter"]
+fn scoped_text_waits_restrict_matching() {
+    let session = Session::start("scoped", &static_program());
+
+    session.msg(&["wait", "text", "STATUS-42", "--line", "1", "--timeout", "10s"]);
+    session.msg(&["wait", "text", "STATUS", "--rect", "5,1,6,1", "--timeout", "10s"]);
+    session.msg(&["wait", "text", "STATUS-[0-9]+", "--regex", "--line", "1", "--timeout", "10s"]);
+
+    // The text is on screen but on another row: the scope must refuse it.
+    let wrong_row =
+        session.try_msg(&["wait", "text", "STATUS-42", "--line", "0", "--timeout", "2s"]);
+    assert!(!wrong_row.status.success(), "row scope matched outside its row");
+}
+
+/// run-plan asserts terminal state and result shapes, and exports JUnit for CI.
+#[test]
+#[ignore = "spawns processes and needs a wgpu adapter"]
+fn run_plan_asserts_state_and_writes_junit() {
+    let session = Session::start("plan", &shell_program());
+    let windows: serde_json::Value =
+        serde_json::from_str(&session.msg(&["list-windows"])).expect("window list JSON");
+    let window_id = windows["windows"][0]["window_id"].as_u64().expect("window ID");
+
+    #[cfg(unix)]
+    let command = "echo PLAN-ASSERT-99\n";
+    #[cfg(windows)]
+    let command = "Write-Output PLAN-ASSERT-99\r";
+    let plan = session.runtime.join("assert-plan.json");
+    fs::write(
+        &plan,
+        format!(
+            r#"{{"version":2,"name":"assert-e2e","steps":[
+            {{"id":"type","method":"typing","params":{{"text":{command:?}}}}},
+            {{"id":"see","method":"wait_text","params":{{"text":"PLAN-ASSERT-99","common":{{"timeout":15000,"target":{{}}}}}},"assert":{{"text_contains":"PLAN-ASSERT-99","window_id":{window_id},"lines_from_bottom":30,"timeout_ms":15000}}}},
+            {{"id":"shape","method":"list_windows","assert":{{"result_pointer":"/windows/0/window_id","result_equals":{window_id}}}}}
+        ]}}"#
+        ),
+    )
+    .unwrap();
+    let report = session.runtime.join("junit.xml");
+    let output = session.try_msg(&[
+        "run-plan",
+        "--file",
+        plan.to_str().unwrap(),
+        "--report",
+        "junit",
+        "--output",
+        report.to_str().unwrap(),
+    ]);
+    assert!(
+        output.status.success(),
+        "run-plan failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let xml = fs::read_to_string(&report).unwrap();
+    assert!(xml.contains(r#"name="assert-e2e""#), "{xml}");
+    assert!(xml.contains(r#"tests="3" failures="0""#), "{xml}");
+    assert!(xml.contains(r#"name="see""#), "{xml}");
+
+    // A failing assertion fails the step and the suite, and the report says so.
+    let failing = session.runtime.join("failing-plan.json");
+    fs::write(
+        &failing,
+        format!(
+            r#"{{"version":2,"steps":[
+            {{"id":"miss","method":"ping","on_error":"continue","assert":{{"text_contains":"NEVER-PRINTED","window_id":{window_id},"timeout_ms":1000}}}}
+        ]}}"#
+        ),
+    )
+    .unwrap();
+    let failing_report = session.runtime.join("failing-junit.xml");
+    let failed = session.try_msg(&[
+        "run-plan",
+        "--file",
+        failing.to_str().unwrap(),
+        "--report",
+        "junit",
+        "--output",
+        failing_report.to_str().unwrap(),
+    ]);
+    assert!(!failed.status.success(), "a failing assertion must fail the plan");
+    let xml = fs::read_to_string(&failing_report).unwrap();
+    assert!(xml.contains(r#"tests="1" failures="1""#), "{xml}");
+    assert!(xml.contains("NEVER-PRINTED"), "{xml}");
+}
+
+/// `vivido test` runs a plan in an ephemeral session, reports JUnit, and tears down.
+#[test]
+#[ignore = "spawns processes and needs a wgpu adapter"]
+fn test_runner_executes_a_plan_and_tears_down() {
+    let runtime = test_runtime("runner");
+    let _ = fs::remove_dir_all(&runtime);
+    fs::create_dir_all(&runtime).expect("runtime directory");
+    set_private(&runtime);
+
+    #[cfg(unix)]
+    let latch = "echo RUNNER-SMOKE-7\n";
+    #[cfg(windows)]
+    let latch = "Write-Output 'RUNNER-SMOKE-7'\r";
+    let plan = runtime.join("smoke-plan.json");
+    fs::write(
+        &plan,
+        r#"{"version":1,"steps":[
+        {"id":"type","method":"typing","params":{"text":"LATCH"}},
+        {"id":"see","method":"wait_text","params":{"text":"RUNNER-SMOKE-7","common":{"timeout":15000,"target":{}}}}
+    ]}"#
+        .replace("LATCH", &latch.replace('\n', "\\n").replace('\r', "\\r")),
+    )
+    .unwrap();
+    let report = runtime.join("smoke-junit.xml");
+
+    let mut command = base_command(&runtime);
+    command.args([
+        "test",
+        "--session",
+        "runner-smoke",
+        "--file",
+        plan.to_str().unwrap(),
+        "--report",
+        "junit",
+        "--output",
+        report.to_str().unwrap(),
+    ]);
+    #[cfg(unix)]
+    command.args(["--", "sh"]);
+    #[cfg(windows)]
+    command.args(["--", "powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive"]);
+    let output = command.output().expect("run vivido test");
+    assert!(
+        output.status.success(),
+        "vivido test failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // Stdout stays machine-readable plan NDJSON even under the test runner.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains(r#""type":"plan_completed""#), "no plan events: {stdout}");
+    let xml = fs::read_to_string(&report).unwrap();
+    assert!(xml.contains(r#"tests="2" failures="0""#), "{xml}");
+
+    // The ephemeral session is gone: nothing to leak into the next run. Teardown is asynchronous
+    // by design — the daemon ACKs `quit`, exits its event loop, and drops its registry guard
+    // afterward — so poll instead of asserting on the first observation, which a slow renderer
+    // teardown can lose.
+    let deadline = Instant::now() + READY_TIMEOUT;
+    loop {
+        let mut list = base_command(&runtime);
+        list.arg("list");
+        let list = list.output().expect("run vivido list");
+        if !String::from_utf8_lossy(&list.stdout).contains("runner-smoke") {
+            break;
+        }
+        assert!(Instant::now() < deadline, "test session survived its passing run");
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
+    // A failing run captures evidence, keeps the session with --keep-failed, and still fails.
+    let failing = runtime.join("failing-plan.json");
+    fs::write(
+        &failing,
+        r#"{"version":1,"steps":[
+        {"id":"miss","method":"wait_text","params":{"text":"NEVER-PRINTED","common":{"timeout":1000,"target":{}}}}
+    ]}"#,
+    )
+    .unwrap();
+    let artifacts = runtime.join("artifacts");
+    let failing_report = runtime.join("failing-junit.xml");
+    let mut failed = base_command(&runtime);
+    failed.args([
+        "test",
+        "--session",
+        "runner-keep",
+        "--file",
+        failing.to_str().unwrap(),
+        "--report",
+        "junit",
+        "--output",
+        failing_report.to_str().unwrap(),
+        "--artifacts-dir",
+        artifacts.to_str().unwrap(),
+        "--keep-failed",
+    ]);
+    #[cfg(unix)]
+    failed.args(["--", "sh"]);
+    #[cfg(windows)]
+    failed.args(["--", "powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive"]);
+    let output = failed.output().expect("run failing vivido test");
+    assert!(!output.status.success(), "a failing plan must fail `vivido test`");
+    assert!(artifacts.join("miss.grid.txt").is_file(), "no grid capture");
+    assert!(artifacts.join("miss.screenshot.json").is_file(), "no screenshot capture");
+    let xml = fs::read_to_string(&failing_report).unwrap();
+    assert!(xml.contains(r#"tests="1" failures="1""#), "{xml}");
+
+    // The kept session is a real session: quit it explicitly to leave no residue.
+    let mut quit = base_command(&runtime);
+    quit.args(["kill-session", "--target", "runner-keep"]);
+    let quit = quit.output().expect("quit kept session");
+    assert!(quit.status.success(), "cannot quit kept session");
+    // `kill-session` signals and returns; the daemon clears its registry as it dies, so poll.
+    let deadline = Instant::now() + READY_TIMEOUT;
+    loop {
+        let mut list = base_command(&runtime);
+        list.arg("list");
+        let list = list.output().expect("run vivido list");
+        if !String::from_utf8_lossy(&list.stdout).contains("runner-keep") {
+            break;
+        }
+        assert!(Instant::now() < deadline, "kept session survived kill-session");
+        std::thread::sleep(Duration::from_millis(200));
+    }
 }
 
 /// The whole point: a session with no compositor still answers text and pixel queries.
@@ -273,6 +621,88 @@ fn typing_drives_the_shell_in_a_headless_session() {
     assert!(text.contains("RESULT-42"), "the shell never ran the typed command: {text}");
 }
 
+/// A clearing click leaves an empty selection anchor. Dragging the scrollbar must not expand it.
+#[cfg(unix)]
+#[test]
+#[ignore = "spawns processes and needs a wgpu adapter"]
+fn scrollbar_drag_after_clearing_selection_does_not_select_text() {
+    let session = Session::start("scrollbar-selection", &shell_program());
+    session.msg(&["typing", "seq 300\n"]);
+    session.msg(&["wait", "text", "299"]);
+
+    let inspect = || -> serde_json::Value {
+        serde_json::from_str(&session.msg(&["inspect"])).expect("inspect JSON")
+    };
+    let state = inspect();
+    assert!(state["scrollback_size"].as_u64().unwrap_or(0) > 0, "{state}");
+    let width = state["window"]["pixels"]["width"].as_u64().expect("client width");
+    let height = state["window"]["pixels"]["height"].as_u64().expect("client height");
+    let text_y = height / 2;
+    let text_start = format!("{},{}", width / 4, text_y);
+    let text_end = format!("{},{}", width / 2, text_y);
+    session.msg(&["mouse", "path", "--route", "ui", "--point", &text_start, &text_end]);
+    assert!(!inspect()["selection"].is_null(), "text drag should select");
+
+    session.msg(&[
+        "mouse",
+        "click",
+        "--route",
+        "ui",
+        "--button",
+        "left",
+        "--x",
+        &(width / 3).to_string(),
+        "--y",
+        &text_y.to_string(),
+    ]);
+    assert!(inspect()["selection"].is_null(), "click should clear the highlight");
+
+    let scrollbar_x = width - 4;
+    let scrollbar_start = format!("{},{}", scrollbar_x, height * 3 / 4);
+    let scrollbar_end = format!("{},{}", scrollbar_x, height / 4);
+    session.msg(&["mouse", "path", "--route", "ui", "--point", &scrollbar_start, &scrollbar_end]);
+    let state = inspect();
+    assert!(state["selection"].is_null(), "scrollbar drag selected text: {state}");
+    assert!(state["display_offset"].as_u64().unwrap_or(0) > 0, "scrollbar did not scroll: {state}");
+}
+
+/// A misbehaving full-screen client can be recovered without replacing the host process.
+#[test]
+#[ignore = "spawns processes and needs a wgpu adapter"]
+fn terminal_recovery_preserves_host_liveness_and_window_identity() {
+    let session = Session::start("recovery", &shell_program());
+    let windows: serde_json::Value =
+        serde_json::from_str(&session.msg(&["list-windows"])).expect("window list JSON");
+    let window_id = windows["windows"][0]["window_id"].as_u64().expect("window ID");
+
+    #[cfg(unix)]
+    session.msg(&["typing", "printf '\\033[?1049h\\033[?1003h\\033[?1004h\\033[?2004hDIRTY'\n"]);
+    #[cfg(windows)]
+    session.msg(&[
+        "typing",
+        "$e=[char]27; [Console]::Write(\"$e[?1049h$e[?1003h$e[?1004h$e[?2004hDIRTY\")\r",
+    ]);
+    session.msg(&["wait", "text", "DIRTY"]);
+    let dirty = session.msg(&["inspect"]);
+    assert!(dirty.contains(r#""screen":"alternate""#), "dirty terminal state: {dirty}");
+
+    session.msg(&["reset-terminal", "--window-id", &window_id.to_string()]);
+    assert!(session.msg(&["ping"]).contains(r#""pong""#));
+    let reset = session.msg(&["inspect", "--window-id", &window_id.to_string()]);
+    assert!(reset.contains(r#""screen":"primary""#), "reset state: {reset}");
+    for mode in ["mouse_motion", "focus_in_out", "bracketed_paste"] {
+        assert!(!reset.contains(mode), "reset retained {mode}: {reset}");
+    }
+
+    session.msg(&["restart-terminal", "--window-id", &window_id.to_string()]);
+    assert!(session.msg(&["ping"]).contains(r#""pong""#));
+    let restarted = session.msg(&["list-windows"]);
+    assert!(
+        restarted.contains(&format!(r#""window_id":{window_id}"#)),
+        "restart changed the public identity: {restarted}"
+    );
+}
+
 /// A resize must retarget the renderer, not just the grid.
 #[test]
 #[ignore = "spawns processes and needs a wgpu adapter"]
@@ -323,12 +753,69 @@ fn a_headless_session_persists_and_is_listed_until_it_is_told_to_quit() {
     assert!(text.is_empty() || text.chars().all(char::is_whitespace) || !text.is_empty());
 
     session.msg(&["quit"]);
-    std::thread::sleep(Duration::from_millis(500));
 
-    // Shutting down clears the rendezvous, so a stale entry cannot outlive the daemon.
-    assert!(!session.list().contains("lifecycle"), "the registry survived shutdown");
+    // Shutting down clears the rendezvous, so a stale entry cannot outlive the daemon. The clear
+    // happens when the daemon's registry guard drops after its event loop exits, so poll instead
+    // of sleeping a duration that only fits a fast machine.
+    let deadline = Instant::now() + READY_TIMEOUT;
+    loop {
+        if !session.list().contains("lifecycle") {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the registry survived shutdown");
+        std::thread::sleep(Duration::from_millis(100));
+    }
     #[cfg(unix)]
     assert!(!Path::new(&session.socket).exists(), "the socket survived shutdown");
+}
+
+/// `close-window` removes one window while the session keeps serving the rest.
+#[test]
+#[ignore = "spawns processes and needs a wgpu adapter"]
+fn close_window_removes_one_window_and_keeps_the_session() {
+    let session = Session::start("close", &shell_program());
+
+    let mut create_window = vec![String::from("create-window"), String::from("-e")];
+    create_window.extend(shell_program());
+    let second = session.msg(&create_window);
+    let second: u64 = second.trim().parse().expect("create-window returns a window id");
+
+    let closed = session.msg(&["close-window", "--window-id", &second.to_string()]);
+    let closed: serde_json::Value =
+        serde_json::from_str(&closed).expect("close-window replies with JSON");
+    assert_eq!(closed["window_id"], second);
+    assert_eq!(closed["closed"], true);
+
+    // The reply is sent before the terminal exit event is processed, so wait for the removal.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let windows = session.msg(&["list-windows"]);
+        if !windows.contains(&format!(r#""window_id":{second}"#)) {
+            assert_eq!(
+                windows.matches(r#""window_id""#).count(),
+                1,
+                "exactly one window remains: {windows}"
+            );
+            break;
+        }
+        assert!(Instant::now() < deadline, "closed window never left: {windows}");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    // The session outlives its closed window: the survivor still answers.
+    assert!(session.msg(&["ping"]).contains(r#""pong""#));
+
+    // A force close also removes its window rather than only killing the child.
+    let third = session.msg(&create_window);
+    let third: u64 = third.trim().parse().expect("create-window returns a window id");
+    let forced = session.msg(&["close-window", "--window-id", &third.to_string(), "--force"]);
+    let forced: serde_json::Value =
+        serde_json::from_str(&forced).expect("force close-window replies with JSON");
+    assert_eq!(forced["forced"], true);
+    assert!(session.msg(&["ping"]).contains(r#""pong""#));
+
+    // Closing a window that does not exist is refused, never silently accepted.
+    assert!(!session.try_msg(&["close-window", "--window-id", "424242"]).status.success());
 }
 
 /// Two sessions must be completely independent, including when one is torn down.
@@ -379,6 +866,50 @@ fn tearing_down_one_session_leaves_the_other_untouched() {
     let listed = second.list();
     assert!(listed.contains("iso-two"), "the survivor was unregistered: {listed:?}");
     assert!(!listed.contains("iso-one"), "the dead session was not reaped: {listed:?}");
+}
+
+/// A program that exits at once, so teardown wins the race against any later wait.
+#[cfg(unix)]
+fn exit_program() -> Vec<String> {
+    ["sh", "-c", "exit 3"].into_iter().map(String::from).collect()
+}
+
+#[cfg(windows)]
+fn exit_program() -> Vec<String> {
+    ["powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "exit 3"]
+        .into_iter()
+        .map(String::from)
+        .collect()
+}
+
+/// `wait exit` reports the exit even when the window is already gone.
+#[test]
+#[ignore = "spawns processes and needs a wgpu adapter"]
+fn wait_exit_succeeds_when_the_window_already_exited() {
+    let session = Session::start("gone", &exit_program());
+
+    // The child exits immediately; wait until teardown has removed its window so the
+    // waits below deterministically arrive after the removal.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let windows = session.msg(&["list-windows"]);
+        if !windows.contains(r#""window_id""#) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "exited window never left: {windows}");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    let named = session.msg(&["wait", "exit", "--timeout", "10s", "--window-id", "1"]);
+    assert!(named.contains(r#""exited":true"#), "named late wait: {named}");
+    assert!(named.contains(r#""code":3"#), "the recorded exit code: {named}");
+
+    let unqualified = session.msg(&["wait", "exit", "--timeout", "10s"]);
+    assert!(unqualified.contains(r#""exited":true"#), "unqualified late wait: {unqualified}");
+
+    // A window that never ran is still refused, never mistaken for an exit.
+    let missing = session.try_msg(&["wait", "exit", "--timeout", "2s", "--window-id", "424242"]);
+    assert!(!missing.status.success(), "an unknown window must not read as exited");
 }
 
 /// A session name must never escape the runtime directory.

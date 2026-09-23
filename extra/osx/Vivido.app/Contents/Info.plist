@@ -24,6 +24,8 @@
   <string>1</string>
   <key>CFBundleIconFile</key>
   <string>vivido.icns</string>
+  <key>CFBundleIconName</key>
+  <string>Vivido</string>
   <key>NSHighResolutionCapable</key>
   <true/>
   <key>NSMainNibFile</key>

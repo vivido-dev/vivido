@@ -7,7 +7,7 @@ use serde::de::{Error as SerdeError, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::terminal::term::color::COUNT;
-use crate::terminal::vte::ansi::{NamedColor, Rgb as VteRgb};
+use crate::terminal::vvte::ansi::{NamedColor, Rgb as VteRgb};
 
 use crate::config::color::Colors;
 
@@ -182,6 +182,13 @@ impl Rgb {
     #[inline]
     pub fn as_tuple(self) -> (u8, u8, u8) {
         (self.0.r, self.0.g, self.0.b)
+    }
+
+    /// Perceived brightness from 0.0 to 1.0, weighted for the eye's response to each channel.
+    #[inline]
+    pub fn brightness(self) -> f32 {
+        let (r, g, b) = self.as_tuple();
+        (0.299 * f32::from(r) + 0.587 * f32::from(g) + 0.114 * f32::from(b)) / 255.
     }
 }
 

@@ -31,6 +31,7 @@ const NEXT_ID: NodeId = NodeId(0x2_002);
 const MINIMIZE_ID: NodeId = NodeId(0x2_003);
 const MAXIMIZE_ID: NodeId = NodeId(0x2_004);
 const CLOSE_WINDOW_ID: NodeId = NodeId(0x2_005);
+const NEW_TAB_MENU_ID: NodeId = NodeId(0x2_007);
 #[cfg(target_os = "linux")]
 const MENU_ID: NodeId = NodeId(0x2_006);
 #[cfg(target_os = "linux")]
@@ -44,7 +45,7 @@ pub enum AccessibilityCommand {
     SelectTab(usize),
     CloseTab(usize),
     NewTab,
-    /// Open the `+` button's launch menu.
+    /// Open the `˅` button's launch menu.
     ShowNewTabMenu,
     /// Run the launch entry at this index of the open menu.
     #[cfg(target_os = "linux")]
@@ -200,7 +201,7 @@ fn build_tree(
         let Some(tab) = tabs.as_slice().get(*index) else { continue };
         let tab_node_id = tab_id(*index);
         let close_node_id = close_id(*index);
-        tab_list_children.extend([tab_node_id, close_node_id]);
+        tab_list_children.push(tab_node_id);
 
         let mut node = Node::new(Role::Tab);
         node.set_label(tab.title.clone());
@@ -211,6 +212,7 @@ fn build_tree(
         nodes.push((tab_node_id, node));
 
         if let Some((_, close_rect)) = hits.tab_closes.iter().find(|(i, _)| i == index) {
+            tab_list_children.push(close_node_id);
             nodes.push((close_node_id, button("Close tab", *close_rect)));
         }
     }
@@ -224,10 +226,11 @@ fn build_tree(
     }
     if hits.new_tab.width > 0 {
         tab_list_children.push(NEW_TAB_ID);
-        let mut new_tab = button("New tab", hits.new_tab);
-        // The same button offers the launch menu a right-click opens.
-        new_tab.add_action(Action::ShowContextMenu);
-        nodes.push((NEW_TAB_ID, new_tab));
+        nodes.push((NEW_TAB_ID, button("New tab", hits.new_tab)));
+    }
+    if hits.new_tab_menu.width > 0 {
+        tab_list_children.push(NEW_TAB_MENU_ID);
+        nodes.push((NEW_TAB_MENU_ID, button("New tab options", hits.new_tab_menu)));
     }
     if draw_controls {
         for (id, label, bounds) in [
@@ -258,14 +261,18 @@ fn build_tree(
     let _ = terminal;
 
     nodes.push((WINDOW_ID, root));
+    // Startup and tab changes can precede the next painted hit map. Only focus a tab
+    // emitted in this update; AccessKit rejects references to missing nodes.
+    let tab_focus = tabs
+        .active_index()
+        .map(tab_id)
+        .filter(|id| nodes.iter().any(|(node_id, _)| node_id == id))
+        .unwrap_or(WINDOW_ID);
     #[cfg(target_os = "linux")]
-    let focus = if terminal.is_some_and(|snapshot| snapshot.focused) {
-        TERMINAL_ID
-    } else {
-        tabs.active_index().map(tab_id).unwrap_or(WINDOW_ID)
-    };
+    let focus =
+        if terminal.is_some_and(|snapshot| snapshot.focused) { TERMINAL_ID } else { tab_focus };
     #[cfg(windows)]
-    let focus = tabs.active_index().map(tab_id).unwrap_or(WINDOW_ID);
+    let focus = tab_focus;
     TreeUpdate { nodes, tree: Some(TreeInfo::new(WINDOW_ID)), tree_id: TreeId::ROOT, focus }
 }
 
@@ -375,9 +382,6 @@ fn line_id(index: usize) -> NodeId {
 }
 
 fn command_for_action(action: Action, id: NodeId) -> Option<AccessibilityCommand> {
-    if action == Action::ShowContextMenu {
-        return (id == NEW_TAB_ID).then_some(AccessibilityCommand::ShowNewTabMenu);
-    }
     if !matches!(action, Action::Click | Action::Focus) {
         return None;
     }
@@ -397,6 +401,7 @@ fn command_for_node(id: NodeId) -> Option<AccessibilityCommand> {
     }
     match id {
         NEW_TAB_ID => Some(AccessibilityCommand::NewTab),
+        NEW_TAB_MENU_ID => Some(AccessibilityCommand::ShowNewTabMenu),
         PREVIOUS_ID => Some(AccessibilityCommand::PreviousTabs),
         NEXT_ID => Some(AccessibilityCommand::NextTabs),
         MINIMIZE_ID => Some(AccessibilityCommand::Minimize),
@@ -436,6 +441,90 @@ fn text_position(snapshot: &AccessibilitySnapshot, offset: usize) -> TextPositio
 mod tests {
     use super::*;
 
+    fn tab_tree(tabs: &Tabs, hits: &ChromeHitMap) -> TreeUpdate {
+        build_tree("Vivido", tabs, ChromeLayout::default(), hits, false, None, None)
+    }
+
+    fn assert_valid_references(update: &TreeUpdate) {
+        // Exercise the same validator that rejected the initial Windows tree.
+        let _ = accesskit_consumer::Tree::new(update.clone(), true);
+        let ids: std::collections::HashSet<_> = update.nodes.iter().map(|(id, _)| *id).collect();
+        assert_eq!(ids.len(), update.nodes.len(), "duplicate accessibility node");
+        assert!(ids.contains(&update.focus), "focused node is missing");
+        for (_, node) in &update.nodes {
+            for child in node.children() {
+                assert!(ids.contains(child), "child node is missing");
+            }
+        }
+    }
+
+    #[test]
+    fn removing_last_tab_before_repaint_has_valid_accessibility_tree() {
+        assert_valid_references(&empty_tree("Vivido"));
+        let mut tabs = Tabs::default();
+        let window = winit::window::WindowId::from(1);
+        tabs.add(window, "PowerShell".into());
+        let mut hits = ChromeHitMap::default();
+        hits.tabs.push((0, PhysicalRect::default()));
+        hits.tab_closes.push((0, PhysicalRect::default()));
+        assert_valid_references(&tab_tree(&tabs, &hits));
+
+        tabs.remove(window);
+        let update = tab_tree(&tabs, &hits);
+        assert_valid_references(&update);
+        assert_eq!(update.focus, WINDOW_ID);
+        assert!(!update.nodes.iter().any(|(id, _)| *id == tab_id(0) || *id == close_id(0)));
+    }
+
+    #[test]
+    fn startup_before_first_paint_has_valid_accessibility_focus() {
+        let mut tabs = Tabs::default();
+        tabs.add(winit::window::WindowId::from(1), "PowerShell".into());
+        let update = tab_tree(&tabs, &ChromeHitMap::default());
+        assert_valid_references(&update);
+        assert_eq!(update.focus, WINDOW_ID);
+    }
+
+    #[test]
+    fn tab_without_close_geometry_has_no_dangling_child() {
+        let mut tabs = Tabs::default();
+        tabs.add(winit::window::WindowId::from(1), "PowerShell".into());
+        let mut hits = ChromeHitMap::default();
+        hits.tabs.push((0, PhysicalRect::default()));
+        let update = tab_tree(&tabs, &hits);
+        assert_valid_references(&update);
+        assert_eq!(update.focus, tab_id(0));
+
+        hits.tab_closes.push((0, PhysicalRect::default()));
+        let update = tab_tree(&tabs, &hits);
+        assert_valid_references(&update);
+        assert!(update.nodes.iter().any(|(id, _)| *id == close_id(0)));
+    }
+
+    #[test]
+    fn switching_tabs_before_repaint_never_focuses_a_missing_node() {
+        let mut tabs = Tabs::default();
+        let first = winit::window::WindowId::from(1);
+        let second = winit::window::WindowId::from(2);
+        tabs.add(first, "First".into());
+        tabs.add(second, "Second".into());
+        let mut hits = ChromeHitMap::default();
+        hits.tabs.push((0, PhysicalRect::default()));
+        let update = tab_tree(&tabs, &hits);
+        assert_valid_references(&update);
+        assert_eq!(update.focus, WINDOW_ID);
+
+        hits.tabs[0].0 = 1;
+        let update = tab_tree(&tabs, &hits);
+        assert_valid_references(&update);
+        assert_eq!(update.focus, tab_id(1));
+
+        tabs.remove(second);
+        let update = tab_tree(&tabs, &hits);
+        assert_valid_references(&update);
+        assert_eq!(update.focus, WINDOW_ID);
+    }
+
     #[test]
     fn tab_and_close_nodes_map_to_commands() {
         assert_eq!(command_for_node(tab_id(7)), Some(AccessibilityCommand::SelectTab(7)));
@@ -443,15 +532,17 @@ mod tests {
     }
 
     #[test]
-    fn the_new_tab_button_answers_click_and_context_menu_differently() {
+    fn new_tab_and_options_have_separate_click_actions() {
         assert_eq!(
             command_for_action(Action::Click, NEW_TAB_ID),
             Some(AccessibilityCommand::NewTab)
         );
         assert_eq!(
-            command_for_action(Action::ShowContextMenu, NEW_TAB_ID),
+            command_for_action(Action::Click, NEW_TAB_MENU_ID),
             Some(AccessibilityCommand::ShowNewTabMenu)
         );
+        assert_eq!(command_for_action(Action::ShowContextMenu, NEW_TAB_ID), None);
+        assert_eq!(command_for_action(Action::ShowContextMenu, NEW_TAB_MENU_ID), None);
         assert_eq!(command_for_action(Action::ShowContextMenu, CLOSE_WINDOW_ID), None);
         assert_eq!(command_for_action(Action::Increment, NEW_TAB_ID), None);
     }

@@ -10,7 +10,7 @@ use super::Row;
 use crate::terminal::index::Line;
 
 /// Maximum number of buffered lines outside of the grid for performance optimization.
-const MAX_CACHE_SIZE: usize = 1_000;
+const MAX_CACHE_SIZE: usize = 256;
 
 /// A ring buffer for optimizing indexing and rotation.
 ///

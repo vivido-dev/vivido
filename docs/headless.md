@@ -42,11 +42,27 @@ later one, and stops only on `vivido msg quit`, `vivido kill-session`, or a term
 | `--session NAME` | Name the session. Default is `vivido-<pid>`, which is unique by construction. Requires `--headless`. |
 | `--foreground` | Do not detach; block in this terminal until shutdown. Requires `--headless`. |
 | `--headless-size SIZE` | Initial geometry, as `COLUMNSxLINES` or `WIDTHxHEIGHTpx`. Requires `--headless`. |
+| `--ephemeral` | Tear down when the launcher is gone or the last client disconnects. Requires `--headless`. |
 | `-s`, `--socket PATH` | Not needed headless: the session name determines the endpoint. |
 
 `--foreground` is the shape to use under a supervisor, a container entrypoint, or a test harness
 that wants the child's lifetime to be the session's lifetime. It prints the same two `export` lines
 on standard output once the session is serving.
+
+### Ephemeral sessions
+
+```sh
+vivido --headless --ephemeral --session temp_test
+```
+
+An ephemeral session tears itself down — child processes, named pipes/sockets, and registry
+entries, exactly as for `quit` — so background test runs never leak sessions. Teardown fires
+when the watched launcher process terminates (a foreground session watches its parent, which
+is the process that started it), or when the last IPC client has been disconnected for 30
+seconds. The linger tolerates the gaps between one-shot `msg` commands, each of which is its
+own connection; a detached session has no launcher to watch after detaching, so it relies on
+the disconnect trigger alone. A session nobody ever connects to stays up until its launcher
+goes away (foreground) or until it is quit explicitly.
 
 A session name is 1–64 ASCII letters, digits, `.`, `-`, or `_`, and may not start with `.`. The name
 becomes part of a filename and a pipe name, so anything that could escape the runtime directory is
@@ -62,6 +78,22 @@ fallback is 1280x720 physical pixels at scale factor 1.0.
 
 Headless windows can still be resized at runtime with `vivido msg resize`, in either grid or pixel
 units.
+
+## Agents in a headless session
+
+A headless session is a runtime instance like any other. Every pane inherits `AGENT_MESH_RUNTIME`,
+`AGENT_MESH_INSTANCE` — the session name — and `AGENT_MESH_ADDRESS`, and the session starts one
+`vvagent watch` for itself when `vvagent` is on `PATH`, leashed to the daemon so it exits with it.
+
+```sh
+eval "$(vivido --headless --session build)"
+# in a pane of that session:
+vvagent bind --alias builder        # runtime vivido, instance build, address w1
+```
+
+`AGENT_MESH_WATCH=off` opts out of the watcher; `AGENT_MESH_BIN` names the executable when it is not
+on `PATH`. Coordinates inherited from a pane this session was launched in are cleared at startup, so
+a pane sees this session's identity rather than the launcher's.
 
 ## Managing sessions
 

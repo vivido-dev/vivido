@@ -62,6 +62,24 @@ Request parameters are not repeated in trace events. `--dry-run` validates witho
 `--preflight` executes observation methods only and reports mutations or unavailable dependencies
 as skipped.
 
+Version 2 plans add an optional per-step `assert`, evaluated after a successful action and
+failing the step like an action error under the same `on_error` policy. A text assertion waits
+up to `timeout_ms` for `text_contains` in `window_id` (an ID or `{"$ref":alias}`), then checks
+the last `lines_from_bottom` rows; a result assertion requires the JSON Pointer
+`result_pointer` into the action result to equal `result_equals`. `--report junit --output
+FILE` additionally writes a JUnit XML suite (named by the plan `name`, else the file stem),
+and `--report sarif --output FILE` writes a SARIF 2.1.0 log with one result per step
+(failed steps are `error`/`fail`, skipped steps `none`/`notApplicable`), for CI integration;
+the NDJSON events still go to stdout.
+
+`vivido test --session NAME --file plan.json` runs a plan inside an ephemeral headless session
+of its own: it spawns the session (with `--headless-size` and an optional `-- SHELL...`
+program for the first window), executes with `run-plan` semantics, and shuts the session down
+afterwards. A failing run writes `<step>.grid.txt` and `<step>.screenshot.json` captures into
+`--artifacts-dir` (default `vivido-test-artifacts`), and `--keep-failed` leaves the failed
+session running with reattach instructions instead of tearing it down. The session name must
+not already exist; a generated `vivido-test-<pid>` name is used when `--session` is omitted.
+
 ## Endpoint discovery and targeting
 
 The endpoint is an owner-only Unix socket with mode `0600` on Unix, and a named pipe with an
@@ -107,7 +125,9 @@ Every connection must begin with `hello`:
 ```
 
 The response advertises the server version, protocol version, whether this instance is headless,
-its optional session and `automation_name`, methods, event kinds, stable error codes, and limits:
+its optional session and `automation_name`, methods, event kinds, stable error codes, and limits
+(including `max_conpty_windows`: 64 on Windows, where the desktop heap bounds concurrent ConPTY
+sessions per process, and null where ConPTY does not exist):
 
 ```json
 {"version":2,"id":1,"ok":true,"result":{"server_version":"0.0.0","protocol_version":2,"headless":true,"session":"build","methods":[],"event_kinds":[],"limits":{}}}
@@ -147,7 +167,7 @@ interleave. Programs must correlate responses by `id` and distinguish event fram
 Stable protocol errors are `unsupported_version`, `invalid_request`, `invalid_params`,
 `duplicate_request_id`, `limit_exceeded`, `window_not_found`, `no_focused_window`, `unsupported`,
 `invalid_state`, `timeout`, `sequence_gap`, `pty_closed`, `resize_mismatch`, `focus_denied`,
-`regex_invalid`, and `subscription_overflow`. Errors may include a `data` object with recovery
+`regex_invalid`, `subscription_overflow`, and `client_fault`. Errors may include a `data` object with recovery
 details.
 
 ## Common JSON conventions
@@ -168,14 +188,32 @@ physical modifiers pressed.
 
 - `hello {}`: required handshake. `vivido msg capabilities` prints its `result` as JSON.
 - `ping {}` / `vivido msg ping`: liveness request; returns `{"pong":true}`.
+- `reset_terminal {"window_id":ID}` / `vivido msg reset-terminal`: discards partial parser state,
+  returns to the primary screen, clears client-controlled input modes and the Vivid scene, and
+  resumes a quarantined PTY. Primary scrollback and the stable window ID are preserved.
+- `restart_terminal {"window_id":ID}` / `vivido msg restart-terminal`: transactionally creates a
+  replacement PTY and Vivid service from the pane's retained launch options. The window ID and any
+  embedding Vivida workspace/tab/split position remain stable; a failed replacement leaves the
+  existing quarantined pane available for another recovery attempt.
 - `quit {}`: shuts the whole instance down, closing every window. For a headless session this is
   the graceful stop, and it lets the daemon remove its own endpoint and registry; `vivido
   kill-session` is the forceful alternative.
+- `close_window {"window_id":ID,"force":false}` / `vivido msg close-window [-w ID] [--force]`:
+  closes one window without stopping the instance, returning
+  `{"window_id":ID,"closed":true,"forced":bool}`. Graceful close exits the terminal through the
+  normal removal path; `--force` kills the child process group first for children that ignore
+  hangup. Closing the last window of a headed instance exits it; a headless session keeps
+  serving.
 - `unsubscribe {"subscription_id":ID}`: wire-only cancellation for a subscription on the same
   connection.
 - `create_window`: synchronously constructs a complete window and returns `{"window_id":ID}`.
   The CLI is `vivido msg create-window` with its existing window, command, directory, hold, title,
-  class, and config options. `ipc_window_id` is optional and must be unique. The response does not
+  class, and config options. `ipc_window_id` is optional and must be unique. Assigned IDs are small
+  and monotonic within a process, starting at 1, and are never reused; a caller that names its own
+  ID keeps it, and automatic assignment then steps past it. The value is opaque — discover it, never
+  predict it — but it is deliberately small enough to be an agent-mesh address segment, which is a
+  one-based `u32`. A window whose ID is outside that range works normally here and simply inherits
+  no `AGENT_MESH_ADDRESS`. The response does not
   wait for the first rendered frame. In a headed Windows/Linux process this method creates and
   activates a tab in the existing top-level window; each tab's returned window ID remains its
   stable public identity. macOS and headless sessions retain their existing window semantics.
@@ -241,6 +279,19 @@ waiting until it disconnects, the same as any unanswered request.
 - `paste {"text":"...","route":"application","target":{...}}` accepts at most 1 MiB. Application
   paste uses Vivido's bracketed-paste filtering and newline normalization without entering local UI
   state. UI paste can instead update an active search.
+- `drop_file {"path":"/abs/file","at":[COLUMN,ROW],"type_path":false,"timeout":MS,"target":{...}}`
+  copies a local regular file to the Vivid receiver bound to a window, exactly as a drag would
+  (`file-drop-v1`, automation origin). Vivido opens `path` itself — the client sends it absolute —
+  without following a final link, and the receiver sees only the basename and length. Without
+  `at` the window's target-wide binding receives it; `at` hit-tests a cell for a surface binding.
+  The reply waits for the receiver's result: `{"result":"committed"|"already_committed",
+  "basename","bytes","sha256","remote_path"}`, where `sha256` is what Vivido sent and
+  `remote_path` is the committed absolute path when the receiver negotiated `file-drop-path-v1`.
+  That path goes only to this caller: never to status, diagnostics, or logs. Nothing is typed
+  unless `type_path` is true. Errors: `no_file_drop_binding` (never a fallback to typing a local
+  path), `busy`, `file_drop_rejected`, `file_drop_failed` (with `data.result`),
+  `file_drop_cancelled`, `file_drop_lost`, `timeout`. The window shows the same message-bar
+  notice as a drag while the copy runs.
 - `mouse {"action":{"move":POSITION}}` supports `move`, `click`, `double_click`, `down`, `up`,
   `drag`, `path`, and `scroll`. A position contains exactly one zero-based cell pair
   (`cell_column`,`cell_row`) or physical-pixel pair (`x`,`y`), plus `mods`, `route`, and `target`.
@@ -294,12 +345,21 @@ waiting until it disconnects, the same as any unanswered request.
   frame position, process state, and current screen/frame/output sequences.
 - `inspect {"window_id":ID}` returns the list entry plus cell dimensions, scale, scrollback,
   display offset, primary/alternate screen, terminal mode names, cursor, selection, shell PID,
-  foreground process group, optional executable basename/current directory, echo state, exit
-  status, global event sequence, and effective automation limits. It never returns process
+  live PTY telemetry (`pty_state`, session-wide `conpty_handles`, `system_memory_mb`, and
+  `active_waiters_count`), foreground process group, optional executable basename/current
+  directory, echo state, exit status, global event sequence, and effective automation limits.
+  It never returns process
   arguments, environment values, Vivid root/resume secrets, channel authenticators, or derived
   capabilities. `current_directory` prefers the shell's OSC 7 report when its host is this
   machine and falls back to the foreground-process probe; over Windows OSC 7 is the only
   source.
+  It also reports `ime_cursor_area`, lightweight native-accessibility state, `vivid_overlay`
+  resource/submission counters, and overlay render-cache passes, skips, and target allocations.
+  These counters are cumulative and are intended for bounded acceptance and performance probes;
+  they do not expose producer content or capability material.
+- `list_windows`, `inspect`, and `diagnose` include `client_health` (`healthy`, `quarantined`, or
+  `recovering`) and an optional bounded `last_client_fault` containing only an opaque fault ID,
+  fault class, and fixed diagnostic text.
 - `diagnose` captures window, renderer, presenter, track, flow, connection-health, and bounded
   recent-trace metadata in one event-loop turn. It does not wait for rendering or transport;
   asynchronous metrics carry an age.
@@ -350,8 +410,11 @@ a monotonic `event_sequence`.
 Wait methods use a 30-second CLI default. `timeout` is milliseconds on the wire and accepts 1 ms
 through 24 hours. CLI duration values accept bare milliseconds or `ms`, `s`, `m`, and `h` suffixes.
 
-- `wait_text`: params are `text`, `regex`, `after_screen`, and `common:{timeout,target}`. It searches
-  current visible text immediately unless `after_screen` requires a newer screen.
+- `wait_text`: params are `text`, `regex`, `after_screen`, an optional scope (`line` or
+  `rect`), and `common:{timeout,target}`. It searches current visible text immediately unless
+  `after_screen` requires a newer screen. `line` restricts matching to one viewport row (`0` is
+  the top, `-1` the bottom); `rect` restricts it to `COL,ROW,WIDTH,HEIGHT` from the visible
+  top-left. An out-of-range scope matches nothing and stays pending rather than erroring.
 - `wait_output`: params are `pattern`, mutually exclusive `regex`/`base64`, `after_offset`, and
   `common`. Without an offset it starts at the current output end and matches only future bytes.
   Matches may cross PTY read boundaries. An evicted explicit offset returns `sequence_gap`.
@@ -362,6 +425,12 @@ through 24 hours. CLI duration values accept bare milliseconds or `ms`, `s`, `m`
 - `wait_frame`: params are `after_frame` and `common`; omitted means the next presented frame.
 - `wait_exit`: params are `timeout` and `target`. Held windows with retained status return
   immediately; unheld windows complete from child exit before removal.
+- `wait_prompt`: params are `timeout` and `target`; returns `{"ready":true,"generation":N}` when
+  the shell sits at a prompt. `wait_command_finish`: params are `timeout` and `target`; resolves
+  on the next command finish after registration and returns
+  `{"status":"completed","exit_code":E,"elapsed_ms":M,"generation":N}`. Both require OSC 133
+  shell integration markers: a shell that never emits them never resolves these waits, and a
+  finish that already happened never resolves a later `wait_command_finish`.
 
 Regex patterns are limited to 8 KiB and use linear-time matching. Disconnecting cancels waits,
 pending tagged input, resize/focus requests, and subscriptions immediately.
@@ -432,9 +501,17 @@ Event frames have this shape:
 {"version":2,"subscription_id":7,"event_sequence":123,"window_id":42,"event":{"type":"screen_changed","data":{}}}
 ```
 
+An event frame carries the same protocol version as requests and responses. Distinguish it by the
+presence of `subscription_id`, not by `version`.
+
 Kinds are `screen_changed`, `output`, `frame_presented`, `title_changed`, `directory_changed`,
 `focus_changed`, `resized`, `moved`, `bell`, `child_exit`, `window_created`, `window_closed`, and
-`overflow`. Output data is split into
+`overflow`, plus `client_fault` and `client_recovered`. The handshake's `event_kinds` is the
+authority and is also the `--events` allowlist: a kind it does not list cannot be subscribed to by
+name. A replayable `client_fault` contains the
+window ID in the envelope and only `fault_id`, `class`, and `quarantined`; client bytes, panic
+payloads, paths, and capability material are never included. `client_recovered` follows a completed
+reset. Output data is split into
 at most 64 KiB chunks with start/end offsets and base64 bytes. Screen-change data contains current
 row replacements. `directory_changed` fires when the local shell reports a new working directory
 through OSC 7 and carries `{"directory":"/path"}`. The process replay ring is bounded by both 4 MiB and 4,096 events.

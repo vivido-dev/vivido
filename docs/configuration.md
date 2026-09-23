@@ -168,11 +168,13 @@ instance = "Vivido"
 |---|---|---|---|
 | `history` | integer | `10000` | Scrollback lines retained. Maximum `100000`. |
 | `multiplier` | integer | `3` | Lines scrolled per wheel/step increment. |
+| `scrollbar` | boolean | `true` | Show the overlay scrollbar while scrolling, dragging it, or hovering its gutter. Never shown on the alternate screen or over pane overlays. |
 
 ```toml
 [scrolling]
 history = 50000
 multiplier = 3
+scrollbar = true
 ```
 
 ## `font`
@@ -454,7 +456,7 @@ Each binding needs a `key`, optional `mods` and `mode`, and one of `action`, `ch
 Window / app: `Quit`, `Hide`, `HideOtherApplications` (macOS), `Minimize`, `ToggleFullscreen`,
 `ToggleMaximized`, `ToggleSimpleFullscreen` (macOS), `SpawnNewInstance`, `CreateNewWindow`,
 `CreateNewTab`, `SelectNextTab`, `SelectPreviousTab`, `SelectTab1`…`SelectTab9`,
-`SelectLastTab`.
+`SelectLastTab`, `CheckForUpdates`.
 
 Clipboard / selection: `Copy`, `Paste`, `CopySelection`, `PasteSelection`, `ClearSelection`.
 
@@ -471,11 +473,12 @@ Misc: `ClearHistory`, `ClearLogNotice`, `ReceiveChar`, `None`.
 
 > There is no vi mode, so vi-motion, vi-cursor, and vi-selection actions do not exist in Vivido.
 
-### Default Windows/Linux tab bindings
+### Default Windows/Linux app and tab bindings
 
 | Keys | Action |
 |---|---|
 | `Ctrl+Shift+T` | Create and activate a tab |
+| `Ctrl+Shift+U` | Check for Vivido updates |
 | `Ctrl+Shift+W` | Close the active tab |
 | `Ctrl+Tab` / `Ctrl+Shift+Tab` | Select the next / previous tab, wrapping at either end |
 | `Alt+1`…`Alt+8` | Select the matching tab from the left |
@@ -485,10 +488,10 @@ On Windows and Linux, `CreateNewWindow` also creates a tab in the current Vivido
 `SpawnNewInstance` is the action for another top-level OS window. Custom bindings replace these
 defaults by trigger in the normal way.
 
-### The tab strip's `+` menu
+### The tab strip's launch menu
 
-Left-clicking `+` creates a tab immediately, running whatever the active tab runs. Right-clicking it
-opens a small menu of launch choices instead, which the pointer or the arrow keys select from,
+Left-clicking `+` creates a tab immediately, running whatever the active tab runs. Left-clicking
+the adjacent `˅` button opens a small menu of launch choices, which the pointer or the arrow keys select from,
 `Enter` runs, and `Esc` or a click elsewhere dismisses.
 
 What the menu offers depends on the platform:
@@ -502,7 +505,7 @@ Windows probes for those programs once per session, so a distribution installed 
 running appears the next time it starts. A tab opened from the menu keeps its shell: clicking `+`
 from a WSL tab opens another WSL tab.
 
-macOS has no `+` button — it uses native window tabbing — so the menu does not apply there.
+macOS has no custom `+` or `˅` button — it uses native window tabbing — so the menu does not apply there.
 
 ### Default macOS tab bindings
 

@@ -171,8 +171,74 @@ pub struct AutomationWindowState {
     pub screen_metadata_hash: u64,
     pub transcript: Arc<Mutex<Transcript>>,
     pub exit_status: Option<ExitStatus>,
+    /// Shell prompt/command tracking folded from OSC 133 markers. Unknown — no marker ever
+    /// observed — until the shell emits integration sequences.
+    pub shell: CommandExecutionState,
     pub waiters: Vec<Waiter>,
     pub pending_writes: Vec<PendingWrite>,
+}
+
+/// Semantic shell state tracked from OSC 133 (FinalTerm/FTCS) integration markers.
+///
+/// A state update costs one event-loop turn per marker — shells emit a handful per command —
+/// and nothing at all when the shell emits no markers.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CommandExecutionState {
+    /// The shell drew a prompt and is not currently running a command.
+    pub in_prompt: bool,
+    /// A submitted command is running (between `B`/`C` and `D`).
+    pub command_running: bool,
+    /// Command line of the running command, when an emitter reports it inline.
+    pub last_command_line: Option<String>,
+    /// Exit code of the most recently finished command.
+    pub last_exit_code: Option<i32>,
+    /// Count of commands started; distinguishes one command from the next.
+    pub command_generation: u64,
+    /// Count of commands finished; a `command-finish` wait resolves on the next increment.
+    pub finished_count: u64,
+}
+
+impl CommandExecutionState {
+    /// Fold one shell-lifecycle marker into the tracked state.
+    pub fn apply(&mut self, marker: crate::osc_notification::ShellIntegrationMarker) {
+        use crate::osc_notification::ShellIntegrationMarker as Marker;
+        match marker {
+            Marker::PromptStart => {
+                self.in_prompt = true;
+                self.command_running = false;
+            },
+            Marker::CommandStart => {
+                self.in_prompt = false;
+                self.command_running = true;
+                self.last_command_line = None;
+                self.command_generation = self.command_generation.saturating_add(1);
+            },
+            Marker::CommandOutputStart => {
+                self.command_running = true;
+            },
+            Marker::CommandFinished { exit_code } => {
+                self.command_running = false;
+                self.last_exit_code = exit_code;
+                self.finished_count = self.finished_count.saturating_add(1);
+            },
+        }
+    }
+
+    /// Whether the shell is sitting at a prompt ready to accept input.
+    pub fn at_prompt(&self) -> bool {
+        self.in_prompt && !self.command_running
+    }
+}
+
+/// Viewport scope restricting a `wait text` match.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TextScope {
+    /// The whole visible viewport (the historical behavior).
+    Full,
+    /// One viewport row: `0` is the top row, `-1` the bottom row.
+    Line(i32),
+    /// A viewport rectangle: column, row, width, height, all zero-based from the top-left.
+    Rect { col: u16, row: u16, width: u16, height: u16 },
 }
 
 impl AutomationWindowState {
@@ -191,6 +257,7 @@ impl AutomationWindowState {
             screen_metadata_hash: 0,
             transcript,
             exit_status: None,
+            shell: CommandExecutionState::default(),
             waiters: Vec::new(),
             pending_writes: Vec::new(),
         }
@@ -235,6 +302,14 @@ pub enum WaitKind {
         pattern: String,
         regex: bool,
         after_screen: Option<u64>,
+        scope: TextScope,
+    },
+    /// Resolve when the shell sits at a prompt (`OSC 133;A` with no command running).
+    Prompt,
+    /// Resolve on the next command finish after registration, reporting its exit code.
+    CommandFinish {
+        after_count: u64,
+        started: Instant,
     },
     Output {
         pattern: Vec<u8>,
@@ -286,6 +361,10 @@ pub enum WaitKind {
     Focus {
         after_focus: u64,
     },
+    /// A file drop this request started, answered with the receiver's result.
+    FileDrop {
+        handle: crate::vivid::file_drop::DropHandle,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -321,12 +400,54 @@ impl StoredPayload {
     }
 
     /// Contribution to the replay ring's byte budget, which bounds retained memory.
+    ///
+    /// Both arms are an upper bound on the bytes the ring actually holds, never on the bytes a
+    /// subscriber would read off the wire. Those two differ by an order of magnitude for JSON, so
+    /// measuring the wrong one silently multiplies the budget.
     fn encoded_size(&self) -> usize {
         match self {
-            Self::Json(value) => serde_json::to_vec(value).map_or(0, |value| value.len()),
-            // Charge what a subscriber would receive: base64 emits four bytes per three.
+            Self::Json(value) => json_footprint(value),
+            // Charge what a subscriber would receive: base64 emits four bytes per three. That
+            // over-charges the retained `Vec<u8>` by a third, which keeps the bound conservative.
             Self::Output { bytes, .. } => bytes.len().div_ceil(3) * 4,
         }
+    }
+}
+
+/// Approximate heap bytes retained by a `Value` tree.
+///
+/// This charged `serde_json::to_vec(value).len()` — the *serialized* length — against a budget
+/// documented as bounding retained memory. The ring holds the parsed tree instead, and the two are
+/// nowhere near each other: `serde_json::Map` is a `BTreeMap`, whose nodes are a fixed block of
+/// roughly 640 bytes holding up to eleven entries, so a three-key object retains ~640 bytes and
+/// serializes to about forty. Measured on a live window, a 4 MiB budget was holding ~48 MiB of
+/// `BTreeMap` nodes. Serializing the whole tree to measure it also threw the result away.
+fn json_footprint(value: &Value) -> usize {
+    /// `LeafNode<String, Value>`: two `u16`, a parent pointer, and eleven slots of each, which
+    /// lands in the 640-byte allocation class.
+    const BTREE_NODE_BYTES: usize = 640;
+    /// `BTreeMap`'s per-node entry capacity (`2 * B - 1`, with `B == 6`).
+    const BTREE_NODE_ENTRIES: usize = 11;
+
+    let inline = size_of::<Value>();
+    match value {
+        Value::Null | Value::Bool(_) | Value::Number(_) => inline,
+        Value::String(text) => inline + text.capacity(),
+        Value::Array(items) => {
+            inline
+                + items.capacity() * size_of::<Value>()
+                + items.iter().map(json_footprint).sum::<usize>()
+        },
+        Value::Object(entries) => {
+            // An empty object still owns a root node.
+            let nodes = entries.len().div_ceil(BTREE_NODE_ENTRIES).max(1);
+            inline
+                + nodes * BTREE_NODE_BYTES
+                + entries
+                    .iter()
+                    .map(|(key, value)| key.capacity() + json_footprint(value))
+                    .sum::<usize>()
+        },
     }
 }
 
@@ -355,16 +476,15 @@ impl Subscriber {
 
     fn send(&mut self, event: &StoredEvent) {
         if let Some((start, end)) = self.overflow {
-            let overflow = SubscriptionEventEnvelope {
-                version: 1,
-                subscription_id: self.id,
-                event_sequence: end,
-                window_id: self.window_id,
-                event: json!({
+            let overflow = SubscriptionEventEnvelope::new(
+                self.id,
+                end,
+                self.window_id,
+                json!({
                     "type": "overflow",
                     "data": {"first_dropped_sequence": start, "last_dropped_sequence": end},
                 }),
-            };
+            );
             if self.connection.event(overflow, &self.queued_events).is_err() {
                 self.overflow = Some((start, event.sequence));
                 return;
@@ -372,13 +492,12 @@ impl Subscriber {
             self.overflow = None;
         }
 
-        let envelope = SubscriptionEventEnvelope {
-            version: 1,
-            subscription_id: self.id,
-            event_sequence: event.sequence,
-            window_id: event.window_id,
-            event: json!({"type": event.kind, "data": event.payload.to_value()}),
-        };
+        let envelope = SubscriptionEventEnvelope::new(
+            self.id,
+            event.sequence,
+            event.window_id,
+            json!({"type": event.kind, "data": event.payload.to_value()}),
+        );
         if self.connection.event(envelope, &self.queued_events).is_err() {
             self.overflow = Some(match self.overflow {
                 Some((start, _)) => (start, event.sequence),
@@ -435,6 +554,13 @@ impl AutomationHub {
     }
 
     fn emit_payload(&mut self, window_id: Option<u64>, kind: &str, payload: StoredPayload) -> u64 {
+        // An unadvertised kind is delivered to unfiltered subscriptions but cannot be named by
+        // `subscribe`, which validates against the same list. `directory_changed` sat in that state:
+        // emitted, documented, and impossible to ask for.
+        debug_assert!(
+            crate::polling::ipc::EVENT_KINDS.contains(&kind),
+            "event kind {kind:?} is emitted but not advertised in EVENT_KINDS"
+        );
         self.event_sequence = self.event_sequence.saturating_add(1);
         let encoded_size = payload.encoded_size() + kind.len() + 128;
         let event = StoredEvent {
@@ -558,6 +684,65 @@ mod tests {
     use super::*;
 
     #[test]
+    fn an_event_frame_carries_the_protocol_version() {
+        // It carried a literal `1`, written when the protocol was version 1 and left behind when
+        // the protocol moved to 2, so an event disagreed with every other frame on its connection.
+        let envelope = SubscriptionEventEnvelope::new(
+            1,
+            1,
+            Some(1),
+            serde_json::json!({"type": "bell", "data": {}}),
+        );
+
+        assert_eq!(
+            envelope.version,
+            crate::polling::ipc::PROTOCOL_VERSION,
+            "an event frame and a response frame must agree on the protocol version"
+        );
+        assert_ne!(envelope.version, 1, "the leftover value from protocol version 1");
+    }
+
+    #[test]
+    #[should_panic(expected = "not advertised in EVENT_KINDS")]
+    fn emitting_an_unadvertised_kind_is_caught_in_development() {
+        // The guard that would have caught `directory_changed`: emitting a kind `subscribe` will
+        // not accept means unfiltered subscribers see an event nobody can ask for by name.
+        AutomationHub::default().emit(Some(1), "not_a_real_kind", serde_json::json!({}));
+    }
+
+    #[test]
+    fn shell_markers_fold_into_prompt_and_command_state() {
+        use crate::osc_notification::ShellIntegrationMarker as Marker;
+        let mut shell = CommandExecutionState::default();
+        assert!(!shell.at_prompt(), "unknown state is not a prompt");
+
+        shell.apply(Marker::PromptStart);
+        assert!(shell.at_prompt());
+        assert_eq!(shell.command_generation, 0);
+
+        shell.apply(Marker::CommandStart);
+        assert!(!shell.at_prompt());
+        assert!(shell.command_running);
+        assert_eq!(shell.command_generation, 1);
+
+        shell.apply(Marker::CommandOutputStart);
+        assert!(shell.command_running);
+
+        shell.apply(Marker::CommandFinished { exit_code: Some(2) });
+        assert!(!shell.command_running);
+        assert!(!shell.at_prompt(), "a finish is not a prompt until the next prompt marker");
+        assert_eq!(shell.last_exit_code, Some(2));
+        assert_eq!(shell.finished_count, 1);
+
+        // A second command advances the generation so waits can tell commands apart.
+        shell.apply(Marker::CommandStart);
+        shell.apply(Marker::CommandFinished { exit_code: None });
+        assert_eq!(shell.command_generation, 2);
+        assert_eq!(shell.finished_count, 2);
+        assert_eq!(shell.last_exit_code, None);
+    }
+
+    #[test]
     fn transcript_has_monotonic_offsets_and_eviction_gaps() {
         let mut transcript = Transcript::default();
         assert_eq!(transcript.append(b"abc"), (0, 3));
@@ -618,6 +803,65 @@ mod tests {
         // A read running past the end returns exactly the retained remainder.
         assert_eq!(transcript.range(end - 3, 1000).unwrap().len(), 3);
         assert!(transcript.range(end, 1000).unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_replay_budget_charges_retained_bytes_not_serialized_bytes() {
+        // The budget is documented as bounding retained memory, but it measured
+        // `serde_json::to_vec(..).len()`. `serde_json::Map` is a `BTreeMap`, so even a three-key
+        // object owns a ~640-byte node: a live window was holding ~48 MiB against a 4 MiB budget.
+        let value = json!({"c": "x", "fg": 1, "bg": 2});
+        let serialized = serde_json::to_vec(&value).expect("the sample serializes").len();
+        let charged = StoredPayload::Json(value).encoded_size();
+
+        assert!(serialized < 64, "the sample is small on the wire: {serialized} bytes");
+        assert!(
+            charged > 10 * serialized,
+            "retained bytes ({charged}) must dominate serialized bytes ({serialized})",
+        );
+    }
+
+    #[test]
+    fn json_footprint_counts_nested_owners() {
+        // Nesting must recurse: a row of cells costs a node per cell, not one node for the array.
+        let cell = json!({"c": "x"});
+        let one = json_footprint(&cell);
+        let row = json!([cell.clone(), cell.clone(), cell]);
+
+        assert!(
+            json_footprint(&row) >= 3 * one,
+            "an array of three objects retains at least three objects",
+        );
+        // A string's own bytes are charged on top of the inline `Value`.
+        let short = json_footprint(&json!("a"));
+        let long = json_footprint(&Value::String("a".repeat(500)));
+        assert!(long >= 500, "a 500-byte string charges at least its bytes: {long}");
+        assert!(long > short, "a longer string costs more: {short} then {long}");
+    }
+
+    #[test]
+    fn the_replay_ring_stays_inside_its_byte_budget() {
+        // Object-shaped events are exactly what overran the ring in production.
+        let mut hub = AutomationHub::default();
+        for sequence in 0..4_000u64 {
+            hub.emit(
+                Some(1),
+                "screen_changed",
+                json!({"screen_sequence": sequence, "full": false, "rows": [1, 2, 3]}),
+            );
+        }
+
+        assert!(
+            hub.replay_bytes <= EVENT_REPLAY_BYTES,
+            "retained {} bytes against a {EVENT_REPLAY_BYTES} budget",
+            hub.replay_bytes,
+        );
+        assert!(hub.replay.len() <= EVENT_REPLAY_COUNT);
+        assert_eq!(
+            hub.replay_bytes,
+            hub.replay.iter().map(|event| event.encoded_size).sum::<usize>(),
+            "eviction must keep the running total consistent with the ring",
+        );
     }
 
     #[test]

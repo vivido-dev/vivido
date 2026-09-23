@@ -216,11 +216,8 @@ impl TabbedApplication {
             }
         }
         self.tab_options.insert(window_id, inherited_options);
-        let title = self
-            .processor
-            .window(window_id)
-            .map(|window| window.title().to_owned())
-            .unwrap_or_else(|| self.config.window.identity.title.clone());
+        let title =
+            self.tab_title(window_id).unwrap_or_else(|| self.config.window.identity.title.clone());
         self.tabs.add(window_id, title);
         self.sync_visibility_geometry_and_focus(true);
         self.request_redraw();
@@ -241,13 +238,13 @@ impl TabbedApplication {
         options
     }
 
-    /// Open the `+` button's launch menu, or close it when it is already open.
+    /// Open the `˅` button's launch menu, or close it when it is already open.
     fn toggle_new_tab_menu(&mut self, event_loop: &ActiveEventLoop) {
         if self.menu.is_some() {
             self.close_menu();
             return;
         }
-        let anchor = self.hits.new_tab;
+        let anchor = self.hits.new_tab_menu;
         let Some(bounds) = self.chrome.as_ref().map(|chrome| chrome.inner_size()) else { return };
         if anchor.width == 0 {
             return;
@@ -404,6 +401,9 @@ impl TabbedApplication {
     #[cfg(windows)]
     fn handle_menu_window_event(&mut self, event_loop: &ActiveEventLoop, event: WindowEvent) {
         match event {
+            WindowEvent::KeyboardInput { event: key, .. } => {
+                self.menu_key(event_loop, &key);
+            },
             WindowEvent::RedrawRequested => {
                 if let (Some(window), Some(menu)) = (&mut self.menu_window, &self.menu) {
                     window.render(menu);
@@ -526,13 +526,26 @@ impl TabbedApplication {
         }
     }
 
+    fn tab_title(&self, window_id: WindowId) -> Option<String> {
+        let window = self.processor.window(window_id)?;
+        #[cfg(windows)]
+        if let Some(directory) = window.display_directory().or_else(|| {
+            self.tab_options
+                .get(&window_id)
+                .and_then(|options| options.terminal_options.working_directory.clone())
+        }) {
+            return Some(directory_tab_title(&directory));
+        }
+        Some(window.title().to_owned())
+    }
+
     fn refresh_titles(&mut self) {
         let updates = self
             .tabs
             .as_slice()
             .iter()
             .filter_map(|tab| {
-                let title = self.processor.window(tab.window_id)?.title().to_owned();
+                let title = self.tab_title(tab.window_id)?;
                 (title != tab.title).then_some((tab.window_id, title))
             })
             .collect::<Vec<_>>();
@@ -782,6 +795,7 @@ impl TabbedApplication {
                 self.draw_controls,
                 &frames,
                 self.menu.as_ref(),
+                self.cursor,
             ) {
                 Ok((layout, hits, _)) => {
                     let geometry_changed = layout != self.layout;
@@ -826,6 +840,10 @@ impl TabbedApplication {
             self.hits.tabs.iter().find(|(_, rect)| rect.contains(position.x, position.y))
         {
             self.switch_to(*index);
+            return;
+        }
+        if self.hits.new_tab_menu.contains(position.x, position.y) {
+            self.toggle_new_tab_menu(event_loop);
             return;
         }
         if self.hits.new_tab.contains(position.x, position.y) {
@@ -1015,6 +1033,11 @@ impl TabbedApplication {
             },
             WindowEvent::RedrawRequested => self.render(),
             event @ WindowEvent::CursorMoved { position, .. } => {
+                if self.hits.hovered_tab_action(self.cursor)
+                    != self.hits.hovered_tab_action(Some(position))
+                {
+                    self.request_redraw();
+                }
                 self.cursor = Some(position);
                 self.update_resize_cursor(position);
                 // An open menu owns the pointer, so the pane never sees a move behind it.
@@ -1026,6 +1049,14 @@ impl TabbedApplication {
                     }
                     return;
                 }
+                #[cfg(target_os = "linux")]
+                self.route_linux_input(event);
+                #[cfg(windows)]
+                let _ = event;
+            },
+            event @ WindowEvent::CursorLeft { .. } => {
+                self.cursor = None;
+                self.request_redraw();
                 #[cfg(target_os = "linux")]
                 self.route_linux_input(event);
                 #[cfg(windows)]
@@ -1047,16 +1078,6 @@ impl TabbedApplication {
                     Some(index) => self.activate_menu_entry(event_loop, index),
                     None => self.close_menu(),
                 }
-            },
-            WindowEvent::MouseInput {
-                state: ElementState::Pressed,
-                button: MouseButton::Right,
-                ..
-            } if self
-                .cursor
-                .is_some_and(|position| self.hits.new_tab.contains(position.x, position.y)) =>
-            {
-                self.toggle_new_tab_menu(event_loop)
             },
             WindowEvent::KeyboardInput { event: key, .. } if self.menu.is_some() => {
                 self.menu_key(event_loop, &key);
@@ -1083,15 +1104,13 @@ impl TabbedApplication {
                 self.click_chrome(event_loop)
             },
             #[cfg(windows)]
-            WindowEvent::Focused(true) => {
+            WindowEvent::Focused(true) if self.menu.is_none() => {
                 // The integrated chrome is the top-level activation target, while keyboard input
                 // belongs to its active child pane. Windows can return focus to the chrome after
                 // an application-mode transition; hand it straight back so the next key is not
                 // discarded until a tab switch happens to call `SetFocus`. An open menu is the one
                 // exception: it holds the keyboard until it closes.
-                if self.menu.is_none() {
-                    self.focus_active_pane();
-                }
+                self.focus_active_pane();
             },
             #[cfg(windows)]
             WindowEvent::Focused(false) => {},
@@ -1187,6 +1206,16 @@ impl ApplicationHandler<Event> for TabbedApplication {
         window_id: WindowId,
         event: WindowEvent,
     ) {
+        #[cfg(windows)]
+        if (Some(window_id) == self.chrome_id
+            || self.menu_window.as_ref().is_some_and(|window| window.id() == window_id))
+            && let Some(events) = super::touch_click_events(&event)
+        {
+            for event in events {
+                self.window_event(event_loop, window_id, event);
+            }
+            return;
+        }
         if Some(window_id) == self.chrome_id {
             self.handle_chrome_event(event_loop, event);
             return;
@@ -1241,10 +1270,39 @@ impl ApplicationHandler<Event> for TabbedApplication {
     }
 }
 
+/// Display native Windows and WSL directories using the same folder-only labels as Vivida.
+#[cfg(windows)]
+fn directory_tab_title(directory: &std::path::Path) -> String {
+    let path = directory.to_string_lossy();
+    let name = path.trim_end_matches(['/', '\\']).rsplit(['/', '\\']).next().unwrap_or_default();
+    let name = name
+        .chars()
+        .map(|character| if character.is_control() { ' ' } else { character })
+        .collect::<String>();
+    let name = name.trim();
+    if name.is_empty() { "root".to_owned() } else { name.to_owned() }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use winit::dpi::PhysicalSize;
+
+    #[cfg(windows)]
+    #[test]
+    fn tab_labels_use_the_current_folder_for_windows_and_wsl() {
+        for (path, expected) in [
+            (r"C:\Users\dev\project", "project"),
+            ("/home/dev/project/", "project"),
+            (r"\\wsl.localhost\Ubuntu\home\dev\project\", "project"),
+            ("/", "root"),
+            (r"C:\", "C:"),
+            ("/home/dev/another", "another"),
+            ("/home/dev/my project", "my project"),
+        ] {
+            assert_eq!(directory_tab_title(std::path::Path::new(path)), expected);
+        }
+    }
 
     fn direction(x: f64, y: f64) -> Option<ResizeDirection> {
         resize_direction_at(PhysicalSize::new(800, 600), 1.0, PhysicalPosition::new(x, y))

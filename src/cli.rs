@@ -72,6 +72,12 @@ pub struct Options {
     #[clap(long, requires = "headless")]
     pub foreground: bool,
 
+    /// Tear the headless session down when its launcher is gone or its last IPC client
+    /// disconnects, so background test runs never leak sessions. Requires `--headless`.
+    #[cfg(any(unix, windows))]
+    #[clap(long, requires = "headless")]
+    pub ephemeral: bool,
+
     /// Size of the headless window, as COLUMNSxLINES or WIDTHxHEIGHTpx.
     #[cfg(any(unix, windows))]
     #[clap(long, value_name = "SIZE", requires = "headless")]
@@ -217,6 +223,17 @@ impl std::str::FromStr for HeadlessSize {
     }
 }
 
+#[cfg(any(unix, windows))]
+impl HeadlessSize {
+    /// Render back to the `COLUMNSxLINES` / `WIDTHxHEIGHTpx` CLI form.
+    pub fn as_arg(&self) -> String {
+        match *self {
+            Self::Cells { columns, lines } => format!("{columns}x{lines}"),
+            Self::Pixels { width, height } => format!("{width}x{height}px"),
+        }
+    }
+}
+
 /// Parse the class CLI parameter.
 fn parse_class(input: &str) -> Result<Class, String> {
     let (general, instance) = match input.split_once(',') {
@@ -351,6 +368,64 @@ pub enum Subcommands {
         #[clap(short = 't', long = "target", value_name = "NAME")]
         target: String,
     },
+
+    /// Run an automation plan inside an ephemeral headless session, then tear it down.
+    Test(IpcTest),
+}
+
+/// Parameters to the `test` composite command: a plan plus a session to run it in.
+///
+/// The runner spawns a fresh headless session, executes the plan with `run-plan` semantics
+/// (NDJSON events on stdout, optional JUnit/SARIF), captures a grid dump and screenshot metadata on
+/// failure, and shuts the session down — unless `--keep-failed` preserves a failed session for
+/// post-mortem inspection.
+#[cfg(any(unix, windows))]
+#[derive(Args, Debug, Clone, PartialEq, Eq)]
+pub struct IpcTest {
+    /// JSON plan file, using the `run-plan` schema. Omit this option or pass `-` for stdin.
+    #[clap(long, value_name = "PATH", value_hint = ValueHint::FilePath)]
+    pub file: Option<PathBuf>,
+
+    /// Session name. Must not already exist; defaults to `vivido-test-<pid>`.
+    #[clap(long, value_name = "NAME")]
+    pub session: Option<String>,
+
+    /// Size of the session window, as COLUMNSxLINES or WIDTHxHEIGHTpx.
+    #[clap(long, value_name = "SIZE", default_value = "100x30")]
+    pub headless_size: HeadlessSize,
+
+    /// Keep a failed session running and print how to reattach to it.
+    #[clap(long)]
+    pub keep_failed: bool,
+
+    /// Report format, as in `run-plan`. JUnit and SARIF always write `--output` too.
+    #[clap(long, value_enum, default_value = "ndjson")]
+    pub report: IpcPlanReport,
+
+    /// Destination file for `--report junit` or `--report sarif`.
+    #[clap(long, value_name = "PATH", value_hint = ValueHint::FilePath)]
+    pub output: Option<PathBuf>,
+
+    /// Directory for failure captures (`<step>.grid.txt`, `<step>.screenshot.json`).
+    #[clap(long, value_name = "DIR", value_hint = ValueHint::DirPath)]
+    pub artifacts_dir: Option<PathBuf>,
+
+    /// Set a plan variable, overriding the plan's `vars`. Repeatable as `--set KEY=VALUE`.
+    ///
+    /// Values appear in the runner's process arguments; prefer plan files or restricted
+    /// environments for secrets, which the plan masks in reports via `secrets` regardless.
+    #[clap(long = "set", value_name = "KEY=VALUE")]
+    pub set: Vec<String>,
+
+    /// Write a diagnostic bundle per failed step (frame.png, grid.json, transcript.bin,
+    /// presenter_trace.json, metadata.json). Secrets are masked in text artifacts; pixel
+    /// data in frame.png is not.
+    #[clap(long, value_name = "DIR", value_hint = ValueHint::DirPath)]
+    pub on_failure_dump: Option<PathBuf>,
+
+    /// Shell program for the session's initial window; the headless default when omitted.
+    #[clap(last = true, value_name = "SHELL")]
+    pub shell: Vec<String>,
 }
 
 /// Options for listing discoverable Vivido instances.
@@ -448,7 +523,7 @@ pub struct MessageOptions {
     #[clap(short, long, value_hint = ValueHint::FilePath)]
     pub socket: Option<PathBuf>,
 
-    /// Name of the headless session to talk to [default: $VIVIDO_SESSION, else the only session].
+    /// Name of the session to talk to [default: $VIVIDO_SESSION or $VIVIDA_TARGET, else the only session].
     #[clap(short = 't', long, value_name = "NAME", conflicts_with = "socket")]
     pub target: Option<String>,
 
@@ -464,11 +539,20 @@ pub enum SocketMessage {
     /// Create a new window in the same Vivido process.
     CreateWindow(WindowOptions),
 
+    /// Close one window, terminating its terminal without stopping the instance.
+    CloseWindow(IpcCloseWindow),
+
     /// Shut down the Vivido instance, closing every window.
     Quit,
 
     /// Check IPC liveness.
     Ping,
+
+    /// Reset parser and client-controlled terminal state for one window.
+    ResetTerminal(IpcTarget),
+
+    /// Replace one terminal process while preserving its stable window identity.
+    RestartTerminal(IpcTarget),
 
     /// Update the Vivido configuration.
     Config(IpcConfig),
@@ -481,6 +565,12 @@ pub enum SocketMessage {
 
     /// Read terminal text.
     GetText(IpcGetText),
+
+    /// Find pattern matches with cell and pixel rectangles.
+    FindText(IpcFindText),
+
+    /// Run one shell command in a window's working directory and report its result.
+    Exec(IpcExec),
 
     /// Capture the last displayed terminal frame.
     Screenshot(IpcScreenshot),
@@ -499,6 +589,12 @@ pub enum SocketMessage {
 
     /// Paste literal text into a terminal.
     Paste(IpcPaste),
+
+    /// Copy a local file to the remote receiver bound to a window, as a drag would.
+    ///
+    /// Waits for the receiver's result and prints it as JSON, including the committed path on
+    /// the remote host when the receiver reports one. Nothing is typed unless `--type-path` asks.
+    DropFile(IpcDropFile),
 
     /// Send a mouse action to a terminal or Vivido UI.
     Mouse(IpcMouse),
@@ -549,6 +645,18 @@ pub enum SocketMessage {
     Subscribe(IpcSubscribe),
 }
 
+/// Report format for the client-side `run-plan` composite command.
+#[cfg(any(unix, windows))]
+#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IpcPlanReport {
+    /// NDJSON step events on stdout (the historical output).
+    Ndjson,
+    /// JUnit XML suite written to `--output`, in addition to the NDJSON events.
+    Junit,
+    /// SARIF 2.1.0 log written to `--output`, in addition to the NDJSON events.
+    Sarif,
+}
+
 /// Parameters to the client-side `run-plan` composite command.
 #[cfg(any(unix, windows))]
 #[derive(Args, Debug, Clone, PartialEq, Eq)]
@@ -564,6 +672,28 @@ pub struct IpcRunPlan {
     /// Execute observation steps only and report mutating steps as skipped.
     #[clap(long, conflicts_with = "dry_run")]
     pub preflight: bool,
+
+    /// Report format. JUnit and SARIF always write `--output` and keep the NDJSON events
+    /// on stdout.
+    #[clap(long, value_enum, default_value = "ndjson")]
+    pub report: IpcPlanReport,
+
+    /// Destination file for `--report junit` or `--report sarif`.
+    #[clap(long, value_name = "PATH", value_hint = ValueHint::FilePath)]
+    pub output: Option<PathBuf>,
+
+    /// Set a plan variable, overriding the plan's `vars`. Repeatable as `--set KEY=VALUE`.
+    ///
+    /// Values appear in the runner's process arguments; prefer plan files or restricted
+    /// environments for secrets, which the plan masks in reports via `secrets` regardless.
+    #[clap(long = "set", value_name = "KEY=VALUE")]
+    pub set: Vec<String>,
+
+    /// Write a diagnostic bundle per failed step (frame.png, grid.json, transcript.bin,
+    /// presenter_trace.json, metadata.json). Secrets are masked in text artifacts; pixel
+    /// data in frame.png is not.
+    #[clap(long, value_name = "DIR", value_hint = ValueHint::DirPath)]
+    pub on_failure_dump: Option<PathBuf>,
 }
 
 /// Parameters to the client-side `capture` composite command.
@@ -603,6 +733,18 @@ pub struct IpcCapture {
 #[serde(deny_unknown_fields)]
 pub struct IpcAutomationPlan {
     pub version: u16,
+    /// Suite name used by JUnit/SARIF reports; defaults to the plan file stem.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Named values substituted as `${name}` throughout the steps. `--set` overrides these.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub vars: BTreeMap<String, String>,
+    /// Variable names whose values are secrets: they are masked in reports and excerpts.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub secrets: Vec<String>,
+    /// Other plan files whose steps run first, resolved relative to this file.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub include: Vec<PathBuf>,
     pub steps: Vec<IpcAutomationPlanStep>,
 }
 
@@ -623,6 +765,43 @@ pub struct IpcAutomationPlanStep {
     pub on_error: IpcPlanErrorPolicy,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verify: Option<IpcPlanVerification>,
+    /// Assertion evaluated against the step's result after a successful action.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assert: Option<IpcPlanAssertion>,
+}
+
+/// State assertion evaluated after a plan step's action succeeds.
+///
+/// A step carries at most the checks it needs: terminal-output checks, result-shape checks,
+/// or both. Either check failing fails the step exactly like an action error, honoring the
+/// step's `on_error` policy.
+#[cfg(any(unix, windows))]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct IpcPlanAssertion {
+    /// Substring that must appear in terminal text within `timeout_ms`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_contains: Option<String>,
+    /// Window the text check reads: a window ID or a `{"$ref": alias}` reference.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_id: Option<serde_json::Value>,
+    /// How long the text check waits before failing.
+    #[serde(default = "default_plan_assert_timeout")]
+    pub timeout_ms: u64,
+    /// Only inspect this many rows from the bottom of the viewport.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lines_from_bottom: Option<u16>,
+    /// JSON Pointer into the step's action result whose value must equal `result_equals`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_pointer: Option<String>,
+    /// Expected value at `result_pointer`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_equals: Option<serde_json::Value>,
+}
+
+#[cfg(any(unix, windows))]
+const fn default_plan_assert_timeout() -> u64 {
+    5_000
 }
 
 #[cfg(any(unix, windows))]
@@ -719,7 +898,10 @@ pub struct WindowOptions {
 
     /// Stable IPC ID assigned to this window.
     ///
-    /// When omitted, Vivido uses the platform window ID.
+    /// When omitted, Vivido assigns the next ID from a small monotonic per-process counter, which
+    /// is what lets a window ID also be an agent-mesh address segment. An ID named here is honored
+    /// and the counter steps past it; one outside a one-based `u32` works for automation but leaves
+    /// the window with no mesh address.
     #[cfg(any(unix, windows))]
     #[clap(short = 'w', long = "window-id", value_name = "WINDOW_ID")]
     pub ipc_window_id: Option<u64>,
@@ -842,13 +1024,70 @@ pub struct IpcGetText {
     ///
     /// The current visible viewport is returned when this is omitted.
     #[clap(long, value_parser = clap::value_parser!(u16).range(1..=1000))]
+    #[serde(default)]
     pub rows: Option<u16>,
 
     /// Window ID for terminal text.
     ///
     /// The focused window is used when no ID is specified.
     #[clap(short, long, env = "VIVIDO_WINDOW_ID")]
+    #[serde(default)]
     pub window_id: Option<u64>,
+}
+
+/// Parameters to the `find-text` IPC subcommand.
+#[cfg(any(unix, windows))]
+#[derive(Args, Serialize, Deserialize, Default, Debug, Clone, PartialEq, Eq)]
+pub struct IpcFindText {
+    /// Literal text (or regular expression with `--regex`) to locate on the visible viewport.
+    #[clap(long)]
+    pub pattern: String,
+
+    /// Treat the pattern as a regular expression instead of literal text.
+    #[clap(long, default_value_t = false)]
+    #[serde(default)]
+    pub regex: bool,
+
+    /// Window ID to search. Every window is searched when omitted.
+    #[clap(short, long, env = "VIVIDO_WINDOW_ID")]
+    #[serde(default)]
+    pub window_id: Option<u64>,
+
+    /// Maximum matches returned per window, 1 through 100.
+    #[clap(long, default_value_t = 50, value_parser = clap::value_parser!(u16).range(1..=100))]
+    #[serde(default = "default_find_text_matches")]
+    pub max_matches: u16,
+}
+
+#[cfg(any(unix, windows))]
+const fn default_find_text_matches() -> u16 {
+    50
+}
+
+/// Parameters to the `exec` IPC subcommand.
+#[cfg(any(unix, windows))]
+#[derive(Args, Serialize, Deserialize, Default, Debug, Clone, PartialEq, Eq)]
+pub struct IpcExec {
+    /// Shell command to run in the target window's working directory.
+    #[clap(long)]
+    pub command: String,
+
+    /// Window whose working directory scopes the command.
+    ///
+    /// The focused window is used when no ID is specified.
+    #[clap(short, long, env = "VIVIDO_WINDOW_ID")]
+    #[serde(default)]
+    pub window_id: Option<u64>,
+
+    /// Maximum wait for completion.
+    #[clap(long, default_value = "60s", value_parser = parse_ipc_duration)]
+    #[serde(default = "default_exec_timeout")]
+    pub timeout: u64,
+}
+
+#[cfg(any(unix, windows))]
+const fn default_exec_timeout() -> u64 {
+    crate::exec::DEFAULT_EXEC_TIMEOUT_MS
 }
 
 /// Parameters to the `screenshot` IPC subcommand.
@@ -859,6 +1098,7 @@ pub struct IpcScreenshot {
     ///
     /// The focused window is used when no ID is specified.
     #[clap(short, long, env = "VIVIDO_WINDOW_ID")]
+    #[serde(default)]
     pub window_id: Option<u64>,
 
     /// Print capture metadata together with the private PNG path.
@@ -873,7 +1113,23 @@ pub struct IpcScreenshot {
 pub struct IpcTarget {
     /// Window ID. The focused window is used when this is omitted.
     #[clap(short, long, env = "VIVIDO_WINDOW_ID")]
+    #[serde(default)]
     pub window_id: Option<u64>,
+}
+
+/// Parameters to the `close-window` IPC subcommand.
+#[cfg(any(unix, windows))]
+#[derive(Args, Serialize, Deserialize, Default, Debug, Clone, PartialEq, Eq)]
+pub struct IpcCloseWindow {
+    /// Window ID. The focused window is used when this is omitted.
+    #[clap(short, long, env = "VIVIDO_WINDOW_ID")]
+    #[serde(default)]
+    pub window_id: Option<u64>,
+
+    /// Kill the child process group first, for children that ignore hangup.
+    #[clap(short, long)]
+    #[serde(default)]
+    pub force: bool,
 }
 
 /// Parameters for a correlated diagnostic snapshot.
@@ -1081,6 +1337,43 @@ impl std::fmt::Debug for IpcPaste {
             .field("target", &self.target)
             .finish()
     }
+}
+
+/// Parameters to the `drop-file` IPC subcommand.
+#[cfg(any(unix, windows))]
+#[derive(Args, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct IpcDropFile {
+    /// The local file to copy. Vivido opens it itself, as it does a dragged file; only its name
+    /// and length reach the receiver.
+    #[clap(required = true, value_name = "PATH")]
+    pub path: PathBuf,
+
+    /// Drop onto the surface at this cell, `COLUMN,ROW`, for a receiver bound to one surface
+    /// (a remote desktop, say). Without it the window's whole-window binding receives the file.
+    #[clap(long, value_name = "COLUMN,ROW", value_parser = parse_drop_cell)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at: Option<(u16, u16)>,
+
+    /// Type the committed remote path into the terminal afterwards, exactly as a drag would.
+    /// Off by default: the typed text lands in whatever has focus.
+    #[clap(long)]
+    #[serde(default)]
+    pub type_path: bool,
+
+    /// How long to wait for the receiver's result (for example 30s or 10m).
+    #[clap(long, default_value = "10m", value_parser = parse_ipc_duration)]
+    pub timeout: u64,
+
+    #[clap(flatten)]
+    pub target: IpcTarget,
+}
+
+#[cfg(any(unix, windows))]
+fn parse_drop_cell(value: &str) -> Result<(u16, u16), String> {
+    let (column, row) =
+        value.split_once(',').ok_or_else(|| "expected COLUMN,ROW, e.g. 10,4".to_owned())?;
+    let parse = |text: &str| text.trim().parse::<u16>().map_err(|error| error.to_string());
+    Ok((parse(column)?, parse(row)?))
 }
 
 /// Mouse coordinate and modifier arguments.
@@ -1455,15 +1748,61 @@ pub struct IpcWaitCommon {
     pub target: IpcTarget,
 }
 
+/// Viewport rectangle for scoped text waits, as `COL,ROW,WIDTH,HEIGHT` zero-based from the
+/// visible top-left.
+#[cfg(any(unix, windows))]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IpcTextRect {
+    pub col: u16,
+    pub row: u16,
+    pub width: u16,
+    pub height: u16,
+}
+
+#[cfg(any(unix, windows))]
+impl std::str::FromStr for IpcTextRect {
+    type Err = String;
+
+    fn from_str(rect: &str) -> Result<Self, Self::Err> {
+        let parts: Vec<&str> = rect.split(',').collect();
+        let [col, row, width, height] = parts.as_slice() else {
+            return Err(String::from("rect must be COL,ROW,WIDTH,HEIGHT"));
+        };
+        let parse = |part: &&str, name: &str| {
+            part.parse::<u16>().map_err(|_| format!("rect {name} must be 0 through 65535"))
+        };
+        let rect = Self {
+            col: parse(col, "col")?,
+            row: parse(row, "row")?,
+            width: parse(width, "width")?,
+            height: parse(height, "height")?,
+        };
+        if rect.width == 0 || rect.width > 1000 || rect.height == 0 || rect.height > 1000 {
+            return Err(String::from("rect width and height must be 1 through 1000"));
+        }
+        Ok(rect)
+    }
+}
+
 /// Text wait parameters.
 #[cfg(any(unix, windows))]
 #[derive(Args, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct IpcWaitText {
     pub text: String,
     #[clap(long)]
+    #[serde(default)]
     pub regex: bool,
     #[clap(long)]
+    #[serde(default)]
     pub after_screen: Option<u64>,
+    /// Restrict matching to one viewport row: 0 is the top row, -1 the bottom row.
+    #[clap(long, conflicts_with = "rect", allow_hyphen_values = true)]
+    #[serde(default)]
+    pub line: Option<i32>,
+    /// Restrict matching to a viewport rectangle as COL,ROW,WIDTH,HEIGHT.
+    #[clap(long, value_name = "COL,ROW,WIDTH,HEIGHT", conflicts_with = "line")]
+    #[serde(default)]
+    pub rect: Option<IpcTextRect>,
     #[clap(flatten)]
     pub common: IpcWaitCommon,
 }
@@ -1528,6 +1867,12 @@ pub enum IpcWaitCondition {
     Frame(IpcWaitFrame),
     VividTrack(IpcWaitVividTrack),
     Exit(IpcWaitCommon),
+    /// Block until the shell sits at a prompt. Requires OSC 133 shell integration; a shell
+    /// that never emits markers never resolves this wait.
+    Prompt(IpcWaitCommon),
+    /// Block until the running command finishes, reporting its exit code. Resolves on the
+    /// next finish after registration, never on a command that already finished.
+    CommandFinish(IpcWaitCommon),
 }
 
 /// Named Vivid track conditions. The IPC v2 wire retains its registered numeric values.
@@ -1863,6 +2208,54 @@ mod tests {
 
     #[cfg(any(unix, windows))]
     #[test]
+    fn parse_drop_file_message() {
+        let options = Options::try_parse_from([
+            "vivido",
+            "msg",
+            "drop-file",
+            "build/firmware.bin",
+            "--window-id",
+            "12",
+            "--at",
+            "10,4",
+            "--type-path",
+            "--timeout",
+            "30s",
+        ])
+        .unwrap();
+        let Some(Subcommands::Msg(message)) = options.subcommands else {
+            panic!("expected msg subcommand");
+        };
+        assert_eq!(
+            message.message,
+            SocketMessage::DropFile(IpcDropFile {
+                path: PathBuf::from("build/firmware.bin"),
+                at: Some((10, 4)),
+                type_path: true,
+                timeout: 30_000,
+                target: IpcTarget { window_id: Some(12) },
+            })
+        );
+
+        // Defaults: the whole-window binding, nothing typed, ten minutes.
+        let options =
+            Options::try_parse_from(["vivido", "msg", "drop-file", "/tmp/x", "--window-id", "1"])
+                .unwrap();
+        let Some(Subcommands::Msg(message)) = options.subcommands else {
+            panic!("expected msg subcommand");
+        };
+        let SocketMessage::DropFile(params) = message.message else {
+            panic!("expected drop-file");
+        };
+        assert_eq!((params.at, params.type_path, params.timeout), (None, false, 600_000));
+
+        for bad in ["10", "a,b", "10,-1", "70000,1"] {
+            assert!(parse_drop_cell(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
     fn parse_typing_message() {
         let options =
             Options::try_parse_from(["vivido", "msg", "typing", "--window-id", "42", "echo hello"])
@@ -1941,6 +2334,206 @@ mod tests {
             panic!("expected create-window message");
         };
         assert_eq!(window_options.ipc_window_id, Some(5678));
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn parse_close_window() {
+        let options =
+            Options::try_parse_from(["vivido", "msg", "close-window", "-w", "2", "--force"])
+                .unwrap();
+        let Some(Subcommands::Msg(message)) = options.subcommands else {
+            panic!("expected msg subcommand");
+        };
+        assert_eq!(
+            message.message,
+            SocketMessage::CloseWindow(IpcCloseWindow { window_id: Some(2), force: true })
+        );
+
+        let options = Options::try_parse_from(["vivido", "msg", "close-window"]).unwrap();
+        let Some(Subcommands::Msg(message)) = options.subcommands else {
+            panic!("expected msg subcommand");
+        };
+        assert_eq!(
+            message.message,
+            SocketMessage::CloseWindow(IpcCloseWindow { window_id: None, force: false })
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn parse_test_runner() {
+        let options = Options::try_parse_from([
+            "vivido",
+            "test",
+            "--session",
+            "smoke",
+            "--keep-failed",
+            "--report",
+            "junit",
+            "--output",
+            "results.xml",
+            "--file",
+            "plan.json",
+            "--headless-size",
+            "120x40",
+            "--artifacts-dir",
+            "artifacts",
+            "--",
+            "sh",
+            "-c",
+            "echo hi",
+        ])
+        .unwrap();
+        let Some(Subcommands::Test(test)) = options.subcommands else {
+            panic!("expected test subcommand");
+        };
+        assert_eq!(
+            test,
+            IpcTest {
+                file: Some(PathBuf::from("plan.json")),
+                session: Some(String::from("smoke")),
+                headless_size: HeadlessSize::Cells { columns: 120, lines: 40 },
+                keep_failed: true,
+                report: IpcPlanReport::Junit,
+                output: Some(PathBuf::from("results.xml")),
+                artifacts_dir: Some(PathBuf::from("artifacts")),
+                shell: vec![String::from("sh"), String::from("-c"), String::from("echo hi"),],
+                set: Vec::new(),
+                on_failure_dump: None,
+            }
+        );
+
+        // Defaults: generated session name, headless default shell, NDJSON report.
+        let options = Options::try_parse_from(["vivido", "test"]).unwrap();
+        let Some(Subcommands::Test(test)) = options.subcommands else {
+            panic!("expected test subcommand");
+        };
+        assert_eq!(test.session, None);
+        assert!(!test.keep_failed);
+        assert_eq!(test.report, IpcPlanReport::Ndjson);
+        assert_eq!(test.headless_size, HeadlessSize::Cells { columns: 100, lines: 30 });
+        assert!(test.shell.is_empty());
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn parse_ephemeral_headless_session() {
+        let options = Options::try_parse_from([
+            "vivido",
+            "--headless",
+            "--ephemeral",
+            "--session",
+            "temp_test",
+        ])
+        .unwrap();
+        assert!(options.headless);
+        assert!(options.ephemeral);
+        assert_eq!(options.session.as_deref(), Some("temp_test"));
+
+        // Ephemeral teardown only means something for a headless session.
+        assert!(Options::try_parse_from(["vivido", "--ephemeral"]).is_err());
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn parse_semantic_waits() {
+        let options =
+            Options::try_parse_from(["vivido", "msg", "wait", "prompt", "--timeout", "5s"])
+                .unwrap();
+        let Some(Subcommands::Msg(message)) = options.subcommands else {
+            panic!("expected msg subcommand");
+        };
+        let SocketMessage::Wait(wait) = message.message else {
+            panic!("expected wait message");
+        };
+        assert_eq!(
+            wait.condition,
+            IpcWaitCondition::Prompt(IpcWaitCommon {
+                timeout: 5_000,
+                target: IpcTarget::default()
+            })
+        );
+
+        let options = Options::try_parse_from([
+            "vivido",
+            "msg",
+            "wait",
+            "command-finish",
+            "--window-id",
+            "3",
+            "--timeout",
+            "30s",
+        ])
+        .unwrap();
+        let Some(Subcommands::Msg(message)) = options.subcommands else {
+            panic!("expected msg subcommand");
+        };
+        let SocketMessage::Wait(wait) = message.message else {
+            panic!("expected wait message");
+        };
+        assert_eq!(
+            wait.condition,
+            IpcWaitCondition::CommandFinish(IpcWaitCommon {
+                timeout: 30_000,
+                target: IpcTarget { window_id: Some(3) },
+            })
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn parse_scoped_text_waits() {
+        let options =
+            Options::try_parse_from(["vivido", "msg", "wait", "text", "PS>", "--line", "-1"])
+                .unwrap();
+        let Some(Subcommands::Msg(message)) = options.subcommands else {
+            panic!("expected msg subcommand");
+        };
+        let SocketMessage::Wait(wait) = message.message else {
+            panic!("expected wait message");
+        };
+        let IpcWaitCondition::Text(text) = wait.condition else {
+            panic!("expected text wait");
+        };
+        assert_eq!(text.line, Some(-1));
+        assert_eq!(text.rect, None);
+
+        let options = Options::try_parse_from([
+            "vivido",
+            "msg",
+            "wait",
+            "text",
+            "Submit",
+            "--rect",
+            "40,12,6,1",
+            "--regex",
+        ])
+        .unwrap();
+        let Some(Subcommands::Msg(message)) = options.subcommands else {
+            panic!("expected msg subcommand");
+        };
+        let SocketMessage::Wait(wait) = message.message else {
+            panic!("expected wait message");
+        };
+        let IpcWaitCondition::Text(text) = wait.condition else {
+            panic!("expected text wait");
+        };
+        assert_eq!(text.rect, Some(IpcTextRect { col: 40, row: 12, width: 6, height: 1 }));
+        assert!(text.regex);
+
+        // A wait reads one scope: line and rect conflict.
+        assert!(
+            Options::try_parse_from([
+                "vivido", "msg", "wait", "text", "x", "--line", "2", "--rect", "0,0,4,4",
+            ])
+            .is_err()
+        );
+        assert!(
+            Options::try_parse_from(["vivido", "msg", "wait", "text", "x", "--rect", "0,0,0,4"])
+                .is_err()
+        );
+        assert!("10,10,80,24".parse::<IpcTextRect>().is_ok());
     }
 
     #[cfg(any(unix, windows))]
@@ -2190,6 +2783,165 @@ mod tests {
 
     #[cfg(any(unix, windows))]
     #[test]
+    fn parse_find_text_message() {
+        let options = Options::try_parse_from([
+            "vivido",
+            "msg",
+            "find-text",
+            "--pattern",
+            "Submit",
+            "--window-id",
+            "42",
+            "--regex",
+            "--max-matches",
+            "10",
+        ])
+        .unwrap();
+        let Some(Subcommands::Msg(message)) = options.subcommands else {
+            panic!("expected msg subcommand");
+        };
+        assert_eq!(
+            message.message,
+            SocketMessage::FindText(IpcFindText {
+                pattern: "Submit".to_owned(),
+                regex: true,
+                window_id: Some(42),
+                max_matches: 10,
+            })
+        );
+
+        // Defaults search literally across every window, fifty matches per window.
+        let options =
+            Options::try_parse_from(["vivido", "msg", "find-text", "--pattern", "x"]).unwrap();
+        let Some(Subcommands::Msg(message)) = options.subcommands else {
+            panic!("expected msg subcommand");
+        };
+        assert_eq!(
+            message.message,
+            SocketMessage::FindText(IpcFindText {
+                pattern: "x".to_owned(),
+                regex: false,
+                window_id: None,
+                max_matches: 50,
+            })
+        );
+
+        assert!(
+            Options::try_parse_from([
+                "vivido",
+                "msg",
+                "find-text",
+                "--pattern",
+                "x",
+                "--max-matches",
+                "0"
+            ])
+            .is_err()
+        );
+        assert!(
+            Options::try_parse_from([
+                "vivido",
+                "msg",
+                "find-text",
+                "--pattern",
+                "x",
+                "--max-matches",
+                "101"
+            ])
+            .is_err()
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn parse_plan_set_flags() {
+        let options = Options::try_parse_from([
+            "vivido",
+            "msg",
+            "run-plan",
+            "--file",
+            "plan.json",
+            "--set",
+            "USER=root",
+            "--set",
+            "TOKEN=hunter2",
+        ])
+        .unwrap();
+        let Some(Subcommands::Msg(message)) = options.subcommands else {
+            panic!("expected msg subcommand");
+        };
+        let SocketMessage::RunPlan(plan) = message.message else {
+            panic!("expected run-plan message");
+        };
+        assert_eq!(plan.file, Some(PathBuf::from("plan.json")));
+        assert_eq!(plan.set, ["USER=root".to_owned(), "TOKEN=hunter2".to_owned()]);
+        assert_eq!(plan.on_failure_dump, None);
+
+        let options =
+            Options::try_parse_from(["vivido", "msg", "run-plan", "--on-failure-dump", "dumps"])
+                .unwrap();
+        let Some(Subcommands::Msg(message)) = options.subcommands else {
+            panic!("expected msg subcommand");
+        };
+        let SocketMessage::RunPlan(plan) = message.message else {
+            panic!("expected run-plan message");
+        };
+        assert_eq!(plan.on_failure_dump, Some(PathBuf::from("dumps")));
+
+        let options =
+            Options::try_parse_from(["vivido", "test", "--set", "A=1", "--", "sh"]).unwrap();
+        let Some(Subcommands::Test(test)) = options.subcommands else {
+            panic!("expected test subcommand");
+        };
+        assert_eq!(test.set, ["A=1".to_owned()]);
+        assert_eq!(test.shell, ["sh".to_owned()]);
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn parse_exec_message() {
+        let options = Options::try_parse_from([
+            "vivido",
+            "msg",
+            "exec",
+            "--window-id",
+            "7",
+            "--command",
+            "cargo check",
+            "--timeout",
+            "5s",
+        ])
+        .unwrap();
+        let Some(Subcommands::Msg(message)) = options.subcommands else {
+            panic!("expected msg subcommand");
+        };
+        assert_eq!(
+            message.message,
+            SocketMessage::Exec(IpcExec {
+                command: "cargo check".to_owned(),
+                window_id: Some(7),
+                timeout: 5_000,
+            })
+        );
+
+        // Defaults wait one minute in the focused window.
+        let options =
+            Options::try_parse_from(["vivido", "msg", "exec", "--command", "true"]).unwrap();
+        let Some(Subcommands::Msg(message)) = options.subcommands else {
+            panic!("expected msg subcommand");
+        };
+        assert_eq!(
+            message.message,
+            SocketMessage::Exec(IpcExec {
+                command: "true".to_owned(),
+                window_id: None,
+                timeout: 60_000,
+            })
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
     fn parse_agent_control_and_wait_commands() {
         let options = Options::try_parse_from([
             "vivido",
@@ -2260,6 +3012,11 @@ mod tests {
     // clap_complete emits even hidden macOS/Windows re-exec options, so the checked-in public shell
     // completions are generated from Linux where those internal implementation details do not
     // exist.
+    //
+    // A new subcommand or flag makes this fail until the files are regenerated. That is the point,
+    // but the failure reads as a wall of shell script, so: rerun with
+    // `VIVIDO_GENERATE_COMPLETIONS=1` and commit `extra/completions/` with the change that caused
+    // it.
     #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     fn completions() {

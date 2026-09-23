@@ -31,7 +31,7 @@ use crate::terminal::grid::{Dimensions, Scroll};
 use crate::terminal::index::{Column, Direction, Point, Side};
 use crate::terminal::selection::SelectionType;
 use crate::terminal::term::{ClipboardType, Term, TermMode};
-use crate::terminal::vte::ansi::{ClearMode, Handler};
+use crate::terminal::vvte::ansi::{ClearMode, Handler};
 
 use crate::clipboard::Clipboard;
 #[cfg(target_os = "macos")]
@@ -41,7 +41,7 @@ use crate::display::hint::HintMatch;
 use crate::display::window::{ImeInhibitor, Window};
 use crate::display::{Display, SizeInfo};
 use crate::event::{ClickState, Event, EventType, Mouse, TouchPurpose, TouchZoom};
-use crate::message_bar::{self, Message};
+use crate::message_bar::{self, Message, MessageType};
 use crate::scheduler::{Scheduler, TimerId, Topic};
 
 pub mod keyboard;
@@ -62,7 +62,7 @@ const SELECTION_SCROLLING_STEP: f64 = 20.;
 const MAX_TAP_DISTANCE: f64 = 20.;
 
 /// Maximum delay between two clicks in a double-click or triple-click sequence.
-const CLICK_THRESHOLD: Duration = Duration::from_millis(400);
+pub(crate) const CLICK_THRESHOLD: Duration = Duration::from_millis(400);
 
 const SELECTION_CLIPBOARDS: [ClipboardType; 2] =
     [ClipboardType::Selection, ClipboardType::Clipboard];
@@ -79,6 +79,13 @@ fn next_click_state(mouse: &Mouse, button: MouseButton, point: Point, now: Insta
         // A fourth click matches no arm and so restarts the sequence at a single click.
         _ => ClickState::Click,
     }
+}
+
+fn is_update_notice(message: Option<&Message>) -> bool {
+    message.is_some_and(|message| {
+        message.ty() == MessageType::Info
+            && message.target().map(String::as_str) == Some(crate::event::UPDATE_MESSAGE_TARGET)
+    })
 }
 
 fn selection_clipboards(button: MouseButton) -> &'static [ClipboardType] {
@@ -120,6 +127,8 @@ pub struct Processor<T: EventListener, A: ActionContext<T>> {
 }
 
 pub trait ActionContext<T: EventListener> {
+    fn toggle_microphone(&self) {}
+    fn next_microphone(&self) {}
     fn write_to_pty<B: Into<Cow<'static, [u8]>>>(&self, _data: B) {}
     fn mark_dirty(&mut self) {}
     fn size_info(&self) -> SizeInfo;
@@ -132,6 +141,35 @@ pub trait ActionContext<T: EventListener> {
     ///
     /// The default is "no grant", which is every context that is not a live window.
     fn send_desktop_input(&self, _event: vivid_protocol::input::InputEvent) -> bool {
+        false
+    }
+    fn overlay_keyboard(&self, _event: vivid_protocol::overlay::Event, _escape: bool) -> bool {
+        false
+    }
+    fn overlay_capturing(&self) -> bool {
+        false
+    }
+    /// The cursor the hovered overlay region asks for, if any.
+    fn overlay_cursor(&self) -> Option<CursorIcon> {
+        None
+    }
+    fn overlay_pointer(
+        &self,
+        _x: f64,
+        _y: f64,
+        _button: Option<(u16, bool)>,
+        _modifiers: u32,
+        _pressure: Option<f64>,
+    ) -> bool {
+        false
+    }
+    fn overlay_wheel(
+        &self,
+        _x: f64,
+        _y: f64,
+        _scroll: crate::vivid::overlay::ScrollInput,
+        _modifiers: u32,
+    ) -> bool {
         false
     }
     /// Route clipboard media to the live file-drop binding, returning whether it took the paste.
@@ -160,6 +198,9 @@ pub trait ActionContext<T: EventListener> {
     fn create_new_window(&mut self) {}
     fn change_font_size(&mut self, _delta: f32) {}
     fn reset_font_size(&mut self) {}
+    fn terminal_recovery(&mut self) {}
+    fn check_for_updates(&self) {}
+    fn install_update(&self) {}
     fn pop_message(&mut self) {}
     fn message(&self) -> Option<&Message>;
     fn config(&self) -> &UiConfig;
@@ -246,6 +287,8 @@ impl<T: EventListener> Execute<T> for Action {
                 ctx.shell_action(crate::shell::ShellAction::ToggleFullscreen);
             },
             Action::ToggleFullscreen => ctx.window().toggle_fullscreen(),
+            Action::ToggleMicrophone => ctx.toggle_microphone(),
+            Action::NextMicrophone => ctx.next_microphone(),
             #[cfg(any(target_os = "linux", windows))]
             Action::ToggleMaximized if ctx.window().is_hosted() => {
                 ctx.shell_action(crate::shell::ShellAction::ToggleMaximized);
@@ -283,6 +326,8 @@ impl<T: EventListener> Execute<T> for Action {
             Action::IncreaseFontSize => ctx.change_font_size(FONT_SIZE_STEP),
             Action::DecreaseFontSize => ctx.change_font_size(-FONT_SIZE_STEP),
             Action::ResetFontSize => ctx.reset_font_size(),
+            Action::TerminalRecovery => ctx.terminal_recovery(),
+            Action::CheckForUpdates => ctx.check_for_updates(),
             Action::ScrollPageUp
             | Action::ScrollPageDown
             | Action::ScrollHalfPageUp
@@ -422,21 +467,80 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
     #[inline]
     pub fn mouse_moved(&mut self, position: PhysicalPosition<f64>) {
         let size_info = self.ctx.size_info();
+        let scrollbar_scale = self.ctx.display().window.scale_factor as f32;
 
-        let (x, y) = position.into();
+        // A scrollbar drag owns the pointer: track it ahead of pane overlays so a host
+        // gesture never leaks into producer UI mid-drag.
+        if self.ctx.display().scrollbar.dragging() {
+            let x = position.x.max(0.) as usize;
+            let y = position.y.max(0.) as usize;
+            self.ctx.mouse_mut().x = x;
+            self.ctx.mouse_mut().y = y;
+            if let Some(target) =
+                self.ctx.display().scrollbar.drag_target(&size_info, scrollbar_scale, y as f32)
+            {
+                let current = self.ctx.terminal().grid().display_offset();
+                if target != current {
+                    self.ctx.scroll(Scroll::Delta(target as i32 - current as i32));
+                }
+            }
+            return;
+        }
+
+        let (raw_x, raw_y): (i32, i32) = position.into();
+        let x = raw_x.clamp(0, size_info.width() as i32 - 1) as usize;
+        let y = raw_y.clamp(0, size_info.height() as i32 - 1) as usize;
+
+        // The wider invisible interaction strip is host chrome. Keep pointer motion in it away
+        // from terminal selection, application mouse reporting, and producer overlays. An overlay
+        // which already owns a gesture keeps its capture until release.
+        let scrollbar_inside = !self.ctx.overlay_capturing()
+            && self.ctx.display().scrollbar.contains_point(
+                &size_info,
+                scrollbar_scale,
+                position.x as f32,
+                position.y as f32,
+            );
+        let scrollbar_hover_changed =
+            self.ctx.display().scrollbar.set_hover(Instant::now(), scrollbar_inside);
+        if scrollbar_hover_changed {
+            self.ctx.mark_dirty();
+            // The frame pump may be idle in quiescence; a bare dirty flag waits for a frame
+            // timer that is not scheduled, so request the redraw explicitly.
+            self.ctx.window().request_redraw();
+        }
+        if scrollbar_inside {
+            let mouse = self.ctx.mouse_mut();
+            mouse.x = x;
+            mouse.y = y;
+            mouse.inside_text_area = false;
+            mouse.hint_highlight_dirty = true;
+            mouse.block_hint_launcher = true;
+            self.ctx.window().set_mouse_cursor(CursorIcon::Default);
+            return;
+        }
+
+        let overlay_modifiers = crate::vivid::hid::modifiers(self.ctx.modifiers().state());
+        if (size_info.contains_point(position.x.max(0.) as usize, position.y.max(0.) as usize)
+            || self.ctx.overlay_capturing())
+            && self.ctx.overlay_pointer(position.x, position.y, None, overlay_modifiers, None)
+        {
+            self.ctx.mouse_mut().x = position.x.max(0.) as usize;
+            self.ctx.mouse_mut().y = position.y.max(0.) as usize;
+            return;
+        }
+
         let old_pixel = (self.ctx.mouse().x, self.ctx.mouse().y);
 
         let lmb_pressed = self.ctx.mouse().left_button_state == ElementState::Pressed;
         let rmb_pressed = self.ctx.mouse().right_button_state == ElementState::Pressed;
         if !self.ctx.selection_is_empty() && (lmb_pressed || rmb_pressed) {
-            self.update_selection_scrolling(y);
+            self.update_selection_scrolling(raw_y);
         }
 
         let display_offset = self.ctx.terminal().grid().display_offset();
         let old_point = self.ctx.mouse().point(&size_info, display_offset);
 
-        let x = x.clamp(0, size_info.width() as i32 - 1) as usize;
-        let y = y.clamp(0, size_info.height() as i32 - 1) as usize;
         self.ctx.mouse_mut().x = x;
         self.ctx.mouse_mut().y = y;
 
@@ -683,6 +787,34 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
     }
 
     pub fn mouse_wheel_input(&mut self, delta: MouseScrollDelta, phase: TouchPhase) {
+        let overlay_modifiers = crate::vivid::hid::modifiers(self.ctx.modifiers().state());
+        let (dx, dy, precise) = match delta {
+            MouseScrollDelta::LineDelta(x, y) => (
+                f64::from(x * self.ctx.size_info().cell_width()),
+                f64::from(y * self.ctx.size_info().cell_height()),
+                false,
+            ),
+            MouseScrollDelta::PixelDelta(position) => (position.x, position.y, true),
+        };
+        let scroll = crate::vivid::overlay::ScrollInput {
+            dx,
+            dy,
+            precise,
+            phase: match phase {
+                TouchPhase::Started => vivid_protocol::overlay::ScrollPhase::Began,
+                TouchPhase::Moved => vivid_protocol::overlay::ScrollPhase::Changed,
+                TouchPhase::Ended => vivid_protocol::overlay::ScrollPhase::Ended,
+                TouchPhase::Cancelled => vivid_protocol::overlay::ScrollPhase::Cancelled,
+            },
+        };
+        if self.ctx.overlay_wheel(
+            self.ctx.mouse().x as f64,
+            self.ctx.mouse().y as f64,
+            scroll,
+            overlay_modifiers,
+        ) {
+            return;
+        }
         let multiplier = self.ctx.config().scrolling.multiplier;
         match delta {
             MouseScrollDelta::LineDelta(columns, lines) => {
@@ -946,6 +1078,57 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
     }
 
     pub fn mouse_input(&mut self, state: ElementState, button: MouseButton) {
+        // The scrollbar is host chrome: presses on its invisible interaction strip drag the
+        // scrollback instead of selecting, reporting to the application, or hitting overlays and
+        // mouse bindings. An overlay which already captured a gesture keeps priority until release.
+        if button == MouseButton::Left {
+            let size_info = self.ctx.size_info();
+            let scrollbar_scale = self.ctx.display().window.scale_factor as f32;
+            let (mouse_x, mouse_y) = (self.ctx.mouse().x, self.ctx.mouse().y);
+            let drag_starting = state == ElementState::Pressed
+                && !self.ctx.overlay_capturing()
+                && self.ctx.display().scrollbar.contains_point(
+                    &size_info,
+                    scrollbar_scale,
+                    mouse_x as f32,
+                    mouse_y as f32,
+                );
+            let drag_ending =
+                state == ElementState::Released && self.ctx.display().scrollbar.dragging();
+            if drag_starting || drag_ending {
+                self.ctx.mouse_mut().left_button_state = state;
+                let scrollbar = &mut self.ctx.display().scrollbar;
+                if drag_starting {
+                    scrollbar.begin_drag(
+                        Instant::now(),
+                        &size_info,
+                        scrollbar_scale,
+                        mouse_y as f32,
+                    );
+                } else {
+                    scrollbar.end_drag(Instant::now());
+                }
+                self.ctx.mark_dirty();
+                self.ctx.window().request_redraw();
+                return;
+            }
+        }
+
+        let overlay_modifiers = crate::vivid::hid::modifiers(self.ctx.modifiers().state());
+        if let Some(overlay_button) = crate::vivid::hid::button(button)
+            && (self.ctx.size_info().contains_point(self.ctx.mouse().x, self.ctx.mouse().y)
+                || self.ctx.overlay_capturing())
+            && self.ctx.overlay_pointer(
+                self.ctx.mouse().x as f64,
+                self.ctx.mouse().y as f64,
+                Some((overlay_button, state == ElementState::Pressed)),
+                overlay_modifiers,
+                None,
+            )
+        {
+            return;
+        }
+
         match button {
             MouseButton::Left => self.ctx.mouse_mut().left_button_state = state,
             MouseButton::Middle => self.ctx.mouse_mut().middle_button_state = state,
@@ -962,6 +1145,10 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
             let current_lines = self.ctx.message().map_or(0, |m| m.text(&size).len());
 
             self.ctx.clear_selection();
+            if self.update_notice_active() {
+                self.ctx.install_update();
+                return;
+            }
             self.ctx.pop_message();
 
             // Reset cursor when message bar height changed or all messages are gone.
@@ -972,6 +1159,7 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
                 Ordering::Equal => CursorIcon::Pointer,
                 Ordering::Greater => crate::display::resolve_mouse_cursor(
                     None,
+                    self.ctx.overlay_cursor(),
                     false,
                     self.ctx.terminal().mouse_cursor_icon(),
                     self.ctx.mouse_mode(),
@@ -1042,13 +1230,18 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
 
         if self.ctx.message().is_none() || (mouse.y <= terminal_end) {
             None
-        } else if mouse.y <= terminal_end + size.cell_height() as usize
-            && point.column + message_bar::CLOSE_BUTTON_TEXT.len() >= size.columns()
+        } else if self.update_notice_active()
+            || (mouse.y <= terminal_end + size.cell_height() as usize
+                && point.column + message_bar::CLOSE_BUTTON_TEXT.len() >= size.columns())
         {
             Some(CursorIcon::Pointer)
         } else {
             Some(CursorIcon::Default)
         }
+    }
+
+    fn update_notice_active(&self) -> bool {
+        is_update_notice(self.ctx.message())
     }
 
     /// Icon state of the cursor.
@@ -1062,6 +1255,7 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
 
         crate::display::resolve_mouse_cursor(
             self.message_bar_cursor_state(),
+            self.ctx.overlay_cursor(),
             self.ctx.display().highlighted_hint.as_ref().is_some_and(hint_highlighted),
             self.ctx.terminal().mouse_cursor_icon(),
             !self.modifiers_state().shift_key() && self.ctx.mouse_mode(),
@@ -1225,6 +1419,21 @@ mod tests {
         assert_eq!(selection_clipboards(MouseButton::Left), &SELECTION_CLIPBOARDS);
         assert_eq!(selection_clipboards(MouseButton::Right), &SELECTION_CLIPBOARDS);
         assert!(selection_clipboards(MouseButton::Middle).is_empty());
+    }
+
+    #[test]
+    fn only_targeted_info_messages_activate_update_installation() {
+        let mut update = Message::new("Vivido 1.0 is available".into(), MessageType::Info);
+        update.set_target(crate::event::UPDATE_MESSAGE_TARGET.into());
+        assert!(is_update_notice(Some(&update)));
+
+        let mut warning = Message::new("Vivido 1.0 is available".into(), MessageType::Warning);
+        warning.set_target(crate::event::UPDATE_MESSAGE_TARGET.into());
+        assert!(!is_update_notice(Some(&warning)));
+
+        let information = Message::new("Vivido is up to date".into(), MessageType::Info);
+        assert!(!is_update_notice(Some(&information)));
+        assert!(!is_update_notice(None));
     }
 
     #[test]
