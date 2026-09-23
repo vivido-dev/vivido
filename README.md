@@ -7,16 +7,15 @@ text like a champion — and then goes where no terminal has gone before: images
 play *inside* your shell, and AI agents get a first-class API to drive, read, and observe every
 window. One terminal, built for the two users who share it: you and your agent.
 
-> [!WARNING]
-> **On Windows, do not install WezTerm alongside Vivido.** Older Vivido builds can load
-> WezTerm's bundled `conpty.dll` from `PATH`. We reproduced dropped key-release events with
-> that DLL, causing controls in apps such as vvdoom to stop responding after the first movement.
-> Updated Vivido builds use Windows' built-in ConPTY instead. If WezTerm is already installed,
-> remove its directory from `PATH` or uninstall it, then restart Vivido completely.
+<img width="1915" height="1077" alt="vivida_screenshot" src="https://github.com/user-attachments/assets/752ddf5b-f8e6-46b0-b4a1-b8ce5133eece" />
+
+(screenshot is [Vivida](https://github.com/vivido-dev/vivida), a wrapper of vivido, vivido does not have workspaces and split panes, but you can use [vvmux](https://github.com/vivido-dev/vvmux) to similar effects in Vivido)
 
 ## Why developers love Vivido
 
 ### Speed you can feel
+
+Vivido is one of the fastest terminal, ([see benchmark](docs/benchmarks.md) vivido is the fastest on benchmark average).
 
 Text is rendered on the GPU through [wgpu](https://github.com/gfx-rs/wgpu),
 riding Metal on macOS, DirectX 12 on Windows, and Vulkan on Linux.
@@ -99,3 +98,12 @@ its authors and contributors for the outstanding foundation it is built on.
 ## License
 
 Vivido is released under the Apache-2.0 license. See [LICENSE](LICENSE).
+
+## Note
+
+> [!WARNING]
+> **On Windows, do not install WezTerm alongside Vivido.** Older Vivido builds can load
+> WezTerm's bundled `conpty.dll` from `PATH`. We reproduced dropped key-release events with
+> that DLL, causing controls in apps such as vvdoom to stop responding after the first movement.
+> Updated Vivido builds use Windows' built-in ConPTY instead. If WezTerm is already installed,
+> remove its directory from `PATH` or uninstall it, then restart Vivido completely.
