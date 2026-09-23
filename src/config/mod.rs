@@ -341,7 +341,7 @@ pub fn installed_config() -> Option<PathBuf> {
 #[cfg(windows)]
 pub fn installed_config() -> Option<PathBuf> {
     let user_profile = env::var_os("USERPROFILE").map(PathBuf::from).or_else(home::home_dir);
-    first_existing_windows_config(windows_config_candidates(user_profile, dirs::config_dir()))
+    first_existing_windows_config(windows_config_candidates(user_profile))
 }
 
 /// Return the per-user directory for Vivido configuration and state.
@@ -368,28 +368,18 @@ fn first_existing_windows_config(candidates: Vec<PathBuf>) -> Option<PathBuf> {
 /// Return Windows configuration candidates in lookup order.
 ///
 /// `%USERPROFILE%\.config\vivido` matches the cross-platform user location.
-/// The installer-managed `%USERPROFILE%\vivido` path and the former roaming
-/// `%APPDATA%\vivido` path remain fallbacks.
+/// The installer-managed `%USERPROFILE%\vivido` path is the fallback.
 #[cfg(any(windows, test))]
-fn windows_config_candidates(
-    home_dir: Option<PathBuf>,
-    roaming_config_dir: Option<PathBuf>,
-) -> Vec<PathBuf> {
+fn windows_config_candidates(home_dir: Option<PathBuf>) -> Vec<PathBuf> {
     let file_name = "vivido.toml";
-    let mut candidates = Vec::with_capacity(3);
-
-    if let Some(home_dir) = home_dir {
-        candidates.push(home_dir.join(".config").join("vivido").join(file_name));
-        candidates.push(home_dir.join("vivido").join(file_name));
-    }
-    if let Some(roaming_config_dir) = roaming_config_dir {
-        let legacy = roaming_config_dir.join("vivido").join(file_name);
-        if !candidates.contains(&legacy) {
-            candidates.push(legacy);
-        }
-    }
-
-    candidates
+    home_dir
+        .map(|home_dir| {
+            vec![
+                home_dir.join(".config").join("vivido").join(file_name),
+                home_dir.join("vivido").join(file_name),
+            ]
+        })
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -481,44 +471,38 @@ mod tests {
     }
 
     #[test]
-    fn windows_config_prefers_dot_config_and_keeps_existing_fallbacks() {
+    fn windows_config_prefers_dot_config_then_installer_path() {
         let home = PathBuf::from("profile/José Example");
-        let roaming = PathBuf::from("profile/José Example/AppData/Roaming");
-        let candidates = windows_config_candidates(Some(home.clone()), Some(roaming.clone()));
+        let candidates = windows_config_candidates(Some(home.clone()));
 
         assert_eq!(
             candidates,
             [
                 home.join(".config").join("vivido").join("vivido.toml"),
                 home.join("vivido").join("vivido.toml"),
-                roaming.join("vivido").join("vivido.toml"),
             ]
         );
     }
 
     #[test]
-    fn windows_config_discovers_new_path_before_legacy_and_falls_back() {
+    fn windows_config_discovers_dot_config_before_installer_path() {
         let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         let root = env::temp_dir().join(format!("vivido-config-discovery-José-{nonce}"));
         let profile = root.join("profile");
-        let roaming = root.join("roaming");
         let dot_config_path = profile.join(".config/vivido/vivido.toml");
         let installer_path = profile.join("vivido/vivido.toml");
-        let legacy_path = roaming.join("vivido/vivido.toml");
         fs::create_dir_all(dot_config_path.parent().unwrap()).unwrap();
         fs::create_dir_all(installer_path.parent().unwrap()).unwrap();
-        fs::create_dir_all(legacy_path.parent().unwrap()).unwrap();
-        fs::write(&legacy_path, "legacy = true\n").unwrap();
 
-        let candidates = windows_config_candidates(Some(profile.clone()), Some(roaming.clone()));
-        assert_eq!(first_existing_windows_config(candidates), Some(legacy_path.clone()));
+        let candidates = windows_config_candidates(Some(profile.clone()));
+        assert_eq!(first_existing_windows_config(candidates), None);
 
         fs::write(&installer_path, "installer = true\n").unwrap();
-        let candidates = windows_config_candidates(Some(profile.clone()), Some(roaming.clone()));
+        let candidates = windows_config_candidates(Some(profile.clone()));
         assert_eq!(first_existing_windows_config(candidates), Some(installer_path));
 
         fs::write(&dot_config_path, "dot_config = true\n").unwrap();
-        let candidates = windows_config_candidates(Some(profile), Some(roaming));
+        let candidates = windows_config_candidates(Some(profile));
         assert_eq!(first_existing_windows_config(candidates), Some(dot_config_path));
         fs::remove_dir_all(root).unwrap();
     }

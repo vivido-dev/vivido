@@ -36,21 +36,17 @@ fn main() {
 
 fn initialize_config() -> io::Result<()> {
     let user_profile = required_env_path("USERPROFILE")?;
-    let app_data = required_env_path("APPDATA")?;
-    initialize_config_at(&user_profile, &app_data)
+    initialize_config_at(&user_profile)
 }
 
-fn initialize_config_at(user_profile: &Path, app_data: &Path) -> io::Result<()> {
+fn initialize_config_at(user_profile: &Path) -> io::Result<()> {
     let dot_config_root = user_profile.join(".config");
     let dot_config_dir = dot_config_root.join("vivido");
     let dot_config_path = dot_config_dir.join("vivido.toml");
     let config_dir = user_profile.join("vivido");
     let config_path = config_dir.join("vivido.toml");
-    let legacy_dir = app_data.join("vivido");
-    let legacy_path = legacy_dir.join("vivido.toml");
 
     reject_reparse_point(user_profile)?;
-    reject_reparse_point(app_data)?;
     if dot_config_path.exists() {
         reject_reparse_point(&dot_config_root)?;
         reject_reparse_point(&dot_config_dir)?;
@@ -67,20 +63,8 @@ fn initialize_config_at(user_profile: &Path, app_data: &Path) -> io::Result<()> 
         return Ok(());
     }
 
-    if legacy_dir.exists() {
-        reject_reparse_point(&legacy_dir)?;
-    }
-    let contents = match fs::read(&legacy_path) {
-        Ok(contents) => {
-            reject_reparse_point(&legacy_path)?;
-            contents
-        },
-        Err(error) if error.kind() == io::ErrorKind::NotFound => DEFAULT_CONFIG.as_bytes().to_vec(),
-        Err(error) => return Err(error),
-    };
-
     let mut destination = OpenOptions::new().write(true).create_new(true).open(config_path)?;
-    destination.write_all(&contents)?;
+    destination.write_all(DEFAULT_CONFIG.as_bytes())?;
     destination.sync_all()
 }
 
@@ -251,13 +235,10 @@ mod tests {
     fn config_init_preserves_existing_user_file() {
         let root = temporary_root("existing");
         let profile = root.join("profile");
-        let roaming = root.join("roaming");
         fs::create_dir_all(profile.join("vivido")).unwrap();
-        fs::create_dir_all(roaming.join("vivido")).unwrap();
         fs::write(profile.join("vivido/vivido.toml"), "existing = true\n").unwrap();
-        fs::write(roaming.join("vivido/vivido.toml"), "legacy = true\n").unwrap();
 
-        initialize_config_at(&profile, &roaming).unwrap();
+        initialize_config_at(&profile).unwrap();
         assert_eq!(
             fs::read_to_string(profile.join("vivido/vivido.toml")).unwrap(),
             "existing = true\n"
@@ -269,32 +250,13 @@ mod tests {
     fn config_init_preserves_existing_dot_config_without_seeding_fallback() {
         let root = temporary_root("dot-config");
         let profile = root.join("profile");
-        let roaming = root.join("roaming");
         let dot_config = profile.join(".config/vivido/vivido.toml");
         fs::create_dir_all(dot_config.parent().unwrap()).unwrap();
-        fs::create_dir_all(&roaming).unwrap();
         fs::write(&dot_config, "existing = true\n").unwrap();
 
-        initialize_config_at(&profile, &roaming).unwrap();
+        initialize_config_at(&profile).unwrap();
         assert_eq!(fs::read_to_string(dot_config).unwrap(), "existing = true\n");
         assert!(!profile.join("vivido/vivido.toml").exists());
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn config_init_migrates_legacy_file_with_unicode_path() {
-        let root = temporary_root("José Example");
-        let profile = root.join("profile");
-        let roaming = root.join("roaming");
-        fs::create_dir_all(&profile).unwrap();
-        fs::create_dir_all(roaming.join("vivido")).unwrap();
-        fs::write(roaming.join("vivido/vivido.toml"), "legacy = true\n").unwrap();
-
-        initialize_config_at(&profile, &roaming).unwrap();
-        assert_eq!(
-            fs::read_to_string(profile.join("vivido/vivido.toml")).unwrap(),
-            "legacy = true\n"
-        );
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -302,11 +264,9 @@ mod tests {
     fn config_init_seeds_default_when_no_config_exists() {
         let root = temporary_root("default");
         let profile = root.join("profile");
-        let roaming = root.join("roaming");
         fs::create_dir_all(&profile).unwrap();
-        fs::create_dir_all(&roaming).unwrap();
 
-        initialize_config_at(&profile, &roaming).unwrap();
+        initialize_config_at(&profile).unwrap();
         assert_eq!(fs::read_to_string(profile.join("vivido/vivido.toml")).unwrap(), DEFAULT_CONFIG);
         fs::remove_dir_all(root).unwrap();
     }
@@ -319,12 +279,10 @@ mod tests {
         let root = temporary_root("symlink");
         let real_profile = root.join("real-profile");
         let profile_link = root.join("profile-link");
-        let roaming = root.join("roaming");
         fs::create_dir_all(&real_profile).unwrap();
-        fs::create_dir_all(&roaming).unwrap();
         symlink(&real_profile, &profile_link).unwrap();
 
-        let error = initialize_config_at(&profile_link, &roaming).unwrap_err();
+        let error = initialize_config_at(&profile_link).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
         fs::remove_dir_all(root).unwrap();
     }

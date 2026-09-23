@@ -88,7 +88,6 @@ set of features with high performance.
 
 		. _%USERPROFILE%\\.config\\vivido\\vivido.toml_
 		. _%USERPROFILE%\\vivido\\vivido.toml_
-		. _%APPDATA%\\vivido\\vivido.toml_
 
 *-o, --option* _<OPTION>..._
 
