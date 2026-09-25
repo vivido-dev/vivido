@@ -601,6 +601,17 @@ impl Window {
         }
     }
 
+    /// Show `label` as the native title, which macOS also uses as the tab label, without
+    /// changing the terminal title that `title` reports.
+    #[cfg(target_os = "macos")]
+    pub fn show_title(&self, label: &str) {
+        if let Some(window) = self.backend.winit()
+            && window.title() != label
+        {
+            window.set_title(label);
+        }
+    }
+
     /// Get the window title.
     #[inline]
     pub fn title(&self) -> &str {

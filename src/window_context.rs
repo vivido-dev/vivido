@@ -77,6 +77,7 @@ use crate::cli::{ParsedOptions, VividTarget, WindowOptions};
 use crate::client_fault::{ClientFault, ClientHealth};
 use crate::clipboard::Clipboard;
 use crate::config::UiConfig;
+use crate::config::window::WindowConfig;
 use crate::display::Display;
 #[cfg(any(unix, windows))]
 use crate::display::ScreenshotReadback;
@@ -686,6 +687,8 @@ impl WindowContext {
         {
             self.display.window.set_title(self.config.window.identity.title.clone());
         }
+        #[cfg(target_os = "macos")]
+        self.show_native_title();
 
         let opaque = self.config.window_opacity() >= 1.;
 
@@ -1033,6 +1036,12 @@ impl WindowContext {
         {
             self.display.window.request_redraw();
         }
+
+        // A batch carries title changes, OSC 7 reports, and the output of a shell whose folder
+        // changed; the label probe locks the terminal again.
+        drop(terminal);
+        #[cfg(target_os = "macos")]
+        self.show_native_title();
     }
 
     pub fn settle_vivid_resize(&mut self, generation: u64) {
@@ -1049,6 +1058,28 @@ impl WindowContext {
     /// Current terminal window title.
     pub fn title(&self) -> &str {
         self.display.window.title()
+    }
+
+    /// Title chosen for this terminal: one set by a program through OSC 0/2, given at launch, or
+    /// the configured title when programs may not change it. `None` while the terminal shows
+    /// only the configured default or a cleared title.
+    pub fn explicit_title(&self) -> Option<&str> {
+        let title = self.display.window.title();
+        is_explicit_title(title, self.preserve_title, &self.config.window).then_some(title)
+    }
+
+    /// Label a native macOS tab by its current folder until a program sets a title, and again
+    /// once the title is reset or cleared. The terminal title itself is left untouched.
+    #[cfg(target_os = "macos")]
+    pub fn show_native_title(&self) {
+        let label = match self.explicit_title() {
+            Some(title) => title.to_owned(),
+            None => match self.display_directory() {
+                Some(directory) => directory_tab_title(&directory),
+                None => self.title().to_owned(),
+            },
+        };
+        self.display.window.show_title(&label);
     }
 
     /// Working directory of the local shell: its OSC 7 report when available, otherwise the
@@ -3684,6 +3715,75 @@ fn hash_color<H: Hasher>(color: Option<Color>, hasher: &mut H) {
             3u8.hash(hasher);
             index.hash(hasher);
         },
+    }
+}
+
+/// Display native Windows and WSL directories using the same folder-only labels as Vivida. On
+/// other platforms the home directory reads `~`, as shells show it.
+pub(crate) fn directory_tab_title(directory: &std::path::Path) -> String {
+    #[cfg(not(windows))]
+    if home::home_dir().is_some_and(|home| home == directory) {
+        return "~".to_owned();
+    }
+    let path = directory.to_string_lossy();
+    let name = path.trim_end_matches(['/', '\\']).rsplit(['/', '\\']).next().unwrap_or_default();
+    let name = name
+        .chars()
+        .map(|character| if character.is_control() { ' ' } else { character })
+        .collect::<String>();
+    let name = name.trim();
+    if name.is_empty() { "root".to_owned() } else { name.to_owned() }
+}
+
+fn is_explicit_title(title: &str, preserve_title: bool, window: &WindowConfig) -> bool {
+    preserve_title
+        || !window.dynamic_title
+        || (!title.trim().is_empty() && title != window.identity.title)
+}
+
+#[cfg(test)]
+mod title_tests {
+    use super::{directory_tab_title, is_explicit_title};
+    use crate::config::window::WindowConfig;
+
+    #[test]
+    fn tab_labels_use_the_current_folder_for_windows_and_wsl() {
+        for (path, expected) in [
+            (r"C:\Users\dev\project", "project"),
+            ("/home/dev/project/", "project"),
+            (r"\\wsl.localhost\Ubuntu\home\dev\project\", "project"),
+            ("/", "root"),
+            (r"C:\", "C:"),
+            ("/home/dev/another", "another"),
+            ("/home/dev/my project", "my project"),
+        ] {
+            assert_eq!(directory_tab_title(std::path::Path::new(path)), expected);
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn home_tab_label_reads_as_tilde() {
+        let home = home::home_dir().unwrap();
+        assert_eq!(directory_tab_title(&home), "~");
+        assert_eq!(directory_tab_title(&home.join("project")), "project");
+    }
+
+    #[test]
+    fn only_program_or_launch_titles_are_explicit() {
+        let window = WindowConfig::default();
+        let default = window.identity.title.clone();
+        // Unset, reset to the default, or cleared by an exiting program: fall back to the folder.
+        assert!(!is_explicit_title(&default, false, &window));
+        assert!(!is_explicit_title("", false, &window));
+        assert!(!is_explicit_title("  ", false, &window));
+        // A running program's OSC title, and a title given at launch, stay.
+        assert!(is_explicit_title("vim README.md", false, &window));
+        assert!(is_explicit_title(&default, true, &window));
+        // A configured title that programs may not change is the user's choice.
+        let mut fixed = WindowConfig::default();
+        fixed.dynamic_title = false;
+        assert!(is_explicit_title(&default, false, &fixed));
     }
 }
 

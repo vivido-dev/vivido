@@ -4415,6 +4415,9 @@ impl Processor {
                     #[cfg(windows)]
                     window_context.acknowledge_terminal_wakeup();
                     window_context.dirty = true;
+                    // Output is how a shell that sends no OSC 7 shows it changed folder.
+                    #[cfg(target_os = "macos")]
+                    window_context.show_native_title();
 
                     // Posted PTY events can keep Windows' higher-priority message queues busy
                     // long enough to starve both WM_PAINT and AboutToWait. Present through the

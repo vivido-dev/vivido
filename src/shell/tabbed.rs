@@ -526,15 +526,20 @@ impl TabbedApplication {
         }
     }
 
+    /// Label a tab by its current folder. Windows always does, like Vivida; elsewhere a title a
+    /// program set wins, and the folder stands in until one is set or after it is cleared.
     fn tab_title(&self, window_id: WindowId) -> Option<String> {
         let window = self.processor.window(window_id)?;
-        #[cfg(windows)]
+        #[cfg(not(windows))]
+        if let Some(title) = window.explicit_title() {
+            return Some(title.to_owned());
+        }
         if let Some(directory) = window.display_directory().or_else(|| {
             self.tab_options
                 .get(&window_id)
                 .and_then(|options| options.terminal_options.working_directory.clone())
         }) {
-            return Some(directory_tab_title(&directory));
+            return Some(crate::window_context::directory_tab_title(&directory));
         }
         Some(window.title().to_owned())
     }
@@ -1270,39 +1275,10 @@ impl ApplicationHandler<Event> for TabbedApplication {
     }
 }
 
-/// Display native Windows and WSL directories using the same folder-only labels as Vivida.
-#[cfg(windows)]
-fn directory_tab_title(directory: &std::path::Path) -> String {
-    let path = directory.to_string_lossy();
-    let name = path.trim_end_matches(['/', '\\']).rsplit(['/', '\\']).next().unwrap_or_default();
-    let name = name
-        .chars()
-        .map(|character| if character.is_control() { ' ' } else { character })
-        .collect::<String>();
-    let name = name.trim();
-    if name.is_empty() { "root".to_owned() } else { name.to_owned() }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use winit::dpi::PhysicalSize;
-
-    #[cfg(windows)]
-    #[test]
-    fn tab_labels_use_the_current_folder_for_windows_and_wsl() {
-        for (path, expected) in [
-            (r"C:\Users\dev\project", "project"),
-            ("/home/dev/project/", "project"),
-            (r"\\wsl.localhost\Ubuntu\home\dev\project\", "project"),
-            ("/", "root"),
-            (r"C:\", "C:"),
-            ("/home/dev/another", "another"),
-            ("/home/dev/my project", "my project"),
-        ] {
-            assert_eq!(directory_tab_title(std::path::Path::new(path)), expected);
-        }
-    }
 
     fn direction(x: f64, y: f64) -> Option<ResizeDirection> {
         resize_direction_at(PhysicalSize::new(800, 600), 1.0, PhysicalPosition::new(x, y))
