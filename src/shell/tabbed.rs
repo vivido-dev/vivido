@@ -528,7 +528,12 @@ impl TabbedApplication {
 
     fn tab_title(&self, window_id: WindowId) -> Option<String> {
         let window = self.processor.window(window_id)?;
-        #[cfg(windows)]
+        let title = window.title();
+        if !title.is_empty() {
+            return Some(title.to_owned());
+        }
+        // No OSC title yet, or the program that set one has exited and cleared it.
+        // Fall back to the working directory on every platform, not only Windows.
         if let Some(directory) = window.display_directory().or_else(|| {
             self.tab_options
                 .get(&window_id)
@@ -536,7 +541,7 @@ impl TabbedApplication {
         }) {
             return Some(directory_tab_title(&directory));
         }
-        Some(window.title().to_owned())
+        Some(title.to_owned())
     }
 
     fn refresh_titles(&mut self) {
