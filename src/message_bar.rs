@@ -111,6 +111,12 @@ impl Message {
         lines
     }
 
+    /// The message as written, before wrapping to the window.
+    #[inline]
+    pub fn raw_text(&self) -> &str {
+        &self.text
+    }
+
     /// Message type.
     #[inline]
     pub fn ty(&self) -> MessageType {

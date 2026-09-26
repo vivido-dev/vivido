@@ -3994,6 +3994,10 @@ impl Processor {
         #[cfg(any(unix, windows))]
         {
             let Some(window) = self.windows.get(&window_id) else { return true };
+            // A headless session has nobody to answer, and a modal dialog would stall its loop.
+            if window.display.window.is_headless() {
+                return true;
+            }
             let programs = self.running_programs([window_id]);
             programs.is_empty()
                 || crate::shell::confirm_close(
@@ -4640,20 +4644,25 @@ impl Processor {
             },
             #[cfg(any(unix, windows))]
             (EventType::Terminal(TerminalEvent::RecoveryPrompt), Some(window_id)) => {
-                let Some(ipc_window_id) =
-                    self.windows.get(window_id).map(WindowContext::ipc_window_id)
-                else {
+                let Some(window) = self.windows.get(window_id) else {
                     return;
                 };
+                let ipc_window_id = window.ipc_window_id();
+                // A headless session has nobody to answer a dialog, and a modal one would stall
+                // its loop; it gets the same message-bar hint as the other platforms.
                 #[cfg(windows)]
-                {
+                if !window.display.window.is_headless() {
+                    let owner =
+                        crate::shell::close::owner_hwnd(window.display.window.dialog_owner());
                     let message = win32_string(
                         "Recover this terminal pane?\n\nYes: Reset Terminal\nNo: Restart Terminal\nCancel: Keep the pane unchanged",
                     );
                     let title = win32_string("Vivido Terminal Recovery");
+                    // SAFETY: `owner` is null or this window's live HWND, and both UTF-16 buffers
+                    // stay alive and NUL-terminated for the modal call.
                     let choice = unsafe {
                         MessageBoxW(
-                            std::ptr::null_mut(),
+                            owner,
                             message.as_ptr(),
                             title.as_ptr(),
                             MB_ICONWARNING | MB_YESNOCANCEL | MB_SETFOREGROUND | MB_TASKMODAL,
@@ -4671,8 +4680,8 @@ impl Processor {
                         window.dirty = true;
                         window.display.window.request_redraw();
                     }
+                    return;
                 }
-                #[cfg(not(windows))]
                 if let Some(window) = self.windows.get_mut(window_id) {
                     window.message_buffer.push(Message::new(
                         format!(
@@ -5665,9 +5674,12 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
     }
 
     fn terminal_recovery(&mut self) {
+        // The prompt belongs to this window. Without its ID the event fell to the broadcast arm,
+        // which hands it to every window's input handler, and those ignore it.
+        let window_id = self.display.window.id();
         let _ = self
             .event_proxy
-            .send_event(Event::new(EventType::Terminal(TerminalEvent::RecoveryPrompt), None));
+            .send_event(Event::new(EventType::Terminal(TerminalEvent::RecoveryPrompt), window_id));
     }
 
     fn check_for_updates(&self) {

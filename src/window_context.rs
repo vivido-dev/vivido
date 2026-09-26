@@ -91,7 +91,7 @@ use crate::event::{
 use crate::input;
 #[cfg(any(unix, windows))]
 use crate::logging::LOG_TARGET_IPC_CONFIG;
-use crate::message_bar::MessageBuffer;
+use crate::message_bar::{MessageBuffer, MessageType};
 use crate::osc_notification::{NotificationController, OscNotification, WindowNotificationState};
 #[cfg(any(unix, windows))]
 use crate::polling::ipc::{IpcConnection, IpcError};
@@ -1510,9 +1510,10 @@ impl WindowContext {
             clipboard,
             scheduler,
         };
-        let encoded =
-            input::Processor::new(context).ipc_key_input(&key.key, &key.mods, repeated)?;
+        let encoded = input::Processor::new(context).ipc_key_input(&key.key, &key.mods, repeated);
         drop(terminal);
+        self.redraw_if_dirty();
+        let encoded = encoded?;
         let mut bytes = notifier.into_bytes();
         if let Some(encoded) = encoded {
             bytes.extend(encoded);
@@ -1618,6 +1619,7 @@ impl WindowContext {
                 ),
             }
         }
+        self.redraw_if_dirty();
         Ok(notifier.into_bytes())
     }
 
@@ -1682,7 +1684,21 @@ impl WindowContext {
             }
             processor.mouse_input(ElementState::Released, button);
         }
+        self.redraw_if_dirty();
         Ok(notifier.into_bytes())
+    }
+
+    /// Ask for a frame when UI-routed automation input changed what is shown.
+    ///
+    /// Native input reaches the window through [`Self::handle_event`], which requests the frame
+    /// itself. Automation input runs the same processor directly, and the idle turn that follows
+    /// returns early with nothing queued, so without this a search bar or hint opened by
+    /// automation stayed off screen until something else redrew the window.
+    #[cfg(any(unix, windows))]
+    fn redraw_if_dirty(&mut self) {
+        if self.dirty && self.display.window.has_frame && !self.occluded {
+            self.display.window.request_redraw();
+        }
     }
 
     /// Encode one application mouse action without entering Vivido's UI input path.
@@ -2579,6 +2595,14 @@ impl WindowContext {
             "executable": executable,
             "current_directory": current_directory,
             "running_program": running_program,
+            "message": self.message_buffer.message().map(|message| json_value!({
+                "type": match message.ty() {
+                    MessageType::Info => "info",
+                    MessageType::Warning => "warning",
+                    MessageType::Error => "error",
+                },
+                "text": message.raw_text(),
+            })),
             "progress": self.display.progress.automation_json(),
             "echo": echo,
             "exit_status": exit_status_json(self.automation.exit_status.as_ref()),

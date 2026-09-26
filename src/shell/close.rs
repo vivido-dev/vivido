@@ -74,15 +74,8 @@ fn platform_confirm(
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         IDYES, MB_DEFBUTTON2, MB_ICONWARNING, MB_SETFOREGROUND, MB_TASKMODAL, MB_YESNO, MessageBoxW,
     };
-    use winit::raw_window_handle::RawWindowHandle;
 
-    let owner = owner
-        .and_then(|owner| owner.window_handle().ok())
-        .and_then(|handle| match handle.as_raw() {
-            RawWindowHandle::Win32(handle) => Some(handle.hwnd.get() as *mut std::ffi::c_void),
-            _ => None,
-        })
-        .unwrap_or(std::ptr::null_mut());
+    let owner = owner_hwnd(owner);
     let wide = |text: &str| text.encode_utf16().chain(Some(0)).collect::<Vec<_>>();
     let message = wide(&confirmation.message());
     let title = wide(confirmation.title);
@@ -97,6 +90,22 @@ fn platform_confirm(
             MB_ICONWARNING | MB_YESNO | MB_DEFBUTTON2 | MB_SETFOREGROUND | MB_TASKMODAL,
         ) == IDYES
     }
+}
+
+/// The HWND a Win32 dialog should belong to, or null to make it modal to the application.
+#[cfg(windows)]
+pub(crate) fn owner_hwnd(
+    owner: Option<&dyn winit::raw_window_handle::HasWindowHandle>,
+) -> *mut std::ffi::c_void {
+    use winit::raw_window_handle::RawWindowHandle;
+
+    owner
+        .and_then(|owner| owner.window_handle().ok())
+        .and_then(|handle| match handle.as_raw() {
+            RawWindowHandle::Win32(handle) => Some(handle.hwnd.get() as *mut std::ffi::c_void),
+            _ => None,
+        })
+        .unwrap_or(std::ptr::null_mut())
 }
 
 #[cfg(target_os = "macos")]

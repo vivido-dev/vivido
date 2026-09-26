@@ -9,6 +9,7 @@ use std::{mem, ptr};
 use windows_sys::Win32::Foundation::{HANDLE, S_OK};
 use windows_sys::Win32::System::Console::{
     COORD, ClosePseudoConsole, CreatePseudoConsole, HPCON, ResizePseudoConsole,
+    SetConsoleCtrlHandler,
 };
 use windows_sys::core::PWSTR;
 
@@ -152,6 +153,16 @@ pub fn new(config: &Options, window_size: WindowSize) -> Result<Pty> {
         },
         None => ptr::null_mut(),
     };
+
+    // A process started with `CREATE_NEW_PROCESS_GROUP` — the detached headless daemon, a
+    // `spawn_daemon` instance, or a launcher's background job — ignores Ctrl+C, and every process
+    // it creates inherits that. The shell would then drop the CTRL_C_EVENT the pseudoconsole raises
+    // for `^C`, so neither the keyboard nor automation could interrupt a program. Clear the flag
+    // so the child inherits normal Ctrl+C handling. Vivido is never attached to this
+    // pseudoconsole, so this does not expose it to the child's interrupts.
+    //
+    // SAFETY: a null handler with FALSE only clears this process's ignore-Ctrl+C flag.
+    unsafe { SetConsoleCtrlHandler(None, 0) };
 
     let mut proc_info: PROCESS_INFORMATION = unsafe { mem::zeroed() };
     unsafe {

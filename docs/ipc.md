@@ -356,6 +356,9 @@ waiting until it disconnects, the same as any unanswered request.
   when the terminal sits at its shell prompt or has exited: on Unix the foreground process group
   when it is not the shell's, on Windows a direct child of the shell unless OSC 133 reports the
   prompt (`"a command"` when integration reports a command the shell runs in-process).
+  `message` is the message bar's current entry as `{"type":"info|warning|error","text":…}`, or
+  null when the bar is empty, so a client can read notices such as the terminal-recovery hint
+  that are drawn over the grid rather than written into it.
   It also reports `ime_cursor_area`, lightweight native-accessibility state, `vivid_overlay`
   resource/submission counters, and overlay render-cache passes, skips, and target allocations.
   These counters are cumulative and are intended for bounded acceptance and performance probes;

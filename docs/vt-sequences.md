@@ -43,8 +43,10 @@ game controls stuck. Clients reading enhanced input must still enable VT input a
 escape sequences themselves rather than relying on synthesized native key records.
 
 If an application exits without leaving the alternate screen or disabling mouse, focus,
-bracketed-paste, Kitty-keyboard, or synchronized-output modes, press `Ctrl+Shift+F12`. The
-host-owned recovery prompt offers Reset Terminal, Restart Terminal, and Cancel. Reset discards
+bracketed-paste, Kitty-keyboard, or synchronized-output modes, press `Ctrl+Shift+F12`. On
+Windows the host-owned recovery prompt offers Reset Terminal, Restart Terminal, and Cancel; on
+other platforms, and in headless sessions where nobody could answer a dialog, the message bar
+names the equivalent `vivido msg reset-terminal` and `restart-terminal` commands instead. Reset discards
 partial parser state and client-controlled modes, returns to the primary screen, clears the Vivid
 scene, and preserves primary scrollback. Restart replaces the PTY while preserving the public
 window identity and an embedding Vivida layout position. Neither action is triggered automatically

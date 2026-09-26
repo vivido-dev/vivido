@@ -466,6 +466,78 @@ fn agent_titles_draw_progress_without_osc_reports_and_clear_only_their_own_windo
     assert_eq!(inspect(&claude)["progress"], idle);
 }
 
+/// Poll `inspect` until `accept` takes the value at `pointer`, failing with `what` after 15 s.
+fn wait_for_inspect(
+    session: &Session,
+    pointer: &str,
+    accept: &dyn Fn(&serde_json::Value) -> bool,
+    what: &str,
+) -> serde_json::Value {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let inspect: serde_json::Value =
+            serde_json::from_str(&session.msg(&["inspect"])).expect("inspect JSON");
+        let value = inspect.pointer(pointer).cloned().unwrap_or(serde_json::Value::Null);
+        if accept(&value) {
+            return value;
+        }
+        assert!(Instant::now() < deadline, "{what}; last saw {value}");
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// Ctrl+C interrupts the program the shell is running.
+///
+/// On Windows the headless daemon is started in a new process group, which ignores Ctrl+C and
+/// used to hand that to every shell it spawned: the pseudoconsole's CTRL_C_EVENT for `^C` was
+/// dropped, and nothing — keyboard or automation — could interrupt a program.
+#[test]
+#[ignore = "spawns processes and needs a wgpu adapter"]
+fn ctrl_c_interrupts_a_running_child() {
+    let session = Session::start("interrupt", &shell_program());
+    wait_for_inspect(&session, "/running_program", &|value| value.is_null(), "never idle");
+
+    #[cfg(unix)]
+    session.msg(&["typing", "sleep 60\n"]);
+    #[cfg(windows)]
+    session.msg(&["typing", "ping -n 60 127.0.0.1\r"]);
+    wait_for_inspect(&session, "/running_program", &|value| value.is_string(), "never ran");
+
+    session.msg(&["key", "c", "--mods", "Ctrl"]);
+    wait_for_inspect(
+        &session,
+        "/running_program",
+        &|value| value.is_null(),
+        "Ctrl+C did not interrupt the running child",
+    );
+}
+
+/// The terminal-recovery binding reaches its own window. In a headless session, where nobody can
+/// answer a dialog, it shows the recovery commands in the message bar instead.
+///
+/// The prompt used to be sent without a window, so the broadcast path handed it to every window's
+/// input handler, which ignored it: the binding did nothing on any platform.
+#[test]
+#[ignore = "spawns processes and needs a wgpu adapter"]
+fn terminal_recovery_binding_reaches_its_window() {
+    let session = Session::start("recovery-binding", &shell_program());
+    wait_for_inspect(&session, "/message", &|value| value.is_null(), "a message was already up");
+
+    session.msg(&["key", "F12", "--mods", "Ctrl,Shift", "--route", "ui"]);
+    let message = wait_for_inspect(
+        &session,
+        "/message",
+        &|value| value.is_object(),
+        "the recovery binding showed nothing",
+    );
+    assert_eq!(message["type"], "warning", "unexpected message {message}");
+    let text = message["text"].as_str().unwrap_or_default();
+    assert!(
+        text.contains("reset-terminal --window-id") && text.contains("restart-terminal"),
+        "the hint names both recovery commands: {text:?}"
+    );
+}
+
 /// A terminal at its prompt has no running program, so closing it would not ask; a child the
 /// shell is waiting on is named, and the terminal is idle again once it exits.
 #[test]
