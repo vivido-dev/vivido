@@ -188,6 +188,9 @@ pub struct WindowContext {
     cursor_blink_timed_out: bool,
     prev_bell_cmd: Option<Instant>,
     notifications: NotificationController,
+    /// Progress last shown in this window's taskbar button.
+    #[cfg(windows)]
+    taskbar_progress: Option<crate::display::progress::Progress>,
     modifiers: Modifiers,
     search_state: SearchState,
     notifier: Notifier,
@@ -602,6 +605,8 @@ impl WindowContext {
             cursor_blink_timed_out: Default::default(),
             prev_bell_cmd: Default::default(),
             notifications,
+            #[cfg(windows)]
+            taskbar_progress: None,
             message_buffer: Default::default(),
             window_config: Default::default(),
             search_state: Default::default(),
@@ -2145,6 +2150,22 @@ impl WindowContext {
                 false,
                 timer_id,
             );
+        }
+    }
+
+    /// The OSC 9;4 progress this terminal shows, for an embedding host's tab or indicator.
+    pub fn progress(&self) -> Option<crate::display::progress::Progress> {
+        self.display.progress.current(Instant::now())
+    }
+
+    /// Mirror the current progress into this window's taskbar button when it changed.
+    ///
+    /// Embedded and headless windows have no button of their own; their host mirrors them.
+    #[cfg(windows)]
+    pub(crate) fn sync_taskbar_progress(&mut self, now: Instant) {
+        let progress = self.display.progress.current(now);
+        if progress != self.taskbar_progress && self.display.window.set_taskbar_progress(progress) {
+            self.taskbar_progress = progress;
         }
     }
 

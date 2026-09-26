@@ -382,6 +382,14 @@ none. A bar with no new report for 15 seconds is removed, so a crashed tool does
 behind. The bar works the same inside Vivida panes, and IPC `inspect` and the `progress_changed`
 event report its state. `terminal.progress = false` turns it off.
 
+Progress also shows outside the terminal. On Windows the window's taskbar button fills in the same
+colour (paused and error use the shell's amber and red, and busy shows its moving indicator). On
+macOS the Dock tile carries a badge — `42%`, `…` while busy, `42% ‖` when paused, `!` on error —
+for the most urgent window; an error outranks a pause, which outranks running work, and among
+running work the least complete wins. Vivida marks each tab with a thin strip in the same colours,
+the sidebar badges each workspace, and its own taskbar button or Dock tile shows the most urgent
+pane. Wayland has no portable taskbar progress, so on Linux only the in-window indicators appear.
+
 ```sh
 printf '\033]9;4;1;42\007'   # 42 %
 printf '\033]9;4;3\007'      # busy

@@ -69,7 +69,8 @@ mod damage;
 mod media;
 mod meter;
 mod overlay;
-mod progress;
+pub mod progress;
+pub mod progress_indicator;
 mod scrollbar;
 #[cfg(windows)]
 mod windows_live_move;

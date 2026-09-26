@@ -8,6 +8,9 @@
 //! A report goes stale after [`STALE_AFTER`] without another one, so a tool that crashed
 //! mid-operation does not leave a bar behind forever. The owning window schedules a timer for
 //! [`ProgressBar::deadline`] and calls [`ProgressBar::expire`] when it fires.
+//!
+//! Outside the surface, [`ProgressBar::current`] is what a window, taskbar button, Dock tile, or
+//! an embedding host's tab mirrors, and [`most_urgent`] folds several surfaces into one.
 
 use std::time::{Duration, Instant};
 
@@ -43,6 +46,56 @@ pub enum ProgressVisual {
     Bounce { offset: f32 },
 }
 
+/// The reported progress of one surface, for mirroring outside it.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct Progress {
+    pub kind: ProgressKind,
+    /// Percent complete in `0..=100`; `None` only for [`ProgressKind::Indeterminate`].
+    pub percent: Option<u8>,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ProgressKind {
+    Normal,
+    Indeterminate,
+    Paused,
+    Error,
+}
+
+impl ProgressKind {
+    /// How strongly a surface in this state asks for attention when states are combined.
+    fn urgency(self) -> u8 {
+        match self {
+            Self::Indeterminate => 0,
+            Self::Normal => 1,
+            Self::Paused => 2,
+            Self::Error => 3,
+        }
+    }
+}
+
+/// Fold several surfaces' progress into the one a shared indicator shows.
+///
+/// An error outranks a pause, which outranks running work, and a known percent outranks an
+/// indeterminate one. Among equals the least complete surface wins, since the combined work is
+/// not done until it is.
+pub fn most_urgent(progress: impl IntoIterator<Item = Progress>) -> Option<Progress> {
+    progress.into_iter().max_by_key(|progress| {
+        (progress.kind.urgency(), std::cmp::Reverse(progress.percent.unwrap_or(0)))
+    })
+}
+
+/// Short text for a badge that cannot draw a bar, such as the macOS Dock tile's.
+pub fn badge_label(progress: Progress) -> String {
+    let percent = progress.percent.unwrap_or(0);
+    match progress.kind {
+        ProgressKind::Normal => format!("{percent}%"),
+        ProgressKind::Indeterminate => String::from("…"),
+        ProgressKind::Paused => format!("{percent}% ‖"),
+        ProgressKind::Error => String::from("!"),
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct Active {
     /// Never [`ProgressState::Remove`]; removal clears the bar instead.
@@ -68,7 +121,7 @@ impl ProgressBar {
     ///
     /// Returns whether the reported state or percent changed. Tools re-send the same report as a
     /// keepalive; those refresh staleness but are not a change worth announcing.
-    pub fn apply(&mut self, report: ProgressReport, now: Instant) -> bool {
+    pub(crate) fn apply(&mut self, report: ProgressReport, now: Instant) -> bool {
         let previous = self.active;
         let Some(state) = (report.state != ProgressState::Remove).then_some(report.state) else {
             return self.active.take().is_some();
@@ -144,9 +197,25 @@ impl ProgressBar {
         })
     }
 
+    /// The progress a frame drawn at `now` shows, for mirroring outside the surface.
+    pub fn current(&self, now: Instant) -> Option<Progress> {
+        let active = self.active.filter(|active| !is_stale(active, now))?;
+        let kind = match active.state {
+            ProgressState::Normal | ProgressState::Remove => ProgressKind::Normal,
+            ProgressState::Indeterminate => ProgressKind::Indeterminate,
+            ProgressState::Paused => ProgressKind::Paused,
+            ProgressState::Error => ProgressKind::Error,
+        };
+        Some(Progress { kind, percent: active.percent })
+    }
+
     /// The reported state for automation: `state` is `none` when no bar is showing.
+    ///
+    /// A stale report reads as `none` even before its expiry timer has fired, matching what is
+    /// drawn.
     pub fn automation_json(&self) -> serde_json::Value {
-        let (state, percent) = match self.active {
+        let (state, percent) = match self.active.filter(|active| !is_stale(active, Instant::now()))
+        {
             None => ("none", None),
             Some(active) => (state_name(active.state), active.percent),
         };
@@ -313,5 +382,46 @@ mod tests {
         assert!(bar.apply(report(ProgressState::Remove, None), stale));
         assert_eq!(bar.visual_at(stale), None);
         assert_eq!(bar.deadline(), None);
+    }
+
+    #[test]
+    fn current_mirrors_the_resolved_report_until_it_goes_stale() {
+        let start = Instant::now();
+        let mut bar = ProgressBar::default();
+        assert_eq!(bar.current(start), None);
+
+        bar.apply(report(ProgressState::Normal, Some(40)), start);
+        bar.apply(report(ProgressState::Paused, None), start);
+        assert_eq!(
+            bar.current(start),
+            Some(Progress { kind: ProgressKind::Paused, percent: Some(40) }),
+            "the mirror shows the reported percent, not the easing fill"
+        );
+        assert_eq!(bar.current(start + STALE_AFTER), None);
+    }
+
+    #[test]
+    fn most_urgent_prefers_errors_then_pauses_then_the_least_complete_work() {
+        let progress = |kind, percent| Progress { kind, percent };
+        let busy = progress(ProgressKind::Indeterminate, None);
+        let early = progress(ProgressKind::Normal, Some(10));
+        let late = progress(ProgressKind::Normal, Some(90));
+        let paused = progress(ProgressKind::Paused, Some(95));
+        let failed = progress(ProgressKind::Error, Some(100));
+
+        assert_eq!(most_urgent([]), None);
+        assert_eq!(most_urgent([busy]), Some(busy));
+        assert_eq!(most_urgent([busy, late, early]), Some(early));
+        assert_eq!(most_urgent([early, paused, late]), Some(paused));
+        assert_eq!(most_urgent([paused, failed, busy]), Some(failed));
+    }
+
+    #[test]
+    fn badge_labels_stay_short() {
+        let label = |kind, percent| badge_label(Progress { kind, percent });
+        assert_eq!(label(ProgressKind::Normal, Some(42)), "42%");
+        assert_eq!(label(ProgressKind::Indeterminate, None), "…");
+        assert_eq!(label(ProgressKind::Paused, Some(7)), "7% ‖");
+        assert_eq!(label(ProgressKind::Error, Some(50)), "!");
     }
 }

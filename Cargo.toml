@@ -153,6 +153,7 @@ objc2-app-kit = { version = "0.3.1", default-features = false, features = [
   "NSColor",
   "NSColorSpace",
   "NSControl",
+  "NSDockTile",
   "NSEvent",
   "NSGraphics",
   "NSLayoutAnchor",
@@ -201,6 +202,8 @@ windows-sys = { version = "0.61.2", features = [
 windows = { version = "0.62.2", default-features = false, features = [
   "Win32_Foundation",
   "Win32_Graphics_DirectComposition",
+  "Win32_System_Com",
+  "Win32_UI_Shell",
   "Win32_Security_Cryptography",
   "Win32_Security_Cryptography_Catalog",
   "Win32_Security_Cryptography_Sip",

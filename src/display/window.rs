@@ -739,6 +739,22 @@ impl Window {
         }
     }
 
+    /// Show progress in this window's taskbar button, returning whether it has one.
+    ///
+    /// A hosted pane is a child of its host's window and has no button; the host mirrors it.
+    #[cfg(windows)]
+    pub(crate) fn set_taskbar_progress(
+        &self,
+        progress: Option<crate::display::progress::Progress>,
+    ) -> bool {
+        if self.hosted {
+            return false;
+        }
+        let Some(window) = self.backend.winit() else { return false };
+        crate::display::progress_indicator::set_taskbar_progress(window.as_ref(), progress);
+        true
+    }
+
     /// Whether the native resize currently being dispatched represents a minimized window.
     #[cfg(windows)]
     pub(crate) fn is_minimized(&self) -> bool {

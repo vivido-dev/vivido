@@ -438,6 +438,9 @@ pub struct Processor {
     shell_actions: VecDeque<crate::shell::ShellActionRequest>,
     cli_options: CliOptions,
     config: Rc<UiConfig>,
+    /// Progress last shown on the application's Dock tile.
+    #[cfg(target_os = "macos")]
+    dock_progress: Option<crate::display::progress::Progress>,
     update_cancel: Arc<AtomicBool>,
     update_manifest: Option<UpdateManifest>,
     update_ready: Option<ReadyInstaller>,
@@ -508,6 +511,8 @@ impl Processor {
             proxy,
             scheduler,
             config: Rc::new(config),
+            #[cfg(target_os = "macos")]
+            dock_progress: None,
             update_cancel: Arc::new(AtomicBool::new(false)),
             update_manifest: None,
             update_ready: None,
@@ -3969,6 +3974,35 @@ impl Processor {
         }
     }
 
+    /// Mirror OSC 9;4 progress onto the taskbar buttons and the Dock tile.
+    ///
+    /// Runs once per loop turn and touches the platform only when a state changed, which also
+    /// covers reports, expiry, config reloads, and closed windows without hooking each of them.
+    /// The Dock belongs to the application, so it shows the most urgent of every window with a
+    /// user-visible surface, embedded panes included; a plain headless session has none.
+    fn sync_progress_indicators(&mut self) {
+        let now = Instant::now();
+        #[cfg(windows)]
+        for window_context in self.windows.values_mut() {
+            window_context.sync_taskbar_progress(now);
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let progress = crate::display::progress::most_urgent(
+                self.windows
+                    .values()
+                    .filter(|window| !window.display.window.is_headless())
+                    .filter_map(|window| window.display.progress.current(now)),
+            );
+            if progress != self.dock_progress {
+                crate::display::progress_indicator::set_dock_progress(progress);
+                self.dock_progress = progress;
+            }
+        }
+        #[cfg(not(any(windows, target_os = "macos")))]
+        let _ = now;
+    }
+
     /// Draw embedded terminals which requested a frame.
     pub fn draw_pending_embedded_windows(&mut self) -> bool {
         let pending = self
@@ -4824,6 +4858,8 @@ impl Processor {
         for window_context in self.windows.values_mut() {
             window_context.display.window.refresh_tab_shortcut_badge();
         }
+
+        self.sync_progress_indicators();
 
         #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
         for window_context in self.windows.values_mut() {
