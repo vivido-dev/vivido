@@ -1,6 +1,7 @@
 //! Integrated Windows/Linux title and tab strip.
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use vello::Scene;
 use vello::kurbo::{Affine, BezPath, Rect, Stroke};
@@ -89,13 +90,14 @@ pub fn compute_layout(size: PhysicalSize<u32>, scale: f64) -> ChromeLayout {
 }
 
 pub struct ChromeRenderer {
-    #[cfg(target_os = "linux")]
     window: Arc<Window>,
     renderer: SceneRenderer,
     text: TextSystem,
     scale: f64,
     background: Rgb,
     opacity: f32,
+    retry_at: Option<Instant>,
+    retry_delay: Duration,
 }
 
 impl ChromeRenderer {
@@ -107,12 +109,13 @@ impl ChromeRenderer {
                 window.inner_size(),
                 true,
             )?,
-            #[cfg(target_os = "linux")]
             window,
             text: text_system(config, scale),
             scale,
             background: config.colors.primary.background,
             opacity: config.window_opacity(),
+            retry_at: None,
+            retry_delay: Duration::from_millis(100),
         })
     }
 
@@ -124,6 +127,10 @@ impl ChromeRenderer {
             self.scale = scale;
             self.text = text_system(config, scale);
         }
+    }
+
+    pub(super) fn recovery_deadline(&self) -> Option<Instant> {
+        self.retry_at
     }
 
     /// Lay a launch menu out with the chrome's own text system and scale factor.
@@ -207,12 +214,55 @@ impl ChromeRenderer {
             )
         });
 
-        let presented = self.renderer.render_composited(
+        if self.renderer.gpu_failed() || self.retry_at.is_some() {
+            if self.retry_at.is_some_and(|deadline| Instant::now() < deadline) {
+                return Ok((layout, hits, false));
+            }
+            // Chrome has no terminal Display to perform recovery for it. Rebuild its composition
+            // surface too, and back off if the driver remains unavailable rather than generating
+            // an error/message/redraw loop while the terminal's own recovery timer runs.
+            match self.renderer.rebuild(RenderSource::Surface(Arc::clone(&self.window)), size, true)
+            {
+                Ok(()) => {
+                    self.retry_at = None;
+                    log::info!("Vivido tab chrome GPU recovered");
+                    // Linux frames were prepared on the previous device; let the panes recover
+                    // before copying them into this new surface.
+                    #[cfg(target_os = "linux")]
+                    {
+                        self.window.request_redraw();
+                        return Ok((layout, hits, false));
+                    }
+                },
+                Err(error) => {
+                    log::warn!("Vivido tab chrome GPU recovery failed ({error})");
+                    self.retry_at = Some(Instant::now() + self.retry_delay);
+                    self.retry_delay =
+                        self.retry_delay.saturating_mul(2).min(Duration::from_secs(5));
+                    return Ok((layout, hits, false));
+                },
+            }
+        }
+
+        let presented = match self.renderer.render_composited(
             &scene,
             Color::from_rgba8(BACKGROUND.r, BACKGROUND.g, BACKGROUND.b, 0),
             frames,
             exclude,
-        )?;
+        ) {
+            Ok(presented) => {
+                if presented {
+                    self.retry_delay = Duration::from_millis(100);
+                }
+                presented
+            },
+            Err(error) => {
+                log::warn!("Vivido tab chrome GPU render failed ({error})");
+                self.retry_at = Some(Instant::now() + self.retry_delay);
+                self.retry_delay = self.retry_delay.saturating_mul(2).min(Duration::from_secs(5));
+                false
+            },
+        };
         Ok((layout, hits, presented))
     }
 

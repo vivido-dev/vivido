@@ -1,10 +1,12 @@
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::Arc;
 #[cfg(any(unix, windows))]
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 #[cfg(any(unix, windows))]
 use std::time::Instant;
 
+use parking_lot::Mutex;
 use pollster::block_on;
 use vello::peniko::Color;
 use vello::util::{RenderContext, RenderSurface};
@@ -37,6 +39,7 @@ pub enum Error {
     SurfaceValidation,
     NoOffscreenAdapter(String),
     NoWindowDevice,
+    GpuUnavailable(String),
     #[cfg(windows)]
     WindowsComposition(windows::core::Error),
 }
@@ -111,6 +114,7 @@ impl std::fmt::Display for Error {
             Self::NoWindowDevice => {
                 f.write_str("an embedded renderer requires an initialized window renderer")
             },
+            Self::GpuUnavailable(error) => write!(f, "GPU is unavailable: {error}"),
             #[cfg(windows)]
             Self::WindowsComposition(err) => {
                 write!(f, "failed to initialize Windows composition: {err}")
@@ -132,6 +136,7 @@ pub struct SceneRenderer {
     renderer: Rc<RefCell<Renderer>>,
     device: wgpu::Device,
     queue: wgpu::Queue,
+    gpu_health: GpuHealth,
     /// Whether the render target has a drawable (non-zero) size.
     valid_target: bool,
     max_surface_dimension: u32,
@@ -211,9 +216,52 @@ pub struct SharedRenderContext(Rc<RefCell<SharedRenderState>>);
 struct SharedRenderState {
     context: RenderContext,
     renderers: Vec<Option<Rc<RefCell<Renderer>>>>,
+    device_health: Vec<GpuHealth>,
+}
+
+/// wgpu reports device loss through a callback, then returns invalid resources from subsequent
+/// allocations. Creating a view of such a texture invokes its default panic handler. Retain the
+/// first failure instead, so resize and rendering can enter recovery without a modal panic dialog.
+#[derive(Clone, Default)]
+struct GpuHealth(Arc<Mutex<Option<String>>>);
+
+impl GpuHealth {
+    fn monitor(device: &wgpu::Device) -> Self {
+        let health = Self::default();
+        let errors = health.clone();
+        device.on_uncaptured_error(Arc::new(move |error| errors.record(error.to_string())));
+        let loss = health.clone();
+        device.set_device_lost_callback(move |reason, message| {
+            loss.record(format!("device lost ({reason:?}): {message}"));
+        });
+        health
+    }
+
+    fn record(&self, error: String) {
+        self.0.lock().get_or_insert(error);
+    }
+
+    fn failed(&self) -> bool {
+        self.0.lock().is_some()
+    }
+
+    fn check(&self) -> Result<(), Error> {
+        match &*self.0.lock() {
+            Some(error) => Err(Error::GpuUnavailable(error.clone())),
+            None => Ok(()),
+        }
+    }
 }
 
 impl SharedRenderState {
+    fn health_for(&mut self, device_id: usize) -> GpuHealth {
+        while self.device_health.len() <= device_id {
+            let device = &self.context.devices[self.device_health.len()].device;
+            self.device_health.push(GpuHealth::monitor(device));
+        }
+        self.device_health[device_id].clone()
+    }
+
     fn renderer_for(
         &mut self,
         device_id: usize,
@@ -237,6 +285,7 @@ impl SharedRenderContext {
         Self(Rc::new(RefCell::new(SharedRenderState {
             context: create_window_render_context(),
             renderers: Vec::new(),
+            device_health: Vec::new(),
         })))
     }
 }
@@ -252,8 +301,18 @@ thread_local! {
 }
 
 fn window_render_context() -> SharedRenderContext {
-    WINDOW_RENDER_CONTEXT
-        .with(|slot| slot.borrow_mut().get_or_insert_with(SharedRenderContext::new).clone())
+    WINDOW_RENDER_CONTEXT.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot
+            .as_ref()
+            .is_some_and(|context| context.0.borrow().device_health.iter().any(GpuHealth::failed))
+        {
+            // Vello reuses any compatible adapter's cached device, including a lost device.
+            // Old windows retain their context until they recover; new renderers share this one.
+            *slot = None;
+        }
+        slot.get_or_insert_with(SharedRenderContext::new).clone()
+    })
 }
 
 #[cfg(not(windows))]
@@ -280,6 +339,15 @@ pub fn shutdown_window_render_context() {
     });
 }
 
+fn retire_window_render_context(context: &SharedRenderContext) {
+    WINDOW_RENDER_CONTEXT.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.as_ref().is_some_and(|current| Rc::ptr_eq(&current.0, &context.0)) {
+            *slot = None;
+        }
+    });
+}
+
 impl SceneRenderer {
     pub fn new(
         source: RenderSource,
@@ -291,7 +359,7 @@ impl SceneRenderer {
         #[cfg(windows)]
         let mut composition = None;
 
-        let (context, surface, device, queue, target_size, renderer) = match source {
+        let (context, surface, device, queue, target_size, renderer, gpu_health) = match source {
             RenderSource::Surface(window) => {
                 let context = window_render_context();
                 let mut context_ref = context.0.borrow_mut();
@@ -321,7 +389,7 @@ impl SceneRenderer {
                 // ResizeBuffers, so construct it here and make PreMultiplied part of the very
                 // first configure call.
                 let surface = create_window_surface(
-                    &mut context_ref.context,
+                    &mut context_ref,
                     wgpu_surface,
                     size.width.max(1),
                     size.height.max(1),
@@ -336,21 +404,31 @@ impl SceneRenderer {
 
                 let handle = &context_ref.context.devices[surface.dev_id];
                 let (device, queue) = (handle.device.clone(), handle.queue.clone());
+                let gpu_health = context_ref.health_for(surface.dev_id);
                 let renderer = context_ref
                     .renderer_for(surface.dev_id, &device)
                     .map_err(Error::CreateRenderer)?;
                 let target_size = PhysicalSize::new(surface.config.width, surface.config.height);
                 drop(context_ref);
-                (Some(context), Some(Box::new(surface)), device, queue, target_size, renderer)
+                (
+                    Some(context),
+                    Some(Box::new(surface)),
+                    device,
+                    queue,
+                    target_size,
+                    renderer,
+                    gpu_health,
+                )
             },
             RenderSource::Offscreen => {
                 let (device, queue) = offscreen_device()?;
+                let gpu_health = GpuHealth::monitor(&device);
                 // Nothing can refuse an offscreen size, but keep the same minimum-1 clamp so the
                 // texture is always creatable.
                 let target_size = PhysicalSize::new(size.width.max(1), size.height.max(1));
                 let renderer =
                     Rc::new(RefCell::new(create_renderer(&device).map_err(Error::CreateRenderer)?));
-                (None, None, device, queue, target_size, renderer)
+                (None, None, device, queue, target_size, renderer, gpu_health)
             },
             RenderSource::Embedded => {
                 let context = window_render_context();
@@ -359,11 +437,13 @@ impl SceneRenderer {
                     return Err(Error::NoWindowDevice);
                 };
                 let (device, queue) = (handle.device.clone(), handle.queue.clone());
+                let gpu_health = context_ref.health_for(0);
+                gpu_health.check()?;
                 let renderer =
                     context_ref.renderer_for(0, &device).map_err(Error::CreateRenderer)?;
                 let target_size = PhysicalSize::new(size.width.max(1), size.height.max(1));
                 drop(context_ref);
-                (Some(context), None, device, queue, target_size, renderer)
+                (Some(context), None, device, queue, target_size, renderer, gpu_health)
             },
         };
 
@@ -371,6 +451,7 @@ impl SceneRenderer {
         let media = VividMediaRenderer::new(&device);
         let (render_target, render_target_view) =
             create_render_target(&device, target_size.width, target_size.height);
+        gpu_health.check()?;
 
         Ok(Self {
             context,
@@ -380,6 +461,7 @@ impl SceneRenderer {
             renderer,
             device,
             queue,
+            gpu_health,
             valid_target,
             max_surface_dimension,
             media,
@@ -415,10 +497,13 @@ impl SceneRenderer {
         {
             self.composition = None;
         }
-        self.context = None;
+        if let Some(context) = self.context.take() {
+            // Another window may already have replaced this shared device. Do not discard its
+            // healthy replacement when the next window retires the same old context.
+            retire_window_render_context(&context);
+        }
         self.media.clear_sources();
         self.has_rendered_frame = false;
-        shutdown_window_render_context();
         *self = Self::new(source, size, transparent)?;
         Ok(())
     }
@@ -431,15 +516,23 @@ impl SceneRenderer {
             return;
         }
 
+        // Preserve the requested size for recovery, but never allocate from a device which has
+        // already failed. Errors racing with this check are retained by the callbacks as well.
+        self.target_size = size;
+        self.has_rendered_frame = false;
+        self.hidden_released = false;
+        if self.gpu_health.failed() {
+            self.valid_target = false;
+            return;
+        }
+
         if let (Some(context), Some(surface)) = (&self.context, &mut self.surface) {
             reconfigure_surface(&context.0.borrow().context, surface, size.width, size.height);
         }
         (self.render_target, self.render_target_view) =
             create_render_target(&self.device, size.width, size.height);
         self.target_size = size;
-        self.valid_target = true;
-        self.has_rendered_frame = false;
-        self.hidden_released = false;
+        self.valid_target = !self.gpu_health.failed();
     }
 
     /// Hand back the window-sized GPU memory a hidden window cannot use.
@@ -454,7 +547,7 @@ impl SceneRenderer {
     /// (see `begin_screenshot`), so releasing it would make `screenshot` fail for exactly the
     /// background tabs automation tends to ask about.
     pub fn release_while_hidden(&mut self) {
-        if self.hidden_released || self.surface.is_none() {
+        if self.hidden_released || self.surface.is_none() || self.gpu_health.failed() {
             return;
         }
 
@@ -488,6 +581,11 @@ impl SceneRenderer {
 
     pub fn clamp_render_size(&self, size: PhysicalSize<u32>) -> PhysicalSize<u32> {
         clamp_render_size(size, self.max_surface_dimension)
+    }
+
+    /// Whether the device must be replaced before further GPU work.
+    pub fn gpu_failed(&self) -> bool {
+        self.gpu_health.failed()
     }
 
     /// Round the finished frame's corners by `radius` physical pixels.
@@ -526,6 +624,9 @@ impl SceneRenderer {
         size: &SizeInfo,
         display_offset: usize,
     ) -> Option<super::media::PreparedMedia> {
+        if self.gpu_health.failed() {
+            return None;
+        }
         let mut renderer = self.renderer.borrow_mut();
         let media = self.media.draw(&self.device, &self.queue, &mut renderer, size, display_offset);
         let (overlay, changed) = match self.overlays.draw(
@@ -573,6 +674,7 @@ impl SceneRenderer {
         frames: &[EmbeddedFramePlacement<'_>],
         exclude: Option<(PhysicalPosition<u32>, PhysicalSize<u32>)>,
     ) -> Result<bool, Error> {
+        self.gpu_health.check()?;
         if !self.valid_target {
             return Ok(false);
         }
@@ -605,6 +707,7 @@ impl SceneRenderer {
         };
 
         self.paint_scene(scene, base_color, width, height)?;
+        self.gpu_health.check()?;
 
         if !frames.is_empty() {
             let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -669,13 +772,14 @@ impl SceneRenderer {
             surface_texture.present();
         }
 
+        self.gpu_health.check()?;
         self.has_rendered_frame = true;
         self.overlays.finish(true);
         Ok(true)
     }
 
     pub fn embedded_frame(&self) -> Option<EmbeddedFrame<'_>> {
-        self.has_rendered_frame
+        (self.has_rendered_frame && !self.gpu_health.failed())
             .then_some(EmbeddedFrame { texture: &self.render_target, size: self.target_size })
     }
 
@@ -979,14 +1083,17 @@ fn create_renderer(device: &wgpu::Device) -> Result<Renderer, vello::Error> {
 }
 
 fn create_window_surface(
-    context: &mut RenderContext,
+    state: &mut SharedRenderState,
     surface: wgpu::Surface<'static>,
     width: u32,
     height: u32,
     transparent: bool,
 ) -> Result<RenderSurface<'static>, Error> {
-    let dev_id = block_on(context.device(Some(&surface)))
+    let dev_id = block_on(state.context.device(Some(&surface)))
         .ok_or(Error::CreateSurface(vello::Error::NoCompatibleDevice))?;
+    let health = state.health_for(dev_id);
+    health.check()?;
+    let context = &state.context;
     let handle = &context.devices[dev_id];
     let capabilities = surface.get_capabilities(handle.adapter());
     let format = capabilities
@@ -1027,6 +1134,7 @@ fn create_window_surface(
 
     // This must be the swapchain's first configure; DXGI AlphaMode is immutable afterwards.
     context.configure_surface(&surface);
+    health.check()?;
 
     if matches!(
         alpha_mode,
@@ -1195,13 +1303,14 @@ pub(crate) fn gpu_test_lock() -> std::sync::MutexGuard<'static, ()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        RenderSource, SceneRenderer, SharedRenderContext, clamp_render_size, embedded_copy_extent,
-        frame_copy_regions, gpu_test_lock as gpu_lock, offscreen_device, premultiply_blend_state,
-        screenshot_layout, shutdown_window_render_context, surface_alpha_mode,
-        window_render_context,
+        Error, RenderSource, SceneRenderer, SharedRenderContext, clamp_render_size,
+        embedded_copy_extent, frame_copy_regions, gpu_test_lock as gpu_lock, offscreen_device,
+        premultiply_blend_state, retire_window_render_context, screenshot_layout,
+        shutdown_window_render_context, surface_alpha_mode, window_render_context,
     };
     use std::rc::Rc;
 
+    use pollster::block_on;
     use vello::peniko::Color;
     use vello::wgpu::CompositeAlphaMode;
     use vello::{Scene, kurbo};
@@ -1349,6 +1458,61 @@ mod tests {
 
         assert!(!renderer.hidden_released, "a resize leaves the window ready to paint");
         renderer.render(&Scene::new(), Color::BLACK).expect("render after resize");
+    }
+
+    #[test]
+    fn device_loss_during_resize_returns_an_error_and_a_rebuild_renders_again() {
+        let _gpu = gpu_lock();
+        if offscreen_device().is_err() {
+            eprintln!("Skipping device-loss test: no wgpu adapter");
+            return;
+        }
+        let mut renderer =
+            SceneRenderer::new(RenderSource::Offscreen, PhysicalSize::new(32, 16), false)
+                .expect("offscreen renderer");
+        renderer.render(&Scene::new(), Color::BLACK).expect("first frame");
+        renderer.device.destroy();
+
+        // This was the Windows crash: resizing used the lost device's invalid texture and
+        // panicked in Texture::create_view before Display could enter renderer recovery.
+        renderer.resize(PhysicalSize::new(48, 24));
+        assert!(renderer.gpu_failed());
+        assert!(!renderer.has_rendered_frame());
+        assert!(matches!(
+            renderer.render(&Scene::new(), Color::BLACK),
+            Err(Error::GpuUnavailable(_))
+        ));
+        renderer
+            .rebuild(RenderSource::Offscreen, PhysicalSize::new(48, 24), false)
+            .expect("replace lost device");
+        assert!(renderer.render(&Scene::new(), Color::BLACK).expect("recovered frame"));
+        assert!(!renderer.gpu_failed());
+    }
+
+    #[test]
+    fn a_failed_shared_device_is_replaced_once_for_all_recovering_windows() {
+        let _gpu = gpu_lock();
+        shutdown_window_render_context();
+        let old = window_render_context();
+        let health = {
+            let mut state = old.0.borrow_mut();
+            let Some(id) = block_on(state.context.device(None)) else {
+                eprintln!("Skipping shared device-loss test: no wgpu adapter");
+                shutdown_window_render_context();
+                return;
+            };
+            let health = state.health_for(id);
+            state.context.devices[id].device.destroy();
+            let _ = state.context.devices[id].device.poll(vello::wgpu::PollType::Poll);
+            health
+        };
+        assert!(health.failed());
+        let recovered = window_render_context();
+        assert!(!Rc::ptr_eq(&old.0, &recovered.0), "a lost cached device must not be reused");
+        retire_window_render_context(&old);
+        let second_window = window_render_context();
+        assert!(Rc::ptr_eq(&recovered.0, &second_window.0), "recovery still shares one context");
+        shutdown_window_render_context();
     }
 
     #[test]

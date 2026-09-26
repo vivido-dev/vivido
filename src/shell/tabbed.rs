@@ -13,7 +13,7 @@ use winit::event::TouchPhase;
 use winit::event::{
     ElementState, Event as WinitEvent, KeyEvent, MouseButton, StartCause, WindowEvent,
 };
-use winit::event_loop::{ActiveEventLoop, EventLoop};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{CursorIcon, Fullscreen, ResizeDirection, Window, WindowId};
 
@@ -1255,6 +1255,21 @@ impl ApplicationHandler<Event> for TabbedApplication {
         self.update_accessibility();
         if self.processor.has_pending_embedded_redraw() {
             self.request_redraw();
+        }
+        if let Some(deadline) = self.renderer.as_ref().and_then(ChromeRenderer::recovery_deadline) {
+            if Instant::now() >= deadline {
+                self.request_redraw();
+            } else {
+                match event_loop.control_flow() {
+                    ControlFlow::Wait => {
+                        event_loop.set_control_flow(ControlFlow::WaitUntil(deadline))
+                    },
+                    ControlFlow::WaitUntil(current) if deadline < current => {
+                        event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
+                    },
+                    _ => (),
+                }
+            }
         }
     }
 
