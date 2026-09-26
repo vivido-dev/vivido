@@ -57,9 +57,11 @@ pub use tabs::{Tab, Tabs, VisibleTabs};
 mod chrome;
 #[cfg(any(target_os = "linux", windows))]
 pub use chrome::{ChromeHitMap, ChromeLayout, ChromeRenderer, TAB_BAR_LOGICAL, compute_layout};
+pub mod close;
 mod launch;
 #[cfg(windows)]
 mod touch;
+pub use close::{CloseConfirmation, confirm_close};
 pub use launch::{LaunchAction, LaunchEntry, entries as launch_entries};
 #[cfg(windows)]
 pub use touch::touch_click_events;

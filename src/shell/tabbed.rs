@@ -484,13 +484,45 @@ impl TabbedApplication {
         }
     }
 
+    /// Close one tab at the user's request, asking first if its terminal is running a program.
     fn close_tab(&mut self, index: usize) {
         let Some(window_id) = self.tabs.as_slice().get(index).map(|tab| tab.window_id) else {
             return;
         };
+        if !self.confirm_closing(&[window_id], "Close this tab?", "this tab", "Close") {
+            return;
+        }
         if let Some(window) = self.processor.window_mut(window_id) {
             window.request_close();
         }
+    }
+
+    /// Quit at the user's request, asking first if any tab is running a program.
+    fn quit(&mut self, event_loop: &ActiveEventLoop) {
+        let ids = self.tabs.as_slice().iter().map(|tab| tab.window_id).collect::<Vec<_>>();
+        if self.confirm_closing(&ids, "Quit Vivido?", "Vivido", "Quit") {
+            self.close_all();
+            event_loop.exit();
+        }
+    }
+
+    /// Whether closing these terminals may go ahead: silently when none is running a program,
+    /// otherwise only if the user confirms.
+    fn confirm_closing(
+        &self,
+        windows: &[WindowId],
+        title: &str,
+        subject: &str,
+        action: &str,
+    ) -> bool {
+        let programs = self.processor.running_programs(windows.iter().copied());
+        programs.is_empty()
+            || super::confirm_close(
+                self.chrome
+                    .as_deref()
+                    .map(|chrome| chrome as &dyn winit::raw_window_handle::HasWindowHandle),
+                &super::CloseConfirmation { title, subject, action, programs: &programs },
+            )
     }
 
     fn close_all(&mut self) {
@@ -763,10 +795,7 @@ impl TabbedApplication {
                         chrome.set_maximized(!chrome.is_maximized());
                     }
                 },
-                AccessibilityCommand::CloseWindow => {
-                    self.close_all();
-                    event_loop.exit();
-                },
+                AccessibilityCommand::CloseWindow => self.quit(event_loop),
             }
         }
     }
@@ -819,8 +848,7 @@ impl TabbedApplication {
     fn click_chrome(&mut self, event_loop: &ActiveEventLoop) {
         let Some(position) = self.cursor else { return };
         if self.hits.close.contains(position.x, position.y) {
-            self.close_all();
-            event_loop.exit();
+            self.quit(event_loop);
             return;
         }
         if self.hits.minimize.contains(position.x, position.y) {
@@ -1011,10 +1039,7 @@ impl TabbedApplication {
             accessibility.process_event(chrome, &event);
         }
         match event {
-            WindowEvent::CloseRequested => {
-                self.close_all();
-                event_loop.exit();
-            },
+            WindowEvent::CloseRequested => self.quit(event_loop),
             WindowEvent::Resized(size) => {
                 self.close_menu();
                 if let (Some(renderer), Some(chrome)) = (&mut self.renderer, &self.chrome) {

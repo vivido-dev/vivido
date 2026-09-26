@@ -394,6 +394,45 @@ fn has_top_band(path: &Path) -> bool {
         .all(|x| image.get_pixel(x, 0).0[..3] != background[..3])
 }
 
+/// A terminal at its prompt has no running program, so closing it would not ask; a child the
+/// shell is waiting on is named, and the terminal is idle again once it exits.
+#[test]
+#[ignore = "spawns processes and needs a wgpu adapter"]
+fn running_program_distinguishes_an_idle_shell_from_a_running_child() {
+    let session = Session::start("running", &shell_program());
+    let running = || -> serde_json::Value {
+        let inspect: serde_json::Value =
+            serde_json::from_str(&session.msg(&["inspect"])).expect("inspect JSON");
+        inspect["running_program"].clone()
+    };
+    let wait_for = |expected: &dyn Fn(&serde_json::Value) -> bool, what: &str| {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let value = running();
+            if expected(&value) {
+                return value;
+            }
+            assert!(Instant::now() < deadline, "{what}; last saw {value}");
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    };
+
+    wait_for(&|value| value.is_null(), "an idle shell never reported no running program");
+
+    #[cfg(unix)]
+    let (command, program) = ("sleep 4\n", "sleep");
+    #[cfg(windows)]
+    let (command, program) = ("ping -n 5 127.0.0.1\r", "ping");
+    session.msg(&["typing", command]);
+    let name = wait_for(&|value| value.is_string(), "the running child was never reported");
+    assert!(
+        name.as_str().unwrap().to_ascii_lowercase().starts_with(program),
+        "expected {program}, got {name}"
+    );
+
+    wait_for(&|value| value.is_null(), "the shell never returned to idle after the child exited");
+}
+
 /// OSC 9;4 draws a bar in the headless renderer — the path Vivida's embedded panes render
 /// through — reports it in `inspect`, and clears it on removal.
 #[test]

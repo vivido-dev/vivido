@@ -359,6 +359,43 @@ fn latency_sensitive_draw_delay(last_draw: Option<Instant>, now: Instant) -> Opt
 }
 
 impl WindowContext {
+    /// The program still running in this terminal, if closing it would stop more than an idle
+    /// shell; `None` at a prompt or once the process has exited.
+    ///
+    /// On Unix the terminal's foreground process group answers exactly: anything but the shell's
+    /// own group is a running program. Windows has no foreground group, so a direct child of the
+    /// shell counts as running, unless OSC 133 shell integration reports the shell at its prompt;
+    /// integration also catches commands a shell runs in-process.
+    #[cfg(any(unix, windows))]
+    pub fn running_program(&self) -> Option<String> {
+        if self.automation.exit_status.is_some() {
+            return None;
+        }
+
+        #[cfg(unix)]
+        {
+            // SAFETY: `master_fd` is this terminal's live PTY master.
+            let foreground = unsafe { libc::tcgetpgrp(self.master_fd) };
+            (foreground > 0 && foreground as u32 != self.shell_pid).then(|| {
+                foreground_executable_basename(foreground)
+                    .unwrap_or_else(|| String::from("a program"))
+            })
+        }
+
+        #[cfg(windows)]
+        {
+            let shell = &self.automation.shell;
+            let integrated = shell.in_prompt || shell.command_generation > 0;
+            if integrated && !shell.command_running {
+                return None;
+            }
+            // Never the reported command line: it can carry arguments, and this name reaches
+            // `inspect` as well as the dialog.
+            child_process_name(self.shell_pid)
+                .or_else(|| integrated.then(|| String::from("a command")))
+        }
+    }
+
     /// Close this terminal even when its configured hold policy is enabled.
     pub fn request_close(&mut self) {
         self.display.window.hold = false;
@@ -2453,6 +2490,8 @@ impl WindowContext {
     /// Detailed, secret-free terminal/window inspection.
     #[cfg(any(unix, windows))]
     pub fn automation_inspect(&self, event_sequence: u64, live_pty_count: usize) -> Value {
+        // Probed before the terminal lock is taken; it reads only process state.
+        let running_program = self.running_program();
         let terminal = self.terminal.lock();
         let grid = terminal.grid();
         let size = self.display.size_info;
@@ -2514,6 +2553,7 @@ impl WindowContext {
             "foreground_process_group_id": foreground_pgid,
             "executable": executable,
             "current_directory": current_directory,
+            "running_program": running_program,
             "progress": self.display.progress.automation_json(),
             "echo": echo,
             "exit_status": exit_status_json(self.automation.exit_status.as_ref()),
@@ -3488,6 +3528,53 @@ fn cbor_json(value: &vivid_protocol::cbor::Value) -> Value {
 #[cfg(any(unix, windows))]
 fn hex_bytes(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// Executable name of the first live direct child of `parent`, skipping console hosts.
+#[cfg(windows)]
+fn child_process_name(parent: u32) -> Option<String> {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+        TH32CS_SNAPPROCESS,
+    };
+
+    if parent == 0 {
+        return None;
+    }
+    // SAFETY: the snapshot handle is checked before use and always closed; `entry` is a plain
+    // struct the API fills after `dwSize` versions it.
+    unsafe {
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snapshot == INVALID_HANDLE_VALUE {
+            return None;
+        }
+        let mut entry = PROCESSENTRY32W {
+            dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+            ..Default::default()
+        };
+        let mut found = None;
+        let mut more = Process32FirstW(snapshot, &mut entry) != 0;
+        while more {
+            if entry.th32ParentProcessID == parent {
+                let length = entry
+                    .szExeFile
+                    .iter()
+                    .position(|&unit| unit == 0)
+                    .unwrap_or(entry.szExeFile.len());
+                let name = String::from_utf16_lossy(&entry.szExeFile[..length]);
+                if !name.eq_ignore_ascii_case("conhost.exe")
+                    && !name.eq_ignore_ascii_case("OpenConsole.exe")
+                {
+                    found = Some(name);
+                    break;
+                }
+            }
+            more = Process32NextW(snapshot, &mut entry) != 0;
+        }
+        CloseHandle(snapshot);
+        found
+    }
 }
 
 #[cfg(all(unix, target_os = "linux"))]

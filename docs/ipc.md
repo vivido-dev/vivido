@@ -352,7 +352,10 @@ waiting until it disconnects, the same as any unanswered request.
   arguments, environment values, Vivid root/resume secrets, channel authenticators, or derived
   capabilities. `current_directory` prefers the shell's OSC 7 report when its host is this
   machine and falls back to the foreground-process probe; over Windows OSC 7 is the only
-  source.
+  source. `running_program` names the program a user-initiated close would stop, or is null
+  when the terminal sits at its shell prompt or has exited: on Unix the foreground process group
+  when it is not the shell's, on Windows a direct child of the shell unless OSC 133 reports the
+  prompt (`"a command"` when integration reports a command the shell runs in-process).
   It also reports `ime_cursor_area`, lightweight native-accessibility state, `vivid_overlay`
   resource/submission counters, and overlay render-cache passes, skips, and target allocations.
   These counters are cumulative and are intended for bounded acceptance and performance probes;

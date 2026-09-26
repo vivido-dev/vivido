@@ -17,6 +17,21 @@ right-click expansion, and all other selection-expansion modes are intentionally
 On Windows, right-click pastes the system clipboard when terminal mouse reporting is inactive;
 hold Shift to use this terminal-side paste while an application has enabled mouse reporting.
 
+## Closing terminals
+
+Closing a terminal that is sitting at its shell prompt happens at once. Closing one that is still
+running a program — `vim`, a build, an agent — first asks, naming what would be stopped; the
+default answer keeps it running. This covers the window's close button, the `Quit` binding, and
+closing a tab in the Windows/Linux tab strip, where quitting asks once for every tab with a
+running program. Vivida asks the same way when closing a pane (`Control+W`), a workspace, or the
+whole app, and no longer asks when nothing is running.
+
+On Linux and macOS a program is running when the terminal's foreground process group is not the
+shell's. Windows has no foreground group, so a child process of the shell counts, unless OSC 133
+shell integration reports the shell at its prompt. IPC `inspect` reports the same answer as
+`running_program`. Automation closes (`close-window`, `close-pane`, and the like) never ask. Linux
+has no native dialog under Wayland, so there closes still happen without asking.
+
 ## Hints
 
 Regex hints remain available for opening links and launching configured commands. Hints are

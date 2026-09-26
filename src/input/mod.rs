@@ -199,6 +199,8 @@ pub trait ActionContext<T: EventListener> {
     fn change_font_size(&mut self, _delta: f32) {}
     fn reset_font_size(&mut self) {}
     fn terminal_recovery(&mut self) {}
+    /// Close this terminal at the user's request, asking first if a program is running.
+    fn request_close(&mut self) {}
     fn check_for_updates(&self) {}
     fn install_update(&self) {}
     fn pop_message(&mut self) {}
@@ -319,10 +321,7 @@ impl<T: EventListener> Execute<T> for Action {
                 ctx.shell_action(crate::shell::ShellAction::Minimize);
             },
             Action::Minimize => ctx.window().set_minimized(true),
-            Action::Quit => {
-                ctx.window().hold = false;
-                ctx.terminal_mut().exit();
-            },
+            Action::Quit => ctx.request_close(),
             Action::IncreaseFontSize => ctx.change_font_size(FONT_SIZE_STEP),
             Action::DecreaseFontSize => ctx.change_font_size(-FONT_SIZE_STEP),
             Action::ResetFontSize => ctx.reset_font_size(),

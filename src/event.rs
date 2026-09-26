@@ -3974,6 +3974,45 @@ impl Processor {
         }
     }
 
+    /// Programs still running in these terminals, one per terminal that has one.
+    ///
+    /// An embedding host checks this before a user-initiated close of a tab, workspace, or its
+    /// whole window, and asks with [`crate::shell::confirm_close`] only when it is not empty.
+    #[cfg(any(unix, windows))]
+    pub fn running_programs(&self, windows: impl IntoIterator<Item = WindowId>) -> Vec<String> {
+        windows
+            .into_iter()
+            .filter_map(|window_id| self.windows.get(&window_id)?.running_program())
+            .collect()
+    }
+
+    /// Whether a user-initiated close of one terminal may go ahead.
+    ///
+    /// Idle terminals close without asking; one running a program asks, parented to its own
+    /// window when it has a native one.
+    fn confirm_user_close(&self, window_id: WindowId) -> bool {
+        #[cfg(any(unix, windows))]
+        {
+            let Some(window) = self.windows.get(&window_id) else { return true };
+            let programs = self.running_programs([window_id]);
+            programs.is_empty()
+                || crate::shell::confirm_close(
+                    window.display.window.dialog_owner(),
+                    &crate::shell::CloseConfirmation {
+                        title: "Close this terminal?",
+                        subject: "this terminal",
+                        action: "Close",
+                        programs: &programs,
+                    },
+                )
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = window_id;
+            true
+        }
+    }
+
     /// Mirror OSC 9;4 progress onto the taskbar buttons and the Dock tile.
     ///
     /// Runs once per loop turn and touches the platform only when a state changed, which also
@@ -4090,6 +4129,15 @@ impl Processor {
 
         // Ignore all events we do not care about.
         if Self::skip_window_event(&event) {
+            return;
+        }
+
+        // A standalone window's close button asks first when a program is running. Hosted panes
+        // never receive it from the user; their host confirms its own closes.
+        if matches!(event, WindowEvent::CloseRequested)
+            && self.windows.get(&window_id).is_some_and(|window| !window.display.window.is_hosted())
+            && !self.confirm_user_close(window_id)
+        {
             return;
         }
 
@@ -4441,6 +4489,13 @@ impl Processor {
                         "progress_changed",
                         window.display.progress.automation_json(),
                     );
+                }
+            },
+            (EventType::RequestClose, Some(window_id)) => {
+                if self.confirm_user_close(*window_id)
+                    && let Some(window) = self.windows.get_mut(window_id)
+                {
+                    window.request_close();
                 }
             },
             (EventType::ProgressTimeout, Some(window_id)) => {
@@ -5125,6 +5180,8 @@ pub enum EventType {
     /// This deliberately has no outer-`Processor` arm: the catch-all forwards it into
     /// `WindowContext::handle_event`, which is the only place an `ActionContext` exists.
     VividFileDropPaste,
+    /// The user asked to close this terminal; confirm first if a program is running.
+    RequestClose,
     /// Wake the loop on behalf of an in-process host. Vivido itself does nothing with it.
     HostWakeup,
 }
@@ -5567,6 +5624,12 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
         self.display
             .pending_update
             .set_font(self.config.font.clone().with_size(self.display.font_size));
+    }
+
+    fn request_close(&mut self) {
+        // The processor owns the process state the confirmation needs.
+        let window_id = self.display.window.id();
+        let _ = self.event_proxy.send_event(Event::new(EventType::RequestClose, window_id));
     }
 
     fn terminal_recovery(&mut self) {
@@ -6378,6 +6441,7 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                 | EventType::Update(_)
                 | EventType::MessageTimeout(_)
                 | EventType::ProgressTimeout
+                | EventType::RequestClose
                 | EventType::ConfigReload(_)
                 | EventType::CreateWindow(_)
                 | EventType::NotificationActivated

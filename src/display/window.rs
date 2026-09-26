@@ -739,6 +739,19 @@ impl Window {
         }
     }
 
+    /// The native window a modal dialog about this terminal should belong to.
+    ///
+    /// Hosted panes are children of their host's window and headless windows have none; their
+    /// dialogs are modal to the application instead.
+    pub fn dialog_owner(&self) -> Option<&dyn winit::raw_window_handle::HasWindowHandle> {
+        if self.hosted {
+            return None;
+        }
+        self.backend
+            .winit()
+            .map(|window| window.as_ref() as &dyn winit::raw_window_handle::HasWindowHandle)
+    }
+
     /// Show progress in this window's taskbar button, returning whether it has one.
     ///
     /// A hosted pane is a child of its host's window and has no button; the host mirrors it.
