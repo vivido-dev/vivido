@@ -1,4 +1,4 @@
-//! OSC 9;4 progress bar drawn across the top of the terminal.
+//! Program progress drawn across the top of the terminal.
 //!
 //! Programs such as `winget`, systemd, and agent CLIs report progress with ConEmu's
 //! `OSC 9;4;<state>[;<percent>]`. [`ProgressBar`] folds those reports into per-window state and
@@ -11,6 +11,10 @@
 //!
 //! Outside the surface, [`ProgressBar::current`] is what a window, taskbar button, Dock tile, or
 //! an embedding host's tab mirrors, and [`most_urgent`] folds several surfaces into one.
+//!
+//! Claude Code and Muse also report activity with a Braille spinner in their OSC window title,
+//! even when they do not emit OSC 9;4. That supplies indeterminate progress until the program
+//! replaces the spinner title. Unlike percent reports, title activity needs no keepalive.
 
 use std::time::{Duration, Instant};
 
@@ -114,6 +118,7 @@ struct Active {
 #[derive(Debug, Default)]
 pub struct ProgressBar {
     active: Option<Active>,
+    title_activity: Option<Active>,
 }
 
 impl ProgressBar {
@@ -122,9 +127,11 @@ impl ProgressBar {
     /// Returns whether the reported state or percent changed. Tools re-send the same report as a
     /// keepalive; those refresh staleness but are not a change worth announcing.
     pub(crate) fn apply(&mut self, report: ProgressReport, now: Instant) -> bool {
+        let before = self.current(now);
         let previous = self.active;
         let Some(state) = (report.state != ProgressState::Remove).then_some(report.state) else {
-            return self.active.take().is_some();
+            self.active = None;
+            return before != self.current(now);
         };
 
         // Error and pause keep the last known percent when they carry none, and fill the whole
@@ -138,8 +145,6 @@ impl ProgressBar {
             ProgressState::Remove => unreachable!("removal returned above"),
         };
 
-        let changed =
-            previous.is_none_or(|active| (active.state, active.percent) != (state, percent));
         let restarts = previous.is_none_or(|active| {
             active.percent != percent
                 || (state == ProgressState::Indeterminate)
@@ -152,12 +157,46 @@ impl ProgressBar {
         };
 
         self.active = Some(Active { state, percent, from, changed_at, updated_at: now });
-        changed
+        before != self.current(now)
+    }
+
+    /// Use a standalone Braille spinner in the program's title as a busy fallback.
+    ///
+    /// An OSC percent/error/pause takes precedence. Withdrawing or expiring that report still
+    /// leaves a busy title visible, including between an agent's model and tool phases. The
+    /// title returning to plain text ends the fallback, without periodic title updates.
+    pub(crate) fn apply_title(&mut self, title: &str, now: Instant) -> bool {
+        let before = self.current(now);
+        let busy = title.split_whitespace().any(|word| {
+            let mut chars = word.chars();
+            chars.next().is_some_and(|c| ('\u{2801}'..='\u{28ff}').contains(&c))
+                && chars.next().is_none()
+        });
+        if busy {
+            self.title_activity.get_or_insert(Active {
+                state: ProgressState::Indeterminate,
+                percent: None,
+                from: 0.,
+                changed_at: now,
+                updated_at: now,
+            });
+        } else if self.title_activity.take().is_some()
+            && self.active.is_some_and(|active| {
+                matches!(active.state, ProgressState::Normal | ProgressState::Indeterminate)
+            })
+        {
+            // The same program finished its turn. A remaining running percent is no longer
+            // current; retain an explicit error/pause until it is withdrawn or goes stale.
+            self.active = None;
+        }
+        before != self.current(now)
     }
 
     /// Remove the bar, returning whether one was showing.
     pub fn clear(&mut self) -> bool {
-        self.active.take().is_some()
+        let reported = self.active.take().is_some();
+        let title = self.title_activity.take().is_some();
+        reported || title
     }
 
     /// Remove a bar whose last report is older than [`STALE_AFTER`], returning whether it did.
@@ -176,7 +215,7 @@ impl ProgressBar {
 
     /// The visual a frame drawn at `now` shows.
     pub fn visual_at(&self, now: Instant) -> Option<ProgressVisual> {
-        let active = self.active.filter(|active| !is_stale(active, now))?;
+        let active = self.visible_active(now)?;
         let tone = match active.state {
             ProgressState::Indeterminate => {
                 return Some(ProgressVisual::Bounce { offset: bounce_offset(&active, now) });
@@ -190,16 +229,15 @@ impl ProgressBar {
 
     /// Whether frames drawn after `now` differ from one drawn at `now`.
     pub fn is_animating_at(&self, now: Instant) -> bool {
-        self.active.is_some_and(|active| {
-            !is_stale(&active, now)
-                && (active.state == ProgressState::Indeterminate
-                    || now.saturating_duration_since(active.changed_at) < FILL_ANIMATION)
+        self.visible_active(now).is_some_and(|active| {
+            active.state == ProgressState::Indeterminate
+                || now.saturating_duration_since(active.changed_at) < FILL_ANIMATION
         })
     }
 
     /// The progress a frame drawn at `now` shows, for mirroring outside the surface.
     pub fn current(&self, now: Instant) -> Option<Progress> {
-        let active = self.active.filter(|active| !is_stale(active, now))?;
+        let active = self.visible_active(now)?;
         let kind = match active.state {
             ProgressState::Normal | ProgressState::Remove => ProgressKind::Normal,
             ProgressState::Indeterminate => ProgressKind::Indeterminate,
@@ -211,11 +249,10 @@ impl ProgressBar {
 
     /// The reported state for automation: `state` is `none` when no bar is showing.
     ///
-    /// A stale report reads as `none` even before its expiry timer has fired, matching what is
-    /// drawn.
+    /// Stale reports fall back to title activity or `none` even before their expiry timer fires,
+    /// matching what is drawn.
     pub fn automation_json(&self) -> serde_json::Value {
-        let (state, percent) = match self.active.filter(|active| !is_stale(active, Instant::now()))
-        {
+        let (state, percent) = match self.visible_active(Instant::now()) {
             None => ("none", None),
             Some(active) => (state_name(active.state), active.percent),
         };
@@ -223,9 +260,13 @@ impl ProgressBar {
     }
 
     fn fill_fraction_at(&self, now: Instant) -> Option<f32> {
-        self.active
-            .filter(|active| active.state != ProgressState::Indeterminate && !is_stale(active, now))
+        self.visible_active(now)
+            .filter(|active| active.state != ProgressState::Indeterminate)
             .map(|active| fill_fraction(&active, now))
+    }
+
+    fn visible_active(&self, now: Instant) -> Option<Active> {
+        self.active.filter(|active| !is_stale(active, now)).or(self.title_activity)
     }
 }
 
@@ -269,6 +310,86 @@ mod tests {
 
     fn report(state: ProgressState, percent: Option<u8>) -> ProgressReport {
         ProgressReport { state, percent }
+    }
+
+    #[test]
+    fn agent_title_activity_survives_silent_thinking_and_tool_execution() {
+        for (busy, idle) in [("⠋ Claude Code", "✳ Claude Code"), ("⠸ vivido", "vivido")] {
+            let start = Instant::now();
+            let mut bar = ProgressBar::default();
+            assert!(bar.apply_title(busy, start));
+            let later = start + Duration::from_secs(120);
+            assert!(matches!(bar.visual_at(later), Some(ProgressVisual::Bounce { .. })));
+            assert!(bar.is_animating_at(later));
+            assert_eq!(bar.deadline(), None, "a title is state, not a heartbeat");
+            assert!(!bar.expire(later));
+            assert!(!bar.apply(report(ProgressState::Remove, None), later));
+            assert!(bar.current(later).is_some(), "OSC clear between tools keeps the fallback");
+            assert!(bar.apply_title(idle, later));
+            assert_eq!(bar.current(later), None);
+        }
+    }
+
+    #[test]
+    fn explicit_reports_override_busy_titles_and_expire_back_to_the_fallback() {
+        let start = Instant::now();
+        let mut bar = ProgressBar::default();
+        bar.apply_title("⠋ Claude Code", start);
+        bar.apply(report(ProgressState::Normal, Some(42)), start);
+        assert_eq!(
+            bar.current(start),
+            Some(Progress { kind: ProgressKind::Normal, percent: Some(42) })
+        );
+        assert_eq!(
+            bar.current(start + STALE_AFTER),
+            Some(Progress { kind: ProgressKind::Indeterminate, percent: None })
+        );
+        assert!(bar.expire(start + STALE_AFTER));
+        bar.apply(report(ProgressState::Error, Some(42)), start + STALE_AFTER);
+        assert!(!bar.apply_title("✳ Claude Code", start + STALE_AFTER));
+        assert_eq!(
+            bar.current(start + STALE_AFTER),
+            Some(Progress { kind: ProgressKind::Error, percent: Some(42) })
+        );
+    }
+
+    #[test]
+    fn idle_title_clears_a_running_report_and_repeated_spinners_do_not_restart_animation() {
+        let start = Instant::now();
+        let mut bar = ProgressBar::default();
+        bar.apply_title("⠋ project", start);
+        let later = start + BOUNCE_SWEEP;
+        let visual = bar.visual_at(later);
+        assert!(!bar.apply_title("⠙ project", later));
+        assert_eq!(bar.visual_at(later), visual);
+        bar.apply(report(ProgressState::Normal, Some(80)), later);
+        assert!(bar.apply_title("project", later));
+        assert_eq!(bar.current(later), None);
+        assert_eq!(bar.deadline(), None);
+    }
+
+    #[test]
+    fn normal_titles_and_braille_words_do_not_start_progress() {
+        let mut bar = ProgressBar::default();
+        for title in ["Claude Code", "Muse Code", "Thinking", "⠁⠃ braille", "a⠋b", "⠀ project"]
+        {
+            assert!(!bar.apply_title(title, Instant::now()), "{title}");
+            assert_eq!(bar.current(Instant::now()), None);
+        }
+    }
+
+    #[test]
+    fn clearing_one_surfaces_activity_does_not_clear_another_surface() {
+        let start = Instant::now();
+        let mut first = ProgressBar::default();
+        let mut second = ProgressBar::default();
+        first.apply_title("⠋ Claude Code", start);
+        second.apply_title("⠋ project", start);
+        first.apply(report(ProgressState::Normal, Some(10)), start);
+        assert!(first.clear());
+        assert_eq!(first.current(start), None);
+        assert!(second.current(start + Duration::from_secs(120)).is_some());
+        assert!(!first.clear());
     }
 
     #[test]

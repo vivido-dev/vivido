@@ -4397,6 +4397,15 @@ impl Processor {
             },
             #[cfg(any(unix, windows))]
             (EventType::Terminal(TerminalEvent::Title(title)), Some(window_id)) => {
+                if let Some(window) = self.windows.get_mut(window_id)
+                    && window.apply_progress_title(&title, &mut self.scheduler)
+                {
+                    self.automation.emit(
+                        Some(window.ipc_window_id()),
+                        "progress_changed",
+                        window.display.progress.automation_json(),
+                    );
+                }
                 self.automation.emit(
                     self.windows.get(window_id).map(WindowContext::ipc_window_id),
                     "title_changed",
@@ -4418,6 +4427,15 @@ impl Processor {
             },
             #[cfg(any(unix, windows))]
             (EventType::Terminal(TerminalEvent::ResetTitle), Some(window_id)) => {
+                if let Some(window) = self.windows.get_mut(window_id)
+                    && window.apply_progress_title("", &mut self.scheduler)
+                {
+                    self.automation.emit(
+                        Some(window.ipc_window_id()),
+                        "progress_changed",
+                        window.display.progress.automation_json(),
+                    );
+                }
                 let title = self
                     .windows
                     .get(window_id)
@@ -4669,6 +4687,13 @@ impl Processor {
             #[cfg(any(unix, windows))]
             (EventType::Terminal(TerminalEvent::ClientResetComplete(token)), Some(window_id)) => {
                 if let Some(window) = self.windows.get_mut(window_id) {
+                    if window.clear_progress(&mut self.scheduler) {
+                        self.automation.emit(
+                            Some(window.ipc_window_id()),
+                            "progress_changed",
+                            window.display.progress.automation_json(),
+                        );
+                    }
                     window.complete_client_reset();
                     self.automation.emit(
                         Some(window.ipc_window_id()),
@@ -4731,6 +4756,13 @@ impl Processor {
             #[cfg(any(unix, windows))]
             (EventType::Terminal(TerminalEvent::ChildExit(status)), Some(window_id)) => {
                 if let Some(window) = self.windows.get_mut(window_id) {
+                    if window.clear_progress(&mut self.scheduler) {
+                        self.automation.emit(
+                            Some(window.ipc_window_id()),
+                            "progress_changed",
+                            window.display.progress.automation_json(),
+                        );
+                    }
                     window.automation.exit_status = Some(status);
                     self.automation.emit(
                         Some(window.ipc_window_id()),

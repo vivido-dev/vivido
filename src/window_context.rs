@@ -1467,6 +1467,7 @@ impl WindowContext {
     #[cfg(any(unix, windows))]
     pub(crate) fn complete_client_reset(&mut self) {
         self.client_health = ClientHealth::Healthy;
+        self.display.progress.clear();
         self.dirty = true;
     }
 
@@ -2163,6 +2164,30 @@ impl WindowContext {
         changed
     }
 
+    /// Fold activity from an OSC title into the progress shown inside and outside the terminal.
+    /// This consumes the reported title even when dynamic title display is off.
+    pub(crate) fn apply_progress_title(&mut self, title: &str, scheduler: &mut Scheduler) -> bool {
+        if !self.config.terminal.progress {
+            return false;
+        }
+        let changed = self.display.progress.apply_title(title, Instant::now());
+        self.schedule_progress_timeout(scheduler);
+        if changed {
+            self.request_progress_frame();
+        }
+        changed
+    }
+
+    /// End progress when this terminal process exits, including held windows.
+    pub(crate) fn clear_progress(&mut self, scheduler: &mut Scheduler) -> bool {
+        let changed = self.display.progress.clear();
+        self.schedule_progress_timeout(scheduler);
+        if changed {
+            self.request_progress_frame();
+        }
+        changed
+    }
+
     /// Drop a progress bar whose program stopped reporting, returning whether one was removed.
     pub(crate) fn expire_progress(&mut self, scheduler: &mut Scheduler) -> bool {
         let expired = self.display.progress.expire(Instant::now());
@@ -2190,7 +2215,7 @@ impl WindowContext {
         }
     }
 
-    /// The OSC 9;4 progress this terminal shows, for an embedding host's tab or indicator.
+    /// The progress this terminal shows, for an embedding host's tab or indicator.
     pub fn progress(&self) -> Option<crate::display::progress::Progress> {
         self.display.progress.current(Instant::now())
     }

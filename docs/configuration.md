@@ -329,7 +329,7 @@ blinking = "Off"
 |---|---|---|---|
 | `osc52` | enum | `onlycopy` | Clipboard access via OSC 52: `disabled`, `onlycopy`, `onlypaste`, `copypaste` (case-insensitive). |
 | `osc_notifications` | bool | `true` | Allow OSC 9 and OSC 99 desktop notifications. |
-| `progress` | bool | `true` | Draw a progress bar for OSC 9;4 progress reports. |
+| `progress` | bool | `true` | Show OSC 9;4 progress and activity reported by spinner titles. |
 | `shell` | string or `{ program, args }` | *system* | Shell to launch instead of the login shell. |
 
 ```toml
@@ -381,6 +381,14 @@ turns it red (error), `4` turns it yellow (paused), `3` shows a segment bouncing
 none. A bar with no new report for 15 seconds is removed, so a crashed tool does not leave one
 behind. The bar works the same inside Vivida panes, and IPC `inspect` and the `progress_changed`
 event report its state. `terminal.progress = false` turns it off.
+
+Claude Code and Muse can report activity with a Braille spinner in their window title instead of
+OSC 9;4. Vivido uses that as a busy fallback for both thinking and tool execution, without requiring
+agent hooks or changing agent settings. The fallback stays visible through silent work and OSC
+clears between tools, and ends when the title loses its spinner, the terminal resets, or its child
+exits. Explicit percent, error, and pause reports take precedence while current. This also works
+when `window.dynamic_title` is off. A program must report progress or a spinner title; elapsed
+runtime alone does not start a bar, and a busy indicator does not imply a completion percentage.
 
 Progress also shows outside the terminal. On Windows the window's taskbar button fills in the same
 colour (paused and error use the shell's amber and red, and busy shows its moving indicator). On

@@ -394,6 +394,78 @@ fn has_top_band(path: &Path) -> bool {
         .all(|x| image.get_pixel(x, 0).0[..3] != background[..3])
 }
 
+/// Emit the agent's busy title without OSC progress, including an intermediate OSC clear, and
+/// stay silent until the test requests the idle title. File triggers keep the phases deterministic.
+#[cfg(unix)]
+fn agent_title_program(trigger: &Path, title: &str) -> Vec<String> {
+    vec![
+        String::from("sh"),
+        String::from("-c"),
+        format!(
+            "printf '\\033]0;⠋ {title}\\a\\033]9;4;0\\a'; echo TITLE-BUSY; while [ ! -e '{}' ]; do sleep 0.1; done; printf '\\033]0;{title}\\a'; echo TITLE-IDLE; sleep 300",
+            trigger.display()
+        ),
+    ]
+}
+
+#[cfg(windows)]
+fn agent_title_program(trigger: &Path, title: &str) -> Vec<String> {
+    vec![
+        String::from("powershell.exe"),
+        String::from("-NoLogo"),
+        String::from("-NoProfile"),
+        String::from("-NonInteractive"),
+        String::from("-Command"),
+        format!(
+            "[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); $e=[char]27; $b=[char]7; [Console]::Write($e + ']0;' + [char]0x280b + ' {title}' + $b + $e + ']9;4;0' + $b); Write-Output 'TITLE-BUSY'; while (-not (Test-Path -LiteralPath '{}')) {{ Start-Sleep -Milliseconds 100 }}; [Console]::Write($e + ']0;{title}' + $b); Write-Output 'TITLE-IDLE'; Start-Sleep -Seconds 300",
+            trigger.display()
+        ),
+    ]
+}
+
+/// Exercise real title delivery, rendering, and owner isolation, including Windows ConPTY.
+#[test]
+#[ignore = "spawns processes and needs a wgpu adapter"]
+fn agent_titles_draw_progress_without_osc_reports_and_clear_only_their_own_window() {
+    let triggers = tempfile::tempdir().expect("agent title triggers");
+    let claude_trigger = triggers.path().join("claude-idle");
+    let muse_trigger = triggers.path().join("muse-idle");
+    let claude =
+        Session::start("title-claude", &agent_title_program(&claude_trigger, "Claude Code"));
+    let muse = Session::start("title-muse", &agent_title_program(&muse_trigger, "project"));
+    let inspect = |session: &Session| -> serde_json::Value {
+        serde_json::from_str(&session.msg(&["inspect", "--window-id", "1"])).expect("inspect JSON")
+    };
+    let busy = serde_json::json!({"state": "indeterminate", "percent": null});
+    let idle = serde_json::json!({"state": "none", "percent": null});
+
+    for session in [&claude, &muse] {
+        session.msg(&["wait", "text", "TITLE-BUSY", "--window-id", "1", "--timeout", "10s"]);
+        let state = inspect(session);
+        assert_eq!(state["window"]["window_id"], 1, "owners reuse the same local ID");
+        assert_eq!(state["progress"], busy);
+        let path = PathBuf::from(session.msg(&["screenshot", "--window-id", "1"]).trim());
+        assert!(has_top_band(&path), "title activity draws the busy track and segment");
+        let _ = fs::remove_file(&path);
+    }
+
+    // No PTY bytes arrive after the initial title. Thinking must outlast the OSC keepalive timeout.
+    std::thread::sleep(Duration::from_secs(16));
+    assert_eq!(inspect(&claude)["progress"], busy);
+    assert_eq!(inspect(&muse)["progress"], busy);
+    fs::write(&claude_trigger, b"").expect("finish the Claude turn");
+    claude.msg(&["wait", "text", "TITLE-IDLE", "--window-id", "1", "--timeout", "10s"]);
+    assert_eq!(inspect(&claude)["progress"], idle);
+    assert_eq!(inspect(&muse)["progress"], busy, "the other owner stays busy");
+    let path = PathBuf::from(claude.msg(&["screenshot", "--window-id", "1"]).trim());
+    assert!(!has_top_band(&path), "the idle title removes the visible bar");
+    let _ = fs::remove_file(&path);
+
+    muse.msg(&["reset-terminal", "--window-id", "1"]);
+    assert_eq!(inspect(&muse)["progress"], idle, "reset also clears title activity");
+    assert_eq!(inspect(&claude)["progress"], idle);
+}
+
 /// A terminal at its prompt has no running program, so closing it would not ask; a child the
 /// shell is waiting on is named, and the terminal is idle again once it exits.
 #[test]

@@ -10,7 +10,7 @@ pub struct Terminal {
     pub osc52: SerdeOsc52,
     /// Allow terminal applications to create desktop notifications through OSC 9/99.
     pub osc_notifications: bool,
-    /// Draw a progress bar for OSC 9;4 progress reports.
+    /// Draw a progress bar for OSC 9;4 reports and activity reported by spinner titles.
     pub progress: bool,
     /// Path to a shell program to run on startup.
     pub shell: Option<Program>,

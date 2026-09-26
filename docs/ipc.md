@@ -518,7 +518,8 @@ reset. Output data is split into
 at most 64 KiB chunks with start/end offsets and base64 bytes. Screen-change data contains current
 row replacements. `directory_changed` fires when the local shell reports a new working directory
 through OSC 7 and carries `{"directory":"/path"}`. `progress_changed` fires when an OSC 9;4
-report changes the window's progress state or percent, or when a stale bar expires, and carries
+report or a program's spinner title changes the window's progress state or percent, or when a
+stale report expires, the child exits, or terminal recovery clears progress, and carries
 `{"state":"normal|error|indeterminate|paused|none","percent":42}`; `percent` is null for
 `indeterminate` and `none`. `inspect` reports the same object as `progress`. The process replay ring is bounded by both 4 MiB and 4,096 events.
 
