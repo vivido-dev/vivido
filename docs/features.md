@@ -11,11 +11,40 @@ Vi mode and vi-specific search commands are not part of Vivido.
 
 ## Mouse selection
 
-Drag the primary mouse button to create a simple character selection. Hold Control while
-dragging for a rectangular block selection. Double/triple-click semantic or line selection,
-right-click expansion, and all other selection-expansion modes are intentionally absent.
+Drag the primary mouse button to select characters; hold Control while dragging for a
+rectangular block. Double-click selects the word under the pointer and triple-click its whole
+logical line, soft-wrapped rows included; keep the button down and drag to extend by words or
+lines. Shift-click moves the end of an existing selection to the pointer, keeping where it started
+and whether it runs by characters, words, or lines. Words end at the characters in
+[`selection.semantic_escape_chars`](configuration.md#selection).
+
+While an application has enabled mouse reporting, clicks go to it; hold Shift to select instead.
 On Windows, right-click pastes the system clipboard when terminal mouse reporting is inactive;
 hold Shift to use this terminal-side paste while an application has enabled mouse reporting.
+
+## Paste protection and clipboard prompts
+
+A program that has not enabled bracketed paste cannot tell a paste from typing, so pasting text
+with a line break presses Enter, and other control characters act as the keys that produce them.
+Before such a paste Vivido asks, showing the question, how many line breaks and control characters
+the text holds, and its first lines with control characters made visible (`␛` for Escape). The
+refusing choice starts highlighted, so a reflexive `Enter` pastes nothing. `P` or `Y` pastes; `C`,
+`N`, `Escape`, or `Control+C` cancels; `Tab`, `Left`, or `Right` moves the highlight and `Enter`
+takes it. Shells with bracketed paste — bash 5.1 and later, zsh, fish — receive pastes as plain
+text with Escape removed, so they paste at once. Set `terminal.paste_protection = false` to never
+ask.
+
+Programs can also read and replace the clipboard with OSC 52. Replacing it is allowed by default,
+which is how editors copy over SSH; reading it asks, since the clipboard can hold a password. That
+prompt shows the text the program would receive, with `Allow` (`A`) and `Deny` (`D`). Set either
+direction of `terminal.osc52` to `allow`, `ask`, or `deny`. Only a focused terminal's requests
+count, and one that arrives while a prompt is waiting is dropped. Resetting or restarting the
+terminal client withdraws a waiting prompt, so its answer never reaches another program.
+
+The prompt is drawn in the terminal surface, like the command palette, so it looks and works the
+same on Linux, macOS, and Windows, and inside Vivida panes. While it is open no keystroke or paste
+reaches the terminal. Automation pastes (`vivido msg paste`) never ask; IPC `inspect` reports an
+open prompt as `clipboard_prompt`.
 
 ## Command palette
 

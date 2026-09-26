@@ -210,7 +210,7 @@ not fit at end-of-line get a leading spacer cell when DECAWM is on.
 | Kitty color protocol | 21 | ❌ | |
 | Pointer shape | 22 | ✅ | `vte` validates the shape; Term stores it and emits `MouseCursorDirty`. Precedence: message bar / hint highlight, then the app-requested shape, then the mouse-report arrow, then the text caret. Cleared by RIS. |
 | Cursor shape | 50 | ✅ | `CursorShape=0/1/2` only. |
-| Clipboard | 52 | ✅ | Copy and paste, `c`/`s`/`p` selections, base64. Gated by `terminal.osc52` (default `OnlyCopy`). |
+| Clipboard | 52 | ✅ | Copy and paste, `c`/`s`/`p` selections, base64. Reading and writing are gated separately by `terminal.osc52` (`allow`/`ask`/`deny`; default reads ask, writes allowed); `ask` shows an in-surface prompt with the text. Focused terminals only. |
 | Reset palette | 104 | ✅ | All indexes or a list. |
 | Reset special colors | 105 | ❌ | |
 | Reset FG / BG / cursor | 110, 111, 112 | ✅ | |

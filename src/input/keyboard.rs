@@ -13,6 +13,7 @@ use crate::terminal::event::EventListener;
 use crate::terminal::term::TermMode;
 use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
 
+use crate::clipboard_prompt::KeyAnswer;
 use crate::config::{Action, BindingKey, BindingMode, KeyBinding};
 use crate::event::TYPING_SEARCH_DELAY;
 use crate::input::{ActionContext, Execute, Processor};
@@ -35,6 +36,16 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
 
         let mode = *self.ctx.terminal().mode();
         let mods = self.ctx.modifiers().state();
+
+        // A clipboard prompt is modal and sits above the palette: it takes every key until it is
+        // answered, and releases go nowhere.
+        if self.ctx.display().clipboard_prompt().is_some() {
+            if key.state == ElementState::Pressed {
+                let text = key.text_with_all_modifiers().unwrap_or_default();
+                self.apply_clipboard_prompt_key(&key.logical_key, text, mods);
+            }
+            return;
+        }
 
         // The command palette is modal: while it is open it takes every key, and releases go
         // nowhere, so no half of a keystroke leaks to the terminal.
@@ -255,6 +266,19 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
         )
     }
 
+    /// Apply one key press to the open clipboard prompt.
+    fn apply_clipboard_prompt_key(&mut self, key: &Key, text: &str, mods: ModifiersState) {
+        let Some(prompt) = self.ctx.display().clipboard_prompt_mut() else { return };
+        match prompt.answer_for_key(key, text, mods) {
+            KeyAnswer::Answer(confirm) => self.ctx.answer_clipboard_prompt(confirm),
+            KeyAnswer::SwitchFocus => {
+                prompt.switch_focus();
+                self.ctx.mark_dirty();
+            },
+            KeyAnswer::Ignore => (),
+        }
+    }
+
     /// Apply one key press to the open command palette; running an entry closes it first.
     fn apply_palette_command(&mut self, command: PaletteCommand, text: &str) {
         let display = self.ctx.display();
@@ -404,6 +428,11 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
             Key::Named(named) => named.to_text().unwrap_or_default().to_owned(),
             _ => String::new(),
         };
+
+        if self.ctx.display().clipboard_prompt().is_some() {
+            self.apply_clipboard_prompt_key(&logical_key, &text, mods);
+            return Ok(None);
+        }
 
         if self.ctx.display().hint_state.active() {
             for character in text.chars() {

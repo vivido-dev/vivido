@@ -1378,6 +1378,8 @@ impl WindowContext {
         self.notifier.0.send(Msg::ResetClient { completion }).map_err(|error| {
             IpcError::new("pty_closed", format!("failed to reset terminal: {error}"))
         })?;
+        // A clipboard answer meant for the old client must not reach its replacement.
+        self.display.close_clipboard_prompt();
         self.vivid_service.disconnect_clients();
         self.client_health = ClientHealth::Recovering;
         Ok(())
@@ -1436,6 +1438,8 @@ impl WindowContext {
         // against a command line that no longer exists.
         self.automation.shell = crate::automation::CommandExecutionState::default();
         self.terminal.lock().reset_client_state();
+        // A clipboard answer meant for the old shell must not reach the new one.
+        self.display.close_clipboard_prompt();
         self.display.set_vivid_scene(new_service.scene());
         self.vivid_service = new_service;
         self.vivid_service.set_overlay_font(self.config.font.clone());
@@ -2571,8 +2575,17 @@ impl WindowContext {
         let native_accessibility = false;
         let (text_scene_builds, cached_scene_frames, media_metrics, overlay_metrics) =
             self.display.optimization_metrics();
+        // Never the text itself, which can be a password on its way to the clipboard.
+        let clipboard_prompt = self.display.clipboard_prompt().map(|prompt| {
+            let (confirm, refuse) = prompt.choices();
+            json_value!({
+                "kind": prompt.kind(),
+                "title": prompt.title(),
+                "highlighted": if prompt.confirm_focused() { confirm } else { refuse },
+            })
+        });
 
-        json_value!({
+        let mut inspect = json_value!({
             "window": self.automation_summary_with_terminal(&terminal),
             "cell": {"width": size.cell_width(), "height": size.cell_height()},
             "ime_cursor_area": self.display.window.ime_area().map(|(overlay,position,size)| json_value!({
@@ -2644,7 +2657,10 @@ impl WindowContext {
                 "grid_rows": 1000,
                 "reply_bytes": crate::polling::ipc::MAX_REPLY_FRAME_BYTES,
             },
-        })
+        });
+        // Set apart because the literal above is at the macro's recursion limit.
+        inspect["clipboard_prompt"] = clipboard_prompt.into();
+        inspect
     }
 
     #[cfg(any(unix, windows))]

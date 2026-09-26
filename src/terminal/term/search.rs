@@ -12,8 +12,8 @@ use regex_automata::{Anchored, Input, MatchKind};
 
 use crate::terminal::grid::{BidirectionalIterator, Dimensions, GridIterator, Indexed};
 use crate::terminal::index::{Boundary, Column, Direction, Point, Side};
+use crate::terminal::term::Term;
 use crate::terminal::term::cell::{Cell, Flags};
-use crate::terminal::term::{SEMANTIC_ESCAPE_CHARS, Term};
 
 pub type Match = RangeInclusive<Point>;
 
@@ -471,12 +471,13 @@ impl<T> Term<T> {
     #[must_use]
     pub fn semantic_search_left(&self, point: Point) -> Point {
         let point = self.semantic_search_point(point);
+        let escape_chars = self.config.semantic_escape_chars.as_str();
 
-        if SEMANTIC_ESCAPE_CHARS.contains(self.grid[point].c) {
+        if escape_chars.contains(self.grid[point].c) {
             return point;
         }
 
-        match self.inline_search_left(point, SEMANTIC_ESCAPE_CHARS) {
+        match self.inline_search_left(point, escape_chars) {
             // Move one cell back toward the token, skipping wide-cell spacers.
             Ok(point) => {
                 let wide_spacer = Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER;
@@ -493,12 +494,13 @@ impl<T> Term<T> {
     #[must_use]
     pub fn semantic_search_right(&self, point: Point) -> Point {
         let point = self.semantic_search_point(point);
+        let escape_chars = self.config.semantic_escape_chars.as_str();
 
-        if SEMANTIC_ESCAPE_CHARS.contains(self.grid[point].c) {
+        if escape_chars.contains(self.grid[point].c) {
             return point;
         }
 
-        match self.inline_search_right(point, SEMANTIC_ESCAPE_CHARS) {
+        match self.inline_search_right(point, escape_chars) {
             Ok(point) => self.grid.iter_from(point).prev().map_or(point, |cell| cell.point),
             Err(point) => point,
         }
@@ -668,6 +670,20 @@ mod tests {
     use crate::terminal::index::{Column, Line};
     use crate::terminal::term::Config;
     use crate::terminal::term::test::{TermSize, mock_term};
+
+    #[test]
+    fn semantic_search_stops_at_the_configured_escape_chars() {
+        let mut term = mock_term("cd /usr/lib;ls");
+        let point = Point::new(Line(0), Column(5));
+
+        // Neither `/` nor `;` ends a word by default, so a double click takes the whole argument.
+        assert_eq!(term.semantic_search_left(point), Point::new(Line(0), Column(3)));
+        assert_eq!(term.semantic_search_right(point), Point::new(Line(0), Column(13)));
+
+        term.set_options(Config { semantic_escape_chars: " /;".into(), ..Config::default() });
+        assert_eq!(term.semantic_search_left(point), Point::new(Line(0), Column(4)));
+        assert_eq!(term.semantic_search_right(point), Point::new(Line(0), Column(6)));
+    }
 
     #[test]
     fn regex_right() {

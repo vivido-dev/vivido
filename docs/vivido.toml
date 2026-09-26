@@ -248,6 +248,9 @@ color = "#ffffff"
 # selection
 # ─────────────────────────────────────────────────────────────────────────────
 [selection]
+# Characters that end a word for double-click selection.
+semantic_escape_chars = ",│`|:\"' ()[]{}<>\t"
+
 # Copy selections to the system clipboard automatically.
 save_to_clipboard = false
 
@@ -277,8 +280,12 @@ blinking = "Off"
 # terminal
 # ─────────────────────────────────────────────────────────────────────────────
 [terminal]
-# Clipboard access via OSC 52: disabled | onlycopy | onlypaste | copypaste
-osc52 = "onlycopy"
+# Whether programs may read and replace the clipboard via OSC 52: allow | ask | deny each.
+osc52 = { read = "ask", write = "allow" }
+
+# Ask before pasting text with line breaks or control characters into a program that has not
+# enabled bracketed paste, where they would run as keystrokes.
+paste_protection = true
 
 # Allow terminal applications to create desktop notifications through OSC 9 and OSC 99.
 osc_notifications = true

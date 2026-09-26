@@ -48,8 +48,8 @@ pub const MIN_SCREEN_LINES: usize = 1;
 /// Max size of the window title stack.
 const TITLE_STACK_MAX_DEPTH: usize = 4096;
 
-/// Characters which terminate terminal-friendly semantic token selection.
-const SEMANTIC_ESCAPE_CHARS: &str = ",│`|:\"' ()[]{}<>\t";
+/// Characters which end a word for double-click selection unless configured otherwise.
+pub const SEMANTIC_ESCAPE_CHARS: &str = ",│`|:\"' ()[]{}<>\t";
 
 /// Max size of the keyboard modes.
 const KEYBOARD_MODE_STACK_MAX_DEPTH: usize = TITLE_STACK_MAX_DEPTH;
@@ -536,8 +536,11 @@ pub struct Config {
     /// Whether to enable kitty keyboard protocol.
     pub kitty_keyboard: bool,
 
-    /// OSC52 support mode.
+    /// OSC52 clipboard policy.
     pub osc52: Osc52,
+
+    /// Characters which end a word for double-click selection.
+    pub semantic_escape_chars: String,
 }
 
 impl Default for Config {
@@ -547,26 +550,39 @@ impl Default for Config {
             default_cursor_style: Default::default(),
             kitty_keyboard: Default::default(),
             osc52: Default::default(),
+            semantic_escape_chars: SEMANTIC_ESCAPE_CHARS.to_owned(),
         }
     }
 }
 
-/// OSC 52 behavior.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// What happens when a program uses one direction of the OSC 52 clipboard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize), serde(rename_all = "lowercase"))]
-pub enum Osc52 {
-    /// The handling of the escape sequence is disabled.
-    Disabled,
-    /// Only copy sequence is accepted.
-    ///
-    /// This option is the default as a compromise between entirely
-    /// disabling it (the most secure) and allowing `paste` (the less secure).
-    #[default]
-    OnlyCopy,
-    /// Only paste sequence is accepted.
-    OnlyPaste,
-    /// Both are accepted.
-    CopyPaste,
+pub enum ClipboardAccess {
+    /// The request is ignored.
+    Deny,
+    /// The user is asked each time.
+    Ask,
+    /// The request is honored.
+    Allow,
+}
+
+/// OSC 52 clipboard policy, separately for reading and setting the clipboard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct Osc52 {
+    /// A program asking for the clipboard's contents.
+    pub read: ClipboardAccess,
+    /// A program replacing the clipboard's contents.
+    pub write: ClipboardAccess,
+}
+
+impl Default for Osc52 {
+    /// Setting the clipboard is how remote editors copy, so it is allowed; reading it could leak
+    /// whatever was copied last, a password included, so the user is asked.
+    fn default() -> Self {
+        Self { read: ClipboardAccess::Ask, write: ClipboardAccess::Allow }
+    }
 }
 
 /// Byte span of row text and the cell column that produced it.
@@ -2385,7 +2401,7 @@ impl<T: EventListener> Handler for Term<T> {
     /// Store data into clipboard.
     #[inline]
     fn clipboard_store(&mut self, clipboard: u8, base64: &[u8]) {
-        if !matches!(self.config.osc52, Osc52::OnlyCopy | Osc52::CopyPaste) {
+        if self.config.osc52.write == ClipboardAccess::Deny {
             debug!("Denied osc52 store");
             return;
         }
@@ -2406,7 +2422,7 @@ impl<T: EventListener> Handler for Term<T> {
     /// Load data from clipboard.
     #[inline]
     fn clipboard_load(&mut self, clipboard: u8, terminator: &str) {
-        if !matches!(self.config.osc52, Osc52::OnlyPaste | Osc52::CopyPaste) {
+        if self.config.osc52.read == ClipboardAccess::Deny {
             debug!("Denied osc52 load");
             return;
         }
@@ -4682,40 +4698,59 @@ mod tests {
         }
     }
 
-    #[derive(Clone, Default)]
-    struct ClipboardStoreListener(Arc<Mutex<Vec<(ClipboardType, String)>>>);
+    /// OSC 52 requests passed on: a store with its text, or a load.
+    type ClipboardRequests = Vec<(ClipboardType, Option<String>)>;
 
-    impl EventListener for ClipboardStoreListener {
+    /// Records the OSC 52 requests a terminal passes on.
+    #[derive(Clone, Default)]
+    struct ClipboardListener(Arc<Mutex<ClipboardRequests>>);
+
+    impl EventListener for ClipboardListener {
         fn send_event(&self, event: Event) {
-            if let Event::ClipboardStore(ty, text) = event {
-                self.0.lock().unwrap().push((ty, text));
+            match event {
+                Event::ClipboardStore(ty, text) => self.0.lock().unwrap().push((ty, Some(text))),
+                Event::ClipboardLoad(ty, _) => self.0.lock().unwrap().push((ty, None)),
+                _ => (),
+            }
+        }
+    }
+
+    /// Only a denied direction stops at the terminal; asking is the window's business, so an
+    /// `ask` request is passed on exactly like an allowed one.
+    #[test]
+    fn osc52_passes_on_every_direction_that_is_not_denied() {
+        use ClipboardAccess::{Allow, Ask, Deny};
+
+        for read in [Deny, Ask, Allow] {
+            for write in [Deny, Ask, Allow] {
+                let size = TermSize::new(25, 80);
+                let listener = ClipboardListener::default();
+                let requests = listener.0.clone();
+                let config = Config { osc52: Osc52 { read, write }, ..Config::default() };
+                let mut term = Term::new(config, &size, listener);
+                let mut parser: ansi::Processor = ansi::Processor::new();
+
+                parser.advance(&mut term, b"\x1b]52;c;aMOpbGxvIPCfpoA=\x1b\\");
+                parser.advance(&mut term, b"\x1b]52;p;?\x1b\\");
+
+                let mut expected = Vec::new();
+                if write != Deny {
+                    expected.push((ClipboardType::Clipboard, Some("héllo 🦀".to_owned())));
+                }
+                if read != Deny {
+                    expected.push((ClipboardType::Selection, None));
+                }
+                assert_eq!(*requests.lock().unwrap(), expected, "read={read:?} write={write:?}");
             }
         }
     }
 
     #[test]
-    fn osc52_store_obeys_copy_policy() {
-        for (osc52, expected) in [
-            (Osc52::OnlyCopy, true),
-            (Osc52::CopyPaste, true),
-            (Osc52::Disabled, false),
-            (Osc52::OnlyPaste, false),
-        ] {
-            let size = TermSize::new(25, 80);
-            let listener = ClipboardStoreListener::default();
-            let stores = listener.0.clone();
-            let config = Config { osc52, ..Config::default() };
-            let mut term = Term::new(config, &size, listener);
-            let mut parser: ansi::Processor = ansi::Processor::new();
-
-            parser.advance(&mut term, b"\x1b]52;c;aMOpbGxvIPCfpoA=\x1b\\");
-
-            let stores = stores.lock().unwrap();
-            assert_eq!(!stores.is_empty(), expected, "policy={osc52:?}");
-            if expected {
-                assert_eq!(stores.as_slice(), &[(ClipboardType::Clipboard, "héllo 🦀".to_owned())]);
-            }
-        }
+    fn osc52_asks_before_reading_and_allows_setting_by_default() {
+        assert_eq!(
+            Osc52::default(),
+            Osc52 { read: ClipboardAccess::Ask, write: ClipboardAccess::Allow }
+        );
     }
 
     #[test]

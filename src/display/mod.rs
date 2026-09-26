@@ -27,6 +27,7 @@ use crate::terminal::term::{
 };
 use crate::terminal::vvte::ansi::{CursorShape, NamedColor};
 
+use crate::clipboard_prompt::ClipboardPrompt;
 use crate::command_palette::{CommandPalette, Entry as PaletteEntry};
 use crate::config::UiConfig;
 use crate::config::font::{Font, FontSize};
@@ -343,6 +344,8 @@ pub struct Display {
     pub hint_state: HintState,
     /// The command palette while it is open.
     command_palette: Option<CommandPalette>,
+    /// The clipboard request waiting for the user's answer, drawn above the palette.
+    clipboard_prompt: Option<ClipboardPrompt>,
     pub pending_update: DisplayUpdate,
     pub pending_renderer_update: Option<RendererUpdate>,
     pub ime: Ime,
@@ -508,6 +511,7 @@ impl Display {
             colors: List::from(&config.colors),
             hint_state,
             command_palette: None,
+            clipboard_prompt: None,
             pending_update: Default::default(),
             pending_renderer_update: Default::default(),
             ime: Default::default(),
@@ -721,6 +725,7 @@ impl Display {
             && !self.hint_state.active()
             && search_state.regex().is_none()
             && self.command_palette.is_none()
+            && self.clipboard_prompt.is_none()
             && !self.damage_tracker.debug
             // The cached scene must show exactly the scrollbar visual this frame would.
             && self.scrollbar.drawn_visual() == scrollbar_visual
@@ -776,7 +781,8 @@ impl Display {
         let requires_full_damage = self.visual_bell.intensity() != 0.
             || self.hint_state.active()
             || search_state.regex().is_some()
-            || self.command_palette.is_some();
+            || self.command_palette.is_some()
+            || self.clipboard_prompt.is_some();
         if requires_full_damage {
             self.damage_tracker.frame().mark_fully_damaged();
             self.damage_tracker.next_frame().mark_fully_damaged();
@@ -968,8 +974,10 @@ impl Display {
             if let Some(visual) = progress_visual {
                 self.draw_progress(&mut scene, config, visual);
             }
-            // The palette is modal, so it draws above every other piece of host UI.
+            // The palette is modal, so it draws above every other piece of host UI, and a
+            // clipboard prompt, which also takes the keys from the palette, above that.
             self.draw_command_palette(&mut scene, config);
+            self.draw_clipboard_prompt(&mut scene, config);
             self.draw_render_timer(&mut scene, config);
 
             if has_highlighted_hint {
@@ -1548,6 +1556,119 @@ impl Display {
         }
     }
 
+    /// The clipboard request waiting for an answer, if any.
+    pub(crate) fn clipboard_prompt(&self) -> Option<&ClipboardPrompt> {
+        self.clipboard_prompt.as_ref()
+    }
+
+    /// The open clipboard prompt, for moving its highlight.
+    pub(crate) fn clipboard_prompt_mut(&mut self) -> Option<&mut ClipboardPrompt> {
+        self.clipboard_prompt.as_mut()
+    }
+
+    /// Show `prompt` unless another is still waiting, returning whether it is shown.
+    ///
+    /// One request waits at a time, so a program repeating OSC 52 cannot queue up prompts.
+    pub(crate) fn open_clipboard_prompt(&mut self, prompt: ClipboardPrompt) -> bool {
+        if self.clipboard_prompt.is_some() {
+            return false;
+        }
+        self.clipboard_prompt = Some(prompt);
+        self.invalidate_cached_scene();
+        self.damage_tracker.frame().mark_fully_damaged();
+        true
+    }
+
+    /// Remove the clipboard prompt, returning its request to be carried out or dropped.
+    pub(crate) fn close_clipboard_prompt(&mut self) -> Option<ClipboardPrompt> {
+        let prompt = self.clipboard_prompt.take();
+        if prompt.is_some() {
+            // The cached scene still shows it.
+            self.invalidate_cached_scene();
+            self.damage_tracker.frame().mark_fully_damaged();
+        }
+        prompt
+    }
+
+    /// Draw the clipboard prompt over the top rows of the grid: the question, why it is asked,
+    /// the text in question in the terminal's own colours, and the two choices.
+    ///
+    /// Short grids drop the text first, then the reason, then the question; the choices always
+    /// show. The highlighted choice swaps foreground and background.
+    fn draw_clipboard_prompt(&mut self, scene: &mut Scene, config: &UiConfig) {
+        let Some(prompt) = self.clipboard_prompt.as_ref() else { return };
+        let size_info = self.size_info;
+        let columns = size_info.columns();
+        let lines = size_info.screen_lines();
+        if columns < PALETTE_MIN_COLUMNS || lines == 0 {
+            return;
+        }
+        let width = columns.min(PROMPT_MAX_COLUMNS);
+        let left = (columns - width) / 2;
+        let fg = config.colors.footer_bar_foreground();
+        let bg = config.colors.footer_bar_background();
+
+        let heading = [prompt.title(), prompt.detail()];
+        let heading = &heading[..lines.saturating_sub(1).min(2)];
+        let mut preview = prompt.preview().to_vec();
+        if prompt.hidden_lines() > 0 {
+            let hidden = prompt.hidden_lines();
+            preview.push(format!("… {hidden} more line{}", if hidden == 1 { "" } else { "s" }));
+        }
+        preview.truncate(lines.saturating_sub(heading.len() + 1));
+        let (confirm, refuse) = prompt.choices();
+        let confirm_focused = prompt.confirm_focused();
+
+        let mut line = 0;
+        for text in heading {
+            let text = pad_cells(&fit_cells_start(&format!(" {text}"), width), width);
+            self.paint_string_cells(scene, Point::new(line, Column(left)), fg, bg, &text);
+            line += 1;
+        }
+        // The text sits in a box of the terminal's colours, one cell in from either edge.
+        let (text_fg, text_bg) =
+            (config.colors.primary.foreground, config.colors.primary.background);
+        for text in &preview {
+            let text = pad_cells(&fit_cells_start(text, width - 2), width - 2);
+            self.paint_string_cells(scene, Point::new(line, Column(left)), fg, bg, " ");
+            self.paint_string_cells(
+                scene,
+                Point::new(line, Column(left + 1)),
+                text_fg,
+                text_bg,
+                &text,
+            );
+            self.paint_string_cells(scene, Point::new(line, Column(left + width - 1)), fg, bg, " ");
+            line += 1;
+        }
+
+        let buttons = [(format!("[ {confirm} ]"), true), (format!("[ {refuse} ]"), false)];
+        let hint = format!("Tab switches · Esc = {refuse} ");
+        let buttons_width =
+            buttons.iter().map(|(label, _)| text_cell_width(label) + 1).sum::<usize>() + 1;
+        let row = if buttons_width + text_cell_width(&hint) <= width {
+            format!("{:>width$}", hint)
+        } else {
+            String::new()
+        };
+        self.paint_string_cells(
+            scene,
+            Point::new(line, Column(left)),
+            fg,
+            bg,
+            &pad_cells(&row, width),
+        );
+        let mut column = left + 1;
+        for (label, confirms) in &buttons {
+            if column + text_cell_width(label) > left + width {
+                break;
+            }
+            let (fg, bg) = if *confirms == confirm_focused { (bg, fg) } else { (fg, bg) };
+            self.paint_string_cells(scene, Point::new(line, Column(column)), fg, bg, label);
+            column += text_cell_width(label) + 1;
+        }
+    }
+
     fn draw_render_timer(&mut self, scene: &mut Scene, config: &UiConfig) {
         if !config.debug.render_timer {
             return;
@@ -1870,6 +1991,8 @@ fn scene_glyph_from_layout(
 const PALETTE_MAX_COLUMNS: usize = 72;
 /// Narrowest grid the command palette draws in; below it there is no room for a title.
 const PALETTE_MIN_COLUMNS: usize = 12;
+/// Widest the clipboard prompt gets, in cells; wider than the palette to show more of the text.
+const PROMPT_MAX_COLUMNS: usize = 80;
 
 /// One palette row: the title on the left and its shortcut on the right, exactly `width` cells.
 ///

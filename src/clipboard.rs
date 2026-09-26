@@ -190,6 +190,12 @@ impl Default for Clipboard {
 }
 
 impl Clipboard {
+    /// Whether this platform has a primary selection. Without one, loading the selection reads
+    /// the clipboard instead and storing to it does nothing.
+    pub fn has_selection(&self) -> bool {
+        self.selection.is_some()
+    }
+
     pub fn store(&mut self, ty: ClipboardType, text: impl Into<String>) {
         let clipboard = match (ty, &mut self.selection) {
             (ClipboardType::Selection, Some(provider)) => provider,

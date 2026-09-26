@@ -13,6 +13,7 @@ mod automation;
 pub mod cli;
 mod client_fault;
 mod clipboard;
+mod clipboard_prompt;
 mod command_palette;
 #[macro_use]
 mod config_derive;

@@ -126,6 +126,7 @@ impl UiConfig {
             scrolling_history: self.scrolling.history() as usize,
             default_cursor_style: self.cursor.style(),
             osc52: self.terminal.osc52.0,
+            semantic_escape_chars: self.selection.semantic_escape_chars.clone(),
             kitty_keyboard: true,
         }
     }
@@ -697,22 +698,6 @@ impl_serde_replace!(HintsAlphabet);
 impl_config_deserialize_enum!(HintInternalAction { Copy, Paste, Select });
 impl_config_deserialize!(HintMouse { enabled, mods });
 impl_serde_replace!(Percentage);
-
-pub(crate) struct StringVisitor;
-impl serde::de::Visitor<'_> for StringVisitor {
-    type Value = String;
-
-    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("a string")
-    }
-
-    fn visit_str<E>(self, s: &str) -> Result<Self::Value, E>
-    where
-        E: serde::de::Error,
-    {
-        Ok(s.to_lowercase())
-    }
-}
 
 #[cfg(test)]
 mod tests {

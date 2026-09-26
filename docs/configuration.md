@@ -297,11 +297,18 @@ command = { program = "paplay", args = ["/usr/share/sounds/freedesktop/stereo/be
 
 | Field | Type | Default | Description |
 |---|---|---|---|
+| `semantic_escape_chars` | string | *see below* | Characters that end a word for double-click selection. |
 | `save_to_clipboard` | bool | `false` | Copy selections to the system clipboard automatically. |
 
-> Vivido has a deliberately minimal selection model: drag for a character selection, hold `Control`
-> while dragging for a block selection. Semantic word/line expansion and
-> `semantic_escape_chars` are not implemented, so there is no such option to configure.
+```toml
+[selection]
+semantic_escape_chars = ",│`|:\"' ()[]{}<>\t"
+save_to_clipboard = false
+```
+
+The default above keeps a path or `key=value` together as one word but splits a URL at its `:`.
+Add `/`, `=`, or `;` to stop at them too, or remove `:` to keep URLs whole. See
+[mouse selection](features.md#mouse-selection) for the gestures.
 
 ## `cursor`
 
@@ -327,18 +334,26 @@ blinking = "Off"
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `osc52` | enum | `onlycopy` | Clipboard access via OSC 52: `disabled`, `onlycopy`, `onlypaste`, `copypaste` (case-insensitive). |
+| `osc52` | `{ read, write }` | `{ read = "ask", write = "allow" }` | Whether programs may read and replace the clipboard through OSC 52; each is `allow`, `ask`, or `deny`. A missing key keeps its default. |
+| `paste_protection` | bool | `true` | Ask before pasting text with line breaks or control characters into a program that has not enabled bracketed paste. |
 | `osc_notifications` | bool | `true` | Allow OSC 9 and OSC 99 desktop notifications. |
 | `progress` | bool | `true` | Show OSC 9;4 progress and activity reported by spinner titles. |
 | `shell` | string or `{ program, args }` | *system* | Shell to launch instead of the login shell. |
 
 ```toml
 [terminal]
-osc52 = "onlycopy"
+osc52 = { read = "ask", write = "allow" }
+paste_protection = true
 osc_notifications = true
 progress = true
 shell = { program = "/usr/bin/fish", args = ["--login"] }
 ```
+
+`ask` shows the text in question and waits for an answer; see
+[paste protection](features.md#paste-protection-and-clipboard-prompts). Replacing the clipboard is
+allowed by default because that is how editors copy over SSH; reading it asks because the clipboard
+can hold a password. The older single-word values still work: `disabled`, `onlycopy`, `onlypaste`,
+and `copypaste` mean `deny` or `allow` for each direction.
 
 ## `file_drop`
 

@@ -47,7 +47,7 @@ use crate::terminal::grid::{Dimensions, Scroll};
 use crate::terminal::index::{Boundary, Column, Direction, Line, Point, Side};
 use crate::terminal::selection::{Selection, SelectionType};
 use crate::terminal::term::search::{Match, RegexSearch};
-use crate::terminal::term::{self, ClipboardType, Term, TermMode};
+use crate::terminal::term::{self, ClipboardAccess, ClipboardType, Term, TermMode};
 #[cfg(windows)]
 use crate::terminal::tty::windows::win32_string;
 use crate::terminal::vvte::ansi::NamedColor;
@@ -60,6 +60,7 @@ use crate::automation::{PendingWrite, TextScope, WaitKind, Waiter};
 use crate::cli::ParsedOptions;
 use crate::cli::{Options as CliOptions, WindowOptions};
 use crate::clipboard::Clipboard;
+use crate::clipboard_prompt::{self, ClipboardPrompt};
 #[cfg(target_os = "macos")]
 use crate::config::Action;
 use crate::config::font::FontSize;
@@ -5951,8 +5952,49 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
         }
     }
 
+    fn paste_clipboard_text(&mut self, text: &str) {
+        // Only text bound for the PTY can run anything: the palette, search, and a focused
+        // overlay each take a paste as plain input.
+        let reaches_pty = self.display.command_palette().is_none()
+            && self.display.clipboard_prompt().is_none()
+            && !self.search_active()
+            && !self.vivid_service.overlay_focused();
+        if reaches_pty
+            && self.config.terminal.paste_protection
+            && !self.terminal.mode().contains(TermMode::BRACKETED_PASTE)
+            && clipboard_prompt::is_unsafe_paste(text)
+        {
+            let prompt = ClipboardPrompt::new(clipboard_prompt::Request::Paste(text.to_owned()));
+            self.display.open_clipboard_prompt(prompt);
+            *self.dirty = true;
+            return;
+        }
+        self.paste(text, true);
+    }
+
+    fn answer_clipboard_prompt(&mut self, confirm: bool) {
+        let Some(prompt) = self.display.close_clipboard_prompt() else { return };
+        *self.dirty = true;
+        if !confirm {
+            return;
+        }
+        match prompt.into_request() {
+            clipboard_prompt::Request::Paste(text) => self.paste(&text, true),
+            clipboard_prompt::Request::Read { text, reply, .. } => {
+                self.write_to_pty(reply(&text).into_bytes());
+            },
+            clipboard_prompt::Request::Write { clipboard, text } => {
+                self.clipboard.store(clipboard, text);
+            },
+        }
+    }
+
     /// Paste a text into the terminal.
     fn paste(&mut self, text: &str, bracketed: bool) {
+        // Nothing is typed behind a clipboard prompt; it is answered with keys, not text.
+        if self.display.clipboard_prompt().is_some() {
+            return;
+        }
         // Pasted text and IME commits go to the open command palette's query, never the PTY.
         if let Some(palette) = self.display.command_palette_mut() {
             palette.insert(text);
@@ -6028,6 +6070,18 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
 }
 
 impl<'a, N: Notify + 'a, T: EventListener> ActionContext<'a, N, T> {
+    /// Ask the user about a program's OSC 52 request.
+    ///
+    /// A request arriving while another prompt waits is dropped as if denied, so a program
+    /// repeating OSC 52 gets one prompt rather than a queue of them.
+    fn ask_clipboard(&mut self, request: clipboard_prompt::Request) {
+        if self.display.open_clipboard_prompt(ClipboardPrompt::new(request)) {
+            *self.dirty = true;
+        } else {
+            debug!("Dropped an OSC 52 request while a clipboard prompt is open");
+        }
+    }
+
     /// Recalculate the footer geometry and restart any warning dismissal timer.
     fn message_buffer_changed(&mut self) {
         self.display.pending_update.dirty = true;
@@ -6443,17 +6497,54 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                         );
                         self.ctx.mark_dirty();
                     },
-                    TerminalEvent::ClipboardStore(clipboard_type, content) => {
-                        if self.ctx.terminal.is_focused {
-                            self.ctx.clipboard.store(clipboard_type, content);
+                    // OSC 52 from a program; the terminal already dropped denied directions.
+                    TerminalEvent::ClipboardStore(clipboard, text)
+                        if self.ctx.terminal.is_focused =>
+                    {
+                        // Without a primary selection a store to it does nothing, so there is
+                        // nothing to ask about.
+                        let reachable = clipboard == ClipboardType::Clipboard
+                            || self.ctx.clipboard.has_selection();
+                        match self.ctx.config.terminal.osc52.0.write {
+                            ClipboardAccess::Allow => self.ctx.clipboard.store(clipboard, text),
+                            ClipboardAccess::Ask if reachable => {
+                                self.ctx.ask_clipboard(clipboard_prompt::Request::Write {
+                                    clipboard,
+                                    text,
+                                })
+                            },
+                            ClipboardAccess::Ask | ClipboardAccess::Deny => (),
                         }
                     },
-                    TerminalEvent::ClipboardLoad(clipboard_type, format) => {
-                        if self.ctx.terminal.is_focused {
-                            let text = format(self.ctx.clipboard.load(clipboard_type).as_str());
-                            self.ctx.write_to_pty(text.into_bytes());
+                    TerminalEvent::ClipboardLoad(clipboard, reply)
+                        if self.ctx.terminal.is_focused =>
+                    {
+                        match self.ctx.config.terminal.osc52.0.read {
+                            ClipboardAccess::Allow => {
+                                let text = self.ctx.clipboard.load(clipboard);
+                                self.ctx.write_to_pty(reply(&text).into_bytes())
+                            },
+                            // The prompt shows, and an answer sends, the text as it is now.
+                            ClipboardAccess::Ask => {
+                                let text = self.ctx.clipboard.load(clipboard);
+                                // Without a primary selection that load read the clipboard, so
+                                // the prompt names the clipboard.
+                                let clipboard = if self.ctx.clipboard.has_selection() {
+                                    clipboard
+                                } else {
+                                    ClipboardType::Clipboard
+                                };
+                                self.ctx.ask_clipboard(clipboard_prompt::Request::Read {
+                                    clipboard,
+                                    text,
+                                    reply,
+                                })
+                            },
+                            ClipboardAccess::Deny => (),
                         }
                     },
+                    // An unfocused terminal neither reads nor sets the clipboard.
+                    TerminalEvent::ClipboardStore(..) | TerminalEvent::ClipboardLoad(..) => (),
                     TerminalEvent::ColorRequest(index, format) => {
                         let color = match self.ctx.terminal().colors()[index] {
                             Some(color) => Rgb(color),

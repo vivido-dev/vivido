@@ -361,7 +361,10 @@ waiting until it disconnects, the same as any unanswered request.
   that are drawn over the grid rather than written into it. `command_palette` is null while the
   palette is closed and otherwise `{"query":…,"matches":N,"selected":"Title"}`; drive it with
   UI-routed keys (`key p --mods Ctrl,Shift --route ui`, one `key` per typed character, then
-  `Enter` or `Escape`).
+  `Enter` or `Escape`). `clipboard_prompt` is null unless a paste or an OSC 52 request is waiting
+  for an answer, and otherwise `{"kind":"paste|read|write","title":…,"highlighted":"Cancel"}`; it
+  never includes the text. It takes UI-routed keys ahead of the palette: `Escape` refuses, and
+  `Enter` takes the highlighted choice, which starts on refusing.
   It also reports `ime_cursor_area`, lightweight native-accessibility state, `vivid_overlay`
   resource/submission counters, and overlay render-cache passes, skips, and target allocations.
   These counters are cumulative and are intended for bounded acceptance and performance probes;

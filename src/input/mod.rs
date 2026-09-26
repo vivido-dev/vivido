@@ -116,6 +116,39 @@ fn report_mouse_to_application(mouse_mode: bool, shift: bool) -> bool {
     mouse_mode && !shift
 }
 
+/// What a left press that Vivido handles itself does to the selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LeftPress {
+    /// Clear the selection and start a new one of this type at the press.
+    Start(SelectionType),
+    /// Replace the selection with one of this type expanded around the press.
+    Expand(SelectionType),
+    /// Move the selection's free end to the press, keeping its anchor and type.
+    Extend,
+    Ignore,
+}
+
+/// Decide what a left press does: Shift extends an existing selection, a single click starts a
+/// character (or, with Control, block) selection, and double and triple clicks select the word and
+/// the logical line under the pointer.
+fn left_press(
+    click_state: ClickState,
+    control: bool,
+    shift: bool,
+    has_selection: bool,
+) -> LeftPress {
+    match click_state {
+        ClickState::None => LeftPress::Ignore,
+        _ if shift && has_selection => LeftPress::Extend,
+        ClickState::Click if control => LeftPress::Start(SelectionType::Block),
+        ClickState::Click => LeftPress::Start(SelectionType::Simple),
+        // Control is reserved for the block selection started on the first click.
+        ClickState::DoubleClick | ClickState::TripleClick if control => LeftPress::Ignore,
+        ClickState::DoubleClick => LeftPress::Expand(SelectionType::Semantic),
+        ClickState::TripleClick => LeftPress::Expand(SelectionType::Lines),
+    }
+}
+
 /// Processes input from winit.
 ///
 /// An escape sequence may be emitted in case specific keys or key combinations
@@ -178,6 +211,12 @@ pub trait ActionContext<T: EventListener> {
     fn paste_clipboard_media(&mut self) -> bool {
         false
     }
+    /// Paste text the user took from a clipboard, asking first when it could run commands.
+    fn paste_clipboard_text(&mut self, text: &str) {
+        self.paste(text, true);
+    }
+    /// Answer the open clipboard prompt: `true` pastes or allows, `false` cancels or denies.
+    fn answer_clipboard_prompt(&mut self, _confirm: bool) {}
     fn mouse_mut(&mut self) -> &mut Mouse;
     fn mouse(&self) -> &Mouse;
     fn touch_purpose(&mut self) -> &mut TouchPurpose;
@@ -276,13 +315,13 @@ impl<T: EventListener> Execute<T> for Action {
             Action::ClearSelection => ctx.clear_selection(),
             Action::Paste if !ctx.paste_clipboard_media() => {
                 let text = ctx.clipboard_mut().load(ClipboardType::Clipboard);
-                ctx.paste(&text, true);
+                ctx.paste_clipboard_text(&text);
             },
             // Clipboard media took the paste and routed it to a file-drop binding.
             Action::Paste => {},
             Action::PasteSelection => {
                 let text = ctx.clipboard_mut().load(ClipboardType::Selection);
-                ctx.paste(&text, true);
+                ctx.paste_clipboard_text(&text);
             },
             #[cfg(any(target_os = "linux", windows))]
             Action::ToggleFullscreen if ctx.window().is_hosted() => {
@@ -742,30 +781,33 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
     /// Handle left click selection.
     fn on_left_click(&mut self, point: Point) {
         let side = self.ctx.mouse().cell_side;
-        let control = self.modifiers_state().control_key();
+        let modifiers = self.modifiers_state();
+        let press = left_press(
+            self.ctx.mouse().click_state,
+            modifiers.control_key(),
+            modifiers.shift_key(),
+            !self.ctx.selection_is_empty(),
+        );
 
-        match self.ctx.mouse().click_state {
-            ClickState::Click => {
+        match press {
+            LeftPress::Start(ty) => {
                 // Don't launch URLs if this click cleared the selection.
                 self.ctx.mouse_mut().block_hint_launcher = !self.ctx.selection_is_empty();
                 self.ctx.clear_selection();
-
-                if control {
-                    self.ctx.start_selection(SelectionType::Block, point, side);
-                } else {
-                    self.ctx.start_selection(SelectionType::Simple, point, side);
-                }
+                self.ctx.start_selection(ty, point, side);
             },
-            ClickState::DoubleClick if !control => {
+            LeftPress::Expand(ty) => {
                 self.ctx.mouse_mut().block_hint_launcher = true;
-                self.ctx.start_selection(SelectionType::Semantic, point, side);
+                self.ctx.start_selection(ty, point, side);
             },
-            ClickState::TripleClick if !control => {
-                self.ctx.mouse_mut().block_hint_launcher = true;
-                self.ctx.start_selection(SelectionType::Lines, point, side);
+            LeftPress::Extend => {
+                let mouse = self.ctx.mouse_mut();
+                mouse.block_hint_launcher = true;
+                // A quick click after this one starts afresh instead of selecting a word.
+                mouse.click_state = ClickState::None;
+                self.ctx.update_selection(point, side);
             },
-            // Control is reserved for the block selection started on the first click.
-            ClickState::None | ClickState::DoubleClick | ClickState::TripleClick => (),
+            LeftPress::Ignore => (),
         }
     }
 
@@ -1453,6 +1495,34 @@ mod tests {
         assert!(report_mouse_to_application(true, false));
         assert!(!report_mouse_to_application(true, true));
         assert!(!report_mouse_to_application(false, false));
+    }
+
+    #[test]
+    fn clicks_select_characters_words_and_lines() {
+        let press = |state| left_press(state, false, false, false);
+        assert_eq!(press(ClickState::Click), LeftPress::Start(SelectionType::Simple));
+        assert_eq!(press(ClickState::DoubleClick), LeftPress::Expand(SelectionType::Semantic));
+        assert_eq!(press(ClickState::TripleClick), LeftPress::Expand(SelectionType::Lines));
+
+        // Control starts a block selection and leaves it alone on the following clicks.
+        let control = |state| left_press(state, true, false, true);
+        assert_eq!(control(ClickState::Click), LeftPress::Start(SelectionType::Block));
+        assert_eq!(control(ClickState::DoubleClick), LeftPress::Ignore);
+        assert_eq!(control(ClickState::TripleClick), LeftPress::Ignore);
+    }
+
+    #[test]
+    fn shift_click_extends_an_existing_selection() {
+        for state in [ClickState::Click, ClickState::DoubleClick, ClickState::TripleClick] {
+            assert_eq!(left_press(state, false, true, true), LeftPress::Extend, "{state:?}");
+            assert_eq!(left_press(state, true, true, true), LeftPress::Extend, "{state:?}");
+        }
+
+        // With nothing to extend, Shift only bypasses mouse reporting and a click selects anew.
+        assert_eq!(
+            left_press(ClickState::Click, false, true, false),
+            LeftPress::Start(SelectionType::Simple)
+        );
     }
 
     #[test]
