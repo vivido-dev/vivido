@@ -17,6 +17,20 @@ right-click expansion, and all other selection-expansion modes are intentionally
 On Windows, right-click pastes the system clipboard when terminal mouse reporting is inactive;
 hold Shift to use this terminal-side paste while an application has enabled mouse reporting.
 
+## Command palette
+
+`Control+Shift+P` (`Command+Shift+P` on macOS) opens a searchable list of everything Vivido can
+do: every built-in action, each bound hint, and every `command` binding in the configuration,
+each shown with the shortcut that runs it. Type to filter — each word must appear in order, and
+letters that start words rank higher, so `inc font` finds "Increase font size" — then `Enter`
+runs the highlighted entry. `Up`/`Down`, `Tab`/`Shift+Tab`, `Control+P`/`Control+N`, and
+`PageUp`/`PageDown` move the highlight; `Backspace`, `Control+W`, and `Control+U` edit the query;
+`Escape`, `Control+C`, or the palette's shortcut closes it. While it is open no keystroke or paste
+reaches the terminal.
+
+The palette is drawn in the terminal surface, so it works the same inside Vivida panes. Rebind it
+with the `ToggleCommandPalette` action.
+
 ## Closing terminals
 
 Closing a terminal that is sitting at its shell prompt happens at once. Closing one that is still

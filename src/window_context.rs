@@ -1692,8 +1692,8 @@ impl WindowContext {
     ///
     /// Native input reaches the window through [`Self::handle_event`], which requests the frame
     /// itself. Automation input runs the same processor directly, and the idle turn that follows
-    /// returns early with nothing queued, so without this a search bar or hint opened by
-    /// automation stayed off screen until something else redrew the window.
+    /// returns early with nothing queued, so without this a search bar, hint, or command palette
+    /// opened by automation stayed off screen until something else redrew the window.
     #[cfg(any(unix, windows))]
     fn redraw_if_dirty(&mut self) {
         if self.dirty && self.display.window.has_frame && !self.occluded {
@@ -2595,6 +2595,11 @@ impl WindowContext {
             "executable": executable,
             "current_directory": current_directory,
             "running_program": running_program,
+            "command_palette": self.display.command_palette().map(|palette| json_value!({
+                "query": palette.query(),
+                "matches": palette.match_count(),
+                "selected": palette.selected().map(|entry| entry.title.as_str()),
+            })),
             "message": self.message_buffer.message().map(|message| json_value!({
                 "type": match message.ty() {
                     MessageType::Info => "info",

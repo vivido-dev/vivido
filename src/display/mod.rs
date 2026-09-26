@@ -27,6 +27,7 @@ use crate::terminal::term::{
 };
 use crate::terminal::vvte::ansi::{CursorShape, NamedColor};
 
+use crate::command_palette::{CommandPalette, Entry as PaletteEntry};
 use crate::config::UiConfig;
 use crate::config::font::{Font, FontSize};
 use crate::config::window::Dimensions;
@@ -340,6 +341,8 @@ pub struct Display {
     drawn_progress: Option<ProgressVisual>,
     pub colors: List,
     pub hint_state: HintState,
+    /// The command palette while it is open.
+    command_palette: Option<CommandPalette>,
     pub pending_update: DisplayUpdate,
     pub pending_renderer_update: Option<RendererUpdate>,
     pub ime: Ime,
@@ -504,6 +507,7 @@ impl Display {
             drawn_progress: None,
             colors: List::from(&config.colors),
             hint_state,
+            command_palette: None,
             pending_update: Default::default(),
             pending_renderer_update: Default::default(),
             ime: Default::default(),
@@ -716,6 +720,7 @@ impl Display {
             && self.visual_bell.intensity() == 0.
             && !self.hint_state.active()
             && search_state.regex().is_none()
+            && self.command_palette.is_none()
             && !self.damage_tracker.debug
             // The cached scene must show exactly the scrollbar visual this frame would.
             && self.scrollbar.drawn_visual() == scrollbar_visual
@@ -770,7 +775,8 @@ impl Display {
 
         let requires_full_damage = self.visual_bell.intensity() != 0.
             || self.hint_state.active()
-            || search_state.regex().is_some();
+            || search_state.regex().is_some()
+            || self.command_palette.is_some();
         if requires_full_damage {
             self.damage_tracker.frame().mark_fully_damaged();
             self.damage_tracker.next_frame().mark_fully_damaged();
@@ -962,6 +968,8 @@ impl Display {
             if let Some(visual) = progress_visual {
                 self.draw_progress(&mut scene, config, visual);
             }
+            // The palette is modal, so it draws above every other piece of host UI.
+            self.draw_command_palette(&mut scene, config);
             self.draw_render_timer(&mut scene, config);
 
             if has_highlighted_hint {
@@ -1462,6 +1470,84 @@ impl Display {
         );
     }
 
+    /// The command palette, if it is open.
+    pub(crate) fn command_palette(&self) -> Option<&CommandPalette> {
+        self.command_palette.as_ref()
+    }
+
+    /// The open command palette, for editing its query or selection.
+    pub(crate) fn command_palette_mut(&mut self) -> Option<&mut CommandPalette> {
+        self.command_palette.as_mut()
+    }
+
+    /// Open the command palette over `entries`, replacing any open one.
+    pub(crate) fn open_command_palette(&mut self, entries: Vec<PaletteEntry>) {
+        self.command_palette = Some(CommandPalette::new(entries));
+        self.invalidate_cached_scene();
+        self.damage_tracker.frame().mark_fully_damaged();
+    }
+
+    /// Close the command palette, returning whether it was open.
+    pub(crate) fn close_command_palette(&mut self) -> bool {
+        let was_open = self.command_palette.take().is_some();
+        if was_open {
+            // The cached scene still shows it.
+            self.invalidate_cached_scene();
+            self.damage_tracker.frame().mark_fully_damaged();
+        }
+        was_open
+    }
+
+    /// Draw the command palette over the top rows of the grid: the query, then the matches.
+    ///
+    /// It is drawn in terminal cells with the search bar's colours, centred and at most
+    /// [`PALETTE_MAX_COLUMNS`] wide; the highlighted match swaps foreground and background.
+    fn draw_command_palette(&mut self, scene: &mut Scene, config: &UiConfig) {
+        let Some(palette) = self.command_palette.as_ref() else { return };
+        let size_info = self.size_info;
+        let columns = size_info.columns();
+        let lines = size_info.screen_lines();
+        if columns < PALETTE_MIN_COLUMNS || lines < 2 {
+            return;
+        }
+        let width = columns.min(PALETTE_MAX_COLUMNS);
+        let left = (columns - width) / 2;
+        let fg = config.colors.footer_bar_foreground();
+        let bg = config.colors.footer_bar_background();
+
+        // One cell stays free after the query for the caret.
+        let prompt = fit_cells_end(&format!("> {}", palette.query()), width - 1);
+        let caret_column = left + text_cell_width(&prompt);
+        let mut rows = palette
+            .visible(lines - 1)
+            .map(|(entry, selected)| (palette_row(entry, width), selected))
+            .collect::<Vec<_>>();
+        if rows.is_empty() {
+            rows.push((pad_cells(" No matching commands", width), false));
+        }
+
+        self.paint_string_cells(
+            scene,
+            Point::new(0, Column(left)),
+            fg,
+            bg,
+            &pad_cells(&prompt, width),
+        );
+        let caret = RenderRect::new(
+            size_info.padding_x() + caret_column as f32 * size_info.cell_width(),
+            size_info.padding_y(),
+            (size_info.cell_width() / 8.).max(1.),
+            size_info.cell_height(),
+            fg,
+            1.,
+        );
+        paint_rect(scene, &caret);
+        for (index, (text, selected)) in rows.iter().enumerate() {
+            let (fg, bg) = if *selected { (bg, fg) } else { (fg, bg) };
+            self.paint_string_cells(scene, Point::new(index + 1, Column(left)), fg, bg, text);
+        }
+    }
+
     fn draw_render_timer(&mut self, scene: &mut Scene, config: &UiConfig) {
         if !config.debug.render_timer {
             return;
@@ -1778,6 +1864,71 @@ fn scene_glyph_from_layout(
     let positioned = Glyph { id: glyph.id, x: *cursor_x + glyph.x, y: baseline - glyph.y };
     *cursor_x += glyph.advance;
     positioned
+}
+
+/// Widest the command palette gets, in cells.
+const PALETTE_MAX_COLUMNS: usize = 72;
+/// Narrowest grid the command palette draws in; below it there is no room for a title.
+const PALETTE_MIN_COLUMNS: usize = 12;
+
+/// One palette row: the title on the left and its shortcut on the right, exactly `width` cells.
+///
+/// A title too long for the row is cut short with `…`; a shortcut that leaves no room for a
+/// title is dropped.
+fn palette_row(entry: &PaletteEntry, width: usize) -> String {
+    let shortcut =
+        entry.shortcut.as_deref().map(|shortcut| format!("{shortcut} ")).unwrap_or_default();
+    let shortcut_width = text_cell_width(&shortcut);
+    // A leading space, then the title, then at least one space before the shortcut.
+    let (shortcut, shortcut_width) =
+        if shortcut_width + 8 <= width { (shortcut, shortcut_width) } else { (String::new(), 0) };
+    let title = fit_cells_start(&entry.title, width.saturating_sub(shortcut_width + 2));
+    let gap = width.saturating_sub(1 + text_cell_width(&title) + shortcut_width);
+    format!(" {title}{:gap$}{shortcut}", "")
+}
+
+/// `text` cut to at most `width` cells from its start, ending in `…` when cut.
+fn fit_cells_start(text: &str, width: usize) -> String {
+    if text_cell_width(text) <= width {
+        return text.to_owned();
+    }
+    let mut fitted = String::new();
+    let mut used = 0;
+    for character in text.chars() {
+        let cells = char_cell_width(character);
+        if used + cells + 1 > width {
+            break;
+        }
+        fitted.push(character);
+        used += cells;
+    }
+    fitted.push('…');
+    fitted
+}
+
+/// `text` cut to at most `width` cells from its end, starting with `…` when cut, so the part
+/// being typed stays visible.
+fn fit_cells_end(text: &str, width: usize) -> String {
+    if text_cell_width(text) <= width {
+        return text.to_owned();
+    }
+    let mut kept = Vec::new();
+    let mut used = 0;
+    for character in text.chars().rev() {
+        let cells = char_cell_width(character);
+        if used + cells + 1 > width {
+            break;
+        }
+        kept.push(character);
+        used += cells;
+    }
+    std::iter::once('…').chain(kept.into_iter().rev()).collect()
+}
+
+/// `text` padded with spaces to exactly `width` cells; callers pass text that already fits.
+fn pad_cells(text: &str, width: usize) -> String {
+    let padding = width.saturating_sub(text_cell_width(text));
+    format!("{text}{:padding$}", "")
 }
 
 fn char_cell_width(character: char) -> usize {

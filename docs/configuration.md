@@ -501,7 +501,9 @@ Search: `SearchForward`, `SearchBackward`. Inside search mode: `SearchFocusNext`
 `SearchFocusPrevious`, `SearchConfirm`, `SearchCancel`, `SearchClear`, `SearchDeleteWord`,
 `SearchHistoryPrevious`, `SearchHistoryNext`.
 
-Misc: `ClearHistory`, `ClearLogNotice`, `ReceiveChar`, `None`.
+Misc: `ToggleCommandPalette` (bound to `Ctrl+Shift+P`, `Command+Shift+P` on macOS; see
+[the command palette](features.md#command-palette)), `TerminalRecovery`, `ClearHistory`,
+`ClearLogNotice`, `ToggleMicrophone`, `NextMicrophone`, `ReceiveChar`, `None`.
 
 > There is no vi mode, so vi-motion, vi-cursor, and vi-selection actions do not exist in Vivido.
 
@@ -511,6 +513,7 @@ Misc: `ClearHistory`, `ClearLogNotice`, `ReceiveChar`, `None`.
 |---|---|
 | `Ctrl+Shift+T` | Create and activate a tab |
 | `Ctrl+Shift+U` | Check for Vivido updates |
+| `Ctrl+Shift+P` | Open or close the command palette |
 | `Ctrl+Shift+W` | Close the active tab |
 | `Ctrl+Tab` / `Ctrl+Shift+Tab` | Select the next / previous tab, wrapping at either end |
 | `Alt+1`…`Alt+8` | Select the matching tab from the left |

@@ -234,6 +234,9 @@ pub enum Action {
     /// Start a backward buffer search.
     SearchBackward,
 
+    /// Open or close the command palette.
+    ToggleCommandPalette,
+
     /// No action.
     None,
 }
@@ -416,6 +419,7 @@ fn common_keybindings() -> Vec<KeyBinding> {
         "b",    ModifiersState::CONTROL | ModifiersState::SHIFT, ~BindingMode::SEARCH;                   Action::SearchBackward;
         "t",    ModifiersState::CONTROL | ModifiersState::SHIFT;                                         Action::CreateNewTab;
         "u",    ModifiersState::CONTROL | ModifiersState::SHIFT;                                         Action::CheckForUpdates;
+        "p",    ModifiersState::CONTROL | ModifiersState::SHIFT;                                         Action::ToggleCommandPalette;
         "w",    ModifiersState::CONTROL | ModifiersState::SHIFT;                                         Action::Quit;
         Tab,    ModifiersState::CONTROL;                                                                  Action::SelectNextTab;
         Tab,    ModifiersState::CONTROL | ModifiersState::SHIFT;                                          Action::SelectPreviousTab;
@@ -502,6 +506,7 @@ fn macos_keybindings() -> Vec<KeyBinding> {
         "w",    ModifiersState::SUPER;                                         Action::Quit;
         "f",    ModifiersState::SUPER, ~BindingMode::SEARCH;                   Action::SearchForward;
         "b",    ModifiersState::SUPER, ~BindingMode::SEARCH;                   Action::SearchBackward;
+        "p",    ModifiersState::SUPER | ModifiersState::SHIFT;                 Action::ToggleCommandPalette;
         "+" => KeyLocation::Numpad, ModifiersState::SUPER;                     Action::IncreaseFontSize;
         "-" => KeyLocation::Numpad, ModifiersState::SUPER;                     Action::DecreaseFontSize;
     )
@@ -1140,6 +1145,7 @@ impl_config_deserialize_enum!(Action {
     ReceiveChar,
     SearchForward,
     SearchBackward,
+    ToggleCommandPalette,
     None,
 });
 impl_config_deserialize_enum!(SearchAction {
@@ -1466,6 +1472,22 @@ mod tests {
                 && binding.mods == ModifiersState::CONTROL | ModifiersState::SHIFT
                 && binding.action == Action::CheckForUpdates
         }));
+    }
+
+    #[test]
+    fn command_palette_defaults_to_shift_p_with_the_platform_modifier() {
+        let trigger =
+            BindingKey::Keycode { key: Key::Character("p".into()), location: KeyLocation::Any };
+        let bound = |bindings: Vec<KeyBinding>, mods: ModifiersState| {
+            bindings.iter().any(|binding| {
+                binding.trigger == trigger
+                    && binding.mods == mods
+                    && binding.action == Action::ToggleCommandPalette
+            })
+        };
+
+        assert!(bound(common_keybindings(), ModifiersState::CONTROL | ModifiersState::SHIFT));
+        assert!(bound(macos_keybindings(), ModifiersState::SUPER | ModifiersState::SHIFT));
     }
 
     #[test]

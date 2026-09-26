@@ -358,7 +358,10 @@ waiting until it disconnects, the same as any unanswered request.
   prompt (`"a command"` when integration reports a command the shell runs in-process).
   `message` is the message bar's current entry as `{"type":"info|warning|error","text":…}`, or
   null when the bar is empty, so a client can read notices such as the terminal-recovery hint
-  that are drawn over the grid rather than written into it.
+  that are drawn over the grid rather than written into it. `command_palette` is null while the
+  palette is closed and otherwise `{"query":…,"matches":N,"selected":"Title"}`; drive it with
+  UI-routed keys (`key p --mods Ctrl,Shift --route ui`, one `key` per typed character, then
+  `Enter` or `Escape`).
   It also reports `ime_cursor_area`, lightweight native-accessibility state, `vivid_overlay`
   resource/submission counters, and overlay render-cache passes, skips, and target allocations.
   These counters are cumulative and are intended for bounded acceptance and performance probes;

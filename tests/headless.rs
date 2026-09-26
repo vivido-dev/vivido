@@ -512,6 +512,76 @@ fn ctrl_c_interrupts_a_running_child() {
     );
 }
 
+/// The command palette opens on its binding, filters as keys arrive, runs the highlighted action
+/// on Enter, and closes on Escape, without any of the typing reaching the shell.
+#[test]
+#[ignore = "spawns processes and needs a wgpu adapter"]
+fn command_palette_filters_runs_and_closes() {
+    let session = Session::start("palette", &static_program());
+    let inspect = || -> serde_json::Value {
+        serde_json::from_str(&session.msg(&["inspect"])).expect("inspect JSON")
+    };
+    let key = |key: &str, mods: Option<&str>| {
+        let mut arguments = vec!["key", key, "--route", "ui"];
+        if let Some(mods) = mods {
+            arguments.extend(["--mods", mods]);
+        }
+        session.msg(&arguments);
+    };
+    #[cfg(target_os = "macos")]
+    let open = "Super,Shift";
+    #[cfg(not(target_os = "macos"))]
+    let open = "Ctrl,Shift";
+
+    session.msg(&["wait", "text", "STATUS-42", "--timeout", "10s"]);
+    assert!(inspect()["command_palette"].is_null(), "the palette starts closed");
+    assert!(inspect()["message"].is_null(), "no message is up yet");
+    let frame = inspect()["window"]["sequences"]["frame"].as_u64().expect("frame sequence");
+
+    key("p", Some(open));
+    let palette =
+        wait_for_inspect(&session, "/command_palette", &|value| value.is_object(), "never opened");
+    // UI-routed automation input used to change state without asking for a frame, so the
+    // palette stayed off screen until something else redrew the window.
+    wait_for_inspect(
+        &session,
+        "/window/sequences/frame",
+        &|value| value.as_u64().is_some_and(|sequence| sequence > frame),
+        "opening the palette presented no new frame",
+    );
+    assert_eq!(palette["query"], "");
+    assert!(
+        palette["matches"].as_u64().unwrap() > 10,
+        "an empty query lists everything: {palette}"
+    );
+
+    for character in "rec term".chars() {
+        key(&character.to_string(), None);
+    }
+    let palette = inspect()["command_palette"].clone();
+    assert_eq!(palette["query"], "rec term");
+    assert_eq!(palette["selected"], "Recover terminal", "{palette}");
+
+    // Recovery is one of the actions a headless session can show: its hint lands in the message
+    // bar, where `inspect` reads it.
+    key("Enter", None);
+    wait_for_inspect(&session, "/command_palette", &|value| value.is_null(), "Enter left it open");
+    let message = wait_for_inspect(
+        &session,
+        "/message",
+        &|value| value.is_object(),
+        "the chosen action did not run",
+    );
+    assert!(message["text"].as_str().unwrap_or_default().contains("reset-terminal"), "{message}");
+    let text = session.msg(&["get-text"]);
+    assert!(!text.contains("rec term"), "palette typing reached the terminal: {text:?}");
+
+    key("p", Some(open));
+    wait_for_inspect(&session, "/command_palette", &|value| value.is_object(), "never reopened");
+    key("Escape", None);
+    wait_for_inspect(&session, "/command_palette", &|value| value.is_null(), "Escape left it open");
+}
+
 /// The terminal-recovery binding reaches its own window. In a headless session, where nobody can
 /// answer a dialog, it shows the recovery commands in the message bar instead.
 ///

@@ -36,6 +36,18 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
         let mode = *self.ctx.terminal().mode();
         let mods = self.ctx.modifiers().state();
 
+        // The command palette is modal: while it is open it takes every key, and releases go
+        // nowhere, so no half of a keystroke leaks to the terminal.
+        if self.ctx.display().command_palette().is_some() {
+            if key.state == ElementState::Pressed {
+                let toggles = self.key_triggers(&key, &Action::ToggleCommandPalette);
+                let text = key.text_with_all_modifiers().unwrap_or_default();
+                let command = palette_command(&key.logical_key, text, mods, toggles);
+                self.apply_palette_command(command, text);
+            }
+            return;
+        }
+
         if key.state == ElementState::Released {
             if !self.ctx.search_active() && self.forward_overlay_key(&key) {
                 return;
@@ -224,6 +236,61 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
         }
     }
 
+    /// Whether `key` triggers a binding for `action` in the current mode.
+    fn key_triggers(&mut self, key: &KeyEvent, action: &Action) -> bool {
+        let mode = BindingMode::new(self.ctx.terminal().mode(), self.ctx.search_active());
+        let mods = self.ctx.modifiers().state();
+        let logical_key = binding_logical_key(key, mods);
+        self.ctx.config().key_bindings().iter().filter(|binding| binding.action == *action).any(
+            |binding| {
+                let trigger = match &binding.trigger {
+                    BindingKey::Scancode(_) => BindingKey::Scancode(key.physical_key),
+                    _ => BindingKey::Keycode {
+                        key: logical_key.clone(),
+                        location: key.location.into(),
+                    },
+                };
+                binding.is_triggered_by(mode, mods, &trigger)
+            },
+        )
+    }
+
+    /// Apply one key press to the open command palette; running an entry closes it first.
+    fn apply_palette_command(&mut self, command: PaletteCommand, text: &str) {
+        let display = self.ctx.display();
+        match command {
+            PaletteCommand::Close => {
+                display.close_command_palette();
+            },
+            PaletteCommand::Run => {
+                let action = display
+                    .command_palette()
+                    .and_then(|palette| palette.selected())
+                    .map(|entry| entry.action.clone());
+                display.close_command_palette();
+                self.ctx.mark_dirty();
+                if let Some(action) = action {
+                    action.execute(&mut self.ctx);
+                }
+                return;
+            },
+            PaletteCommand::Ignore => return,
+            edit => {
+                let Some(palette) = display.command_palette_mut() else { return };
+                match edit {
+                    PaletteCommand::Move(delta) => palette.move_selection(delta),
+                    PaletteCommand::Page(forward) => palette.page(forward),
+                    PaletteCommand::Backspace => palette.backspace(),
+                    PaletteCommand::DeleteWord => palette.delete_word(),
+                    PaletteCommand::Clear => palette.clear(),
+                    PaletteCommand::Insert => palette.insert(text),
+                    PaletteCommand::Close | PaletteCommand::Run | PaletteCommand::Ignore => (),
+                }
+            },
+        }
+        self.ctx.mark_dirty();
+    }
+
     /// Attempt to find a binding and execute its action.
     ///
     /// The provided mode, mods, and key must match what is allowed by a binding
@@ -235,27 +302,7 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
         // Don't suppress char if no bindings were triggered.
         let mut suppress_chars = None;
 
-        // We don't want the key without modifier, because it means something else most of
-        // the time. However what we want is to manually lowercase the character to account
-        // for both small and capital letters on regular characters at the same time.
-        let logical_key = if let Key::Character(ch) = key.logical_key.as_ref() {
-            // Match `Alt` bindings without `Alt` being applied, otherwise they use the
-            // composed chars, which are not intuitive to bind.
-            //
-            // On Windows, the `Ctrl + Alt` mangles `logical_key` to unidentified values, thus
-            // preventing them from being used in bindings
-            //
-            // For more see https://github.com/rust-windowing/winit/issues/2945.
-            if (cfg!(target_os = "macos") || (cfg!(windows) && mods.control_key()))
-                && mods.alt_key()
-            {
-                key.key_without_modifiers()
-            } else {
-                Key::Character(ch.to_lowercase().into())
-            }
-        } else {
-            key.logical_key.clone()
-        };
+        let logical_key = binding_logical_key(key, mods);
 
         // Get the action of a key binding.
         let mut binding_action = |binding: &KeyBinding| {
@@ -372,6 +419,16 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
             logical_key => logical_key.clone(),
         };
         let trigger = BindingKey::Keycode { key: binding_key, location: location.into() };
+
+        if self.ctx.display().command_palette().is_some() {
+            let toggles = self.ctx.config().key_bindings().iter().any(|binding| {
+                binding.action == Action::ToggleCommandPalette
+                    && binding.is_triggered_by(binding_mode, mods, &trigger)
+            });
+            self.apply_palette_command(palette_command(&logical_key, &text, mods, toggles), &text);
+            return Ok(None);
+        }
+
         let bindings = self.ctx.config().key_bindings().to_vec();
         let hint_bindings: Vec<_> = self
             .ctx
@@ -926,6 +983,80 @@ fn is_control_character(text: &str) -> bool {
 
 /// Encode a protocol-neutral IPC key for the current terminal keyboard modes.
 #[cfg(any(unix, windows))]
+/// The key a binding is matched against.
+///
+/// We don't want the key without modifier, because it means something else most of the time.
+/// However what we want is to manually lowercase the character to account for both small and
+/// capital letters on regular characters at the same time.
+fn binding_logical_key(key: &KeyEvent, mods: ModifiersState) -> Key {
+    if let Key::Character(ch) = key.logical_key.as_ref() {
+        // Match `Alt` bindings without `Alt` being applied, otherwise they use the
+        // composed chars, which are not intuitive to bind.
+        //
+        // On Windows, the `Ctrl + Alt` mangles `logical_key` to unidentified values, thus
+        // preventing them from being used in bindings
+        //
+        // For more see https://github.com/rust-windowing/winit/issues/2945.
+        if (cfg!(target_os = "macos") || (cfg!(windows) && mods.control_key())) && mods.alt_key() {
+            key.key_without_modifiers()
+        } else {
+            Key::Character(ch.to_lowercase().into())
+        }
+    } else {
+        key.logical_key.clone()
+    }
+}
+
+/// What one key press does to the open command palette.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PaletteCommand {
+    Close,
+    Run,
+    Move(isize),
+    Page(bool),
+    Backspace,
+    DeleteWord,
+    Clear,
+    /// Add the key's text to the query.
+    Insert,
+    Ignore,
+}
+
+/// Decide what a key press does while the command palette is open.
+///
+/// `toggles` is whether the key is bound to `ToggleCommandPalette`, which closes it again. The
+/// editing keys follow the search bar's: `Ctrl+U` clears, `Ctrl+W` deletes a word, `Ctrl+P` and
+/// `Ctrl+N` move like the arrows, and `Ctrl+C` cancels. Other `Control` or `Super` chords are
+/// ignored; `Ctrl+Alt` is AltGr on Windows and still types.
+fn palette_command(key: &Key, text: &str, mods: ModifiersState, toggles: bool) -> PaletteCommand {
+    if toggles {
+        return PaletteCommand::Close;
+    }
+    let control = mods.control_key() && !mods.alt_key();
+    match key {
+        Key::Named(NamedKey::Escape) => PaletteCommand::Close,
+        Key::Named(NamedKey::Enter) => PaletteCommand::Run,
+        Key::Named(NamedKey::ArrowUp) => PaletteCommand::Move(-1),
+        Key::Named(NamedKey::ArrowDown) => PaletteCommand::Move(1),
+        Key::Named(NamedKey::Tab) if mods.shift_key() => PaletteCommand::Move(-1),
+        Key::Named(NamedKey::Tab) => PaletteCommand::Move(1),
+        Key::Named(NamedKey::PageUp) => PaletteCommand::Page(false),
+        Key::Named(NamedKey::PageDown) => PaletteCommand::Page(true),
+        Key::Named(NamedKey::Backspace) if control || mods.alt_key() => PaletteCommand::DeleteWord,
+        Key::Named(NamedKey::Backspace) => PaletteCommand::Backspace,
+        Key::Character(character) if control => match character.to_lowercase().as_str() {
+            "c" | "g" => PaletteCommand::Close,
+            "p" | "k" => PaletteCommand::Move(-1),
+            "n" | "j" => PaletteCommand::Move(1),
+            "u" => PaletteCommand::Clear,
+            "w" => PaletteCommand::DeleteWord,
+            _ => PaletteCommand::Ignore,
+        },
+        _ if mods.super_key() || control || text.is_empty() => PaletteCommand::Ignore,
+        _ => PaletteCommand::Insert,
+    }
+}
+
 pub fn encode_ipc_key_event(
     key: &str,
     modifiers: &[String],
@@ -1292,7 +1423,9 @@ fn ipc_logical_key(key: &str) -> Result<(Key, KeyLocation), crate::polling::ipc:
 
 #[cfg(all(test, any(unix, windows)))]
 mod ipc_tests {
-    use super::{encode_ipc_key_event, ipc_hid_usage};
+    use winit::keyboard::{Key, ModifiersState, NamedKey};
+
+    use super::{PaletteCommand, encode_ipc_key_event, ipc_hid_usage, palette_command};
     use crate::terminal::term::TermMode;
 
     fn encode_ipc_key(
@@ -1333,6 +1466,50 @@ mod ipc_tests {
         assert_eq!(
             encode_ipc_key_event("F5", &[], TermMode::REPORT_EVENT_TYPES, true).unwrap(),
             b"\x1b[15;1:2~"
+        );
+    }
+
+    #[test]
+    fn palette_keys_edit_move_run_and_close() {
+        let none = ModifiersState::empty();
+        let ctrl = ModifiersState::CONTROL;
+        let named = |key| Key::Named(key);
+        let character = |text: &str| Key::Character(text.into());
+        let command = |key: &Key, text, mods| palette_command(key, text, mods, false);
+
+        assert_eq!(command(&character("f"), "f", none), PaletteCommand::Insert);
+        assert_eq!(command(&character("F"), "F", ModifiersState::SHIFT), PaletteCommand::Insert);
+        assert_eq!(command(&named(NamedKey::Space), " ", none), PaletteCommand::Insert);
+        assert_eq!(command(&named(NamedKey::Enter), "\r", none), PaletteCommand::Run);
+        assert_eq!(command(&named(NamedKey::Escape), "\u{1b}", none), PaletteCommand::Close);
+        assert_eq!(command(&named(NamedKey::ArrowDown), "", none), PaletteCommand::Move(1));
+        assert_eq!(
+            command(&named(NamedKey::Tab), "", ModifiersState::SHIFT),
+            PaletteCommand::Move(-1)
+        );
+        assert_eq!(command(&named(NamedKey::PageDown), "", none), PaletteCommand::Page(true));
+        assert_eq!(command(&named(NamedKey::Backspace), "\u{8}", none), PaletteCommand::Backspace);
+        assert_eq!(command(&named(NamedKey::Backspace), "", ctrl), PaletteCommand::DeleteWord);
+
+        // The search bar's editing chords, whether the key reports text or a control code.
+        assert_eq!(command(&character("u"), "\u{15}", ctrl), PaletteCommand::Clear);
+        assert_eq!(command(&character("w"), "w", ctrl), PaletteCommand::DeleteWord);
+        assert_eq!(command(&character("p"), "\u{10}", ctrl), PaletteCommand::Move(-1));
+        assert_eq!(command(&character("n"), "n", ctrl), PaletteCommand::Move(1));
+        assert_eq!(command(&character("c"), "\u{3}", ctrl), PaletteCommand::Close);
+        assert_eq!(command(&character("v"), "v", ctrl), PaletteCommand::Ignore);
+        assert_eq!(command(&character("a"), "a", ModifiersState::SUPER), PaletteCommand::Ignore);
+        // `Ctrl+Alt` is AltGr on Windows; what it types belongs in the query.
+        assert_eq!(
+            command(&character("@"), "@", ctrl | ModifiersState::ALT),
+            PaletteCommand::Insert
+        );
+        assert_eq!(command(&named(NamedKey::F5), "", none), PaletteCommand::Ignore);
+
+        // The key bound to the palette closes it, whatever else it would do.
+        assert_eq!(
+            palette_command(&character("p"), "P", ctrl | ModifiersState::SHIFT, true),
+            PaletteCommand::Close
         );
     }
 

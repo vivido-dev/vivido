@@ -5953,6 +5953,12 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
 
     /// Paste a text into the terminal.
     fn paste(&mut self, text: &str, bracketed: bool) {
+        // Pasted text and IME commits go to the open command palette's query, never the PTY.
+        if let Some(palette) = self.display.command_palette_mut() {
+            palette.insert(text);
+            *self.dirty = true;
+            return;
+        }
         if !self.search_active()
             && self.overlay_keyboard(vivid_protocol::overlay::Event::Text(text.to_owned()), false)
         {

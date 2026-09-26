@@ -32,7 +32,7 @@ use crate::cli::Options;
 #[cfg(test)]
 pub use crate::config::bindings::Binding;
 pub use crate::config::bindings::{
-    Action, BindingKey, BindingMode, KeyBinding, MouseEvent, SearchAction,
+    Action, BindingKey, BindingMode, KeyBinding, KeyLocation, MouseEvent, SearchAction,
 };
 pub use crate::config::ui_config::UiConfig;
 use crate::logging::LOG_TARGET_CONFIG;

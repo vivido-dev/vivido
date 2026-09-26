@@ -322,6 +322,19 @@ impl<T: EventListener> Execute<T> for Action {
             },
             Action::Minimize => ctx.window().set_minimized(true),
             Action::Quit => ctx.request_close(),
+            Action::ToggleCommandPalette => {
+                if ctx.display().command_palette().is_some() {
+                    ctx.display().close_command_palette();
+                } else {
+                    // One modal input at a time: the palette takes over from an open search.
+                    if ctx.search_active() {
+                        ctx.cancel_search();
+                    }
+                    let entries = crate::command_palette::entries(ctx.config());
+                    ctx.display().open_command_palette(entries);
+                }
+                ctx.mark_dirty();
+            },
             Action::IncreaseFontSize => ctx.change_font_size(FONT_SIZE_STEP),
             Action::DecreaseFontSize => ctx.change_font_size(-FONT_SIZE_STEP),
             Action::ResetFontSize => ctx.reset_font_size(),
