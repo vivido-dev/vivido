@@ -780,12 +780,14 @@ impl WindowContext {
             &mut self.search_state,
         );
 
-        // Request immediate re-draw if the visual bell or scrollbar animation is not done
-        // yet. This must run after the draw: the scrollbar wakes inside it, when the
+        // Request immediate re-draw if the visual bell, scrollbar, or progress animation is not
+        // done yet. This must run after the draw: the scrollbar wakes inside it, when the
         // terminal's display offset is sampled, so checking earlier would miss the wake
         // frame and let the fade stall after a single presentation.
+        let now = Instant::now();
         if !self.display.visual_bell.completed()
-            || self.display.scrollbar.is_animating_at(Instant::now())
+            || self.display.scrollbar.is_animating_at(now)
+            || self.display.progress.is_animating_at(now)
         {
             // We can get an OS redraw which bypasses Vivido's frame throttling, thus
             // marking the window as dirty when we don't have frame yet.
@@ -2100,6 +2102,59 @@ impl WindowContext {
         self.notifications.handle(notification, state, &self.notifier);
     }
 
+    /// Fold an OSC 9;4 progress report into the progress bar, returning whether it changed.
+    ///
+    /// Every report re-arms the staleness timer, including repeats that change nothing visible.
+    pub(crate) fn apply_progress(
+        &mut self,
+        report: crate::osc_notification::ProgressReport,
+        scheduler: &mut Scheduler,
+    ) -> bool {
+        if !self.config.terminal.progress {
+            return false;
+        }
+        let changed = self.display.progress.apply(report, Instant::now());
+        self.schedule_progress_timeout(scheduler);
+        if changed {
+            self.request_progress_frame();
+        }
+        changed
+    }
+
+    /// Drop a progress bar whose program stopped reporting, returning whether one was removed.
+    pub(crate) fn expire_progress(&mut self, scheduler: &mut Scheduler) -> bool {
+        let expired = self.display.progress.expire(Instant::now());
+        if expired {
+            self.request_progress_frame();
+        } else {
+            // A report arrived after this timer was armed and moved the deadline.
+            self.schedule_progress_timeout(scheduler);
+        }
+        expired
+    }
+
+    fn schedule_progress_timeout(&self, scheduler: &mut Scheduler) {
+        let window_id = self.display.window.id();
+        let timer_id = TimerId::new(Topic::ProgressTimeout, window_id);
+        scheduler.unschedule(timer_id);
+        if let Some(deadline) = self.display.progress.deadline() {
+            let event = Event::new(EventType::ProgressTimeout, window_id);
+            scheduler.schedule(
+                event,
+                deadline.saturating_duration_since(Instant::now()),
+                false,
+                timer_id,
+            );
+        }
+    }
+
+    fn request_progress_frame(&mut self) {
+        self.dirty = true;
+        if self.display.window.has_frame {
+            self.display.window.request_redraw();
+        }
+    }
+
     /// Focus the live originating native window after its notification is activated.
     pub(crate) fn activate_desktop_notification(&self) {
         if !self.display.window.is_headless() && !self.display.window.is_embedded() {
@@ -2438,6 +2493,7 @@ impl WindowContext {
             "foreground_process_group_id": foreground_pgid,
             "executable": executable,
             "current_directory": current_directory,
+            "progress": self.display.progress.automation_json(),
             "echo": echo,
             "exit_status": exit_status_json(self.automation.exit_status.as_ref()),
             "event_sequence": event_sequence,

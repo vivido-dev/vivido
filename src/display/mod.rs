@@ -39,6 +39,9 @@ use crate::display::cursor::IntoRects;
 use crate::display::damage::{DamageTracker, damage_y_to_viewport_y};
 use crate::display::hint::{HintMatch, HintState};
 use crate::display::meter::Meter;
+use crate::display::progress::{
+    BAR_HEIGHT, ProgressBar, ProgressTone, ProgressVisual, SEGMENT_FRACTION, TRACK_ALPHA,
+};
 use crate::display::rects::{RenderLine, RenderLines, RenderRect, paint_rect, paint_rects};
 use crate::display::renderer::{EmbeddedFrame, SceneRenderer};
 use crate::display::scrollbar::{ScrollbarModel, ScrollbarState, THUMB_ALPHA, THUMB_COLOR};
@@ -66,6 +69,7 @@ mod damage;
 mod media;
 mod meter;
 mod overlay;
+mod progress;
 mod scrollbar;
 #[cfg(windows)]
 mod windows_live_move;
@@ -329,6 +333,10 @@ pub struct Display {
     pub cursor_hidden: bool,
     pub visual_bell: VisualBell,
     pub scrollbar: ScrollbarState,
+    /// OSC 9;4 progress reported by the terminal's programs.
+    pub progress: ProgressBar,
+    /// The progress visual the cached scene shows.
+    drawn_progress: Option<ProgressVisual>,
     pub colors: List,
     pub hint_state: HintState,
     pub pending_update: DisplayUpdate,
@@ -378,6 +386,7 @@ impl Display {
         self.cached_scene = None;
         self.vivid_frame_requested = false;
         self.scrollbar.record_drawn(None);
+        self.drawn_progress = None;
     }
 
     pub fn set_vivid_scene(&mut self, scene: crate::vivid::scene::SharedScene) {
@@ -490,6 +499,8 @@ impl Display {
             cursor_hidden: Default::default(),
             visual_bell: VisualBell::from(&config.bell),
             scrollbar: ScrollbarState::new(),
+            progress: ProgressBar::default(),
+            drawn_progress: None,
             colors: List::from(&config.colors),
             hint_state,
             pending_update: Default::default(),
@@ -690,6 +701,7 @@ impl Display {
         let scrollbar_scale = self.window.scale_factor as f32;
         let scrollbar_visual =
             self.scrollbar.visual_at(Instant::now(), &size_info, scrollbar_scale);
+        let progress_visual = self.progress.visual_at(Instant::now());
         let prepared_media = self.scene_renderer.prepare_media(&size_info, early_display_offset);
         let media_generation = prepared_media.as_ref().map_or(0, |media| media.image_generation);
         let _media_changed = prepared_media.as_ref().is_some_and(|media| media.changed);
@@ -705,7 +717,8 @@ impl Display {
             && search_state.regex().is_none()
             && !self.damage_tracker.debug
             // The cached scene must show exactly the scrollbar visual this frame would.
-            && self.scrollbar.drawn_visual() == scrollbar_visual;
+            && self.scrollbar.drawn_visual() == scrollbar_visual
+            && self.drawn_progress == progress_visual;
         if can_reuse_scene {
             self.cached_scene_frames = self.cached_scene_frames.saturating_add(1);
             drop(terminal);
@@ -945,6 +958,9 @@ impl Display {
                 );
                 self.damage_tracker.frame().mark_fully_damaged();
             }
+            if let Some(visual) = progress_visual {
+                self.draw_progress(&mut scene, config, visual);
+            }
             self.draw_render_timer(&mut scene, config);
 
             if has_highlighted_hint {
@@ -998,6 +1014,7 @@ impl Display {
             self.cached_media_generation = media_generation;
             self.cached_base_color = base_color;
             self.scrollbar.record_drawn(scrollbar_visual);
+            self.drawn_progress = progress_visual;
         }
         self.vivid_frame_requested = false;
 
@@ -1012,6 +1029,9 @@ impl Display {
         self.visual_bell.update_config(&config.bell);
         if !config.scrolling.scrollbar {
             self.scrollbar.hide();
+        }
+        if !config.terminal.progress {
+            self.progress.clear();
         }
         self.colors = List::from(&config.colors);
     }
@@ -1486,6 +1506,43 @@ impl Display {
     }
 
     /// Draw the overlay scrollbar thumb at `intensity` and damage its gutter.
+    /// Draw the OSC 9;4 progress bar along the top edge of the grid.
+    ///
+    /// It sits in the top padding when there is room for it and overlays the first row's top
+    /// edge when there is not, so it never shifts terminal content.
+    fn draw_progress(&mut self, scene: &mut Scene, config: &UiConfig, visual: ProgressVisual) {
+        let size_info = self.size_info;
+        let height = (BAR_HEIGHT * self.window.scale_factor as f32).round().max(1.);
+        let y = (size_info.padding_y() - height).max(0.);
+        let width = size_info.width();
+        let accent = config.colors.normal.blue;
+
+        let rects = match visual {
+            ProgressVisual::Fill { tone, fraction } => {
+                let color = match tone {
+                    ProgressTone::Normal => accent,
+                    ProgressTone::Paused => config.colors.normal.yellow,
+                    ProgressTone::Error => config.colors.normal.red,
+                };
+                vec![RenderRect::new(0., y, width * fraction.clamp(0., 1.), height, color, 1.)]
+            },
+            ProgressVisual::Bounce { offset } => vec![
+                RenderRect::new(0., y, width, height, accent, TRACK_ALPHA),
+                RenderRect::new(width * offset, y, width * SEGMENT_FRACTION, height, accent, 1.),
+            ],
+        };
+        paint_rects(scene, rects);
+
+        // Damage the whole strip: the fill shrinks as well as grows, and the segment moves.
+        self.damage_tracker.frame().add_viewport_rect(
+            &size_info,
+            0,
+            y as i32,
+            width.ceil() as i32,
+            height as i32,
+        );
+    }
+
     fn draw_scrollbar(&mut self, scene: &mut Scene, intensity: f32, scale_factor: f32) {
         let geometry = self.scrollbar.geometry(&self.size_info, scale_factor);
         let Some(thumb) = geometry.thumb else {

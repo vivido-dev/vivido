@@ -329,12 +329,14 @@ blinking = "Off"
 |---|---|---|---|
 | `osc52` | enum | `onlycopy` | Clipboard access via OSC 52: `disabled`, `onlycopy`, `onlypaste`, `copypaste` (case-insensitive). |
 | `osc_notifications` | bool | `true` | Allow OSC 9 and OSC 99 desktop notifications. |
+| `progress` | bool | `true` | Draw a progress bar for OSC 9;4 progress reports. |
 | `shell` | string or `{ program, args }` | *system* | Shell to launch instead of the login shell. |
 
 ```toml
 [terminal]
 osc52 = "onlycopy"
 osc_notifications = true
+progress = true
 shell = { program = "/usr/bin/fish", args = ["--login"] }
 ```
 
@@ -370,6 +372,20 @@ the desktop backend supports them. Icons, buttons, and callbacks into the PTY ar
 ```sh
 printf '\033]9;Build complete\007'
 printf '\033]99;;Build complete\033\\'
+```
+
+Programs report progress with ConEmu's `OSC 9 ; 4 ; state ; percent ST`. Vivido draws it as a
+thin bar along the top edge of the terminal: `1` fills to the percent in the palette's blue, `2`
+turns it red (error), `4` turns it yellow (paused), `3` shows a segment bouncing over a faint track
+(busy, no percent), and `0` removes it. Error and pause keep the last percent when they carry
+none. A bar with no new report for 15 seconds is removed, so a crashed tool does not leave one
+behind. The bar works the same inside Vivida panes, and IPC `inspect` and the `progress_changed`
+event report its state. `terminal.progress = false` turns it off.
+
+```sh
+printf '\033]9;4;1;42\007'   # 42 %
+printf '\033]9;4;3\007'      # busy
+printf '\033]9;4;0\007'      # remove
 ```
 
 ## `mouse`

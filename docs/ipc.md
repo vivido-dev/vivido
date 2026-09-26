@@ -505,7 +505,7 @@ An event frame carries the same protocol version as requests and responses. Dist
 presence of `subscription_id`, not by `version`.
 
 Kinds are `screen_changed`, `output`, `frame_presented`, `title_changed`, `directory_changed`,
-`focus_changed`, `resized`, `moved`, `bell`, `child_exit`, `window_created`, `window_closed`, and
+`progress_changed`, `focus_changed`, `resized`, `moved`, `bell`, `child_exit`, `window_created`, `window_closed`, and
 `overflow`, plus `client_fault` and `client_recovered`. The handshake's `event_kinds` is the
 authority and is also the `--events` allowlist: a kind it does not list cannot be subscribed to by
 name. A replayable `client_fault` contains the
@@ -514,7 +514,10 @@ payloads, paths, and capability material are never included. `client_recovered` 
 reset. Output data is split into
 at most 64 KiB chunks with start/end offsets and base64 bytes. Screen-change data contains current
 row replacements. `directory_changed` fires when the local shell reports a new working directory
-through OSC 7 and carries `{"directory":"/path"}`. The process replay ring is bounded by both 4 MiB and 4,096 events.
+through OSC 7 and carries `{"directory":"/path"}`. `progress_changed` fires when an OSC 9;4
+report changes the window's progress state or percent, or when a stale bar expires, and carries
+`{"state":"normal|error|indeterminate|paused|none","percent":42}`; `percent` is null for
+`indeterminate` and `none`. `inspect` reports the same object as `progress`. The process replay ring is bounded by both 4 MiB and 4,096 events.
 
 `since_event` atomically replays retained matching events before live delivery. If history is gone,
 the first event is `overflow` with the gap and current window sequences so the client can recover

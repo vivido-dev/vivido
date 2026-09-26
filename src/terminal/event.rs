@@ -31,6 +31,9 @@ pub enum Event {
     /// Shell-lifecycle marker reported with OSC 133.
     ShellIntegration(crate::osc_notification::ShellIntegrationMarker),
 
+    /// Progress state reported with OSC 9;4.
+    Progress(crate::osc_notification::ProgressReport),
+
     /// Request to store a text string in the clipboard.
     ClipboardStore(ClipboardType, String),
 
@@ -119,6 +122,7 @@ impl Debug for Event {
             Event::Title(title) => write!(f, "Title({title})"),
             Event::WorkingDirectory(path) => write!(f, "WorkingDirectory({path})"),
             Event::ShellIntegration(marker) => write!(f, "ShellIntegration({marker:?})"),
+            Event::Progress(report) => write!(f, "Progress({report:?})"),
             Event::CursorBlinkingChange => write!(f, "CursorBlinkingChange"),
             Event::MouseCursorDirty => write!(f, "MouseCursorDirty"),
             Event::ResetTitle => write!(f, "ResetTitle"),

@@ -1456,6 +1456,14 @@ impl<T> Term<T> {
         self.event_proxy.send_event(Event::ShellIntegration(marker));
     }
 
+    /// Forward an OSC 9;4 progress report to the owning window.
+    pub(crate) fn progress_report(&self, report: crate::osc_notification::ProgressReport)
+    where
+        T: EventListener,
+    {
+        self.event_proxy.send_event(Event::Progress(report));
+    }
+
     /// Forward a decoded graphics/media command to the UI renderer.
     ///
     /// Escape-sequence parsers can call this after translating Sixel, Kitty, or custom protocol

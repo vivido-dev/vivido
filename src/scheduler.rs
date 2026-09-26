@@ -32,6 +32,7 @@ pub enum Topic {
     HiddenRelease,
     VividResizeSettled,
     MessageTimeout,
+    ProgressTimeout,
     #[cfg(any(unix, windows))]
     ScreenshotReadback,
     #[cfg(any(unix, windows))]

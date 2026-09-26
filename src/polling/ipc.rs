@@ -299,6 +299,7 @@ pub const EVENT_KINDS: &[&str] = &[
     "frame_presented",
     "title_changed",
     "directory_changed",
+    "progress_changed",
     "focus_changed",
     "resized",
     "moved",

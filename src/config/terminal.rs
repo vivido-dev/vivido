@@ -10,13 +10,15 @@ pub struct Terminal {
     pub osc52: SerdeOsc52,
     /// Allow terminal applications to create desktop notifications through OSC 9/99.
     pub osc_notifications: bool,
+    /// Draw a progress bar for OSC 9;4 progress reports.
+    pub progress: bool,
     /// Path to a shell program to run on startup.
     pub shell: Option<Program>,
 }
 
 impl Default for Terminal {
     fn default() -> Self {
-        Self { osc52: Default::default(), osc_notifications: true, shell: None }
+        Self { osc52: Default::default(), osc_notifications: true, progress: true, shell: None }
     }
 }
 
@@ -33,7 +35,7 @@ impl<'de> Deserialize<'de> for SerdeOsc52 {
     }
 }
 
-impl_config_deserialize!(Terminal { osc52, osc_notifications, shell: option });
+impl_config_deserialize!(Terminal { osc52, osc_notifications, progress, shell: option });
 impl_serde_replace!(SerdeOsc52);
 
 #[cfg(test)]

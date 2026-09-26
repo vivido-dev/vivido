@@ -354,6 +354,79 @@ fn scoped_text_waits_restrict_matching() {
     assert!(!wrong_row.status.success(), "row scope matched outside its row");
 }
 
+/// Report full progress, then clear it once `trigger` exists.
+#[cfg(unix)]
+fn progress_program(trigger: &Path) -> Vec<String> {
+    vec![
+        String::from("sh"),
+        String::from("-c"),
+        format!(
+            "printf '\\033]9;4;1;100\\a'; echo PROGRESS-SET; while [ ! -e '{}' ]; do sleep 0.1; done; printf '\\033]9;4;0\\a'; echo PROGRESS-CLEARED; sleep 300",
+            trigger.display()
+        ),
+    ]
+}
+
+/// No double quotes: `-e` arguments containing them do not currently reach PowerShell intact.
+#[cfg(windows)]
+fn progress_program(trigger: &Path) -> Vec<String> {
+    vec![
+        String::from("powershell.exe"),
+        String::from("-NoLogo"),
+        String::from("-NoProfile"),
+        String::from("-NonInteractive"),
+        String::from("-Command"),
+        format!(
+            "$e=[char]27; $b=[char]7; [Console]::Write($e + ']9;4;1;100' + $b); Write-Output 'PROGRESS-SET'; while (-not (Test-Path -LiteralPath '{}')) {{ Start-Sleep -Milliseconds 100 }}; [Console]::Write($e + ']9;4;0' + $b); Write-Output 'PROGRESS-CLEARED'; Start-Sleep -Seconds 300",
+            trigger.display()
+        ),
+    ]
+}
+
+/// Whether the screenshot's top rows are a solid band unlike the terminal background.
+fn has_top_band(path: &Path) -> bool {
+    let image = image::open(path).expect("decode screenshot PNG").into_rgba8();
+    let (width, height) = image.dimensions();
+    let background = image.get_pixel(width - 1, height - 1).0;
+    // Sample away from both ends of the first row; a full bar spans the whole width.
+    [width / 4, width / 2, width * 3 / 4]
+        .into_iter()
+        .all(|x| image.get_pixel(x, 0).0[..3] != background[..3])
+}
+
+/// OSC 9;4 draws a bar in the headless renderer — the path Vivida's embedded panes render
+/// through — reports it in `inspect`, and clears it on removal.
+#[test]
+#[ignore = "spawns processes and needs a wgpu adapter"]
+fn osc_progress_draws_a_bar_and_clears_it() {
+    // The session recreates its runtime directory, so the trigger lives beside it.
+    let trigger = env::temp_dir().join(format!("vivido-it-{}-progress-clear", std::process::id()));
+    let _ = fs::remove_file(&trigger);
+    let session = Session::start("progress", &progress_program(&trigger));
+    let progress = || -> serde_json::Value {
+        let inspect: serde_json::Value =
+            serde_json::from_str(&session.msg(&["inspect"])).expect("inspect JSON");
+        inspect["progress"].clone()
+    };
+
+    session.msg(&["wait", "text", "PROGRESS-SET", "--timeout", "10s"]);
+    assert_eq!(progress(), serde_json::json!({"state": "normal", "percent": 100}));
+
+    // Let the 200 ms fill ease settle so the bar spans the full width.
+    std::thread::sleep(Duration::from_millis(400));
+    let path = PathBuf::from(session.msg(&["screenshot"]).trim());
+    assert!(has_top_band(&path), "a full progress bar crosses the top of the surface");
+    let _ = fs::remove_file(&path);
+
+    fs::write(&trigger, b"").expect("write the clear trigger");
+    session.msg(&["wait", "text", "PROGRESS-CLEARED", "--timeout", "10s"]);
+    assert_eq!(progress(), serde_json::json!({"state": "none", "percent": null}));
+    let path = PathBuf::from(session.msg(&["screenshot"]).trim());
+    assert!(!has_top_band(&path), "a removed bar is no longer drawn");
+    let _ = fs::remove_file(&path);
+    let _ = fs::remove_file(&trigger);
+}
+
 /// run-plan asserts terminal state and result shapes, and exports JUnit for CI.
 #[test]
 #[ignore = "spawns processes and needs a wgpu adapter"]

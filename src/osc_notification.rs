@@ -1,4 +1,4 @@
-//! Bounded OSC 7/9/99 parsing and desktop-notification lifecycle management.
+//! Bounded OSC 7/9/99/133 parsing and desktop-notification lifecycle management.
 
 use std::collections::{HashMap, VecDeque};
 #[cfg(target_os = "macos")]
@@ -41,6 +41,30 @@ pub(crate) enum OscMessage {
     Notification(OscNotification),
     WorkingDirectory(OscWorkingDirectory),
     ShellIntegration(ShellIntegrationMarker),
+    Progress(ProgressReport),
+}
+
+/// One ConEmu `OSC 9;4;<state>[;<percent>]` progress report.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProgressReport {
+    pub state: ProgressState,
+    /// Percent complete, clamped to `0..=100`. Absent when the report carried none.
+    pub percent: Option<u8>,
+}
+
+/// The state field of an `OSC 9;4` progress report.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProgressState {
+    /// `0`: remove the progress indicator.
+    Remove,
+    /// `1`: normal determinate progress.
+    Normal,
+    /// `2`: the operation failed.
+    Error,
+    /// `3`: busy, with no known completion.
+    Indeterminate,
+    /// `4`: the operation is paused.
+    Paused,
 }
 
 /// One FinalTerm/FTCS `OSC 133` shell-lifecycle marker.
@@ -302,6 +326,10 @@ fn parse_osc(raw: &[u8]) -> Option<OscMessage> {
         return parse_working_directory(url).map(OscMessage::WorkingDirectory);
     }
 
+    if let Some(report) = raw.strip_prefix(b"9;4;") {
+        return parse_progress(report).map(OscMessage::Progress);
+    }
+
     if let Some(message) = raw.strip_prefix(b"9;") {
         return parse_legacy(message).map(OscNotification::Legacy).map(OscMessage::Notification);
     }
@@ -315,6 +343,32 @@ fn parse_osc(raw: &[u8]) -> Option<OscMessage> {
     parse_kitty(&rest[..separator], &rest[separator + 1..])
         .map(OscNotification::Kitty)
         .map(OscMessage::Notification)
+}
+
+/// Parse one `OSC 9;4` progress report body (the bytes after `9;4;`).
+///
+/// The state is one digit. The percent is optional, decimal, and clamped to 100; a malformed one
+/// rejects the whole report rather than guessing a value. Fields past the percent are ignored,
+/// as ConEmu and Windows Terminal ignore them.
+fn parse_progress(report: &[u8]) -> Option<ProgressReport> {
+    let mut fields = report.split(|&byte| byte == b';');
+    let state = match fields.next()? {
+        b"0" => ProgressState::Remove,
+        b"1" => ProgressState::Normal,
+        b"2" => ProgressState::Error,
+        b"3" => ProgressState::Indeterminate,
+        b"4" => ProgressState::Paused,
+        _ => return None,
+    };
+    let percent = match fields.next() {
+        None | Some(b"") => None,
+        Some(digits) if digits.len() <= 10 && digits.iter().all(u8::is_ascii_digit) => {
+            let value = std::str::from_utf8(digits).ok()?.parse::<u64>().ok()?;
+            Some(value.min(100) as u8)
+        },
+        Some(_) => return None,
+    };
+    Some(ProgressReport { state, percent })
 }
 
 /// Parse one `OSC 133` shell-lifecycle marker body (the bytes after `133;`).
@@ -377,7 +431,8 @@ fn parse_legacy(message: &[u8]) -> Option<String> {
         return None;
     }
 
-    // OSC 9 has incompatible numeric subfamilies, including OSC 9;4 progress reports.
+    // OSC 9 has incompatible numeric subfamilies. `9;4` progress is parsed before this; the rest
+    // are not notifications either.
     if message.iter().position(|&byte| byte == b';').is_some_and(|separator| {
         let selector = &message[..separator];
         !selector.is_empty() && selector.iter().all(u8::is_ascii_digit)
@@ -1271,7 +1326,9 @@ mod tests {
             .into_iter()
             .filter_map(|message| match message {
                 OscMessage::Notification(notification) => Some(notification),
-                OscMessage::WorkingDirectory(_) | OscMessage::ShellIntegration(_) => None,
+                OscMessage::WorkingDirectory(_)
+                | OscMessage::ShellIntegration(_)
+                | OscMessage::Progress(_) => None,
             })
             .collect()
     }
@@ -1351,6 +1408,74 @@ mod tests {
     #[test]
     fn ignores_numeric_osc9_families() {
         assert!(parse(b"\x1b]9;4;1;50\x1b\\").is_empty());
+        assert!(parse(b"\x1b]9;1;500\x1b\\").is_empty());
+    }
+
+    fn parse_progress_reports(bytes: &[u8]) -> Vec<ProgressReport> {
+        parse_messages(bytes)
+            .into_iter()
+            .filter_map(|message| match message {
+                OscMessage::Progress(report) => Some(report),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn progress_reports_parse_every_state_with_both_terminators() {
+        let report = |state, percent| ProgressReport { state, percent };
+        assert_eq!(
+            parse_progress_reports(
+                b"\x1b]9;4;1;42\x07\x1b]9;4;3\x1b\\\x1b]9;4;2;\x07\x1b]9;4;4;7\x07\x1b]9;4;0\x07"
+            ),
+            [
+                report(ProgressState::Normal, Some(42)),
+                report(ProgressState::Indeterminate, None),
+                report(ProgressState::Error, None),
+                report(ProgressState::Paused, Some(7)),
+                report(ProgressState::Remove, None),
+            ]
+        );
+    }
+
+    #[test]
+    fn progress_percent_clamps_and_trailing_fields_are_ignored() {
+        assert_eq!(
+            parse_progress_reports(b"\x1b]9;4;1;250;extra\x07\x1b]9;4;1;99999999999\x07"),
+            [ProgressReport { state: ProgressState::Normal, percent: Some(100) }],
+            "an over-long percent is malformed, not clamped"
+        );
+    }
+
+    #[test]
+    fn malformed_progress_reports_are_dropped() {
+        for bytes in [
+            b"\x1b]9;4;5;10\x07".as_slice(),
+            b"\x1b]9;4;;10\x07",
+            b"\x1b]9;4;1;-3\x07",
+            b"\x1b]9;4;1;4x\x07",
+            b"\x1b]9;4;01\x07",
+        ] {
+            let messages = parse_messages(bytes);
+            assert!(messages.is_empty(), "{bytes:?} produced {messages:?}");
+        }
+    }
+
+    #[test]
+    fn progress_report_survives_every_byte_boundary() {
+        let bytes = b"\x1b]9;4;1;64\x1b\\";
+        let mut parser = OscNotificationParser::default();
+        let messages = bytes
+            .iter()
+            .flat_map(|byte| parser.advance(std::slice::from_ref(byte)))
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            messages.as_slice(),
+            [OscMessage::Progress(ProgressReport {
+                state: ProgressState::Normal,
+                percent: Some(64)
+            })]
+        ));
     }
 
     #[test]

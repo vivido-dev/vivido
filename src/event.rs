@@ -4397,6 +4397,30 @@ impl Processor {
                     );
                 }
             },
+            (EventType::Terminal(TerminalEvent::Progress(report)), Some(window_id)) => {
+                if let Some(window) = self.windows.get_mut(window_id)
+                    && window.apply_progress(report, &mut self.scheduler)
+                {
+                    #[cfg(any(unix, windows))]
+                    self.automation.emit(
+                        Some(window.ipc_window_id()),
+                        "progress_changed",
+                        window.display.progress.automation_json(),
+                    );
+                }
+            },
+            (EventType::ProgressTimeout, Some(window_id)) => {
+                if let Some(window) = self.windows.get_mut(window_id)
+                    && window.expire_progress(&mut self.scheduler)
+                {
+                    #[cfg(any(unix, windows))]
+                    self.automation.emit(
+                        Some(window.ipc_window_id()),
+                        "progress_changed",
+                        window.display.progress.automation_json(),
+                    );
+                }
+            },
             (
                 EventType::Terminal(TerminalEvent::DesktopNotification(notification)),
                 Some(window_id),
@@ -5058,6 +5082,8 @@ pub enum EventType {
     VividResizeSettled(u64),
     /// Dismiss the warning that was visible when this timer was scheduled.
     MessageTimeout(Message),
+    /// The window's last OSC 9;4 progress report may have gone stale.
+    ProgressTimeout,
     /// A remote receiver committed a dropped file; type its committed path into the PTY.
     ///
     /// This deliberately has no outer-`Processor` arm: the catch-all forwards it into
@@ -6217,6 +6243,8 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                     // Shell markers fold into per-window automation state; the IPC
                     // processor already applied the marker before dropping the event.
                     TerminalEvent::ShellIntegration(_) => (),
+                    // Progress is applied by the processor, which also announces it.
+                    TerminalEvent::Progress(_) => (),
                     TerminalEvent::Bell => {
                         // Set window urgency hint when window is not focused.
                         let focused = self.ctx.terminal.is_focused;
@@ -6313,6 +6341,7 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                 EventType::Message(_)
                 | EventType::Update(_)
                 | EventType::MessageTimeout(_)
+                | EventType::ProgressTimeout
                 | EventType::ConfigReload(_)
                 | EventType::CreateWindow(_)
                 | EventType::NotificationActivated

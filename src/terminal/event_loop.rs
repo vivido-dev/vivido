@@ -635,6 +635,9 @@ impl State {
                 OscMessage::ShellIntegration(marker) => {
                     terminal.shell_integration_report(marker);
                 },
+                OscMessage::Progress(report) => {
+                    terminal.progress_report(report);
+                },
             }
         }
 

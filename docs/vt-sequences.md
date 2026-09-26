@@ -24,7 +24,8 @@ is therefore decided in three places:
    sequence does. `vte`'s `Handler` trait gives every method an empty default, so a method
    Vivido does not override is a parse-only no-op.
 3. **Pre-parser scanners** (`src/terminal/event_loop.rs`, `src/osc_notification.rs`) — intercept
-   OSC 7 working-directory reports, OSC 9/99 desktop notifications, DCS queries, and Vivid media
+   OSC 7 working-directory reports, OSC 9/99 desktop notifications, OSC 9;4 progress, DCS
+   queries, and Vivid media
    anchors before `vte` sees them.
 
 ## Client compatibility and recovery
@@ -199,8 +200,8 @@ not fit at end-of-line get a leading spacer cell when DECAWM is on.
 | Special colors | 5 | ❌ | |
 | Current working directory | 7 | ✅ | Bounded (8 KiB) pre-parser. `file://` URLs only, percent-decoded; reports whose host is empty, `localhost`, or this machine update the shell working directory (new-window cwd, IPC `inspect`, `directory_changed` events); foreign hosts (vvssh/ssh) are ignored. |
 | Hyperlinks | 8 | ✅ | `id=` parameter honored; stored per cell; opened through hints. |
-| Desktop notification | 9 | ✅ | Bounded (8 KiB) pre-parser; macOS/Windows notification workers; rate-limited. Gated by `terminal.osc_notifications` (default on). Numeric subfamilies are rejected. |
-| Progress state | 9;4 | ❌ | Explicitly ignored. |
+| Desktop notification | 9 | ✅ | Bounded (8 KiB) pre-parser; macOS/Windows notification workers; rate-limited. Gated by `terminal.osc_notifications` (default on). Numeric subfamilies (including `9;4` progress) are never notifications. |
+| Progress state | 9;4 | ✅ | ConEmu states 0–4 with an optional percent (clamped to 100), drawn as a bar along the top edge and cleared after 15 s without a report. Gated by `terminal.progress` (default on). Reported by IPC `inspect` and `progress_changed`. |
 | Kitty notifications | 99 | ✅ | Payload assembly, `a=`, `f=`, `o=`, `u=`, `s=`, `i=`/`d=` (close, focus, query) subsets, bounded and rate-limited. |
 | FG / BG / cursor color | 10, 11, 12 | ✅ | Set and `?` query; multiple colors per sequence accepted up to index 12. |
 | Pointer / Tek / highlight colors | 13–19 | ❌ | |
