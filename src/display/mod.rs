@@ -448,6 +448,8 @@ impl Display {
 
     /// Build the renderer for an initially hidden `window`.
     pub fn new(window: Window, config: &UiConfig) -> Result<Display, Error> {
+        #[cfg(target_os = "macos")]
+        let mut window = window;
         let scale_factor = window.scale_factor as f32;
         let font_size = config.font.size().scale(scale_factor);
         let font = config.font.clone().with_size(font_size);
@@ -466,12 +468,29 @@ impl Display {
             window.request_inner_size(viewport_size);
         }
 
-        let scene_renderer = SceneRenderer::new(
+        let mut scene_renderer = SceneRenderer::new(
             window.render_source(),
             viewport_size,
             config.window_opacity() < 1.0,
         )?;
         let viewport_size = scene_renderer.clamp_render_size(viewport_size);
+        // Seed native and embedded panes before mapping them. Waiting for a redraw exposes
+        // an empty transparent surface while the PTY and host topology are being initialized.
+        let background = config.colors.primary.background;
+        #[cfg(target_os = "macos")]
+        window.set_titlebar_appearance(background, config.window_opacity(), config.window.theme());
+        window.pre_present_notify();
+        if scene_renderer.render(
+            &Scene::new(),
+            Color::from_rgba8(
+                background.r,
+                background.g,
+                background.b,
+                (config.window_opacity() * 255.) as u8,
+            ),
+        )? {
+            window.did_present();
+        }
         let size_info = scaled_size_info(
             viewport_size,
             metrics.cell_width,
@@ -537,6 +556,10 @@ impl Display {
 
     /// Map the window after platform accessibility has been attached.
     pub fn map_window(&self, config: &UiConfig, tabbed: bool, no_activate: bool) {
+        // The layout owner reveals native panes after placing them in their final rectangles.
+        if self.window.is_hosted() {
+            return;
+        }
         #[cfg(windows)]
         let _ = (config, tabbed);
 
@@ -748,6 +771,9 @@ impl Display {
                     false
                 },
             };
+            if presented {
+                self.window.did_present();
+            }
             self.vivid_frame_requested = false;
             self.request_frame(scheduler);
             self.damage_tracker.swap_damage();
@@ -1024,6 +1050,9 @@ impl Display {
                 (false, false)
             },
         };
+        if presented {
+            self.window.did_present();
+        }
 
         if cacheable {
             self.cached_scene = Some(scene);
@@ -2274,6 +2303,55 @@ mod tests {
     use crate::terminal::term::cell::Flags;
     use winit::dpi::PhysicalSize;
     use winit::window::CursorIcon;
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn a_new_display_has_the_configured_background_before_terminal_output() {
+        let _gpu = super::renderer::gpu_test_lock();
+        for (opacity, expected) in [("1.0", [200, 100, 50, 255]), ("0.5", [200, 100, 50, 127])] {
+            let config: crate::config::UiConfig = toml::from_str(&format!(
+                "[window]\nopacity = {opacity}\n[colors.primary]\nbackground = '#c86432'\n"
+            ))
+            .unwrap();
+            let window = super::Window::headless(
+                &config,
+                &config.window.identity,
+                &crate::cli::WindowOptions::default(),
+                PhysicalSize::new(32, 32),
+                1.,
+            );
+            let display = match super::Display::new(window, &config) {
+                Ok(display) => display,
+                Err(super::Error::Render(super::renderer::Error::NoOffscreenAdapter(error))) => {
+                    eprintln!("Skipping initial background test: {error}");
+                    return;
+                },
+                Err(error) => panic!("initial display: {error}"),
+            };
+            let readback = display.begin_screenshot().expect("initial background frame");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let pixels = loop {
+                if let Some(pixels) = display.poll_screenshot(&readback).unwrap() {
+                    break pixels;
+                }
+                assert!(std::time::Instant::now() < deadline, "GPU readback timed out");
+                std::thread::yield_now();
+            };
+            for y in 0..pixels.height as usize {
+                for x in 0..pixels.width as usize {
+                    let offset = y * pixels.padded_bytes_per_row as usize + x * 4;
+                    let pixel = &pixels.bytes[offset..offset + 4];
+                    assert_eq!(pixel[3], expected[3]);
+                    // Premultiplying into an 8-bit render target and unpremultiplying for
+                    // capture can round a translucent RGB channel by one.
+                    let tolerance = u8::from(expected[3] < 255);
+                    for channel in 0..3 {
+                        assert!(pixel[channel].abs_diff(expected[channel]) <= tolerance);
+                    }
+                }
+            }
+        }
+    }
 
     fn renderable_cell(line: usize, column: usize, character: char) -> RenderableCell {
         RenderableCell {

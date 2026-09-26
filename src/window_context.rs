@@ -656,7 +656,9 @@ impl WindowContext {
             occluded: Default::default(),
             mouse: Default::default(),
             touch: Default::default(),
-            dirty: Default::default(),
+            // The startup background is only a placeholder; the first real frame must still
+            // draw terminal state, including the cursor, even before any PTY output arrives.
+            dirty: true,
             vivid_service,
             vivid_target,
             restart_pty_config,

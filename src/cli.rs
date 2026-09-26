@@ -872,6 +872,7 @@ impl ParentWindowHandle {
         Self(handle)
     }
 
+    #[cfg(windows)]
     pub(crate) fn raw(self) -> RawWindowHandle {
         self.0
     }

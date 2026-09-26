@@ -225,6 +225,8 @@ pub struct Window {
     tab_shortcut: Option<u8>,
     #[cfg(target_os = "macos")]
     titlebar: Titlebar,
+    #[cfg(target_os = "macos")]
+    initial_background: Cell<bool>,
 }
 
 /// Vivido's paint job for the native macOS title bar.
@@ -308,7 +310,9 @@ impl Window {
             window_attributes = window_attributes.with_active(false);
         }
 
-        #[cfg(any(target_os = "macos", windows))]
+        // AppKit can order a child with its visible parent even with `visible = false`.
+        // The macOS pane host attaches it only after initialization and placement.
+        #[cfg(windows)]
         if let Some(parent) = options.parent_window {
             // SAFETY: `ParentWindowHandle::new` requires the caller to keep the parent alive until
             // after its children. Window creation and all subsequent access happen on this active
@@ -334,7 +338,7 @@ impl Window {
 
         let scale_factor = window.scale_factor();
         log::info!("Window scale factor: {scale_factor}");
-        Ok(Self {
+        let result = Self {
             hold: options.terminal_options.hold,
             requested_redraw: false,
             title: identity.title,
@@ -354,7 +358,23 @@ impl Window {
             tab_shortcut: None,
             #[cfg(target_os = "macos")]
             titlebar: Default::default(),
-        })
+            #[cfg(target_os = "macos")]
+            initial_background: Cell::new(true),
+        };
+        #[cfg(target_os = "macos")]
+        if let Some(window) = result.ns_window() {
+            // Native tabs may be ordered before the renderer is ready. Match the terminal's
+            // configured fill until its first frame, rather than exposing an empty clear view.
+            let background = config.colors.primary.background;
+            let fill = NSColor::colorWithSRGBRed_green_blue_alpha(
+                f64::from(background.r) / 255.,
+                f64::from(background.g) / 255.,
+                f64::from(background.b) / 255.,
+                f64::from(config.window_opacity()),
+            );
+            window.setBackgroundColor(Some(&fill));
+        }
+        Ok(result)
     }
 
     /// Create a window with no windowing system behind it.
@@ -392,6 +412,8 @@ impl Window {
             tab_shortcut: None,
             #[cfg(target_os = "macos")]
             titlebar: Default::default(),
+            #[cfg(target_os = "macos")]
+            initial_background: Cell::new(false),
         }
     }
 
@@ -426,6 +448,8 @@ impl Window {
             tab_shortcut: None,
             #[cfg(target_os = "macos")]
             titlebar: Default::default(),
+            #[cfg(target_os = "macos")]
+            initial_background: Cell::new(false),
         }
     }
 
@@ -808,6 +832,17 @@ impl Window {
     pub fn pre_present_notify(&self) {
         if let Some(window) = self.backend.winit() {
             window.pre_present_notify();
+        }
+    }
+
+    /// Retire the startup fill only after a frame has actually reached the surface.
+    pub fn did_present(&self) {
+        #[cfg(target_os = "macos")]
+        if self.initial_background.replace(false)
+            && let Some(window) = self.ns_window()
+        {
+            // A native fill behind a translucent GPU frame would apply opacity twice.
+            window.setBackgroundColor(Some(&NSColor::clearColor()));
         }
     }
 

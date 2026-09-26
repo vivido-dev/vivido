@@ -11,7 +11,7 @@ fn main() {
     use vivido::ParentWindowHandle;
     use vivido::cli::WindowOptions;
     use vivido::config::{UiConfig, window::Decorations};
-    use vivido::display::window::Window;
+    use vivido::display::{color::Rgb, window::Window};
     use winit::application::ApplicationHandler;
     use winit::dpi::{PhysicalPosition, PhysicalSize};
     use winit::event::WindowEvent;
@@ -53,8 +53,15 @@ fn main() {
             let cover_native = native(cover.window_handle().unwrap().as_raw());
             let mut config = UiConfig::default();
             config.window.decorations = Decorations::None;
+            config.colors.primary.background = Rgb::new(30, 60, 90);
+            host_native.orderFrontRegardless();
             let mut panes = Vec::new();
-            for _ in 0..2 {
+            for opacity in [1., 0.5] {
+                config.window.opacity =
+                    toml::from_str::<UiConfig>(&format!("[window]\nopacity = {opacity}\n"))
+                        .unwrap()
+                        .window
+                        .opacity;
                 let mut options = WindowOptions::default();
                 // SAFETY: host outlives both panes; all calls run on the event-loop thread.
                 options.parent_window = Some(unsafe {
@@ -63,6 +70,18 @@ fn main() {
                 options.no_activate = true;
                 let pane = Window::new(event_loop, &config, &config.window.identity, &mut options)
                     .unwrap();
+                let pane_native = native(pane.raw_window_handle().unwrap());
+                assert!(pane.is_hosted());
+                assert!(pane_native.parentWindow().is_none(), "new pane attached before placement");
+                assert!(!pane_native.isVisible(), "new pane mapped before its first frame");
+                let fill = pane_native.backgroundColor();
+                assert!((fill.redComponent() - 30. / 255.).abs() < 0.001);
+                assert!((fill.greenComponent() - 60. / 255.).abs() < 0.001);
+                assert!((fill.blueComponent() - 90. / 255.).abs() < 0.001);
+                assert_eq!(fill.alphaComponent(), opacity);
+                // Simulate a successful presentation: the GPU now owns the background.
+                pane.did_present();
+                assert_eq!(pane_native.backgroundColor().alphaComponent(), 0.);
                 pane.set_resizable(false);
                 host_native.removeChildWindow(&native(pane.raw_window_handle().unwrap()));
                 pane.set_visible(false);
