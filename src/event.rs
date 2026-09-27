@@ -4021,6 +4021,7 @@ impl Processor {
     /// Ring the bell exactly as a `\x07` would: automation hears it, and the window flashes,
     /// hints urgency, and runs `bell.command`.
     #[cfg(any(unix, windows))]
+    #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
     fn ring_bell(&mut self, event_loop: LoopHandle<'_>, window_id: WindowId) {
         self.automation.emit(
             self.windows.get(&window_id).map(WindowContext::ipc_window_id),

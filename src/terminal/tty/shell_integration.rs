@@ -10,7 +10,7 @@
 
 use std::fs;
 use std::io;
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use tempfile::TempDir;
@@ -63,7 +63,12 @@ pub struct Injection {
 
 /// Write the scripts to a new private directory, which lives as long as the returned value.
 pub fn provision() -> io::Result<TempDir> {
-    let directory = tempfile::Builder::new().prefix("vivido-shell-").tempdir()?;
+    // Owner-only regardless of the umask, which tempfile would otherwise apply; the scripts
+    // inside are then out of everyone else's reach whatever their own modes.
+    let directory = tempfile::Builder::new()
+        .prefix("vivido-shell-")
+        .permissions(fs::Permissions::from_mode(0o700))
+        .tempdir()?;
     for (path, contents) in FILES {
         let path = directory.path().join(path);
         if let Some(parent) = path.parent() {
@@ -268,7 +273,6 @@ mod tests {
     use super::*;
 
     use std::collections::HashMap;
-    use std::os::unix::fs::PermissionsExt;
 
     fn strings(args: &[&str]) -> Vec<String> {
         args.iter().map(|arg| (*arg).to_owned()).collect()
