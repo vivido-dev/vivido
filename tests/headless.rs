@@ -138,7 +138,9 @@ fn base_command(runtime: &Path) -> Command {
         .env_remove("WAYLAND_DISPLAY")
         .env_remove("DISPLAY")
         .env_remove("VIVIDO_SOCKET")
-        .env_remove("VIVIDO_SESSION");
+        .env_remove("VIVIDO_SESSION")
+        // Every omitted `--window-id` falls back to it, and it is set inside a Vivido window.
+        .env_remove("VIVIDO_WINDOW_ID");
     command
 }
 
