@@ -1,4 +1,6 @@
 //! Opt-in release throughput measurements. Set VIVIDO_BENCH_WORKLOAD and VIVIDO_BENCH_LAYER to select a workload and layer.
+//! Unoptimized builds default to a single 1 MiB sample: their throughput means nothing, so they
+//! only smoke-test the harness instead of spending minutes on it.
 
 use std::hint::black_box;
 
@@ -70,15 +72,17 @@ fn parser_throughput() {
         None => workload(&name),
     };
     assert!(!data.is_empty());
-    let repetitions =
-        (number("VIVIDO_BENCH_MIB", 64).checked_mul(1024 * 1024).unwrap() / data.len()).max(1);
+    let (default_mib, default_samples) = if cfg!(debug_assertions) { (1, 1) } else { (64, 7) };
+    let repetitions = (number("VIVIDO_BENCH_MIB", default_mib).checked_mul(1024 * 1024).unwrap()
+        / data.len())
+    .max(1);
     let columns = number("VIVIDO_BENCH_COLUMNS", 80);
     let lines = number("VIVIDO_BENCH_LINES", 24);
     assert!(columns >= 2 && lines > 0);
     let size = TermSize::new(columns, lines);
     let chunk_size = number("VIVIDO_BENCH_CHUNK", MAX_LOCKED_READ);
     assert!(chunk_size > 0);
-    let samples_count = number("VIVIDO_BENCH_SAMPLES", 7);
+    let samples_count = number("VIVIDO_BENCH_SAMPLES", default_samples);
     assert!(samples_count > 0 && samples_count % 2 == 1);
     let sync = number("VIVIDO_BENCH_SYNC", 0) != 0;
     let layer_filter = std::env::var("VIVIDO_BENCH_LAYER").ok();
