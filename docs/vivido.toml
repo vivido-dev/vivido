@@ -290,6 +290,16 @@ paste_protection = true
 # Allow terminal applications to create desktop notifications through OSC 9 and OSC 99.
 osc_notifications = true
 
+# Signal when a slow shell command finishes (requires a shell emitting OSC 133 markers).
+# Never | Unfocused | Always
+notify_on_command_finish = "Never"
+
+# How the finish signals: the normal bell path, a desktop notification, or both.
+notify_on_command_finish_action = { bell = true, notify = false }
+
+# How long a command must run, in seconds, before its finish signals.
+notify_on_command_finish_after = 5
+
 # Shell to launch instead of the login shell.
 # shell = { program = "/usr/bin/fish", args = ["--login"] }
 

@@ -338,6 +338,9 @@ blinking = "Off"
 | `paste_protection` | bool | `true` | Ask before pasting text with line breaks or control characters into a program that has not enabled bracketed paste. |
 | `osc_notifications` | bool | `true` | Allow OSC 9 and OSC 99 desktop notifications. |
 | `progress` | bool | `true` | Show OSC 9;4 progress and activity reported by spinner titles. |
+| `notify_on_command_finish` | enum | `Never` | Signal when a slow shell command finishes: `Never`, `Unfocused`, or `Always`. |
+| `notify_on_command_finish_action` | `{ bell, notify }` | `{ bell = true, notify = false }` | How the finish signals: the normal bell, a desktop notification, or both. A missing key keeps its default. |
+| `notify_on_command_finish_after` | integer (s) | `5` | How long a command must run before its finish signals. |
 | `shell` | string or `{ program, args }` | *system* | Shell to launch instead of the login shell. |
 
 ```toml
@@ -346,6 +349,9 @@ osc52 = { read = "ask", write = "allow" }
 paste_protection = true
 osc_notifications = true
 progress = true
+notify_on_command_finish = "Unfocused"
+notify_on_command_finish_action = { bell = true, notify = true }
+notify_on_command_finish_after = 5
 shell = { program = "/usr/bin/fish", args = ["--login"] }
 ```
 
@@ -354,6 +360,15 @@ shell = { program = "/usr/bin/fish", args = ["--login"] }
 allowed by default because that is how editors copy over SSH; reading it asks because the clipboard
 can hold a password. The older single-word values still work: `disabled`, `onlycopy`, `onlypaste`,
 and `copypaste` mean `deny` or `allow` for each direction.
+
+A finished command signals only when its runtime *exceeds* `notify_on_command_finish_after`, and
+only when the shell emits OSC 133 integration markers — the runtime runs from the command-start
+marker to the finish marker, and a finish without a start never signals. The `bell` channel rings
+exactly as `\x07` would (visual flash per [`bell`](#bell), urgency hint, `bell.command`, and a
+`bell` automation event); the `notify` channel shows a desktop notification — "Command
+Succeeded/Failed" with the runtime and exit code — which answers your own configuration rather
+than a program request, so it works even with `osc_notifications = false`. Clicking it focuses
+the terminal. See [command-finish notifications](features.md#command-finish-notifications).
 
 ## `file_drop`
 

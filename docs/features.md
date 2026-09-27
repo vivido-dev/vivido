@@ -75,6 +75,21 @@ shell integration reports the shell at its prompt. IPC `inspect` reports the sam
 `running_program`. Automation closes (`close-window`, `close-pane`, and the like) never ask. Linux
 has no native dialog under Wayland, so there closes still happen without asking.
 
+## Command-finish notifications
+
+A command that runs longer than `terminal.notify_on_command_finish_after` (5 seconds) can announce
+its finish when you are looking elsewhere. Set `terminal.notify_on_command_finish` to `Unfocused`
+or `Always`, and choose the channel with `terminal.notify_on_command_finish_action`: the normal
+bell, a desktop notification, or both. The notification names the outcome — "Command Succeeded",
+"Command Failed" — with the runtime and exit code, and clicking it focuses the terminal.
+
+This needs a shell that emits OSC 133 integration markers, since the runtime runs from the
+command-start marker to the finish marker. A finish without a start never signals, and neither
+does a command that finishes within the threshold. The bell channel is the ordinary bell, so
+`bell.command` still runs and automation still hears a `bell` event; the notification channel is
+your own configuration rather than a program request, so it works even with
+`terminal.osc_notifications = false`.
+
 ## Hints
 
 Regex hints remain available for opening links and launching configured commands. Hints are

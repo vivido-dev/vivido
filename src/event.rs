@@ -4018,6 +4018,55 @@ impl Processor {
         }
     }
 
+    /// Ring the bell exactly as a `\x07` would: automation hears it, and the window flashes,
+    /// hints urgency, and runs `bell.command`.
+    #[cfg(any(unix, windows))]
+    fn ring_bell(&mut self, event_loop: LoopHandle<'_>, window_id: WindowId) {
+        self.automation.emit(
+            self.windows.get(&window_id).map(WindowContext::ipc_window_id),
+            "bell",
+            serde_json::json!({}),
+        );
+        if let Some(window_context) = self.windows.get_mut(&window_id) {
+            window_context.handle_event(
+                #[cfg(target_os = "macos")]
+                event_loop.winit(),
+                &self.proxy,
+                &mut self.clipboard,
+                &mut self.scheduler,
+                WinitEvent::UserEvent(Event::new(
+                    EventType::Terminal(TerminalEvent::Bell),
+                    window_id,
+                )),
+            );
+        }
+    }
+
+    /// Signal one finished shell command through the configured bell/notification channels.
+    ///
+    /// The config decides from the window focus and the measured runtime; a finish without a
+    /// measured start never signals.
+    #[cfg(any(unix, windows))]
+    fn signal_command_finished(
+        &mut self,
+        event_loop: LoopHandle<'_>,
+        window_id: WindowId,
+        finished: crate::automation::CommandFinished,
+    ) {
+        let Some(window) = self.windows.get(&window_id) else { return };
+        let actions =
+            window.config().terminal.command_finish_actions(window.is_focused(), finished.duration);
+        if actions.bell {
+            self.ring_bell(event_loop, window_id);
+        }
+        if actions.notify
+            && let Some(duration) = finished.duration
+            && let Some(window) = self.windows.get_mut(&window_id)
+        {
+            window.notify_command_finished(finished.exit_code, duration);
+        }
+    }
+
     /// Mirror OSC 9;4 progress onto the taskbar buttons and the Dock tile.
     ///
     /// Runs once per loop turn and touches the platform only when a state changed, which also
@@ -4476,31 +4525,18 @@ impl Processor {
             },
             #[cfg(any(unix, windows))]
             (EventType::Terminal(TerminalEvent::ShellIntegration(marker)), Some(window_id)) => {
-                if let Some(window) = self.windows.get_mut(window_id) {
-                    window.automation.shell.apply(marker);
+                let finished = self
+                    .windows
+                    .get_mut(window_id)
+                    .and_then(|window| window.automation.shell.apply(marker, Instant::now()));
+                if let Some(finished) = finished {
+                    self.signal_command_finished(event_loop, *window_id, finished);
                 }
                 self.evaluate_waiters(*window_id);
             },
             #[cfg(any(unix, windows))]
             (EventType::Terminal(TerminalEvent::Bell), Some(window_id)) => {
-                self.automation.emit(
-                    self.windows.get(window_id).map(WindowContext::ipc_window_id),
-                    "bell",
-                    serde_json::json!({}),
-                );
-                if let Some(window_context) = self.windows.get_mut(window_id) {
-                    window_context.handle_event(
-                        #[cfg(target_os = "macos")]
-                        event_loop.winit(),
-                        &self.proxy,
-                        &mut self.clipboard,
-                        &mut self.scheduler,
-                        WinitEvent::UserEvent(Event::new(
-                            EventType::Terminal(TerminalEvent::Bell),
-                            *window_id,
-                        )),
-                    );
-                }
+                self.ring_bell(event_loop, *window_id);
             },
             (EventType::Terminal(TerminalEvent::Progress(report)), Some(window_id)) => {
                 if let Some(window) = self.windows.get_mut(window_id)

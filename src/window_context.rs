@@ -2167,6 +2167,12 @@ impl WindowContext {
         self.notifications.handle(notification, state, &self.notifier);
     }
 
+    /// Announce one finished long command with a desktop notification of Vivido's own composing.
+    pub(crate) fn notify_command_finished(&mut self, exit_code: Option<i32>, duration: Duration) {
+        let (title, body) = crate::osc_notification::command_finished_text(exit_code, duration);
+        self.notifications.notify_local(title, body);
+    }
+
     /// Fold an OSC 9;4 progress report into the progress bar, returning whether it changed.
     ///
     /// Every report re-arms the staleness timer, including repeats that change nothing visible.

@@ -727,6 +727,26 @@ impl NotificationController {
         self.enabled = enabled;
     }
 
+    /// Show a notification Vivido itself composed, such as a finished long command.
+    ///
+    /// Unlike program requests this answers the user's own configuration, so it does not consult
+    /// the OSC allow-switch; it still shares the rate limiter, and clicking it focuses the window
+    /// where the backend supports it.
+    pub(crate) fn notify_local(&mut self, title: String, body: String) {
+        if !self.limiter.take() {
+            return;
+        }
+        self.worker.display(DesktopNotification {
+            id: None,
+            title,
+            body,
+            focus: self.can_focus,
+            urgency: Urgency::Normal,
+            expiry: Expiry::Default,
+            sound: Sound::System,
+        });
+    }
+
     pub(crate) fn handle<N: Notify>(
         &mut self,
         notification: OscNotification,
@@ -849,6 +869,48 @@ fn occasion_matches(occasion: Occasion, state: WindowNotificationState) -> bool 
             !state.focused && (state.headless || !state.visible || state.occluded)
         },
     }
+}
+
+/// Title and body announcing one finished long command.
+pub(crate) fn command_finished_text(
+    exit_code: Option<i32>,
+    duration: Duration,
+) -> (String, String) {
+    let title = match exit_code {
+        None => "Command Finished",
+        Some(0) => "Command Succeeded",
+        Some(_) => "Command Failed",
+    }
+    .to_owned();
+    let runtime = format_command_duration(duration);
+    let body = match exit_code {
+        None => format!("Command took {runtime}."),
+        Some(code) => format!("Command took {runtime} and exited with code {code}."),
+    };
+    (title, body)
+}
+
+/// Compact runtime for a finished command: `900ms`, `7s`, `3m 4s`, `2h 5m`.
+fn format_command_duration(duration: Duration) -> String {
+    let secs = duration.as_secs();
+    if secs < 1 {
+        return format!("{}ms", duration.as_millis());
+    }
+    if secs < 60 {
+        return format!("{secs}s");
+    }
+    let minutes = secs / 60;
+    if minutes < 60 {
+        let remainder = secs % 60;
+        return if remainder == 0 {
+            format!("{minutes}m")
+        } else {
+            format!("{minutes}m {remainder}s")
+        };
+    }
+    let hours = minutes / 60;
+    let remainder = minutes % 60;
+    if remainder == 0 { format!("{hours}h") } else { format!("{hours}h {remainder}m") }
 }
 
 struct RateLimiter {
@@ -1869,5 +1931,66 @@ mod tests {
             Some(Instant::now() - ASSEMBLY_TIMEOUT - Duration::from_secs(1));
         controller.expire_pending();
         assert!(!controller.pending.contains_key("old"));
+    }
+
+    #[test]
+    fn local_notifications_ignore_the_osc_switch_but_keep_the_limiter() {
+        let (mut controller, state) = controller();
+        controller.set_enabled(false);
+
+        controller.notify_local("done".into(), "a command finished".into());
+
+        {
+            let state = state.lock().unwrap();
+            assert_eq!(state.displayed.len(), 1);
+            assert_eq!(state.displayed[0].title, "done");
+            assert_eq!(state.displayed[0].body, "a command finished");
+            assert!(state.displayed[0].focus);
+            assert!(matches!(state.displayed[0].urgency, Urgency::Normal));
+        }
+
+        for _ in 0..10 {
+            controller.notify_local("done".into(), "a command finished".into());
+        }
+        assert!(state.lock().unwrap().displayed.len() <= RATE_BURST as usize + 1);
+    }
+
+    #[test]
+    fn finished_command_text_names_exit_code_and_runtime() {
+        assert_eq!(
+            command_finished_text(Some(0), Duration::from_secs(7)),
+            (
+                String::from("Command Succeeded"),
+                String::from("Command took 7s and exited with code 0.")
+            )
+        );
+        assert_eq!(
+            command_finished_text(Some(2), Duration::from_secs(184)),
+            (
+                String::from("Command Failed"),
+                String::from("Command took 3m 4s and exited with code 2.")
+            )
+        );
+        assert_eq!(
+            command_finished_text(None, Duration::from_millis(900)),
+            (String::from("Command Finished"), String::from("Command took 900ms."))
+        );
+    }
+
+    #[test]
+    fn command_durations_format_compactly() {
+        for (duration, expected) in [
+            (Duration::from_millis(0), "0ms"),
+            (Duration::from_millis(999), "999ms"),
+            (Duration::from_secs(1), "1s"),
+            (Duration::from_secs(59), "59s"),
+            (Duration::from_secs(60), "1m"),
+            (Duration::from_secs(61), "1m 1s"),
+            (Duration::from_secs(3599), "59m 59s"),
+            (Duration::from_secs(3600), "1h"),
+            (Duration::from_secs(7500), "2h 5m"),
+        ] {
+            assert_eq!(format_command_duration(duration), expected);
+        }
     }
 }

@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use serde::{Deserialize, Deserializer, Serialize, de};
 use toml::Value;
 
@@ -14,6 +16,13 @@ pub struct Terminal {
     pub osc_notifications: bool,
     /// Draw a progress bar for OSC 9;4 reports and activity reported by spinner titles.
     pub progress: bool,
+    /// When a shell command running longer than [`Terminal::notify_on_command_finish_after`]
+    /// finishes, signal it.
+    pub notify_on_command_finish: NotifyOnCommandFinish,
+    /// How a finished long command signals: the normal bell path, a desktop notification, or both.
+    pub notify_on_command_finish_action: NotifyOnCommandFinishAction,
+    /// How long a command must run before its finish signals, in seconds.
+    notify_on_command_finish_after: u64,
     /// Path to a shell program to run on startup.
     pub shell: Option<Program>,
 }
@@ -25,8 +34,68 @@ impl Default for Terminal {
             paste_protection: true,
             osc_notifications: true,
             progress: true,
+            notify_on_command_finish: Default::default(),
+            notify_on_command_finish_action: Default::default(),
+            notify_on_command_finish_after: 5,
             shell: None,
         }
+    }
+}
+
+impl Terminal {
+    /// How long a command must run before its finish signals.
+    pub fn notify_on_command_finish_after(&self) -> Duration {
+        Duration::from_secs(self.notify_on_command_finish_after)
+    }
+
+    /// Which signals a finished command emits, given the window focus and the measured runtime.
+    ///
+    /// A command with no measured start — the shell emitted `D` without `B`/`C` — never signals,
+    /// as there is no runtime to compare against the threshold.
+    pub fn command_finish_actions(
+        &self,
+        focused: bool,
+        duration: Option<Duration>,
+    ) -> NotifyOnCommandFinishAction {
+        let eligible = match self.notify_on_command_finish {
+            NotifyOnCommandFinish::Never => false,
+            NotifyOnCommandFinish::Unfocused => !focused,
+            NotifyOnCommandFinish::Always => true,
+        };
+        let slow_enough =
+            duration.is_some_and(|elapsed| elapsed > self.notify_on_command_finish_after());
+        if eligible && slow_enough {
+            self.notify_on_command_finish_action
+        } else {
+            NotifyOnCommandFinishAction { bell: false, notify: false }
+        }
+    }
+}
+
+/// When a finished long command signals its completion.
+#[derive(Serialize, Default, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NotifyOnCommandFinish {
+    /// Never signal.
+    #[default]
+    Never,
+    /// Signal only when the window is not focused.
+    Unfocused,
+    /// Signal even when the window is focused.
+    Always,
+}
+
+/// How a finished long command signals: each channel is independent.
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NotifyOnCommandFinishAction {
+    /// Ring the bell (visual flash, urgency hint, and `bell.command`, as with `\x07`).
+    pub bell: bool,
+    /// Show a desktop notification naming the exit code and runtime.
+    pub notify: bool,
+}
+
+impl Default for NotifyOnCommandFinishAction {
+    fn default() -> Self {
+        Self { bell: true, notify: false }
     }
 }
 
@@ -96,8 +165,13 @@ impl_config_deserialize!(Terminal {
     paste_protection,
     osc_notifications,
     progress,
+    notify_on_command_finish,
+    notify_on_command_finish_action,
+    notify_on_command_finish_after,
     shell: option
 });
+impl_config_deserialize!(NotifyOnCommandFinishAction { bell, notify });
+impl_config_deserialize_enum!(NotifyOnCommandFinish { Never, Unfocused, Always });
 impl_serde_replace!(SerdeOsc52);
 
 #[cfg(test)]
@@ -155,5 +229,74 @@ mod tests {
             let table = toml::from_str::<toml::Table>(&format!("osc52 = {value}")).unwrap();
             assert!(SerdeOsc52::deserialize(table["osc52"].clone()).is_err(), "{value}");
         }
+    }
+
+    #[test]
+    fn command_finish_signals_nothing_by_default() {
+        let terminal = toml::from_str::<Terminal>("").unwrap();
+        assert_eq!(terminal.notify_on_command_finish, super::NotifyOnCommandFinish::Never);
+        assert_eq!(
+            terminal.notify_on_command_finish_action,
+            super::NotifyOnCommandFinishAction { bell: true, notify: false }
+        );
+        assert_eq!(terminal.notify_on_command_finish_after(), std::time::Duration::from_secs(5));
+    }
+
+    #[test]
+    fn command_finish_config_parses_modes_actions_and_threshold() {
+        let terminal = toml::from_str::<Terminal>(
+            "notify_on_command_finish = \"unfocused\"\n\
+             notify_on_command_finish_action = { bell = false, notify = true }\n\
+             notify_on_command_finish_after = 30",
+        )
+        .unwrap();
+        assert_eq!(terminal.notify_on_command_finish, super::NotifyOnCommandFinish::Unfocused);
+        assert_eq!(
+            terminal.notify_on_command_finish_action,
+            super::NotifyOnCommandFinishAction { bell: false, notify: true }
+        );
+        assert_eq!(terminal.notify_on_command_finish_after(), std::time::Duration::from_secs(30));
+    }
+
+    #[test]
+    fn command_finish_action_keeps_defaults_for_missing_keys() {
+        let terminal =
+            toml::from_str::<Terminal>("notify_on_command_finish_action = { notify = true }")
+                .unwrap();
+        assert_eq!(
+            terminal.notify_on_command_finish_action,
+            super::NotifyOnCommandFinishAction { bell: true, notify: true }
+        );
+    }
+
+    #[test]
+    fn command_finish_actions_follow_mode_focus_and_threshold() {
+        use std::time::Duration;
+
+        use super::{NotifyOnCommandFinish, NotifyOnCommandFinishAction};
+
+        let terminal = toml::from_str::<Terminal>(
+            "notify_on_command_finish = \"unfocused\"\n\
+             notify_on_command_finish_action = { bell = true, notify = true }",
+        )
+        .unwrap();
+        let both = NotifyOnCommandFinishAction { bell: true, notify: true };
+        let neither = NotifyOnCommandFinishAction { bell: false, notify: false };
+
+        assert_eq!(terminal.command_finish_actions(false, Some(Duration::from_secs(6))), both);
+        assert_eq!(terminal.command_finish_actions(true, Some(Duration::from_secs(6))), neither);
+        // The runtime must exceed the threshold; exactly five seconds is not slow enough.
+        assert_eq!(terminal.command_finish_actions(false, Some(Duration::from_secs(5))), neither);
+        assert_eq!(terminal.command_finish_actions(false, Some(Duration::from_secs(4))), neither);
+        // No measured start means no runtime to compare, so nothing signals.
+        assert_eq!(terminal.command_finish_actions(false, None), neither);
+
+        let mut always = terminal.clone();
+        always.notify_on_command_finish = NotifyOnCommandFinish::Always;
+        assert_eq!(always.command_finish_actions(true, Some(Duration::from_secs(6))), both);
+
+        let mut never = terminal.clone();
+        never.notify_on_command_finish = NotifyOnCommandFinish::Never;
+        assert_eq!(never.command_finish_actions(false, Some(Duration::from_secs(60))), neither);
     }
 }
