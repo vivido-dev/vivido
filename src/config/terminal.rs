@@ -25,6 +25,9 @@ pub struct Terminal {
     notify_on_command_finish_after: u64,
     /// Path to a shell program to run on startup.
     pub shell: Option<Program>,
+    /// Start bash, zsh, fish, and PowerShell with Vivido's integration loaded, so they report
+    /// their prompts, commands, and working directory.
+    pub shell_integration: bool,
 }
 
 impl Default for Terminal {
@@ -38,6 +41,7 @@ impl Default for Terminal {
             notify_on_command_finish_action: Default::default(),
             notify_on_command_finish_after: 5,
             shell: None,
+            shell_integration: true,
         }
     }
 }
@@ -50,7 +54,7 @@ impl Terminal {
 
     /// Which signals a finished command emits, given the window focus and the measured runtime.
     ///
-    /// A command with no measured start — the shell emitted `D` without `B`/`C` — never signals,
+    /// A command with no measured start — the shell emitted `D` without `C` — never signals,
     /// as there is no runtime to compare against the threshold.
     pub fn command_finish_actions(
         &self,
@@ -168,7 +172,8 @@ impl_config_deserialize!(Terminal {
     notify_on_command_finish,
     notify_on_command_finish_action,
     notify_on_command_finish_after,
-    shell: option
+    shell: option,
+    shell_integration
 });
 impl_config_deserialize!(NotifyOnCommandFinishAction { bell, notify });
 impl_config_deserialize_enum!(NotifyOnCommandFinish { Never, Unfocused, Always });
@@ -189,6 +194,14 @@ mod tests {
         assert!(toml::from_str::<Terminal>("").unwrap().osc_notifications);
         assert!(
             !toml::from_str::<Terminal>("osc_notifications = false").unwrap().osc_notifications
+        );
+    }
+
+    #[test]
+    fn shell_integration_is_on_by_default_and_can_be_disabled() {
+        assert!(toml::from_str::<Terminal>("").unwrap().shell_integration);
+        assert!(
+            !toml::from_str::<Terminal>("shell_integration = false").unwrap().shell_integration
         );
     }
 

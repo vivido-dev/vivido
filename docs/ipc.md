@@ -356,6 +356,9 @@ waiting until it disconnects, the same as any unanswered request.
   when the terminal sits at its shell prompt or has exited: on Unix the foreground process group
   when it is not the shell's, on Windows a direct child of the shell unless OSC 133 reports the
   prompt (`"a command"` when integration reports a command the shell runs in-process).
+  `shell_integration` names the shell Vivido started with its integration loaded (`"bash"`,
+  `"zsh"`, `"fish"`, or `"powershell"`), or is null when it loaded none, in which case prompt and
+  command waits resolve only if the shell reports OSC 133 some other way.
   `message` is the message bar's current entry as `{"type":"info|warning|error","text":…}`, or
   null when the bar is empty, so a client can read notices such as the terminal-recovery hint
   that are drawn over the grid rather than written into it. `command_palette` is null while the
@@ -441,8 +444,10 @@ through 24 hours. CLI duration values accept bare milliseconds or `ms`, `s`, `m`
   the shell sits at a prompt. `wait_command_finish`: params are `timeout` and `target`; resolves
   on the next command finish after registration and returns
   `{"status":"completed","exit_code":E,"elapsed_ms":M,"generation":N}`. Both require OSC 133
-  shell integration markers: a shell that never emits them never resolves these waits, and a
-  finish that already happened never resolves a later `wait_command_finish`. The shell is at its
+  shell integration markers, which Vivido's own integration provides in bash, zsh, fish, and
+  PowerShell (see `shell_integration` in `inspect`): a shell that never emits them never resolves
+  these waits, and a finish that already happened never resolves a later `wait_command_finish`,
+  so register the wait before sending the command. The shell is at its
   prompt from `A` through `B` (where input begins) until `C` starts a command; `generation`
   counts `C` markers, so it names commands rather than prompts.
 

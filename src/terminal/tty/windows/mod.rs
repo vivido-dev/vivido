@@ -7,7 +7,9 @@ use std::sync::mpsc::TryRecvError;
 
 use crate::terminal::event::{OnResize, WindowSize};
 use crate::terminal::tty::windows::child::ChildExitWatcher;
-use crate::terminal::tty::{ChildEvent, EventedPty, EventedReadWrite, Options, Shell};
+use crate::terminal::tty::{
+    ChildEvent, EventedPty, EventedReadWrite, IntegratedShell, Options, Shell,
+};
 
 mod blocking;
 mod child;
@@ -40,12 +42,15 @@ pub struct Pty {
     backend: ConptyBackend,
     conin: WritePipe,
     child_watcher: ChildExitWatcher,
+    shell_integration: Option<IntegratedShell>,
 }
 
 pub fn new(config: &Options, window_size: WindowSize, _window_id: u64) -> Result<Pty> {
     let mut config = with_shell_environment(config);
-    powershell::configure(&mut config);
-    conpty::new(&config, window_size)
+    let shell_integration = powershell::configure(&mut config);
+    let mut pty = conpty::new(&config, window_size)?;
+    pty.shell_integration = shell_integration;
+    Ok(pty)
 }
 
 /// Advertise the program Vivido launched as the interactive shell.
@@ -75,11 +80,17 @@ impl Pty {
             backend: ConptyBackend { conpty: backend.into(), conout: conout.into() },
             conin: conin.into(),
             child_watcher,
+            shell_integration: None,
         }
     }
 
     pub fn child_watcher(&self) -> &ChildExitWatcher {
         &self.child_watcher
+    }
+
+    /// The shell started with Vivido's integration loaded, if any.
+    pub fn shell_integration(&self) -> Option<IntegratedShell> {
+        self.shell_integration
     }
 }
 

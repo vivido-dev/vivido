@@ -141,6 +141,7 @@ impl UiConfig {
             shell,
             drain_on_exit: false,
             env: HashMap::new(),
+            shell_integration: self.terminal.shell_integration,
             #[cfg(target_os = "windows")]
             escape_args: false,
         }

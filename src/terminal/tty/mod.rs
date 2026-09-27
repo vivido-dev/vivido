@@ -13,6 +13,8 @@ use polling::{Event, PollMode, Poller};
 use tempfile::TempDir;
 
 #[cfg(not(windows))]
+pub mod shell_integration;
+#[cfg(not(windows))]
 mod unix;
 #[cfg(not(windows))]
 pub use self::unix::*;
@@ -39,6 +41,10 @@ pub struct Options {
     /// Extra environment variables.
     pub env: HashMap<String, String>,
 
+    /// Start a supported shell with Vivido's integration loaded, so it reports its prompts,
+    /// commands, and working directory.
+    pub shell_integration: bool,
+
     /// Specifies whether the Windows shell arguments should be escaped.
     ///
     /// - When `true`: Arguments will be escaped according to the standard C runtime rules.
@@ -59,6 +65,27 @@ pub struct Shell {
 impl Shell {
     pub fn new(program: String, args: Vec<String>) -> Self {
         Self { program, args }
+    }
+}
+
+/// A shell that Vivido started with its integration loaded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IntegratedShell {
+    Bash,
+    Zsh,
+    Fish,
+    PowerShell,
+}
+
+impl IntegratedShell {
+    /// The name automation reports.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Bash => "bash",
+            Self::Zsh => "zsh",
+            Self::Fish => "fish",
+            Self::PowerShell => "powershell",
+        }
     }
 }
 
@@ -106,10 +133,13 @@ const TERMINFO_NAME: &str = "vivido";
 // host ncurses build, `tic` may put the entry below `v/` or hexadecimal `76/`.
 const BUNDLED_TERMINFO: &str = include_str!("../../../extra/vivido.terminfo.b64");
 
-/// Keeps Vivido's private terminfo tree alive until all PTY children have exited.
+/// Keeps Vivido's private terminfo tree and shell integration scripts alive until all PTY
+/// children have exited.
 #[must_use]
 pub struct TerminfoGuard {
     _directory: Option<TempDir>,
+    #[cfg(not(windows))]
+    _shell_integration: Option<TempDir>,
 }
 
 /// Setup environment variables.
@@ -143,7 +173,27 @@ pub fn setup_env() -> TerminfoGuard {
     // Advertise 24-bit color support.
     unsafe { env::set_var("COLORTERM", "truecolor") };
 
-    TerminfoGuard { _directory: directory }
+    // Shells read the scripts from here, and anyone loading them by hand finds them through the
+    // variable. A value inherited from an enclosing Vivido names that instance's copy, so it is
+    // replaced, or removed when this instance has none.
+    #[cfg(not(windows))]
+    let shell_integration = match shell_integration::provision() {
+        Ok(directory) => {
+            unsafe { env::set_var(shell_integration::DIRECTORY_ENV, directory.path()) };
+            Some(directory)
+        },
+        Err(error) => {
+            warn!("Could not provision shell integration scripts: {error}");
+            unsafe { env::remove_var(shell_integration::DIRECTORY_ENV) };
+            None
+        },
+    };
+
+    TerminfoGuard {
+        _directory: directory,
+        #[cfg(not(windows))]
+        _shell_integration: shell_integration,
+    }
 }
 
 /// Materialize the bundled compiled entry in both terminfo directory layouts.

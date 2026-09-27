@@ -201,6 +201,8 @@ pub struct WindowContext {
     #[cfg(not(windows))]
     master_fd: RawFd,
     shell_pid: u32,
+    /// The shell started with Vivido's integration loaded, which reports prompts and commands.
+    shell_integration: Option<tty::IntegratedShell>,
     window_config: ParsedOptions,
     config: Rc<UiConfig>,
     vivid_service: VividService,
@@ -594,6 +596,7 @@ impl WindowContext {
         let shell_pid = pty.child().id();
         #[cfg(windows)]
         let shell_pid = pty.child_watcher().pid().map_or(0, std::num::NonZeroU32::get);
+        let shell_integration = pty.shell_integration();
 
         // Create the pseudoterminal I/O loop.
         //
@@ -637,6 +640,7 @@ impl WindowContext {
             #[cfg(not(windows))]
             master_fd,
             shell_pid,
+            shell_integration,
             config,
             notifier: Notifier(loop_tx),
             cursor_blink_timed_out: Default::default(),
@@ -1420,6 +1424,7 @@ impl WindowContext {
         let shell_pid = pty.child().id();
         #[cfg(windows)]
         let shell_pid = pty.child_watcher().pid().map_or(0, std::num::NonZeroU32::get);
+        let shell_integration = pty.shell_integration();
         let event_loop = PtyEventLoop::new(
             Arc::clone(&self.terminal),
             self.event_proxy.clone(),
@@ -1455,6 +1460,7 @@ impl WindowContext {
             self.master_fd = master_fd;
         }
         self.shell_pid = shell_pid;
+        self.shell_integration = shell_integration;
         self.notifier = Notifier(event_loop.channel());
         self.io_thread = Some(event_loop.spawn());
         self.automation.exit_status = None;
@@ -2668,6 +2674,8 @@ impl WindowContext {
         });
         // Set apart because the literal above is at the macro's recursion limit.
         inspect["clipboard_prompt"] = clipboard_prompt.into();
+        inspect["shell_integration"] =
+            self.shell_integration.map(tty::IntegratedShell::name).into();
         inspect
     }
 

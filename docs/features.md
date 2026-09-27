@@ -60,6 +60,43 @@ reaches the terminal.
 The palette is drawn in the terminal surface, so it works the same inside Vivida panes. Rebind it
 with the `ToggleCommandPalette` action.
 
+## Shell integration
+
+Vivido starts bash, zsh, fish, and PowerShell with a small integration loaded, so the shell reports
+where each prompt starts, where your input starts, when a command runs, and how it finished (OSC
+133), along with its working directory (OSC 7). That is what lets `vivido msg wait prompt` and
+`wait command-finish` work, times commands for
+[command-finish notifications](#command-finish-notifications), keeps
+[closing terminals](#closing-terminals) quiet at an idle Windows prompt, and opens new windows
+where you are. Your startup files are never edited, and every one of them still runs:
+
+- **bash** 4.4 or newer starts in POSIX mode with `ENV` naming Vivido's script, which leaves POSIX
+  mode, reads the startup files bash would have read (honoring `-l`, `--norc`, `--noprofile`, and
+  `--rcfile`), and then hooks `PROMPT_COMMAND` and `PS0`. macOS's own `/bin/bash` is 3.2 and is left
+  alone; so is bash running a script or `-c` command.
+- **zsh** reads Vivido's `.zshenv` through `ZDOTDIR`, which puts your `ZDOTDIR` back and runs your
+  `.zshenv`; the hooks go in at the first prompt, after `.zshrc` and its themes. An `/etc/zshenv`
+  that sets `ZDOTDIR` itself bypasses this.
+- **fish** finds a `vendor_conf.d` file through `XDG_DATA_DIRS`, which restores the variable. fish
+  4 reports all of this itself, so the file only acts on fish 3.
+- **PowerShell** on Windows wraps the prompt your profile left behind, and PSReadLine's line reader
+  for the command mark.
+
+A shell Vivido did not start, such as one inside `ssh` or a bash you run by hand, can load the same
+scripts from `$VIVIDO_SHELL_INTEGRATION_DIR`:
+
+```sh
+# ~/.bashrc
+[ -n "$VIVIDO_SHELL_INTEGRATION_DIR" ] && . "$VIVIDO_SHELL_INTEGRATION_DIR/bash/vivido.bash"
+# ~/.zshrc
+[[ -n $VIVIDO_SHELL_INTEGRATION_DIR ]] && source "$VIVIDO_SHELL_INTEGRATION_DIR/zsh/vivido-integration.zsh"
+```
+
+IPC `inspect` names the integrated shell as `shell_integration`, or `null` when Vivido loaded none,
+so automation can tell "no prompt yet" from "no prompt will ever be reported". Turn it off with
+`terminal.shell_integration = false`. Vivido does not load it into WSL, `cmd.exe`, nushell (which
+reports prompts itself), or elvish.
+
 ## Closing terminals
 
 Closing a terminal that is sitting at its shell prompt happens at once. Closing one that is still
@@ -83,12 +120,12 @@ or `Always`, and choose the channel with `terminal.notify_on_command_finish_acti
 bell, a desktop notification, or both. The notification names the outcome — "Command Succeeded",
 "Command Failed" — with the runtime and exit code, and clicking it focuses the terminal.
 
-This needs a shell that emits OSC 133 integration markers, since the runtime runs from the
-marker that starts the command (`C`) to the finish marker (`D`); time spent typing at the prompt
-does not count. A finish without a start never signals, and neither
-does a command that finishes within the threshold. The bell channel is the ordinary bell, so
-`bell.command` still runs and automation still hears a `bell` event; the notification channel is
-your own configuration rather than a program request, so it works even with
+This needs OSC 133 integration markers, which [shell integration](#shell-integration) provides in
+bash, zsh, fish, and PowerShell: the runtime runs from the marker that starts the command (`C`) to
+the finish marker (`D`), so time spent typing at the prompt does not count. A finish without a start
+never signals, and neither does a command that finishes within the threshold. The bell channel is
+the ordinary bell, so `bell.command` still runs and automation still hears a `bell` event; the
+notification channel is your own configuration rather than a program request, so it works even with
 `terminal.osc_notifications = false`.
 
 ## Hints
