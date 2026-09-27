@@ -16,6 +16,11 @@ fn main() {
     use winit::raw_window_handle::RawWindowHandle;
     use winit::window::WindowId;
 
+    // Answer libtest's terse listing so cargo-nextest sees one ignored test.
+    if std::env::args().any(|arg| arg == "--list") {
+        println!("macos_tabs: test");
+        return;
+    }
     if !std::env::args().any(|arg| arg == "--ignored") {
         println!("macos_tabs: ignored (requires a macOS desktop; pass --ignored)");
         return;

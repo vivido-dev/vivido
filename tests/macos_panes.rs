@@ -20,6 +20,11 @@ fn main() {
     use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
     use winit::window::{Window as HostWindow, WindowId};
 
+    // Answer libtest's terse listing so cargo-nextest sees one ignored test.
+    if std::env::args().any(|arg| arg == "--list") {
+        println!("macos_panes: test");
+        return;
+    }
     if !std::env::args().any(|arg| arg == "--ignored") {
         println!("macos_panes: ignored (requires a macOS desktop; pass --ignored)");
         return;
