@@ -2071,11 +2071,27 @@ mod tests {
     #[cfg(all(unix, not(target_os = "macos")))]
     use std::io::{Read, Write};
 
-    #[cfg(all(unix, not(target_os = "macos")))]
-    use clap::CommandFactory;
+    use std::ffi::OsString;
+
+    use clap::{Command, CommandFactory, FromArgMatches};
     #[cfg(all(unix, not(target_os = "macos")))]
     use clap_complete::Shell;
     use toml::Table;
+
+    /// Parse as the binary does, minus environment fallbacks: `VIVIDO_WINDOW_ID` is set whenever
+    /// the tests run inside a Vivido window and would otherwise fill every omitted `--window-id`.
+    fn parse_options<I, T>(arguments: I) -> Result<Options, clap::Error>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<OsString> + Clone,
+    {
+        fn without_env(command: Command) -> Command {
+            command.mut_args(|arg| arg.env(None)).mut_subcommands(without_env)
+        }
+
+        let mut matches = without_env(Options::command()).try_get_matches_from(arguments)?;
+        Options::from_arg_matches_mut(&mut matches)
+    }
 
     #[test]
     fn dynamic_title_ignoring_options_by_default() {
@@ -2179,7 +2195,7 @@ mod tests {
             1234,
             "build",
         ));
-        let options = Options::try_parse_from(arguments).unwrap();
+        let options = parse_options(arguments).unwrap();
 
         assert!(options.headless);
         assert_eq!(options.session.as_deref(), Some("build"));
@@ -2211,7 +2227,7 @@ mod tests {
     #[cfg(any(unix, windows))]
     #[test]
     fn parse_drop_file_message() {
-        let options = Options::try_parse_from([
+        let options = parse_options([
             "vivido",
             "msg",
             "drop-file",
@@ -2241,8 +2257,7 @@ mod tests {
 
         // Defaults: the whole-window binding, nothing typed, ten minutes.
         let options =
-            Options::try_parse_from(["vivido", "msg", "drop-file", "/tmp/x", "--window-id", "1"])
-                .unwrap();
+            parse_options(["vivido", "msg", "drop-file", "/tmp/x", "--window-id", "1"]).unwrap();
         let Some(Subcommands::Msg(message)) = options.subcommands else {
             panic!("expected msg subcommand");
         };
@@ -2260,8 +2275,7 @@ mod tests {
     #[test]
     fn parse_typing_message() {
         let options =
-            Options::try_parse_from(["vivido", "msg", "typing", "--window-id", "42", "echo hello"])
-                .unwrap();
+            parse_options(["vivido", "msg", "typing", "--window-id", "42", "echo hello"]).unwrap();
 
         let Some(Subcommands::Msg(message)) = options.subcommands else {
             panic!("expected msg subcommand");
@@ -2279,7 +2293,7 @@ mod tests {
     #[cfg(any(unix, windows))]
     #[test]
     fn parse_vivid_trace_historical_selectors() {
-        let options = Options::try_parse_from([
+        let options = parse_options([
             "vivido",
             "msg",
             "vivid",
@@ -2303,32 +2317,27 @@ mod tests {
         assert_eq!(trace.preceding, 64);
         assert_eq!(trace.following, 16);
 
-        assert!(Options::try_parse_from(["vivido", "msg", "vivid", "trace", "--tail"]).is_ok());
-        assert!(Options::try_parse_from(["vivido", "msg", "vivid", "trace"]).is_ok());
+        assert!(parse_options(["vivido", "msg", "vivid", "trace", "--tail"]).is_ok());
+        assert!(parse_options(["vivido", "msg", "vivid", "trace"]).is_ok());
 
         assert!(
-            Options::try_parse_from([
-                "vivido", "msg", "vivid", "trace", "--tail", "--before", "420",
-            ])
-            .is_err()
+            parse_options(["vivido", "msg", "vivid", "trace", "--tail", "--before", "420",])
+                .is_err()
         );
         assert!(
-            Options::try_parse_from([
-                "vivido", "msg", "vivid", "trace", "--around", "420", "--follow",
-            ])
-            .is_err()
+            parse_options(["vivido", "msg", "vivid", "trace", "--around", "420", "--follow",])
+                .is_err()
         );
     }
 
     #[cfg(any(unix, windows))]
     #[test]
     fn parse_assigned_window_ids() {
-        let options = Options::try_parse_from(["vivido", "--window-id", "1234"]).unwrap();
+        let options = parse_options(["vivido", "--window-id", "1234"]).unwrap();
         assert_eq!(options.window_options.ipc_window_id, Some(1234));
 
         let options =
-            Options::try_parse_from(["vivido", "msg", "create-window", "--window-id", "5678"])
-                .unwrap();
+            parse_options(["vivido", "msg", "create-window", "--window-id", "5678"]).unwrap();
         let Some(Subcommands::Msg(message)) = options.subcommands else {
             panic!("expected msg subcommand");
         };
@@ -2342,8 +2351,7 @@ mod tests {
     #[test]
     fn parse_close_window() {
         let options =
-            Options::try_parse_from(["vivido", "msg", "close-window", "-w", "2", "--force"])
-                .unwrap();
+            parse_options(["vivido", "msg", "close-window", "-w", "2", "--force"]).unwrap();
         let Some(Subcommands::Msg(message)) = options.subcommands else {
             panic!("expected msg subcommand");
         };
@@ -2352,7 +2360,7 @@ mod tests {
             SocketMessage::CloseWindow(IpcCloseWindow { window_id: Some(2), force: true })
         );
 
-        let options = Options::try_parse_from(["vivido", "msg", "close-window"]).unwrap();
+        let options = parse_options(["vivido", "msg", "close-window"]).unwrap();
         let Some(Subcommands::Msg(message)) = options.subcommands else {
             panic!("expected msg subcommand");
         };
@@ -2365,7 +2373,7 @@ mod tests {
     #[cfg(any(unix, windows))]
     #[test]
     fn parse_test_runner() {
-        let options = Options::try_parse_from([
+        let options = parse_options([
             "vivido",
             "test",
             "--session",
@@ -2407,7 +2415,7 @@ mod tests {
         );
 
         // Defaults: generated session name, headless default shell, NDJSON report.
-        let options = Options::try_parse_from(["vivido", "test"]).unwrap();
+        let options = parse_options(["vivido", "test"]).unwrap();
         let Some(Subcommands::Test(test)) = options.subcommands else {
             panic!("expected test subcommand");
         };
@@ -2421,28 +2429,22 @@ mod tests {
     #[cfg(any(unix, windows))]
     #[test]
     fn parse_ephemeral_headless_session() {
-        let options = Options::try_parse_from([
-            "vivido",
-            "--headless",
-            "--ephemeral",
-            "--session",
-            "temp_test",
-        ])
-        .unwrap();
+        let options =
+            parse_options(["vivido", "--headless", "--ephemeral", "--session", "temp_test"])
+                .unwrap();
         assert!(options.headless);
         assert!(options.ephemeral);
         assert_eq!(options.session.as_deref(), Some("temp_test"));
 
         // Ephemeral teardown only means something for a headless session.
-        assert!(Options::try_parse_from(["vivido", "--ephemeral"]).is_err());
+        assert!(parse_options(["vivido", "--ephemeral"]).is_err());
     }
 
     #[cfg(any(unix, windows))]
     #[test]
     fn parse_semantic_waits() {
         let options =
-            Options::try_parse_from(["vivido", "msg", "wait", "prompt", "--timeout", "5s"])
-                .unwrap();
+            parse_options(["vivido", "msg", "wait", "prompt", "--timeout", "5s"]).unwrap();
         let Some(Subcommands::Msg(message)) = options.subcommands else {
             panic!("expected msg subcommand");
         };
@@ -2457,7 +2459,7 @@ mod tests {
             })
         );
 
-        let options = Options::try_parse_from([
+        let options = parse_options([
             "vivido",
             "msg",
             "wait",
@@ -2487,8 +2489,7 @@ mod tests {
     #[test]
     fn parse_scoped_text_waits() {
         let options =
-            Options::try_parse_from(["vivido", "msg", "wait", "text", "PS>", "--line", "-1"])
-                .unwrap();
+            parse_options(["vivido", "msg", "wait", "text", "PS>", "--line", "-1"]).unwrap();
         let Some(Subcommands::Msg(message)) = options.subcommands else {
             panic!("expected msg subcommand");
         };
@@ -2501,7 +2502,7 @@ mod tests {
         assert_eq!(text.line, Some(-1));
         assert_eq!(text.rect, None);
 
-        let options = Options::try_parse_from([
+        let options = parse_options([
             "vivido",
             "msg",
             "wait",
@@ -2526,14 +2527,13 @@ mod tests {
 
         // A wait reads one scope: line and rect conflict.
         assert!(
-            Options::try_parse_from([
+            parse_options([
                 "vivido", "msg", "wait", "text", "x", "--line", "2", "--rect", "0,0,4,4",
             ])
             .is_err()
         );
         assert!(
-            Options::try_parse_from(["vivido", "msg", "wait", "text", "x", "--rect", "0,0,0,4"])
-                .is_err()
+            parse_options(["vivido", "msg", "wait", "text", "x", "--rect", "0,0,0,4"]).is_err()
         );
         assert!("10,10,80,24".parse::<IpcTextRect>().is_ok());
     }
@@ -2551,7 +2551,7 @@ mod tests {
     #[cfg(any(unix, windows))]
     #[test]
     fn parse_window_layout_messages() {
-        let options = Options::try_parse_from([
+        let options = parse_options([
             "vivido",
             "msg",
             "set-geometry",
@@ -2581,7 +2581,7 @@ mod tests {
             })
         );
 
-        let options = Options::try_parse_from([
+        let options = parse_options([
             "vivido",
             "msg",
             "set-visible",
@@ -2602,15 +2602,9 @@ mod tests {
             })
         );
 
-        let options = Options::try_parse_from([
-            "vivido",
-            "msg",
-            "set-level",
-            "always-on-top",
-            "--window-id",
-            "42",
-        ])
-        .unwrap();
+        let options =
+            parse_options(["vivido", "msg", "set-level", "always-on-top", "--window-id", "42"])
+                .unwrap();
         let Some(Subcommands::Msg(message)) = options.subcommands else {
             panic!("expected msg subcommand");
         };
@@ -2623,22 +2617,15 @@ mod tests {
         );
 
         // A lone coordinate is not a position.
-        assert!(Options::try_parse_from(["vivido", "msg", "set-geometry", "--x", "10"]).is_err());
+        assert!(parse_options(["vivido", "msg", "set-geometry", "--x", "10"]).is_err());
     }
 
     #[cfg(any(unix, windows))]
     #[test]
     fn parse_capture_messages() {
-        let options = Options::try_parse_from([
-            "vivido",
-            "msg",
-            "get-text",
-            "--rows",
-            "1000",
-            "--window-id",
-            "42",
-        ])
-        .unwrap();
+        let options =
+            parse_options(["vivido", "msg", "get-text", "--rows", "1000", "--window-id", "42"])
+                .unwrap();
         let Some(Subcommands::Msg(message)) = options.subcommands else {
             panic!("expected msg subcommand");
         };
@@ -2647,8 +2634,7 @@ mod tests {
             SocketMessage::GetText(IpcGetText { rows: Some(1000), window_id: Some(42) })
         );
 
-        let options =
-            Options::try_parse_from(["vivido", "msg", "screenshot", "--window-id", "42"]).unwrap();
+        let options = parse_options(["vivido", "msg", "screenshot", "--window-id", "42"]).unwrap();
         let Some(Subcommands::Msg(message)) = options.subcommands else {
             panic!("expected msg subcommand");
         };
@@ -2657,7 +2643,7 @@ mod tests {
             SocketMessage::Screenshot(IpcScreenshot { window_id: Some(42), json: false })
         );
 
-        let options = Options::try_parse_from([
+        let options = parse_options([
             "vivido",
             "msg",
             "mouse",
@@ -2684,7 +2670,7 @@ mod tests {
         assert_eq!(path.duration, None);
         assert!(!path.wait_frame);
 
-        let options = Options::try_parse_from([
+        let options = parse_options([
             "vivido",
             "msg",
             "mouse",
@@ -2710,7 +2696,7 @@ mod tests {
         assert!(path.wait_frame);
         assert_eq!(path.timeout, 2_000);
 
-        let options = Options::try_parse_from([
+        let options = parse_options([
             "vivido",
             "msg",
             "mouse",
@@ -2734,15 +2720,9 @@ mod tests {
         assert_eq!(click.position.relative_x, Some(0.5));
         assert_eq!(click.position.relative_y, Some(1.0));
 
-        let options = Options::try_parse_from([
-            "vivido",
-            "msg",
-            "run-plan",
-            "--file",
-            "plan.json",
-            "--preflight",
-        ])
-        .unwrap();
+        let options =
+            parse_options(["vivido", "msg", "run-plan", "--file", "plan.json", "--preflight"])
+                .unwrap();
         let Some(Subcommands::Msg(message)) = options.subcommands else {
             panic!("expected msg subcommand");
         };
@@ -2751,7 +2731,7 @@ mod tests {
             SocketMessage::RunPlan(IpcRunPlan { preflight: true, .. })
         ));
 
-        let options = Options::try_parse_from([
+        let options = parse_options([
             "vivido",
             "msg",
             "capture",
@@ -2779,14 +2759,14 @@ mod tests {
     #[cfg(any(unix, windows))]
     #[test]
     fn capture_rows_are_bounded() {
-        assert!(Options::try_parse_from(["vivido", "msg", "get-text", "--rows", "0"]).is_err());
-        assert!(Options::try_parse_from(["vivido", "msg", "get-text", "--rows", "1001"]).is_err());
+        assert!(parse_options(["vivido", "msg", "get-text", "--rows", "0"]).is_err());
+        assert!(parse_options(["vivido", "msg", "get-text", "--rows", "1001"]).is_err());
     }
 
     #[cfg(any(unix, windows))]
     #[test]
     fn parse_find_text_message() {
-        let options = Options::try_parse_from([
+        let options = parse_options([
             "vivido",
             "msg",
             "find-text",
@@ -2813,8 +2793,7 @@ mod tests {
         );
 
         // Defaults search literally across every window, fifty matches per window.
-        let options =
-            Options::try_parse_from(["vivido", "msg", "find-text", "--pattern", "x"]).unwrap();
+        let options = parse_options(["vivido", "msg", "find-text", "--pattern", "x"]).unwrap();
         let Some(Subcommands::Msg(message)) = options.subcommands else {
             panic!("expected msg subcommand");
         };
@@ -2829,35 +2808,19 @@ mod tests {
         );
 
         assert!(
-            Options::try_parse_from([
-                "vivido",
-                "msg",
-                "find-text",
-                "--pattern",
-                "x",
-                "--max-matches",
-                "0"
-            ])
-            .is_err()
+            parse_options(["vivido", "msg", "find-text", "--pattern", "x", "--max-matches", "0"])
+                .is_err()
         );
         assert!(
-            Options::try_parse_from([
-                "vivido",
-                "msg",
-                "find-text",
-                "--pattern",
-                "x",
-                "--max-matches",
-                "101"
-            ])
-            .is_err()
+            parse_options(["vivido", "msg", "find-text", "--pattern", "x", "--max-matches", "101"])
+                .is_err()
         );
     }
 
     #[cfg(any(unix, windows))]
     #[test]
     fn parse_plan_set_flags() {
-        let options = Options::try_parse_from([
+        let options = parse_options([
             "vivido",
             "msg",
             "run-plan",
@@ -2880,8 +2843,7 @@ mod tests {
         assert_eq!(plan.on_failure_dump, None);
 
         let options =
-            Options::try_parse_from(["vivido", "msg", "run-plan", "--on-failure-dump", "dumps"])
-                .unwrap();
+            parse_options(["vivido", "msg", "run-plan", "--on-failure-dump", "dumps"]).unwrap();
         let Some(Subcommands::Msg(message)) = options.subcommands else {
             panic!("expected msg subcommand");
         };
@@ -2890,8 +2852,7 @@ mod tests {
         };
         assert_eq!(plan.on_failure_dump, Some(PathBuf::from("dumps")));
 
-        let options =
-            Options::try_parse_from(["vivido", "test", "--set", "A=1", "--", "sh"]).unwrap();
+        let options = parse_options(["vivido", "test", "--set", "A=1", "--", "sh"]).unwrap();
         let Some(Subcommands::Test(test)) = options.subcommands else {
             panic!("expected test subcommand");
         };
@@ -2902,7 +2863,7 @@ mod tests {
     #[cfg(any(unix, windows))]
     #[test]
     fn parse_exec_message() {
-        let options = Options::try_parse_from([
+        let options = parse_options([
             "vivido",
             "msg",
             "exec",
@@ -2927,8 +2888,7 @@ mod tests {
         );
 
         // Defaults wait one minute in the focused window.
-        let options =
-            Options::try_parse_from(["vivido", "msg", "exec", "--command", "true"]).unwrap();
+        let options = parse_options(["vivido", "msg", "exec", "--command", "true"]).unwrap();
         let Some(Subcommands::Msg(message)) = options.subcommands else {
             panic!("expected msg subcommand");
         };
@@ -2945,7 +2905,7 @@ mod tests {
     #[cfg(any(unix, windows))]
     #[test]
     fn parse_agent_control_and_wait_commands() {
-        let options = Options::try_parse_from([
+        let options = parse_options([
             "vivido",
             "msg",
             "key",
@@ -2971,7 +2931,7 @@ mod tests {
         assert_eq!(key.repeat, 3);
         assert_eq!(key.target.window_id, Some(42));
 
-        let options = Options::try_parse_from([
+        let options = parse_options([
             "vivido",
             "msg",
             "wait",
@@ -2998,17 +2958,9 @@ mod tests {
     #[cfg(any(unix, windows))]
     #[test]
     fn agent_cli_limits_are_rejected() {
-        assert!(
-            Options::try_parse_from(["vivido", "msg", "key", "a", "--repeat", "1001"]).is_err()
-        );
-        assert!(
-            Options::try_parse_from(["vivido", "msg", "wait", "frame", "--timeout", "0ms"])
-                .is_err()
-        );
-        assert!(
-            Options::try_parse_from(["vivido", "msg", "wait", "frame", "--timeout", "25h"])
-                .is_err()
-        );
+        assert!(parse_options(["vivido", "msg", "key", "a", "--repeat", "1001"]).is_err());
+        assert!(parse_options(["vivido", "msg", "wait", "frame", "--timeout", "0ms"]).is_err());
+        assert!(parse_options(["vivido", "msg", "wait", "frame", "--timeout", "25h"]).is_err());
     }
 
     // clap_complete emits even hidden macOS/Windows re-exec options, so the checked-in public shell
