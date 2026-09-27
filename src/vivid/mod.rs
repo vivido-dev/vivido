@@ -6993,7 +6993,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires built SDK bindings and VIVID_OVERLAY_TEST_PYTHON/VIVID_OVERLAY_TEST_NODE"]
+    #[ignore = "requires built SDK bindings, their .venv (or VIVID_OVERLAY_TEST_PYTHON) and Node"]
     fn native_overlay_python_and_typescript_bindings() {
         let _gpu = crate::display::renderer::gpu_test_lock();
         use crate::display::renderer::SceneRenderer;
@@ -7008,13 +7008,16 @@ mod tests {
             }
         }
         let sdk = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../vivid_sdk");
-        for (runtime, fixture, mode) in [
-            ("VIVID_OVERLAY_TEST_PYTHON", "overlay_python.py", "blocking"),
-            ("VIVID_OVERLAY_TEST_PYTHON", "overlay_python.py", "async"),
-            ("VIVID_OVERLAY_TEST_NODE", "overlay_node.mjs", "async"),
+        let python = test_prerequisite(
+            "VIVID_OVERLAY_TEST_PYTHON",
+            &["vivid_sdk/.venv/bin/python".into(), "vivid_sdk/.venv/Scripts/python.exe".into()],
+        );
+        let node = std::env::var_os("VIVID_OVERLAY_TEST_NODE").unwrap_or_else(|| "node".into());
+        for (executable, fixture, mode) in [
+            (&python, "overlay_python.py", "blocking"),
+            (&python, "overlay_python.py", "async"),
+            (&node, "overlay_node.mjs", "async"),
         ] {
-            let executable =
-                std::env::var_os(runtime).expect("binding test runtime must be configured");
             let service =
                 socket_service!(VividService::start_with_wake(test_geometry(), Arc::new(|_| {})));
             service.update_overlay_viewport(800., 600., 2.);
@@ -7144,6 +7147,24 @@ mod tests {
             authentication: ProducerAuthentication::root_hex(service.root_secret()).unwrap(),
             ..ProducerConfig::default()
         }
+    }
+
+    /// An acceptance test's external input: `variable` when set, otherwise the most recently
+    /// modified of `candidates`, relative to the repository that holds Vivido's sibling projects.
+    fn test_prerequisite(variable: &str, candidates: &[String]) -> std::ffi::OsString {
+        if let Some(value) = std::env::var_os(variable) {
+            return value;
+        }
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        candidates
+            .iter()
+            .filter_map(|candidate| {
+                let path = root.join(candidate);
+                Some((path.metadata().ok()?.modified().ok()?, path))
+            })
+            .max()
+            .map(|(_, path)| path.into_os_string())
+            .unwrap_or_else(|| panic!("set {variable} or provide one of {candidates:?}"))
     }
 
     /// Connect a receiver that offers `file-drop-path-v1` the way `vvreceive` does.

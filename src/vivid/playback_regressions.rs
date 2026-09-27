@@ -1,3 +1,17 @@
+/// A sibling project's newest build of `name`, unless `variable` names one.
+fn built_test_binary(variable: &str, name: &str) -> std::ffi::OsString {
+    let file = format!("{name}{}", std::env::consts::EXE_SUFFIX);
+    test_prerequisite(
+        variable,
+        &[format!("{name}/target/release/{file}"), format!("{name}/target/debug/{file}")],
+    )
+}
+
+/// Portable AV1/Opus media long enough for every seek and resume below.
+fn playback_test_media() -> std::ffi::OsString {
+    test_prerequisite("VIVI_TEST_MEDIA", &["medias/under_attack.webm".into()])
+}
+
 #[cfg(unix)]
 mod process_playback {
     use super::*;
@@ -9,7 +23,8 @@ mod process_playback {
     // retained only for failure diagnostics; authenticated media uses separate sockets.
     const PTY_DRIVER: &str = r#"
 import os, pty, select, struct, subprocess, sys, termios, fcntl, tempfile, json, shlex
-directory = tempfile.TemporaryDirectory(prefix='vivi-playback-')
+# Short `/tmp` root: vvmux's session socket lives in the runtime directory and must fit `sun_path`.
+directory = tempfile.TemporaryDirectory(prefix='vvp-', dir='/tmp')
 argv = [os.environ['VIVI_TEST_BIN'], os.environ['VIVI_TEST_MEDIA']]
 mux = os.environ.get('VIVI_TEST_USE_MUX') == '1'
 if mux:
@@ -66,23 +81,26 @@ finally:
     struct Player(Child);
     impl Player {
         fn start(service: &VividService, mux: bool) -> Self {
-            Self(
-                Command::new("python3")
-                    .args(["-c", PTY_DRIVER])
-                    .env("VIVID_ENDPOINT_CONTROL", service.control_endpoint())
-                    .env("VIVID_ENDPOINT_REALTIME", service.control_endpoint())
-                    .env("VIVID_ENDPOINT_BULK", service.control_endpoint())
-                    .env("VIVID_ROOT_SECRET", service.root_secret())
-                    .env("TERM", "xterm-256color")
-                    .env("TMUX", "playback-test")
-                    .env("VIVI_TEST_USE_MUX", if mux { "1" } else { "0" })
-                    .env_remove("VIVID_REMOTE")
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::piped())
-                    .spawn()
-                    .unwrap(),
-            )
+            let mut command = Command::new("python3");
+            command
+                .args(["-c", PTY_DRIVER])
+                .env("VIVI_TEST_BIN", built_test_binary("VIVI_TEST_BIN", "vivi"))
+                .env("VIVI_TEST_MEDIA", playback_test_media())
+                .env("VIVID_ENDPOINT_CONTROL", service.control_endpoint())
+                .env("VIVID_ENDPOINT_REALTIME", service.control_endpoint())
+                .env("VIVID_ENDPOINT_BULK", service.control_endpoint())
+                .env("VIVID_ROOT_SECRET", service.root_secret())
+                .env("TERM", "xterm-256color")
+                .env("TMUX", "playback-test")
+                .env("VIVI_TEST_USE_MUX", if mux { "1" } else { "0" })
+                .env_remove("VIVID_REMOTE")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped());
+            if mux {
+                command.env("VVMUX_TEST_BIN", built_test_binary("VVMUX_TEST_BIN", "vvmux"));
+            }
+            Self(command.spawn().unwrap())
         }
 
         fn key(&mut self, key: &[u8]) {
@@ -155,11 +173,8 @@ finally:
     }
 
     #[test]
-    #[ignore = "requires VIVI_TEST_BIN, VIVI_TEST_MEDIA and Python 3; real native media acceptance"]
+    #[ignore = "requires a built vivi and Python 3; real native media acceptance"]
     fn native_vivi_pause_quit_relaunch() {
-        for variable in ["VIVI_TEST_BIN", "VIVI_TEST_MEDIA"] {
-            assert!(std::env::var_os(variable).is_some(), "missing {variable}");
-        }
         let service = VividService::start_with_wake(test_geometry(), Arc::new(|_| {})).unwrap();
         service.shared.clocked_test_audio.store(true, Ordering::SeqCst);
         for _ in 0..3 {
@@ -194,11 +209,8 @@ finally:
     }
 
     #[test]
-    #[ignore = "requires VIVI_TEST_BIN, VVMUX_TEST_BIN, VIVI_TEST_MEDIA and Python 3"]
+    #[ignore = "requires a built vivi and vvmux, and Python 3"]
     fn vvmux_vivi_pause_quit_relaunch() {
-        for variable in ["VIVI_TEST_BIN", "VVMUX_TEST_BIN", "VIVI_TEST_MEDIA"] {
-            assert!(std::env::var_os(variable).is_some(), "missing {variable}");
-        }
         let service = VividService::start_with_wake(test_geometry(), Arc::new(|_| {})).unwrap();
         service.shared.clocked_test_audio.store(true, Ordering::SeqCst);
         let mut player = Player::start(&service, true);
@@ -254,9 +266,9 @@ mod windows_process_playback {
     }
     impl TestMux {
         fn start(service: &VividService, second_tab: bool) -> Self {
-            let binary = PathBuf::from(std::env::var_os("VVMUX_TEST_BIN").expect("VVMUX_TEST_BIN"));
-            let vivi = std::env::var("VIVI_TEST_BIN").expect("VIVI_TEST_BIN");
-            let media = std::env::var("VIVI_TEST_MEDIA").expect("VIVI_TEST_MEDIA");
+            let binary = PathBuf::from(built_test_binary("VVMUX_TEST_BIN", "vvmux"));
+            let vivi = built_test_binary("VIVI_TEST_BIN", "vivi").to_string_lossy().into_owned();
+            let media = playback_test_media().to_string_lossy().into_owned();
             let directory = tempfile::tempdir().unwrap();
             let name = format!(
                 "playback-test-{}",
@@ -391,7 +403,7 @@ mod windows_process_playback {
     }
 
     #[test]
-    #[ignore = "requires VIVI_TEST_BIN, VVMUX_TEST_BIN and VIVI_TEST_MEDIA; isolated ConPTY acceptance"]
+    #[ignore = "requires a built vivi and vvmux; isolated ConPTY acceptance"]
     fn windows_vvmux_vivi_pause_quit_relaunch() {
         let service = VividService::start_with_wake(test_geometry(), Arc::new(|_| {})).unwrap();
         service.shared.clocked_test_audio.store(true, Ordering::SeqCst);
@@ -426,13 +438,13 @@ mod windows_process_playback {
     }
 
     #[test]
-    #[ignore = "requires VIVI_TEST_BIN, VVMUX_TEST_BIN and VIVI_TEST_MEDIA; isolated ConPTY acceptance"]
+    #[ignore = "requires a built vivi and vvmux; isolated ConPTY acceptance"]
     fn windows_vvmux_vivi_hide_resume_and_seek() {
         exercise_hide_resume_and_seek(&[15, 45]);
     }
 
     #[test]
-    #[ignore = "requires VIVI_TEST_BIN, VVMUX_TEST_BIN and VIVI_TEST_MEDIA; isolated ConPTY acceptance"]
+    #[ignore = "requires a built vivi and vvmux; isolated ConPTY acceptance"]
     fn windows_vvmux_vivi_paused_tab_return() {
         exercise_hide_resume_and_seek(&[]);
     }
