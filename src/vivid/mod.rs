@@ -7021,6 +7021,14 @@ mod tests {
             let service =
                 socket_service!(VividService::start_with_wake(test_geometry(), Arc::new(|_| {})));
             service.update_overlay_viewport(800., 600., 2.);
+            // Adapter startup can take seconds, so finish it before the producer's presentation
+            // deadline starts.
+            let mut renderer = SceneRenderer::new(
+                RenderSource::Offscreen,
+                winit::dpi::PhysicalSize::new(800, 600),
+                false,
+            )
+            .expect("binding render acceptance requires a Vello adapter");
             let mut command = Command::new(executable);
             command
                 .arg(sdk.join("bindings/tests").join(fixture))
@@ -7047,12 +7055,6 @@ mod tests {
                 thread::sleep(Duration::from_millis(2));
             }
             // Read actual Vello pixels while the child holds its scene until the release marker.
-            let mut renderer = SceneRenderer::new(
-                RenderSource::Offscreen,
-                winit::dpi::PhysicalSize::new(800, 600),
-                false,
-            )
-            .expect("binding render acceptance requires a Vello adapter");
             renderer.set_vivid_scene(service.scene());
             let media = renderer
                 .prepare_media(&SizeInfo::new(800., 600., 10., 25., 0., 0., false), 0)
