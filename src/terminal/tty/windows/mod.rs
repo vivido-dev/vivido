@@ -271,6 +271,7 @@ mod test {
             working_directory: None,
             drain_on_exit: true,
             env: Default::default(),
+            shell_integration: false,
             escape_args: false,
         };
         assert_eq!(cmdline(&options), "echo hello world");
@@ -289,6 +290,7 @@ mod test {
             working_directory: None,
             drain_on_exit: false,
             env: [("Shell".to_string(), "stale.exe".to_string())].into_iter().collect(),
+            shell_integration: false,
             escape_args: false,
         };
 
