@@ -342,7 +342,10 @@ mod windows_process_playback {
             Self { pty, binary, name, _directory: directory, tail: Vec::new() }
         }
         fn key(&mut self, key: &[u8]) {
-            self.pty.writer().write_all(key).unwrap();
+            if let Err(error) = self.pty.writer().write_all(key) {
+                self.drain();
+                panic!("key {key:?}: {error}; terminal={}", String::from_utf8_lossy(&self.tail));
+            }
         }
         fn drain(&mut self) {
             let mut bytes = [0; 4096];
@@ -440,7 +443,9 @@ mod windows_process_playback {
     #[test]
     #[ignore = "requires a built vivi and vvmux; isolated ConPTY acceptance"]
     fn windows_vvmux_vivi_hide_resume_and_seek() {
-        exercise_hide_resume_and_seek(&[15, 45]);
+        // The long hide is the point: it outlasts every 30-second producer and relay timeout, so a
+        // hidden stall misread as failure exits here. The short one only repeats the cycle.
+        exercise_hide_resume_and_seek(&[2, 45]);
     }
 
     #[test]
