@@ -442,7 +442,9 @@ through 24 hours. CLI duration values accept bare milliseconds or `ms`, `s`, `m`
   on the next command finish after registration and returns
   `{"status":"completed","exit_code":E,"elapsed_ms":M,"generation":N}`. Both require OSC 133
   shell integration markers: a shell that never emits them never resolves these waits, and a
-  finish that already happened never resolves a later `wait_command_finish`.
+  finish that already happened never resolves a later `wait_command_finish`. The shell is at its
+  prompt from `A` through `B` (where input begins) until `C` starts a command; `generation`
+  counts `C` markers, so it names commands rather than prompts.
 
 Regex patterns are limited to 8 KiB and use linear-time matching. Disconnecting cancels waits,
 pending tagged input, resize/focus requests, and subscriptions immediately.

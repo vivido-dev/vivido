@@ -362,8 +362,8 @@ can hold a password. The older single-word values still work: `disabled`, `onlyc
 and `copypaste` mean `deny` or `allow` for each direction.
 
 A finished command signals only when its runtime *exceeds* `notify_on_command_finish_after`, and
-only when the shell emits OSC 133 integration markers — the runtime runs from the command-start
-marker to the finish marker, and a finish without a start never signals. The `bell` channel rings
+only when the shell emits OSC 133 integration markers — the runtime runs from the marker that
+starts the command (`C`) to the finish marker (`D`), and a finish without a start never signals. The `bell` channel rings
 exactly as `\x07` would (visual flash per [`bell`](#bell), urgency hint, `bell.command`, and a
 `bell` automation event); the `notify` channel shows a desktop notification — "Command
 Succeeded/Failed" with the runtime and exit code — which answers your own configuration rather

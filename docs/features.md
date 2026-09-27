@@ -84,7 +84,8 @@ bell, a desktop notification, or both. The notification names the outcome — "C
 "Command Failed" — with the runtime and exit code, and clicking it focuses the terminal.
 
 This needs a shell that emits OSC 133 integration markers, since the runtime runs from the
-command-start marker to the finish marker. A finish without a start never signals, and neither
+marker that starts the command (`C`) to the finish marker (`D`); time spent typing at the prompt
+does not count. A finish without a start never signals, and neither
 does a command that finishes within the threshold. The bell channel is the ordinary bell, so
 `bell.command` still runs and automation still hears a `bell` event; the notification channel is
 your own configuration rather than a program request, so it works even with

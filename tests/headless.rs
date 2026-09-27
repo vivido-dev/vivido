@@ -267,18 +267,24 @@ fn marker_program(marker: &str) -> Vec<String> {
 }
 
 /// A shell emitting OSC 133 markers drives semantic prompt/finish tracking.
+///
+/// The sequence is what real integrations send: `A` with options, the prompt text, `B` where
+/// input begins, `C` once a command runs, and `D` with its exit code followed by options. The
+/// first prompt idles for six seconds, as a user would before typing.
 #[cfg(unix)]
 fn integration_program() -> Vec<String> {
     vec![
         String::from("sh"),
         String::from("-c"),
         String::from(
-            "printf '\\033]133;A\\a'; i=0; while true; do printf '\\033]133;B\\a'; sleep 2; echo \"WORK-$i\"; printf '\\033]133;C\\a'; echo \"OUT-$i\"; printf '\\033]133;D;0\\a'; sleep 2; printf '\\033]133;A\\a'; sleep 2; i=$((i+1)); done",
+            "p() { printf '\\033]133;A;cl=line;aid=%s\\aPROMPT> \\033]133;B\\a' $$; }; p; sleep 6; i=0; while true; do echo; printf '\\033]133;C;\\a'; echo \"OUT-$i\"; printf '\\033]133;D;0;aid=%s\\a' $$; p; sleep 2; i=$((i+1)); done",
         ),
     ]
 }
 
 /// Windows ConPTY forwards unrecognized OSC sequences, so the same markers work there.
+///
+/// No double quotes: `-e` arguments containing them do not currently reach PowerShell intact.
 #[cfg(windows)]
 fn integration_program() -> Vec<String> {
     vec![
@@ -288,7 +294,7 @@ fn integration_program() -> Vec<String> {
         String::from("-NonInteractive"),
         String::from("-Command"),
         String::from(
-            "$e=[char]27; $b=[char]7; $i=0; [Console]::Write(\"$e]133;A$b\"); while ($true) { [Console]::Write(\"$e]133;B$b\"); Start-Sleep -Seconds 2; Write-Output \"WORK-$i\"; [Console]::Write(\"$e]133;C$b\"); Write-Output \"OUT-$i\"; [Console]::Write(\"$e]133;D;0$b\"); Start-Sleep -Seconds 2; [Console]::Write(\"$e]133;A$b\"); Start-Sleep -Seconds 2; $i++ }",
+            "$e=[char]27; $b=[char]7; function Write-TestPrompt { [Console]::Write($e + ']133;A;cl=line;aid=' + $PID + $b + 'PROMPT> ' + $e + ']133;B' + $b) }; Write-TestPrompt; Start-Sleep -Seconds 6; $i=0; while ($true) { [Console]::WriteLine(); [Console]::Write($e + ']133;C;' + $b); Write-Output ('OUT-' + $i); [Console]::Write($e + ']133;D;0;aid=' + $PID + $b); Write-TestPrompt; Start-Sleep -Seconds 2; $i++ }",
         ),
     ]
 }
@@ -323,14 +329,19 @@ fn static_program() -> Vec<String> {
 fn semantic_waits_follow_shell_integration_markers() {
     let session = Session::start("shell", &integration_program());
 
-    // The prompt marker predates the wait: tracked state resolves it immediately.
-    let ready = session.msg(&["wait", "prompt", "--timeout", "10s"]);
+    // The shell sits idle after `B`, the way every real integration leaves it. Tracked state
+    // resolves the wait at once; the first command is still seconds away.
+    session.msg(&["wait", "text", "PROMPT>", "--timeout", "10s"]);
+    let ready = session.msg(&["wait", "prompt", "--timeout", "2s"]);
     assert!(ready.contains(r#""ready":true"#), "prompt wait: {ready}");
+    assert!(ready.contains(r#""generation":0"#), "a prompt is not a command: {ready}");
 
-    // The next finish resolves with its own exit code, never an earlier command's.
+    // The next finish resolves with its own exit code, never an earlier command's, even though
+    // options follow the code.
     let finished = session.msg(&["wait", "command-finish", "--timeout", "15s"]);
     assert!(finished.contains(r#""status":"completed""#), "finish wait: {finished}");
     assert!(finished.contains(r#""exit_code":0"#), "finish wait: {finished}");
+    assert!(finished.contains(r#""generation":1"#), "finish wait: {finished}");
 
     // A shell emitting no markers never resolves a semantic wait.
     let plain = Session::start("plain", &shell_program());

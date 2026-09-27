@@ -184,9 +184,9 @@ pub struct AutomationWindowState {
 /// and nothing at all when the shell emits no markers.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CommandExecutionState {
-    /// The shell drew a prompt and is not currently running a command.
+    /// The shell is drawing a prompt or taking input (`A`/`P` through `B` until `C`).
     pub in_prompt: bool,
-    /// A submitted command is running (between `B`/`C` and `D`).
+    /// A submitted command is running (between `C` and `D`).
     pub command_running: bool,
     /// Command line of the running command, when an emitter reports it inline.
     pub last_command_line: Option<String>,
@@ -208,8 +208,8 @@ pub struct CommandExecutionState {
 pub struct CommandFinished {
     /// Exit code the shell reported, when it reported one.
     pub exit_code: Option<i32>,
-    /// Time between the observed start (`B`, refreshed by `C`) and this finish; `None` when the
-    /// shell emitted `D` without a start.
+    /// Time between the observed start (`C`) and this finish; `None` when the shell emitted `D`
+    /// without a start, as integrations do for an empty command line.
     pub duration: Option<Duration>,
 }
 
@@ -225,25 +225,21 @@ impl CommandExecutionState {
     ) -> Option<CommandFinished> {
         use crate::osc_notification::ShellIntegrationMarker as Marker;
         match marker {
-            Marker::PromptStart => {
+            // `B` ends the prompt, not the command line: the user has yet to type, so the shell
+            // stays at its prompt until `C`. A prompt marker arriving mid-command (a nested
+            // shell's prompt) also means the terminal now shows a prompt.
+            Marker::PromptStart | Marker::InputStart => {
                 self.in_prompt = true;
                 self.command_running = false;
                 self.command_started_at = None;
                 None
             },
-            Marker::CommandStart => {
+            Marker::CommandOutputStart => {
                 self.in_prompt = false;
                 self.command_running = true;
                 self.last_command_line = None;
                 self.command_started_at = Some(now);
                 self.command_generation = self.command_generation.saturating_add(1);
-                None
-            },
-            Marker::CommandOutputStart => {
-                self.command_running = true;
-                // `C` follows `B` within milliseconds; refreshing here measures from execution
-                // while still timing a shell that emits `C` without `B`.
-                self.command_started_at = Some(now);
                 None
             },
             Marker::CommandFinished { exit_code } => {
@@ -756,13 +752,16 @@ mod tests {
         assert!(shell.at_prompt());
         assert_eq!(shell.command_generation, 0);
 
-        assert_eq!(shell.apply(Marker::CommandStart, now), None);
+        // `B` closes the prompt and opens the input area: the shell is still idle.
+        assert_eq!(shell.apply(Marker::InputStart, now), None);
+        assert!(shell.at_prompt());
+        assert!(!shell.command_running);
+        assert_eq!(shell.command_generation, 0);
+
+        assert_eq!(shell.apply(Marker::CommandOutputStart, now), None);
         assert!(!shell.at_prompt());
         assert!(shell.command_running);
         assert_eq!(shell.command_generation, 1);
-
-        assert_eq!(shell.apply(Marker::CommandOutputStart, now), None);
-        assert!(shell.command_running);
 
         let finished = shell.apply(Marker::CommandFinished { exit_code: Some(2) }, now);
         assert!(!shell.command_running);
@@ -774,8 +773,12 @@ mod tests {
             Some(super::CommandFinished { exit_code: Some(2), duration: Some(Duration::ZERO) })
         );
 
-        // A second command advances the generation so waits can tell commands apart.
-        assert_eq!(shell.apply(Marker::CommandStart, now), None);
+        // A second command advances the generation so waits can tell commands apart; prompts
+        // alone do not.
+        assert_eq!(shell.apply(Marker::PromptStart, now), None);
+        assert_eq!(shell.apply(Marker::InputStart, now), None);
+        assert_eq!(shell.command_generation, 1);
+        assert_eq!(shell.apply(Marker::CommandOutputStart, now), None);
         let second = shell.apply(Marker::CommandFinished { exit_code: None }, now);
         assert_eq!(
             second,
@@ -787,12 +790,36 @@ mod tests {
     }
 
     #[test]
+    fn shell_sitting_after_input_start_is_at_its_prompt() {
+        use crate::osc_notification::ShellIntegrationMarker as Marker;
+        // Standard integrations end every prompt with `B` and then wait for the user, so a
+        // `wait prompt` registered at an idle shell sees exactly this state. It must be ready,
+        // and Windows close confirmation must not see a running command.
+        for markers in [
+            [Marker::PromptStart, Marker::InputStart].as_slice(),
+            &[Marker::PromptStart, Marker::PromptStart, Marker::InputStart],
+            &[Marker::InputStart],
+        ] {
+            let mut shell = CommandExecutionState::default();
+            for marker in markers {
+                shell.apply(*marker, Instant::now());
+            }
+            assert!(shell.at_prompt(), "{markers:?}");
+            assert!(!shell.command_running, "{markers:?}");
+            assert_eq!(shell.command_generation, 0, "{markers:?}");
+        }
+    }
+
+    #[test]
     fn shell_finish_reports_runtime_since_the_observed_start() {
         use crate::osc_notification::ShellIntegrationMarker as Marker;
         let mut shell = CommandExecutionState::default();
-        let start = Instant::now();
+        let prompt = Instant::now();
 
-        assert_eq!(shell.apply(Marker::CommandStart, start), None);
+        // Time spent typing after `B` is not command runtime; the clock starts at `C`.
+        assert_eq!(shell.apply(Marker::InputStart, prompt), None);
+        let start = prompt + Duration::from_secs(30);
+        assert_eq!(shell.apply(Marker::CommandOutputStart, start), None);
         let later = start + Duration::from_secs(7);
         let finished = shell.apply(Marker::CommandFinished { exit_code: Some(0) }, later);
         assert_eq!(
@@ -823,7 +850,7 @@ mod tests {
         let mut shell = CommandExecutionState::default();
         let start = Instant::now();
 
-        assert_eq!(shell.apply(Marker::CommandStart, start), None);
+        assert_eq!(shell.apply(Marker::CommandOutputStart, start), None);
         assert_eq!(shell.apply(Marker::PromptStart, start + Duration::from_secs(60)), None);
         // The orphaned start must not leak into the next command's finish.
         let finished = shell

@@ -72,13 +72,16 @@ pub enum ProgressState {
 /// Payloads stay tiny (`133;A`, `133;D;0`), so capturing them costs nothing beyond the
 /// terminator scan every other OSC body pays. Markers from a shell that never emits them
 /// simply never arrive, and waiting on them times out rather than guessing.
+///
+/// Every marker may carry `;key=value` options (`aid`, `cl`, `k`, `redraw`, `click_events`, …);
+/// none of them change the lifecycle, so they are accepted and ignored.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ShellIntegrationMarker {
-    /// `133;A`: the shell is drawing a prompt and will soon accept input.
+    /// `133;A`, `133;N`, or `133;P`: the shell is drawing a prompt, or one line of it.
     PromptStart,
-    /// `133;B`: the user submitted a command; the shell is parsing it.
-    CommandStart,
-    /// `133;C`: the command spawned and its output is beginning.
+    /// `133;B` or `133;I`: the prompt ended and the user's input begins; no command runs yet.
+    InputStart,
+    /// `133;C`: input ended; the command runs and its output begins.
     CommandOutputStart,
     /// `133;D[;<exit>]`: the command finished, optionally with an exit code.
     CommandFinished { exit_code: Option<i32> },
@@ -373,27 +376,32 @@ fn parse_progress(report: &[u8]) -> Option<ProgressReport> {
 
 /// Parse one `OSC 133` shell-lifecycle marker body (the bytes after `133;`).
 ///
-/// Only the FinalTerm/FTCS single-letter markers are recognized; anything else — including a
-/// bare terminator with no marker — is not shell integration and yields no message.
+/// Only the single-letter markers of the semantic-prompts proposal that move the shell lifecycle
+/// are recognized; anything else — `L` fresh-line, an unknown letter, or a bare terminator with
+/// no marker — is not shell integration and yields no message.
 fn parse_shell_integration(marker: &[u8]) -> Option<ShellIntegrationMarker> {
     let (kind, payload) = match marker.iter().position(|&byte| byte == b';') {
         Some(separator) => (&marker[..separator], Some(&marker[separator + 1..])),
         None => (marker, None),
     };
     match kind {
-        b"A" => Some(ShellIntegrationMarker::PromptStart),
-        b"B" => Some(ShellIntegrationMarker::CommandStart),
+        b"A" | b"N" | b"P" => Some(ShellIntegrationMarker::PromptStart),
+        b"B" | b"I" => Some(ShellIntegrationMarker::InputStart),
         b"C" => Some(ShellIntegrationMarker::CommandOutputStart),
         b"D" => {
-            let exit_code = payload
-                .filter(|payload| !payload.is_empty())
-                .and_then(|payload| std::str::from_utf8(payload).ok())
-                .and_then(|payload| payload.parse::<i32>().ok());
-            // A `D` with a non-numeric payload is malformed, not a finish without a code: a
-            // garbage exit code must never resolve `wait command-finish` as success.
-            if payload.is_some_and(|payload| !payload.is_empty()) && exit_code.is_none() {
-                return None;
-            }
+            // The exit code is the first field; options may follow it (`D;0;aid=7`) or stand in
+            // for it (`D;aid=7`).
+            let field = payload
+                .and_then(|payload| payload.split(|&byte| byte == b';').next())
+                .filter(|field| !field.is_empty() && !field.contains(&b'='));
+            let exit_code = match field {
+                Some(field) => {
+                    // A non-numeric code is malformed, not a finish without a code: a garbage
+                    // exit code must never resolve `wait command-finish` as success.
+                    Some(std::str::from_utf8(field).ok()?.parse::<i32>().ok()?)
+                },
+                None => None,
+            };
             Some(ShellIntegrationMarker::CommandFinished { exit_code })
         },
         _ => None,
@@ -1783,7 +1791,7 @@ mod tests {
                 "terminator {terminator:?}",
             );
             assert!(
-                matches!(messages[1], OscMessage::ShellIntegration(Marker::CommandStart)),
+                matches!(messages[1], OscMessage::ShellIntegration(Marker::InputStart)),
                 "terminator {terminator:?}",
             );
             assert!(
@@ -1800,10 +1808,48 @@ mod tests {
     }
 
     #[test]
+    fn shell_integration_markers_accept_options_and_prompt_variants() {
+        use ShellIntegrationMarker as Marker;
+        // What real integrations send (Ghostty's bash, zsh, fish, and elvish scripts, and the
+        // semantic-prompts proposal): options on every marker, explicit prompt lines, and an exit
+        // code followed or replaced by options.
+        let cases: [(&str, Marker); 12] = [
+            ("A;cl=line;aid=4242", Marker::PromptStart),
+            ("A;redraw=last;cl=line;aid=4242", Marker::PromptStart),
+            ("N;aid=4242", Marker::PromptStart),
+            ("P;k=i", Marker::PromptStart),
+            ("P;k=s", Marker::PromptStart),
+            ("B", Marker::InputStart),
+            ("I", Marker::InputStart),
+            ("C;", Marker::CommandOutputStart),
+            ("C;cmdline_url=echo%20hi", Marker::CommandOutputStart),
+            ("D;0;aid=4242", Marker::CommandFinished { exit_code: Some(0) }),
+            ("D;aid=4242", Marker::CommandFinished { exit_code: None }),
+            ("D;;aid=4242", Marker::CommandFinished { exit_code: None }),
+        ];
+        for (body, expected) in cases {
+            let input = format!("\x1b]133;{body}\x07");
+            match parse_messages(input.as_bytes()).as_slice() {
+                [OscMessage::ShellIntegration(marker)] => assert_eq!(*marker, expected, "{body}"),
+                unexpected => panic!("{body} parsed as {unexpected:?}"),
+            }
+        }
+    }
+
+    #[test]
     fn shell_integration_rejects_malformed_markers() {
-        // No marker letter, an unknown letter, and a non-numeric exit code are not
-        // integration events: garbage must never resolve a semantic wait.
-        for body in ["\x1b]133;\x07", "\x1b]133;Q\x07", "\x1b]133;D;ok\x07", "\x1b]1337;foo\x07"] {
+        // No marker letter, an unknown letter, a letter with trailing bytes, fresh-line only, and
+        // a non-numeric exit code are not integration events: garbage must never resolve a
+        // semantic wait.
+        for body in [
+            "\x1b]133;\x07",
+            "\x1b]133;Q\x07",
+            "\x1b]133;Aextra\x07",
+            "\x1b]133;L\x07",
+            "\x1b]133;D;ok\x07",
+            "\x1b]133;D;ok;aid=1\x07",
+            "\x1b]1337;foo\x07",
+        ] {
             assert!(
                 parse_messages(body.as_bytes()).is_empty(),
                 "malformed marker parsed: {body:?}"

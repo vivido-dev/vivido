@@ -215,7 +215,7 @@ not fit at end-of-line get a leading spacer cell when DECAWM is on.
 | Reset special colors | 105 | ❌ | |
 | Reset FG / BG / cursor | 110, 111, 112 | ✅ | |
 | Reset pointer/Tek/highlight | 113–119 | ❌ | |
-| Shell integration | 133 | ❌ | |
+| Shell integration | 133 | ⚠️ | Lifecycle only: `A`/`N`/`P` prompt, `B`/`I` input start, `C` command running, `D[;exit]` finished; options such as `aid`, `cl`, and `k` are accepted and ignored. Drives IPC `wait prompt`/`wait command-finish`, Windows close confirmation, and command-finish notifications. No prompt marks in the grid, so no prompt jumping or output selection. |
 | Session color scheme (ConPTY) | 9;1 / 9;… variants | ❌ | |
 
 ## DCS, APC, and media protocols
