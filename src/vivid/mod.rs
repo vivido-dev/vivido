@@ -6993,8 +6993,8 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires built SDK bindings, their .venv (or VIVID_OVERLAY_TEST_PYTHON) and Node"]
-    fn native_overlay_python_and_typescript_bindings() {
+    #[ignore = "requires built SDK bindings, their .venv (or VIVID_OVERLAY_TEST_PYTHON), Node, and LuaJIT"]
+    fn native_overlay_language_bindings() {
         let _gpu = crate::display::renderer::gpu_test_lock();
         use crate::display::renderer::SceneRenderer;
         use crate::display::window::RenderSource;
@@ -7013,10 +7013,15 @@ mod tests {
             &["vivid_sdk/.venv/bin/python".into(), "vivid_sdk/.venv/Scripts/python.exe".into()],
         );
         let node = std::env::var_os("VIVID_OVERLAY_TEST_NODE").unwrap_or_else(|| "node".into());
+        // The Lua fixture loads the module `vivid_sdk/lua/build.sh` stages, for whichever Lua
+        // it was built for; LuaJIT is that script's default.
+        let lua = std::env::var_os("VIVID_OVERLAY_TEST_LUA").unwrap_or_else(|| "luajit".into());
+        let lua_cpath = sdk.join("lua").join(if cfg!(windows) { "?.dll" } else { "?.so" });
         for (executable, fixture, mode) in [
             (&python, "overlay_python.py", "blocking"),
             (&python, "overlay_python.py", "async"),
             (&node, "overlay_node.mjs", "async"),
+            (&lua, "overlay_lua.lua", "blocking"),
         ] {
             let service =
                 socket_service!(VividService::start_with_wake(test_geometry(), Arc::new(|_| {})));
@@ -7035,6 +7040,7 @@ mod tests {
                 .arg(mode)
                 .env("VIVID_ROOT_SECRET", service.root_secret())
                 .env("PYTHONPATH", sdk.join("python"))
+                .env("LUA_CPATH", lua_cpath.as_os_str())
                 .stdin(Stdio::piped());
             for endpoint in [
                 "VIVID_ENDPOINT_CONTROL",
