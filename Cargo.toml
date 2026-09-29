@@ -1,6 +1,6 @@
 [package]
 name = "vivido"
-version = "0.5.1"
+version = "0.5.2"
 authors = ["Wensheng Wang <wenshengwang@gmail.com>"]
 license = "Apache-2.0"
 description = "A fast cross-platform terminal emulator with protocol-neutral media hooks"
@@ -84,7 +84,7 @@ vvte = { version = "0.15", path = "../vvte", default-features = false, features 
   "serde",
 ] }
 zeroize = "1.8.1"
-vivid_sdk = { version = "1.5.8", path = "../vivid_sdk" }
+vivid_sdk = { version = "1.5.9", path = "../vivid_sdk" }
 vello = { version = "0.10", default-features = false, features = ["wgpu"] }
 winit = { version = "0.30", default-features = false, features = [
   "rwh_06",
