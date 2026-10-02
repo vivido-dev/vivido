@@ -58,7 +58,7 @@ warning_timeout = 5
 # ─────────────────────────────────────────────────────────────────────────────
 [window]
 # Blank space around the grid, in pixels (scaled by DPI).
-padding = { x = 0, y = 0 }
+padding = { x = 3, y = 3 }
 
 # Distribute leftover space evenly as extra padding.
 dynamic_padding = false

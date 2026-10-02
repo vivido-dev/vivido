@@ -123,7 +123,7 @@ terminfo entry; SSH forwards `TERM`, but not a locally materialized terminfo dat
 |---|---|---|---|
 | `dimensions` | `{ columns, lines }` | `{ 0, 0 }` | Initial size in cells. **Both** must be non-zero to take effect. |
 | `position` | `{ x, y }` | *auto* | Startup position in physical pixels. Unset lets the window manager decide. |
-| `padding` | `{ x, y }` | `{ 0, 0 }` | Blank space around the grid, in pixels (scaled by DPI). |
+| `padding` | `{ x, y }` | `{ 3, 3 }` | Blank space around the grid, in pixels (scaled by DPI). |
 | `dynamic_padding` | bool | `false` | Distribute leftover space evenly as extra padding. |
 | `decorations` | enum | `Full` | `Full`, `None`, `Transparent`, or `Buttonless`. |
 | `opacity` | float `0.0`–`1.0` | `1.0` | Background opacity. Requires a compositor that honors it. |
@@ -139,7 +139,7 @@ terminfo entry; SSH forwards `TERM`, but not a locally materialized terminfo dat
 
 ```toml
 [window]
-padding = { x = 6, y = 6 }
+padding = { x = 3, y = 3 }
 opacity = 0.95
 decorations = "Full"
 startup_mode = "Windowed"

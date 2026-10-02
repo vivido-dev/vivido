@@ -64,7 +64,7 @@ impl Default for WindowConfig {
         Self {
             dynamic_title: true,
             blur: Default::default(),
-            padding: Default::default(),
+            padding: Delta { x: 3, y: 3 },
             opacity: Default::default(),
             position: Default::default(),
             identity: Default::default(),
