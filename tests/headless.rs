@@ -396,15 +396,20 @@ fn progress_program(trigger: &Path) -> Vec<String> {
     ]
 }
 
-/// Whether the screenshot's top rows are a solid band unlike the terminal background.
-fn has_top_band(path: &Path) -> bool {
+/// Whether the top padding contains a full-width band unlike the terminal background.
+fn has_progress_band(path: &Path, window: &serde_json::Value) -> bool {
     let image = image::open(path).expect("decode screenshot PNG").into_rgba8();
     let (width, height) = image.dimensions();
     let background = image.get_pixel(width - 1, height - 1).0;
-    // Sample away from both ends of the first row; a full bar spans the whole width.
-    [width / 4, width / 2, width * 3 / 4]
-        .into_iter()
-        .all(|x| image.get_pixel(x, 0).0[..3] != background[..3])
+    let padding_y = window["padding"]["y"].as_f64().expect("window top padding");
+    // Padding moves the bar below row zero. Scan the padding, or the first row when there is
+    // none, without entering the text area where glyphs could be mistaken for progress.
+    let rows = padding_y.ceil().max(1.).min(f64::from(height)) as u32;
+    (0..rows).any(|y| {
+        [width / 4, width / 2, width * 3 / 4]
+            .into_iter()
+            .all(|x| image.get_pixel(x, y).0[..3] != background[..3])
+    })
 }
 
 /// Emit the agent's busy title without OSC progress, including an intermediate OSC clear, and
@@ -458,7 +463,10 @@ fn agent_titles_draw_progress_without_osc_reports_and_clear_only_their_own_windo
         assert_eq!(state["window"]["window_id"], 1, "owners reuse the same local ID");
         assert_eq!(state["progress"], busy);
         let path = PathBuf::from(session.msg(&["screenshot", "--window-id", "1"]).trim());
-        assert!(has_top_band(&path), "title activity draws the busy track and segment");
+        assert!(
+            has_progress_band(&path, &state["window"]),
+            "title activity draws the busy track and segment"
+        );
         let _ = fs::remove_file(&path);
     }
 
@@ -468,10 +476,11 @@ fn agent_titles_draw_progress_without_osc_reports_and_clear_only_their_own_windo
     assert_eq!(inspect(&muse)["progress"], busy);
     fs::write(&claude_trigger, b"").expect("finish the Claude turn");
     claude.msg(&["wait", "text", "TITLE-IDLE", "--window-id", "1", "--timeout", "10s"]);
-    assert_eq!(inspect(&claude)["progress"], idle);
+    let state = inspect(&claude);
+    assert_eq!(state["progress"], idle);
     assert_eq!(inspect(&muse)["progress"], busy, "the other owner stays busy");
     let path = PathBuf::from(claude.msg(&["screenshot", "--window-id", "1"]).trim());
-    assert!(!has_top_band(&path), "the idle title removes the visible bar");
+    assert!(!has_progress_band(&path, &state["window"]), "the idle title removes the visible bar");
     let _ = fs::remove_file(&path);
 
     muse.msg(&["reset-terminal", "--window-id", "1"]);
@@ -669,26 +678,29 @@ fn osc_progress_draws_a_bar_and_clears_it() {
     let trigger = env::temp_dir().join(format!("vivido-it-{}-progress-clear", std::process::id()));
     let _ = fs::remove_file(&trigger);
     let session = Session::start("progress", &progress_program(&trigger));
-    let progress = || -> serde_json::Value {
-        let inspect: serde_json::Value =
-            serde_json::from_str(&session.msg(&["inspect"])).expect("inspect JSON");
-        inspect["progress"].clone()
+    let inspect = || -> serde_json::Value {
+        serde_json::from_str(&session.msg(&["inspect"])).expect("inspect JSON")
     };
 
     session.msg(&["wait", "text", "PROGRESS-SET", "--timeout", "10s"]);
-    assert_eq!(progress(), serde_json::json!({"state": "normal", "percent": 100}));
+    let state = inspect();
+    assert_eq!(state["progress"], serde_json::json!({"state": "normal", "percent": 100}));
 
     // Let the 200 ms fill ease settle so the bar spans the full width.
     std::thread::sleep(Duration::from_millis(400));
     let path = PathBuf::from(session.msg(&["screenshot"]).trim());
-    assert!(has_top_band(&path), "a full progress bar crosses the top of the surface");
+    assert!(
+        has_progress_band(&path, &state["window"]),
+        "a full progress bar crosses the top padding"
+    );
     let _ = fs::remove_file(&path);
 
     fs::write(&trigger, b"").expect("write the clear trigger");
     session.msg(&["wait", "text", "PROGRESS-CLEARED", "--timeout", "10s"]);
-    assert_eq!(progress(), serde_json::json!({"state": "none", "percent": null}));
+    let state = inspect();
+    assert_eq!(state["progress"], serde_json::json!({"state": "none", "percent": null}));
     let path = PathBuf::from(session.msg(&["screenshot"]).trim());
-    assert!(!has_top_band(&path), "a removed bar is no longer drawn");
+    assert!(!has_progress_band(&path, &state["window"]), "a removed bar is no longer drawn");
     let _ = fs::remove_file(&path);
     let _ = fs::remove_file(&trigger);
 }

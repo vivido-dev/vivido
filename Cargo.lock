@@ -956,9 +956,9 @@ dependencies = [
 
 [[package]]
 name = "dirs"
-version = "6.0.0"
+version = "7.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c3e8aa94d75141228480295a7d0e7feb620b1a5ad9f12bc40be62411e38cce4e"
+checksum = "8d57d423b3c82e89b9a24ca3091fee61f456a26edbd28d26c65906f4bc1dcd8f"
 dependencies = [
  "dirs-sys",
 ]
@@ -3985,7 +3985,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vivid_protocol"
-version = "1.5.9"
+version = "1.5.10"
 dependencies = [
  "base64",
  "hmac",
@@ -4028,7 +4028,7 @@ dependencies = [
  "futures-lite",
  "futures-timer",
  "getrandom 0.4.3",
- "hashbrown 0.15.5",
+ "hashbrown 0.17.1",
  "hex",
  "home",
  "image",
