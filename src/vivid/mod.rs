@@ -6745,7 +6745,9 @@ mod tests {
                     "movement preserves the texture used by cached terminal scenes"
                 );
             } else {
-                eprintln!("overlay GPU readback unavailable: no usable adapter");
+                // Everything below needs a presented overlay to hit, focus, and dismiss.
+                eprintln!("overlay GPU readback unavailable: no usable adapter; skipping");
+                return;
             }
         }
         assert_eq!(lock(&service.shared.overlays).drawing(&service.scene).len(), 2);
