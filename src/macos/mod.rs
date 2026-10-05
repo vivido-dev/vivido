@@ -1,6 +1,7 @@
 use objc2::runtime::AnyObject;
 use objc2_foundation::{NSDictionary, NSString, NSUserDefaults, ns_string};
 
+pub mod activity;
 pub mod locale;
 pub mod menu;
 pub mod proc;

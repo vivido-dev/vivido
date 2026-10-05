@@ -188,6 +188,8 @@ pub struct WindowContext {
     cursor_blink_timed_out: bool,
     prev_bell_cmd: Option<Instant>,
     notifications: NotificationController,
+    #[cfg(target_os = "macos")]
+    _terminal_activity: crate::macos::activity::TerminalActivity,
     /// Progress last shown in this window's taskbar button.
     #[cfg(windows)]
     taskbar_progress: Option<crate::display::progress::Progress>,
@@ -646,6 +648,8 @@ impl WindowContext {
             cursor_blink_timed_out: Default::default(),
             prev_bell_cmd: Default::default(),
             notifications,
+            #[cfg(target_os = "macos")]
+            _terminal_activity: crate::macos::activity::TerminalActivity::new(),
             #[cfg(windows)]
             taskbar_progress: None,
             message_buffer: Default::default(),
