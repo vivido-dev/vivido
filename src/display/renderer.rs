@@ -1,8 +1,8 @@
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::sync::Arc;
 #[cfg(any(unix, windows))]
 use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::{Arc, LazyLock};
 #[cfg(any(unix, windows))]
 use std::time::Instant;
 
@@ -769,7 +769,7 @@ impl SceneRenderer {
                 &surface_view,
             );
             self.queue.submit([encoder.finish()]);
-            surface_texture.present();
+            self.queue.present(surface_texture);
         }
 
         self.gpu_health.check()?;
@@ -826,9 +826,13 @@ impl SceneRenderer {
         let (sender, receiver) = mpsc::channel();
         let callback_buffer = readback.clone();
         readback.slice(..).map_async(wgpu::MapMode::Read, move |result| {
-            let result = result
-                .map_err(|err| err.to_string())
-                .map(|()| callback_buffer.slice(..).get_mapped_range().to_vec());
+            let result = result.map_err(|err| err.to_string()).and_then(|()| {
+                callback_buffer
+                    .slice(..)
+                    .get_mapped_range()
+                    .map(|view| view.to_vec())
+                    .map_err(|err| err.to_string())
+            });
             callback_buffer.unmap();
             let _ = sender.send(result);
         });
@@ -1108,6 +1112,7 @@ fn create_window_surface(
     let config = wgpu::SurfaceConfiguration {
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
         format,
+        color_space: wgpu::SurfaceColorSpace::Auto,
         width,
         height,
         present_mode: wgpu::PresentMode::AutoVsync,
@@ -1156,8 +1161,13 @@ fn create_window_surface(
 ///
 /// Tries a real GPU first, then falls back to a software adapter (lavapipe on Linux, WARP on
 /// Windows) so a headless terminal still renders on a machine with no display hardware at all.
+///
+/// The instance is created once per process. Creating a Vulkan instance loads every installed ICD,
+/// and some (NVIDIA's) open `$DISPLAY` while doing so; a stale forwarded X display costs seconds
+/// per attempt. Adapters are still requested afresh, so device-loss recovery gets a new device.
 fn offscreen_device() -> Result<(wgpu::Device, wgpu::Queue), Error> {
-    let instance = wgpu::Instance::default();
+    static INSTANCE: LazyLock<wgpu::Instance> = LazyLock::new(wgpu::Instance::default);
+    let instance = &*INSTANCE;
 
     let mut attempts = Vec::new();
     for (power, fallback) in [
@@ -1169,6 +1179,7 @@ fn offscreen_device() -> Result<(wgpu::Device, wgpu::Queue), Error> {
             power_preference: power,
             force_fallback_adapter: fallback,
             compatible_surface: None,
+            apply_limit_buckets: false,
         };
         match block_on(instance.request_adapter(&options)) {
             Ok(adapter) => {
@@ -1472,6 +1483,9 @@ mod tests {
                 .expect("offscreen renderer");
         renderer.render(&Scene::new(), Color::BLACK).expect("first frame");
         renderer.device.destroy();
+        // `destroy` reports the loss only once the queue drains, and the first frame may still be
+        // in flight; wait so the loss is known before the resize, as with a real device loss.
+        let _ = renderer.device.poll(wgpu::PollType::wait_indefinitely());
 
         // This was the Windows crash: resizing used the lost device's invalid texture and
         // panicked in Texture::create_view before Display could enter renderer recovery.
