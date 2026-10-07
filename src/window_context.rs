@@ -19,11 +19,11 @@ use std::rc::Rc;
 use std::sync::Arc;
 #[cfg(any(unix, windows))]
 use std::sync::Mutex;
-#[cfg(windows)]
+#[cfg(any(target_os = "macos", windows))]
 use std::sync::atomic::AtomicBool;
 #[cfg(any(unix, windows))]
 use std::sync::atomic::{AtomicU64, Ordering};
-#[cfg(windows)]
+#[cfg(any(target_os = "macos", windows))]
 use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -122,8 +122,8 @@ fn terminal_accessibility_focused(terminal_focused: bool, overlay_focused: bool)
     terminal_focused && !overlay_focused
 }
 
-/// Maximum delay between directly presented frames during continuous Windows input or PTY output.
-#[cfg(windows)]
+/// Minimum interval between direct frames during continuous native input or PTY output.
+#[cfg(any(target_os = "macos", windows))]
 const LATENCY_SENSITIVE_FRAME_INTERVAL: Duration = Duration::from_millis(16);
 
 #[cfg(any(unix, windows))]
@@ -178,9 +178,9 @@ pub struct WindowContext {
     pub display: Display,
     pub dirty: bool,
     event_queue: Vec<WinitEvent<Event>>,
-    #[cfg(windows)]
-    last_latency_sensitive_draw: Option<Instant>,
-    #[cfg(windows)]
+    #[cfg(any(target_os = "macos", windows))]
+    last_draw: Option<Instant>,
+    #[cfg(any(target_os = "macos", windows))]
     latency_sensitive_frame_timer: LatencySensitiveFrameTimer,
     #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     event_proxy: EventProxy,
@@ -248,20 +248,20 @@ fn assign_ipc_window_id(requested: Option<u64>) -> u64 {
     }
 }
 
-/// Active Windows wake for the final update accumulated by the direct-draw rate limiter.
+/// Active wake for the final update accumulated by the direct-draw rate limiter.
 ///
-/// The ordinary scheduler advances from winit's `AboutToWait` callback. ConPTY and native input
-/// can keep the Windows message queue busy enough that callback never arrives, so a timer stored
+/// The ordinary scheduler advances from winit's `AboutToWait` callback. Continuous PTY output
+/// can keep the native event queue busy enough that callback never arrives, so a timer stored
 /// only in the scheduler can leave the last prompt or selection change invisible indefinitely.
 /// This worker owns a bounded one-slot queue and coalesces all requests until the main loop
 /// acknowledges the corresponding event.
-#[cfg(windows)]
+#[cfg(any(target_os = "macos", windows))]
 struct LatencySensitiveFrameTimer {
     sender: SyncSender<Duration>,
     pending: Arc<AtomicBool>,
 }
 
-#[cfg(windows)]
+#[cfg(any(target_os = "macos", windows))]
 impl LatencySensitiveFrameTimer {
     fn new(event_sink: EventSink, window_id: WindowId) -> Self {
         let (sender, receiver) = mpsc::sync_channel(1);
@@ -353,7 +353,7 @@ fn flushes_staged_input(event: &WinitEvent<Event>) -> bool {
     ) || is_latency_sensitive_input(event)
 }
 
-#[cfg(windows)]
+#[cfg(any(target_os = "macos", windows))]
 fn latency_sensitive_draw_delay(last_draw: Option<Instant>, now: Instant) -> Option<Duration> {
     last_draw.and_then(|last_draw| {
         LATENCY_SENSITIVE_FRAME_INTERVAL
@@ -492,7 +492,7 @@ impl WindowContext {
             display.size_info.columns()
         );
 
-        #[cfg(windows)]
+        #[cfg(any(target_os = "macos", windows))]
         let latency_sensitive_frame_timer =
             LatencySensitiveFrameTimer::new(proxy.clone(), display.window.id());
         let event_proxy = EventProxy::new(proxy, display.window.id());
@@ -621,6 +621,7 @@ impl WindowContext {
         // The event loop channel allows write requests from the event processor
         // to be sent to the pty loop and ultimately written to the pty.
         let loop_tx = event_loop.channel();
+        event_proxy.set_pty_writer(loop_tx.clone());
 
         // Kick off the I/O thread.
         let io_thread = event_loop.spawn();
@@ -656,9 +657,9 @@ impl WindowContext {
             window_config: Default::default(),
             search_state: Default::default(),
             event_queue: Default::default(),
-            #[cfg(windows)]
-            last_latency_sensitive_draw: None,
-            #[cfg(windows)]
+            #[cfg(any(target_os = "macos", windows))]
+            last_draw: None,
+            #[cfg(any(target_os = "macos", windows))]
             latency_sensitive_frame_timer,
             modifiers: Default::default(),
             occluded: Default::default(),
@@ -854,16 +855,20 @@ impl WindowContext {
             (winit::dpi::PhysicalPosition::new(x, y), winit::dpi::PhysicalSize::new(w, h))
         });
         self.display.window.set_overlay_ime_area(area);
+        #[cfg(any(target_os = "macos", windows))]
+        {
+            self.last_draw = Some(Instant::now());
+        }
         presented
     }
 
-    /// Present latency-sensitive state without waiting for Windows to synthesize `WM_PAINT`.
+    /// Present latency-sensitive state without waiting for a native redraw callback.
     ///
-    /// `WM_PAINT` has lower priority than posted input and PTY wakeups, so a continuous stream can
-    /// otherwise update the terminal model for seconds without presenting it. The timestamp is
-    /// recorded after the draw, allowing subsequent updates to accumulate for one frame interval
+    /// Native redraws can wait behind posted input and PTY wakeups on macOS and Windows, so a
+    /// continuous stream can update the terminal model for seconds without presenting it. The
+    /// timestamp is recorded after the draw, allowing updates to accumulate for one frame interval
     /// instead of rendering each event and falling behind the stream.
-    #[cfg(windows)]
+    #[cfg(any(target_os = "macos", windows))]
     pub fn draw_latency_sensitive(&mut self, scheduler: &mut Scheduler) -> Option<bool> {
         if !self.dirty
             || self.occluded
@@ -874,51 +879,30 @@ impl WindowContext {
         }
 
         let now = Instant::now();
-        if let Some(delay) = latency_sensitive_draw_delay(self.last_latency_sensitive_draw, now) {
+        if let Some(delay) = latency_sensitive_draw_delay(self.last_draw, now) {
             self.latency_sensitive_frame_timer.schedule(delay);
-            return None;
+            // The update is handled by the active timer. Do not fall back to a native redraw,
+            // which would bypass this same interval when a scheduled Frame just opened its gate.
+            return Some(false);
         }
 
-        let presented = self.draw(scheduler);
-        self.last_latency_sensitive_draw = Some(Instant::now());
-        Some(presented)
+        Some(self.draw(scheduler))
     }
 
-    /// Present the accumulated state when the Windows frame timer expires.
-    ///
-    /// The latency-sensitive path deliberately accumulates updates for one frame interval. Its
-    /// timer must finish that interval with a direct presentation; falling back to `WM_PAINT`
-    /// recreates the starvation this path exists to avoid and can leave the final typed bytes
-    /// invisible until another mouse event arrives.
-    #[cfg(windows)]
-    pub fn draw_scheduled_frame(&mut self, scheduler: &mut Scheduler) -> Option<bool> {
-        if !self.dirty
-            || self.occluded
-            || self.display.window.is_headless()
-            || self.display.window.is_visible() == Some(false)
-        {
-            return None;
-        }
-
-        let presented = self.draw(scheduler);
-        self.last_latency_sensitive_draw = Some(Instant::now());
-        Some(presented)
-    }
-
-    /// Acknowledge the active Windows tail-frame wake so another interval can be queued.
-    #[cfg(windows)]
+    /// Acknowledge the active tail-frame wake so another interval can be queued.
+    #[cfg(any(target_os = "macos", windows))]
     pub fn acknowledge_latency_sensitive_frame(&self) {
         self.latency_sensitive_frame_timer.acknowledge();
     }
 
     /// Open the coalescing gate for another terminal-model notification.
-    #[cfg(windows)]
+    #[cfg(any(target_os = "macos", windows))]
     pub fn acknowledge_terminal_wakeup(&self) {
         self.event_proxy.acknowledge_terminal_wakeup();
     }
 
-    /// Take the complete transcript span accumulated behind one Windows UI notification.
-    #[cfg(windows)]
+    /// Take the complete transcript span accumulated behind one UI notification.
+    #[cfg(any(target_os = "macos", windows))]
     pub fn take_pty_output(&self, fallback: (u64, u64)) -> (u64, u64) {
         self.event_proxy.take_pty_output(fallback)
     }
@@ -1466,6 +1450,7 @@ impl WindowContext {
         self.shell_pid = shell_pid;
         self.shell_integration = shell_integration;
         self.notifier = Notifier(event_loop.channel());
+        self.event_proxy.set_pty_writer(self.notifier.0.clone());
         self.io_thread = Some(event_loop.spawn());
         self.automation.exit_status = None;
         self.complete_client_reset();
@@ -4055,9 +4040,10 @@ mod vivid_environment_tests {
     #[cfg(windows)]
     use super::vivid_wslenv;
     #[cfg(windows)]
+    use super::windows_path_from_shell_report;
+    #[cfg(any(target_os = "macos", windows))]
     use super::{
         LATENCY_SENSITIVE_FRAME_INTERVAL, LatencySensitiveFrameTimer, latency_sensitive_draw_delay,
-        windows_path_from_shell_report,
     };
     #[cfg(any(unix, windows))]
     use super::{ResolvedMousePosition, append_mouse_report};
@@ -4198,7 +4184,7 @@ mod vivid_environment_tests {
         assert!(is_latency_sensitive_input(&event));
     }
 
-    #[cfg(windows)]
+    #[cfg(any(target_os = "macos", windows))]
     #[test]
     fn latency_sensitive_draws_are_bounded_to_one_per_frame_interval() {
         let start = std::time::Instant::now();
@@ -4217,7 +4203,7 @@ mod vivid_environment_tests {
         );
     }
 
-    #[cfg(windows)]
+    #[cfg(any(target_os = "macos", windows))]
     #[test]
     fn latency_sensitive_tail_wake_is_active_and_coalesced() {
         let (sink, receiver) = crate::event::EventSink::headless();

@@ -500,6 +500,7 @@ struct PendingInput {
     completion: Option<u64>,
 }
 
+#[derive(Debug)]
 pub struct Notifier(pub EventLoopSender);
 
 impl event::Notify for Notifier {
@@ -558,7 +559,7 @@ impl std::error::Error for EventLoopSendError {
     }
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct EventLoopSender {
     sender: Sender<Msg>,
     poller: Arc<Poller>,
@@ -568,6 +569,75 @@ impl EventLoopSender {
     pub fn send(&self, msg: Msg) -> Result<(), EventLoopSendError> {
         self.sender.send(msg).map_err(EventLoopSendError::Send)?;
         self.poller.notify().map_err(EventLoopSendError::Io)
+    }
+}
+
+#[cfg(test)]
+mod terminal_reply_tests {
+    use super::*;
+    use crate::event::{EventProxy, EventSink, EventType};
+    use winit::window::WindowId;
+
+    fn channel() -> (EventLoopSender, Receiver<Msg>) {
+        let (sender, receiver) = mpsc::channel();
+        (EventLoopSender { sender, poller: Arc::new(Poller::new().unwrap()) }, receiver)
+    }
+
+    fn expect_reply(receiver: &Receiver<Msg>, expected: &[u8]) {
+        let Msg::Input { bytes, completion } = receiver.try_recv().unwrap() else {
+            panic!("expected terminal reply");
+        };
+        assert_eq!(bytes.as_ref(), expected);
+        assert_eq!(completion, None);
+    }
+
+    #[test]
+    fn replies_bypass_ui_and_remain_ordered() {
+        let (sink, ui) = EventSink::headless();
+        let proxy = EventProxy::new(sink, WindowId::dummy());
+        let (writer, replies) = channel();
+        proxy.set_pty_writer(writer);
+        for text in ["\x1b[0n", "\x1b[3;4R", ""] {
+            EventListener::send_event(&proxy, Event::PtyWrite(text.into()));
+        }
+        expect_reply(&replies, b"\x1b[0n");
+        expect_reply(&replies, b"\x1b[3;4R");
+        assert!(replies.try_recv().is_err());
+        assert!(ui.try_recv().is_err());
+    }
+
+    #[test]
+    fn replacing_one_owner_writer_leaves_another_owner_intact() {
+        let (sink, ui) = EventSink::headless();
+        let first = EventProxy::new(sink.clone(), WindowId::dummy());
+        let second = EventProxy::new(sink, WindowId::dummy());
+        let first_parser = first.clone();
+        let (writer, old_replies) = channel();
+        first.set_pty_writer(writer);
+        let (writer, other_replies) = channel();
+        second.set_pty_writer(writer);
+        EventListener::send_event(&first_parser, Event::PtyWrite("old".into()));
+        expect_reply(&old_replies, b"old");
+
+        let (writer, new_replies) = channel();
+        first.set_pty_writer(writer);
+        EventListener::send_event(&first_parser, Event::PtyWrite("new".into()));
+        EventListener::send_event(&second, Event::PtyWrite("other".into()));
+        expect_reply(&new_replies, b"new");
+        expect_reply(&other_replies, b"other");
+        assert!(old_replies.try_recv().is_err());
+        assert!(new_replies.try_recv().is_err());
+        assert!(other_replies.try_recv().is_err());
+        assert!(ui.try_recv().is_err());
+    }
+
+    #[test]
+    fn unattached_proxy_preserves_event_listener_contract() {
+        let (sink, ui) = EventSink::headless();
+        let proxy = EventProxy::new(sink, WindowId::dummy());
+        EventListener::send_event(&proxy, Event::PtyWrite("reply".into()));
+        assert!(matches!(ui.try_recv().unwrap().payload(),
+            EventType::Terminal(Event::PtyWrite(text)) if text == "reply"));
     }
 }
 

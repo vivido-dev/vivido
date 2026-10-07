@@ -36,6 +36,10 @@ harness = false
 name = "macos_background_panes"
 harness = false
 
+[[test]]
+name = "macos_output_frames"
+harness = false
+
 [dependencies]
 ahash = { version = "0.8", features = ["no-rng"] }
 hashbrown = { version = "0.17", default-features = false }

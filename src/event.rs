@@ -42,7 +42,7 @@ use winit::raw_window_handle::HasDisplayHandle;
 use winit::window::WindowId;
 
 use crate::terminal::event::{Event as TerminalEvent, EventListener, Notify};
-use crate::terminal::event_loop::Notifier;
+use crate::terminal::event_loop::{EventLoopSender, Notifier};
 use crate::terminal::grid::{Dimensions, Scroll};
 use crate::terminal::index::{Boundary, Column, Direction, Line, Point, Side};
 use crate::terminal::selection::{Selection, SelectionType};
@@ -4262,6 +4262,18 @@ impl Processor {
         }
 
         let _presented = if is_redraw {
+            #[cfg(any(target_os = "macos", windows))]
+            {
+                // A native redraw may already be queued when a PTY wake presents directly.
+                // Consume that request, but keep its damage for the active timer if this frame
+                // is too early. Otherwise native and direct frames can alternate unthrottled.
+                window_context.display.window.requested_redraw = false;
+                window_context.dirty = true;
+                window_context
+                    .draw_latency_sensitive(&mut self.scheduler)
+                    .or_else(|| Some(window_context.draw(&mut self.scheduler)))
+            }
+            #[cfg(not(any(target_os = "macos", windows)))]
             Some(window_context.draw(&mut self.scheduler))
         } else {
             #[cfg(windows)]
@@ -4585,19 +4597,18 @@ impl Processor {
             },
             (EventType::Terminal(TerminalEvent::Wakeup), Some(window_id)) => {
                 if let Some(window_context) = self.windows.get_mut(window_id) {
-                    #[cfg(windows)]
+                    #[cfg(any(target_os = "macos", windows))]
                     window_context.acknowledge_terminal_wakeup();
                     window_context.dirty = true;
                     // Output is how a shell that sends no OSC 7 shows it changed folder.
                     #[cfg(target_os = "macos")]
                     window_context.show_native_title();
 
-                    // Posted PTY events can keep Windows' higher-priority message queues busy
-                    // long enough to starve both WM_PAINT and AboutToWait. Present through the
-                    // same bounded direct path as continuous wheel input so output remains live.
-                    #[cfg(windows)]
+                    // Continuous PTY events can starve native redraws and AboutToWait on macOS
+                    // and Windows. Present at most once per frame interval while output is live.
+                    #[cfg(any(target_os = "macos", windows))]
                     let presented = window_context.draw_latency_sensitive(&mut self.scheduler);
-                    #[cfg(not(windows))]
+                    #[cfg(not(any(target_os = "macos", windows)))]
                     let presented = None::<bool>;
 
                     if presented.is_none() && window_context.display.window.has_frame {
@@ -4619,10 +4630,16 @@ impl Processor {
             #[cfg(any(unix, windows))]
             (EventType::Terminal(TerminalEvent::PtyOutput { start, end }), Some(window_id)) => {
                 if let Some(window) = self.windows.get(window_id) {
-                    #[cfg(windows)]
+                    #[cfg(any(target_os = "macos", windows))]
                     let (start, end) = window.take_pty_output((start, end));
-                    let transcript = window.automation.transcript.lock().unwrap();
-                    if let Ok(bytes) = transcript.range(start, end.saturating_sub(start) as usize) {
+                    let bytes = window
+                        .automation
+                        .transcript
+                        .lock()
+                        .unwrap()
+                        .range(start, end.saturating_sub(start) as usize);
+                    // Subscription delivery and replay retention must not hold up PTY reads.
+                    if let Ok(bytes) = bytes {
                         self.automation.emit_output(window.ipc_window_id(), start, &bytes);
                     }
                 }
@@ -4870,12 +4887,11 @@ impl Processor {
                 if let Some(window_context) = self.windows.get_mut(window_id) {
                     window_context.display.window.has_frame = true;
 
-                    // A latency-sensitive Windows draw accumulates updates until this timer. End
-                    // the interval with a direct presentation instead of returning to WM_PAINT,
-                    // which can remain starved behind ConPTY and keyboard messages.
-                    #[cfg(windows)]
-                    let presented = window_context.draw_scheduled_frame(&mut self.scheduler);
-                    #[cfg(not(windows))]
+                    // End the frame interval with a direct presentation: native redraws can
+                    // remain starved behind continuous PTY and keyboard events.
+                    #[cfg(any(target_os = "macos", windows))]
+                    let presented = window_context.draw_latency_sensitive(&mut self.scheduler);
+                    #[cfg(not(any(target_os = "macos", windows)))]
                     let presented = None::<bool>;
 
                     if presented.is_none() && window_context.dirty {
@@ -4894,7 +4910,7 @@ impl Processor {
                     }
                 }
             },
-            #[cfg(windows)]
+            #[cfg(any(target_os = "macos", windows))]
             (EventType::LatencySensitiveFrame, Some(window_id)) => {
                 if let Some(window_context) = self.windows.get_mut(window_id) {
                     window_context.acknowledge_latency_sensitive_frame();
@@ -5241,7 +5257,7 @@ pub enum EventType {
     #[cfg(any(unix, windows))]
     Shutdown,
     Frame,
-    #[cfg(windows)]
+    #[cfg(any(target_os = "macos", windows))]
     LatencySensitiveFrame,
     /// Drain the bounded, ordered terminal-position updates accumulated by a Windows PTY.
     #[cfg(windows)]
@@ -6628,8 +6644,10 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                 | EventType::HiddenRelease
                 | EventType::HostWakeup
                 | EventType::VividResizeSettled(_) => (),
+                #[cfg(any(target_os = "macos", windows))]
+                EventType::LatencySensitiveFrame => (),
                 #[cfg(windows)]
-                EventType::LatencySensitiveFrame | EventType::TerminalVividBatch => (),
+                EventType::TerminalVividBatch => (),
                 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
                 EventType::ShellAction(_) => (),
                 EventType::VividFrame => (),
@@ -6870,8 +6888,9 @@ fn is_renderable_resize(size: PhysicalSize<u32>, minimized: bool) -> bool {
 #[derive(Debug, Clone)]
 pub struct EventProxy {
     proxy: EventSink,
+    pty_writer: Arc<Mutex<Option<Notifier>>>,
     window_id: WindowId,
-    #[cfg(windows)]
+    #[cfg(any(target_os = "macos", windows))]
     pending_terminal_events: Arc<PendingTerminalEvents>,
 }
 
@@ -6880,9 +6899,16 @@ impl EventProxy {
         Self {
             proxy,
             window_id,
-            #[cfg(windows)]
+            pty_writer: Arc::default(),
+            #[cfg(any(target_os = "macos", windows))]
             pending_terminal_events: Arc::default(),
         }
+    }
+
+    /// Route parser-generated replies to this terminal's I/O worker, independently of rendering.
+    /// Install before spawning a worker; replace only after the previous worker has joined.
+    pub(crate) fn set_pty_writer(&self, writer: EventLoopSender) {
+        *self.pty_writer.lock() = Some(Notifier(writer));
     }
 
     /// Send an event to the event loop.
@@ -6891,13 +6917,13 @@ impl EventProxy {
     }
 
     /// Permit the next terminal-model wake after the UI has started handling this one.
-    #[cfg(windows)]
+    #[cfg(any(target_os = "macos", windows))]
     pub fn acknowledge_terminal_wakeup(&self) {
         self.pending_terminal_events.wakeup.store(false, Ordering::Release);
     }
 
     /// Take every transcript span represented by this coalesced PTY-output notification.
-    #[cfg(windows)]
+    #[cfg(any(target_os = "macos", windows))]
     pub fn take_pty_output(&self, fallback: (u64, u64)) -> (u64, u64) {
         self.pending_terminal_events.output.lock().take().unwrap_or(fallback)
     }
@@ -6911,9 +6937,26 @@ impl EventProxy {
 
 impl EventListener for EventProxy {
     fn send_event(&self, event: TerminalEvent) {
-        #[cfg(windows)]
+        if let TerminalEvent::PtyWrite(text) = event {
+            if let Some(writer) = self.pty_writer.lock().as_ref() {
+                // These replies already contain the parser's answer. A GPU presentation or a
+                // busy UI queue must not delay the child waiting for its status/cursor report.
+                if writer.notify(text.into_bytes()).is_err() {
+                    debug!("Failed to queue terminal reply: PTY worker unavailable");
+                }
+            } else {
+                // A proxy used without a PTY worker retains the ordinary event-listener contract.
+                let _ = self
+                    .proxy
+                    .send_event(Event::new(TerminalEvent::PtyWrite(text).into(), self.window_id));
+            }
+            return;
+        }
+
+        #[cfg(any(target_os = "macos", windows))]
         match event {
             TerminalEvent::Wakeup => {
+                // Keep macOS user-event draining bounded while the UI is presenting.
                 // WSL commonly exposes `cat` output to ConPTY in very small chunks. Posting a
                 // winit user event for every chunk can fill Windows' 10,000-message queue. Winit
                 // ignores `PostMessageW` failure after first enqueueing the Rust-side event, so
@@ -6950,6 +6993,7 @@ impl EventListener for EventProxy {
                 ));
                 return;
             },
+            #[cfg(windows)]
             event @ (TerminalEvent::VividGridScroll { .. }
             | TerminalEvent::VividMarker { .. }
             | TerminalEvent::VividClear
@@ -6968,11 +7012,12 @@ impl EventListener for EventProxy {
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(target_os = "macos", windows))]
 #[derive(Debug, Default)]
 struct PendingTerminalEvents {
     wakeup: AtomicBool,
     output: Mutex<Option<(u64, u64)>>,
+    #[cfg(windows)]
     vivid: Mutex<PendingVividEvents>,
 }
 
@@ -7049,8 +7094,8 @@ impl PendingTerminalEvents {
     }
 }
 
-#[cfg(all(test, windows))]
-mod windows_event_proxy_tests {
+#[cfg(all(test, any(target_os = "macos", windows)))]
+mod output_event_proxy_tests {
     use super::*;
 
     #[test]
@@ -7102,6 +7147,11 @@ mod windows_event_proxy_tests {
         ));
         assert_eq!(proxy.take_pty_output((0, 0)), (20_010, 20_015));
     }
+}
+
+#[cfg(all(test, windows))]
+mod windows_event_proxy_tests {
+    use super::*;
 
     #[test]
     fn wsl_sized_scroll_output_keeps_exit_notification_reachable() {
