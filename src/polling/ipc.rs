@@ -546,7 +546,7 @@ struct EventQueueSlot(Arc<AtomicUsize>);
 impl EventQueueSlot {
     fn reserve(counter: Arc<AtomicUsize>) -> Option<Self> {
         counter
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |queued| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |queued| {
                 (queued < MAX_SUBSCRIBER_EVENTS).then_some(queued + 1)
             })
             .ok()

@@ -870,7 +870,7 @@ fn discard_stale_samples<C: Consumer<Item = f32>>(shared: &Shared, consumer: &mu
     if requested != 0 {
         let removed = consumer.skip(usize::try_from(requested).unwrap_or(usize::MAX)) as u64;
         if removed != 0 {
-            let _ = shared.discard_samples.fetch_update(
+            let _ = shared.discard_samples.try_update(
                 Ordering::SeqCst,
                 Ordering::SeqCst,
                 |remaining| Some(remaining.saturating_sub(removed)),
@@ -999,7 +999,7 @@ where
     for sample in output {
         if shared
             .hold_silence_samples
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| remaining.checked_sub(1))
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| remaining.checked_sub(1))
             .is_ok()
         {
             *sample = T::from_sample(0.0);
@@ -1007,11 +1007,11 @@ where
         }
         let emit_silence = shared
             .gap_silence_samples
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| remaining.checked_sub(1))
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| remaining.checked_sub(1))
             .is_ok()
             || shared
                 .leading_silence_samples
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
                     remaining.checked_sub(1)
                 })
                 .is_ok();
