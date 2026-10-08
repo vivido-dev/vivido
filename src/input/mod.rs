@@ -31,7 +31,6 @@ use crate::terminal::grid::{Dimensions, Scroll};
 use crate::terminal::index::{Column, Direction, Point, Side};
 use crate::terminal::selection::SelectionType;
 use crate::terminal::term::{ClipboardType, Term, TermMode};
-use crate::terminal::vvte::ansi::{ClearMode, Handler};
 
 use crate::clipboard::Clipboard;
 #[cfg(target_os = "macos")]
@@ -397,7 +396,7 @@ impl<T: EventListener> Execute<T> for Action {
             Action::ScrollLineDown => ctx.scroll(Scroll::Delta(-1)),
             Action::ScrollToTop => ctx.scroll(Scroll::Top),
             Action::ScrollToBottom => ctx.scroll(Scroll::Bottom),
-            Action::ClearHistory => ctx.terminal_mut().clear_screen(ClearMode::Saved),
+            Action::ClearHistory => ctx.terminal_mut().clear_buffer(),
             Action::ClearLogNotice => ctx.pop_message(),
             #[cfg(any(target_os = "linux", windows))]
             Action::CreateNewWindow if ctx.window().is_hosted() => ctx.create_new_tab(),

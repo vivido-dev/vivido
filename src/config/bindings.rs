@@ -150,7 +150,7 @@ pub enum Action {
     /// Scroll all the way to the bottom.
     ScrollToBottom,
 
-    /// Clear the display buffer(s) to remove history.
+    /// Clear scrollback and the viewport, keeping the current input line at the top.
     ClearHistory,
 
     /// Hide the Vivido window.
@@ -366,6 +366,7 @@ pub fn default_key_bindings() -> Vec<KeyBinding> {
         "m", ModifiersState::CONTROL | ModifiersState::SHIFT; Action::ToggleMicrophone;
         "n", ModifiersState::CONTROL | ModifiersState::SHIFT; Action::NextMicrophone;
         Paste; Action::Paste;
+        "k",       ModifiersState::SUPER, ~BindingMode::SEARCH; Action::ClearHistory;
         "l",       ModifiersState::CONTROL; Action::ClearLogNotice;
         "l",       ModifiersState::CONTROL; Action::ReceiveChar;
         Home,      ModifiersState::SHIFT, ~BindingMode::ALT_SCREEN; Action::ScrollToTop;
@@ -493,8 +494,6 @@ fn macos_keybindings() -> Vec<KeyBinding> {
         "=",    ModifiersState::SUPER;                                         Action::IncreaseFontSize;
         "+",    ModifiersState::SUPER;                                         Action::IncreaseFontSize;
         "-",    ModifiersState::SUPER;                                         Action::DecreaseFontSize;
-        "k",    ModifiersState::SUPER, ~BindingMode::SEARCH; Action::Esc("\x0c".into());
-        "k",    ModifiersState::SUPER, ~BindingMode::SEARCH; Action::ClearHistory;
         "v",    ModifiersState::SUPER;                                         Action::Paste;
         "n",    ModifiersState::SUPER;                                         Action::CreateNewWindow;
         "f",    ModifiersState::CONTROL | ModifiersState::SUPER;               Action::ToggleFullscreen;
@@ -1167,6 +1166,23 @@ mod tests {
     use winit::keyboard::ModifiersState;
 
     type MockBinding = Binding<usize>;
+
+    #[test]
+    fn super_k_only_clears_the_terminal_buffer() {
+        let key =
+            BindingKey::Keycode { key: Key::Character("k".into()), location: KeyLocation::Any };
+        let actions: Vec<_> = default_key_bindings()
+            .into_iter()
+            .filter(|binding| {
+                binding.is_triggered_by(BindingMode::empty(), ModifiersState::SUPER, &key)
+            })
+            .map(|binding| binding.action)
+            .collect();
+        assert_eq!(actions, [Action::ClearHistory]);
+        assert!(!macos_keybindings().iter().any(|binding| {
+            binding.is_triggered_by(BindingMode::empty(), ModifiersState::SUPER, &key)
+        }));
+    }
 
     impl Default for MockBinding {
         fn default() -> Self {

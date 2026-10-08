@@ -183,22 +183,15 @@ struct ReadyInstaller {
 }
 
 #[cfg(target_os = "macos")]
-#[derive(Debug, PartialEq, Eq)]
-enum MenuEffect {
-    Action(Action),
-    Clear,
-}
-
-#[cfg(target_os = "macos")]
-fn menu_effect(command: MenuCommand) -> MenuEffect {
+fn menu_action(command: MenuCommand) -> Action {
     match command {
-        MenuCommand::NewWindow => MenuEffect::Action(Action::CreateNewWindow),
-        MenuCommand::NewTab => MenuEffect::Action(Action::CreateNewTab),
-        MenuCommand::Copy => MenuEffect::Action(Action::Copy),
-        MenuCommand::Paste => MenuEffect::Action(Action::Paste),
-        MenuCommand::Find => MenuEffect::Action(Action::SearchForward),
-        MenuCommand::Clear => MenuEffect::Clear,
-        MenuCommand::CheckForUpdates => MenuEffect::Action(Action::CheckForUpdates),
+        MenuCommand::NewWindow => Action::CreateNewWindow,
+        MenuCommand::NewTab => Action::CreateNewTab,
+        MenuCommand::Copy => Action::Copy,
+        MenuCommand::Paste => Action::Paste,
+        MenuCommand::Find => Action::SearchForward,
+        MenuCommand::Clear => Action::ClearHistory,
+        MenuCommand::CheckForUpdates => Action::CheckForUpdates,
     }
 }
 
@@ -6431,13 +6424,7 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
         match event {
             WinitEvent::UserEvent(Event { payload, .. }) => match payload {
                 #[cfg(target_os = "macos")]
-                EventType::MacOsMenu(command) => match menu_effect(command) {
-                    MenuEffect::Action(action) => self.execute_action(&action),
-                    MenuEffect::Clear => {
-                        self.execute_action(&Action::Esc("\x0c".into()));
-                        self.execute_action(&Action::ClearHistory);
-                    },
-                },
+                EventType::MacOsMenu(command) => self.execute_action(&menu_action(command)),
                 EventType::VividFileDropPaste => {
                     let pastes = self.ctx.vivid_service.take_file_drop_pastes();
                     if !pastes.is_empty() {
@@ -7373,13 +7360,13 @@ mod macos_menu_tests {
             (MenuCommand::Copy, Action::Copy),
             (MenuCommand::Paste, Action::Paste),
             (MenuCommand::Find, Action::SearchForward),
+            (MenuCommand::Clear, Action::ClearHistory),
             (MenuCommand::CheckForUpdates, Action::CheckForUpdates),
         ];
 
         for (command, action) in expected {
-            assert_eq!(menu_effect(command), MenuEffect::Action(action));
+            assert_eq!(menu_action(command), action);
         }
-        assert_eq!(menu_effect(MenuCommand::Clear), MenuEffect::Clear);
     }
 }
 

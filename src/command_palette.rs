@@ -99,7 +99,7 @@ fn built_in_actions() -> Vec<(&'static str, Action)> {
         ("Scroll to bottom", Action::ScrollToBottom),
         ("Scroll page up", Action::ScrollPageUp),
         ("Scroll page down", Action::ScrollPageDown),
-        ("Clear scrollback", Action::ClearHistory),
+        ("Clear buffer", Action::ClearHistory),
         ("Toggle fullscreen", Action::ToggleFullscreen),
         ("Toggle maximized", Action::ToggleMaximized),
         ("Minimize window", Action::Minimize),

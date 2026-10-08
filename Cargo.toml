@@ -8,7 +8,7 @@ readme = "README.md"
 homepage = "https://vivido.dev"
 repository = "https://github.com/vivido-dev/vivido"
 edition = "2024"
-rust-version = "1.88.0"
+rust-version = "1.95.0"
 links = "vivido_runtime"
 exclude = ["src/terminal/ref_tests.rs", "tests/ref"]
 

@@ -678,6 +678,47 @@ impl<T> Term<T> {
         }
     }
 
+    /// Clear the active buffer locally, retaining the cursor's logical line at the top.
+    ///
+    /// Unlike ED3, this also removes old viewport contents. No shell redraw is requested, so
+    /// there is no asynchronous clear that can push the discarded contents back into history.
+    pub fn clear_buffer(&mut self)
+    where
+        T: EventListener,
+    {
+        let cursor_line = self.grid.cursor.point.line;
+        let last_column = self.last_column();
+        let mut start = cursor_line;
+        let mut end = cursor_line;
+
+        // Keep wrapped input together, inspecting only the live viewport.
+        while start > Line(0)
+            && self.grid[start - 1usize][last_column].flags.contains(Flags::WRAPLINE)
+        {
+            start -= 1;
+        }
+        while end < self.bottommost_line()
+            && self.grid[end][last_column].flags.contains(Flags::WRAPLINE)
+        {
+            end += 1;
+        }
+
+        let region = Line(0)..Line(self.screen_lines() as i32);
+        self.grid.scroll_up(&region, start.0 as usize);
+        let retained_lines = Line(end.0 - start.0 + 1);
+        if retained_lines < region.end {
+            self.grid.reset_region(retained_lines..);
+        }
+        self.grid.cursor.point.line -= start.0;
+        self.grid.clear_history();
+        self.selection = None;
+
+        self.flush_grid_scroll();
+        self.event_proxy.send_event(Event::VividClear);
+        self.event_proxy.send_event(Event::MouseCursorDirty);
+        self.mark_fully_damaged();
+    }
+
     pub fn new<D: Dimensions>(config: Config, dimensions: &D, event_proxy: T) -> Term<T> {
         let num_cols = dimensions.columns();
         let num_lines = dimensions.screen_lines();
@@ -4023,6 +4064,100 @@ mod tests {
         term.input('a');
 
         assert_eq!(term.grid()[cursor].c, '▒');
+    }
+
+    #[test]
+    fn clear_buffer_discards_full_history_and_old_viewport_without_pty_input() {
+        let size = TermSize::new(20, 5);
+        let listener = PtyWriteListener::default();
+        let writes = listener.0.clone();
+        let config = Config::default();
+        let history_limit = config.scrolling_history;
+        let mut term = Term::new(config, &size, listener);
+        let mut parser: ansi::Processor = ansi::Processor::new();
+        for _ in 0..history_limit + size.screen_lines() {
+            parser.advance(&mut term, b"old output\r\n");
+        }
+        parser.advance(&mut term, b"$ input");
+        assert_eq!(term.history_size(), history_limit);
+        term.scroll_display(Scroll::Top);
+        term.selection = Some(Selection::new(
+            SelectionType::Simple,
+            Point::new(Line(-1), Column(0)),
+            Side::Left,
+        ));
+        term.reset_damage();
+
+        term.clear_buffer();
+
+        assert_eq!(term.history_size(), 0);
+        assert_eq!(term.grid.display_offset(), 0);
+        assert_eq!(term.grid.cursor.point, Point::new(Line(0), Column(7)));
+        assert_eq!(term.viewport_line_text(0), "$ input");
+        for line in 1..size.screen_lines() {
+            assert_eq!(term.viewport_line_text(line as i32), "");
+        }
+        assert!(term.selection.is_none());
+        assert!(matches!(term.damage(), TermDamage::Full));
+        assert!(writes.lock().unwrap().is_empty());
+
+        // Repeating the shortcut is harmless; subsequent shell output continues at the prompt.
+        term.clear_buffer();
+        parser.advance(&mut term, b"!\r\nnew output\r\n$ ");
+        term.scroll_display(Scroll::Top);
+        assert_eq!(term.history_size(), 0);
+        assert_eq!(term.grid.display_offset(), 0);
+        assert_eq!(term.viewport_line_text(0), "$ input!");
+        assert_eq!(term.viewport_line_text(1), "new output");
+        assert!(!term.visible_text().contains("old output"));
+        assert!(writes.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn clear_buffer_keeps_wrapped_input_and_cursor_state() {
+        let size = TermSize::new(5, 6);
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+        let mut parser: ansi::Processor = ansi::Processor::new();
+        parser.advance(&mut term, b"old\r\n$ abcdefghijk\r\nstale\x1b[3;3H");
+        term.clear_buffer();
+
+        assert_eq!(term.history_size(), 0);
+        assert_eq!(term.grid.cursor.point, Point::new(Line(1), Column(2)));
+        assert_eq!(term.viewport_line_text(0), "$ abc");
+        assert_eq!(term.viewport_line_text(1), "defgh");
+        assert_eq!(term.viewport_line_text(2), "ijk");
+        for line in 3..6 {
+            assert_eq!(term.viewport_line_text(line), "");
+        }
+        assert!(term.grid[Line(0)][Column(4)].flags.contains(Flags::WRAPLINE));
+        assert!(term.grid[Line(1)][Column(4)].flags.contains(Flags::WRAPLINE));
+    }
+
+    #[test]
+    fn clear_buffer_handles_empty_single_row_and_alternate_screens() {
+        for lines in [1, 5] {
+            let size = TermSize::new(5, lines);
+            let mut term = Term::new(Config::default(), &size, VoidListener);
+            let mut parser: ansi::Processor = ansi::Processor::new();
+            term.clear_buffer();
+            assert_eq!(term.history_size(), 0);
+            assert_eq!(term.grid.cursor.point, Point::new(Line(0), Column(0)));
+
+            parser.advance(&mut term, b"\x1b[?1049h$ abc");
+            assert!(term.grid.cursor.input_needs_wrap);
+            term.clear_buffer();
+            assert!(term.mode.contains(TermMode::ALT_SCREEN));
+            assert!(term.grid.cursor.input_needs_wrap);
+            assert_eq!(term.viewport_line_text(0), "$ abc");
+            assert_eq!(term.grid.cursor.point, Point::new(Line(0), Column(4)));
+        }
+    }
+
+    #[test]
+    fn clear_buffer_notifies_the_media_scene() {
+        let (mut term, events) = scene_term(3);
+        term.clear_buffer();
+        assert_eq!(*events.lock().unwrap(), ["clear"]);
     }
 
     #[test]

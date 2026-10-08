@@ -541,6 +541,9 @@ Misc: `ToggleCommandPalette` (bound to `Ctrl+Shift+P`, `Command+Shift+P` on macO
 [the command palette](features.md#command-palette)), `TerminalRecovery`, `ClearHistory`,
 `ClearLogNotice`, `ToggleMicrophone`, `NextMicrophone`, `ReceiveChar`, `None`.
 
+`ClearHistory` (`Super+K`, or `Command+K` / Edit ▸ Clear on macOS) clears scrollback and the
+active viewport locally, keeping the current input line at the top. It sends no input to the shell.
+
 > There is no vi mode, so vi-motion, vi-cursor, and vi-selection actions do not exist in Vivido.
 
 ### Default Windows/Linux app and tab bindings
