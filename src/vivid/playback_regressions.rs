@@ -380,7 +380,7 @@ mod windows_process_playback {
                         .track_keys()
                         .iter()
                         .filter_map(|key| service.scene.track_status(*key).map(|s| (
-                            key.track_id,
+                            key.track_id(),
                             s.last_decoded_pts_us,
                             service.scene.playback_state(*key, None),
                             s.state.milestones
@@ -415,13 +415,13 @@ mod windows_process_playback {
         for _ in 0..3 {
             player.wait(&service, "replacement audio/video start", |service| {
                 service.scene.track_keys().into_iter().any(|key| {
-                    key.track_id > retired_track
+                    key.track_id() > retired_track
                         && service.scene.track_status(key).is_some_and(|s| {
                             matches!(s.configuration.kind, KindConfiguration::Video(_))
                                 && s.last_decoded_pts_us.is_some_and(|pts| pts > 500_000)
                         })
                         && lock(&service.shared.audio_outputs).iter().any(|(audio_key, audio)| {
-                            audio_key.surface == key.surface
+                            audio_key.surface() == key.surface()
                                 && audio.rendered_pts().is_some_and(|pts| pts > 500_000)
                         })
                 })
@@ -429,12 +429,12 @@ mod windows_process_playback {
             player.key(b" ");
             player.wait(&service, "pause before quit", |service| {
                 service.scene.track_keys().into_iter().any(|key| {
-                    key.track_id > retired_track
+                    key.track_id() > retired_track
                         && service.scene.playback_state(key, None).is_some_and(|s| s.0 == 3)
                 })
             });
             retired_track =
-                service.scene.track_keys().iter().map(|key| key.track_id).max().unwrap();
+                service.scene.track_keys().iter().map(|key| key.track_id()).max().unwrap();
             player.key(b"q");
         }
         player.wait(&service, "final producer cleanup", |s| s.scene.track_keys().is_empty());
@@ -468,7 +468,7 @@ mod windows_process_playback {
                             .latest_frame(key)
                             .is_some_and(|frame| frame.pts_us > target)
                 }) && lock(&service.shared.audio_outputs).iter().any(|(audio_key, audio)| {
-                    audio_key.surface == key.surface
+                    audio_key.surface() == key.surface()
                         && audio.rendered_pts().is_some_and(|pts| pts > target)
                 })
             })
