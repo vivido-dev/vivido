@@ -254,8 +254,8 @@ struct Registry {
 impl Registry {
     /// Publish a session under both the ID its producer uses and the tag its markers carry.
     fn insert_session(&mut self, runtime: Arc<SessionRuntime>) {
-        self.by_tag.insert(runtime.session_tag, runtime.identity.session_id);
-        self.sessions.insert(runtime.identity.session_id, runtime);
+        self.by_tag.insert(runtime.session_tag, runtime.identity.session_id());
+        self.sessions.insert(runtime.identity.session_id(), runtime);
     }
 
     /// Retire one session from both indexes, leaving every other session's entries alone.
@@ -806,7 +806,7 @@ impl VividService {
             if !session.post_control(messages::TARGET_CHANGED, 0, body.clone()) {
                 log::debug!(
                     "could not queue TARGET_CHANGED for Vivid session {}",
-                    session.identity.session_id
+                    session.identity.session_id()
                 );
             }
         }
@@ -1010,7 +1010,7 @@ impl VividService {
         let Some((owner, offer)) = offer else {
             return disposition;
         };
-        let session = lock(&self.shared.registry).sessions.get(&owner.session_id).cloned();
+        let session = lock(&self.shared.registry).sessions.get(&owner.session_id()).cloned();
         let Some(session) = session else {
             return file_drop::LocalDropDisposition::Rejected("The remote receiver disconnected");
         };
@@ -1143,7 +1143,7 @@ impl VividService {
     #[cfg(any(unix, windows))]
     pub(crate) fn automation_track_status(&self, identity: TrackIdentity) -> Option<TrackStatus> {
         let mut status = self.scene.track_status(identity)?;
-        let audio = self.scene.active_track(identity.surface, 2).unwrap_or(identity);
+        let audio = self.scene.active_track(identity.surface(), 2).unwrap_or(identity);
         let pts =
             lock(&self.shared.audio_outputs).get(&audio).and_then(|output| output.clock_pts());
         if let Some((state, pts)) = self.scene.playback_state(identity, pts) {
@@ -1228,21 +1228,21 @@ impl VividService {
         }
         let sessions = lock(&self.shared.registry).sessions.clone();
         for identity in anchors {
-            let Some(session) = sessions.get(&identity.context.session.session_id) else {
+            let Some(session) = sessions.get(&identity.context().session().session_id()) else {
                 continue;
             };
             let body = Envelope::new(
                 0,
                 vec![
-                    (0, Value::Unsigned(identity.context.context_id)),
-                    (1, Value::Unsigned(identity.anchor_id)),
+                    (0, Value::Unsigned(identity.context().context_id())),
+                    (1, Value::Unsigned(identity.anchor_id())),
                     (2, Value::Unsigned(2)),
                 ],
             )
             .encode();
             if let Ok(body) = body {
                 // Reached from the PTY parser on every scroll, clear, and screen swap.
-                session.post_control(record_type, identity.anchor_id, body);
+                session.post_control(record_type, identity.anchor_id(), body);
             }
         }
     }
@@ -1605,7 +1605,7 @@ fn handle_control(
     if egress.overflowed() {
         log::debug!(
             "Vivid session {} closed: the producer stopped draining its control replies",
-            session.identity.session_id
+            session.identity.session_id()
         );
     }
     Ok(())
@@ -1834,12 +1834,12 @@ fn observe_surface(session: &Arc<SessionRuntime>, status: &SurfaceStatus, change
         observation::class::SURFACE,
         ObservationKey {
             record_type: messages::SURFACE_CHANGED,
-            context_id: status.identity.context.context_id,
-            object_id: status.identity.surface_id,
+            context_id: status.identity.context().context_id(),
+            object_id: status.identity.surface_id(),
         },
         vec![
-            (0, Value::Unsigned(status.identity.context.context_id)),
-            (1, Value::Unsigned(status.identity.surface_id)),
+            (0, Value::Unsigned(status.identity.context().context_id())),
+            (1, Value::Unsigned(status.identity.surface_id())),
             (2, Value::Unsigned(status.revision.get())),
             (3, Value::Unsigned(status.generation.get())),
             (4, Value::Unsigned(changed)),
@@ -1853,13 +1853,13 @@ fn observe_track(session: &Arc<SessionRuntime>, status: &TrackStatus, changed: u
         observation::class::TRACK,
         ObservationKey {
             record_type: messages::TRACK_CHANGED,
-            context_id: status.identity.surface.context.context_id,
-            object_id: status.identity.track_id,
+            context_id: status.identity.surface().context().context_id(),
+            object_id: status.identity.track_id(),
         },
         vec![
-            (0, Value::Unsigned(status.identity.surface.context.context_id)),
-            (1, Value::Unsigned(status.identity.surface.surface_id)),
-            (2, Value::Unsigned(status.identity.track_id)),
+            (0, Value::Unsigned(status.identity.surface().context().context_id())),
+            (1, Value::Unsigned(status.identity.surface().surface_id())),
+            (2, Value::Unsigned(status.identity.track_id())),
             (3, Value::Unsigned(status.state.revision.get())),
             (4, Value::Unsigned(status.state.channel_generation.get())),
             (5, Value::Unsigned(changed)),
@@ -1923,7 +1923,7 @@ fn suspend_lease(
     revoke_input(session, grant_reason::SUSPENSION);
     shared.scene.suspend_session(session.identity);
     stop_session_audio(shared, session.identity);
-    let issuer = lock(&shared.registry).sessions.get(&key.0.session_id).cloned();
+    let issuer = lock(&shared.registry).sessions.get(&key.0.session_id()).cloned();
     if let Some(issuer) = issuer {
         if let Ok(body) = Envelope::new(0, payload).encode() {
             // The issuer is a different session with a different reader. Writing its socket from
@@ -1941,7 +1941,7 @@ fn stop_session_audio(shared: &Arc<ServiceShared>, session: SessionIdentity) {
         let mut outputs = lock(&shared.audio_outputs);
         let keys = outputs
             .keys()
-            .filter(|identity| identity.surface.context.session == session)
+            .filter(|identity| identity.surface().context().session() == session)
             .copied()
             .collect::<Vec<_>>();
         keys.into_iter().filter_map(|identity| outputs.remove(&identity)).collect::<Vec<_>>()
@@ -1988,7 +1988,7 @@ fn revoke_lease(
     let _ = lease.machine.revoke();
     let child = lease.child.take();
     let payload = lease.changed_payload(key.1, key.2, reason, Instant::now());
-    let child_runtime = child.and_then(|child| registry.remove_session(child.session_id));
+    let child_runtime = child.and_then(|child| registry.remove_session(child.session_id()));
     drop(registry);
 
     // Release the capacity the lease held back from its owning context.
@@ -2023,7 +2023,7 @@ fn finish_session(shared: &Arc<ServiceShared>, session: &Arc<SessionRuntime>, cl
             && lease.awaiting_first
             && lease.machine.confirm_transport_lost(false).is_ok()
         {
-            registry.remove_session(session.identity.session_id);
+            registry.remove_session(session.identity.session_id());
             return;
         }
     }
@@ -2035,10 +2035,10 @@ fn finish_session(shared: &Arc<ServiceShared>, session: &Arc<SessionRuntime>, cl
     // A leased child closing releases its own lease back to the issuer, unless an unclean loss
     // under cleanup policy one suspends it instead (security §7.1).
     if let Some(key) = session.lease {
-        let issuer = lock(&shared.registry).sessions.get(&key.0.session_id).cloned();
+        let issuer = lock(&shared.registry).sessions.get(&key.0.session_id()).cloned();
         if let Some(issuer) = issuer {
             if !clean && suspend_lease(shared, session, key) {
-                lock(&shared.registry).remove_session(session.identity.session_id);
+                lock(&shared.registry).remove_session(session.identity.session_id());
                 shared.request_frame_wake();
                 return;
             }
@@ -2047,12 +2047,12 @@ fn finish_session(shared: &Arc<ServiceShared>, session: &Arc<SessionRuntime>, cl
         }
     }
     lock(&shared.file_drops).remove_session(session.identity);
-    lock(&shared.registry).remove_session(session.identity.session_id);
+    lock(&shared.registry).remove_session(session.identity.session_id());
     let removed_audio = {
         let mut outputs = lock(&shared.audio_outputs);
         let keys = outputs
             .keys()
-            .filter(|identity| identity.surface.context.session == session.identity)
+            .filter(|identity| identity.surface().context().session() == session.identity)
             .copied()
             .collect::<Vec<_>>();
         keys.into_iter().filter_map(|identity| outputs.remove(&identity)).collect::<Vec<_>>()
@@ -2357,7 +2357,7 @@ fn establish_root_session(
     let mut welcome = Welcome {
         session_id,
         session_tag,
-        root_context_id: root_context.context_id,
+        root_context_id: root_context.context_id(),
         target_generation: target.generation(),
         target_profile: target.profile_name().into(),
         target_descriptor: target.descriptor(),
@@ -2479,7 +2479,7 @@ fn establish_root_session(
             lease.begin_retry_window(Instant::now());
             let generation = lease.machine.resume_generation().get();
             let announcement = lease.changed_payload(key.1, key.2, reason::RESUMED, Instant::now());
-            resumed_announcements.push((key.0.session_id, key.2, announcement));
+            resumed_announcements.push((key.0.session_id(), key.2, announcement));
             let prk = auth::extract_handshake_prk(
                 &session_secret,
                 &hello.client_nonce,
@@ -2493,7 +2493,7 @@ fn establish_root_session(
         },
     };
     let identity = SessionIdentity::new(shared.presenter, session_id).map_err(io::Error::other)?;
-    let root_context = identity.context(root_context.context_id).map_err(io::Error::other)?;
+    let root_context = identity.context(root_context.context_id()).map_err(io::Error::other)?;
     if matches!(principal, Principal::Root) {
         registry.root_nonces.insert(hello.client_nonce, Instant::now() + Duration::from_secs(300));
     }
@@ -2528,8 +2528,8 @@ fn establish_root_session(
         actor_ingress: Mutex::new(None),
         control_shutdown: Mutex::new(None),
         contexts: Mutex::new(HashMap::from([(
-            root_context.context_id,
-            ContextState::root(identity, root_context.context_id, classes, contract)
+            root_context.context_id(),
+            ContextState::root(identity, root_context.context_id(), classes, contract)
                 .map_err(io::Error::other)?,
         )])),
         seen_anchors: Mutex::new(HashSet::new()),
@@ -2625,7 +2625,7 @@ fn dispatch_control(
                     envelope.transaction_id.unwrap_or(record.object_id),
                 )
                 .map_err(ControlError::state)?
-                .context_id,
+                .context_id(),
         )
     } else {
         context_field.and_then(|key| {
@@ -2925,7 +2925,7 @@ fn dispatch_control(
                 .map_err(|_| ControlError::bad_message("invalid context revoke"))?;
             let context_id =
                 map.required_u64(0).map_err(|_| ControlError::bad_message("missing context ID"))?;
-            if context_id == session.root_context.context_id {
+            if context_id == session.root_context.context_id() {
                 return Err(ControlError::bad_state("context cannot be revoked"));
             }
             let mut contexts = lock(&session.contexts);
@@ -3056,8 +3056,8 @@ fn dispatch_control(
                 lock(&shared.overlays).remove_surface(identity);
                 lock(&shared.file_drops).remove_surface(
                     session.identity,
-                    identity.context.context_id,
-                    identity.surface_id,
+                    identity.context().context_id(),
+                    identity.surface_id(),
                 );
             }
             observe_surface(session, &status, SURFACE_CHANGED_GEOMETRY);
@@ -3072,8 +3072,8 @@ fn dispatch_control(
             lock(&shared.overlays).remove_surface(identity);
             lock(&shared.file_drops).remove_surface(
                 session.identity,
-                identity.context.context_id,
-                identity.surface_id,
+                identity.context().context_id(),
+                identity.surface_id(),
             );
             (messages::OK, record.object_id, Ok(messages::ok(request_id)))
         },
@@ -3163,9 +3163,9 @@ fn dispatch_control(
                 }),
             );
             let mut payload = vec![
-                (0, Value::Unsigned(identity.surface.context.context_id)),
-                (1, Value::Unsigned(identity.surface.surface_id)),
-                (2, Value::Unsigned(identity.track_id)),
+                (0, Value::Unsigned(identity.surface().context().context_id())),
+                (1, Value::Unsigned(identity.surface().surface_id())),
+                (2, Value::Unsigned(identity.track_id())),
                 (3, Value::Unsigned(status.state.revision.get())),
                 (4, Value::Unsigned(status.state.channel_generation.get())),
                 (5, Value::Unsigned(CHANNEL_OPEN_DEADLINE_US)),
@@ -3234,7 +3234,8 @@ fn dispatch_control(
                 .scene
                 .track_status(identity)
                 .ok_or_else(|| ControlError::not_found("track does not exist"))?;
-            let audio_identity = shared.scene.active_track(identity.surface, 2).unwrap_or(identity);
+            let audio_identity =
+                shared.scene.active_track(identity.surface(), 2).unwrap_or(identity);
             let audio_pts = lock(&shared.audio_outputs)
                 .get(&audio_identity)
                 .and_then(|output| output.clock_pts());
@@ -3312,9 +3313,9 @@ fn dispatch_control(
                 Envelope::new(
                     request_id,
                     vec![
-                        (0, Value::Unsigned(identity.surface.context.context_id)),
-                        (1, Value::Unsigned(identity.surface.surface_id)),
-                        (2, Value::Unsigned(identity.track_id)),
+                        (0, Value::Unsigned(identity.surface().context().context_id())),
+                        (1, Value::Unsigned(identity.surface().surface_id())),
+                        (2, Value::Unsigned(identity.track_id())),
                         (3, Value::Unsigned(status.state.channel_generation.get())),
                         (4, Value::Unsigned(CHANNEL_OPEN_DEADLINE_US)),
                         (5, Value::Unsigned(status.state.revision.get())),
@@ -3723,7 +3724,7 @@ fn dispatch_control(
             })?;
             let output_identity = if matches!(record.record_type, messages::PLAY | messages::PAUSE)
             {
-                shared.scene.active_track(identity.surface, 2).unwrap_or(identity)
+                shared.scene.active_track(identity.surface(), 2).unwrap_or(identity)
             } else {
                 identity
             };
@@ -4321,18 +4322,7 @@ fn handle_track_channel(
         )?;
         return Err(io::Error::new(ErrorKind::InvalidData, "stale channel generation"));
     }
-    let expected_tag = auth::channel_tag(
-        session.channel_key.expose(),
-        open.session_id,
-        open.context_id,
-        open.surface_id,
-        open.track_id,
-        open.channel_generation,
-        open.track_kind as u32,
-        open.lane as u32,
-        &open.client_nonce,
-    );
-    if !auth::verify_tag(&expected_tag, &open.authentication_tag) {
+    if !open.verify(session.channel_key.expose()) {
         trace_track_channel_rejected(
             shared,
             None,
@@ -4601,9 +4591,9 @@ fn handle_track_channel(
         let body = Envelope::new(
             0,
             vec![
-                (0, Value::Unsigned(identity.surface.context.context_id)),
-                (1, Value::Unsigned(identity.surface.surface_id)),
-                (2, Value::Unsigned(identity.track_id)),
+                (0, Value::Unsigned(identity.surface().context().context_id())),
+                (1, Value::Unsigned(identity.surface().surface_id())),
+                (2, Value::Unsigned(identity.track_id())),
                 (3, Value::Unsigned(error_code)),
                 (4, Value::Unsigned(status.state.revision.get())),
                 (5, Value::Map(vec![])),
@@ -4613,7 +4603,7 @@ fn handle_track_channel(
         .encode()?;
         // This is the track channel's thread, not the session's. Queue so a stalled control peer
         // cannot hold a media connection open past its own failure.
-        session.post_control(messages::TRACK_LOST, identity.track_id, body);
+        session.post_control(messages::TRACK_LOST, identity.track_id(), body);
     }
     match result {
         Ok(_) => Ok(()),
@@ -4719,9 +4709,9 @@ fn classify_audio_step(expected_pts_us: Option<i64>, pts_us: i64, live: bool) ->
 
 fn track_address(identity: TrackIdentity, generation: ChannelGeneration) -> track::TrackAddress {
     track::TrackAddress {
-        context_id: identity.surface.context.context_id,
-        surface_id: identity.surface.surface_id,
-        track_id: identity.track_id,
+        context_id: identity.surface().context().context_id(),
+        surface_id: identity.surface().surface_id(),
+        track_id: identity.track_id(),
         channel_generation: generation,
     }
 }
@@ -4746,7 +4736,7 @@ fn request_keyframe(
                 "reason": reason,
             }),
         );
-        if writer.write_record(messages::NEED_KEYFRAME, identity.track_id, &body).is_ok() {
+        if writer.write_record(messages::NEED_KEYFRAME, identity.track_id(), &body).is_ok() {
             shared.trace(
                 trace::TraceCategory::Recovery,
                 "need_keyframe_written",
@@ -4770,7 +4760,7 @@ fn request_full_frame(
 ) {
     let payload = track::need_full_frame_payload(track_address(identity, generation), reason);
     if let Ok(body) = Envelope::new(0, payload).encode() {
-        let _ = writer.write_record(messages::NEED_FULL_FRAME, identity.track_id, &body);
+        let _ = writer.write_record(messages::NEED_FULL_FRAME, identity.track_id(), &body);
     }
 }
 
@@ -4865,7 +4855,7 @@ fn channel_loop(
             Err(error) => return Err(ChannelFailure::read(error, context)),
         };
         context.begin_record(header.record_type, header.sequence, body.len());
-        if header.object_id != identity.track_id {
+        if header.object_id != identity.track_id() {
             return Err(ChannelFailure::message(
                 ChannelFailureKind::RecordIdentity,
                 ErrorKind::InvalidData,
@@ -5151,7 +5141,7 @@ fn channel_loop(
                     )
                 );
                 let linked_audio =
-                    shared.scene.active_track(identity.surface, scene::SLOT_AUDIO).and_then(
+                    shared.scene.active_track(identity.surface(), scene::SLOT_AUDIO).and_then(
                         |audio_identity| lock(&shared.audio_outputs).get(&audio_identity).cloned(),
                     );
                 // Keep sound and picture together by delaying the sound.
@@ -5426,9 +5416,9 @@ fn channel_loop(
                         .map_or(0, |status| status.state.last_media_id),
                     0,
                 );
-                if eos.required_u64(0).ok() != Some(identity.surface.context.context_id)
-                    || eos.required_u64(1).ok() != Some(identity.surface.surface_id)
-                    || eos.required_u64(2).ok() != Some(identity.track_id)
+                if eos.required_u64(0).ok() != Some(identity.surface().context().context_id())
+                    || eos.required_u64(1).ok() != Some(identity.surface().surface_id())
+                    || eos.required_u64(2).ok() != Some(identity.track_id())
                     || eos.required_u64(3).ok() != Some(generation.get())
                 {
                     return Err(ChannelFailure::message(
@@ -5550,7 +5540,7 @@ fn channel_loop(
             );
             channel_io!(
                 ChannelFailureKind::TransportWrite,
-                writer.write_record(messages::MAX_CHANNEL_DATA, identity.track_id, &grant,)
+                writer.write_record(messages::MAX_CHANNEL_DATA, identity.track_id(), &grant,)
             );
             if recovery_unit || last_flow_trace.elapsed() >= Duration::from_millis(250) {
                 shared.trace(
@@ -5635,7 +5625,7 @@ fn try_start_synchronized(shared: &Arc<ServiceShared>, identity: TrackIdentity) 
     let _transition = lock(&shared.playback_transition);
     let output = shared
         .scene
-        .active_track(identity.surface, scene::SLOT_AUDIO)
+        .active_track(identity.surface(), scene::SLOT_AUDIO)
         .and_then(|id| lock(&shared.audio_outputs).get(&id).cloned());
     if shared.scene.try_start_synchronized(
         identity,
@@ -5671,7 +5661,7 @@ fn wait_until_video_due(
         }
         let audio = shared
             .scene
-            .active_track(identity.surface, scene::SLOT_AUDIO)
+            .active_track(identity.surface(), scene::SLOT_AUDIO)
             .and_then(|identity| lock(&shared.audio_outputs).get(&identity).cloned());
         let Some(audio) = audio else {
             return shared.scene.wait_until_due(identity, pts_us, false).map_err(io::Error::other);
@@ -6004,8 +5994,8 @@ fn serve_lane(
 
 fn surface_ready_payload(status: &SurfaceStatus) -> Vec<(u64, Value)> {
     surface::surface_ready_payload(
-        status.identity.context.context_id,
-        status.identity.surface_id,
+        status.identity.context().context_id(),
+        status.identity.surface_id(),
         status.revision,
         status.generation,
         status.definition.policy,
@@ -6015,8 +6005,8 @@ fn surface_ready_payload(status: &SurfaceStatus) -> Vec<(u64, Value)> {
 
 fn surface_status_payload(status: &SurfaceStatus) -> Vec<(u64, Value)> {
     vec![
-        (0, Value::Unsigned(status.identity.context.context_id)),
-        (1, Value::Unsigned(status.identity.surface_id)),
+        (0, Value::Unsigned(status.identity.context().context_id())),
+        (1, Value::Unsigned(status.identity.surface_id())),
         (2, Value::Unsigned(status.revision.get())),
         (3, Value::Unsigned(status.generation.get())),
         (4, Value::Text(status.definition.semantic_profile.clone())),
@@ -6045,9 +6035,9 @@ fn surface_status_payload(status: &SurfaceStatus) -> Vec<(u64, Value)> {
 
 fn track_status_payload(status: &TrackStatus, include_audio_gain: bool) -> Vec<(u64, Value)> {
     let mut payload = vec![
-        (0, Value::Unsigned(status.identity.surface.context.context_id)),
-        (1, Value::Unsigned(status.identity.surface.surface_id)),
-        (2, Value::Unsigned(status.identity.track_id)),
+        (0, Value::Unsigned(status.identity.surface().context().context_id())),
+        (1, Value::Unsigned(status.identity.surface().surface_id())),
+        (2, Value::Unsigned(status.identity.track_id())),
         (3, Value::Unsigned(status.state.revision.get())),
         (4, Value::Unsigned(status.configuration.kind.kind() as u64)),
         (5, Value::Unsigned(status.configuration.mode as u64)),
@@ -6125,9 +6115,9 @@ fn wait_satisfied_payload(
     satisfied: TrackWaitSatisfied,
 ) -> Vec<(u64, Value)> {
     vec![
-        (0, Value::Unsigned(identity.surface.context.context_id)),
-        (1, Value::Unsigned(identity.surface.surface_id)),
-        (2, Value::Unsigned(identity.track_id)),
+        (0, Value::Unsigned(identity.surface().context().context_id())),
+        (1, Value::Unsigned(identity.surface().surface_id())),
+        (2, Value::Unsigned(identity.track_id())),
         (3, Value::Unsigned(satisfied.revision.get())),
         (4, Value::Unsigned(satisfied.channel_generation.get())),
         (5, Value::Unsigned(condition)),
@@ -8285,7 +8275,7 @@ mod tests {
             trace::TraceSelection::Tail,
             128,
             trace::TraceFilter {
-                session_id: Some(owner.session_id),
+                session_id: Some(owner.session_id()),
                 context_id: Some(context_id),
                 surface_id: Some(surface.id()),
                 track_id: Some(71),
@@ -8428,7 +8418,7 @@ mod tests {
             let registry = lock(&service.shared.registry);
             let session = registry
                 .sessions
-                .get(&identity.surface.context.session.session_id)
+                .get(&identity.surface().context().session().session_id())
                 .ok_or_else(|| io::Error::new(ErrorKind::NotFound, "session disappeared"))?;
             let status = service
                 .scene
@@ -8437,28 +8427,18 @@ mod tests {
             (*session.channel_key.expose(), status.configuration)
         };
         let client_nonce = [0x52; 16];
-        let authentication_tag = auth::channel_tag(
-            &channel_key,
-            identity.surface.context.session.session_id,
-            identity.surface.context.context_id,
-            identity.surface.surface_id,
-            identity.track_id,
-            generation.get(),
-            configuration.kind.kind() as u32,
-            configuration.lane as u32,
-            &client_nonce,
-        );
-        let open = ChannelOpen {
-            session_id: identity.surface.context.session.session_id,
-            context_id: identity.surface.context.context_id,
-            surface_id: identity.surface.surface_id,
-            track_id: identity.track_id,
+        let mut open = ChannelOpen {
+            session_id: identity.surface().context().session().session_id(),
+            context_id: identity.surface().context().context_id(),
+            surface_id: identity.surface().surface_id(),
+            track_id: identity.track_id(),
             channel_generation: generation.get(),
             track_kind: configuration.kind.kind(),
             lane: configuration.lane,
             client_nonce,
-            authentication_tag,
+            authentication_tag: [0; 16],
         };
+        open.sign(&channel_key);
         let envelope = Envelope::correlated(1, open.payload()).map_err(io::Error::other)?;
         let body = envelope.encode().map_err(io::Error::other)?;
         let mut stream = connect_endpoint(service.control_endpoint())?;
@@ -8466,7 +8446,7 @@ mod tests {
             ConnectionKind::Track,
             vivid_protocol::HARD_MAX_RECORD_BODY,
         ))?;
-        write_raw(&mut stream, 1, messages::CHANNEL_OPEN, identity.track_id, &body)?;
+        write_raw(&mut stream, 1, messages::CHANNEL_OPEN, identity.track_id(), &body)?;
         let accepted = read_raw(&mut stream)?;
         if accepted.record_type != messages::CHANNEL_ACCEPTED {
             return Err(io::Error::other("track channel was not accepted"));
@@ -8519,7 +8499,8 @@ mod tests {
         let first_generation = track.channel_generation();
         let mut superseded = open_raw_track_channel(&service, identity, first_generation).unwrap();
         session.advance_channel(&track, 1, &RequestMetadata::default()).unwrap();
-        write_raw(&mut superseded, 2, messages::RASTER_FRAME, identity.track_id + 1, &[]).unwrap();
+        write_raw(&mut superseded, 2, messages::RASTER_FRAME, identity.track_id() + 1, &[])
+            .unwrap();
 
         let deadline = Instant::now() + Duration::from_secs(2);
         let superseded_detach = loop {
@@ -8527,10 +8508,10 @@ mod tests {
                 trace::TraceSelection::Tail,
                 128,
                 trace::TraceFilter {
-                    session_id: Some(owner.session_id),
+                    session_id: Some(owner.session_id()),
                     context_id: Some(context_id),
                     surface_id: Some(surface.id()),
-                    track_id: Some(identity.track_id),
+                    track_id: Some(identity.track_id()),
                     ..trace::TraceFilter::default()
                 },
             );
@@ -8549,17 +8530,17 @@ mod tests {
 
         let current_generation = track.channel_generation();
         let mut current = open_raw_track_channel(&service, identity, current_generation).unwrap();
-        write_raw(&mut current, 2, messages::RASTER_FRAME, identity.track_id + 1, &[]).unwrap();
+        write_raw(&mut current, 2, messages::RASTER_FRAME, identity.track_id() + 1, &[]).unwrap();
         let deadline = Instant::now() + Duration::from_secs(2);
         let lost = loop {
             let batch = service.automation_trace(
                 trace::TraceSelection::Tail,
                 128,
                 trace::TraceFilter {
-                    session_id: Some(owner.session_id),
+                    session_id: Some(owner.session_id()),
                     context_id: Some(context_id),
                     surface_id: Some(surface.id()),
-                    track_id: Some(identity.track_id),
+                    track_id: Some(identity.track_id()),
                     ..trace::TraceFilter::default()
                 },
             );
@@ -9011,11 +8992,11 @@ mod tests {
                 .track_keys()
                 .into_iter()
                 .find(|key| {
-                    key.surface.context.session.session_id == session.info().session_id
-                        && key.track_id == 12
+                    key.surface().context().session().session_id() == session.info().session_id
+                        && key.track_id() == 12
                 })
                 .unwrap();
-            let video_identity = TrackIdentity { track_id: 11, ..session_identity };
+            let video_identity = session_identity.surface().track(11).unwrap();
             for identity in [video_identity, session_identity] {
                 service
                     .shared
@@ -9436,7 +9417,7 @@ mod tests {
             .scene
             .track_keys()
             .into_iter()
-            .find(|identity| identity.track_id == track.id())
+            .find(|identity| identity.track_id() == track.id())
             .expect("the raster track is registered");
         let deadline = Instant::now() + Duration::from_secs(2);
         let frame = loop {
@@ -10223,7 +10204,7 @@ mod tests {
             .scene
             .anchor_positions()
             .iter()
-            .filter(|(identity, ..)| identity.context.session == session.identity)
+            .filter(|(identity, ..)| identity.context().session() == session.identity)
             .count()
     }
 
@@ -10448,7 +10429,7 @@ mod tests {
         // Arm an input grant, so the unclean-loss suspension has an active grant to revoke.
         let child_runtime = live_sessions(&service)
             .into_iter()
-            .find(|session| session.identity.session_id == child_session)
+            .find(|session| session.identity.session_id() == child_session)
             .expect("the child session is registered");
         let binding = InputBinding {
             producer_epoch: vivid_protocol::revision::InputEpoch::ONE,
@@ -10984,10 +10965,13 @@ mod tests {
             SessionIdentity::new(service.shared.presenter, healthy.info().session_id).unwrap();
         let status = service
             .scene
-            .surface_status(SurfaceIdentity {
-                context: healthy_identity.context(healthy_context).unwrap(),
-                surface_id: healthy_surface.id(),
-            })
+            .surface_status(
+                healthy_identity
+                    .context(healthy_context)
+                    .unwrap()
+                    .surface(healthy_surface.id())
+                    .unwrap(),
+            )
             .expect("the healthy producer keeps its surface");
         assert_eq!(status.lifecycle, 1);
     }

@@ -541,13 +541,13 @@ impl SharedScene {
     pub fn remove_session(&self, session: SessionIdentity) {
         let mut state = self.lock();
         state.invalidate_topology();
-        state.surfaces.retain(|identity, _| identity.context.session != session);
-        state.tracks.retain(|identity, _| identity.surface.context.session != session);
+        state.surfaces.retain(|identity, _| identity.context().session() != session);
+        state.tracks.retain(|identity, _| identity.surface().context().session() != session);
         state.scenes.remove(&session);
-        state.anchors.retain(|identity, _| identity.context.session != session);
-        state.gone_anchors.retain(|identity| identity.context.session != session);
+        state.anchors.retain(|identity, _| identity.context().session() != session);
+        state.gone_anchors.retain(|identity| identity.context().session() != session);
         state.detached_sessions.remove(&session);
-        state.retained_posters.retain(|poster| poster.anchor.context.session != session);
+        state.retained_posters.retain(|poster| poster.anchor.context().session() != session);
         self.0.changed.notify_all();
     }
 
@@ -570,7 +570,7 @@ impl SharedScene {
         let owned = state
             .tracks
             .keys()
-            .filter(|identity| identity.surface.context.session == session)
+            .filter(|identity| identity.surface().context().session() == session)
             .copied()
             .collect::<Vec<_>>();
         for identity in owned {
@@ -600,7 +600,9 @@ impl SharedScene {
         let Some(track_id) = surface.active_slots.get(&SLOT_PRIMARY_VIDEO) else {
             return false;
         };
-        let key = TrackIdentity { surface: identity, track_id: *track_id };
+        let Ok(key) = identity.track(*track_id) else {
+            return false;
+        };
         state
             .tracks
             .get(&key)
@@ -625,7 +627,7 @@ impl SharedScene {
         let posters_kept = state
             .retained_posters
             .iter()
-            .filter(|poster| poster.anchor.context.session != session)
+            .filter(|poster| poster.anchor.context().session() != session)
             .count();
         for node in scene.nodes.values() {
             if let Some((poster, pixels)) = retained_poster(&*self.0.target, &state, session, node)
@@ -638,14 +640,14 @@ impl SharedScene {
         }
 
         let retained_anchors = posters.iter().map(|poster| poster.anchor).collect::<HashSet<_>>();
-        state.surfaces.retain(|identity, _| identity.context.session != session);
-        state.tracks.retain(|identity, _| identity.surface.context.session != session);
+        state.surfaces.retain(|identity, _| identity.context().session() != session);
+        state.tracks.retain(|identity, _| identity.surface().context().session() != session);
         state.scenes.remove(&session);
         state.anchors.retain(|identity, _| {
-            identity.context.session != session || retained_anchors.contains(identity)
+            identity.context().session() != session || retained_anchors.contains(identity)
         });
-        state.gone_anchors.retain(|identity| identity.context.session != session);
-        state.retained_posters.retain(|poster| poster.anchor.context.session != session);
+        state.gone_anchors.retain(|identity| identity.context().session() != session);
+        state.retained_posters.retain(|poster| poster.anchor.context().session() != session);
         state.retained_posters.extend(posters);
         if retained_anchors.is_empty() {
             state.detached_sessions.remove(&session);
@@ -660,19 +662,20 @@ impl SharedScene {
         let mut state = self.lock();
         state.invalidate_topology();
         state.surfaces.retain(|identity, _| {
-            identity.context.session != session || !contexts.contains(&identity.context.context_id)
+            identity.context().session() != session
+                || !contexts.contains(&identity.context().context_id())
         });
         state.tracks.retain(|identity, _| {
-            identity.surface.context.session != session
-                || !contexts.contains(&identity.surface.context.context_id)
+            identity.surface().context().session() != session
+                || !contexts.contains(&identity.surface().context().context_id())
         });
         if let Some(scene) = state.scenes.get_mut(&session) {
             let before = scene.nodes.len();
             scene.nodes.retain(|identity, node| {
-                !contexts.contains(&identity.context.context_id)
+                !contexts.contains(&identity.context().context_id())
                     && !contexts.contains(&node.surface_context_id)
             });
-            scene.pending.retain(|(identity, _), _| !contexts.contains(&identity.context_id));
+            scene.pending.retain(|(identity, _), _| !contexts.contains(&identity.context_id()));
             if scene.nodes.len() != before
                 && let Ok(next) = scene.revision.advance()
             {
@@ -680,14 +683,16 @@ impl SharedScene {
             }
         }
         state.anchors.retain(|identity, _| {
-            identity.context.session != session || !contexts.contains(&identity.context.context_id)
+            identity.context().session() != session
+                || !contexts.contains(&identity.context().context_id())
         });
         state.gone_anchors.retain(|identity| {
-            identity.context.session != session || !contexts.contains(&identity.context.context_id)
+            identity.context().session() != session
+                || !contexts.contains(&identity.context().context_id())
         });
         state.retained_posters.retain(|poster| {
-            poster.anchor.context.session != session
-                || !contexts.contains(&poster.anchor.context.context_id)
+            poster.anchor.context().session() != session
+                || !contexts.contains(&poster.anchor.context().context_id())
         });
         gc_detached_sessions(&mut state);
         self.0.changed.notify_all();
@@ -835,14 +840,14 @@ impl SharedScene {
     ) -> Result<SurfaceStatus, &'static str> {
         definition.validate().map_err(|_| "invalid surface definition")?;
         self.0.target.validate_surface(&definition)?;
-        if definition.context_id != identity.context.context_id
-            || definition.surface_id != identity.surface_id
+        if definition.context_id != identity.context().context_id()
+            || definition.surface_id != identity.surface_id()
         {
             return Err("surface owner does not match complete identity");
         }
         let mut state = self.lock();
         state.invalidate_topology();
-        if !state.scenes.contains_key(&identity.context.session) {
+        if !state.scenes.contains_key(&identity.context().session()) {
             return Err("owning session does not exist");
         }
         if state.surfaces.contains_key(&identity) {
@@ -876,8 +881,8 @@ impl SharedScene {
         if surface.revision != expected_revision || surface.generation != expected_generation {
             return Err("stale surface revision or generation");
         }
-        if replacement.context_id != identity.context.context_id
-            || replacement.surface_id != identity.surface_id
+        if replacement.context_id != identity.context().context_id()
+            || replacement.surface_id != identity.surface_id()
             || replacement.semantic_profile != surface.definition.semantic_profile
             || replacement.coordinate_model != surface.definition.coordinate_model
         {
@@ -909,12 +914,12 @@ impl SharedScene {
         if state.surfaces.remove(&identity).is_none() {
             return Err("surface does not exist");
         }
-        state.tracks.retain(|key, _| key.surface != identity);
-        if let Some(scene) = state.scenes.get_mut(&identity.context.session) {
+        state.tracks.retain(|key, _| key.surface() != identity);
+        if let Some(scene) = state.scenes.get_mut(&identity.context().session()) {
             let before = scene.nodes.len();
             scene.nodes.retain(|_, node| {
-                node.surface_context_id != identity.context.context_id
-                    || node.surface_id != identity.surface_id
+                node.surface_context_id != identity.context().context_id()
+                    || node.surface_id != identity.surface_id()
             });
             if scene.nodes.len() != before {
                 scene.revision =
@@ -934,7 +939,7 @@ impl SharedScene {
         let mut keys = state
             .surfaces
             .keys()
-            .filter(|identity| !state.detached_sessions.contains(&identity.context.session))
+            .filter(|identity| !state.detached_sessions.contains(&identity.context().session()))
             .copied()
             .collect::<Vec<_>>();
         keys.sort();
@@ -947,9 +952,9 @@ impl SharedScene {
         configuration: TrackConfiguration,
     ) -> Result<TrackStatus, &'static str> {
         configuration.validate(false).map_err(|_| "invalid track configuration")?;
-        if configuration.context_id != identity.surface.context.context_id
-            || configuration.surface_id != identity.surface.surface_id
-            || configuration.track_id != identity.track_id
+        if configuration.context_id != identity.surface().context().context_id()
+            || configuration.surface_id != identity.surface().surface_id()
+            || configuration.track_id != identity.track_id()
         {
             return Err("track owner does not match complete identity");
         }
@@ -961,7 +966,7 @@ impl SharedScene {
         }
         let mut state = self.lock();
         state.invalidate_topology();
-        if !state.surfaces.contains_key(&identity.surface) {
+        if !state.surfaces.contains_key(&identity.surface()) {
             return Err("owning surface does not exist");
         }
         if state.tracks.contains_key(&identity) {
@@ -994,9 +999,9 @@ impl SharedScene {
         if state.tracks.remove(&identity).is_none() {
             return Err("track does not exist");
         }
-        if let Some(surface) = state.surfaces.get_mut(&identity.surface) {
+        if let Some(surface) = state.surfaces.get_mut(&identity.surface()) {
             let slots = surface.active_slots.len();
-            surface.active_slots.retain(|_, track_id| *track_id != identity.track_id);
+            surface.active_slots.retain(|_, track_id| *track_id != identity.track_id());
             // Only a vacated slot mutates the surface. Advancing the revision for a track that
             // held no slot moves presenter truth away from the revision the producer holds, with
             // nothing said about it, and the producer's next surface update is rejected as stale.
@@ -1034,7 +1039,8 @@ impl SharedScene {
                 candidate.remove(&slot);
                 continue;
             }
-            let track_identity = TrackIdentity { surface: surface_identity, track_id };
+            let track_identity =
+                surface_identity.track(track_id).map_err(|_| "track does not exist")?;
             let track = state.tracks.get(&track_identity).ok_or("track does not exist")?;
             if track.lifecycle == 6 {
                 return Err("track was lost before slot activation");
@@ -1136,7 +1142,7 @@ impl SharedScene {
     ) -> Option<TrackIdentity> {
         let state = self.lock();
         let track_id = *state.surfaces.get(&surface_identity)?.active_slots.get(&slot)?;
-        let identity = TrackIdentity { surface: surface_identity, track_id };
+        let identity = surface_identity.track(track_id).ok()?;
         state.tracks.get(&identity).is_some_and(|track| track.lifecycle == 1).then_some(identity)
     }
 
@@ -1145,7 +1151,9 @@ impl SharedScene {
         let mut keys = state
             .tracks
             .keys()
-            .filter(|identity| !state.detached_sessions.contains(&identity.surface.context.session))
+            .filter(|identity| {
+                !state.detached_sessions.contains(&identity.surface().context().session())
+            })
             .copied()
             .collect::<Vec<_>>();
         keys.sort();
@@ -1465,12 +1473,12 @@ impl SharedScene {
         }
         let active = state
             .surfaces
-            .get(&identity.surface)
+            .get(&identity.surface())
             .ok_or("surface does not exist")?
             .active_slots
             .values()
             .copied()
-            .map(|track_id| TrackIdentity { surface: identity.surface, track_id })
+            .filter_map(|track_id| identity.surface().track(track_id).ok())
             .collect::<Vec<_>>();
         let mut started = false;
         for candidate in active {
@@ -1507,13 +1515,13 @@ impl SharedScene {
             return false;
         }
         let mut state = self.lock();
-        let Some(surface) = state.surfaces.get(&identity.surface) else {
+        let Some(surface) = state.surfaces.get(&identity.surface()) else {
             return false;
         };
         let members = surface
             .active_slots
             .values()
-            .map(|id| TrackIdentity { surface: identity.surface, track_id: *id })
+            .filter_map(|id| identity.surface().track(*id).ok())
             .collect::<Vec<_>>();
         let pending = members.iter().any(|id| {
             state
@@ -1574,14 +1582,14 @@ impl SharedScene {
         audio_pts: Option<i64>,
     ) -> Result<(), &'static str> {
         let mut state = self.lock();
-        let surface = identity.surface;
+        let surface = identity.surface();
         if !state.tracks.contains_key(&identity) {
             return Err("track does not exist");
         }
         for track in state
             .tracks
             .iter_mut()
-            .filter_map(|(candidate, track)| (candidate.surface == surface).then_some(track))
+            .filter_map(|(candidate, track)| (candidate.surface() == surface).then_some(track))
         {
             if let Some(playback) = track.playback.as_mut() {
                 playback.synchronized_pending = false;
@@ -1769,7 +1777,7 @@ impl SharedScene {
             return Err("transaction ID must be nonzero");
         }
         let mut state = self.lock();
-        let scene = state.scenes.get_mut(&context.session).ok_or("session does not exist")?;
+        let scene = state.scenes.get_mut(&context.session()).ok_or("session does not exist")?;
         if scene.pending.insert((context, transaction_id), Vec::new()).is_some() {
             return Err("transaction already exists");
         }
@@ -1824,7 +1832,7 @@ impl SharedScene {
     pub fn abort_transaction(&self, context: ContextIdentity, transaction_id: u64) -> bool {
         self.lock()
             .scenes
-            .get_mut(&context.session)
+            .get_mut(&context.session())
             .and_then(|scene| scene.pending.remove(&(context, transaction_id)))
             .is_some()
     }
@@ -1838,7 +1846,7 @@ impl SharedScene {
     ) -> Result<SceneRevision, CommitRejection> {
         let mut state = self.lock();
         state.invalidate_topology();
-        let session = context.session;
+        let session = context.session();
         let mutations = state
             .scenes
             .get(&session)
@@ -1862,13 +1870,13 @@ impl SharedScene {
                     let identity = context
                         .node(node.node_id)
                         .map_err(|_| CommitRejection::Failed("invalid node ID"))?;
-                    if node.owning_context_id != context.context_id
+                    if node.owning_context_id != context.context_id()
                         || candidate.contains_key(&identity)
                     {
                         return Err(CommitRejection::Failed("duplicate or misowned node"));
                     }
                     let surface_identity = context
-                        .session
+                        .session()
                         .context(node.surface_context_id)
                         .map_err(|_| CommitRejection::Failed("invalid surface context"))?
                         .surface(node.surface_id)
@@ -1883,7 +1891,7 @@ impl SharedScene {
                     let identity = context
                         .node(node.node_id)
                         .map_err(|_| CommitRejection::Failed("invalid node ID"))?;
-                    if node.owning_context_id != context.context_id
+                    if node.owning_context_id != context.context_id()
                         || !candidate.contains_key(&identity)
                     {
                         return Err(CommitRejection::Failed("missing or misowned node"));
@@ -1891,7 +1899,7 @@ impl SharedScene {
                     candidate.insert(identity, node);
                 },
                 NodeMutation::Delete(identity) => {
-                    if identity.context != context || candidate.remove(&identity).is_none() {
+                    if identity.context() != context || candidate.remove(&identity).is_none() {
                         return Err(CommitRejection::Failed("missing or misowned node"));
                     }
                 },
@@ -1922,25 +1930,25 @@ impl SharedScene {
         let mut entries = Vec::new();
         let mut session_revision = 0_u64;
         for (identity, surface) in &state.surfaces {
-            if identity.context.session != session || entries.len() >= maximum {
+            if identity.context().session() != session || entries.len() >= maximum {
                 continue;
             }
             session_revision = session_revision.saturating_add(surface.revision.get());
             let tracks = state
                 .tracks
                 .iter()
-                .filter(|(key, _)| key.surface == *identity)
+                .filter(|(key, _)| key.surface() == *identity)
                 .map(|(key, track)| {
                     Value::Map(vec![
-                        (0, Value::Unsigned(key.track_id)),
+                        (0, Value::Unsigned(key.track_id())),
                         (1, Value::Unsigned(track.state.revision.get())),
                         (2, Value::Unsigned(track.state.channel_generation.get())),
                     ])
                 })
                 .collect::<Vec<_>>();
             entries.push(Value::Map(vec![
-                (0, Value::Unsigned(identity.context.context_id)),
-                (1, Value::Unsigned(identity.surface_id)),
+                (0, Value::Unsigned(identity.context().context_id())),
+                (1, Value::Unsigned(identity.surface_id())),
                 (2, Value::Unsigned(surface.revision.get())),
                 (3, Value::Unsigned(surface.generation.get())),
                 (4, Value::Unsigned(surface.lifecycle)),
@@ -1959,9 +1967,10 @@ impl SharedScene {
     pub fn resource_usage(&self, session: SessionIdentity) -> Value {
         let state = self.lock();
         let surfaces =
-            state.surfaces.keys().filter(|key| key.context.session == session).count() as u64;
+            state.surfaces.keys().filter(|key| key.context().session() == session).count() as u64;
         let tracks =
-            state.tracks.keys().filter(|key| key.surface.context.session == session).count() as u64;
+            state.tracks.keys().filter(|key| key.surface().context().session() == session).count()
+                as u64;
         let nodes = state.scenes.get(&session).map(|scene| scene.nodes.len() as u64).unwrap_or(0);
         Value::Map(vec![
             (0, Value::Unsigned(surfaces)),
@@ -2060,7 +2069,7 @@ impl SharedScene {
                 let selected =
                     [SLOT_PRIMARY_VIDEO, SLOT_RASTER, SLOT_POSTER].into_iter().find_map(|slot| {
                         let track_id = *surface.active_slots.get(&slot)?;
-                        let key = TrackIdentity { surface: surface_key, track_id };
+                        let key = surface_key.track(track_id).ok()?;
                         let track = state.tracks.get(&key)?;
                         (track.lifecycle == 1)
                             .then_some(track.frame.as_ref().map(|frame| (key, track, frame)))
@@ -2120,7 +2129,7 @@ impl SharedScene {
             };
             items.push(RenderItem {
                 track_key: poster.track_key,
-                surface_key: poster.track_key.surface,
+                surface_key: poster.track_key.surface(),
                 surface_generation: poster.surface_generation,
                 channel_generation: poster.channel_generation,
                 x,
@@ -2155,7 +2164,7 @@ impl SharedScene {
         pts_us: i64,
     ) -> Result<(), PresentationRejection> {
         let mut state = self.lock();
-        let Some(surface) = state.surfaces.get(&identity.surface) else {
+        let Some(surface) = state.surfaces.get(&identity.surface()) else {
             // Retained terminal-native posters have no live track milestone to acknowledge.
             return Ok(());
         };
@@ -2203,11 +2212,11 @@ impl SharedScene {
             return TrackWaitEvaluation::Lost;
         }
         if matches!(condition, 3 | 4)
-            && !state.scenes.get(&identity.surface.context.session).is_some_and(|scene| {
+            && !state.scenes.get(&identity.surface().context().session()).is_some_and(|scene| {
                 scene.nodes.values().any(|node| {
                     node.visible
-                        && node.surface_context_id == identity.surface.context.context_id
-                        && node.surface_id == identity.surface.surface_id
+                        && node.surface_context_id == identity.surface().context().context_id()
+                        && node.surface_id == identity.surface().surface_id()
                 })
             })
         {
@@ -2263,7 +2272,7 @@ impl SharedScene {
         let mut state = self.lock();
         state
             .scenes
-            .get_mut(&context.session)
+            .get_mut(&context.session())
             .and_then(|scene| scene.pending.get_mut(&(context, transaction_id)))
             .ok_or("transaction does not exist")?
             .push(mutation);
@@ -2307,7 +2316,7 @@ fn retained_poster(
     let (track_key, track, frame) =
         [SLOT_PRIMARY_VIDEO, SLOT_RASTER, SLOT_POSTER].into_iter().find_map(|slot| {
             let track_id = *surface.active_slots.get(&slot)?;
-            let track_key = TrackIdentity { surface: surface_key, track_id };
+            let track_key = surface_key.track(track_id).ok()?;
             let track = state.tracks.get(&track_key)?;
             (track.lifecycle == 1)
                 .then_some(track.frame.as_ref().map(|frame| (track_key, track, frame)))
@@ -2359,12 +2368,14 @@ fn remove_anchors(state: &mut State, removed: &[AnchorIdentity]) {
 fn gc_detached_sessions(state: &mut State) {
     let detached = state.detached_sessions.iter().copied().collect::<Vec<_>>();
     for session in detached {
-        let has_posters =
-            state.retained_posters.iter().any(|poster| poster.anchor.context.session == session);
+        let has_posters = state
+            .retained_posters
+            .iter()
+            .any(|poster| poster.anchor.context().session() == session);
         if !has_posters {
             state.detached_sessions.remove(&session);
-            state.anchors.retain(|identity, _| identity.context.session != session);
-            state.gone_anchors.retain(|identity| identity.context.session != session);
+            state.anchors.retain(|identity, _| identity.context().session() != session);
+            state.gone_anchors.retain(|identity| identity.context().session() != session);
         }
     }
 }

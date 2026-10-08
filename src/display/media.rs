@@ -411,7 +411,7 @@ impl VividMediaRenderer {
             let Some(item) = items.iter().find(|item| item.track_key == *key) else {
                 continue;
             };
-            debug_assert_eq!(item.track_key.surface, item.surface_key);
+            debug_assert_eq!(item.track_key.surface(), item.surface_key);
             self.upload_track(device, queue, item.track_key, item);
         }
         self.upload_tracks = upload_tracks;

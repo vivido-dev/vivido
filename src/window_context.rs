@@ -2676,8 +2676,8 @@ impl WindowContext {
             .into_iter()
             .map(|identity| {
                 json_value!({
-                    "session_id": identity.session_id,
-                    "presenter_instance_id": hex_bytes(&identity.presenter.0),
+                    "session_id": identity.session_id(),
+                    "presenter_instance_id": hex_bytes(&identity.presenter().0),
                 })
             })
             .collect::<Vec<_>>();
@@ -2710,9 +2710,9 @@ impl WindowContext {
             .automation_surface_keys()
             .into_iter()
             .find(|identity| {
-                identity.context.session.session_id == session_id
-                    && identity.context.context_id == context_id
-                    && identity.surface_id == surface_id
+                identity.context().session().session_id() == session_id
+                    && identity.context().context_id() == context_id
+                    && identity.surface_id() == surface_id
             })
             .and_then(|identity| self.vivid_service.automation_surface_status(identity))
             .map(|status| vivid_surface_status_json(self.ipc_window_id, &status))
@@ -2746,10 +2746,10 @@ impl WindowContext {
             .automation_track_keys()
             .into_iter()
             .find(|identity| {
-                identity.surface.context.session.session_id == session_id
-                    && identity.surface.context.context_id == context_id
-                    && identity.surface.surface_id == surface_id
-                    && identity.track_id == track_id
+                identity.surface().context().session().session_id() == session_id
+                    && identity.surface().context().context_id() == context_id
+                    && identity.surface().surface_id() == surface_id
+                    && identity.track_id() == track_id
             })
             .and_then(|identity| self.vivid_service.automation_track_status(identity))
             .map(|status| vivid_track_status_json(self.ipc_window_id, &status))
@@ -2769,7 +2769,7 @@ impl WindowContext {
             .vivid_service
             .automation_sessions()
             .into_iter()
-            .find(|identity| identity.session_id == session_id)
+            .find(|identity| identity.session_id() == session_id)
             .ok_or_else(|| IpcError::new("session_not_found", "Vivid session does not exist"))?;
         let status = self.vivid_service.automation_scene_status(session, maximum_nodes);
         let nodes = status
@@ -2777,7 +2777,7 @@ impl WindowContext {
             .into_iter()
             .map(|node| {
                 json_value!({
-                    "presenter_instance_id": hex_bytes(&node.identity.context.session.presenter.0),
+                    "presenter_instance_id": hex_bytes(&node.identity.context().session().presenter().0),
                     "node_id": node.node.node_id,
                     "owning_context_id": node.node.owning_context_id,
                     "surface_context_id": node.node.surface_context_id,
@@ -2792,7 +2792,7 @@ impl WindowContext {
             .collect::<Vec<_>>();
         Ok(json_value!({
             "window_id": self.ipc_window_id,
-            "presenter_instance_id": hex_bytes(&status.session.presenter.0),
+            "presenter_instance_id": hex_bytes(&status.session.presenter().0),
             "session_id": session_id,
             "scene_revision": status.revision.get(),
             "target_generation": status.target_generation.get(),
@@ -2829,7 +2829,7 @@ impl WindowContext {
             .into_iter()
             .filter_map(|identity| {
                 self.automation_vivid_scene(
-                    identity.session_id,
+                    identity.session_id(),
                     crate::vivid::MAX_SCENE_NODES as u64,
                 )
                 .ok()
@@ -2911,10 +2911,10 @@ impl WindowContext {
         value: Option<u64>,
     ) -> TrackWaitEvaluation {
         let identity = self.vivid_service.automation_track_keys().into_iter().find(|identity| {
-            identity.surface.context.session.session_id == session_id
-                && identity.surface.context.context_id == context_id
-                && identity.surface.surface_id == surface_id
-                && identity.track_id == track_id
+            identity.surface().context().session().session_id() == session_id
+                && identity.surface().context().context_id() == context_id
+                && identity.surface().surface_id() == surface_id
+                && identity.track_id() == track_id
         });
         let Some(identity) = identity else {
             return TrackWaitEvaluation::NotFound;
@@ -3512,9 +3512,9 @@ fn vivid_surface_status_json(window_id: u64, status: &crate::vivid::scene::Surfa
     let descriptor = &status.definition.descriptor;
     json_value!({
         "window_id": window_id,
-        "session_id": status.identity.context.session.session_id,
-        "context_id": status.identity.context.context_id,
-        "surface_id": status.identity.surface_id,
+        "session_id": status.identity.context().session().session_id(),
+        "context_id": status.identity.context().context_id(),
+        "surface_id": status.identity.surface_id(),
         "surface_revision": status.revision.get(),
         "surface_generation": status.generation.get(),
         "semantic_profile": status.definition.semantic_profile,
@@ -3542,10 +3542,10 @@ fn vivid_surface_status_json(window_id: u64, status: &crate::vivid::scene::Surfa
 fn vivid_track_status_json(window_id: u64, status: &crate::vivid::scene::TrackStatus) -> Value {
     json_value!({
         "window_id": window_id,
-        "session_id": status.identity.surface.context.session.session_id,
-        "context_id": status.identity.surface.context.context_id,
-        "surface_id": status.identity.surface.surface_id,
-        "track_id": status.identity.track_id,
+        "session_id": status.identity.surface().context().session().session_id(),
+        "context_id": status.identity.surface().context().context_id(),
+        "surface_id": status.identity.surface().surface_id(),
+        "track_id": status.identity.track_id(),
         "track_revision": status.state.revision.get(),
         "channel_generation": status.state.channel_generation.get(),
         "kind": crate::vivid::scene::track_kind_name(&status.configuration),

@@ -121,7 +121,7 @@ fn egress_close_join_cancels_nonreading_peer() {
         .is_some_and(|session| lock(&session.egress).is_some())));
     let runtime = lock(&service.shared.registry).sessions[&peer.session_id].clone();
     // Both owners use root context 1; cancelling one connection must not affect the other.
-    assert_eq!(runtime.root_context.context_id, healthy.info().root_context_id);
+    assert_eq!(runtime.root_context.context_id(), healthy.info().root_context_id);
     let egress = lock(&runtime.egress).clone().unwrap();
     egress.pause_worker_for_test();
     for _ in 0..8 {
