@@ -252,7 +252,6 @@ wayland = [
   "winit/wayland-dlopen",
   "winit/wayland-csd-adwaita",
 ]
-nightly = []
 # Reads Vello's bump allocators back after every frame and records the high-water mark, which is
 # the only way to learn what a terminal scene actually costs: Vello sizes those buffers from
 # constants and reports an overrun by setting a flag nobody reads. Drives the ignored

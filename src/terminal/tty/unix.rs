@@ -80,24 +80,36 @@ fn get_pw_entry(buf: &mut [i8; 1024]) -> Result<Passwd<'_>> {
     let status = unsafe {
         libc::getpwuid_r(uid, entry.as_mut_ptr(), buf.as_mut_ptr() as *mut _, buf.len(), &mut res)
     };
-    let entry = unsafe { entry.assume_init() };
 
-    if status < 0 {
-        return Err(Error::other("getpwuid_r failed"));
+    // `getpwuid_r` reports failure through its return value, not errno, and leaves `entry`
+    // uninitialized unless it found the user.
+    if status != 0 {
+        return Err(Error::from_raw_os_error(status));
     }
 
     if res.is_null() {
         return Err(Error::other("pw not found"));
     }
 
+    // SAFETY: `getpwuid_r` succeeded and returned a non-null result, so it filled `entry`.
+    let entry = unsafe { entry.assume_init() };
+
     // Sanity check.
     assert_eq!(entry.pw_uid, uid);
 
+    // SAFETY: on success every string field points to a NUL-terminated string inside `buf`,
+    // which outlives the returned `Passwd`.
+    let field = |pointer| {
+        unsafe { CStr::from_ptr(pointer) }
+            .to_str()
+            .map_err(|_| Error::new(ErrorKind::InvalidData, "passwd entry is not UTF-8"))
+    };
+
     // Build a borrowed Passwd struct.
     Ok(Passwd {
-        name: unsafe { CStr::from_ptr(entry.pw_name).to_str().unwrap() },
-        dir: unsafe { CStr::from_ptr(entry.pw_dir).to_str().unwrap() },
-        shell: unsafe { CStr::from_ptr(entry.pw_shell).to_str().unwrap() },
+        name: field(entry.pw_name)?,
+        dir: field(entry.pw_dir)?,
+        shell: field(entry.pw_shell)?,
     })
 }
 

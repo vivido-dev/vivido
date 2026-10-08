@@ -267,9 +267,10 @@ impl Decoder {
     fn convert_frame(&mut self) -> io::Result<DecodedFrame> {
         let pts_us = unsafe { self.abi.frame_pts(self.frame) };
         let frame = unsafe { self.abi.frame(self.frame) };
-        if frame.width <= 0 || frame.height <= 0 || frame.width > 8192 || frame.height > 8192 {
-            return Err(invalid("decoder produced invalid frame dimensions"));
-        }
+        let (width, height) = match (u32::try_from(frame.width), u32::try_from(frame.height)) {
+            (Ok(width @ 1..=8192), Ok(height @ 1..=8192)) => (width, height),
+            _ => return Err(invalid("decoder produced invalid frame dimensions")),
+        };
         if self.scale.is_null()
             || self.scale_format != frame.format
             || self.scale_size != (frame.width, frame.height)
@@ -317,8 +318,6 @@ impl Decoder {
             self.scale_size = (frame.width, frame.height);
         }
 
-        let width = u32::try_from(frame.width).unwrap();
-        let height = u32::try_from(frame.height).unwrap();
         let length = (width as usize)
             .checked_mul(height as usize)
             .and_then(|pixels| pixels.checked_mul(4))

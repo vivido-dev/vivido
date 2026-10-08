@@ -178,10 +178,16 @@ impl Clipboard {
 impl Default for Clipboard {
     fn default() -> Self {
         #[cfg(any(target_os = "macos", windows))]
-        return Self {
-            clipboard: Box::new(ClipboardContext::new().unwrap()),
-            selection: None,
-            media: MediaClipboard::Unopened,
+        return match ClipboardContext::new() {
+            Ok(clipboard) => Self {
+                clipboard: Box::new(clipboard),
+                selection: None,
+                media: MediaClipboard::Unopened,
+            },
+            Err(err) => {
+                warn!("Unable to open the system clipboard; text clipboard stays disabled: {err}");
+                Self::new_nop()
+            },
         };
 
         #[cfg(not(any(target_os = "macos", windows)))]

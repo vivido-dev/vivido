@@ -444,7 +444,14 @@ fn vivido(mut options: Options) -> Result<(), Box<dyn Error>> {
 
     // Switch to home directory.
     #[cfg(target_os = "macos")]
-    env::set_current_dir(home::home_dir().unwrap()).unwrap();
+    match home::home_dir() {
+        Some(home) => {
+            if let Err(err) = env::set_current_dir(&home) {
+                log::warn!("Unable to switch to home directory {}: {err}", home.display());
+            }
+        },
+        None => log::warn!("Unable to determine home directory"),
+    }
 
     // Set macOS locale.
     #[cfg(target_os = "macos")]
