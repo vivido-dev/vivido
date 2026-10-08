@@ -342,9 +342,22 @@ mod windows_process_playback {
             Self { pty, binary, name, _directory: directory, tail: Vec::new() }
         }
         fn key(&mut self, key: &[u8]) {
-            if let Err(error) = self.pty.writer().write_all(key) {
-                self.drain();
-                panic!("key {key:?}: {error}; terminal={}", String::from_utf8_lossy(&self.tail));
+            // The event-loop writer is nonblocking and can yield with Ok(0), even for a
+            // short key. Preserve partial writes and retry instead of dropping input.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut remaining = key;
+            while !remaining.is_empty() {
+                match self.pty.writer().write(remaining) {
+                    Ok(0) => {},
+                    Ok(count) => remaining = &remaining[count..],
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {},
+                    Err(error) => panic!("key {key:?}: {error}"),
+                }
+                assert!(Instant::now() < deadline, "key {key:?}: input write timed out");
+                if !remaining.is_empty() {
+                    thread::sleep(Duration::from_millis(1));
+                }
             }
         }
         fn drain(&mut self) {

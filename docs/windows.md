@@ -195,3 +195,35 @@ The config file is yours: repair, upgrade, and uninstall never overwrite or dele
 - The automation endpoint (`vivido msg …`) is an owner-only named pipe on Windows rather than a
   Unix socket.
 - The rendering backend is always DirectX 12 and cannot be changed. Keep your GPU driver current.
+
+## Running ignored acceptance tests
+
+From a checkout, `cargo test -- --ignored --test-threads=1` exercises real GPU, audio,
+ConPTY, and language-binding integrations. Build the sibling `vivi` and `vvmux` projects
+and provide `medias/under_attack.webm` (or set `VIVI_TEST_BIN`, `VVMUX_TEST_BIN`, and
+`VIVI_TEST_MEDIA`). The overlay test also needs the SDK's Python virtual environment,
+built Python and Node bindings, Node on `PATH`, and a LuaJIT runtime with its matching
+native SDK module. See the SDK's `docs/OVERLAYS.md` binding validation instructions.
+
+To prepare LuaJIT locally without changing your system `PATH`, open a **Developer PowerShell
+for Visual Studio configured for x64** and run these commands from `vivido/`:
+
+```powershell
+git clone --depth 1 --branch v2.1 https://github.com/LuaJIT/LuaJIT.git target/overlay-test-tools/LuaJIT
+Push-Location target/overlay-test-tools/LuaJIT/src
+cmd /c msvcbuild.bat
+Pop-Location
+$env:LUA_LIB = (Resolve-Path target/overlay-test-tools/LuaJIT/src).Path
+$env:LUA_LIB_NAME = 'lua51'
+$env:LUA_INC = $env:LUA_LIB
+cargo build --manifest-path ../vivid_sdk/lua-bindings/Cargo.toml
+Copy-Item ../vivid_sdk/lua-bindings/target/debug/vivid_sdk_lua.dll ../vivid_sdk/lua/vivid_sdk.dll
+Copy-Item target/overlay-test-tools/LuaJIT/src/luajit.exe target/overlay-test-tools/luajit.exe
+Copy-Item target/overlay-test-tools/LuaJIT/src/lua51.dll target/overlay-test-tools/lua51.dll
+cargo test -- --ignored --test-threads=1
+```
+
+The overlay test uses this local LuaJIT when present, otherwise `luajit` on `PATH`.
+`VIVID_OVERLAY_TEST_LUA` overrides both choices; its interpreter must match the SDK module's
+Lua ABI. `VIVID_OVERLAY_TEST_PYTHON` and `VIVID_OVERLAY_TEST_NODE` override the other runtimes.
+The prepared runtime lives under `target/`, so repeat its setup after `cargo clean`.

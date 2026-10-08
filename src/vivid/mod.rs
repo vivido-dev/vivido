@@ -7007,7 +7007,11 @@ mod tests {
         let node = std::env::var_os("VIVID_OVERLAY_TEST_NODE").unwrap_or_else(|| "node".into());
         // The Lua fixture loads the module `vivid_sdk/lua/build.sh` stages, for whichever Lua
         // it was built for; LuaJIT is that script's default.
-        let lua = std::env::var_os("VIVID_OVERLAY_TEST_LUA").unwrap_or_else(|| "luajit".into());
+        let lua = std::env::var_os("VIVID_OVERLAY_TEST_LUA").unwrap_or_else(|| {
+            let local = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("target/overlay-test-tools/luajit.exe");
+            if cfg!(windows) && local.is_file() { local.into_os_string() } else { "luajit".into() }
+        });
         let lua_cpath = sdk.join("lua").join(if cfg!(windows) { "?.dll" } else { "?.so" });
         for (executable, fixture, mode) in [
             (&python, "overlay_python.py", "blocking"),
@@ -7042,7 +7046,9 @@ mod tests {
             ] {
                 command.env(endpoint, service.control_endpoint());
             }
-            let mut child = Child(command.spawn().expect("binding test producer starts"));
+            let mut child = Child(command.spawn().unwrap_or_else(|error| {
+                panic!("cannot start {executable:?} for {fixture} {mode}: {error}");
+            }));
             let deadline = Instant::now() + Duration::from_secs(20);
             while lock(&service.shared.overlays).drawing(&service.scene).is_empty() {
                 assert!(
