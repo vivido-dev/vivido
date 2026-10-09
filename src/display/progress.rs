@@ -36,8 +36,11 @@ pub const TRACK_ALPHA: f32 = 0.3;
 /// The colour role of a determinate bar.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ProgressTone {
+    /// Normal presentation or stacking behavior.
     Normal,
+    /// Paused progress or playback.
     Paused,
+    /// Error progress or an operation failure.
     Error,
 }
 
@@ -45,24 +48,38 @@ pub enum ProgressTone {
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub enum ProgressVisual {
     /// Filled from the left edge to `fraction` (`0..=1`) of the width.
-    Fill { tone: ProgressTone, fraction: f32 },
+    Fill {
+        /// Progress indicator color classification.
+        tone: ProgressTone,
+        /// Completed progress fraction from zero to one.
+        fraction: f32,
+    },
     /// A [`SEGMENT_FRACTION`]-wide segment starting at `offset` (`0..=1 - SEGMENT_FRACTION`).
-    Bounce { offset: f32 },
+    Bounce {
+        /// Normalized animation offset.
+        offset: f32,
+    },
 }
 
 /// The reported progress of one surface, for mirroring outside it.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct Progress {
+    /// Classification of this item.
     pub kind: ProgressKind,
     /// Percent complete in `0..=100`; `None` only for [`ProgressKind::Indeterminate`].
     pub percent: Option<u8>,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+/// Progress reported by a terminal application.
 pub enum ProgressKind {
+    /// Normal presentation or stacking behavior.
     Normal,
+    /// Progress without a known completion fraction.
     Indeterminate,
+    /// Paused progress or playback.
     Paused,
+    /// Error progress or an operation failure.
     Error,
 }
 

@@ -4,6 +4,7 @@
 #![deny(clippy::all, clippy::if_not_else, clippy::enum_glob_use)]
 #![cfg_attr(clippy, deny(warnings))]
 
+/// Event types and operations.
 pub mod event;
 pub mod event_loop;
 pub mod graphics;
@@ -12,6 +13,7 @@ pub mod index;
 pub mod selection;
 pub mod sync;
 pub mod term;
+/// Thread types and operations.
 pub mod thread;
 pub mod tty;
 

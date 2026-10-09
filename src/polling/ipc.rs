@@ -10,7 +10,7 @@ use std::io::{self, BufRead, BufReader, Error as IoError, ErrorKind, Read, Write
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, SyncSender, TrySendError};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use base64::Engine;
@@ -78,19 +78,6 @@ const VIVIDO_SESSION_ENV: &str = "VIVIDO_SESSION";
 /// Vivida-side spelling of [`VIVIDO_SESSION_ENV`], honored by the same discovery.
 const VIVIDA_TARGET_ENV: &str = "VIVIDA_TARGET";
 
-/// How this instance describes itself in the `hello` capability document.
-///
-/// Whether a process is headless, and which session it serves, is fixed at startup, so it is
-/// recorded once rather than threaded through every connection.
-static INSTANCE: std::sync::OnceLock<Instance> = std::sync::OnceLock::new();
-
-#[derive(Debug, Default)]
-struct Instance {
-    headless: bool,
-    session: Option<String>,
-    automation_name: Option<String>,
-}
-
 /// Number of serialized frames buffered for one connection.
 const OUTPUT_QUEUE_FRAMES: usize = MAX_SUBSCRIBER_EVENTS + MAX_IN_FLIGHT_REQUESTS;
 
@@ -149,67 +136,49 @@ pub const METHODS: &[&str] = &[
     "subscribe",
 ];
 
-/// Additional methods an in-process host has claimed, advertised alongside [`METHODS`].
-///
-/// The handshake is answered on the listener thread, while claiming happens on the main loop, so
-/// the claimed set lives here rather than on the processor that owns it.
-static HOST_METHODS: RwLock<Vec<String>> = RwLock::new(Vec::new());
-
-/// Descriptors supplied by an embedding host for its claimed methods.
-static HOST_METHOD_CAPABILITIES: RwLock<Vec<MethodCapability>> = RwLock::new(Vec::new());
-
 /// Stable high-level effect class for one automation method.
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum MethodClass {
+    /// Read or wait for state without mutation.
     Observe,
+    /// Deliver terminal input.
     Input,
+    /// Window state or a window-operation failure.
     Window,
+    /// Read or update configuration.
     Config,
+    /// Operate on a child process.
     Process,
+    /// Create, close, reset, or restart an owned resource.
     Lifecycle,
+    /// An embedding-host extension method.
     Extension,
 }
 
 /// Additive method metadata advertised by the version-2 handshake.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct MethodCapability {
+    /// Name identifying this item.
     pub name: String,
+    /// Effect or failure classification.
     pub class: MethodClass,
+    /// Whether this method changes host state.
     pub mutating: bool,
+    /// Whether the embedding host owns dispatch for this method.
     pub host_claimed: bool,
 }
 
 impl MethodCapability {
+    /// Describe a method whose dispatch belongs to the embedding host.
     pub fn host(name: impl Into<String>, class: MethodClass, mutating: bool) -> Self {
         Self { name: name.into(), class, mutating, host_claimed: true }
     }
 }
 
-/// Publish the host's claimed method names for the handshake to advertise.
-pub(crate) fn publish_host_methods<'a>(methods: impl IntoIterator<Item = &'a String>) {
-    let claimed = methods.into_iter().cloned().collect::<Vec<_>>();
-    match HOST_METHODS.write() {
-        Ok(mut host_methods) => *host_methods = claimed,
-        Err(poisoned) => *poisoned.into_inner() = claimed,
-    }
-}
-
-/// Publish effect metadata for methods claimed by an embedding host.
-pub(crate) fn publish_host_method_capabilities(capabilities: &[MethodCapability]) {
-    match HOST_METHOD_CAPABILITIES.write() {
-        Ok(mut published) => *published = capabilities.to_vec(),
-        Err(poisoned) => *poisoned.into_inner() = capabilities.to_vec(),
-    }
-}
-
 /// Every method the handshake advertises: Vivido's own plus the host's claimed names.
-fn advertised_methods() -> Vec<String> {
+fn advertised_methods(host_methods: &std::collections::BTreeSet<String>) -> Vec<String> {
     let mut methods = METHODS.iter().map(|method| (*method).to_owned()).collect::<Vec<_>>();
-    let host_methods = match HOST_METHODS.read() {
-        Ok(host_methods) => host_methods,
-        Err(poisoned) => poisoned.into_inner(),
-    };
     for method in host_methods.iter() {
         if !methods.iter().any(|advertised| advertised == method) {
             methods.push(method.clone());
@@ -261,16 +230,11 @@ fn method_class(name: &str) -> (MethodClass, bool) {
     }
 }
 
-fn advertised_method_capabilities() -> Vec<MethodCapability> {
-    let methods = advertised_methods();
-    let host = match HOST_METHOD_CAPABILITIES.read() {
-        Ok(host) => host,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-    let host_methods = match HOST_METHODS.read() {
-        Ok(methods) => methods,
-        Err(poisoned) => poisoned.into_inner(),
-    };
+fn advertised_method_capabilities(
+    host_methods: &std::collections::BTreeSet<String>,
+    host: &[MethodCapability],
+) -> Vec<MethodCapability> {
+    let methods = advertised_methods(host_methods);
     methods
         .into_iter()
         .map(|name| {
@@ -325,17 +289,22 @@ pub struct RequestEnvelope {
 /// Structured stable IPC error.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct IpcError {
+    /// Stable machine-readable error code.
     pub code: String,
+    /// Human-readable diagnostic.
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// Optional structured error context.
     pub data: Option<Value>,
 }
 
 impl IpcError {
+    /// Create an IPC error with a stable code and diagnostic.
     pub fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
         Self { code: code.into(), message: message.into(), data: None }
     }
 
+    /// Attach structured context to this IPC error.
     pub fn with_data(mut self, data: Value) -> Self {
         self.data = Some(data);
         self
@@ -395,9 +364,13 @@ impl SubscriptionEventEnvelope {
 /// A request delivered to the main UI event loop.
 #[derive(Clone)]
 pub struct IpcRequest {
+    /// Connection on which to send this request's reply.
     pub connection: IpcConnection,
+    /// Identifier scoped to this value's owning context.
     pub id: u64,
+    /// Automation method name.
     pub method: String,
+    /// Method parameters encoded as a JSON object.
     pub params: Value,
 }
 
@@ -434,25 +407,31 @@ impl fmt::Debug for IpcConnection {
 }
 
 impl IpcConnection {
+    /// Return the identifier assigned to this object.
     pub fn id(&self) -> u64 {
         self.inner.id
     }
 
+    /// Whether this connection still accepts replies and events.
     pub fn is_alive(&self) -> bool {
         self.inner.alive.load(Ordering::Acquire)
     }
 
     fn close(&self) {
         self.inner.alive.store(false, Ordering::Release);
-        if let Some(stream) = self.inner.shutdown.lock().unwrap().take() {
+        if let Some(stream) =
+            self.inner.shutdown.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take()
+        {
             let _ = stream.shutdown();
         }
     }
 
+    /// Queue a successful reply and finish the corresponding in-flight request.
     pub fn reply(&self, request_id: u64, result: Value) {
         self.finish_request(request_id, ResponseEnvelope::success(request_id, result));
     }
 
+    /// Queue an error reply and finish the corresponding in-flight request.
     pub fn error(&self, request_id: u64, error: IpcError) {
         self.finish_request(request_id, ResponseEnvelope::error(request_id, error));
     }
@@ -461,6 +440,11 @@ impl IpcConnection {
         let _ = self.queue_json(&ResponseEnvelope::error(request_id, error));
     }
 
+    /// Queue one subscription event within per-connection resource limits.
+    ///
+    /// # Errors
+    ///
+    /// Returns an IPC error if this connection is closed or its bounded output queue is full.
     pub fn event(
         &self,
         event: SubscriptionEventEnvelope,
@@ -480,7 +464,20 @@ impl IpcConnection {
     }
 
     fn finish_request(&self, request_id: u64, response: ResponseEnvelope) {
-        self.inner.in_flight.lock().unwrap().remove(&request_id);
+        if !self.is_alive() {
+            return;
+        }
+        match self.inner.in_flight.lock() {
+            Ok(mut requests) => {
+                requests.remove(&request_id);
+            },
+            Err(poisoned) => {
+                // Only discard poisoned connection state; never dispatch through it again.
+                drop(poisoned.into_inner());
+                self.close();
+                return;
+            },
+        }
         match self.queue_json(&response) {
             Err(QueueError::TooLarge) => {
                 if self
@@ -596,14 +593,8 @@ pub struct IpcListener {
 }
 
 impl IpcListener {
-    pub fn new(options: &Options, event_proxy: EventSink, path: &Path) -> Result<Self, IoError> {
+    pub fn new(_options: &Options, event_proxy: EventSink, path: &Path) -> Result<Self, IoError> {
         let socket = bind_socket(path)?;
-        unsafe { env::set_var(VIVIDO_SOCKET_ENV, path.as_os_str()) };
-        let _ = INSTANCE.set(Instance {
-            headless: options.headless,
-            session: options.session.clone(),
-            automation_name: options.automation_name.clone().or_else(|| options.session.clone()),
-        });
 
         Ok(Self {
             socket,
@@ -677,39 +668,53 @@ fn spawn_connection(
     });
     let writer_inner = Arc::downgrade(&inner);
     thread::spawn_named("IPC writer", move || {
-        let result =
-            client_fault::catch(ClientFaultClass::Ipc, "IPC writer worker panicked", || {
-                let mut writer = writer;
-                let _ = writer.set_write_timeout(Some(IPC_WRITE_TIMEOUT));
-                while let Ok(frame) = output_rx.recv() {
-                    if writer.write_all(&frame.bytes).and_then(|()| writer.flush()).is_err() {
-                        let _ = writer.shutdown();
-                        break;
-                    }
+        supervise_ipc_worker("IPC writer worker panicked", &writer_inner, true, || {
+            let mut writer = writer;
+            let _ = writer.set_write_timeout(Some(IPC_WRITE_TIMEOUT));
+            while let Ok(frame) = output_rx.recv() {
+                if writer.write_all(&frame.bytes).and_then(|()| writer.flush()).is_err() {
+                    let _ = writer.shutdown();
+                    break;
                 }
-            });
-        if let Err(fault) = result {
-            error!("contained IPC writer fault {}", fault.id);
-        }
-        if let Some(writer_inner) = writer_inner.upgrade() {
-            writer_inner.alive.store(false, Ordering::Release);
-        }
+            }
+        });
     });
 
     thread::spawn_named("IPC reader", move || {
         let _guard = guard;
         let _ = event_proxy.send_event(Event::new(EventType::IpcConnect(connection_id), None));
         let connection = IpcConnection { inner };
-        let result =
-            client_fault::catch(ClientFaultClass::Ipc, "IPC reader worker panicked", || {
-                run_connection(stream, connection.clone(), &event_proxy)
-            });
-        if let Err(fault) = result {
-            error!("contained IPC reader fault {}", fault.id);
-        }
-        connection.inner.alive.store(false, Ordering::Release);
+        supervise_ipc_worker(
+            "IPC reader worker panicked",
+            &Arc::downgrade(&connection.inner),
+            false,
+            || run_connection(stream, connection.clone(), &event_proxy),
+        );
         let _ = event_proxy.send_event(Event::new(EventType::IpcDisconnect(connection_id), None));
     });
+}
+
+/// Retire one connection on ordinary return or panic, without retaining its output sender.
+fn supervise_ipc_worker(
+    diagnostic: &'static str,
+    connection: &std::sync::Weak<ConnectionInner>,
+    close_on_return: bool,
+    work: impl FnOnce(),
+) {
+    let fault = client_fault::catch(ClientFaultClass::Ipc, diagnostic, work).err();
+    if let Some(fault) = &fault {
+        error!(event = "ipc_worker_fault", fault_id = fault.id, class = "ipc";
+            "IPC worker retired after an internal fault");
+    }
+    if let Some(inner) = connection.upgrade() {
+        if close_on_return || fault.is_some() {
+            IpcConnection { inner }.close();
+        } else {
+            // A normal reader return may have queued a final protocol error. Let the writer
+            // flush it before it closes the transport; a panic always cancels immediately.
+            inner.alive.store(false, Ordering::Release);
+        }
+    }
 }
 
 fn configure_connection(stream: &LocalStream) -> io::Result<()> {
@@ -747,7 +752,19 @@ fn run_connection(stream: LocalStream, connection: IpcConnection, event_proxy: &
     if !insert_request_id(&connection, first.id) {
         return;
     }
-    connection.reply(first.id, hello_result());
+    // Resolve the handshake on the processor that owns this event sink. Embedding hosts may
+    // have independent method claims and session identities in the same process.
+    let hello = IpcRequest {
+        connection: connection.clone(),
+        id: first.id,
+        method: first.method,
+        params: first.params,
+    };
+    if event_proxy.send_event(Event::new(EventType::IpcRequest(hello), None)).is_err() {
+        connection
+            .error(first.id, IpcError::new("unsupported", "Vivido event loop is shutting down"));
+        return;
+    }
 
     while let Some(frame) = read_request_frame(&mut reader, &connection) {
         let request = match decode_request(&frame) {
@@ -859,18 +876,21 @@ fn max_conpty_windows() -> Value {
     }
 }
 
-fn hello_result() -> Value {
-    let instance = INSTANCE.get();
+pub(crate) fn hello_result(
+    options: &Options,
+    host_methods: &std::collections::BTreeSet<String>,
+    capabilities: &[MethodCapability],
+) -> Value {
     json!({
         "server_version": env!("CARGO_PKG_VERSION"),
         "protocol_version": PROTOCOL_VERSION,
         // Lets an automation client tell a windowless instance from a windowed one without
         // inferring it from a failed `focus`.
-        "headless": instance.is_some_and(|instance| instance.headless),
-        "session": instance.and_then(|instance| instance.session.clone()),
-        "automation_name": instance.and_then(|instance| instance.automation_name.clone()),
-        "methods": advertised_methods(),
-        "method_capabilities": advertised_method_capabilities(),
+        "headless": options.headless,
+        "session": options.session,
+        "automation_name": options.automation_name.as_ref().or(options.session.as_ref()),
+        "methods": advertised_methods(host_methods),
+        "method_capabilities": advertised_method_capabilities(host_methods, capabilities),
         "event_kinds": EVENT_KINDS,
         "error_codes": [
             "unsupported_version", "invalid_request", "invalid_params",
@@ -2200,6 +2220,10 @@ fn write_sarif_report(
 /// fresh session, executes the plan with `run-plan` semantics, captures failure evidence, and
 /// shuts the session down — unless `--keep-failed` preserves a failed session for inspection.
 /// Plan NDJSON events go to stdout; runner chatter goes to stderr so scripts can parse stdout.
+///
+/// # Errors
+///
+/// Returns an I/O error if the IPC endpoint, request, response, or requested check fails.
 pub fn run_test(options: &IpcTest) -> io::Result<()> {
     report_destination(options.report, &options.output, false)?;
     let name = test_session_name(options.session.as_deref())?;
@@ -2560,6 +2584,10 @@ fn run_capture(
 }
 
 /// Send one CLI command using a versioned protocol session.
+///
+/// # Errors
+///
+/// Returns an I/O error if endpoint discovery, connection, request encoding, or response handling fails.
 pub fn send_message(options: MessageOptions) -> io::Result<()> {
     if let SocketMessage::RunPlan(params) = &options.message {
         let (outcome, _) = run_plan(options.socket, options.target.as_deref(), params);
@@ -2609,6 +2637,10 @@ pub fn send_message(options: MessageOptions) -> io::Result<()> {
 }
 
 /// Issue one bounded automation request without rendering CLI output.
+///
+/// # Errors
+///
+/// Returns an I/O error for connection failure, timeout, malformed responses, or a remote error.
 pub fn request_once(
     socket: Option<PathBuf>,
     target: Option<&str>,
@@ -2640,6 +2672,7 @@ fn grant_focus_activation_if_requested(stream: &LocalStream, message: &SocketMes
     };
     // Windows accepts this grant only when the caller is itself foreground-eligible. Failure is
     // deliberately non-fatal: the server may already be foreground and still confirm focus.
+    // SAFETY: The scalar PID came from the connected server handle; this call retains no Rust storage.
     unsafe {
         windows_sys::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow(server_pid);
     }
@@ -2671,6 +2704,10 @@ fn grant_focus_activation_for_method(_stream: &LocalStream, _method: &str) {}
 /// This is the extension point for an embedding host which adds methods beyond
 /// [`SocketMessage`]. It performs the same endpoint discovery, owner checks, handshake, framing,
 /// and response validation as [`send_message`].
+///
+/// # Errors
+///
+/// Returns an I/O error for endpoint discovery, connection, timeout, or a rejected request.
 pub fn request_method(
     socket: Option<PathBuf>,
     target: Option<&str>,
@@ -3362,6 +3399,56 @@ pub(crate) fn test_connection() -> (IpcConnection, mpsc::Receiver<OutputFrame>) 
 mod tests {
 
     #[test]
+    fn normal_reader_retirement_preserves_its_queued_protocol_error() {
+        let (mut client, server) = LocalStream::pair().unwrap();
+        let (connection, frames) = test_connection();
+        *connection.inner.shutdown.lock().unwrap() = Some(server.try_clone().unwrap());
+        let (sink, _events) = EventSink::headless();
+        client
+            .write_all(b"{\"version\":999,\"id\":1,\"method\":\"hello\",\"params\":{}}\n")
+            .unwrap();
+        let mut writer = server.try_clone().unwrap();
+        supervise_ipc_worker(
+            "IPC reader worker panicked",
+            &Arc::downgrade(&connection.inner),
+            false,
+            || {
+                run_connection(server, connection.clone(), &sink);
+            },
+        );
+        assert!(!connection.is_alive());
+        let frame = frames.try_recv().expect("final error was queued");
+        writer.write_all(frame.bytes()).unwrap();
+        let mut response = String::new();
+        BufReader::new(client).read_line(&mut response).unwrap();
+        let response: Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["error"]["code"], "unsupported_version");
+    }
+
+    #[test]
+    fn reader_and_writer_faults_close_only_their_partially_mutated_connection() {
+        for diagnostic in ["IPC reader worker panicked", "IPC writer worker panicked"] {
+            let (failed, failed_output) = test_connection();
+            let (surviving, surviving_output) = test_connection();
+            assert_eq!(failed.id(), surviving.id());
+            failed.inner.in_flight.lock().unwrap().insert(9);
+            surviving.inner.in_flight.lock().unwrap().insert(9);
+            supervise_ipc_worker(diagnostic, &Arc::downgrade(&failed.inner), false, || {
+                let mut requests = failed.inner.in_flight.lock().unwrap();
+                requests.insert(10);
+                panic!("partial request mutation");
+            });
+            assert!(!failed.is_alive());
+            // A retained public handle may be used after cleanup without touching poisoned state.
+            failed.reply(9, json!({"ignored": true}));
+            assert!(failed_output.try_recv().is_err());
+            assert!(surviving.is_alive());
+            surviving.reply(9, json!({"survived": true}));
+            assert!(surviving_output.try_recv().is_ok());
+        }
+    }
+
+    #[test]
     fn drop_file_is_an_advertised_input_method_that_sends_an_absolute_path() {
         assert!(METHODS.contains(&"drop_file"));
         assert_eq!(method_class("drop_file"), (MethodClass::Input, true));
@@ -3886,53 +3973,14 @@ mod tests {
 
     #[cfg(windows)]
     use std::io::Read;
-    use std::io::{BufReader, Write};
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     #[cfg(unix)]
     use std::os::unix::io::AsRawFd;
-    use std::sync::{Mutex, MutexGuard};
 
     use serde_json::json;
 
     use super::*;
-
-    /// Serializes the tests that touch the process-wide claimed-method registries.
-    ///
-    /// `HOST_METHODS` and `HOST_METHOD_CAPABILITIES` are process-wide because the handshake is
-    /// answered on the listener thread while claiming happens on the main loop. Tests run in
-    /// threads of one process, so two that publish would otherwise read each other's claims —
-    /// and each clearing up after itself would clear the other's state as well.
-    static CLAIMED_REGISTRY: Mutex<()> = Mutex::new(());
-
-    /// Exclusive use of the claimed-method registries, empty at both ends.
-    ///
-    /// Held for the whole of any test that publishes or reads the advertised set, so what such a
-    /// test sees is only ever what it put there.
-    struct ClaimedMethods(#[allow(dead_code)] MutexGuard<'static, ()>);
-
-    impl ClaimedMethods {
-        fn acquire() -> Self {
-            // A test that panicked while holding this poisoned the lock. The registries are
-            // emptied on both ends regardless, so one failure is not a reason to fail every test
-            // that runs after it.
-            let guard = CLAIMED_REGISTRY.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-            let claimed = Self(guard);
-            claimed.empty();
-            claimed
-        }
-
-        fn empty(&self) {
-            publish_host_methods([].iter());
-            publish_host_method_capabilities(&[]);
-        }
-    }
-
-    impl Drop for ClaimedMethods {
-        fn drop(&mut self) {
-            self.empty();
-        }
-    }
 
     #[test]
     fn bounded_plan_accepts_backward_only_alias_references() {
@@ -4002,11 +4050,9 @@ mod tests {
 
     #[test]
     fn handshake_classifies_standard_and_host_methods() {
-        let _claimed = ClaimedMethods::acquire();
         let descriptors = [MethodCapability::host("vivida_layout", MethodClass::Observe, false)];
-        publish_host_methods([String::from("vivida_layout")].iter());
-        publish_host_method_capabilities(&descriptors);
-        let capabilities = advertised_method_capabilities();
+        let claimed = [String::from("vivida_layout")].into_iter().collect();
+        let capabilities = advertised_method_capabilities(&claimed, &descriptors);
         assert!(capabilities.iter().any(|capability| {
             capability.name == "mouse"
                 && capability.class == MethodClass::Input
@@ -4348,6 +4394,7 @@ mod tests {
         // and held for no longer than the bind.
         let previous = unsafe { libc::umask(0) };
         let bound = bind_socket(&path);
+        // SAFETY: restore this process-wide scalar mask; the test holds its umask guard.
         unsafe { libc::umask(previous) };
 
         let Some(_socket) = bound_socket_or_skip(bound) else {
@@ -4395,6 +4442,7 @@ mod tests {
         // SAFETY: umask has no preconditions. It is process-wide, so it is restored at once.
         let previous = unsafe { libc::umask(0) };
         let created = private_socket_dir(path.clone());
+        // SAFETY: restore this process-wide scalar mask; the test holds its umask guard.
         unsafe { libc::umask(previous) };
 
         assert_eq!(created, Some(path.clone()));
@@ -4425,6 +4473,7 @@ mod tests {
         server.set_nonblocking(true).unwrap();
         configure_connection(&server).unwrap();
 
+        // SAFETY: server owns this live descriptor; F_GETFL has no pointer arguments.
         let flags = unsafe { libc::fcntl(server.as_raw_fd(), libc::F_GETFL) };
         assert_ne!(flags, -1);
         assert_eq!(flags & libc::O_NONBLOCK, 0);
@@ -4432,10 +4481,7 @@ mod tests {
 
     #[test]
     fn hello_advertises_required_limits() {
-        // This reads the advertised method set, which a test publishing into it would change
-        // underneath it.
-        let _claimed = ClaimedMethods::acquire();
-        let hello = hello_result();
+        let hello = hello_result(&Options::default(), &Default::default(), &[]);
         assert_eq!(hello["protocol_version"], 2);
         assert_eq!(hello["limits"]["connections"], 32);
         #[cfg(windows)]
@@ -4467,19 +4513,21 @@ mod tests {
 
     #[test]
     fn hello_advertises_host_claimed_methods_beside_vivido_own() {
-        let _claimed = ClaimedMethods::acquire();
-        let claimed = [String::from("vvbox_list_tabs"), String::from("create_window")];
-        publish_host_methods(claimed.iter());
+        let claimed =
+            [String::from("vvbox_list_tabs"), String::from("create_window")].into_iter().collect();
 
-        let methods = advertised_methods();
+        let methods = advertised_methods(&claimed);
         // A host name is added once, and re-claiming a built-in never duplicates it.
         assert_eq!(methods.iter().filter(|method| *method == "vvbox_list_tabs").count(), 1);
         assert_eq!(methods.iter().filter(|method| *method == "create_window").count(), 1);
         // Claiming does not withdraw anything Vivido still answers itself.
         assert!(methods.iter().any(|method| method == "get_grid"));
 
-        publish_host_methods([].iter());
-        assert!(!advertised_methods().iter().any(|method| method == "vvbox_list_tabs"));
+        assert!(
+            !advertised_methods(&Default::default())
+                .iter()
+                .any(|method| method == "vvbox_list_tabs")
+        );
     }
 
     /// A connection from this very process is by definition the owner, so it must be accepted.
@@ -4559,9 +4607,9 @@ mod tests {
     /// The capability document tells a client whether it reached a windowless instance.
     #[test]
     fn hello_reports_whether_this_instance_is_headless() {
-        let hello = hello_result();
+        let hello = hello_result(&Options::default(), &Default::default(), &[]);
 
-        // `INSTANCE` is unset in tests, which must read as "windowed" rather than panic.
+        // A default processor describes a windowed instance without a named session.
         assert_eq!(hello["headless"], serde_json::json!(false));
         assert_eq!(hello["session"], Value::Null);
         assert!(hello["methods"].as_array().unwrap().iter().any(|value| value == "quit"));

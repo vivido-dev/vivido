@@ -2,6 +2,7 @@ use std::time::{Duration, Instant};
 
 use crate::config::bell::{BellAnimation, BellConfig};
 
+#[derive(Debug)]
 pub struct VisualBell {
     /// Visual bell animation.
     animation: BellAnimation,

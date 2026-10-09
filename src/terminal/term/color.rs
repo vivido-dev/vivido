@@ -18,7 +18,7 @@ pub const COUNT: usize = 269;
 /// | 259..267 | Dim colors        |
 /// | 267      | Bright foreground |
 /// | 268      | Dim background    |
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug)]
 pub struct Colors([Option<Rgb>; COUNT]);
 
 impl Default for Colors {

@@ -55,14 +55,21 @@ use crate::scheduler::{Scheduler, TimerId, Topic};
 use crate::string::{ShortenDirection, StrShortener};
 use crate::vivid::VividService;
 
+/// Color types and operations.
 pub mod color;
+/// Content types and operations.
 pub mod content;
 pub mod cursor;
+/// Hint types and operations.
 pub mod hint;
+/// Rects types and operations.
 pub mod rects;
+/// Renderer types and operations.
 pub mod renderer;
+/// Text types and operations.
 pub mod text;
 pub mod vector;
+/// Window types and operations.
 pub mod window;
 
 mod bell;
@@ -118,8 +125,11 @@ struct TerminalShapingCell {
 }
 
 #[derive(Debug)]
+/// A failure while creating or using this module's display resources.
 pub enum Error {
+    /// Window state or a window-operation failure.
     Window(window::Error),
+    /// Rendering failed or produced a render-related event.
     Render(renderer::Error),
 }
 
@@ -194,38 +204,44 @@ impl From<SizeInfo<f32>> for WindowSize {
 
 impl<T: Clone + Copy> SizeInfo<T> {
     #[inline]
+    /// Return the width in this geometry's coordinate system.
     pub fn width(&self) -> T {
         self.width
     }
 
     #[inline]
+    /// Return the height in this geometry's coordinate system.
     pub fn height(&self) -> T {
         self.height
     }
 
     #[inline]
+    /// Return one cell's physical-pixel width.
     pub fn cell_width(&self) -> T {
         self.cell_width
     }
 
     #[inline]
+    /// Return one cell's physical-pixel height.
     pub fn cell_height(&self) -> T {
         self.cell_height
     }
 
     #[inline]
+    /// Return horizontal physical-pixel padding.
     pub fn padding_x(&self) -> T {
         self.padding_x
     }
 
     #[inline]
+    /// Return vertical physical-pixel padding.
     pub fn padding_y(&self) -> T {
         self.padding_y
     }
 }
 
 impl SizeInfo<f32> {
-    #[allow(clippy::too_many_arguments)]
+    /// Compute terminal geometry from window, cell, and padding dimensions.
     pub fn new(
         width: f32,
         height: f32,
@@ -259,11 +275,13 @@ impl SizeInfo<f32> {
     }
 
     #[inline]
+    /// Reserve viewport lines for UI while preserving the minimum terminal height.
     pub fn reserve_lines(&mut self, count: usize) {
         self.screen_lines = cmp::max(self.screen_lines.saturating_sub(count), MIN_SCREEN_LINES);
     }
 
     #[inline]
+    /// Whether physical-pixel coordinates fall inside terminal text bounds.
     pub fn contains_point(&self, x: usize, y: usize) -> bool {
         x <= (self.padding_x + self.columns as f32 * self.cell_width) as usize
             && x > self.padding_x as usize
@@ -295,62 +313,84 @@ impl TermDimensions for SizeInfo {
 }
 
 #[derive(Default, Clone, Debug, PartialEq, Eq)]
+/// Pending changes to terminal layout and text rendering.
 pub struct DisplayUpdate {
+    /// Whether this state requires a display update.
     pub dirty: bool,
     dimensions: Option<PhysicalSize<u32>>,
     font: Option<Font>,
 }
 
 impl DisplayUpdate {
+    /// Return the pending or configured window dimensions, when explicitly set.
     pub fn dimensions(&self) -> Option<PhysicalSize<u32>> {
         self.dimensions
     }
 
+    /// Borrow the pending font change, if any.
     pub fn font(&self) -> Option<&Font> {
         self.font.as_ref()
     }
 
+    /// Queue a display geometry update.
     pub fn set_dimensions(&mut self, dimensions: PhysicalSize<u32>) {
         self.dimensions = Some(dimensions);
         self.dirty = true;
     }
 
+    /// Queue a display font update.
     pub fn set_font(&mut self, font: Font) {
         self.font = Some(font);
         self.dirty = true;
     }
 
+    /// Mark cursor appearance as needing an update.
     pub fn set_cursor_dirty(&mut self) {
         self.dirty = true;
     }
 }
 
+/// Window rendering resources and the state needed to compose terminal frames.
 pub struct Display {
+    /// Native or embedded window resources.
     pub window: Window,
+    /// Terminal grid geometry and physical-pixel dimensions.
     pub size_info: SizeInfo,
     /// The cursor a pane overlay asks for, ranked below Vivido's own chrome and above the
     /// terminal's. Refreshed from the service on every update.
     overlay_cursor: Option<CursorIcon>,
+    /// The hint currently highlighted by pointer or keyboard input.
     pub highlighted_hint: Option<HintMatch>,
     highlighted_hint_age: usize,
+    /// Whether terminal cursor rendering is suppressed.
     pub cursor_hidden: bool,
+    /// Current visual-bell animation.
     pub visual_bell: VisualBell,
+    /// Scrollbar interaction and presentation state.
     pub scrollbar: ScrollbarState,
     /// OSC 9;4 progress reported by the terminal's programs.
     pub progress: ProgressBar,
     /// The progress visual the cached scene shows.
     drawn_progress: Option<ProgressVisual>,
+    /// Resolved terminal palette.
     pub colors: List,
+    /// Active keyboard hint selection state.
     pub hint_state: HintState,
     /// The command palette while it is open.
     command_palette: Option<CommandPalette>,
     /// The clipboard request waiting for the user's answer, drawn above the palette.
     clipboard_prompt: Option<ClipboardPrompt>,
+    /// Changes awaiting display layout processing.
     pub pending_update: DisplayUpdate,
+    /// Changes awaiting native renderer processing.
     pub pending_renderer_update: Option<RendererUpdate>,
+    /// Input-method editor state.
     pub ime: Ime,
+    /// Frame pacing state.
     pub frame_timer: FrameTimer,
+    /// Regions that need repainting.
     pub damage_tracker: DamageTracker,
+    /// Current terminal font size.
     pub font_size: FontSize,
 
     hint_mouse_point: Option<Point>,
@@ -396,18 +436,21 @@ impl Display {
         self.drawn_progress = None;
     }
 
+    /// Replace the presented Vivid scene and invalidate cached rendering.
     pub fn set_vivid_scene(&mut self, scene: crate::vivid::scene::SharedScene) {
         self.invalidate_cached_scene();
         self.vivid_scene = Some(scene.clone());
         self.scene_renderer.set_vivid_scene(scene);
     }
 
+    /// Submit a protocol-neutral graphics command and invalidate affected rendering.
     pub fn submit_graphics(&mut self, command: GraphicsCommand) {
         self.invalidate_cached_scene();
         self.scene_renderer.submit_graphics(command);
         self.damage_tracker.frame().mark_fully_damaged();
     }
 
+    /// Borrow the current embedded frame, when available.
     pub fn embedded_frame(&self) -> Option<EmbeddedFrame<'_>> {
         (!self.renderer_unavailable && self.display_window_is_embedded())
             .then(|| self.scene_renderer.embedded_frame())
@@ -425,6 +468,11 @@ impl Display {
     }
 
     #[cfg(any(unix, windows))]
+    /// Begin asynchronous readback of the most recently rendered frame.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no readable frame exists or GPU readback cannot start.
     pub fn begin_screenshot(&self) -> Result<ScreenshotReadback, ScreenshotError> {
         if self.renderer_unavailable {
             return Err(ScreenshotError::NoPresentedFrame);
@@ -433,6 +481,11 @@ impl Display {
     }
 
     #[cfg(any(unix, windows))]
+    /// Poll GPU readback and return pixels once the capture completes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if GPU mapping fails or the captured frame is no longer valid.
     pub fn poll_screenshot(
         &self,
         readback: &ScreenshotReadback,
@@ -441,12 +494,17 @@ impl Display {
     }
 
     #[cfg(any(unix, windows))]
+    /// Whether these physical dimensions fit the current graphics-device limits.
     pub fn supports_render_size(&self, width: u32, height: u32) -> bool {
         self.scene_renderer.clamp_render_size(PhysicalSize::new(width, height))
             == PhysicalSize::new(width, height)
     }
 
     /// Build the renderer for an initially hidden `window`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if font, renderer, or display initialization fails.
     pub fn new(window: Window, config: &UiConfig) -> Result<Display, Error> {
         #[cfg(target_os = "macos")]
         let mut window = window;
@@ -577,7 +635,10 @@ impl Display {
             self.window.set_visible(true);
         }
 
-        #[allow(clippy::single_match)]
+        #[allow(
+            clippy::single_match,
+            reason = "platform-specific branches share this match with additional arms on other targets"
+        )]
         #[cfg(not(windows))]
         if !tabbed {
             match config.window.startup_mode {
@@ -589,6 +650,7 @@ impl Display {
         }
     }
 
+    /// Apply pending display, terminal geometry, and font changes.
     pub fn handle_update<T>(
         &mut self,
         terminal: &mut Term<T>,
@@ -674,6 +736,7 @@ impl Display {
         self.size_info = new_size;
     }
 
+    /// Apply queued native renderer changes.
     pub fn process_renderer_update(&mut self) {
         let renderer_update = match self.pending_renderer_update.take() {
             Some(update) => update,
@@ -692,6 +755,11 @@ impl Display {
         info!("Width: {}, Height: {}", self.size_info.width(), self.size_info.height());
     }
 
+    /// Compose and present one terminal frame.
+    ///
+    /// # Panics
+    ///
+    /// Panics if internal scene-cache invariants are violated.
     pub fn draw<T: EventListener>(
         &mut self,
         mut terminal: MutexGuard<'_, Term<T>>,
@@ -1069,6 +1137,7 @@ impl Display {
         presented
     }
 
+    /// Apply updated terminal appearance settings.
     pub fn update_config(&mut self, config: &UiConfig) {
         self.invalidate_cached_scene();
         self.damage_tracker.debug = config.debug.highlight_damage;
@@ -1082,6 +1151,7 @@ impl Display {
         self.colors = List::from(&config.colors);
     }
 
+    /// Recompute pointer and keyboard hint highlighting.
     pub fn update_highlighted_hints<T>(
         &mut self,
         term: &Term<T>,
@@ -2288,6 +2358,13 @@ fn terminal_font_variant(flags: Flags) -> (bool, bool) {
     (flags.intersects(Flags::BOLD | Flags::DIM_BOLD), flags.contains(Flags::ITALIC))
 }
 
+// Debug omits user content and native resources, and never acquires application locks.
+impl std::fmt::Debug for Display {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Display").finish_non_exhaustive()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -2651,6 +2728,7 @@ mod tests {
 }
 
 #[derive(Debug, Default)]
+/// Input-method editor state for terminal text entry.
 pub struct Ime {
     enabled: bool,
     preedit: Option<Preedit>,
@@ -2658,6 +2736,7 @@ pub struct Ime {
 
 impl Ime {
     #[inline]
+    /// Enable or disable input-method composition.
     pub fn set_enabled(&mut self, is_enabled: bool) {
         if is_enabled {
             self.enabled = is_enabled
@@ -2667,22 +2746,26 @@ impl Ime {
     }
 
     #[inline]
+    /// Whether input-method composition is enabled.
     pub fn is_enabled(&self) -> bool {
         self.enabled
     }
 
     #[inline]
+    /// Replace the input-method composition text.
     pub fn set_preedit(&mut self, preedit: Option<Preedit>) {
         self.preedit = preedit;
     }
 
     #[inline]
+    /// Borrow the current input-method composition, if any.
     pub fn preedit(&self) -> Option<&Preedit> {
         self.preedit.as_ref()
     }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// Uncommitted input-method text and its cursor range.
 pub struct Preedit {
     text: String,
     cursor_byte_offset: Option<(usize, usize)>,
@@ -2690,6 +2773,7 @@ pub struct Preedit {
 }
 
 impl Preedit {
+    /// Store composition text and its optional byte-index cursor range.
     pub fn new(text: String, cursor_byte_offset: Option<(usize, usize)>) -> Self {
         let cursor_end_offset = if let Some(byte_offset) = cursor_byte_offset {
             let start_to_end_offset =
@@ -2706,10 +2790,13 @@ impl Preedit {
 }
 
 #[derive(Debug, Default, Copy, Clone)]
+/// Pending native-surface or renderer changes.
 pub struct RendererUpdate {
     resize: bool,
 }
 
+#[derive(Debug)]
+/// Frame pacing against the current display refresh interval.
 pub struct FrameTimer {
     base: Instant,
     last_synced_timestamp: Instant,
@@ -2723,11 +2810,13 @@ impl Default for FrameTimer {
 }
 
 impl FrameTimer {
+    /// Start a frame timer at the current monotonic instant.
     pub fn new() -> Self {
         let now = Instant::now();
         Self { base: now, last_synced_timestamp: now, refresh_interval: Duration::ZERO }
     }
 
+    /// Compute the wait until the next refresh-aligned frame.
     pub fn compute_timeout(&mut self, refresh_interval: Duration) -> Duration {
         let now = Instant::now();
 

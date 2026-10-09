@@ -87,6 +87,7 @@ fn main() {
                 };
                 // SAFETY: both test windows remain live on the main thread.
                 let child = unsafe { handle.ns_view.cast::<NSView>().as_ref() }.window().unwrap();
+                // SAFETY: both windows are retained on the main thread; AppKit borrows them for this call.
                 unsafe {
                     native(&host).addChildWindow_ordered(&child, NSWindowOrderingMode::Above);
                 }

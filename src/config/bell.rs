@@ -6,6 +6,7 @@ use crate::config::ui_config::Program;
 use crate::display::color::Rgb;
 
 #[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+/// Visual bell animation settings.
 pub struct BellConfig {
     /// Visual bell animation function.
     pub animation: BellAnimation,
@@ -32,6 +33,7 @@ impl Default for BellConfig {
 }
 
 impl BellConfig {
+    /// Return the configured bell animation duration.
     pub fn duration(&self) -> Duration {
         Duration::from_millis(self.duration as u64)
     }
@@ -42,25 +44,35 @@ impl BellConfig {
 #[derive(Serialize, Default, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BellAnimation {
     // CSS animation.
+    /// Ease-in/ease-out animation.
     Ease,
     // CSS animation.
+    /// Animation that decelerates toward completion.
     EaseOut,
     // Penner animation.
+    /// Decelerating sine easing curve.
     EaseOutSine,
     // Penner animation.
+    /// Decelerating quad easing curve.
     EaseOutQuad,
     // Penner animation.
+    /// Decelerating cubic easing curve.
     EaseOutCubic,
     // Penner animation.
+    /// Decelerating quart easing curve.
     EaseOutQuart,
     // Penner animation.
+    /// Decelerating quint easing curve.
     EaseOutQuint,
     // Penner animation.
+    /// Decelerating expo easing curve.
     EaseOutExpo,
     // Penner animation.
+    /// Decelerating circ easing curve.
     EaseOutCirc,
     // Penner animation.
     #[default]
+    /// Constant-speed animation.
     Linear,
 }
 

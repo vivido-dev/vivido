@@ -29,16 +29,27 @@ use crate::display::content::RenderableCell;
 mod typography;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
+/// Physical-pixel font metrics used to place terminal cells and decorations.
 pub struct TextMetrics {
+    /// Physical-pixel width of one terminal cell.
     pub cell_width: f32,
+    /// Physical-pixel height of one terminal cell.
     pub cell_height: f32,
+    /// Text baseline in physical pixels.
     pub baseline: f32,
+    /// Font descent in physical pixels.
     pub descent: f32,
+    /// Underline position in physical pixels.
     pub underline_position: f32,
+    /// Underline thickness in physical pixels.
     pub underline_thickness: f32,
+    /// Strikeout position in physical pixels.
     pub strikeout_position: f32,
+    /// Strikeout thickness in physical pixels.
     pub strikeout_thickness: f32,
+    /// Horizontal glyph offset in physical pixels.
     pub glyph_offset_x: f32,
+    /// Vertical glyph offset in physical pixels.
     pub glyph_offset_y: f32,
 }
 
@@ -171,6 +182,7 @@ struct CachedTerminalLayout {
     used: u64,
 }
 
+/// Font selection, shaping, and cached terminal glyph layouts.
 pub struct TextSystem {
     font: Font,
     font_cx: FontContext,
@@ -191,6 +203,7 @@ pub struct TextSystem {
 }
 
 impl TextSystem {
+    /// Initialize font selection, shaping, and glyph caches.
     pub fn new(font: Font) -> Self {
         let mut font_cx = shared_font_context();
         let fallback_search_families = fallback_search_families(&mut font_cx);
@@ -240,6 +253,7 @@ impl TextSystem {
         layout
     }
 
+    /// Return current physical-pixel font metrics.
     pub fn metrics(&self) -> TextMetrics {
         self.metrics
     }
@@ -324,6 +338,7 @@ impl TextSystem {
         self.font.ligatures()
     }
 
+    /// Replace the terminal font and invalidate cached glyph layouts.
     pub fn update_font(&mut self, font: Font) {
         self.font = font;
         self.family_stacks = family_stacks_for_font(&self.font, &self.pua_fallback_family_names);
@@ -336,6 +351,7 @@ impl TextSystem {
         self.terminal_cache.clear();
     }
 
+    /// Shape one renderable terminal cell, reusing cached layouts where possible.
     pub fn shape_cell(&mut self, cell: &RenderableCell) -> Option<Arc<Layout<()>>> {
         if cell.flags.contains(Flags::HIDDEN) {
             return None;
@@ -409,6 +425,7 @@ impl TextSystem {
     }
 
     #[cfg(test)]
+    /// Shape test text with the requested weight and italic styling.
     pub fn shape_string(
         &mut self,
         text: impl Into<String>,
@@ -428,6 +445,7 @@ impl TextSystem {
         }
     }
 
+    /// Shape a character with the requested style and terminal colors.
     pub fn shape_character(
         &mut self,
         character: char,
@@ -935,6 +953,7 @@ fn parse_named_style(style: Option<&str>, variant: FontVariant) -> (ParleyFontSt
     (slant, weight)
 }
 
+/// Convert terminal RGB components to a vector-renderer color.
 pub fn color_from_rgb(color: Rgb) -> Color {
     Color::from_rgb8(color.r, color.g, color.b)
 }
@@ -1149,6 +1168,13 @@ fn private_use_ranges(text: &str, base: usize) -> impl Iterator<Item = Range<usi
 #[cfg(test)]
 #[path = "glyph_corpus.rs"]
 mod glyph_corpus;
+
+// Debug omits user content and native resources, and never acquires application locks.
+impl std::fmt::Debug for TextSystem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TextSystem").finish_non_exhaustive()
+    }
+}
 
 #[cfg(test)]
 mod tests {

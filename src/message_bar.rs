@@ -202,8 +202,6 @@ impl MessageBuffer {
 mod tests {
     use super::*;
 
-    use crate::display::SizeInfo;
-
     #[test]
     fn appends_close_button() {
         let input = "a";

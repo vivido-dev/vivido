@@ -90,9 +90,10 @@ impl Egress {
                 let result = client_fault::catch(
                     ClientFaultClass::Vivid,
                     "Vivid egress worker panicked",
-                    || egress.run(writer),
+                    || egress.clone().run(writer),
                 );
                 if let Err(fault) = result {
+                    egress.abort_after_fault();
                     log::error!("contained Vivid egress fault {}", fault.id);
                 }
             })?
@@ -108,7 +109,15 @@ impl Egress {
     /// records but stay registered, holding its connection slot and its scene state, until its
     /// peer happened to close. Overflow is meant to end the session, so it has to be able to.
     pub(crate) fn set_shutdown(&self, shutdown: ReadShutdown) {
-        let closed = self.queue.lock().expect("egress queue").closed;
+        let closed = match self.queue.lock() {
+            Ok(queue) => queue.closed,
+            Err(poisoned) => {
+                drop(poisoned.into_inner());
+                shutdown.stop();
+                self.abort_after_fault();
+                return;
+            },
+        };
         if closed {
             // The egress already gave up; honour the handle immediately rather than storing it
             // somewhere nothing will read it again.
@@ -138,7 +147,14 @@ impl Egress {
     /// Queue one record. Returns false when the session must close, because the peer is not
     /// draining its replies or the egress has already shut down.
     pub(crate) fn send(&self, record_type: u16, object_id: u64, body: Vec<u8>) -> bool {
-        let mut queue = self.queue.lock().expect("egress queue");
+        let mut queue = match self.queue.lock() {
+            Ok(queue) => queue,
+            Err(poisoned) => {
+                drop(poisoned.into_inner());
+                self.abort_after_fault();
+                return false;
+            },
+        };
         if queue.closed {
             return false;
         }
@@ -170,7 +186,14 @@ impl Egress {
 
     /// Stop accepting records and let the worker drain what is already queued.
     pub(crate) fn close(&self) {
-        let mut queue = self.queue.lock().expect("egress queue");
+        let mut queue = match self.queue.lock() {
+            Ok(queue) => queue,
+            Err(poisoned) => {
+                drop(poisoned.into_inner());
+                self.abort_after_fault();
+                return;
+            },
+        };
         queue.closed = true;
         self.ready.notify_all();
     }
@@ -197,6 +220,26 @@ impl Egress {
         if let Some(shutdown) = self.shutdown.lock().expect("egress shutdown").take() {
             shutdown.stop();
         }
+    }
+
+    /// Discard a failed worker's queue, including a mutex poisoned by that worker.
+    ///
+    /// Poison recovery here grants only permission to destroy state, never to resume writes.
+    fn abort_after_fault(&self) {
+        let mut queue = self.queue.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        queue.closed = true;
+        queue.records.clear();
+        self.queue.clear_poison();
+        self.ready.notify_all();
+        drop(queue);
+        if let Some(cancel) = &self.cancel {
+            cancel.stop();
+        }
+        let mut shutdown = self.shutdown.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(shutdown) = shutdown.take() {
+            shutdown.stop();
+        }
+        self.shutdown.clear_poison();
     }
 
     fn run(self: Arc<Self>, writer: Arc<Writer>) {
@@ -504,7 +547,6 @@ pub(crate) fn deliver(egress: &Egress, reply: (u16, u64, Vec<u8>)) -> io::Result
 
 #[cfg(test)]
 mod tests {
-    use std::time::Instant;
 
     use vivid_protocol::identity::{PresenterInstanceId, SessionIdentity};
 
@@ -526,6 +568,28 @@ mod tests {
             value: Some(1),
             deadline: Instant::now() + Duration::from_secs(1),
         }
+    }
+
+    #[test]
+    fn fault_cleanup_discards_poisoned_egress_without_affecting_another_owner() {
+        let failed = Egress::detached();
+        let surviving = Egress::detached();
+        assert!(failed.send(1, 9, vec![1]));
+        assert!(surviving.send(1, 9, vec![2]));
+        let worker = failed.clone();
+        let fault = client_fault::catch(ClientFaultClass::Vivid, "injected egress fault", || {
+            let mut queue = worker.queue.lock().unwrap();
+            queue.records.push_back((2, 9, vec![3]));
+            panic!("partial queue mutation");
+        });
+        assert!(fault.is_err());
+        // A producer may observe poison before the worker's supervisor gets scheduled.
+        assert!(!failed.send(2, 9, vec![4]));
+        failed.abort_after_fault();
+        assert!(!failed.send(2, 9, vec![4]));
+        assert!(failed.queue.lock().unwrap().records.is_empty());
+        assert!(surviving.send(2, 9, vec![5]));
+        assert_eq!(surviving.queue.lock().unwrap().records.len(), 2);
     }
 
     #[test]

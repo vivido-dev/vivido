@@ -77,6 +77,10 @@ struct BuiltSshArguments {
     media: Vec<MediaForward>,
 }
 
+// The allocator belongs to the executable; embedding hosts retain their own allocator.
+#[global_allocator]
+static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 fn main() -> ExitCode {
     if askpass::is_helper() {
         return match askpass::run_helper() {

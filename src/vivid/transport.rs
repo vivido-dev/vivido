@@ -548,7 +548,7 @@ fn write_parts(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vivid_protocol::wire::{ConnectionKind, encode_preface};
+    use vivid_protocol::wire::encode_preface;
 
     #[cfg(unix)]
     fn stream_pair() -> (LocalStream, LocalStream) {

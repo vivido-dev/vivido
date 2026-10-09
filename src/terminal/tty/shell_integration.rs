@@ -54,6 +54,7 @@ const PRIVATE_ENV: [&str; 7] = [
 /// How to start one shell with Vivido's integration loaded.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Injection {
+    /// Supported shell selected for startup integration.
     pub shell: IntegratedShell,
     /// Arguments that replace the shell's own.
     pub args: Vec<String>,
@@ -62,6 +63,10 @@ pub struct Injection {
 }
 
 /// Write the scripts to a new private directory, which lives as long as the returned value.
+///
+/// # Errors
+///
+/// Returns an I/O error if temporary shell-integration assets cannot be created or written.
 pub fn provision() -> io::Result<TempDir> {
     // Owner-only regardless of the umask, which tempfile would otherwise apply; the scripts
     // inside are then out of everyone else's reach whatever their own modes.

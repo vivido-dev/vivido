@@ -323,7 +323,10 @@ impl AudioOutput {
     }
 
     #[cfg(test)]
-    #[allow(dead_code)]
+    #[allow(
+        dead_code,
+        reason = "platform-dependent native declarations are retained for ABI completeness"
+    )]
     pub(super) fn force_video_gate_stall_for_test(&self) {
         *self.shared.play_configured_at.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
             Some(Instant::now() - LINKED_AUDIO_STALL_FALLBACK - Duration::from_millis(1));
@@ -1061,10 +1064,18 @@ impl AudioDecoder {
         output_rate: u32,
         output_channels: u16,
     ) -> io::Result<Self> {
+        let input_rate = c_int::try_from(config.sample_rate)
+            .map_err(|_| invalid("audio sample rate exceeds FFmpeg limits"))?;
+        let output_rate = c_int::try_from(output_rate)
+            .map_err(|_| invalid("output sample rate exceeds FFmpeg limits"))?;
+        if input_rate == 0 || output_rate == 0 || config.channels == 0 || output_channels == 0 {
+            return Err(invalid("audio rates and channel counts must be positive"));
+        }
         // Verify the linked FFmpeg's structure layout before touching any of it.
         let abi = ffmpeg::abi()?;
         let name =
             CString::new(config.codec.as_str()).map_err(|_| invalid("audio codec has NUL"))?;
+        // SAFETY: the CString is NUL-terminated and live through the call; the returned descriptor is library-owned.
         let codec = unsafe { avcodec_find_decoder_by_name(name.as_ptr()) };
         if codec.is_null() {
             return Err(io::Error::new(
@@ -1072,31 +1083,38 @@ impl AudioDecoder {
                 format!("FFmpeg decoder {:?} is unavailable", config.codec),
             ));
         }
+        // SAFETY: codec is a checked live library descriptor; this allocation is owned here and null is handled.
         let mut context = unsafe { avcodec_alloc_context3(codec) };
         let mut parameters = match ffmpeg::allocate_parameters() {
             Ok(parameters) => parameters,
             Err(error) => {
+                // SAFETY: these are uniquely owned FFmpeg allocations; each matching free function accepts null and clears its pointer.
                 unsafe { avcodec_free_context(&mut context) };
                 return Err(error);
             },
         };
         if context.is_null() {
-            ffmpeg::free_parameters(&mut parameters);
+            // SAFETY: parameters is uniquely owned here and is no longer used after release.
+            unsafe { ffmpeg::free_parameters(&mut parameters) };
             return Err(io::Error::other("FFmpeg could not allocate audio decoder state"));
         }
         let result = (|| {
             let extradata = if config.extradata.is_empty() {
                 None
             } else {
+                let length = c_int::try_from(config.extradata.len())
+                    .map_err(|_| invalid("audio extradata exceeds i32"))?;
                 let size = config
                     .extradata
                     .len()
                     .checked_add(AV_INPUT_BUFFER_PADDING_SIZE)
                     .ok_or_else(|| invalid("audio extradata size overflows"))?;
+                // SAFETY: the checked size includes FFmpeg padding; allocation failure is handled before writing.
                 let extradata: *mut u8 = unsafe { av_mallocz(size) }.cast();
                 if extradata.is_null() {
                     return Err(io::Error::other("FFmpeg could not allocate audio extradata"));
                 }
+                // SAFETY: the source slice and freshly allocated destination are disjoint and both contain the checked packet/extradata length.
                 unsafe {
                     ptr::copy_nonoverlapping(
                         config.extradata.as_ptr(),
@@ -1104,10 +1122,9 @@ impl AudioDecoder {
                         config.extradata.len(),
                     )
                 };
-                let length = c_int::try_from(config.extradata.len())
-                    .map_err(|_| invalid("audio extradata exceeds i32"))?;
                 Some((extradata, length))
             };
+            // SAFETY: parameters is uniquely owned and the verified ABI matches; padded av_malloc extradata transfers to it.
             unsafe {
                 abi.set_parameters(
                     parameters,
@@ -1116,42 +1133,55 @@ impl AudioDecoder {
                     ParameterValues { extradata, ..Default::default() },
                 );
             }
+            // SAFETY: context and parameters are live owned allocations; FFmpeg copies parameters without retaining this borrow.
             check_ffmpeg("could not configure audio decoder", unsafe {
                 avcodec_parameters_to_context(context, parameters)
             })?;
+            // SAFETY: the decoder context is live, option names are NUL-terminated, and output arguments are initialized writable locals.
             check_ffmpeg("could not set audio packet time base", unsafe {
                 av_opt_set_q(context, c"pkt_timebase".as_ptr(), PACKET_TIME_BASE, 0)
             })?;
             let ar = c"ar";
+            // SAFETY: the decoder context is live, option names are NUL-terminated, and output arguments are initialized writable locals.
             check_ffmpeg("could not set audio sample rate", unsafe {
                 av_opt_set_int(context, ar.as_ptr(), i64::from(config.sample_rate), 0)
             })?;
             let mut layout = AVChannelLayout::default();
             if config.channel_mask == 0 {
+                // SAFETY: layout is initialized writable storage; FFmpeg initializes its layout data before use.
                 unsafe { av_channel_layout_default(&mut layout, c_int::from(config.channels)) };
             } else {
+                // SAFETY: layout is initialized writable storage, and the native function validates the scalar mask.
                 check_ffmpeg("could not set audio channel mask", unsafe {
                     av_channel_layout_from_mask(&mut layout, config.channel_mask)
                 })?;
             }
             let layout_result =
+                // SAFETY: the decoder context is live, option names are NUL-terminated, and output arguments are initialized writable locals.
                 unsafe { av_opt_set_chlayout(context, c"ch_layout".as_ptr(), &layout, 0) };
+            // SAFETY: layout was initialized above and is no longer borrowed by the native option setter.
             unsafe { av_channel_layout_uninit(&mut layout) };
             check_ffmpeg("could not set audio channel layout", layout_result)?;
+            // SAFETY: context is owned and configured, codec is library-owned, and null requests default options.
             check_ffmpeg("could not open audio decoder", unsafe {
                 avcodec_open2(context, codec, ptr::null_mut())
             })
         })();
-        ffmpeg::free_parameters(&mut parameters);
+        // SAFETY: parameters is uniquely owned here and is no longer used after release.
+        unsafe { ffmpeg::free_parameters(&mut parameters) };
         if let Err(error) = result {
+            // SAFETY: these are uniquely owned FFmpeg allocations; each matching free function accepts null and clears its pointer.
             unsafe { avcodec_free_context(&mut context) };
             return Err(error);
         }
+        // SAFETY: the native allocator returns an owned packet pointer; null is checked before use.
         let packet = unsafe { av_packet_alloc() };
+        // SAFETY: the native allocator returns an owned frame pointer; null is checked before use.
         let frame = unsafe { av_frame_alloc() };
         if packet.is_null() || frame.is_null() {
             let mut packet = packet;
             let mut frame = frame;
+            // SAFETY: these are uniquely owned FFmpeg allocations; each matching free function accepts null and clears its pointer.
             unsafe {
                 av_packet_free(&mut packet);
                 av_frame_free(&mut frame);
@@ -1165,10 +1195,10 @@ impl AudioDecoder {
             packet,
             frame,
             resampler: ptr::null_mut(),
-            input_rate: config.sample_rate as c_int,
-            input_channels: config.channels as c_int,
-            output_rate: output_rate as c_int,
-            output_channels: output_channels as c_int,
+            input_rate,
+            input_channels: c_int::from(config.channels),
+            output_rate,
+            output_channels: c_int::from(output_channels),
             pending_trim_start: 0,
             pending_trim_end: 0,
         })
@@ -1180,10 +1210,13 @@ impl AudioDecoder {
         }
         let size = c_int::try_from(packet.data.len())
             .map_err(|_| invalid("audio packet exceeds FFmpeg i32 size"))?;
+        // SAFETY: self owns the initialized packet; the requested length was checked to fit c_int.
         check_ffmpeg("could not allocate audio packet", unsafe {
             av_new_packet(self.packet, size)
         })?;
+        // SAFETY: the ABI probe verified AVPacket layout; &mut self gives exclusive access to this live packet.
         let av_packet = unsafe { &mut *(self.packet as *mut AVPacket) };
+        // SAFETY: the source slice and freshly allocated destination are disjoint and both contain the checked packet/extradata length.
         unsafe {
             ptr::copy_nonoverlapping(packet.data.as_ptr(), av_packet.data, packet.data.len())
         };
@@ -1191,7 +1224,9 @@ impl AudioDecoder {
         av_packet.dts = packet.dts_us;
         av_packet.duration = i64::try_from(packet.duration_us).unwrap_or(i64::MAX);
         av_packet.time_base = PACKET_TIME_BASE;
+        // SAFETY: context and any non-null packet are live; FFmpeg references packet data before the caller unreferences it.
         let result = unsafe { avcodec_send_packet(self.context, self.packet) };
+        // SAFETY: this initialized packet is uniquely owned; the decoder retains its own references to submitted data.
         unsafe { av_packet_unref(self.packet) };
         check_ffmpeg("audio decoder rejected packet", result)?;
         self.pending_trim_start = self.pending_trim_start.saturating_add(converted_trim_samples(
@@ -1216,6 +1251,7 @@ impl AudioDecoder {
     }
 
     pub fn finish(&mut self) -> io::Result<Vec<f32>> {
+        // SAFETY: context and any non-null packet are live; FFmpeg references packet data before the caller unreferences it.
         let result = unsafe { avcodec_send_packet(self.context, ptr::null()) };
         if result < 0 && result != AVERROR_EOF {
             return Err(ffmpeg_error("could not drain audio decoder", result));
@@ -1225,6 +1261,7 @@ impl AudioDecoder {
             loop {
                 let mut output = vec![0.0_f32; 4096 * self.output_channels as usize];
                 let mut planes = [output.as_mut_ptr().cast::<u8>()];
+                // SAFETY: the resampler is initialized; output planes have the requested sample capacity and input planes belong to the live decoded frame (or null for drain).
                 let converted = unsafe {
                     swr_convert(self.resampler, planes.as_mut_ptr(), 4096, ptr::null(), 0)
                 };
@@ -1247,13 +1284,16 @@ impl AudioDecoder {
     fn receive(&mut self, _draining: bool) -> io::Result<Vec<f32>> {
         let mut samples = Vec::new();
         loop {
+            // SAFETY: context and frame are live uniquely owned allocations; a successful result initializes the frame.
             let result = unsafe { avcodec_receive_frame(self.context, self.frame) };
             if result == -libc::EAGAIN || result == AVERROR_EOF {
                 break;
             }
             check_ffmpeg("could not receive decoded audio", result)?;
+            // SAFETY: self owns a successfully decoded live AVFrame and the verified ABI selects its field offsets.
             let frame = unsafe { self.abi.frame(self.frame) };
             if frame.nb_samples <= 0 {
+                // SAFETY: self owns this initialized frame and no borrowed pixel/sample data is used after unref.
                 unsafe { av_frame_unref(self.frame) };
                 continue;
             }
@@ -1271,6 +1311,7 @@ impl AudioDecoder {
             } else {
                 frame.extended_data as *const *const u8
             };
+            // SAFETY: the resampler is initialized; output planes have the requested sample capacity and input planes belong to the live decoded frame (or null for drain).
             let converted = unsafe {
                 swr_convert(
                     self.resampler,
@@ -1283,6 +1324,7 @@ impl AudioDecoder {
             check_ffmpeg("could not resample audio", converted)?;
             output.truncate(converted as usize * self.output_channels as usize);
             samples.extend(output);
+            // SAFETY: self owns this initialized frame and no borrowed pixel/sample data is used after unref.
             unsafe { av_frame_unref(self.frame) };
         }
         Ok(samples)
@@ -1291,10 +1333,12 @@ impl AudioDecoder {
     fn init_resampler(&mut self, input_format: c_int) -> io::Result<()> {
         let mut input = AVChannelLayout::default();
         let mut output = AVChannelLayout::default();
+        // SAFETY: layout is initialized writable storage; FFmpeg initializes its layout data before use.
         unsafe {
             av_channel_layout_default(&mut input, self.input_channels);
             av_channel_layout_default(&mut output, self.output_channels);
         }
+        // SAFETY: input and output layouts are initialized and live; the output pointer receives this decoder's owned resampler.
         let result = unsafe {
             swr_alloc_set_opts2(
                 &mut self.resampler,
@@ -1308,17 +1352,20 @@ impl AudioDecoder {
                 ptr::null_mut(),
             )
         };
+        // SAFETY: layout was initialized above and is no longer borrowed by the native option setter.
         unsafe {
             av_channel_layout_uninit(&mut input);
             av_channel_layout_uninit(&mut output);
         }
         check_ffmpeg("could not allocate audio resampler", result)?;
+        // SAFETY: the decoder context is live, option names are NUL-terminated, and output arguments are initialized writable locals.
         check_ffmpeg("could not initialize audio resampler", unsafe { swr_init(self.resampler) })
     }
 
     #[cfg(test)]
     fn packet_time_base(&self) -> io::Result<AVRational> {
         let mut time_base = AVRational { num: 0, den: 0 };
+        // SAFETY: the live decoder writes a rational into this initialized local through a valid pointer.
         check_ffmpeg("could not read audio packet time base", unsafe {
             av_opt_get_q(self.context, c"pkt_timebase".as_ptr(), 0, &mut time_base)
         })?;
@@ -1328,6 +1375,7 @@ impl AudioDecoder {
 
 impl Drop for AudioDecoder {
     fn drop(&mut self) {
+        // SAFETY: these are uniquely owned FFmpeg allocations; each matching free function accepts null and clears its pointer.
         unsafe {
             swr_free(&mut self.resampler);
             av_frame_free(&mut self.frame);
@@ -1416,7 +1464,7 @@ impl CaptureResampler {
         let rate = c_int::try_from(rate).map_err(|_| invalid("capture rate too large"))?;
         let mut result = Self(ptr::null_mut());
         let mut mono = AVChannelLayout::default();
-        // SAFETY: mono is initialized storage; FFmpeg initializes and releases its layout.
+        // SAFETY: layout is initialized writable storage; FFmpeg initializes its layout data before use.
         unsafe { av_channel_layout_default(&mut mono, 1) };
         // SAFETY: layouts live through the call; result owns the returned context exclusively.
         let status = unsafe {
@@ -1432,7 +1480,7 @@ impl CaptureResampler {
                 ptr::null_mut(),
             )
         };
-        // SAFETY: mono was initialized above and is no longer referenced by swr.
+        // SAFETY: layout was initialized above and is no longer borrowed by the native option setter.
         unsafe { av_channel_layout_uninit(&mut mono) };
         check_ffmpeg("could not allocate microphone resampler", status)?;
         // SAFETY: the allocation succeeded and result exclusively owns the context.
@@ -1465,7 +1513,9 @@ impl Drop for CaptureResampler {
 
 fn ffmpeg_error(context: &str, code: c_int) -> io::Error {
     let mut buffer: [c_char; 256] = [0; 256];
+    // SAFETY: buffer is writable for its declared length; successful av_strerror writes a NUL-terminated diagnostic.
     let description = if unsafe { av_strerror(code, buffer.as_mut_ptr(), buffer.len()) } == 0 {
+        // SAFETY: successful av_strerror wrote a terminated string into the still-live buffer.
         unsafe { CStr::from_ptr(buffer.as_ptr()) }.to_string_lossy().into_owned()
     } else {
         format!("FFmpeg error {code}")
@@ -1554,8 +1604,6 @@ unsafe extern "C" {
 mod tests {
     use super::*;
     use ringbuf::traits::Observer;
-    use vivid_protocol::media::ParsedAudioPacket;
-    use vivid_protocol::track::AudioConfiguration;
 
     #[test]
     fn video_gate_stall_requires_enabled_and_absent_clock_progress() {

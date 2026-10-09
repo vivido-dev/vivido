@@ -22,6 +22,7 @@ pub struct Font {
     /// Shape compatible neighboring terminal cells as ligature runs.
     ligatures: bool,
 
+    /// Request thin font rasterization strokes.
     pub use_thin_strokes: bool,
 
     /// Normal font face.
@@ -51,6 +52,7 @@ impl Font {
     }
 
     #[inline]
+    /// Return the configured terminal font size.
     pub fn size(&self) -> FontSize {
         self.size.0
     }
@@ -102,11 +104,14 @@ impl Default for Font {
 /// Description of the normal font.
 #[derive(Serialize, Debug, Clone, PartialEq, Eq)]
 pub struct FontDescription {
+    /// Font family name.
     pub family: String,
+    /// Font style selection.
     pub style: Option<String>,
 }
 
 impl FontDescription {
+    /// Return the configured style.
     pub fn style(&self) -> Option<&str> {
         self.style.as_deref()
     }
@@ -134,6 +139,7 @@ pub struct SecondaryFontDescription {
 }
 
 impl SecondaryFontDescription {
+    /// Resolve missing font-description fields from the supplied fallback.
     pub fn desc(&self, fallback: &FontDescription) -> FontDescription {
         FontDescription {
             family: self.family.clone().unwrap_or_else(|| fallback.family.clone()),
@@ -152,10 +158,12 @@ pub struct FontSize(f32);
 impl Eq for FontSize {}
 
 impl FontSize {
+    /// Store a font size expressed in configuration points.
     pub const fn new(size: f32) -> Self {
         Self(size)
     }
 
+    /// Convert a platform pixel font size to configuration points.
     pub fn from_px(size: f32) -> Self {
         #[cfg(target_os = "macos")]
         let points = size;
@@ -164,6 +172,7 @@ impl FontSize {
         Self(points)
     }
 
+    /// Convert configuration points to platform font pixels.
     pub fn as_px(self) -> f32 {
         #[cfg(target_os = "macos")]
         return self.0;
@@ -171,10 +180,12 @@ impl FontSize {
         return self.0 * 96. / 72.;
     }
 
+    /// Return the font size in configuration points.
     pub const fn as_pt(self) -> f32 {
         self.0
     }
 
+    /// Return a font size multiplied by the supplied scale factor.
     pub const fn scale(self, factor: f32) -> Self {
         Self(self.0 * factor)
     }

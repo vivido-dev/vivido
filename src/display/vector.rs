@@ -43,6 +43,7 @@ struct CompiledHit {
 
 /// Drawing and hit testing are published as one immutable object.
 pub struct CompiledScene {
+    /// Compiled vector drawing commands.
     pub scene: Scene,
     pub(crate) retained: Vec<Arc<()>>,
     hits: Vec<CompiledHit>,
@@ -80,6 +81,10 @@ struct DrawState {
 
 /// Compile an entire validated list before exposing any of its drawing or input state.
 /// Retained images are resolved within the caller's complete channel identity.
+///
+/// # Errors
+///
+/// Returns a vector error for invalid command parameters or unsupported drawing operations.
 pub fn compile(
     canvas: &Canvas,
     text: &mut TextSystem,
@@ -88,6 +93,11 @@ pub fn compile(
     compile_with_layouts(canvas, text, images, &BTreeMap::new())
 }
 
+/// Compile vector commands with premeasured text layouts.
+///
+/// # Errors
+///
+/// Returns a vector error for invalid commands or inconsistent supplied text layouts.
 pub fn compile_with_layouts(
     canvas: &Canvas,
     text: &mut TextSystem,
@@ -543,6 +553,13 @@ fn falloff(distance: f64, sigma: f64) -> f32 {
 /// How many stepped rings approximate a blur. Ten keeps a band below about a pixel for the
 /// small blurs a user interface actually casts.
 const SHADOW_STEPS: usize = 10;
+
+// Debug omits user content and native resources, and never acquires application locks.
+impl std::fmt::Debug for CompiledScene {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CompiledScene").finish_non_exhaustive()
+    }
+}
 
 #[cfg(test)]
 mod tests {

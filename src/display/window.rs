@@ -87,16 +87,24 @@ impl From<winit::error::OsError> for Error {
 /// A windowed [`Window`] presents through a windowing-system surface; a headless one has no
 /// surface at all and the renderer keeps its offscreen target as the final image.
 pub enum RenderSource {
+    /// Render to a retained native window surface.
     Surface(Arc<WinitWindow>),
+    /// Render without a native window.
     Offscreen,
+    /// Render inside a host-owned pane.
     Embedded,
 }
 
 #[derive(Clone, Copy, Debug)]
+/// Cursor and input-method state requested by an embedded terminal pane.
 pub struct EmbeddedInputState {
+    /// Cursor appearance or current cursor state.
     pub cursor: CursorIcon,
+    /// Whether the host should display the pointer cursor.
     pub cursor_visible: bool,
+    /// Whether input-method composition is enabled.
     pub ime_allowed: bool,
+    /// Physical-pixel rectangle used to position the input-method candidate window.
     pub ime_cursor_area: Option<(PhysicalPosition<f64>, PhysicalSize<f64>)>,
 }
 
@@ -253,6 +261,10 @@ impl Window {
     /// Create a new window.
     ///
     /// This creates a window and fully initializes a window.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if native window or embedding-target initialization fails.
     pub fn new(
         event_loop: &ActiveEventLoop,
         config: &UiConfig,
@@ -283,7 +295,7 @@ impl Window {
             .map(ActivationToken::from_raw)
             .or_else(|| event_loop.read_token_from_env())
         {
-            log::debug!("Activating window with token: {token:?}");
+            log::debug!(event = "window_activation"; "Activating window");
             window_attributes = window_attributes.with_activation_token(token);
 
             // Remove the token from the env.
@@ -460,6 +472,7 @@ impl Window {
     }
 
     #[inline]
+    /// Whether this window renders into an embedding host target.
     pub fn is_embedded(&self) -> bool {
         matches!(&self.backend, Backend::Headless(window) if window.embedded)
     }
@@ -470,6 +483,7 @@ impl Window {
         self.hosted
     }
 
+    /// Return the cursor and input-method state requested by an embedded pane.
     pub fn embedded_input_state(&self) -> Option<EmbeddedInputState> {
         self.is_embedded().then_some(EmbeddedInputState {
             cursor: self.current_mouse_cursor,
@@ -486,6 +500,11 @@ impl Window {
 
     #[cfg(any(target_os = "macos", windows))]
     #[inline]
+    /// Borrow this window’s native handle.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the native backend exists but cannot supply a live window handle.
     pub fn raw_window_handle(&self) -> Option<RawWindowHandle> {
         Some(self.backend.winit()?.window_handle().unwrap().as_raw())
     }
@@ -501,6 +520,7 @@ impl Window {
     }
 
     #[inline]
+    /// Request a physical-pixel content size from the native window manager.
     pub fn request_inner_size(&self, size: PhysicalSize<u32>) {
         match &self.backend {
             Backend::Winit(window) => {
@@ -512,6 +532,7 @@ impl Window {
     }
 
     #[inline]
+    /// Return the current content size in physical pixels.
     pub fn inner_size(&self) -> PhysicalSize<u32> {
         self.backend.inner_size()
     }
@@ -549,6 +570,7 @@ impl Window {
     }
 
     #[inline]
+    /// Request native window visibility.
     pub fn set_visible(&self, visibility: bool) {
         match &self.backend {
             Backend::Winit(window) => window.set_visible(visibility),
@@ -606,6 +628,7 @@ impl Window {
 
     #[inline]
     #[cfg(any(unix, windows))]
+    /// Request native keyboard focus.
     pub fn focus_window(&self) {
         let Some(window) = self.backend.winit() else { return };
 
@@ -643,6 +666,7 @@ impl Window {
     }
 
     #[inline]
+    /// Schedule a native redraw event.
     pub fn request_redraw(&mut self) {
         if !self.requested_redraw {
             self.requested_redraw = true;
@@ -655,6 +679,7 @@ impl Window {
     }
 
     #[inline]
+    /// Request the native pointer cursor shape.
     pub fn set_mouse_cursor(&mut self, cursor: CursorIcon) {
         if cursor != self.current_mouse_cursor {
             self.current_mouse_cursor = cursor;
@@ -675,6 +700,7 @@ impl Window {
     }
 
     #[inline]
+    /// Whether the native pointer cursor is visible.
     pub fn mouse_visible(&self) -> bool {
         self.mouse_visible
     }
@@ -700,6 +726,7 @@ impl Window {
     }
 
     #[cfg(target_os = "macos")]
+    /// Borrow the native window, when this target owns one.
     pub fn get_platform_window(
         _: &Identity,
         window_config: &WindowConfig,
@@ -727,6 +754,7 @@ impl Window {
         }
     }
 
+    /// Request or clear the platform's user-attention indication.
     pub fn set_urgent(&self, is_urgent: bool) {
         let Some(window) = self.backend.winit() else { return };
         let attention = if is_urgent { Some(UserAttentionType::Critical) } else { None };
@@ -734,22 +762,26 @@ impl Window {
         window.request_user_attention(attention);
     }
 
+    /// Return the identifier assigned to this object.
     pub fn id(&self) -> WindowId {
         self.backend.id()
     }
 
+    /// Enable or disable native window transparency.
     pub fn set_transparent(&self, transparent: bool) {
         if let Some(window) = self.backend.winit() {
             window.set_transparent(transparent);
         }
     }
 
+    /// Request native background blur where supported.
     pub fn set_blur(&self, blur: bool) {
         if let Some(window) = self.backend.winit() {
             window.set_blur(blur);
         }
     }
 
+    /// Request a maximized or restored native window.
     pub fn set_maximized(&self, maximized: bool) {
         match &self.backend {
             Backend::Winit(window) => window.set_maximized(maximized),
@@ -757,6 +789,7 @@ impl Window {
         }
     }
 
+    /// Request a minimized or restored native window.
     pub fn set_minimized(&self, minimized: bool) {
         if let Some(window) = self.backend.winit() {
             window.set_minimized(minimized);
@@ -810,6 +843,7 @@ impl Window {
         }
     }
 
+    /// Set physical-pixel increments for interactive native window resizing.
     pub fn set_resize_increments(&self, increments: PhysicalSize<f32>) {
         if let Some(window) = self.backend.winit() {
             window.set_resize_increments(Some(increments));
@@ -856,6 +890,7 @@ impl Window {
         self.current_monitor().and_then(|monitor| monitor.refresh_rate_millihertz())
     }
 
+    /// Request the native window decoration theme.
     pub fn set_theme(&self, theme: Option<Theme>) {
         // This drops whatever appearance the title bar tint installed, so let the next frame
         // derive it again from the terminal background that is current by then.
@@ -869,18 +904,21 @@ impl Window {
     }
 
     #[cfg(target_os = "macos")]
+    /// Toggle macOS fullscreen without creating a separate space.
     pub fn toggle_simple_fullscreen(&self) {
         let Some(window) = self.backend.winit() else { return };
         self.set_simple_fullscreen(!window.simple_fullscreen());
     }
 
     #[cfg(target_os = "macos")]
+    /// Change which macOS Option keys act as terminal Alt modifiers.
     pub fn set_option_as_alt(&self, option_as_alt: OptionAsAlt) {
         if let Some(window) = self.backend.winit() {
             window.set_option_as_alt(option_as_alt);
         }
     }
 
+    /// Request native fullscreen or windowed presentation.
     pub fn set_fullscreen(&self, fullscreen: bool) {
         match &self.backend {
             Backend::Winit(window) if fullscreen => {
@@ -892,11 +930,13 @@ impl Window {
         }
     }
 
+    /// Return the native monitor currently containing this window, if known.
     pub fn current_monitor(&self) -> Option<MonitorHandle> {
         self.backend.winit()?.current_monitor()
     }
 
     #[cfg(target_os = "macos")]
+    /// Set macOS fullscreen without creating a separate space.
     pub fn set_simple_fullscreen(&self, simple_fullscreen: bool) {
         if let Some(window) = self.backend.winit() {
             window.set_simple_fullscreen(simple_fullscreen);
@@ -1131,6 +1171,7 @@ impl Window {
     }
 
     #[cfg(target_os = "macos")]
+    /// Return the native macOS tab-group identifier.
     pub fn tabbing_id(&self) -> String {
         let Some(window) = self.backend.winit() else { return String::new() };
         let identifier = window.tabbing_identifier();
@@ -1145,8 +1186,11 @@ bitflags! {
     /// IME inhibition sources.
     #[derive(Default, Debug, Clone, Copy, PartialEq, Eq, Hash)]
     pub struct ImeInhibitor: u8 {
+        /// Inhibit composition while the window lacks focus.
         const FOCUS = 1;
+        /// Inhibit composition during touch interaction.
         const TOUCH = 1 << 1;
+        /// Inhibit composition in vi navigation mode.
         const VI    = 1 << 2;
     }
 }
@@ -1176,6 +1220,7 @@ fn use_srgb_color_space(window: &WinitWindow) {
     let view = match window.window_handle().unwrap().as_raw() {
         RawWindowHandle::AppKit(handle) => {
             assert!(MainThreadMarker::new().is_some());
+            // SAFETY: the main-thread assertion holds and winit owns this live NSView for the duration of the call.
             unsafe { handle.ns_view.cast::<NSView>().as_ref() }
         },
         _ => return,
@@ -1197,6 +1242,20 @@ fn tab_shortcut(index: usize, tab_count: usize) -> Option<u8> {
         Some(9)
     } else {
         None
+    }
+}
+
+// Debug omits user content and native resources, and never acquires application locks.
+impl std::fmt::Debug for RenderSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RenderSource").finish_non_exhaustive()
+    }
+}
+
+// Debug omits user content and native resources, and never acquires application locks.
+impl std::fmt::Debug for Window {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Window").finish_non_exhaustive()
     }
 }
 

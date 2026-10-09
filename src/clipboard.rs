@@ -118,6 +118,7 @@ impl Clipboard {
         match display {
             #[cfg(all(feature = "wayland", not(any(target_os = "macos", windows))))]
             RawDisplayHandle::Wayland(display) => {
+                // SAFETY: The caller guarantees a live Wayland display; the clipboard objects remain tied to that display lifetime.
                 let (selection, clipboard) = unsafe {
                     wayland_clipboard::create_clipboards_from_external(display.display.as_ptr())
                 };
@@ -285,6 +286,13 @@ fn pasted_image_name() -> String {
     let seconds =
         SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |elapsed| elapsed.as_secs());
     format!("pasted-image-{seconds}.png")
+}
+
+// Debug omits user content and native resources, and never acquires application locks.
+impl std::fmt::Debug for Clipboard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Clipboard").finish_non_exhaustive()
+    }
 }
 
 #[cfg(test)]

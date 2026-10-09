@@ -206,21 +206,25 @@ pub struct HintMatch {
 
 impl HintMatch {
     #[inline]
+    /// Whether this grid point or hyperlink belongs to the matched hint.
     pub fn should_highlight(&self, point: Point, pointed_hyperlink: Option<&Hyperlink>) -> bool {
         self.hyperlink.as_ref() == pointed_hyperlink
             && (self.hyperlink.is_some() || self.bounds.contains(&point))
     }
 
     #[inline]
+    /// Borrow the action attached to this hint.
     pub fn action(&self) -> &HintAction {
         &self.hint.action
     }
 
     #[inline]
+    /// Borrow the inclusive grid bounds of this hint.
     pub fn bounds(&self) -> &Match {
         &self.bounds
     }
 
+    /// Borrow the hint's hyperlink, if present.
     pub fn hyperlink(&self) -> Option<&Hyperlink> {
         self.hyperlink.as_ref()
     }
@@ -588,9 +592,15 @@ impl<T> Iterator for HintPostProcessor<'_, T> {
     }
 }
 
+// Debug omits user content and native resources, and never acquires application locks.
+impl std::fmt::Debug for HintState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HintState").finish_non_exhaustive()
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use crate::terminal::index::{Column, Line};
     use crate::terminal::term::test::mock_term;
     use crate::terminal::vvte::ansi::Handler;
 

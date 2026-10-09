@@ -13,9 +13,13 @@ thread_local! {
 /// The untrusted boundary at which a failure was contained.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ClientFaultClass {
+    /// Terminal output parser failure.
     TerminalParser,
+    /// Pseudoterminal I/O failure.
     PtyIo,
+    /// Vivid media-session failure.
     Vivid,
+    /// Local automation connection failure.
     Ipc,
 }
 
@@ -23,12 +27,16 @@ pub enum ClientFaultClass {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ClientHealth {
     #[default]
+    /// Accepting normal client traffic.
     Healthy,
+    /// Client traffic stopped after an internal worker fault.
     Quarantined,
+    /// Waiting for a requested client reset to complete.
     Recovering,
 }
 
 impl ClientHealth {
+    /// Return the stable diagnostic spelling of this classification.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Healthy => "healthy",
@@ -39,6 +47,7 @@ impl ClientHealth {
 }
 
 impl ClientFaultClass {
+    /// Return the stable diagnostic spelling of this classification.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::TerminalParser => "terminal_parser",
@@ -52,12 +61,16 @@ impl ClientFaultClass {
 /// Secret-free, bounded metadata for one contained client failure.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClientFault {
+    /// Identifier scoped to this value's owning context.
     pub id: u64,
+    /// Effect or failure classification.
     pub class: ClientFaultClass,
+    /// Bounded static diagnostic that contains no client-controlled text.
     pub diagnostic: &'static str,
 }
 
 impl ClientFault {
+    /// Assign a new fault identifier to bounded static diagnostic metadata.
     pub fn new(class: ClientFaultClass, diagnostic: &'static str) -> Self {
         Self { id: NEXT_FAULT_ID.fetch_add(1, Ordering::Relaxed), class, diagnostic }
     }
@@ -84,7 +97,12 @@ pub(crate) fn is_contained() -> bool {
     CONTAINED_DEPTH.with(|depth| depth.get() != 0)
 }
 
-/// Run client-derived work without allowing its panic to escape the current worker boundary.
+/// Contain a panic at a worker boundary whose affected state will be discarded.
+///
+/// Project exception to M-PANIC-CONTINUATION: restarting an embedding host would terminate
+/// unrelated owners. Each caller must stop the affected worker, revoke its resources, and
+/// discard partially mutated state. This is not an exception mechanism for ordinary errors.
+/// See `docs/panic-recovery.md` for the boundary inventory and recovery contract.
 pub(crate) fn catch<T>(
     class: ClientFaultClass,
     diagnostic: &'static str,
@@ -128,8 +146,13 @@ mod tests {
             assert_eq!(fault.diagnostic, "contained worker panic");
         }
 
-        let mut host_turns = 0;
-        host_turns += 1;
-        assert_eq!(host_turns, 1, "the host event loop remains runnable");
+        // Exercise the actual host event channel after the supervised workers have failed.
+        let (sink, receiver) = crate::EventSink::headless();
+        std::thread::spawn(move || {
+            sink.send_event(crate::Event::new(crate::EventType::HostWakeup, None)).unwrap();
+        })
+        .join()
+        .unwrap();
+        assert!(matches!(receiver.recv().unwrap().payload(), crate::EventType::HostWakeup));
     }
 }

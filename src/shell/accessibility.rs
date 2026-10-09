@@ -171,7 +171,7 @@ fn build_tree(
     terminal: Option<&AccessibilitySnapshot>,
 ) -> TreeUpdate {
     let mut nodes = Vec::new();
-    #[allow(unused_mut)]
+    #[allow(unused_mut, reason = "mutability is required only by platform-specific branches")]
     let mut root_children = vec![TAB_LIST_ID];
     #[cfg(target_os = "linux")]
     if terminal.is_some() {

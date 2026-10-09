@@ -41,11 +41,13 @@ impl Drop for Conpty {
         // always runs first.
         //
         // See PR #3084 and https://docs.microsoft.com/en-us/windows/console/closepseudoconsole.
+        // SAFETY: This object owns the live pseudoconsole; its output-drain pipe outlives this close.
         unsafe { ClosePseudoConsole(self.handle) }
     }
 }
 
 // The ConPTY handle can be sent between threads.
+// SAFETY: The pseudoconsole handle has no thread affinity; ownership and close ordering move together.
 unsafe impl Send for Conpty {}
 
 pub fn new(config: &Options, window_size: WindowSize) -> Result<Pty> {
@@ -59,6 +61,7 @@ pub fn new(config: &Options, window_size: WindowSize) -> Result<Pty> {
     let (conin_pty_handle, conin) = miow::pipe::anonymous(0)?;
 
     // Create the Pseudo Console, using the pipes.
+    // SAFETY: Both pipe handles are live and the initialized output receives the new pseudoconsole handle.
     let result = unsafe {
         CreatePseudoConsole(
             window_size.into(),
@@ -77,6 +80,7 @@ pub fn new(config: &Options, window_size: WindowSize) -> Result<Pty> {
 
     let mut size: usize = 0;
 
+    // SAFETY: The Windows startup/output structure consists of integer and pointer fields for which zero is valid.
     let mut startup_info_ex: STARTUPINFOEXW = unsafe { mem::zeroed() };
 
     startup_info_ex.StartupInfo.lpTitle = std::ptr::null_mut() as PWSTR;
@@ -88,6 +92,7 @@ pub fn new(config: &Options, window_size: WindowSize) -> Result<Pty> {
     startup_info_ex.StartupInfo.dwFlags |= STARTF_USESTDHANDLES;
 
     // Create the appropriately sized thread attribute list.
+    // SAFETY: The documented sizing query uses null storage and a writable byte-count output.
     unsafe {
         let failure =
             InitializeProcThreadAttributeList(ptr::null_mut(), 1, 0, &mut size as *mut usize) > 0;
@@ -98,19 +103,12 @@ pub fn new(config: &Options, window_size: WindowSize) -> Result<Pty> {
         }
     }
 
-    let mut attr_list: Box<[u8]> = vec![0; size].into_boxed_slice();
+    let mut attr_list = vec![0usize; size.div_ceil(mem::size_of::<usize>())];
 
-    // Set startup info's attribute list & initialize it
-    //
-    // Lint failure is spurious; it's because winapi's definition of PROC_THREAD_ATTRIBUTE_LIST
-    // implies it is one pointer in size (32 or 64 bits) but really this is just a dummy value.
-    // Casting a *mut u8 (pointer to 8 bit type) might therefore not be aligned correctly in
-    // the compiler's eyes.
-    #[allow(clippy::cast_ptr_alignment)]
-    {
-        startup_info_ex.lpAttributeList = attr_list.as_mut_ptr() as _;
-    }
+    // Native attribute lists require pointer-aligned storage; usize elements supply that.
+    startup_info_ex.lpAttributeList = attr_list.as_mut_ptr().cast();
 
+    // SAFETY: The attribute buffer is pointer-aligned and has the previously reported byte capacity.
     unsafe {
         success = InitializeProcThreadAttributeList(
             startup_info_ex.lpAttributeList,
@@ -125,6 +123,7 @@ pub fn new(config: &Options, window_size: WindowSize) -> Result<Pty> {
     }
 
     // Set thread attribute list's Pseudo Console to the specified ConPTY.
+    // SAFETY: The initialized attribute list and referenced pseudoconsole or handle-list storage remain live through process creation.
     unsafe {
         success = UpdateProcThreadAttribute(
             startup_info_ex.lpAttributeList,
@@ -142,7 +141,7 @@ pub fn new(config: &Options, window_size: WindowSize) -> Result<Pty> {
     }
 
     // Prepare child process creation arguments.
-    let cmdline = win32_string(&cmdline(config));
+    let mut cmdline = win32_string(&cmdline(config));
     let cwd = config.working_directory.as_ref().map(win32_string);
     let mut creation_flags = EXTENDED_STARTUPINFO_PRESENT;
     let custom_env_block = convert_custom_env(&config.env);
@@ -165,10 +164,11 @@ pub fn new(config: &Options, window_size: WindowSize) -> Result<Pty> {
     unsafe { SetConsoleCtrlHandler(None, 0) };
 
     let mut proc_info: PROCESS_INFORMATION = unsafe { mem::zeroed() };
+    // SAFETY: The command line is writable NUL-terminated UTF-16; environment, directory, startup attributes, and output storage remain live through the call.
     unsafe {
         success = CreateProcessW(
             ptr::null(),
-            cmdline.as_ptr() as PWSTR,
+            cmdline.as_mut_ptr(),
             ptr::null_mut(),
             ptr::null_mut(),
             false as i32,
@@ -214,10 +214,7 @@ fn convert_custom_env(custom_env: &HashMap<String, String>) -> Option<Vec<u16>> 
                 OsStr::new(&custom_value),
             );
         } else {
-            warn!(
-                "Omitting environment variable pair with duplicate key: \
-                 '{custom_key}={custom_value}'"
-            );
+            warn!("Omitting a duplicate environment variable");
         }
     }
 
@@ -252,6 +249,7 @@ fn add_windows_env_key_value_to_block(block: &mut Vec<u16>, key: &OsStr, value: 
 
 impl OnResize for Conpty {
     fn on_resize(&mut self, window_size: WindowSize) {
+        // SAFETY: The object owns the live pseudoconsole and the new size is passed by value.
         let result = unsafe { ResizePseudoConsole(self.handle, window_size.into()) };
         assert_eq!(result, S_OK);
     }
@@ -262,5 +260,11 @@ impl From<WindowSize> for COORD {
         let lines = window_size.num_lines;
         let columns = window_size.num_cols;
         COORD { X: columns as i16, Y: lines as i16 }
+    }
+}
+
+impl std::fmt::Debug for Conpty {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("Conpty").finish_non_exhaustive()
     }
 }

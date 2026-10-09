@@ -1,49 +1,34 @@
-#![allow(clippy::let_unit_value)]
+//! Child-process locale defaults on macOS.
 
-use std::ffi::{CStr, CString};
-use std::{env, str};
+use std::env;
+use std::sync::OnceLock;
 
-use libc::{LC_ALL, LC_CTYPE, setlocale};
-use log::debug;
 use objc2::sel;
 use objc2_foundation::{NSLocale, NSObjectProtocol};
 
-const FALLBACK_LOCALE: &str = "UTF-8";
-
+/// Prepare immutable child locale defaults without changing the embedding process locale.
 pub fn set_locale_environment() {
-    let env_locale_c = CString::new("").unwrap();
-    let env_locale_ptr = unsafe { setlocale(LC_ALL, env_locale_c.as_ptr()) };
-    if !env_locale_ptr.is_null() {
-        let env_locale = unsafe { CStr::from_ptr(env_locale_ptr).to_string_lossy() };
+    let _ = child_locale();
+}
 
-        // Assume `C` locale means unchanged, since it is the default anyways.
-        if env_locale != "C" {
-            debug!("Using environment locale: {}", env_locale);
-            return;
+/// A machine locale cache, independent of pane, owner, or embedding context.
+pub(crate) fn child_locale() -> (&'static str, &'static str) {
+    static LOCALE: OnceLock<(String, String)> = OnceLock::new();
+    let (key, value) = LOCALE.get_or_init(|| {
+        let locale = system_locale();
+        if std::path::Path::new("/usr/share/locale").join(&locale).is_dir() {
+            ("LC_ALL".into(), locale)
+        } else {
+            ("LC_CTYPE".into(), "UTF-8".into())
         }
-    }
+    });
+    (key, value)
+}
 
-    let system_locale = system_locale();
-
-    // Set locale to system locale.
-    let system_locale_c = CString::new(system_locale.clone()).expect("nul byte in system locale");
-    let lc_all = unsafe { setlocale(LC_ALL, system_locale_c.as_ptr()) };
-
-    // Check if system locale was valid or not.
-    if lc_all.is_null() {
-        // Use fallback locale.
-        debug!("Using fallback locale: {}", FALLBACK_LOCALE);
-
-        let fallback_locale_c = CString::new(FALLBACK_LOCALE).unwrap();
-        unsafe { setlocale(LC_CTYPE, fallback_locale_c.as_ptr()) };
-
-        unsafe { env::set_var("LC_CTYPE", FALLBACK_LOCALE) };
-    } else {
-        // Use system locale.
-        debug!("Using system locale: {}", system_locale);
-
-        unsafe { env::set_var("LC_ALL", system_locale) };
-    }
+pub(crate) fn needs_child_locale() -> bool {
+    !["LC_ALL", "LC_CTYPE", "LANG"].iter().any(|key| {
+        env::var(key).is_ok_and(|value| !value.is_empty() && value != "C" && value != "POSIX")
+    })
 }
 
 /// Determine system locale based on language and country code.
@@ -61,7 +46,10 @@ fn system_locale() -> String {
     let is_country_code_supported: bool = locale.respondsToSelector(sel!(countryCode));
     if is_language_code_supported && is_country_code_supported {
         let language_code = locale.languageCode();
-        #[allow(deprecated)]
+        #[expect(
+            deprecated,
+            reason = "the platform API has no equivalent replacement for this supported behavior"
+        )]
         if let Some(country_code) = locale.countryCode() {
             format!("{}_{}.UTF-8", language_code, country_code)
         } else {

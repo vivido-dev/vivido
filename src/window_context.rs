@@ -159,8 +159,11 @@ pub struct FoundTextMatch {
     pub text: String,
     /// Physical-pixel rectangles in the client area, matching mouse input coordinates.
     pub pixel_x: u32,
+    /// Vertical position in physical pixels.
     pub pixel_y: u32,
+    /// Width in physical pixels.
     pub pixel_width: u32,
+    /// Height in physical pixels.
     pub pixel_height: u32,
 }
 
@@ -172,10 +175,13 @@ fn snap_pixel(value: f32) -> u32 {
 
 /// Event context for one individual Vivido window.
 pub struct WindowContext {
+    /// Messages currently presented by the terminal UI.
     pub message_buffer: MessageBuffer,
     #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
     accessibility: Option<AccessibilityState>,
+    /// Terminal rendering resources.
     pub display: Display,
+    /// Whether this state requires a display update.
     pub dirty: bool,
     event_queue: Vec<WinitEvent<Event>>,
     #[cfg(any(target_os = "macos", windows))]
@@ -219,6 +225,7 @@ pub struct WindowContext {
     #[cfg(any(unix, windows))]
     screenshot_busy: bool,
     #[cfg(any(unix, windows))]
+    /// Window-scoped automation state.
     pub automation: AutomationWindowState,
     client_health: ClientHealth,
     last_client_fault: Option<ClientFault>,
@@ -421,6 +428,10 @@ impl WindowContext {
     }
 
     /// Create initial window context.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if window, rendering, PTY, or protocol-service initialization fails.
     pub fn initial(
         event_loop: LoopHandle<'_>,
         proxy: EventSink,
@@ -437,6 +448,10 @@ impl WindowContext {
     }
 
     /// Create additional context.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if window, rendering, PTY, or protocol-service initialization fails.
     pub fn additional(
         event_loop: LoopHandle<'_>,
         proxy: EventSink,
@@ -469,7 +484,10 @@ impl WindowContext {
 
     /// Create a new terminal window context.
     fn new(
-        #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
+        #[cfg_attr(
+            not(target_os = "linux"),
+            allow(unused_variables, reason = "Linux startup notification consumes this binding")
+        )]
         event_loop_handle: LoopHandle<'_>,
         mut display: Display,
         config: Rc<UiConfig>,
@@ -1082,6 +1100,7 @@ impl WindowContext {
         self.show_native_title();
     }
 
+    /// Complete a settled Vivid resize generation.
     pub fn settle_vivid_resize(&mut self, generation: u64) {
         self.vivid_resize_settled = Some(generation);
         self.dirty = true;
@@ -1204,6 +1223,10 @@ impl WindowContext {
 
     /// Write bytes and notify the main event loop after the PTY master accepted all of them.
     #[cfg(any(unix, windows))]
+    ///
+    /// # Errors
+    ///
+    /// Returns an IPC error if the PTY worker has exited or its command channel has closed.
     pub fn write_to_pty_with_completion(
         &self,
         bytes: Vec<u8>,
@@ -1217,6 +1240,10 @@ impl WindowContext {
 
     /// Write automation bytes without creating a correlated completion response.
     #[cfg(any(unix, windows))]
+    ///
+    /// # Errors
+    ///
+    /// Returns `EventLoopSendError` after the PTY worker command channel closes.
     pub fn write_automation_bytes(&self, bytes: Vec<u8>) -> Result<(), EventLoopSendError> {
         if bytes.is_empty() {
             return Ok(());
@@ -1226,6 +1253,10 @@ impl WindowContext {
 
     /// Apply the current terminal dimensions to the PTY and report completion.
     #[cfg(any(unix, windows))]
+    ///
+    /// # Errors
+    ///
+    /// Returns an IPC error if the PTY worker has exited or the resize cannot be queued.
     pub fn write_pty_resize_with_completion(
         &self,
         completion: u64,
@@ -1365,7 +1396,17 @@ impl WindowContext {
 
     /// Queue a deterministic reset of parser and client-controlled terminal state.
     #[cfg(any(unix, windows))]
+    ///
+    /// # Errors
+    ///
+    /// Returns an IPC error if the pane is quarantined or its PTY worker cannot accept a reset.
     pub fn reset_terminal_client(&mut self, completion: u64) -> Result<(), IpcError> {
+        if self.client_health == ClientHealth::Quarantined {
+            return Err(IpcError::new(
+                "invalid_state",
+                "quarantined terminals require restart_terminal",
+            ));
+        }
         if self.io_thread.as_ref().is_none_or(JoinHandle::is_finished) {
             return Err(IpcError::new("pty_closed", "terminal PTY worker has exited"));
         }
@@ -1381,6 +1422,10 @@ impl WindowContext {
 
     /// Replace this pane's PTY and Vivid service without changing its window or stable IPC ID.
     #[cfg(any(unix, windows))]
+    ///
+    /// # Errors
+    ///
+    /// Returns an IPC error if replacement protocol, PTY, or polling resources cannot be created.
     pub fn restart_terminal_client(&mut self) -> Result<(), IpcError> {
         let mut pty_config = self.restart_pty_config.clone();
         let new_service = match self.vivid_target {
@@ -1413,8 +1458,14 @@ impl WindowContext {
         #[cfg(windows)]
         let shell_pid = pty.child_watcher().pid().map_or(0, std::num::NonZeroU32::get);
         let shell_integration = pty.shell_integration();
+        // Never reuse state that may have been partially mutated before a parser panic.
+        let terminal = Arc::new(FairMutex::new(Term::new(
+            self.config.term_options(),
+            &self.display.size_info,
+            self.event_proxy.clone(),
+        )));
         let event_loop = PtyEventLoop::new(
-            Arc::clone(&self.terminal),
+            Arc::clone(&terminal),
             self.event_proxy.clone(),
             pty,
             pty_config.drain_on_exit,
@@ -1432,7 +1483,7 @@ impl WindowContext {
         // A fresh PTY means a fresh shell: stale prompt state would resolve semantic waits
         // against a command line that no longer exists.
         self.automation.shell = crate::automation::CommandExecutionState::default();
-        self.terminal.lock().reset_client_state();
+        self.terminal = terminal;
         // A clipboard answer meant for the old shell must not reach the new one.
         self.display.close_clipboard_prompt();
         self.display.set_vivid_scene(new_service.scene());
@@ -1461,6 +1512,17 @@ impl WindowContext {
     pub(crate) fn record_client_fault(&mut self, fault: ClientFault, quarantined: bool) {
         if quarantined {
             self.client_health = ClientHealth::Quarantined;
+            let _ = self.notifier.0.send(Msg::Shutdown);
+            if let Some(worker) = self.io_thread.take() {
+                let _ = worker.join();
+            }
+            self.terminal = Arc::new(FairMutex::new(Term::new(
+                self.config.term_options(),
+                &self.display.size_info,
+                self.event_proxy.clone(),
+            )));
+            self.display.close_clipboard_prompt();
+            self.vivid_service.disconnect_clients();
         }
         self.last_client_fault = Some(fault);
     }
@@ -1474,6 +1536,10 @@ impl WindowContext {
 
     /// Process a neutral key through Vivido's normal UI input processor.
     #[cfg(any(unix, windows))]
+    ///
+    /// # Errors
+    ///
+    /// Returns an IPC error for invalid key parameters or a closed PTY worker.
     pub fn ui_key(
         &mut self,
         key: &IpcKey,
@@ -1524,6 +1590,10 @@ impl WindowContext {
 
     /// Process mouse actions through Vivido's normal UI mouse processor.
     #[cfg(any(unix, windows))]
+    ///
+    /// # Errors
+    ///
+    /// Returns an IPC error for invalid mouse coordinates, buttons, or delivery state.
     pub fn ui_mouse(
         &mut self,
         mouse: &IpcMouse,
@@ -1626,6 +1696,10 @@ impl WindowContext {
 
     /// Process one bounded physical-pixel gesture through Vivido's UI mouse processor.
     #[cfg(any(unix, windows))]
+    ///
+    /// # Errors
+    ///
+    /// Returns an IPC error for invalid path geometry, duration, or delivery state.
     pub fn ui_mouse_path(
         &mut self,
         path: &IpcMousePath,
@@ -1704,6 +1778,10 @@ impl WindowContext {
 
     /// Encode one application mouse action without entering Vivido's UI input path.
     #[cfg(any(unix, windows))]
+    ///
+    /// # Errors
+    ///
+    /// Returns an IPC error for invalid coordinates, unsupported actions, or mouse-reporting mode.
     pub fn application_mouse(&self, mouse: &IpcMouse) -> Result<Vec<u8>, IpcError> {
         let terminal = self.terminal.lock();
         let mode = *terminal.mode();
@@ -1844,6 +1922,14 @@ impl WindowContext {
 
     /// Encode one complete physical-pixel application gesture into one PTY write.
     #[cfg(any(unix, windows))]
+    ///
+    /// # Panics
+    ///
+    /// Panics if internal validation accepts a path with fewer than two positions.
+    ///
+    /// # Errors
+    ///
+    /// Returns an IPC error for invalid path points, duration, or mouse-reporting mode.
     pub fn application_mouse_path(&self, path: &IpcMousePath) -> Result<Vec<u8>, IpcError> {
         validate_mouse_path(path)?;
         let terminal = self.terminal.lock();
@@ -1997,6 +2083,10 @@ impl WindowContext {
 
     /// Send an explicit signal to the foreground process group, falling back to the child group.
     #[cfg(unix)]
+    ///
+    /// # Errors
+    ///
+    /// Returns an IPC error if the foreground process group cannot be found or signaled.
     pub fn signal_process_group(&self, signal: IpcSignalName) -> Result<i32, IpcError> {
         let signal = match signal {
             IpcSignalName::Int => libc::SIGINT,
@@ -2009,8 +2099,10 @@ impl WindowContext {
             IpcSignalName::Kill => libc::SIGKILL,
             IpcSignalName::Stop => libc::SIGSTOP,
         };
+        // SAFETY: tcgetpgrp takes a scalar PTY descriptor and reports closed or invalid descriptors as errors.
         let foreground = unsafe { libc::tcgetpgrp(self.master_fd) };
         let process_group = if foreground > 0 { foreground } else { self.shell_pid as i32 };
+        // SAFETY: the target process group and signal were validated above; kill takes only scalar arguments.
         if unsafe { libc::killpg(process_group, signal) } == -1 {
             return Err(IpcError::new(
                 "unsupported",
@@ -2036,6 +2128,7 @@ impl WindowContext {
                 "this signal cannot be delivered through a Windows pseudoconsole",
             ));
         }
+        // SAFETY: Only scalar access flags and a PID are supplied; the returned handle is checked before use.
         let process = unsafe { OpenProcess(PROCESS_TERMINATE, 0, self.shell_pid) };
         if process.is_null() {
             return Err(IpcError::new(
@@ -2043,7 +2136,9 @@ impl WindowContext {
                 format!("failed to open child process: {}", std::io::Error::last_os_error()),
             ));
         }
+        // SAFETY: The process handle was successfully opened with termination rights and remains live until the call returns.
         let result = unsafe { TerminateProcess(process, 1) };
+        // SAFETY: This scope owns the checked native handle and releases it exactly once after its final use.
         unsafe { CloseHandle(process) };
         if result == 0 {
             return Err(IpcError::new(
@@ -2057,6 +2152,10 @@ impl WindowContext {
 
     /// Request an exact client-area size.
     #[cfg(any(unix, windows))]
+    ///
+    /// # Errors
+    ///
+    /// Returns an IPC error for invalid geometry, unsupported sizes, or an unavailable target.
     pub fn request_automation_resize(
         &self,
         columns: Option<u16>,
@@ -2121,6 +2220,7 @@ impl WindowContext {
     }
 
     #[cfg(any(unix, windows))]
+    /// Whether the window's terminal dimensions match the automation request.
     pub fn automation_size_matches(
         &self,
         columns: Option<u16>,
@@ -2275,6 +2375,10 @@ impl WindowContext {
     /// per-request handshake would serialize the drag against the compositor. Callers that need
     /// confirmation subscribe to `moved` and `resized`.
     #[cfg(any(unix, windows))]
+    ///
+    /// # Errors
+    ///
+    /// Returns an IPC error for invalid geometry or an unavailable native window.
     pub fn request_automation_geometry(
         &self,
         x: Option<i32>,
@@ -2547,6 +2651,7 @@ impl WindowContext {
         let selection =
             terminal.selection.as_ref().and_then(|selection| selection.to_range(&terminal));
         #[cfg(unix)]
+        // SAFETY: tcgetpgrp takes a scalar PTY descriptor and reports closed or invalid descriptors as errors.
         let foreground_pgid = unsafe { libc::tcgetpgrp(self.master_fd) };
         #[cfg(unix)]
         let foreground_pgid = (foreground_pgid > 0).then_some(foreground_pgid);
@@ -2566,6 +2671,7 @@ impl WindowContext {
         #[cfg(unix)]
         let mut attributes = std::mem::MaybeUninit::<libc::termios>::uninit();
         #[cfg(unix)]
+        // SAFETY: attributes is an aligned writable termios; assume_init executes only after tcgetattr succeeds.
         let echo = unsafe {
             (libc::tcgetattr(self.master_fd, attributes.as_mut_ptr()) == 0)
                 .then(|| attributes.assume_init().c_lflag & libc::ECHO != 0)
@@ -2669,6 +2775,7 @@ impl WindowContext {
     }
 
     #[cfg(any(unix, windows))]
+    /// Return bounded status for this pane's Vivid sessions.
     pub fn automation_vivid_sessions(&self) -> Value {
         let sessions = self
             .vivid_service
@@ -2685,6 +2792,7 @@ impl WindowContext {
     }
 
     #[cfg(any(unix, windows))]
+    /// Return bounded status for this pane's owned Vivid surfaces.
     pub fn automation_vivid_surfaces(&self) -> Value {
         let surfaces = self
             .vivid_service
@@ -2700,6 +2808,11 @@ impl WindowContext {
     }
 
     #[cfg(any(unix, windows))]
+    /// Inspect one Vivid surface using its complete owner and object identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an IPC error if the fully addressed owner, context, or surface is unknown.
     pub fn automation_vivid_surface(
         &self,
         session_id: u64,
@@ -2720,6 +2833,7 @@ impl WindowContext {
     }
 
     #[cfg(any(unix, windows))]
+    /// Return bounded status for this pane's owned Vivid tracks.
     pub fn automation_vivid_tracks(&self) -> Value {
         let tracks = self
             .vivid_service
@@ -2735,6 +2849,11 @@ impl WindowContext {
     }
 
     #[cfg(any(unix, windows))]
+    /// Inspect one Vivid track using its complete owner and object identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an IPC error if the fully addressed owner, surface, or track is unknown.
     pub fn automation_vivid_track(
         &self,
         session_id: u64,
@@ -2757,6 +2876,11 @@ impl WindowContext {
     }
 
     #[cfg(any(unix, windows))]
+    /// Inspect one fully addressed Vivid scene.
+    ///
+    /// # Errors
+    ///
+    /// Returns an IPC error if the addressed owner or context is unknown.
     pub fn automation_vivid_scene(
         &self,
         session_id: u64,
@@ -2803,6 +2927,7 @@ impl WindowContext {
     }
 
     #[cfg(any(unix, windows))]
+    /// Query bounded Vivid trace records with the supplied filters.
     pub fn automation_vivid_trace(
         &self,
         selection: crate::vivid::trace::TraceSelection,
@@ -2814,6 +2939,7 @@ impl WindowContext {
     }
 
     #[cfg(any(unix, windows))]
+    /// Collect bounded terminal, renderer, and Vivid diagnostic status.
     pub fn automation_diagnose(
         &self,
         event_sequence: u64,
@@ -2899,7 +3025,11 @@ impl WindowContext {
     }
 
     #[cfg(any(unix, windows))]
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "these established rendering and protocol entry points carry independently required context"
+    )]
+    /// Evaluate a wait against the addressed Vivid track and generation.
     pub fn automation_vivid_wait(
         &self,
         session_id: u64,
@@ -2929,6 +3059,10 @@ impl WindowContext {
 
     /// Structured physical-cell grid snapshot or current-state delta.
     #[cfg(any(unix, windows))]
+    ///
+    /// # Errors
+    ///
+    /// Returns an IPC error for invalid or oversized grid ranges.
     pub fn automation_grid(
         &self,
         start_line: Option<i32>,
@@ -3130,6 +3264,10 @@ impl WindowContext {
 
     /// Start reading back the last successfully presented frame.
     #[cfg(any(unix, windows))]
+    ///
+    /// # Errors
+    ///
+    /// Returns an IPC error for unsupported formats, an unavailable frame, or a pending capture.
     pub fn request_screenshot(
         &mut self,
         connection: IpcConnection,
@@ -3173,6 +3311,10 @@ impl WindowContext {
 
     /// Poll screenshot readback and move PNG encoding off the event-loop thread.
     #[cfg(any(unix, windows))]
+    ///
+    /// # Panics
+    ///
+    /// Panics if internal screenshot-state invariants are violated.
     pub fn poll_screenshot(&mut self, scheduler: &mut Scheduler, event_proxy: &EventSink) {
         let Some(pending) = self.screenshot.as_ref() else {
             return;
@@ -3275,6 +3417,10 @@ impl WindowContext {
     }
 
     /// Write the ref test results to the disk.
+    ///
+    /// # Panics
+    ///
+    /// Panics if terminal snapshot serialization or writing the reference files fails.
     pub fn write_ref_test_results(&self) {
         // Dump grid state.
         let mut grid = self.terminal.lock().grid().clone();
@@ -3428,10 +3574,12 @@ fn process_memory_mb() -> Option<f64> {
         // SAFETY: `usage` is a plain zeroed struct that `getrusage` fills before the
         // return value is checked; no other thread observes the intermediate state.
         let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
+        // SAFETY: usage is a correctly aligned writable rusage buffer whose size the native ABI defines.
         let ok = unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) == 0 };
         if !ok {
             return None;
         }
+        // SAFETY: the preceding getrusage call succeeded and initialized this complete rusage value.
         let usage = unsafe { usage.assume_init() };
         if usage.ru_maxrss <= 0 {
             return None;
@@ -3665,13 +3813,14 @@ fn foreground_executable_basename(pid: libc::pid_t) -> Option<String> {
     use std::ffi::CStr;
 
     let mut buffer = [0_u8; 4096];
+    // SAFETY: buffer is writable for the exact supplied length; its returned path is checked for a terminator below.
     let length = unsafe {
         libc::proc_pidpath(pid, buffer.as_mut_ptr().cast(), buffer.len().try_into().ok()?)
     };
     if length <= 0 {
         return None;
     }
-    let path = unsafe { CStr::from_ptr(buffer.as_ptr().cast()) };
+    let path = CStr::from_bytes_until_nul(&buffer).ok()?;
     std::path::Path::new(path.to_str().ok()?)
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
@@ -3978,6 +4127,15 @@ fn is_explicit_title(title: &str, preserve_title: bool, window: &WindowConfig) -
     preserve_title
         || !window.dynamic_title
         || (!title.trim().is_empty() && title != window.identity.title)
+}
+
+// Debug omits user content and native resources, and never acquires application locks.
+impl std::fmt::Debug for WindowContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WindowContext")
+            .field("client_health", &self.client_health)
+            .finish_non_exhaustive()
+    }
 }
 
 #[cfg(test)]

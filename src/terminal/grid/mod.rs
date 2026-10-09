@@ -3,7 +3,6 @@
 use std::cmp::{max, min};
 use std::ops::{Bound, Deref, Index, IndexMut, Range, RangeBounds};
 
-#[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
 use crate::terminal::index::{Column, Line, Point};
@@ -19,6 +18,7 @@ mod tests;
 pub use self::row::Row;
 use self::storage::Storage;
 
+/// Cell operations required by terminal grid storage and scrolling.
 pub trait GridCell: Sized {
     /// Check if the cell contains any content.
     fn is_empty(&self) -> bool;
@@ -26,11 +26,14 @@ pub trait GridCell: Sized {
     /// Perform an opinionated cell reset based on a template cell.
     fn reset(&mut self, template: &Self);
 
+    /// Borrow this cell's terminal flags.
     fn flags(&self) -> &Flags;
+    /// Mutably borrow this cell's terminal flags.
     fn flags_mut(&mut self) -> &mut Flags;
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
+/// Saved cursor position, cell template, character sets, and pending line-wrap state.
 pub struct Cursor<T> {
     /// The location of this cursor.
     pub point: Point,
@@ -53,6 +56,7 @@ pub struct Cursor<T> {
 }
 
 #[derive(Debug, Default, Copy, Clone, PartialEq, Eq)]
+/// The four character sets selected by terminal escape sequences.
 pub struct Charsets([StandardCharset; 4]);
 
 impl Index<CharsetIndex> for Charsets {
@@ -70,11 +74,17 @@ impl IndexMut<CharsetIndex> for Charsets {
 }
 
 #[derive(Debug, Copy, Clone)]
+/// A change to the visible scrollback offset.
 pub enum Scroll {
+    /// Move the viewport by a signed line count.
     Delta(i32),
+    /// Scroll up by one viewport.
     PageUp,
+    /// Scroll down by one viewport.
     PageDown,
+    /// Scroll to the oldest available history.
     Top,
+    /// Return to the live viewport.
     Bottom,
 }
 
@@ -105,15 +115,14 @@ pub enum Scroll {
 ///                           ^
 ///                        columns
 /// ```
-#[derive(Clone, Debug)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Grid<T> {
     /// Current cursor for writing data.
-    #[cfg_attr(feature = "serde", serde(skip))]
+    #[serde(skip)]
     pub cursor: Cursor<T>,
 
     /// Last saved cursor.
-    #[cfg_attr(feature = "serde", serde(skip))]
+    #[serde(skip)]
     pub saved_cursor: Cursor<T>,
 
     /// Lines in the grid. Each row holds a list of cells corresponding to the
@@ -138,6 +147,7 @@ pub struct Grid<T> {
 }
 
 impl<T: GridCell + Default + PartialEq> Grid<T> {
+    /// Create visible terminal rows and reserve a bounded scrollback limit.
     pub fn new(lines: usize, columns: usize, max_scroll_limit: usize) -> Grid<T> {
         Grid {
             raw: Storage::with_capacity(lines, columns),
@@ -160,6 +170,7 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
         self.max_scroll_limit = history_size;
     }
 
+    /// Move the visible viewport through terminal scrollback.
     pub fn scroll_display(&mut self, scroll: Scroll) {
         self.display_offset = match scroll {
             Scroll::Delta(count) => {
@@ -188,6 +199,7 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
     }
 
     #[inline]
+    /// Scroll rows downward inside the supplied terminal region.
     pub fn scroll_down<D>(&mut self, region: &Range<Line>, positions: usize)
     where
         T: ResetDiscriminant<D>,
@@ -306,6 +318,7 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
         }
     }
 
+    /// Clear visible cells and preserve scrollback according to the terminal policy.
     pub fn clear_viewport<D>(&mut self)
     where
         T: ResetDiscriminant<D>,
@@ -380,6 +393,7 @@ impl<T> Grid<T> {
     }
 
     #[inline]
+    /// Discard terminal scrollback while keeping the visible viewport.
     pub fn clear_history(&mut self) {
         // Clear all scrollback history.
         self.raw.shrink_lines(self.history_size());
@@ -430,11 +444,13 @@ impl<T> Grid<T> {
     }
 
     #[inline]
+    /// Return the number of lines scrolled back from the live viewport.
     pub fn display_offset(&self) -> usize {
         self.display_offset
     }
 
     #[inline]
+    /// Mutably borrow the cell at the current terminal cursor.
     pub fn cursor_cell(&mut self) -> &mut T {
         let point = self.cursor.point;
         &mut self[point.line][point.column]
@@ -552,8 +568,11 @@ impl Dimensions for (usize, usize) {
 }
 
 #[derive(Debug, PartialEq, Eq)]
+/// A terminal cell paired with its grid position.
 pub struct Indexed<T> {
+    /// Grid position of this value.
     pub point: Point,
+    /// Terminal cell value.
     pub cell: T,
 }
 
@@ -631,6 +650,7 @@ impl<'a, T> Iterator for GridIterator<'a, T> {
 
 /// Bidirectional iterator.
 pub trait BidirectionalIterator: Iterator {
+    /// Move backward and return the preceding item, if any.
     fn prev(&mut self) -> Option<Self::Item>;
 }
 
@@ -653,5 +673,12 @@ impl<T> BidirectionalIterator for GridIterator<'_, T> {
         }
 
         Some(Indexed { cell: &self.grid[self.point], point: self.point })
+    }
+}
+
+// Debug omits user content and native resources, and never acquires application locks.
+impl<T> std::fmt::Debug for GridIterator<'_, T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GridIterator").finish_non_exhaustive()
     }
 }

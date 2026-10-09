@@ -1228,7 +1228,10 @@ impl SharedScene {
         Ok(result)
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "these established rendering and protocol entry points carry independently required context"
+    )]
     pub fn publish_frame(
         &self,
         identity: TrackIdentity,
@@ -1310,7 +1313,10 @@ impl SharedScene {
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "these established rendering and protocol entry points carry independently required context"
+    )]
     pub fn admit_media(
         &self,
         identity: TrackIdentity,
@@ -2420,16 +2426,27 @@ pub fn track_kind_name(configuration: &TrackConfiguration) -> &'static str {
     }
 }
 
+// Debug omits user content and native resources, and never acquires application locks.
+impl std::fmt::Debug for SceneStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SceneStatus").finish_non_exhaustive()
+    }
+}
+
+// Debug omits user content and native resources, and never acquires application locks.
+impl std::fmt::Debug for SharedScene {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SharedScene").finish_non_exhaustive()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vivid_protocol::cbor::Value;
     use vivid_protocol::identity::PresenterInstanceId;
     use vivid_protocol::messages::LaneClass;
     use vivid_protocol::surface::{CoordinateModel, SurfaceDescriptor, SurfaceRole};
-    use vivid_protocol::track::{
-        AudioConfiguration, KindConfiguration, RasterConfiguration, VideoConfiguration,
-    };
+    use vivid_protocol::track::{AudioConfiguration, RasterConfiguration, VideoConfiguration};
 
     fn session(presenter: u8, id: u64) -> SessionIdentity {
         SessionIdentity::new(PresenterInstanceId([presenter; 16]), id).unwrap()

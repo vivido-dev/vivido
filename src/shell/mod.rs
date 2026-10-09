@@ -22,26 +22,52 @@ pub const MAX_PENDING_SHELL_ACTIONS: usize = 64;
 /// A window-management operation which must be performed by an embedding chrome.
 #[derive(Clone, Debug)]
 pub enum ShellAction {
+    /// Create a terminal tab using the supplied options.
     CreateTab(Box<WindowOptions>),
+    /// Select the next tab.
     SelectNextTab,
+    /// Select the previous tab.
     SelectPreviousTab,
+    /// Select a tab by index.
     SelectTab(usize),
+    /// Select the last tab.
     SelectLastTab,
+    /// Minimize the host window.
     Minimize,
+    /// Toggle the host window's maximized state.
     ToggleMaximized,
+    /// Toggle the host window's fullscreen state.
     ToggleFullscreen,
+    /// Hide the host window.
     Hide,
+    /// Activate the host window.
     Activate,
-    Resize { width: u32, height: u32 },
-    SetPosition { x: i32, y: i32 },
+    /// Resize the host window in physical pixels.
+    Resize {
+        /// Width in this value's coordinate system.
+        width: u32,
+        /// Height in this value's coordinate system.
+        height: u32,
+    },
+    /// Move the host window in physical pixels.
+    SetPosition {
+        /// Horizontal coordinate.
+        x: i32,
+        /// Vertical coordinate.
+        y: i32,
+    },
+    /// Change host window visibility.
     SetVisible(bool),
+    /// Change the host window stacking level.
     SetLevel(WindowLevel),
 }
 
 /// One shell action together with the terminal pane which originated it.
 #[derive(Clone, Debug)]
 pub struct ShellActionRequest {
+    /// Window that originated this shell action.
     pub source: WindowId,
+    /// Action to execute.
     pub action: ShellAction,
 }
 
@@ -86,9 +112,13 @@ pub use windows::NativePaneHost;
 /// A pane rectangle in physical pixels relative to its host's client area.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PhysicalRect {
+    /// Horizontal coordinate.
     pub x: i32,
+    /// Vertical coordinate.
     pub y: i32,
+    /// Width in this value's coordinate system.
     pub width: u32,
+    /// Height in this value's coordinate system.
     pub height: u32,
 }
 

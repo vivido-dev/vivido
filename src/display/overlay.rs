@@ -4,7 +4,7 @@ use crate::vivid::overlay::Drawing;
 use crate::vivid::scene::SharedScene;
 use vello::kurbo::{Affine, Rect};
 use vello::peniko::{Color, Fill, ImageAlphaType, ImageData, Mix};
-use vello::{AaConfig, RenderParams, Renderer, Scene, wgpu};
+use vello::{AaConfig, RenderParams, Renderer, Scene};
 
 /// Cumulative work performed by the pane-overlay render cache.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

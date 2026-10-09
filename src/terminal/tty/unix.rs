@@ -45,12 +45,16 @@ macro_rules! die {
 
 /// Really only needed on BSD, but should be fine elsewhere.
 fn set_controlling_terminal(fd: c_int) -> Result<()> {
+    // SAFETY: fd is the newly opened PTY slave; TIOCSCTTY receives the platform-specific scalar argument.
     let res = unsafe {
         // TIOSCTTY changes based on platform and the `ioctl` call is different
         // based on architecture (32/64). So a generic cast is used to make sure
         // there are no issues. To allow such a generic cast the clippy warning
         // is disabled.
-        #[allow(clippy::cast_lossless)]
+        #[allow(
+            clippy::cast_lossless,
+            reason = "the native uid type varies across supported Unix targets"
+        )]
         libc::ioctl(fd, TIOCSCTTY as _, 0)
     };
 
@@ -76,7 +80,9 @@ fn get_pw_entry(buf: &mut [i8; 1024]) -> Result<Passwd<'_>> {
     let mut res: *mut libc::passwd = ptr::null_mut();
 
     // Try and read the pw file.
+    // SAFETY: getuid has no arguments and returns a scalar identity.
     let uid = unsafe { libc::getuid() };
+    // SAFETY: entry, result pointer, and scratch buffer are writable locals with their exact declared sizes.
     let status = unsafe {
         libc::getpwuid_r(uid, entry.as_mut_ptr(), buf.as_mut_ptr() as *mut _, buf.len(), &mut res)
     };
@@ -100,6 +106,7 @@ fn get_pw_entry(buf: &mut [i8; 1024]) -> Result<Passwd<'_>> {
     // SAFETY: on success every string field points to a NUL-terminated string inside `buf`,
     // which outlives the returned `Passwd`.
     let field = |pointer| {
+        // SAFETY: successful getpwuid_r returned a checked non-null field in the scratch buffer, which outlives this copy.
         unsafe { CStr::from_ptr(pointer) }
             .to_str()
             .map_err(|_| Error::new(ErrorKind::InvalidData, "passwd entry is not UTF-8"))
@@ -113,15 +120,18 @@ fn get_pw_entry(buf: &mut [i8; 1024]) -> Result<Passwd<'_>> {
     })
 }
 
+/// An owned pseudoterminal, child process, and polling resources.
 pub struct Pty {
     child: Child,
     file: File,
     signals: UnixStream,
     sig_id: SigId,
     shell_integration: Option<IntegratedShell>,
+    _environment: super::TerminfoGuard,
 }
 
 impl Pty {
+    /// Borrow the child process owned by this PTY.
     pub fn child(&self) -> &Child {
         &self.child
     }
@@ -131,6 +141,7 @@ impl Pty {
         self.shell_integration
     }
 
+    /// Borrow this PTY's master file handle.
     pub fn file(&self) -> &File {
         &self.file
     }
@@ -218,6 +229,10 @@ fn login_interpreter(shell: &str) -> &str {
 }
 
 /// Create a new TTY and return a handle to interact with it.
+///
+/// # Errors
+///
+/// Returns an I/O error if PTY allocation, configuration, or child spawning fails.
 pub fn new(config: &Options, window_size: WindowSize, window_id: u64) -> Result<Pty> {
     let pty = openpty(None, Some(&window_size.to_winsize()))?;
     let (master, slave) = (pty.controller, pty.user);
@@ -225,9 +240,12 @@ pub fn new(config: &Options, window_size: WindowSize, window_id: u64) -> Result<
 }
 
 /// Create a new TTY from a PTY's file descriptors.
+///
+/// # Errors
+///
+/// Returns an error if the supplied PTY descriptors cannot be configured or the child cannot start.
 pub fn from_fd(config: &Options, window_id: u64, master: OwnedFd, slave: OwnedFd) -> Result<Pty> {
-    let integration = config.shell_integration.then(shell_integration::directory).flatten();
-    spawn(config, window_id, master, slave, integration.as_deref())
+    spawn(config, window_id, master, slave, None)
 }
 
 /// Start the shell on `slave`, loading the integration scripts in `integration` when it can.
@@ -238,6 +256,11 @@ fn spawn(
     slave: OwnedFd,
     integration: Option<&Path>,
 ) -> Result<Pty> {
+    let environment = super::setup_env();
+    let integration = config
+        .shell_integration
+        .then(|| integration.or_else(|| environment.integration_directory()))
+        .flatten();
     let master_fd = master.as_raw_fd();
     let slave_fd = slave.as_raw_fd();
 
@@ -274,6 +297,7 @@ fn spawn(
     builder.stdout(slave);
 
     // Setup shell environment.
+    environment.apply(&mut builder);
     let window_id = window_id.to_string();
     builder.env("VIVIDO_WINDOW_ID", &window_id);
     builder.env("USER", user.user);
@@ -299,6 +323,7 @@ fn spawn(
         .as_ref()
         .and_then(|path| CString::new(path.as_os_str().as_bytes()).ok());
 
+    // SAFETY: pre_exec uses only async-signal-safe libc calls and prebuilt data, without allocation or locks.
     unsafe {
         builder.pre_exec(move || {
             // Create a new process group.
@@ -341,6 +366,7 @@ fn spawn(
 
     match builder.spawn() {
         Ok(child) => {
+            // SAFETY: the child owns the slave and this Pty owns the live master descriptor passed to fcntl.
             unsafe {
                 // Maybe this should be done outside of this function so nonblocking
                 // isn't forced upon consumers. Although maybe it should be?
@@ -353,6 +379,7 @@ fn spawn(
                 signals,
                 sig_id,
                 shell_integration: injection.map(|injection| injection.shell),
+                _environment: environment,
             })
         },
         Err(err) => Err(Error::new(
@@ -390,6 +417,7 @@ fn reap_child(child: &mut Child, timeout: Duration) -> bool {
 impl Drop for Pty {
     fn drop(&mut self) {
         // Make sure the PTY is terminated properly.
+        // SAFETY: kill accepts the scalar child PID and SIGHUP; no Rust references cross the call.
         unsafe {
             libc::kill(self.child.id() as i32, libc::SIGHUP);
         }
@@ -421,10 +449,12 @@ impl EventedReadWrite for Pty {
         poll_opts: PollMode,
     ) -> Result<()> {
         interest.key = PTY_READ_WRITE_TOKEN;
+        // SAFETY: this Pty owns file until deregistration; its event-loop owner outlives the poll registration.
         unsafe {
             poll.add_with_mode(&self.file, interest, poll_opts)?;
         }
 
+        // SAFETY: this Pty owns signals until deregistration; its event-loop owner outlives the poll registration.
         unsafe {
             poll.add_with_mode(
                 &self.signals,
@@ -500,6 +530,7 @@ impl OnResize for Pty {
     fn on_resize(&mut self, window_size: WindowSize) {
         let win = window_size.to_winsize();
 
+        // SAFETY: win is a correctly aligned initialized winsize that remains live throughout ioctl.
         let res = unsafe { libc::ioctl(self.file.as_raw_fd(), libc::TIOCSWINSZ, &win as *const _) };
 
         if res < 0 {
@@ -516,16 +547,18 @@ pub trait ToWinsize {
 
 impl ToWinsize for WindowSize {
     fn to_winsize(self) -> Winsize {
-        let ws_row = self.num_lines as libc::c_ushort;
-        let ws_col = self.num_cols as libc::c_ushort;
+        let ws_row = self.num_lines;
+        let ws_col = self.num_cols;
 
-        let ws_xpixel = ws_col * self.cell_width as libc::c_ushort;
-        let ws_ypixel = ws_row * self.cell_height as libc::c_ushort;
+        // Pixel dimensions are advisory 16-bit fields; clamp instead of wrapping wide terminals.
+        let ws_xpixel = ws_col.saturating_mul(self.cell_width);
+        let ws_ypixel = ws_row.saturating_mul(self.cell_height);
         Winsize { ws_row, ws_col, ws_xpixel, ws_ypixel }
     }
 }
 
 unsafe fn set_nonblocking(fd: c_int) -> Result<()> {
+    // SAFETY: the caller keeps fd open for these scalar fcntl operations; no borrowed memory is passed.
     let res = unsafe { fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK) };
     if res == 0 { Ok(()) } else { Err(Error::last_os_error()) }
 }
@@ -624,8 +657,15 @@ fn login_command_passes_integration_flags_to_the_shell() {
     assert_eq!(exec, "exec -a -bash /opt/homebrew/bin/bash --posix");
 }
 
-/// Real shells started through [`spawn`] with the integration loaded, read back with the parser
+/// Real shells started through `spawn` with the integration loaded, read back with the parser
 /// the terminal uses. Each test skips when its shell is not installed.
+// Debug omits user content and native resources, and never acquires application locks.
+impl std::fmt::Debug for Pty {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Pty").finish_non_exhaustive()
+    }
+}
+
 #[cfg(test)]
 mod shell_integration_tests {
     use std::collections::HashMap;

@@ -11,6 +11,10 @@ use vivid_protocol::track::{TrackMode, VideoConfiguration};
 use crate::vivid::ffmpeg::{self, AVPacket, AVRational, ParameterValues};
 use crate::vivid::scene::RgbaBuffer;
 
+// Bound one decoded RGBA frame to 256 MiB (8192² × 4). This is a local resource ceiling,
+// applied to decoder output as well as configuration: codecs may report changed dimensions.
+const MAX_DECODED_DIMENSION: u32 = 8192;
+
 const AVMEDIA_TYPE_VIDEO: c_int = 0;
 const AV_INPUT_BUFFER_PADDING_SIZE: usize = 64;
 const AV_PKT_FLAG_KEY: c_int = 1;
@@ -43,6 +47,11 @@ pub struct Decoder {
 
 impl Decoder {
     pub fn new(config: &VideoConfiguration, mode: TrackMode) -> io::Result<Self> {
+        if !(1..=MAX_DECODED_DIMENSION).contains(&config.coded_width)
+            || !(1..=MAX_DECODED_DIMENSION).contains(&config.coded_height)
+        {
+            return Err(invalid("coded video dimensions exceed decoder limits"));
+        }
         // FFmpeg's native `av1` decoder can open when only a hardware path is available, then fail
         // on the first packet on systems without supported AV1 hardware. Require the bounded
         // software implementation for predictable decoding on every supported platform.
@@ -51,10 +60,12 @@ impl Decoder {
             CString::new(decoder_name).map_err(|_| invalid("video codec contains NUL"))?;
         // Verify the linked FFmpeg's structure layout before touching any of it.
         let abi = ffmpeg::abi()?;
+        // SAFETY: the CString is NUL-terminated and live through the call; the returned descriptor is library-owned.
         let codec = unsafe { avcodec_find_decoder_by_name(codec_name.as_ptr()) };
         if codec.is_null() {
             return Err(invalid_owned(format!("FFmpeg decoder {decoder_name:?} is unavailable")));
         }
+        // SAFETY: codec is a checked live library descriptor; this allocation is owned here and null is handled.
         let mut context = unsafe { avcodec_alloc_context3(codec) };
         if context.is_null() {
             return Err(io::Error::other("FFmpeg could not allocate a decoder context"));
@@ -63,24 +74,36 @@ impl Decoder {
         let mut parameters = match ffmpeg::allocate_parameters() {
             Ok(parameters) => parameters,
             Err(error) => {
+                // SAFETY: these are uniquely owned FFmpeg allocations; each matching free function accepts null and clears its pointer.
                 unsafe { avcodec_free_context(&mut context) };
                 return Err(error);
             },
         };
 
         let result = (|| {
+            let dimensions = (
+                c_int::try_from(config.coded_width)
+                    .map_err(|_| invalid("video width exceeds FFmpeg limits"))?,
+                c_int::try_from(config.coded_height)
+                    .map_err(|_| invalid("video height exceeds FFmpeg limits"))?,
+            );
+
             let extradata = if config.extradata.is_empty() {
                 None
             } else {
+                let length = c_int::try_from(config.extradata.len())
+                    .map_err(|_| invalid("codec extradata exceeds i32"))?;
                 let allocation = config
                     .extradata
                     .len()
                     .checked_add(AV_INPUT_BUFFER_PADDING_SIZE)
                     .ok_or_else(|| invalid("codec extradata size overflows"))?;
+                // SAFETY: the checked size includes FFmpeg padding; allocation failure is handled before writing.
                 let extradata = unsafe { av_mallocz(allocation) } as *mut u8;
                 if extradata.is_null() {
                     return Err(io::Error::other("FFmpeg could not allocate codec extradata"));
                 }
+                // SAFETY: the source slice and freshly allocated destination are disjoint and both contain the checked packet/extradata length.
                 unsafe {
                     ptr::copy_nonoverlapping(
                         config.extradata.as_ptr(),
@@ -88,16 +111,9 @@ impl Decoder {
                         config.extradata.len(),
                     );
                 }
-                let length = c_int::try_from(config.extradata.len())
-                    .map_err(|_| invalid("codec extradata exceeds i32"))?;
                 Some((extradata, length))
             };
-            let dimensions = (
-                c_int::try_from(config.coded_width)
-                    .map_err(|_| invalid("video width exceeds FFmpeg limits"))?,
-                c_int::try_from(config.coded_height)
-                    .map_err(|_| invalid("video height exceeds FFmpeg limits"))?,
-            );
+            // SAFETY: parameters is uniquely owned and the verified ABI matches; padded av_malloc extradata transfers to it.
             unsafe {
                 abi.set_parameters(
                     parameters,
@@ -113,45 +129,56 @@ impl Decoder {
                 );
             }
 
+            // SAFETY: context and parameters are live owned allocations; FFmpeg copies parameters without retaining this borrow.
             check_ffmpeg("could not configure decoder", unsafe {
                 avcodec_parameters_to_context(context, parameters)
             })?;
+            // SAFETY: the decoder context is live, option names are NUL-terminated, and output arguments are initialized writable locals.
             check_ffmpeg("could not set decoder packet time base", unsafe {
                 av_opt_set_q(context, c"pkt_timebase".as_ptr(), PACKET_TIME_BASE, 0)
             })?;
+            // SAFETY: the decoder context is live, option names are NUL-terminated, and output arguments are initialized writable locals.
             check_ffmpeg("could not configure automatic decoder threading", unsafe {
                 av_opt_set_int(context, c"threads".as_ptr(), 0, 0)
             })?;
             if decoder_name == "libdav1d" {
                 if mode == TrackMode::Live {
+                    // SAFETY: the decoder context is live, option names are NUL-terminated, and output arguments are initialized writable locals.
                     check_ffmpeg("could not bound live AV1 frame delay", unsafe {
                         av_opt_set_int(context, c"max_frame_delay".as_ptr(), 1, 1)
                     })?;
                 }
             } else {
                 let thread_type = if mode == TrackMode::Live { 2 } else { 2 | 1 };
+                // SAFETY: the decoder context is live, option names are NUL-terminated, and output arguments are initialized writable locals.
                 check_ffmpeg("could not configure decoder thread type", unsafe {
                     av_opt_set_int(context, c"thread_type".as_ptr(), thread_type, 0)
                 })?;
             }
+            // SAFETY: context is owned and configured, codec is library-owned, and null requests default options.
             check_ffmpeg("could not open decoder", unsafe {
                 avcodec_open2(context, codec, ptr::null_mut())
             })?;
             Ok(())
         })();
-        ffmpeg::free_parameters(&mut parameters);
+        // SAFETY: parameters is uniquely owned here and is no longer used after release.
+        unsafe { ffmpeg::free_parameters(&mut parameters) };
         if let Err(error) = result {
             let mut context = context;
+            // SAFETY: these are uniquely owned FFmpeg allocations; each matching free function accepts null and clears its pointer.
             unsafe { avcodec_free_context(&mut context) };
             return Err(error);
         }
 
+        // SAFETY: the native allocator returns an owned packet pointer; null is checked before use.
         let packet = unsafe { av_packet_alloc() };
+        // SAFETY: the native allocator returns an owned frame pointer; null is checked before use.
         let frame = unsafe { av_frame_alloc() };
         if packet.is_null() || frame.is_null() {
             let mut packet = packet;
             let mut frame = frame;
             let mut context = context;
+            // SAFETY: these are uniquely owned FFmpeg allocations; each matching free function accepts null and clears its pointer.
             unsafe {
                 av_packet_free(&mut packet);
                 av_frame_free(&mut frame);
@@ -160,11 +187,13 @@ impl Decoder {
             return Err(io::Error::other("FFmpeg could not allocate decode buffers"));
         }
         let rgba_name = c"rgba";
+        // SAFETY: rgba_name is a live NUL-terminated CString; the result is a scalar pixel-format identifier.
         let rgba_format = unsafe { av_get_pix_fmt(rgba_name.as_ptr()) };
         if rgba_format < 0 {
             let mut packet = packet;
             let mut frame = frame;
             let mut context = context;
+            // SAFETY: these are uniquely owned FFmpeg allocations; each matching free function accepts null and clears its pointer.
             unsafe {
                 av_packet_free(&mut packet);
                 av_frame_free(&mut frame);
@@ -206,10 +235,13 @@ impl Decoder {
         }
         let size = c_int::try_from(packet.data.len())
             .map_err(|_| invalid("encoded packet exceeds FFmpeg i32 size"))?;
+        // SAFETY: self owns the initialized packet; the requested length was checked to fit c_int.
         check_ffmpeg("could not allocate encoded packet", unsafe {
             av_new_packet(self.packet, size)
         })?;
+        // SAFETY: the ABI probe verified AVPacket layout; &mut self gives exclusive access to this live packet.
         let av_packet = unsafe { &mut *(self.packet as *mut AVPacket) };
+        // SAFETY: the source slice and freshly allocated destination are disjoint and both contain the checked packet/extradata length.
         unsafe {
             ptr::copy_nonoverlapping(packet.data.as_ptr(), av_packet.data, packet.data.len())
         };
@@ -223,13 +255,16 @@ impl Decoder {
         };
         av_packet.time_base = PACKET_TIME_BASE;
 
+        // SAFETY: context and any non-null packet are live; FFmpeg references packet data before the caller unreferences it.
         let send_result = unsafe { avcodec_send_packet(self.context, self.packet) };
+        // SAFETY: this initialized packet is uniquely owned; the decoder retains its own references to submitted data.
         unsafe { av_packet_unref(self.packet) };
         check_ffmpeg("decoder rejected encoded packet", send_result)?;
         self.receive_frames(false, discard_before_pts_us)
     }
 
     pub fn finish(&mut self) -> io::Result<Vec<DecodedFrame>> {
+        // SAFETY: context and any non-null packet are live; FFmpeg references packet data before the caller unreferences it.
         let result = unsafe { avcodec_send_packet(self.context, ptr::null()) };
         if result < 0 && result != AVERROR_EOF {
             return Err(ffmpeg_error("could not drain decoder", result));
@@ -245,17 +280,20 @@ impl Decoder {
         let mut output = Vec::new();
         let mut discarded = 0_u64;
         loop {
+            // SAFETY: context and frame are live uniquely owned allocations; a successful result initializes the frame.
             let result = unsafe { avcodec_receive_frame(self.context, self.frame) };
             if result == -libc::EAGAIN || result == AVERROR_EOF {
                 break;
             }
             check_ffmpeg("could not receive decoded frame", result)?;
+            // SAFETY: self owns a successfully decoded live AVFrame and the verified ABI selects its field offsets.
             let pts_us = unsafe { self.abi.frame_pts(self.frame) };
             if decoded_frame_is_late(pts_us, discard_before_pts_us) {
                 discarded = discarded.saturating_add(1);
             } else {
                 output.push(self.convert_frame()?);
             }
+            // SAFETY: self owns this initialized frame and no borrowed pixel/sample data is used after unref.
             unsafe { av_frame_unref(self.frame) };
         }
         if draining && output.is_empty() {
@@ -265,10 +303,14 @@ impl Decoder {
     }
 
     fn convert_frame(&mut self) -> io::Result<DecodedFrame> {
+        // SAFETY: self owns a successfully decoded live AVFrame and the verified ABI selects its field offsets.
         let pts_us = unsafe { self.abi.frame_pts(self.frame) };
+        // SAFETY: self owns a successfully decoded live AVFrame and the verified ABI selects its field offsets.
         let frame = unsafe { self.abi.frame(self.frame) };
         let (width, height) = match (u32::try_from(frame.width), u32::try_from(frame.height)) {
-            (Ok(width @ 1..=8192), Ok(height @ 1..=8192)) => (width, height),
+            (Ok(width @ 1..=MAX_DECODED_DIMENSION), Ok(height @ 1..=MAX_DECODED_DIMENSION)) => {
+                (width, height)
+            },
             _ => return Err(invalid("decoder produced invalid frame dimensions")),
         };
         if self.scale.is_null()
@@ -276,8 +318,10 @@ impl Decoder {
             || self.scale_size != (frame.width, frame.height)
         {
             if !self.scale.is_null() {
+                // SAFETY: scale is this decoder's uniquely owned converter and is not used after it is freed.
                 unsafe { sws_freeContext(self.scale) };
             }
+            // SAFETY: dimensions and pixel formats were validated; optional filter and parameter pointers are null.
             self.scale = unsafe {
                 sws_getContext(
                     frame.width,
@@ -295,10 +339,13 @@ impl Decoder {
             if self.scale.is_null() {
                 return Err(io::Error::other("FFmpeg could not create RGBA converter"));
             }
+            // SAFETY: the function returns a library-owned coefficient table used only while the linked library is live.
             let source_coefficients = unsafe { sws_getCoefficients(self.sws_colorspace) };
+            // SAFETY: the function returns a library-owned coefficient table used only while the linked library is live.
             let destination_coefficients = unsafe { sws_getCoefficients(1) };
             if source_coefficients.is_null()
                 || destination_coefficients.is_null()
+                // SAFETY: scale is live and both non-null coefficient tables are library-owned arrays of the required length.
                 || unsafe {
                     sws_setColorspaceDetails(
                         self.scale,
@@ -332,6 +379,7 @@ impl Decoder {
         let mut destination = [ptr::null_mut(); 4];
         destination[0] = rgba.as_mut_ptr();
         let destination_lines = [frame.width * 4, 0, 0, 0];
+        // SAFETY: the decoded frame owns its input planes; destination storage was checked for width × height × four bytes and remains live.
         let converted = unsafe {
             sws_scale(
                 self.scale,
@@ -357,6 +405,7 @@ impl Decoder {
     #[cfg(test)]
     fn packet_time_base(&self) -> io::Result<AVRational> {
         let mut time_base = AVRational { num: 0, den: 0 };
+        // SAFETY: the live decoder writes a rational into this initialized local through a valid pointer.
         check_ffmpeg("could not read decoder packet time base", unsafe {
             av_opt_get_q(self.context, c"pkt_timebase".as_ptr(), 0, &mut time_base)
         })?;
@@ -366,6 +415,7 @@ impl Decoder {
     #[cfg(test)]
     fn integer_option(&self, name: &CStr, flags: c_int) -> io::Result<i64> {
         let mut value = 0;
+        // SAFETY: name is NUL-terminated and the live decoder writes to this initialized integer local.
         check_ffmpeg("could not read decoder option", unsafe {
             av_opt_get_int(self.context, name.as_ptr(), flags, &mut value)
         })?;
@@ -379,6 +429,7 @@ fn decoded_frame_is_late(pts_us: i64, discard_before_pts_us: Option<i64>) -> boo
 
 impl Drop for Decoder {
     fn drop(&mut self) {
+        // SAFETY: these are uniquely owned FFmpeg allocations; each matching free function accepts null and clears its pointer.
         unsafe {
             if !self.scale.is_null() {
                 sws_freeContext(self.scale);
@@ -396,7 +447,9 @@ fn check_ffmpeg(context: &str, result: c_int) -> io::Result<()> {
 
 fn ffmpeg_error(context: &str, code: c_int) -> io::Error {
     let mut buffer: [c_char; 256] = [0; 256];
+    // SAFETY: buffer is writable for its declared length; successful av_strerror writes a NUL-terminated diagnostic.
     let description = if unsafe { av_strerror(code, buffer.as_mut_ptr(), buffer.len()) } == 0 {
+        // SAFETY: successful av_strerror wrote a terminated string into the still-live buffer.
         unsafe { CStr::from_ptr(buffer.as_ptr()) }.to_string_lossy().into_owned()
     } else {
         format!("FFmpeg error {code}")
@@ -502,6 +555,16 @@ unsafe extern "C" {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oversized_coded_dimensions_are_rejected_before_native_allocation() {
+        for dimensions in [(0, 1), (1, 0), (MAX_DECODED_DIMENSION + 1, 1), (1, u32::MAX)] {
+            let mut config = video_config("h264", Vec::new());
+            config.coded_width = dimensions.0;
+            config.coded_height = dimensions.1;
+            assert!(Decoder::new(&config, TrackMode::Live).is_err());
+        }
+    }
 
     fn video_config(codec: &str, extradata: Vec<u8>) -> VideoConfiguration {
         VideoConfiguration {

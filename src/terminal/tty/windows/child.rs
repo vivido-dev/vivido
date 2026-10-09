@@ -35,10 +35,12 @@ extern "system" fn child_exit_callback(ctx: *mut c_void, timed_out: bool) {
         return;
     }
 
+    // SAFETY: The one-shot registered callback receives the unique Box pointer transferred during wait registration.
     let event_tx: Box<_> = unsafe { Box::from_raw(ctx as *mut ChildExitSender) };
 
     let mut exit_code = 0_u32;
     let child_handle = event_tx.child_handle.load(Ordering::Relaxed) as HANDLE;
+    // SAFETY: The retained child process handle is live and exit_code is initialized writable storage.
     let status = unsafe { GetExitCodeProcess(child_handle, &mut exit_code) };
     let exit_status = if status == FALSE { None } else { Some(ExitStatus::from_raw(exit_code)) };
     event_tx.sender.send(ChildEvent::Exited(exit_status)).ok();
@@ -49,6 +51,7 @@ extern "system" fn child_exit_callback(ctx: *mut c_void, timed_out: bool) {
     }
 }
 
+/// One-shot child-process exit notification routed through a poller.
 pub struct ChildExitWatcher {
     wait_handle: AtomicPtr<c_void>,
     event_rx: mpsc::Receiver<ChildEvent>,
@@ -58,6 +61,11 @@ pub struct ChildExitWatcher {
 }
 
 impl ChildExitWatcher {
+    /// Watch a live child handle that remains open until this watcher is dropped.
+    ///
+    /// # Errors
+    ///
+    /// Returns the Windows error if the one-shot wait cannot be registered.
     pub fn new(child_handle: HANDLE) -> Result<ChildExitWatcher, Error> {
         let (event_tx, event_rx) = mpsc::channel();
 
@@ -69,6 +77,7 @@ impl ChildExitWatcher {
             child_handle: AtomicPtr::from(child_handle),
         });
 
+        // SAFETY: The child handle is live; the boxed callback context remains allocated for the one-shot wait.
         let success = unsafe {
             RegisterWaitForSingleObject(
                 &mut wait_handle,
@@ -83,6 +92,7 @@ impl ChildExitWatcher {
         if success == 0 {
             Err(Error::last_os_error())
         } else {
+            // SAFETY: The live child handle is queried for a scalar PID.
             let pid = unsafe { NonZeroU32::new(GetProcessId(child_handle)) };
             Ok(ChildExitWatcher {
                 event_rx,
@@ -94,14 +104,25 @@ impl ChildExitWatcher {
         }
     }
 
+    /// Borrow the channel of completed child-exit notifications.
     pub fn event_rx(&self) -> &mpsc::Receiver<ChildEvent> {
         &self.event_rx
     }
 
+    /// Route future child-exit readiness to the supplied poller and token.
+    ///
+    /// # Panics
+    ///
+    /// Panics if an earlier panic poisoned registration state.
     pub fn register(&self, poller: &Arc<Poller>, event: Event) {
         *self.interest.lock().unwrap() = Some(Interest { poller: poller.clone(), event });
     }
 
+    /// Remove the poller’s child-exit notification interest.
+    ///
+    /// # Panics
+    ///
+    /// Panics if an earlier panic poisoned registration state.
     pub fn deregister(&self) {
         *self.interest.lock().unwrap() = None;
     }
@@ -126,12 +147,18 @@ impl ChildExitWatcher {
 
 impl Drop for ChildExitWatcher {
     fn drop(&mut self) {
+        // SAFETY: The handle was returned by successful wait registration and is unregistered only by its owner.
         unsafe {
             UnregisterWait(self.wait_handle.load(Ordering::Relaxed) as HANDLE);
         }
     }
 }
 
+impl std::fmt::Debug for ChildExitWatcher {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("ChildExitWatcher").finish_non_exhaustive()
+    }
+}
 #[cfg(test)]
 mod tests {
     use std::os::windows::io::AsRawHandle;

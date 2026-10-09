@@ -4,21 +4,19 @@
 //! Keeping dispatch here avoids embedding window policy in the terminal loop.
 
 use crate::display::{text::TextSystem, vector::CompiledScene};
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::VecDeque;
 use std::sync::Weak;
 use vello::peniko::{Blob, ImageAlphaType, ImageData, ImageFormat};
-use winit::window::CursorIcon;
 
 use vivid_protocol::overlay::wire::{
-    Action, Appearance, Clipboard, Environment, EnvironmentChanged, Query, SetSemantics, SetWindow,
-    Status, Viewport, WindowAddress,
+    Action, Clipboard, Environment, EnvironmentChanged, Query, SetSemantics, SetWindow, Status,
+    Viewport, WindowAddress,
 };
 use vivid_protocol::overlay::wire::{
     PresentationOutcome, Submission, SubmissionOutcome, ViewportChanged,
 };
 use vivid_protocol::overlay::{
-    AccessibleAction, DismissReason, Event, MAX_CLICKS, PointerReport, Scroll, ScrollPhase,
-    Semantics, Windows,
+    DismissReason, Event, MAX_CLICKS, PointerReport, Scroll, ScrollPhase, Semantics, Windows,
 };
 use vivid_protocol::vector::Scalar;
 
@@ -520,7 +518,10 @@ impl Host {
     /// Only the AccessKit adapters can deliver an action, so nothing calls this on macOS, where
     /// the AppKit adapter builds its own tree. It is kept compiled and type-checked there rather
     /// than configured away.
-    #[cfg_attr(not(any(target_os = "linux", target_os = "windows")), allow(dead_code))]
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "windows")),
+        allow(dead_code, reason = "transport helpers are used only on Linux and Windows")
+    )]
     pub(super) fn queue_accessibility(
         &mut self,
         window: SurfaceIdentity,

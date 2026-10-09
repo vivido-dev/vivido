@@ -1,5 +1,3 @@
-#![allow(clippy::enum_glob_use)]
-
 use std::fmt::{self, Debug, Display};
 
 use bitflags::bitflags;
@@ -47,6 +45,7 @@ pub type MouseBinding = Binding<MouseEvent>;
 
 impl<T: Eq> Binding<T> {
     #[inline]
+    /// Whether this input, modifier set, and mode activate the binding.
     pub fn is_triggered_by(&self, mode: BindingMode, mods: ModifiersState, input: &T) -> bool {
         // Check input first since bindings are stored in one big list. This is
         // the most likely item to fail so prioritizing it here allows more
@@ -58,6 +57,7 @@ impl<T: Eq> Binding<T> {
     }
 
     #[inline]
+    /// Whether two bindings overlap in trigger, modifier, and mode requirements.
     pub fn triggers_match(&self, binding: &Binding<T>) -> bool {
         // Check the binding's key and modifiers.
         if self.trigger != binding.trigger || self.mods != binding.mods {
@@ -82,6 +82,7 @@ impl<T: Eq> Binding<T> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// An action invoked by a configured keyboard or mouse binding.
 pub enum Action {
     /// Enable or mute the selected remote microphone.
     ToggleMicrophone,
@@ -261,7 +262,6 @@ impl Display for Action {
 }
 
 /// Search mode specific actions.
-#[allow(clippy::enum_variant_names)]
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum SearchAction {
     /// Move the focus to the next search match.
@@ -285,8 +285,11 @@ pub enum SearchAction {
 /// Mouse binding specific events.
 #[derive(Debug, Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
 pub enum MouseEvent {
+    /// A physical mouse button.
     Button(MouseButton),
+    /// An upward mouse-wheel step.
     WheelUp,
+    /// A downward mouse-wheel step.
     WheelDown,
 }
 
@@ -337,7 +340,10 @@ macro_rules! trigger {
 
 pub fn default_mouse_bindings() -> Vec<MouseBinding> {
     // Extended only by the Windows-specific bindings below.
-    #[cfg_attr(not(target_os = "windows"), allow(unused_mut))]
+    #[cfg_attr(
+        not(target_os = "windows"),
+        allow(unused_mut, reason = "Windows adds platform-specific default bindings")
+    )]
     let mut bindings = bindings!(
         MouseBinding;
         MouseButton::Middle; Action::PasteSelection;
@@ -518,9 +524,17 @@ pub fn platform_key_bindings() -> Vec<KeyBinding> {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// A logical or physical key matched by an input binding.
 pub enum BindingKey {
+    /// A physical key position.
     Scancode(PhysicalKey),
-    Keycode { key: Key, location: KeyLocation },
+    /// A logical key with its keyboard location.
+    Keycode {
+        /// Key matched by this binding.
+        key: Key,
+        /// Physical location of the logical key.
+        location: KeyLocation,
+    },
 }
 
 /// Key location for matching bindings.
@@ -650,16 +664,23 @@ bitflags! {
     /// Modes available for key bindings.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
     pub struct BindingMode: u8 {
+        /// Use application cursor-key sequences.
         const APP_CURSOR             = 0b0000_0001;
+        /// Use application keypad sequences.
         const APP_KEYPAD             = 0b0000_0010;
+        /// Select the alternate terminal screen.
         const ALT_SCREEN             = 0b0000_0100;
+        /// Enable interactive search bindings.
         const SEARCH                 = 0b0001_0000;
+        /// Disambiguate escape-key sequences using the keyboard protocol.
         const DISAMBIGUATE_ESC_CODES = 0b0010_0000;
+        /// Encode every key through the extended keyboard protocol.
         const REPORT_ALL_KEYS_AS_ESC = 0b0100_0000;
     }
 }
 
 impl BindingMode {
+    /// Derive binding modes from terminal flags and interactive search state.
     pub fn new(mode: &TermMode, search: bool) -> BindingMode {
         let mut binding_mode = BindingMode::empty();
         binding_mode.set(BindingMode::APP_CURSOR, mode.contains(TermMode::APP_CURSOR));
@@ -1162,8 +1183,6 @@ impl_serde_replace!(ModsWrapper);
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    use winit::keyboard::ModifiersState;
 
     type MockBinding = Binding<usize>;
 

@@ -380,6 +380,7 @@ struct WindowExitRecord {
 /// Stores some state from received events and dispatches actions when they are
 /// triggered.
 pub struct Processor {
+    /// Optional live configuration watcher owned by this processor.
     pub config_monitor: Option<ConfigMonitor>,
 
     clipboard: Clipboard,
@@ -395,6 +396,8 @@ pub struct Processor {
     /// Automation methods the embedding host answers instead of Vivido.
     #[cfg(any(unix, windows))]
     host_methods: BTreeSet<String>,
+    #[cfg(any(unix, windows))]
+    host_method_capabilities: Vec<MethodCapability>,
     /// Claimed requests waiting for the host to drain them.
     #[cfg(any(unix, windows))]
     host_requests: Vec<IpcRequest>,
@@ -436,6 +439,7 @@ pub struct Processor {
     #[cfg(target_os = "macos")]
     dock_progress: Option<crate::display::progress::Progress>,
     update_cancel: Arc<AtomicBool>,
+    update_service: update::UpdateService,
     update_manifest: Option<UpdateManifest>,
     update_ready: Option<ReadyInstaller>,
     update_check_in_flight: bool,
@@ -445,8 +449,24 @@ pub struct Processor {
     next_headless_draw: Instant,
 }
 
+/// Apply instance discovery only to children, including those created after config reload.
+fn supply_child_discovery(config: &mut UiConfig, options: &CliOptions) {
+    #[cfg(any(unix, windows))]
+    if config.ipc_socket() {
+        let endpoint = options.socket.clone().unwrap_or_else(crate::polling::ipc::default_endpoint);
+        config
+            .env
+            .entry("VIVIDO_SOCKET".into())
+            .or_insert_with(|| endpoint.to_string_lossy().into_owned());
+    }
+}
+
 impl Processor {
     /// Create a new event processor.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the native event loop cannot supply its display handle.
     pub fn new(
         config: UiConfig,
         cli_options: CliOptions,
@@ -481,11 +501,12 @@ impl Processor {
     }
 
     fn with_sink(
-        config: UiConfig,
+        mut config: UiConfig,
         cli_options: CliOptions,
         proxy: EventSink,
         clipboard: Clipboard,
     ) -> Processor {
+        supply_child_discovery(&mut config, &cli_options);
         let scheduler = Scheduler::new(proxy.clone());
         let initial_window_options = Some(cli_options.window_options.clone());
 
@@ -508,6 +529,7 @@ impl Processor {
             #[cfg(target_os = "macos")]
             dock_progress: None,
             update_cancel: Arc::new(AtomicBool::new(false)),
+            update_service: update::UpdateService::new(),
             update_manifest: None,
             update_ready: None,
             update_check_in_flight: false,
@@ -521,6 +543,8 @@ impl Processor {
             automation: Default::default(),
             #[cfg(any(unix, windows))]
             host_methods: BTreeSet::new(),
+            #[cfg(any(unix, windows))]
+            host_method_capabilities: Vec::new(),
             #[cfg(any(unix, windows))]
             host_requests: Vec::new(),
             #[cfg(any(unix, windows))]
@@ -545,6 +569,10 @@ impl Processor {
     }
 
     /// Create the initial window and its Vello/wgpu surface.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if native window, renderer, PTY, or protocol-service initialization fails.
     pub fn create_initial_window(
         &mut self,
         event_loop: LoopHandle<'_>,
@@ -583,6 +611,10 @@ impl Processor {
     }
 
     /// Create a new terminal window.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the native window, renderer, PTY, or protocol service cannot be initialized.
     pub fn create_window(
         &mut self,
         event_loop: LoopHandle<'_>,
@@ -654,6 +686,10 @@ impl Processor {
 
     /// Reset parser and client-controlled state for a stable IPC window ID.
     #[cfg(any(unix, windows))]
+    ///
+    /// # Errors
+    ///
+    /// Returns an IPC error when the window is unknown, quarantined, or its PTY worker has exited.
     pub fn reset_terminal(&mut self, ipc_window_id: u64) -> Result<u64, IpcError> {
         let platform_id = self
             .windows
@@ -670,6 +706,10 @@ impl Processor {
 
     /// Replace a pane's PTY and Vivid service while keeping its window and IPC identity.
     #[cfg(any(unix, windows))]
+    ///
+    /// # Errors
+    ///
+    /// Returns an IPC error for an unknown window or a replacement PTY or service startup failure.
     pub fn restart_terminal(&mut self, ipc_window_id: u64) -> Result<(), IpcError> {
         let window = self
             .windows
@@ -688,6 +728,10 @@ impl Processor {
     /// hangup cannot outlive its window; a kill that fails — the child is already gone — never
     /// blocks the close.
     #[cfg(any(unix, windows))]
+    ///
+    /// # Errors
+    ///
+    /// Returns an IPC error when the window is unknown or graceful closure requires confirmation.
     pub fn close_window(&mut self, target: WindowId, force: bool) -> Result<(), IpcError> {
         let window = self
             .windows
@@ -713,6 +757,10 @@ impl Processor {
     /// Run the event loop.
     ///
     /// The result is exit code generate from the loop.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if event-loop initialization or execution fails.
     pub fn run(&mut self, event_loop: EventLoop<Event>) -> Result<(), Box<dyn Error>> {
         let result = event_loop.run_app(self);
         match self.initial_window_error.take() {
@@ -731,6 +779,10 @@ impl Processor {
     ///
     /// Split out of [`Processor::run_headless`] so a caller can publish a session's real geometry
     /// before it starts serving.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when headless graphics, pane, PTY, or protocol-service initialization fails.
     pub fn start_headless(
         &mut self,
         headless: &HeadlessLoop,
@@ -753,6 +805,11 @@ impl Processor {
         ))
     }
 
+    /// Pump headless events until shutdown, then finish processor cleanup.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if headless loop execution or initialization fails.
     pub fn run_headless(
         &mut self,
         events: &mpsc::Receiver<Event>,
@@ -1055,6 +1112,17 @@ impl Processor {
 
     #[cfg(any(unix, windows))]
     fn handle_ipc_request(&mut self, event_loop: LoopHandle<'_>, request: IpcRequest) {
+        if request.method == "hello" {
+            request.connection.reply(
+                request.id,
+                crate::polling::ipc::hello_result(
+                    &self.cli_options,
+                    &self.host_methods,
+                    &self.host_method_capabilities,
+                ),
+            );
+            return;
+        }
         // A claimed method belongs to the embedding host, which answers it from its own state.
         // Queue it verbatim rather than dispatching: the host owns the reply.
         if self.host_methods.contains(&request.method) {
@@ -1067,7 +1135,7 @@ impl Processor {
             IpcInputRoute, IpcKey, IpcMouse, IpcPaste, IpcResize, IpcScreenshot, IpcSetGeometry,
             IpcSetGeometryBatch, IpcSetLevel, IpcSetVisible, IpcSignal, IpcSubscribe, IpcTarget,
             IpcTranscript, IpcTyping, IpcWaitCommon, IpcWaitFrame, IpcWaitOutput, IpcWaitSequence,
-            IpcWaitStable, IpcWaitText, WindowOptions,
+            IpcWaitStable, IpcWaitText,
         };
 
         let result = match request.method.as_str() {
@@ -3564,6 +3632,12 @@ impl Processor {
         info!("Initialisation complete");
     }
 
+    /// Replace update I/O for deterministic host tests before starting an update check.
+    #[cfg(feature = "test-util")]
+    pub fn set_update_service(&mut self, service: update::UpdateService) {
+        self.update_service = service;
+    }
+
     /// Start the configured quiet update check for a graphical embedding host.
     pub fn start_quiet_update_check(&mut self) {
         if self.config.updates.enabled && self.config.updates.startup_check {
@@ -3581,14 +3655,15 @@ impl Processor {
 
         self.update_check_in_flight = true;
         self.update_check_manual = manual;
-        if let Some(delay) = delay {
+        if let Some(delay) = delay.filter(|_| !self.update_service.uses_virtual_io()) {
+            let service = self.update_service.clone();
             let sink = self.proxy.clone();
             let cancel = Arc::clone(&self.update_cancel);
             let spawn =
                 thread::Builder::new().name("vivido-update-delay".into()).spawn(move || {
                     thread::sleep(delay);
                     if !cancel.load(Ordering::Relaxed) {
-                        update::spawn_check(sink, manual);
+                        service.check(sink, manual);
                     }
                 });
             if let Err(error) = spawn {
@@ -3602,7 +3677,7 @@ impl Processor {
                 }
             }
         } else {
-            update::spawn_check(self.proxy.clone(), manual);
+            self.update_service.check(self.proxy.clone(), manual);
         }
     }
 
@@ -3703,7 +3778,7 @@ impl Processor {
             DownloadChoice::Download => {
                 self.update_cancel.store(false, Ordering::Relaxed);
                 self.update_download_in_flight = true;
-                update::spawn_download(
+                self.update_service.download(
                     self.proxy.clone(),
                     manifest,
                     Arc::clone(&self.update_cancel),
@@ -3809,16 +3884,14 @@ impl Processor {
     #[cfg(any(unix, windows))]
     pub fn claim_ipc_methods(&mut self, methods: &[&str]) {
         self.host_methods = methods.iter().map(|method| (*method).to_owned()).collect();
-        crate::polling::ipc::publish_host_methods(&self.host_methods);
-        crate::polling::ipc::publish_host_method_capabilities(&[]);
+        self.host_method_capabilities.clear();
     }
 
     /// Claim host automation methods and advertise their effect classifications.
     #[cfg(any(unix, windows))]
     pub fn claim_ipc_method_capabilities(&mut self, capabilities: &[MethodCapability]) {
         self.host_methods = capabilities.iter().map(|capability| capability.name.clone()).collect();
-        crate::polling::ipc::publish_host_methods(&self.host_methods);
-        crate::polling::ipc::publish_host_method_capabilities(capabilities);
+        self.host_method_capabilities = capabilities.to_vec();
     }
 
     /// Take the claimed automation requests received so far, oldest first.
@@ -3852,6 +3925,10 @@ impl Processor {
     }
 
     /// Create a terminal whose GPU frame is retained for composition by an in-process host.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the embedded target, renderer, PTY, or protocol service cannot start.
     pub fn create_embedded_window(
         &mut self,
         size: PhysicalSize<u32>,
@@ -3878,6 +3955,10 @@ impl Processor {
     /// Hosts arrange panes by platform window, so returning the public ID here would hand every
     /// caller a value it has to convert — which is where casting it crept in.
     #[cfg(any(unix, windows))]
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if pane, renderer, PTY, or protocol-service initialization fails.
     pub fn create_embedded_pane(
         &mut self,
         size: PhysicalSize<u32>,
@@ -3891,6 +3972,10 @@ impl Processor {
 
     /// Create a window through the event loop and return the platform window it became.
     #[cfg(any(unix, windows))]
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the hosted target, pane, renderer, PTY, or protocol service cannot start.
     pub fn create_hosted_pane(
         &mut self,
         handle: LoopHandle<'_>,
@@ -3928,6 +4013,10 @@ impl Processor {
     /// compositor, so this runs the same automation-geometry handshake the `set_geometry`
     /// IPC path uses and delivers the reflow event directly.
     #[cfg(any(unix, windows))]
+    ///
+    /// # Errors
+    ///
+    /// Returns an IPC error for an unknown window, invalid dimensions, or unsupported render size.
     pub fn resize_headless_window(
         &mut self,
         handle: LoopHandle<'_>,
@@ -4014,7 +4103,10 @@ impl Processor {
     /// Ring the bell exactly as a `\x07` would: automation hears it, and the window flashes,
     /// hints urgency, and runs `bell.command`.
     #[cfg(any(unix, windows))]
-    #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
+    #[cfg_attr(
+        not(target_os = "macos"),
+        allow(unused_variables, reason = "the binding is used only by macOS application events")
+    )]
     fn ring_bell(&mut self, event_loop: LoopHandle<'_>, window_id: WindowId) {
         self.automation.emit(
             self.windows.get(&window_id).map(WindowContext::ipc_window_id),
@@ -4108,12 +4200,14 @@ impl Processor {
         !pending.is_empty()
     }
 
+    /// Whether an embedded pane needs another rendered frame.
     pub fn has_pending_embedded_redraw(&self) -> bool {
         self.windows.values().any(|window| {
             window.display.window.is_embedded() && window.display.window.requested_redraw
         })
     }
 
+    /// Borrow the current embedded frame, when available.
     pub fn embedded_frame(
         &self,
         window_id: WindowId,
@@ -4121,6 +4215,7 @@ impl Processor {
         self.windows.get(&window_id)?.display.embedded_frame()
     }
 
+    /// Return the cursor and input-method state requested by an embedded pane.
     pub fn embedded_input_state(
         &self,
         window_id: WindowId,
@@ -4164,7 +4259,10 @@ impl ApplicationHandler<Event> for Processor {
 
 impl Processor {
     // `event_loop` reaches the action layer only on macOS, whose application-level actions need it.
-    #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
+    #[cfg_attr(
+        not(target_os = "macos"),
+        allow(unused_variables, reason = "the binding is used only by macOS application events")
+    )]
     fn on_window_event(
         &mut self,
         event_loop: LoopHandle<'_>,
@@ -4172,7 +4270,16 @@ impl Processor {
         event: WindowEvent,
     ) {
         if self.config.debug.print_events {
-            info!(target: LOG_TARGET_WINIT, "{event:?}");
+            let class = match &event {
+                WindowEvent::KeyboardInput { .. } => "keyboard",
+                WindowEvent::Ime(_) => "ime",
+                WindowEvent::DroppedFile(_) | WindowEvent::HoveredFile(_) => "file",
+                WindowEvent::Resized(_) => "resize",
+                WindowEvent::RedrawRequested => "redraw",
+                _ => "other",
+            };
+            info!(target: LOG_TARGET_WINIT, event = "window_event", class;
+                "Native window event received");
         }
 
         // Ignore all events we do not care about.
@@ -4299,7 +4406,14 @@ impl Processor {
 
     fn on_user_event(&mut self, event_loop: LoopHandle<'_>, event: Event) {
         if self.config.debug.print_events {
-            info!(target: LOG_TARGET_WINIT, "{event:?}");
+            let class = match &event.payload {
+                EventType::Terminal(_) => "terminal",
+                #[cfg(any(unix, windows))]
+                EventType::IpcRequest(_) => "ipc",
+                _ => "host",
+            };
+            info!(target: LOG_TARGET_WINIT, event = "host_event", class;
+                "Host event received");
         }
 
         // Handle events which don't mandate the WindowId.
@@ -4345,7 +4459,8 @@ impl Processor {
                 }
 
                 // Load config and update each terminal.
-                if let Ok(config) = config::reload(&path, &mut self.cli_options) {
+                if let Ok(mut config) = config::reload(&path, &mut self.cli_options) {
+                    supply_child_discovery(&mut config, &self.cli_options);
                     self.config = Rc::new(config);
 
                     // Restart config monitor if imports changed.
@@ -4777,7 +4892,7 @@ impl Processor {
                         );
                         window.message_buffer.push(Message::new(
                             format!(
-                                "Terminal client quarantined (fault {}). Use `vivido msg reset-terminal --window-id {ipc_window_id}` to recover.",
+                                "Terminal client quarantined (fault {}). Use `vivido msg restart-terminal --window-id {ipc_window_id}` to recover.",
                                 fault.id
                             ),
                             MessageType::Error,
@@ -5090,6 +5205,7 @@ impl Event {
         &self.payload
     }
 
+    /// Create an event optionally addressed to one native window.
     pub fn new<I: Into<Option<WindowId>>>(payload: EventType, window_id: I) -> Self {
         Self { window_id: window_id.into(), payload }
     }
@@ -5114,10 +5230,12 @@ pub struct HeadlessLoop {
 }
 
 impl HeadlessLoop {
+    /// Create headless loop state with physical dimensions and display scale.
     pub fn new(size: PhysicalSize<u32>, scale_factor: f64) -> Self {
         Self { exiting: Cell::new(false), size, scale_factor }
     }
 
+    /// Whether this loop has been asked to exit.
     pub fn exiting(&self) -> bool {
         self.exiting.get()
     }
@@ -5129,9 +5247,17 @@ impl HeadlessLoop {
 /// exiting, and setting the wake deadline — so headless mode supplies its own for each.
 #[derive(Clone, Copy)]
 pub enum LoopHandle<'a> {
+    /// Use the native winit event loop.
     Winit(&'a ActiveEventLoop),
+    /// Use an in-process event channel without a native loop.
     Headless(&'a HeadlessLoop),
-    Embedded { size: PhysicalSize<u32>, scale_factor: f64 },
+    /// Render inside a host-owned pane.
+    Embedded {
+        /// Physical-pixel dimensions.
+        size: PhysicalSize<u32>,
+        /// Physical pixels per logical pixel.
+        scale_factor: f64,
+    },
 }
 
 impl<'a> LoopHandle<'a> {
@@ -5158,7 +5284,10 @@ impl<'a> LoopHandle<'a> {
     ///
     /// Only macOS reaches for this, to run application-level actions that have no headless
     /// equivalent; every other platform drives windows entirely through this handle.
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    #[cfg_attr(
+        not(target_os = "macos"),
+        allow(dead_code, reason = "the native event-loop accessor is used only on macOS")
+    )]
     pub fn winit(&self) -> Option<&'a ActiveEventLoop> {
         match self {
             Self::Winit(event_loop) => Some(event_loop),
@@ -5167,6 +5296,10 @@ impl<'a> LoopHandle<'a> {
     }
 
     /// Build the window this loop can present.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the native window, renderer, PTY, or protocol service cannot be initialized.
     pub fn create_window(
         &self,
         config: &UiConfig,
@@ -5198,7 +5331,9 @@ impl<'a> LoopHandle<'a> {
 /// Vivid service's `Fn() + Send + Sync` wake closure, while `mpsc::Sender` is `!Sync`.
 #[derive(Debug, Clone)]
 pub enum EventSink {
+    /// Use the native winit event loop.
     Winit(EventLoopProxy<Event>),
+    /// Use an in-process event channel without a native loop.
     Headless(Arc<Mutex<mpsc::Sender<Event>>>),
 }
 
@@ -5209,6 +5344,11 @@ impl EventSink {
         (Self::Headless(Arc::new(Mutex::new(sender))), receiver)
     }
 
+    /// Forward an event to the owning host loop.
+    ///
+    /// # Errors
+    ///
+    /// Returns `EventSinkClosed` after the receiving host loop has closed.
     pub fn send_event(&self, event: Event) -> Result<(), EventSinkClosed> {
         match self {
             Self::Winit(proxy) => proxy.send_event(event).map_err(|_| EventSinkClosed),
@@ -5220,44 +5360,68 @@ impl EventSink {
 /// Vivido events.
 #[derive(Debug, Clone)]
 pub enum EventType {
+    /// An event from a terminal worker.
     Terminal(TerminalEvent),
+    /// An update-service event.
     Update(crate::update::UpdateEvent),
+    /// Vivid media requires a new frame.
     VividFrame,
+    /// Reload the primary configuration file.
     ConfigReload(PathBuf),
+    /// Present a terminal UI message.
     Message(Message),
+    /// Change the visible scrollback offset.
     Scroll(Scroll),
+    /// Create a terminal window with the supplied options.
     CreateWindow(WindowOptions),
     #[cfg(target_os = "macos")]
+    /// A macOS menu command.
     MacOsMenu(MenuCommand),
     #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    /// An action for the embedding application shell.
     ShellAction(crate::shell::ShellAction),
     #[cfg(any(unix, windows))]
+    /// An automation request to dispatch or forward to the host.
     IpcRequest(IpcRequest),
     #[cfg(any(unix, windows))]
+    /// A local automation connection opened.
     IpcConnect(u64),
     #[cfg(any(unix, windows))]
+    /// A local automation connection closed.
     IpcDisconnect(u64),
     #[cfg(any(unix, windows))]
+    /// Poll outstanding GPU screenshot readback.
     ScreenshotReadback,
     #[cfg(any(unix, windows))]
+    /// A screenshot capture completed.
     ScreenshotComplete,
     #[cfg(any(unix, windows))]
+    /// Evaluate pending automation waits.
     AutomationTick,
+    /// Toggle the terminal cursor blink phase.
     BlinkCursor,
+    /// Stop blinking after the configured inactivity timeout.
     BlinkCursorTimeout,
+    /// Advance to the next terminal search match.
     SearchNext,
+    /// A desktop notification was activated.
     NotificationActivated,
     #[cfg(any(unix, windows))]
+    /// Stop this host or worker loop.
     Shutdown,
+    /// Render a regularly paced frame.
     Frame,
     #[cfg(any(target_os = "macos", windows))]
+    /// Render a frame for latency-sensitive media.
     LatencySensitiveFrame,
     /// Drain the bounded, ordered terminal-position updates accumulated by a Windows PTY.
     #[cfg(windows)]
     TerminalVividBatch,
+    /// Attempt graphics-device recovery.
     RendererRecovery,
     /// A window has been hidden long enough to give its GPU memory back.
     HiddenRelease,
+    /// A Vivid resize generation has finished settling.
     VividResizeSettled(u64),
     /// Dismiss the warning that was visible when this timer was scheduled.
     MessageTimeout(Message),
@@ -5355,30 +5519,52 @@ impl Default for SearchState {
     }
 }
 
+/// Borrowed terminal and UI resources for processing one input action.
 pub struct ActionContext<'a, N, T> {
+    /// PTY input notification sink.
     pub notifier: &'a mut N,
+    /// Mutable terminal parser and grid state.
     pub terminal: &'a mut Term<T>,
+    /// Host clipboard services.
     pub clipboard: &'a mut Clipboard,
+    /// Mouse interaction state.
     pub mouse: &'a mut Mouse,
+    /// Current touch gesture.
     pub touch: &'a mut TouchPurpose,
+    /// Keyboard modifier state.
     pub modifiers: &'a mut Modifiers,
+    /// Terminal rendering resources.
     pub display: &'a mut Display,
+    /// Messages currently presented by the terminal UI.
     pub message_buffer: &'a mut MessageBuffer,
+    /// Configuration used for this action.
     pub config: &'a UiConfig,
+    /// Whether the cursor blink timeout has elapsed.
     pub cursor_blink_timed_out: &'a mut bool,
+    /// Instant when the bell command last ran.
     pub prev_bell_cmd: &'a mut Option<Instant>,
     #[cfg(target_os = "macos")]
+    /// Native event loop available for platform operations.
     pub event_loop: Option<&'a ActiveEventLoop>,
+    /// Sink for host events.
     pub event_proxy: &'a EventSink,
+    /// Timers scheduled by the terminal UI.
     pub scheduler: &'a mut Scheduler,
+    /// Interactive terminal search state.
     pub search_state: &'a mut SearchState,
+    /// Whether this state requires a display update.
     pub dirty: &'a mut bool,
+    /// Whether the terminal is hidden by another window.
     pub occluded: &'a mut bool,
+    /// Keep the host-assigned title instead of client title updates.
     pub preserve_title: bool,
+    /// Vivid presenter service for this pane.
     pub vivid_service: &'a VividService,
     #[cfg(not(windows))]
+    /// Owned PTY master descriptor borrowed for native queries.
     pub master_fd: RawFd,
     #[cfg(not(windows))]
+    /// Process identifier of the terminal shell.
     pub shell_pid: u32,
 }
 
@@ -5693,8 +5879,8 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
         let result = spawn_daemon(program, args);
 
         match result {
-            Ok(_) => debug!("Launched {program} with args {args:?}"),
-            Err(err) => warn!("Unable to launch {program} with args {args:?}: {err}"),
+            Ok(_) => debug!(event = "process_spawned"; "Launched configured process"),
+            Err(_) => warn!(event = "process_spawn_failed"; "Unable to launch configured process"),
         }
     }
 
@@ -6290,12 +6476,19 @@ impl<'a, N: Notify + 'a, T: EventListener> ActionContext<'a, N, T> {
 #[derive(Default, Debug)]
 pub enum TouchPurpose {
     #[default]
+    /// No active value or behavior for this variant.
     None,
+    /// A touch selection gesture.
     Select(TouchEvent),
+    /// Change the visible scrollback offset.
     Scroll(TouchEvent),
+    /// An active two-contact zoom gesture.
     Zoom(TouchZoom),
+    /// One contact awaiting a second zoom contact.
     ZoomPendingSlot(TouchEvent),
+    /// A possible touch tap.
     Tap(TouchEvent),
+    /// Contacts that cannot form a supported gesture.
     Invalid(HashSet<u64, RandomState>),
 }
 
@@ -6307,6 +6500,7 @@ pub struct TouchZoom {
 }
 
 impl TouchZoom {
+    /// Initialize a two-contact zoom gesture.
     pub fn new(slots: (TouchEvent, TouchEvent)) -> Self {
         Self { slots, fractions: Default::default() }
     }
@@ -6346,19 +6540,33 @@ impl TouchZoom {
 /// State of the mouse.
 #[derive(Debug)]
 pub struct Mouse {
+    /// Current left mouse-button state.
     pub left_button_state: ElementState,
+    /// Current middle mouse-button state.
     pub middle_button_state: ElementState,
+    /// Current right mouse-button state.
     pub right_button_state: ElementState,
+    /// Instant of the previous mouse click.
     pub last_click_timestamp: Instant,
+    /// Button used for the previous click.
     pub last_click_button: MouseButton,
+    /// Grid position of the previous click.
     pub last_click_point: Option<Point>,
+    /// Current click-count classification.
     pub click_state: ClickState,
+    /// Fractional scroll input awaiting a whole step.
     pub accumulated_scroll: AccumulatedScroll,
+    /// Side of the grid cell under the pointer.
     pub cell_side: Side,
+    /// Suppress hint activation during an active selection gesture.
     pub block_hint_launcher: bool,
+    /// Whether pointer movement requires hint highlighting to be recomputed.
     pub hint_highlight_dirty: bool,
+    /// Whether the pointer lies inside terminal text bounds.
     pub inside_text_area: bool,
+    /// Horizontal coordinate.
     pub x: usize,
+    /// Vertical coordinate.
     pub y: usize,
 }
 
@@ -6384,10 +6592,15 @@ impl Default for Mouse {
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
+/// Mouse click count used for selection gestures.
 pub enum ClickState {
+    /// No active value or behavior for this variant.
     None,
+    /// A single mouse click.
     Click,
+    /// Two consecutive mouse clicks.
     DoubleClick,
+    /// Three consecutive mouse clicks.
     TripleClick,
 }
 
@@ -6873,6 +7086,7 @@ fn is_renderable_resize(size: PhysicalSize<u32>, minimized: bool) -> bool {
 }
 
 #[derive(Debug, Clone)]
+/// Window-scoped terminal events forwarded to the host event sink.
 pub struct EventProxy {
     proxy: EventSink,
     pty_writer: Arc<Mutex<Option<Notifier>>>,
@@ -6882,6 +7096,7 @@ pub struct EventProxy {
 }
 
 impl EventProxy {
+    /// Route terminal events to the owning window through this host sink.
     pub fn new(proxy: EventSink, window_id: WindowId) -> Self {
         Self {
             proxy,
@@ -7078,6 +7293,41 @@ impl PendingTerminalEvents {
         pending.notification_pending = false;
         pending.overflowed = false;
         mem::take(&mut pending.events)
+    }
+}
+
+// Debug omits user content and native resources, and never acquires application locks.
+impl std::fmt::Debug for Processor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Processor").field("windows", &self.windows.len()).finish_non_exhaustive()
+    }
+}
+
+// Debug omits user content and native resources, and never acquires application locks.
+impl std::fmt::Debug for HeadlessLoop {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HeadlessLoop").finish_non_exhaustive()
+    }
+}
+
+// Debug omits user content and native resources, and never acquires application locks.
+impl std::fmt::Debug for LoopHandle<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LoopHandle").finish_non_exhaustive()
+    }
+}
+
+// Debug omits user content and native resources, and never acquires application locks.
+impl std::fmt::Debug for SearchState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SearchState").finish_non_exhaustive()
+    }
+}
+
+// Debug omits user content and native resources, and never acquires application locks.
+impl<N, T> std::fmt::Debug for ActionContext<'_, N, T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ActionContext").finish_non_exhaustive()
     }
 }
 
@@ -7397,6 +7647,45 @@ mod host_claim_tests {
         }
     }
 
+    #[test]
+    fn processors_with_reused_connection_ids_advertise_independent_host_state() {
+        let mut first = headless_processor();
+        let mut second = headless_processor();
+        first.cli_options.headless = true;
+        first.cli_options.session = Some("first".into());
+        second.cli_options.session = Some("second".into());
+        first.claim_ipc_method_capabilities(&[MethodCapability::host(
+            "first_layout",
+            crate::host::MethodClass::Observe,
+            false,
+        )]);
+        second.claim_ipc_methods(&["second_layout", "first_layout"]);
+        // Overlapping names keep each processor's own capability metadata.
+        assert_eq!(first.host_method_capabilities.len(), 1);
+        assert!(second.host_method_capabilities.is_empty());
+        second.claim_ipc_methods(&["second_layout"]);
+
+        for (processor, own, foreign, session) in [
+            (&mut first, "first_layout", "second_layout", "first"),
+            (&mut second, "second_layout", "first_layout", "second"),
+        ] {
+            let (connection, frames) = test_connection();
+            processor.handle_ipc_request(
+                LoopHandle::Embedded { size: PhysicalSize::new(80, 24), scale_factor: 1.0 },
+                request(&connection, 1, "hello"),
+            );
+            let frame = frames.try_recv().unwrap();
+            let reply: serde_json::Value = serde_json::from_slice(frame.bytes()).unwrap();
+            let result = &reply["result"];
+            assert_eq!(result["session"], session);
+            assert!(result["methods"].as_array().unwrap().iter().any(|value| value == own));
+            assert!(!result["methods"].as_array().unwrap().iter().any(|value| value == foreign));
+        }
+        second.claim_ipc_methods(&[]);
+        assert!(first.host_methods.contains("first_layout"));
+        assert_eq!(first.host_method_capabilities.len(), 1);
+    }
+
     /// A claimed method is the host's to answer: Vivido must neither dispatch nor reply to it.
     #[test]
     fn a_claimed_method_is_queued_for_the_host_instead_of_dispatched() {
@@ -7416,8 +7705,6 @@ mod host_claim_tests {
             [(7, "vvbox_list_tabs"), (8, "create_window")],
         );
         assert!(processor.take_host_requests().is_empty(), "draining did not consume the queue");
-
-        crate::polling::ipc::publish_host_methods([].iter());
     }
 
     /// Claiming one method must not silently capture the rest of the automation surface.
@@ -7433,8 +7720,6 @@ mod host_claim_tests {
 
         assert!(frames.try_recv().is_ok(), "Vivido did not answer an unclaimed request");
         assert!(processor.take_host_requests().is_empty());
-
-        crate::polling::ipc::publish_host_methods([].iter());
     }
 }
 

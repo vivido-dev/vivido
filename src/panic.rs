@@ -20,6 +20,7 @@ pub fn attach_handler() {
         }
         let _ = writeln!(io::stderr(), "{}", panic_info);
         let msg = format!("{}\n\nPress Ctrl-C to Copy", panic_info);
+        // SAFETY: The temporary UTF-16 message and title remain live for the synchronous dialog; the owner HWND is null.
         unsafe {
             MessageBoxW(
                 ptr::null_mut(),

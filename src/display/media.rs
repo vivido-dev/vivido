@@ -4,9 +4,9 @@ use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use bytemuck::{Pod, Zeroable};
+use vello::Renderer;
 use vello::peniko::{ImageAlphaType, ImageData};
 use vello::wgpu::util::DeviceExt;
-use vello::{Renderer, wgpu};
 
 use crate::terminal::graphics::{DeleteTarget, GraphicsCommand, GraphicsProtocol};
 

@@ -43,6 +43,7 @@ const URL_REGEX: &str = "(ipfs:|ipns:|magnet:|mailto:|gemini://|gopher://|https:
                          [^\u{0000}-\u{001F}\u{007F}-\u{009F}<>\"\\s{-}\\^⟨⟩`\\\\]+";
 
 #[derive(Serialize, Default, Clone, Debug, PartialEq)]
+/// Configuration shared by terminal windows, rendering, input, and child processes.
 pub struct UiConfig {
     /// Miscellaneous configuration options.
     pub general: General,
@@ -140,7 +141,7 @@ impl UiConfig {
             working_directory,
             shell,
             drain_on_exit: false,
-            env: HashMap::new(),
+            env: self.env.clone(),
             shell_integration: self.terminal.shell_integration,
             #[cfg(target_os = "windows")]
             escape_args: false,
@@ -148,27 +149,32 @@ impl UiConfig {
     }
 
     #[inline]
+    /// Return the effective window opacity from zero to one.
     pub fn window_opacity(&self) -> f32 {
         self.window.opacity.as_f32()
     }
 
     #[inline]
+    /// Borrow the configured keyboard bindings.
     pub fn key_bindings(&self) -> &[KeyBinding] {
         &self.keyboard.bindings.0
     }
 
     #[inline]
+    /// Borrow the configured mouse bindings.
     pub fn mouse_bindings(&self) -> &[MouseBinding] {
         &self.mouse.bindings.0
     }
 
     #[inline]
+    /// Whether live configuration reload is enabled.
     pub fn live_config_reload(&self) -> bool {
         self.live_config_reload.unwrap_or(self.general.live_config_reload)
     }
 
     #[cfg(any(unix, windows))]
     #[inline]
+    /// Whether local automation IPC is enabled.
     pub fn ipc_socket(&self) -> bool {
         self.ipc_socket.unwrap_or(self.general.ipc_socket)
     }
@@ -200,6 +206,11 @@ impl<'de> Deserialize<'de> for KeyBindings {
     }
 }
 
+/// Deserialize user bindings and merge them with default bindings.
+///
+/// # Errors
+///
+/// Returns a deserialization error when a binding has an invalid trigger, mode, or action.
 pub fn deserialize_bindings<'a, D, T>(
     deserializer: D,
     mut default: Vec<Binding<T>>,
@@ -380,6 +391,7 @@ pub struct Hint {
 }
 
 #[derive(Serialize, Default, Clone, Debug, PartialEq, Eq)]
+/// Sources that a keyboard hint can match.
 pub struct HintContent {
     /// Regex for finding matches.
     pub regex: Option<LazyRegex>,
@@ -389,6 +401,7 @@ pub struct HintContent {
 }
 
 impl HintContent {
+    /// Configure regex and hyperlink sources for keyboard hints.
     pub fn new(regex: Option<LazyRegex>, hyperlinks: bool) -> Self {
         Self { regex, hyperlinks }
     }
@@ -458,10 +471,13 @@ impl<'de> Deserialize<'de> for HintContent {
 #[derive(Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct HintBinding {
+    /// Key matched by this binding.
     pub key: BindingKey,
     #[serde(default)]
+    /// Required keyboard modifiers.
     pub mods: ModsWrapper,
     #[serde(default)]
+    /// Terminal mode selection.
     pub mode: ModeWrapper,
 
     /// Cache for on-demand [`HintBinding`] to [`KeyBinding`] conversion.
@@ -545,8 +561,11 @@ impl Serialize for LazyRegex {
 /// Regex which is compiled on demand, to avoid expensive computations at startup.
 #[derive(Clone, Debug)]
 pub enum LazyRegexVariant {
+    /// A compiled search expression and its source pattern.
     Compiled(String, Box<RegexSearch>),
+    /// An expression awaiting lazy compilation.
     Pattern(String),
+    /// An expression that failed compilation.
     Uncompilable(String),
 }
 
@@ -603,10 +622,12 @@ impl Default for Percentage {
 }
 
 impl Percentage {
+    /// Create a percentage value from the supplied fraction.
     pub fn new(value: f32) -> Self {
         Percentage(value.clamp(0., 1.))
     }
 
+    /// Return the configured fractional value.
     pub fn as_f32(self) -> f32 {
         self.0
     }
@@ -623,16 +644,22 @@ impl<'de> Deserialize<'de> for Percentage {
 
 #[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
 #[serde(untagged, deny_unknown_fields)]
+/// A configured executable with optional command-line arguments.
 pub enum Program {
+    /// An executable without additional arguments.
     Just(String),
+    /// An executable with explicit command-line arguments.
     WithArgs {
+        /// Executable name or path.
         program: String,
         #[serde(default)]
+        /// Arguments passed to the configured executable.
         args: Vec<String>,
     },
 }
 
 impl Program {
+    /// Borrow the configured executable name or path.
     pub fn program(&self) -> &str {
         match self {
             Program::Just(program) => program,
@@ -640,6 +667,7 @@ impl Program {
         }
     }
 
+    /// Borrow the configured executable's arguments.
     pub fn args(&self) -> &[String] {
         match self {
             Program::Just(_) => &[],

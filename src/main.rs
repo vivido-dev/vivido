@@ -39,7 +39,10 @@ use vivido::config::UiConfig;
 #[cfg(any(target_os = "linux", windows))]
 use vivido::config::window::Decorations;
 use vivido::event::{Event, EventSink, Processor};
-use vivido::terminal::tty;
+
+// The allocator belongs to the executable; embedding hosts retain their own allocator.
+#[global_allocator]
+static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 fn main() -> Result<(), Box<dyn Error>> {
     #[cfg(windows)]
@@ -49,6 +52,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     // to the console of the parent process, so we do it explicitly. This fails
     // silently if the parent has no console.
     #[cfg(windows)]
+    // SAFETY: The scalar constant selects the parent console; no borrowed memory is passed.
     unsafe {
         AttachConsole(ATTACH_PARENT_PROCESS);
     }
@@ -81,7 +85,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 }
 
 /// `msg` subcommand entrypoint.
-#[allow(unused_mut)]
+#[allow(unused_mut, reason = "mutability is required only by platform-specific branches")]
 fn msg(mut options: MessageOptions) -> Result<(), Box<dyn Error>> {
     #[cfg(not(any(target_os = "macos", windows)))]
     if let ActivationSocketMessage::CreateWindow(window_options) = &mut options.message {
@@ -434,14 +438,6 @@ fn vivido(mut options: Options) -> Result<(), Box<dyn Error>> {
         config.window.resize_increments = false;
     }
 
-    // Set tty environment variables.
-    let _terminfo_guard = tty::setup_env();
-
-    // Set env vars from config.
-    for (key, value) in config.env.iter() {
-        unsafe { env::set_var(key, value) };
-    }
-
     // Switch to home directory.
     #[cfg(target_os = "macos")]
     match home::home_dir() {
@@ -485,7 +481,7 @@ fn vivido(mut options: Options) -> Result<(), Box<dyn Error>> {
     let _registry_guard = session::RegistryGuard::new(automation_paths, registry);
 
     // Event processor.
-    #[allow(unused_mut)]
+    #[allow(unused_mut, reason = "mutability is required only by platform-specific branches")]
     let mut processor = Processor::new(config, options, &window_event_loop);
 
     // Start event loop and block until shutdown.
@@ -507,6 +503,7 @@ fn vivido(mut options: Options) -> Result<(), Box<dyn Error>> {
 
     // Without explicitly detaching the console cmd won't redraw it's prompt.
     #[cfg(windows)]
+    // SAFETY: Detaches only this process from its console and takes no borrowed memory.
     unsafe {
         FreeConsole();
     }

@@ -5,7 +5,6 @@ use std::cmp::{Ord, Ordering, max, min};
 use std::fmt;
 use std::ops::{Add, AddAssign, Deref, Sub, SubAssign};
 
-#[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
 use crate::terminal::grid::Dimensions;
@@ -16,12 +15,15 @@ pub type Side = Direction;
 /// Horizontal direction.
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum Direction {
+    /// Move toward the left.
     Left,
+    /// Move toward the right.
     Right,
 }
 
 impl Direction {
     #[must_use]
+    /// Return the opposite horizontal direction.
     pub fn opposite(self) -> Self {
         match self {
             Side::Right => Side::Left,
@@ -31,6 +33,7 @@ impl Direction {
 }
 
 /// Terminal grid boundaries.
+#[derive(Debug)]
 pub enum Boundary {
     /// Cursor's range of motion in the grid.
     ///
@@ -45,14 +48,16 @@ pub enum Boundary {
 }
 
 /// Index in the grid using row, column notation.
-#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Point<L = Line, C = Column> {
+    /// Grid line coordinate.
     pub line: L,
+    /// Grid column coordinate.
     pub column: C,
 }
 
 impl<L, C> Point<L, C> {
+    /// Pair a grid line index with a column index.
     pub fn new(line: L, column: C) -> Point<L, C> {
         Point { line, column }
     }
@@ -131,8 +136,7 @@ impl<L: Ord, C: Ord> Ord for Point<L, C> {
 /// A line.
 ///
 /// Newtype to avoid passing values incorrectly.
-#[derive(Debug, Copy, Clone, Eq, PartialEq, Default, Ord, PartialOrd)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Default, Ord, PartialOrd, Serialize, Deserialize)]
 pub struct Line(pub i32);
 
 impl Line {
@@ -225,8 +229,7 @@ impl PartialEq<usize> for Line {
 /// A column.
 ///
 /// Newtype to avoid passing values incorrectly.
-#[derive(Debug, Copy, Clone, Eq, PartialEq, Default, Ord, PartialOrd)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Default, Ord, PartialOrd, Serialize, Deserialize)]
 pub struct Column(pub usize);
 
 impl fmt::Display for Column {

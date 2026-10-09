@@ -2,9 +2,8 @@
 
 use std::ops::{Index, IndexMut, Range};
 use std::sync::Arc;
-use std::{cmp, mem, ptr, slice, str};
+use std::{cmp, mem, slice, str};
 
-#[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
 use base64::Engine;
@@ -30,8 +29,11 @@ use crate::terminal::vvte::ansi::{
 // The same `cursor-icon` type winit re-exports, keeping this module winit-free.
 use crate::terminal::vvte::ansi::cursor_icon::CursorIcon;
 
+/// Cell types and operations.
 pub mod cell;
+/// Color types and operations.
 pub mod color;
+/// Search types and operations.
 pub mod search;
 
 #[cfg(test)]
@@ -211,39 +213,66 @@ impl DcsScanner {
 }
 
 bitflags! {
+    /// Terminal behavior selected by control sequences.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
     pub struct TermMode: u32 {
+        /// No terminal modes.
         const NONE                    = 0;
+        /// Display the terminal cursor.
         const SHOW_CURSOR             = 1;
+        /// Use application cursor-key sequences.
         const APP_CURSOR              = 1 << 1;
+        /// Use application keypad sequences.
         const APP_KEYPAD              = 1 << 2;
+        /// Report mouse-button presses.
         const MOUSE_REPORT_CLICK      = 1 << 3;
+        /// Bracket pasted text with terminal control sequences.
         const BRACKETED_PASTE         = 1 << 4;
+        /// Encode mouse reports with SGR parameters.
         const SGR_MOUSE               = 1 << 5;
+        /// Report mouse movement without requiring a pressed button.
         const MOUSE_MOTION            = 1 << 6;
+        /// Wrap output at the right margin.
         const LINE_WRAP               = 1 << 7;
+        /// Treat line feed as a newline.
         const LINE_FEED_NEW_LINE      = 1 << 8;
+        /// Interpret cursor positions relative to the scroll region.
         const ORIGIN                  = 1 << 9;
+        /// Insert cells instead of replacing them.
         const INSERT                  = 1 << 10;
+        /// Report window focus changes.
         const FOCUS_IN_OUT            = 1 << 11;
+        /// Select the alternate terminal screen.
         const ALT_SCREEN              = 1 << 12;
+        /// Report movement while a mouse button is held.
         const MOUSE_DRAG              = 1 << 13;
+        /// Encode legacy mouse coordinates as UTF-8.
         const UTF8_MOUSE              = 1 << 14;
+        /// Translate scroll input into cursor keys on the alternate screen.
         const ALTERNATE_SCROLL        = 1 << 15;
         /// DECSET 1016: report SGR mouse coordinates in physical pixels.
         const SGR_PIXEL_MOUSE         = 1 << 16;
+        /// Request attention when terminal output signals urgency.
         const URGENCY_HINTS           = 1 << 17;
+        /// Disambiguate escape-key sequences using the keyboard protocol.
         const DISAMBIGUATE_ESC_CODES  = 1 << 18;
+        /// Include press, repeat, and release classifications in key reports.
         const REPORT_EVENT_TYPES      = 1 << 19;
+        /// Include alternate key identities in keyboard reports.
         const REPORT_ALTERNATE_KEYS   = 1 << 20;
+        /// Encode every key through the extended keyboard protocol.
         const REPORT_ALL_KEYS_AS_ESC  = 1 << 21;
+        /// Include associated text in keyboard reports.
         const REPORT_ASSOCIATED_TEXT  = 1 << 22;
+        /// All mouse-reporting modes.
         const MOUSE_MODE              = Self::MOUSE_REPORT_CLICK.bits() | Self::MOUSE_MOTION.bits() | Self::MOUSE_DRAG.bits();
+        /// All supported extended keyboard-protocol flags.
         const KITTY_KEYBOARD_PROTOCOL = Self::DISAMBIGUATE_ESC_CODES.bits()
                                       | Self::REPORT_EVENT_TYPES.bits()
                                       | Self::REPORT_ALTERNATE_KEYS.bits()
                                       | Self::REPORT_ALL_KEYS_AS_ESC.bits()
                                       | Self::REPORT_ASSOCIATED_TEXT.bits();
+        /// Every terminal mode bit, including reserved bits.
          const ANY                    = u32::MAX;
     }
 }
@@ -295,6 +324,7 @@ pub fn viewport_to_point(display_offset: usize, point: Point<usize>) -> Point {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// The inclusive horizontal damage range for one terminal line.
 pub struct LineDamageBounds {
     /// Damaged line number.
     pub line: usize,
@@ -308,27 +338,32 @@ pub struct LineDamageBounds {
 
 impl LineDamageBounds {
     #[inline]
+    /// Create an inclusive damage range for one terminal line.
     pub fn new(line: usize, left: usize, right: usize) -> Self {
         Self { line, left, right }
     }
 
     #[inline]
+    /// Create an empty damage range for one terminal line.
     pub fn undamaged(line: usize, num_cols: usize) -> Self {
         Self { line, left: num_cols, right: 0 }
     }
 
     #[inline]
+    /// Reset line damage to its empty state.
     pub fn reset(&mut self, num_cols: usize) {
         *self = Self::undamaged(self.line, num_cols);
     }
 
     #[inline]
+    /// Expand line damage to include these inclusive column bounds.
     pub fn expand(&mut self, left: usize, right: usize) {
         self.left = cmp::min(self.left, left);
         self.right = cmp::max(self.right, right);
     }
 
     #[inline]
+    /// Whether the line contains a nonempty damage range.
     pub fn is_damaged(&self) -> bool {
         self.left <= self.right
     }
@@ -352,6 +387,7 @@ pub struct TermDamageIterator<'a> {
 }
 
 impl<'a> TermDamageIterator<'a> {
+    /// Iterate damaged line ranges within the visible viewport.
     pub fn new(line_damage: &'a [LineDamageBounds], display_offset: usize) -> Self {
         let num_lines = line_damage.len();
         // Filter out invisible damage.
@@ -426,10 +462,12 @@ impl TermDamageState {
     }
 }
 
+/// Terminal parser state, visible grid, scrollback, modes, and event listener.
 pub struct Term<T> {
     /// Terminal focus controlling the cursor shape.
     pub is_focused: bool,
 
+    /// Current selection or its configured appearance.
     pub selection: Option<Selection>,
 
     /// Currently active grid.
@@ -520,7 +558,9 @@ struct PendingGridScroll {
 /// A semantic terminal position carried through one grid resize/reflow.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ResizePoint {
+    /// Grid position of this value.
     pub point: Point,
+    /// Whether the alternate screen is active.
     pub alternate: bool,
 }
 
@@ -556,8 +596,8 @@ impl Default for Config {
 }
 
 /// What happens when a program uses one direction of the OSC 52 clipboard.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize), serde(rename_all = "lowercase"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum ClipboardAccess {
     /// The request is ignored.
     Deny,
@@ -568,8 +608,7 @@ pub enum ClipboardAccess {
 }
 
 /// OSC 52 clipboard policy, separately for reading and setting the clipboard.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Osc52 {
     /// A program asking for the clipboard's contents.
     pub read: ClipboardAccess,
@@ -664,6 +703,7 @@ fn span_at(spans: &[RowTextSpan], offset: usize) -> Option<RowTextSpan> {
 
 impl<T> Term<T> {
     #[inline]
+    /// Move the visible viewport through terminal scrollback.
     pub fn scroll_display(&mut self, scroll: Scroll)
     where
         T: EventListener,
@@ -719,6 +759,7 @@ impl<T> Term<T> {
         self.mark_fully_damaged();
     }
 
+    /// Create terminal state from configuration, dimensions, and an event listener.
     pub fn new<D: Dimensions>(config: Config, dimensions: &D, event_proxy: T) -> Term<T> {
         let num_cols = dimensions.columns();
         let num_lines = dimensions.screen_lines();
@@ -1446,6 +1487,7 @@ impl<T> Term<T> {
     }
 
     #[inline]
+    /// Mark the terminal as exited and notify its listener.
     pub fn exit(&mut self)
     where
         T: EventListener,
@@ -1595,6 +1637,7 @@ impl<T> Term<T> {
         self.working_directory.as_deref()
     }
 
+    /// Borrow dynamic terminal palette overrides.
     pub fn colors(&self) -> &Colors {
         &self.colors
     }
@@ -2971,7 +3014,7 @@ impl<T: EventListener> Handler for Term<T> {
 
     #[inline]
     fn set_title(&mut self, title: Option<String>) {
-        trace!("Setting title to '{title:?}'");
+        trace!(event = "terminal_title_changed"; "Terminal title changed");
 
         self.title.clone_from(&title);
 
@@ -2996,13 +3039,11 @@ impl<T: EventListener> Handler for Term<T> {
 
     #[inline]
     fn push_title(&mut self) {
-        trace!("Pushing '{:?}' onto title stack", self.title);
+        trace!(event = "terminal_title_pushed"; "Terminal title stack extended");
 
         if self.title_stack.len() >= TITLE_STACK_MAX_DEPTH {
-            let removed = self.title_stack.remove(0);
-            trace!(
-                "Removing '{removed:?}' from bottom of title stack that exceeds its maximum depth"
-            );
+            self.title_stack.remove(0);
+            trace!(event = "terminal_title_evicted"; "Terminal title stack reached its limit");
         }
 
         self.title_stack.push(self.title.clone());
@@ -3013,7 +3054,7 @@ impl<T: EventListener> Handler for Term<T> {
         trace!("Attempting to pop title from stack...");
 
         if let Some(popped) = self.title_stack.pop() {
-            trace!("Title '{popped:?}' popped from stack");
+            trace!(event = "terminal_title_popped"; "Terminal title restored");
             self.set_title(popped);
         }
     }
@@ -3161,8 +3202,11 @@ fn push_sgr_color(params: &mut Vec<String>, color: Color, foreground: bool) {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The system clipboard or primary selection.
 pub enum ClipboardType {
+    /// The system clipboard.
     Clipboard,
+    /// The primary selection buffer.
     Selection,
 }
 
@@ -3179,9 +3223,7 @@ impl TabStops {
     /// Remove all tabstops.
     #[inline]
     fn clear_all(&mut self) {
-        unsafe {
-            ptr::write_bytes(self.tabs.as_mut_ptr(), 0, self.tabs.len());
-        }
+        self.tabs.fill(false);
     }
 
     /// Increase tabstop capacity.
@@ -3211,9 +3253,11 @@ impl IndexMut<Column> for TabStops {
 }
 
 /// Terminal cursor rendering information.
-#[derive(Copy, Clone, PartialEq, Eq)]
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub struct RenderableCursor {
+    /// Cursor geometry.
     pub shape: CursorShape,
+    /// Grid position of this value.
     pub point: Point,
 }
 
@@ -3240,11 +3284,17 @@ impl RenderableCursor {
 ///
 /// This contains all content required to render the current terminal view.
 pub struct RenderableContent<'a> {
+    /// Iterator over cells in the visible viewport.
     pub display_iter: GridIterator<'a, Cell>,
+    /// Current selection or its configured appearance.
     pub selection: Option<SelectionRange>,
+    /// Cursor appearance or current cursor state.
     pub cursor: RenderableCursor,
+    /// Number of lines scrolled back from the live viewport.
     pub display_offset: usize,
+    /// Resolved terminal palette.
     pub colors: &'a color::Colors,
+    /// Terminal mode selection.
     pub mode: TermMode,
 }
 
@@ -3265,18 +3315,21 @@ impl<'a> RenderableContent<'a> {
 pub mod test {
     use super::*;
 
-    #[cfg(feature = "serde")]
     use serde::{Deserialize, Serialize};
 
     use crate::terminal::event::VoidListener;
 
-    #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+    #[derive(Serialize, Deserialize, Debug)]
+    /// Grid dimensions for terminal examples and test fixtures.
     pub struct TermSize {
+        /// Number of terminal columns.
         pub columns: usize,
+        /// Number of visible grid lines.
         pub screen_lines: usize,
     }
 
     impl TermSize {
+        /// Create terminal dimensions for examples and test fixtures.
         pub fn new(columns: usize, screen_lines: usize) -> Self {
             Self { columns, screen_lines }
         }
@@ -3315,6 +3368,10 @@ pub mod test {
     ///     hello\n:)\r\ntest",
     /// );
     /// ```
+    ///
+    /// # Panics
+    ///
+    /// Panics for characters without a display width or content with no terminal columns.
     pub fn mock_term(content: &str) -> Term<VoidListener> {
         let lines: Vec<&str> = content.split('\n').collect();
         let num_cols = lines
@@ -3353,26 +3410,32 @@ pub mod test {
     }
 }
 
+// Debug omits user content and native resources, and never acquires application locks.
+impl<T> std::fmt::Debug for Term<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Term").finish_non_exhaustive()
+    }
+}
+
+// Debug omits user content and native resources, and never acquires application locks.
+impl std::fmt::Debug for RenderableContent<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RenderableContent").finish_non_exhaustive()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    use std::sync::Arc;
     use std::sync::Mutex;
     #[cfg(windows)]
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use crate::terminal::event::VoidListener;
-    #[cfg(feature = "serde")]
-    use crate::terminal::grid::Grid;
-    use crate::terminal::grid::Scroll;
-    use crate::terminal::index::{Column, Point, Side};
-    use crate::terminal::selection::{Selection, SelectionRange, SelectionType};
-    #[cfg(feature = "serde")]
-    use crate::terminal::term::cell::Cell;
-    use crate::terminal::term::cell::Flags;
+    use crate::terminal::index::Side;
     use crate::terminal::term::test::{TermSize, mock_term};
-    use crate::terminal::vvte::ansi::{self, CharsetIndex, Handler, StandardCharset};
+    use crate::terminal::vvte::ansi::{self};
 
     #[cfg(windows)]
     #[derive(Clone, Default)]

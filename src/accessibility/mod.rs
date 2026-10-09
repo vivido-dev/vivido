@@ -13,7 +13,10 @@ use crate::terminal::term::cell::{Flags, LineLength};
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 mod accesskit_backend;
 #[cfg(all(test, target_os = "macos"))]
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "platform-dependent native declarations are retained for ABI completeness"
+)]
 #[path = "accesskit_backend.rs"]
 mod accesskit_backend_compile;
 #[cfg(target_os = "macos")]
@@ -315,7 +318,10 @@ fn narrow(offset: usize) -> u32 {
     u32::try_from(offset).unwrap_or(u32::MAX)
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "these established rendering and protocol entry points carry independently required context"
+)]
 fn push_character(
     text: &mut String,
     characters: &mut Vec<AccessibleCharacter>,

@@ -62,7 +62,7 @@ image = { version = "0.25", default-features = false, features = [
   "jpeg",
 ] }
 libc = "0.2"
-log = { version = "0.4", features = ["std", "serde"] }
+log = { version = "0.4", features = ["std", "serde", "kv"] }
 memchr = "2.8"
 percent-encoding = "2.3"
 notify = "8.2"
@@ -80,7 +80,6 @@ sha2 = "0.11"
 signal-hook = { version = "0.4", default-features = false }
 tempfile = "3.27"
 toml = "1.1"
-toml_edit = "0.25"
 ureq = { version = "3.4", default-features = false, features = ["rustls"] }
 unicode-width = "0.2"
 unicode-script = "0.5"
@@ -98,6 +97,7 @@ winit = { version = "0.30", default-features = false, features = [
   "rwh_06",
   "serde",
 ] }
+mimalloc = { version = "0.1", default-features = false }
 
 [build-dependencies]
 pkg-config = "0.3"
@@ -241,7 +241,10 @@ wgpu = { version = "30.0", default-features = false, features = [
 embed-resource = "3.0.2"
 
 [features]
+# Deterministic service controls for embedding tests; never enabled by default.
+test-util = []
 default = ["serde", "wayland", "x11"]
+# Kept as a feature spelling; serialization is required by the always-available config API.
 serde = []
 # Winit picks its backend at runtime: Wayland when WAYLAND_DISPLAY is set, X11 otherwise.
 x11 = ["winit/x11"]
@@ -273,3 +276,21 @@ codegen-units = 1
 
 [profile.dev]
 debug = "line-tables-only"
+
+[lints.rust]
+ambiguous_negative_literals = "warn"
+missing_debug_implementations = "warn"
+redundant_imports = "warn"
+redundant_lifetimes = "warn"
+trivial_numeric_casts = "warn"
+unsafe_op_in_unsafe_fn = "deny"
+unused_lifetimes = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+allow_attributes_without_reason = "deny"
+undocumented_unsafe_blocks = "deny"
+
+[package.metadata.cargo-udeps.ignore]
+# Completion generation tests are compiled only on Linux; the dependency is used there.
+development = ["clap_complete"]

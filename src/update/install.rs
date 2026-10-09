@@ -163,6 +163,10 @@ pub fn launch_installer(path: &Path) -> io::Result<()> {
 
 /// Launch the platform installer without waiting for it to exit.
 #[cfg(target_os = "macos")]
+///
+/// # Errors
+///
+/// Returns an I/O error if the verified installer cannot be launched.
 pub fn launch_installer(path: &Path) -> io::Result<()> {
     crate::daemon::spawn_daemon("open", [path.as_os_str()], None)
 }

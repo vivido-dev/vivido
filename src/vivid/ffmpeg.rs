@@ -207,13 +207,23 @@ pub fn abi() -> io::Result<&'static Abi> {
 }
 
 fn probe() -> Result<Abi, String> {
+    // SAFETY: version queries have no arguments and return scalars without retaining resources.
+    let versions = unsafe { (avcodec_version() >> 16, avutil_version() >> 16) };
+    if !matches!(versions, (60, 58) | (61, 59) | (62, 60) | (63, 61)) {
+        return Err("unsupported FFmpeg ABI major; expected FFmpeg 6, 7, 8, or 9".into());
+    }
+    // These supported majors allocate structures larger than both candidate prefixes below.
+    // Sentinel probing validates offsets within those allocations; it cannot validate an
+    // arbitrary future allocation's size, which is why the version gate must run first.
     let frame = probe_frame().ok_or_else(|| unsupported("AVFrame"))?;
     let parameters = probe_parameters().ok_or_else(|| unsupported("AVCodecParameters"))?;
     probe_packet().ok_or_else(|| unsupported("AVPacket"))?;
     log::debug!(
         "FFmpeg ABI verified: libavcodec {}, libavutil {}, {frame:?} frame, {parameters:?} \
          codec parameters",
+        // SAFETY: version queries have no arguments and return scalar values.
         version_text(unsafe { avcodec_version() }),
+        // SAFETY: version queries have no arguments and return scalar values.
         version_text(unsafe { avutil_version() }),
     );
     Ok(Abi { frame, parameters })
@@ -223,9 +233,13 @@ fn unsupported(structure: &str) -> String {
     format!(
         "this FFmpeg does not match any {structure} layout Vivido knows (libavcodec {}, libavutil \
          {}, libswscale {}, libswresample {}); Vivid media is unavailable",
+        // SAFETY: version queries have no arguments and return scalar values.
         version_text(unsafe { avcodec_version() }),
+        // SAFETY: version queries have no arguments and return scalar values.
         version_text(unsafe { avutil_version() }),
+        // SAFETY: version queries have no arguments and return scalar values.
         version_text(unsafe { swscale_version() }),
+        // SAFETY: version queries have no arguments and return a scalar value.
         version_text(unsafe { swresample_version() }),
     )
 }
@@ -237,12 +251,16 @@ fn version_text(version: u32) -> String {
 /// `av_frame_unref` resets a frame to its documented defaults, which put `AV_NOPTS_VALUE` exactly
 /// at the offset the two candidate layouts disagree about.
 fn probe_frame() -> Option<FrameLayout> {
+    // SAFETY: the native allocator returns an owned frame pointer; null is checked before use.
     let mut frame = unsafe { av_frame_alloc() };
     if frame.is_null() {
         return None;
     }
+    // SAFETY: self owns this initialized frame and no borrowed pixel/sample data is used after unref.
     unsafe { av_frame_unref(frame) };
+    // SAFETY: the preflight accepts only FFmpeg 6–9, whose initialized frame allocation contains both candidate prefixes.
     let legacy = unsafe { (*(frame as *const AVFrameLegacy)).pts };
+    // SAFETY: the preflight accepts only FFmpeg 6–9, whose initialized frame allocation contains both candidate prefixes.
     let current = unsafe { (*(frame as *const AVFrameCurrent)).pts };
     let layout = match (legacy == NO_PTS, current == NO_PTS) {
         // Both agreeing means the target's padding puts `pts` in the same place either way, so
@@ -252,6 +270,7 @@ fn probe_frame() -> Option<FrameLayout> {
         (true, false) => Some(FrameLayout::Legacy),
         (false, false) => None,
     };
+    // SAFETY: these are uniquely owned FFmpeg allocations; each matching free function accepts null and clears its pointer.
     unsafe { av_frame_free(&mut frame) };
     layout
 }
@@ -259,11 +278,14 @@ fn probe_frame() -> Option<FrameLayout> {
 /// `avcodec_parameters_alloc` resets `format` to -1 and both `profile` and `level` to
 /// `AV_PROFILE_UNKNOWN`, which straddle the point `coded_side_data` was inserted at.
 fn probe_parameters() -> Option<ParametersLayout> {
+    // SAFETY: the native allocator returns an owned pointer; null is checked before the allocation is used.
     let mut parameters = unsafe { avcodec_parameters_alloc() };
     if parameters.is_null() {
         return None;
     }
+    // SAFETY: the preflight accepts only FFmpeg 6–9, whose initialized parameters allocation contains both candidate prefixes.
     let legacy = unsafe { &*(parameters as *const AVCodecParametersLegacy) };
+    // SAFETY: the preflight accepts only FFmpeg 6–9, whose initialized parameters allocation contains both candidate prefixes.
     let current = unsafe { &*(parameters as *const AVCodecParametersCurrent) };
     let legacy_matches =
         legacy.format == -1 && legacy.profile == UNKNOWN_PROFILE && legacy.level == UNKNOWN_PROFILE;
@@ -277,6 +299,7 @@ fn probe_parameters() -> Option<ParametersLayout> {
         (false, true) => Some(ParametersLayout::Current),
         _ => None,
     };
+    // SAFETY: these are uniquely owned FFmpeg allocations; each matching free function accepts null and clears its pointer.
     unsafe { avcodec_parameters_free(&mut parameters) };
     layout
 }
@@ -284,15 +307,18 @@ fn probe_parameters() -> Option<ParametersLayout> {
 /// `av_packet_alloc` resets timestamps to `AV_NOPTS_VALUE`, `pos` to -1, and `time_base` to 0/1.
 /// `time_base` is the last field, so agreeing on it confirms the whole structure.
 fn probe_packet() -> Option<()> {
+    // SAFETY: the native allocator returns an owned packet pointer; null is checked before use.
     let mut packet = unsafe { av_packet_alloc() };
     if packet.is_null() {
         return None;
     }
+    // SAFETY: the supported native allocation is initialized and contains this complete repr(C) packet layout.
     let fields = unsafe { &*(packet as *const AVPacket) };
     let valid = fields.pts == NO_PTS
         && fields.dts == NO_PTS
         && fields.pos == -1
         && fields.time_base == AVRational { num: 0, den: 1 };
+    // SAFETY: these are uniquely owned FFmpeg allocations; each matching free function accepts null and clears its pointer.
     unsafe { av_packet_free(&mut packet) };
     valid.then_some(())
 }
@@ -320,7 +346,9 @@ impl Abi {
     /// `frame` must be a live `AVFrame` allocated by FFmpeg.
     pub unsafe fn frame_pts(&self, frame: *const c_void) -> i64 {
         match self.frame {
+            // SAFETY: the preflight accepts only FFmpeg 6–9, whose initialized frame allocation contains both candidate prefixes.
             FrameLayout::Legacy => unsafe { (*(frame as *const AVFrameLegacy)).pts },
+            // SAFETY: the preflight accepts only FFmpeg 6–9, whose initialized frame allocation contains both candidate prefixes.
             FrameLayout::Current => unsafe { (*(frame as *const AVFrameCurrent)).pts },
         }
     }
@@ -331,7 +359,9 @@ impl Abi {
     /// context `avcodec_alloc_context3` already tagged with the chosen codec.
     ///
     /// # Safety
-    /// `parameters` must be a live `AVCodecParameters` allocated by FFmpeg.
+    /// `parameters` must be uniquely borrowed and allocated by this process's verified FFmpeg.
+    /// Any extradata must be an `av_malloc` allocation containing its declared length followed
+    /// by `AV_INPUT_BUFFER_PADDING_SIZE` zero bytes; ownership transfers to the parameters.
     pub unsafe fn set_parameters(
         &self,
         parameters: *mut c_void,
@@ -339,6 +369,7 @@ impl Abi {
         codec_id: c_int,
         description: ParameterValues,
     ) {
+        // SAFETY: the caller guarantees unique live parameters; the stable head has the same ABI in all supported majors.
         let head = unsafe { &mut *(parameters as *mut AVCodecParametersHead) };
         head.codec_type = media_type;
         head.codec_id = codec_id;
@@ -435,11 +466,13 @@ pub unsafe fn codec_id(codec: *const c_void) -> c_int {
         media_type: c_int,
         id: c_int,
     }
+    // SAFETY: the caller guarantees a live codec descriptor whose stable repr(C) head contains its ID.
     unsafe { (*(codec as *const AVCodecHead)).id }
 }
 
 /// Allocate a zeroed `AVCodecParameters`, or fail.
 pub fn allocate_parameters() -> io::Result<*mut c_void> {
+    // SAFETY: the native allocator returns an owned pointer; null is checked before the allocation is used.
     let parameters = unsafe { avcodec_parameters_alloc() };
     if parameters.is_null() {
         return Err(io::Error::other("FFmpeg could not allocate codec parameters"));
@@ -448,8 +481,13 @@ pub fn allocate_parameters() -> io::Result<*mut c_void> {
 }
 
 /// Release an `AVCodecParameters` allocated by [`allocate_parameters`].
-pub fn free_parameters(parameters: &mut *mut c_void) {
+///
+/// # Safety
+/// The pointer must be null or a uniquely owned allocation from `allocate_parameters` that
+/// has not already been freed. No references into the parameters may survive this call.
+pub unsafe fn free_parameters(parameters: &mut *mut c_void) {
     if !parameters.is_null() {
+        // SAFETY: these are uniquely owned FFmpeg allocations; each matching free function accepts null and clears its pointer.
         unsafe { avcodec_parameters_free(parameters) };
         *parameters = ptr::null_mut();
     }
@@ -493,6 +531,7 @@ mod tests {
         let abi = abi().expect("the linked FFmpeg matches a known layout");
         // Both probes must agree with the library's own reported majors, which is an independent
         // check on the sentinel probe rather than a restatement of it.
+        // SAFETY: version queries take no arguments and return a scalar.
         let avcodec_major = unsafe { avcodec_version() } >> 16;
         // `coded_side_data` arrived in FFmpeg 7, which is libavcodec 61. This is an independent
         // check on the sentinel probe rather than a restatement of it: the probe reads memory, the
@@ -505,15 +544,20 @@ mod tests {
     #[test]
     fn a_frame_reports_the_unset_timestamp_sentinel_through_the_chosen_layout() {
         let abi = abi().expect("known FFmpeg layout");
+        // SAFETY: the native allocator returns an owned pointer checked below.
         let mut frame = unsafe { av_frame_alloc() };
         assert!(!frame.is_null());
+        // SAFETY: frame is the live initialized allocation owned by this test.
         unsafe { av_frame_unref(frame) };
+        // SAFETY: frame is live and abi was verified for the linked library.
         assert_eq!(unsafe { abi.frame_pts(frame) }, NO_PTS);
         // The stable head must read back the defaults too, which proves the head and the
         // layout-selected tail are consistent with one another.
+        // SAFETY: the live frame remains owned until after these copied fields are read.
         let head = unsafe { abi.frame(frame) };
         assert_eq!((head.width, head.height, head.nb_samples), (0, 0, 0));
         assert_eq!(head.format, -1);
+        // SAFETY: this test uniquely owns frame and no borrowed plane pointers remain.
         unsafe { av_frame_free(&mut frame) };
     }
 
@@ -521,6 +565,7 @@ mod tests {
     fn codec_parameters_round_trip_through_the_chosen_layout() {
         let abi = abi().expect("known FFmpeg layout");
         let mut parameters = allocate_parameters().expect("parameters");
+        // SAFETY: this test uniquely owns the parameters and supplies only scalar fields.
         unsafe {
             abi.set_parameters(
                 parameters,
@@ -534,6 +579,7 @@ mod tests {
                 },
             );
         }
+        // SAFETY: the verified ABI and unique parameter allocation satisfy the tail accessor contract.
         unsafe {
             abi.with_parameters_tail(parameters, |tail| {
                 assert_eq!((*tail.width, *tail.height), (1920, 1080));
@@ -541,8 +587,10 @@ mod tests {
                 assert_eq!(*tail.bit_rate, 0);
             });
         }
+        // SAFETY: parameters is live and contains the stable head; the borrow ends before free.
         let head = unsafe { &*(parameters as *const AVCodecParametersHead) };
         assert_eq!((head.codec_type, head.codec_id), (0, 27));
-        free_parameters(&mut parameters);
+        // SAFETY: the test owns these allocated parameters and uses no references after release.
+        unsafe { free_parameters(&mut parameters) };
     }
 }

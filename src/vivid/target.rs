@@ -535,7 +535,6 @@ impl PresentationTarget for DesktopTarget {
 
 #[cfg(test)]
 mod tests {
-    use vivid_protocol::cbor::Value;
     use vivid_protocol::scene::Fit;
 
     use super::*;

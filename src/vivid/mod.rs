@@ -303,6 +303,8 @@ struct ServiceShared {
 enum ActorMessage {
     Record(Record),
     Wake,
+    #[cfg(test)]
+    FaultForTest(Box<dyn FnOnce() + Send>),
 }
 
 /// One accepted connection's claim on the global connection budget.
@@ -732,7 +734,10 @@ impl VividService {
     ///
     /// Only the AccessKit adapters take one, so this is unused on macOS, where the AppKit adapter
     /// builds its own tree. It is kept compiled and type-checked there rather than configured away.
-    #[cfg_attr(not(any(target_os = "linux", target_os = "windows")), allow(dead_code))]
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "windows")),
+        allow(dead_code, reason = "transport helpers are used only on Linux and Windows")
+    )]
     pub(crate) fn accessibility_actions(&self) -> AccessibilityActions {
         AccessibilityActions { shared: Arc::clone(&self.shared) }
     }
@@ -1280,7 +1285,10 @@ impl SessionRuntime {
 ///
 /// It holds only the shared service state, so the accessibility thread can use it without
 /// touching window or terminal state.
-#[cfg_attr(not(any(target_os = "linux", target_os = "windows")), allow(dead_code))]
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "windows")),
+    allow(dead_code, reason = "transport helpers are used only on Linux and Windows")
+)]
 #[derive(Clone)]
 pub(crate) struct AccessibilityActions {
     shared: Arc<ServiceShared>,
@@ -1289,7 +1297,10 @@ pub(crate) struct AccessibilityActions {
 impl AccessibilityActions {
     /// The callback an accessibility adapter carries, since it is constructed before the window
     /// that will own it.
-    #[cfg_attr(not(any(target_os = "linux", target_os = "windows")), allow(dead_code))]
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "windows")),
+        allow(dead_code, reason = "transport helpers are used only on Linux and Windows")
+    )]
     pub(crate) fn callback(
         &self,
     ) -> Arc<dyn Fn(vivid_protocol::identity::SurfaceIdentity, u64, AccessibleAction) + Send + Sync>
@@ -1665,6 +1676,11 @@ fn actor_loop(
                 }
             },
             Ok(ActorMessage::Wake) => {},
+            #[cfg(test)]
+            Ok(ActorMessage::FaultForTest(mutate)) => {
+                mutate();
+                panic!("injected actor failure after partial mutation");
+            },
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 shared.actor_timeout_services.fetch_add(1, Ordering::Relaxed);
             },
@@ -4182,7 +4198,10 @@ fn io_error_kind_name(kind: ErrorKind) -> &'static str {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "these established rendering and protocol entry points carry independently required context"
+)]
 fn trace_track_channel_rejected(
     shared: &ServiceShared,
     track: Option<TrackIdentity>,
@@ -6467,7 +6486,10 @@ fn apply_raster_delta(base: &Frame, delta: media::ParsedRasterDeltaFrame<'_>) ->
     })
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "these established rendering and protocol entry points carry independently required context"
+)]
 fn copy_raster_rect(
     rgba: &mut [u8],
     frame_width: u32,
@@ -6573,13 +6595,17 @@ fn wake_listener(endpoint: &str) {
     }
 }
 
+// Debug omits user content and native resources, and never acquires application locks.
+impl std::fmt::Debug for VividService {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VividService").finish_non_exhaustive()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vivid_protocol::messages::LaneClass;
-    use vivid_protocol::track::{
-        AudioConfiguration, KindConfiguration, TrackConfiguration, TrackMode,
-    };
+    use vivid_protocol::track::{AudioConfiguration, KindConfiguration};
 
     macro_rules! socket_service {
         ($service:expr) => {
@@ -6598,8 +6624,7 @@ mod tests {
     use vivid_sdk::{
         CoordinateModel, Fit, MILESTONE_CHANNEL_DETACHED, MILESTONE_OUTPUT_READY,
         MILESTONE_PRESENTED, ProducerAuthentication, ProducerConfig, RasterConfiguration,
-        RequestMetadata, SceneNode, SessionEvent, SlotBinding, SurfaceDefinition,
-        SurfaceDescriptor, SurfaceRole, TrackWaitCondition,
+        RequestMetadata, SessionEvent, SlotBinding, SurfaceRole, TrackWaitCondition,
     };
 
     fn test_geometry() -> DisplayGeometry {
@@ -10264,6 +10289,58 @@ mod tests {
             1,
             "the untouched session registers its anchor as usual"
         );
+    }
+
+    #[test]
+    fn actor_panic_retires_only_its_owner_after_partial_mutation() {
+        let service =
+            socket_service!(VividService::start_with_wake(test_geometry(), Arc::new(|_| {})));
+        let mut failed = connect(&service);
+        let failed_surface = grid_surface(&mut failed, 9);
+        let [failed_runtime] = live_sessions(&service).try_into().ok().expect("one session");
+        let mut surviving = connect(&service);
+        let surviving_surface = grid_surface(&mut surviving, 9);
+        assert_eq!(failed_surface.context_id(), surviving_surface.context_id());
+        assert_eq!(failed_surface.id(), surviving_surface.id());
+        let surviving_runtime = live_sessions(&service)
+            .into_iter()
+            .find(|session| session.identity != failed_runtime.identity)
+            .unwrap();
+        let original_contexts = lock(&surviving_runtime.contexts).len();
+        let mutated = failed_runtime.clone();
+        lock(&failed_runtime.actor_ingress)
+            .as_ref()
+            .unwrap()
+            .send(ActorMessage::FaultForTest(Box::new(move || {
+                lock(&mutated.contexts).clear();
+            })))
+            .unwrap();
+        assert!(wait_until(Duration::from_secs(2), || {
+            !lock(&service.shared.registry)
+                .sessions
+                .contains_key(&failed_runtime.identity.session_id())
+        }));
+        let failed_identity = failed_runtime
+            .identity
+            .context(failed_surface.context_id())
+            .unwrap()
+            .surface(9)
+            .unwrap();
+        let surviving_identity = surviving_runtime
+            .identity
+            .context(surviving_surface.context_id())
+            .unwrap()
+            .surface(9)
+            .unwrap();
+        assert!(wait_until(Duration::from_secs(2), || {
+            service.shared.scene.surface_status(failed_identity).is_none()
+        }));
+        assert!(service.shared.scene.surface_status(surviving_identity).is_some());
+        assert_eq!(lock(&surviving_runtime.contexts).len(), original_contexts);
+        // The other owner still accepts mutations after the failed actor and reader exit.
+        let another_surface = grid_surface(&mut surviving, 10);
+        assert_eq!(another_surface.context_id(), surviving_surface.context_id());
+        surviving.close().unwrap();
     }
 
     /// A session that leaves takes its marker tag with it and nothing else.

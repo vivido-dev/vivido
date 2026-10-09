@@ -21,7 +21,9 @@ use conpty::Conpty as Backend;
 use miow::pipe::{AnonRead, AnonWrite};
 use polling::{Event, Poller};
 
+/// Poller token reserved for child-process lifecycle events.
 pub const PTY_CHILD_EVENT_TOKEN: usize = 1;
+/// Poller token reserved for PTY reads and writes.
 pub const PTY_READ_WRITE_TOKEN: usize = 2;
 
 type ReadPipe = UnblockedReader<AnonRead>;
@@ -38,18 +40,28 @@ struct ConptyBackend {
     conout: ReadPipe,
 }
 
+/// Owned Windows pseudoconsole, pipes, and child-process watcher.
 pub struct Pty {
     backend: ConptyBackend,
     conin: WritePipe,
     child_watcher: ChildExitWatcher,
     shell_integration: Option<IntegratedShell>,
+    _environment: Option<super::TerminfoGuard>,
 }
 
+/// Create a pseudoconsole and apply terminal defaults to its child environment.
+///
+/// # Errors
+///
+/// Returns an I/O error if console, pipe, environment, or child-process initialization fails.
 pub fn new(config: &Options, window_size: WindowSize, _window_id: u64) -> Result<Pty> {
     let mut config = with_shell_environment(config);
+    let environment = super::setup_env();
+    environment.apply_options(&mut config.env);
     let shell_integration = powershell::configure(&mut config);
     let mut pty = conpty::new(&config, window_size)?;
     pty.shell_integration = shell_integration;
+    pty._environment = Some(environment);
     Ok(pty)
 }
 
@@ -81,9 +93,11 @@ impl Pty {
             conin: conin.into(),
             child_watcher,
             shell_integration: None,
+            _environment: None,
         }
     }
 
+    /// Borrow the watcher for this PTY’s child process.
     pub fn child_watcher(&self) -> &ChildExitWatcher {
         &self.child_watcher
     }
@@ -221,6 +235,11 @@ pub fn win32_string<S: AsRef<OsStr> + ?Sized>(value: &S) -> Vec<u16> {
     OsStr::new(value).encode_wide().chain(once(0)).collect()
 }
 
+impl std::fmt::Debug for Pty {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("Pty").finish_non_exhaustive()
+    }
+}
 #[cfg(test)]
 mod test {
     use crate::terminal::tty::windows::{cmdline, push_escaped_arg, with_shell_environment};

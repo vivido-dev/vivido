@@ -9,7 +9,6 @@
 //! left exactly as it was.
 
 use bytemuck::{Pod, Zeroable};
-use vello::wgpu;
 use winit::dpi::PhysicalSize;
 
 const SHADER: &str = r#"

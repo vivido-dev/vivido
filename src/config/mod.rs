@@ -8,21 +8,33 @@ use serde::Deserialize;
 use toml::de::Error as TomlError;
 use toml::{Table, Value};
 
+/// Bell types and operations.
 pub mod bell;
+/// Color types and operations.
 pub mod color;
+/// Cursor types and operations.
 pub mod cursor;
+/// Debug types and operations.
 pub mod debug;
+/// File drop types and operations.
 pub mod file_drop;
+/// Font types and operations.
 pub mod font;
 pub mod general;
 pub mod message_bar;
+/// Monitor types and operations.
 pub mod monitor;
+/// Scrolling types and operations.
 pub mod scrolling;
+/// Selection types and operations.
 pub mod selection;
 pub mod serde_utils;
+/// Terminal types and operations.
 pub mod terminal;
+/// Ui config types and operations.
 pub mod ui_config;
 pub mod updates;
+/// Window types and operations.
 pub mod window;
 
 mod bindings;
@@ -129,8 +141,12 @@ where
 }
 
 /// Attempt to reload the configuration file.
+///
+/// # Errors
+///
+/// Returns an error when the configuration cannot be read, parsed, or converted to settings.
 pub fn reload(config_path: &Path, options: &mut Options) -> Result<UiConfig> {
-    debug!("Reloading configuration file: {config_path:?}");
+    debug!(event = "config_reload"; "Reloading configuration");
 
     // Load config, propagating errors.
     let mut config = load_from(config_path)?;
@@ -151,11 +167,11 @@ fn load_from(path: &Path) -> Result<UiConfig> {
     match read_config(path) {
         Ok(config) => Ok(config),
         Err(Error::Io(io)) if io.kind() == io::ErrorKind::NotFound => {
-            error!(target: LOG_TARGET_CONFIG, "Unable to load config {path:?}: File not found");
+            error!(target: LOG_TARGET_CONFIG, event = "config_load_failed", error_kind = "not_found"; "Configuration file was not found");
             Err(Error::Io(io))
         },
         Err(err) => {
-            error!(target: LOG_TARGET_CONFIG, "Unable to load config {path:?}: {err}");
+            error!(target: LOG_TARGET_CONFIG, event = "config_load_failed"; "Unable to load configuration");
             Err(err)
         },
     }
@@ -190,6 +206,10 @@ fn parse_config(
 }
 
 /// Deserialize a configuration file.
+///
+/// # Errors
+///
+/// Returns an error when the file cannot be read or contains invalid TOML.
 pub fn deserialize_config(path: &Path) -> Result<Value> {
     let mut contents = fs::read_to_string(path)?;
 
@@ -214,8 +234,9 @@ fn load_imports(
     // Get paths for all imports.
     let import_paths = match imports(config, base_path, recursion_limit) {
         Ok(import_paths) => import_paths,
-        Err(err) => {
-            error!(target: LOG_TARGET_CONFIG, "{err}");
+        Err(_) => {
+            error!(target: LOG_TARGET_CONFIG, event = "config_import_list_invalid";
+                "Configuration imports could not be resolved");
             return Value::Table(Table::new());
         },
     };
@@ -225,8 +246,9 @@ fn load_imports(
     for import_path in import_paths {
         let path = match import_path {
             Ok(path) => path,
-            Err(err) => {
-                error!(target: LOG_TARGET_CONFIG, "{err}");
+            Err(_) => {
+                error!(target: LOG_TARGET_CONFIG, event = "config_import_path_invalid";
+                    "Configuration import path is invalid");
                 continue;
             },
         };
@@ -234,11 +256,11 @@ fn load_imports(
         match parse_config(&path, config_paths, recursion_limit - 1) {
             Ok(config) => merged = serde_utils::merge(merged, config),
             Err(Error::Io(io)) if io.kind() == io::ErrorKind::NotFound => {
-                info!(target: LOG_TARGET_CONFIG, "Config import not found:\n  {:?}", path.display());
+                info!(target: LOG_TARGET_CONFIG, event = "config_import_missing"; "Configuration import was not found");
                 continue;
             },
-            Err(err) => {
-                error!(target: LOG_TARGET_CONFIG, "Unable to import config {path:?}: {err}")
+            Err(_) => {
+                error!(target: LOG_TARGET_CONFIG, event = "config_import_failed"; "Unable to import configuration")
             },
         }
     }
@@ -247,6 +269,10 @@ fn load_imports(
 }
 
 /// Get all import paths for a configuration.
+///
+/// # Errors
+///
+/// Returns an error for invalid import entries or excessive recursive import depth.
 pub fn imports(
     config: &Value,
     base_path: &Path,

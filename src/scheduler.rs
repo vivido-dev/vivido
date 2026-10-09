@@ -40,6 +40,7 @@ pub enum Topic {
 }
 
 /// Event scheduled to be emitted at a specific time.
+#[derive(Debug)]
 pub struct Timer {
     pub deadline: Instant,
     pub event: Event,
@@ -114,5 +115,12 @@ impl Scheduler {
     /// stick around forever and cause a memory leak.
     pub fn unschedule_window(&mut self, window_id: WindowId) {
         self.timers.retain(|timer| timer.id.window_id != window_id);
+    }
+}
+
+// Debug omits user content and native resources, and never acquires application locks.
+impl std::fmt::Debug for Scheduler {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Scheduler").finish_non_exhaustive()
     }
 }

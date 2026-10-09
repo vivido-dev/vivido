@@ -280,6 +280,17 @@ impl Wake for Registration {
     }
 }
 
+impl<R> std::fmt::Debug for UnblockedReader<R> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("UnblockedReader").finish_non_exhaustive()
+    }
+}
+
+impl<W> std::fmt::Debug for UnblockedWriter<W> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("UnblockedWriter").finish_non_exhaustive()
+    }
+}
 #[cfg(test)]
 mod tests {
     use std::io::{Cursor, Read};

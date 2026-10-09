@@ -31,6 +31,7 @@ pub fn run_reexec(
     let raw_readiness = readiness_handle as HANDLE;
     let mut handle_flags = 0;
     if raw_readiness.is_null()
+        // SAFETY: The candidate handle is queried without dereferencing it and the flag output is initialized writable storage.
         || unsafe { GetHandleInformation(raw_readiness, &mut handle_flags) } == 0
     {
         return Err(io::Error::new(
@@ -44,6 +45,7 @@ pub fn run_reexec(
     let readiness = unsafe { File::from_raw_handle(raw_readiness as RawHandle) };
     // The handle had to cross this re-exec, but the shell must never inherit it. Otherwise the
     // parent cannot observe EOF after readiness and waits for the shell to exit.
+    // SAFETY: The handle is live and only its scalar inheritance flag is updated.
     if unsafe { SetHandleInformation(readiness.as_raw_handle() as HANDLE, HANDLE_FLAG_INHERIT, 0) }
         == 0
     {
@@ -105,10 +107,12 @@ fn spawn_isolated(program: &Path, arguments: &[OsString], readiness: &File) -> i
 
     let mut size = 0;
     // Sizing call: it fails by design and reports the size the one-attribute list needs.
+    // SAFETY: The documented sizing query uses null storage and a writable byte-count output.
     unsafe { InitializeProcThreadAttributeList(ptr::null_mut(), 1, 0, &mut size) };
     // `usize` storage keeps the opaque list pointer-aligned.
     let mut storage = vec![0usize; size.div_ceil(mem::size_of::<usize>())];
     let attributes = storage.as_mut_ptr() as LPPROC_THREAD_ATTRIBUTE_LIST;
+    // SAFETY: The attribute buffer is pointer-aligned and has the previously reported byte capacity.
     if unsafe { InitializeProcThreadAttributeList(attributes, 1, 0, &mut size) } == 0 {
         return Err(io::Error::last_os_error());
     }
@@ -116,10 +120,12 @@ fn spawn_isolated(program: &Path, arguments: &[OsString], readiness: &File) -> i
     struct AttributeList(LPPROC_THREAD_ATTRIBUTE_LIST);
     impl Drop for AttributeList {
         fn drop(&mut self) {
+            // SAFETY: The list was initialized successfully and its aligned backing storage outlives this guard.
             unsafe { DeleteProcThreadAttributeList(self.0) };
         }
     }
     let _attributes = AttributeList(attributes);
+    // SAFETY: The initialized attribute list and referenced pseudoconsole or handle-list storage remain live through process creation.
     if unsafe {
         UpdateProcThreadAttribute(
             attributes,
@@ -135,6 +141,7 @@ fn spawn_isolated(program: &Path, arguments: &[OsString], readiness: &File) -> i
         return Err(io::Error::last_os_error());
     }
 
+    // SAFETY: The Windows startup/output structure consists of integer and pointer fields for which zero is valid.
     let mut startup: STARTUPINFOEXW = unsafe { mem::zeroed() };
     startup.StartupInfo.cb = mem::size_of::<STARTUPINFOEXW>() as u32;
     startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
@@ -145,6 +152,7 @@ fn spawn_isolated(program: &Path, arguments: &[OsString], readiness: &File) -> i
 
     let application = wide_nul(program.as_os_str())?;
     let mut command_line = command_line(program.as_os_str(), arguments)?;
+    // SAFETY: The Windows startup/output structure consists of integer and pointer fields for which zero is valid.
     let mut process: PROCESS_INFORMATION = unsafe { mem::zeroed() };
     // SAFETY: every pointer refers to a live, NUL-terminated buffer or initialized structure, and
     // the handle list names two open, inheritable handles owned by this function's caller.
@@ -165,6 +173,7 @@ fn spawn_isolated(program: &Path, arguments: &[OsString], readiness: &File) -> i
     {
         return Err(io::Error::last_os_error());
     }
+    // SAFETY: This scope owns the checked native handle and releases it exactly once after its final use.
     unsafe {
         CloseHandle(process.hThread);
         CloseHandle(process.hProcess);
@@ -177,6 +186,7 @@ fn inheritable_null() -> io::Result<File> {
     use windows_sys::Win32::Foundation::{HANDLE, HANDLE_FLAG_INHERIT, SetHandleInformation};
 
     let null = std::fs::OpenOptions::new().read(true).write(true).open("NUL")?;
+    // SAFETY: The handle is live and only its scalar inheritance flag is updated.
     if unsafe {
         SetHandleInformation(
             null.as_raw_handle() as HANDLE,
@@ -261,12 +271,15 @@ pub(super) fn readiness_pipe() -> io::Result<(File, File)> {
     };
     let mut read = ptr::null_mut();
     let mut write = ptr::null_mut();
+    // SAFETY: The output handle slots and security attributes are initialized locals; successful ownership transfers to File.
     if unsafe { CreatePipe(&mut read, &mut write, &attributes, 8 * 1024) } == 0 {
         return Err(io::Error::last_os_error());
     }
     // Only the write end crosses re-exec. If the child inherited the read end, the readiness
     // protocol could not reliably observe writer closure after an early startup failure.
+    // SAFETY: The handle is live and only its scalar inheritance flag is updated.
     if unsafe { SetHandleInformation(read, HANDLE_FLAG_INHERIT, 0) } == 0 {
+        // SAFETY: This scope owns the checked native handle and releases it exactly once after its final use.
         unsafe {
             windows_sys::Win32::Foundation::CloseHandle(read);
             windows_sys::Win32::Foundation::CloseHandle(write);
@@ -329,15 +342,18 @@ mod tests {
         use windows_sys::Win32::UI::Shell::CommandLineToArgvW;
 
         let mut count = 0;
+        // SAFETY: The test supplies a NUL-terminated command line; the checked result owns count native argument pointers.
         let argv = unsafe { CommandLineToArgvW(line.as_ptr(), &mut count) };
         assert!(!argv.is_null(), "{}", io::Error::last_os_error());
         let split = (0..count as usize)
+            // SAFETY: The index is below the native argument count and Windows guarantees each returned argument is NUL-terminated.
             .map(|index| unsafe {
                 let argument = *argv.add(index);
                 let length = (0..).take_while(|&offset| *argument.add(offset) != 0).count();
                 OsString::from_wide(std::slice::from_raw_parts(argument, length))
             })
             .collect();
+        // SAFETY: This pointer is an owned allocation returned by the matching Windows allocation API and is released once.
         unsafe { LocalFree(argv.cast()) };
         split
     }

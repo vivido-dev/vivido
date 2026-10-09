@@ -15,6 +15,7 @@ use crate::config::ui_config::{Delta, Percentage};
 pub const DEFAULT_NAME: &str = "Vivido";
 
 #[derive(Serialize, Debug, Clone, PartialEq)]
+/// Window size, placement, appearance, and native integration settings.
 pub struct WindowConfig {
     /// Initial position.
     pub position: Option<Delta<i32>>,
@@ -82,6 +83,7 @@ impl Default for WindowConfig {
 
 impl WindowConfig {
     #[inline]
+    /// Return the pending or configured window dimensions, when explicitly set.
     pub fn dimensions(&self) -> Option<Dimensions> {
         let (lines, columns) = (self.dimensions.lines, self.dimensions.columns);
         let (lines_is_non_zero, columns_is_non_zero) = (lines != 0, columns != 0);
@@ -111,6 +113,7 @@ impl WindowConfig {
     }
 
     #[inline]
+    /// Compute physical-pixel window padding for the supplied scale factor.
     pub fn padding(&self, scale_factor: f32) -> (f32, f32) {
         let padding_x = (f32::from(self.padding.x) * scale_factor).floor();
         let padding_y = (f32::from(self.padding.y) * scale_factor).floor();
@@ -118,6 +121,7 @@ impl WindowConfig {
     }
 
     #[inline]
+    /// Return the requested native fullscreen mode.
     pub fn fullscreen(&self) -> Option<Fullscreen> {
         if self.startup_mode == StartupMode::Fullscreen {
             Some(Fullscreen::Borderless(None))
@@ -127,11 +131,13 @@ impl WindowConfig {
     }
 
     #[inline]
+    /// Whether startup requests a maximized window.
     pub fn maximized(&self) -> bool {
         self.startup_mode == StartupMode::Maximized
     }
 
     #[cfg(target_os = "macos")]
+    /// Convert the configured Option-key policy to the native window policy.
     pub fn option_as_alt(&self) -> WinitOptionAsAlt {
         match self.option_as_alt {
             OptionAsAlt::OnlyLeft => WinitOptionAsAlt::OnlyLeft,
@@ -141,12 +147,14 @@ impl WindowConfig {
         }
     }
 
+    /// Return the optional native decoration theme.
     pub fn theme(&self) -> Option<WinitTheme> {
         self.decorations_theme_variant.map(WinitTheme::from)
     }
 }
 
 #[derive(Serialize, Debug, Clone, PartialEq, Eq)]
+/// Window title and application class identity.
 pub struct Identity {
     /// Window title.
     pub title: String,
@@ -162,20 +170,30 @@ impl Default for Identity {
 }
 
 #[derive(Serialize, Default, Debug, Copy, Clone, PartialEq, Eq)]
+/// Initial native window state.
 pub enum StartupMode {
     #[default]
+    /// A normal window.
     Windowed,
+    /// A maximized window.
     Maximized,
+    /// Native fullscreen mode.
     Fullscreen,
+    /// macOS fullscreen without a separate native space.
     SimpleFullscreen,
 }
 
 #[derive(Serialize, Default, Debug, Copy, Clone, PartialEq, Eq)]
+/// Native window decoration policy.
 pub enum Decorations {
     #[default]
+    /// All native decorations.
     Full,
+    /// Transparent title-bar decorations.
     Transparent,
+    /// Title-bar decorations without window buttons.
     Buttonless,
+    /// No active value or behavior for this variant.
     None,
 }
 
@@ -194,11 +212,14 @@ pub struct Dimensions {
 /// Window class hint.
 #[derive(Serialize, Debug, Clone, PartialEq, Eq)]
 pub struct Class {
+    /// General application class.
     pub general: String,
+    /// Instance-specific application class.
     pub instance: String,
 }
 
 impl Class {
+    /// Create an application class from general and instance names.
     pub fn new(general: impl ToString, instance: impl ToString) -> Self {
         Self { general: general.to_string(), instance: instance.to_string() }
     }
@@ -269,6 +290,7 @@ impl<'de> Deserialize<'de> for Class {
 }
 
 #[derive(Serialize, Default, Debug, Clone, Copy, PartialEq, Eq)]
+/// Which macOS Option keys act as terminal Alt modifiers.
 pub enum OptionAsAlt {
     /// The left `Option` key is treated as `Alt`.
     OnlyLeft,
@@ -287,7 +309,9 @@ pub enum OptionAsAlt {
 /// System decorations theme variant.
 #[derive(Serialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Theme {
+    /// Light native decoration theme.
     Light,
+    /// Dark native decoration theme.
     Dark,
 }
 
@@ -301,9 +325,12 @@ impl From<Theme> for WinitTheme {
 }
 
 #[derive(Serialize, Default, Debug, Clone, Copy, PartialEq, Eq)]
+/// Native window stacking level.
 pub enum WindowLevel {
     #[default]
+    /// Normal presentation or stacking behavior.
     Normal,
+    /// Stack above normal windows.
     AlwaysOnTop,
 }
 

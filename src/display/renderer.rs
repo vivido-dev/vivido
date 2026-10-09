@@ -10,7 +10,7 @@ use parking_lot::Mutex;
 use pollster::block_on;
 use vello::peniko::Color;
 use vello::util::{RenderContext, RenderSurface};
-use vello::{AaConfig, AaSupport, RenderParams, Renderer, RendererOptions, Scene, wgpu};
+use vello::{AaConfig, AaSupport, RenderParams, Renderer, RendererOptions, Scene};
 use winit::dpi::{PhysicalPosition, PhysicalSize};
 #[cfg(windows)]
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -32,14 +32,23 @@ use crate::display::media::VividMediaRenderer;
 use crate::display::window::RenderSource;
 
 #[derive(Debug)]
+/// A failure while creating or using this module's display resources.
 pub enum Error {
+    /// Native GPU surface creation failed.
     CreateSurface(vello::Error),
+    /// GPU renderer initialization failed.
     CreateRenderer(vello::Error),
+    /// Rendering failed or produced a render-related event.
     Render(vello::Error),
+    /// The native surface configuration was rejected.
     SurfaceValidation,
+    /// No compatible offscreen graphics adapter was available.
     NoOffscreenAdapter(String),
+    /// No compatible graphics device was available for the window.
     NoWindowDevice,
+    /// The graphics device is unavailable or lost.
     GpuUnavailable(String),
+    /// Native Windows composition initialization or presentation failed.
     #[cfg(windows)]
     WindowsComposition(windows::core::Error),
 }
@@ -54,13 +63,18 @@ const SCREENSHOT_PIXEL_BYTES: u32 = 4;
 
 #[cfg(any(unix, windows, test))]
 #[derive(Debug)]
+/// A failure while capturing or reading a rendered frame.
 pub enum ScreenshotError {
     #[cfg(any(unix, windows))]
+    /// No completed frame is available to capture.
     NoPresentedFrame,
+    /// The requested capture exceeds resource limits.
     TooLarge,
     #[cfg(any(unix, windows))]
+    /// GPU device operation failed.
     Device(String),
     #[cfg(any(unix, windows))]
+    /// GPU frame readback failed.
     Readback(String),
 }
 
@@ -86,20 +100,31 @@ impl std::error::Error for ScreenshotError {}
 #[cfg(any(unix, windows))]
 pub struct ScreenshotReadback {
     receiver: Receiver<Result<Vec<u8>, String>>,
+    /// Width in this value's coordinate system.
     pub width: u32,
+    /// Height in this value's coordinate system.
     pub height: u32,
+    /// GPU readback row stride including alignment padding.
     pub padded_bytes_per_row: u32,
+    /// Instant at which this operation began.
     pub started: Instant,
+    /// Capture regions that must be redacted before export.
     pub redactions: Vec<CaptureRedaction>,
 }
 
 /// Completed screenshot pixels with WebGPU row padding still present.
 #[cfg(any(unix, windows))]
+#[derive(Debug)]
 pub struct ScreenshotPixels {
+    /// Payload bytes or the declared payload byte count.
     pub bytes: Vec<u8>,
+    /// Width in this value's coordinate system.
     pub width: u32,
+    /// Height in this value's coordinate system.
     pub height: u32,
+    /// GPU readback row stride including alignment padding.
     pub padded_bytes_per_row: u32,
+    /// Capture regions that must be redacted before export.
     pub redactions: Vec<CaptureRedaction>,
 }
 
@@ -125,6 +150,7 @@ impl std::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+/// GPU resources for rendering window, offscreen, and embedded scenes.
 pub struct SceneRenderer {
     /// Owns the wgpu instance and the surface's device. Absent when rendering offscreen.
     context: Option<SharedRenderContext>,
@@ -178,8 +204,11 @@ impl WindowsComposition {
         let device: IDCompositionDevice = unsafe { DCompositionCreateDevice2(None::<&IUnknown>) }?;
         // Put the visual above any HWND client/child content. The HWND itself has no redirection
         // bitmap, so transparent visual pixels reach the desktop compositor directly.
+        // SAFETY: The HWND belongs to the live event-loop window and the COM device remains retained.
         let target = unsafe { device.CreateTargetForHwnd(hwnd, true) }?;
+        // SAFETY: The retained COM device creates an owned visual interface.
         let visual = unsafe { device.CreateVisual() }?;
+        // SAFETY: Both retained COM interfaces are live and remain owned by the composition object.
         unsafe {
             target.SetRoot(&visual)?;
         }
@@ -188,6 +217,7 @@ impl WindowsComposition {
     }
 
     fn commit(&self) -> windows::core::Result<()> {
+        // SAFETY: The retained composition device is live and this call retains no Rust borrows.
         unsafe { self.device.Commit() }
     }
 }
@@ -195,12 +225,16 @@ impl WindowsComposition {
 /// Latest GPU frame retained by an embedded Vivido window.
 pub struct EmbeddedFrame<'a> {
     texture: &'a wgpu::Texture,
+    /// Physical-pixel dimensions.
     pub size: PhysicalSize<u32>,
 }
 
 /// Placement of an embedded frame in a window render target.
+#[derive(Debug)]
 pub struct EmbeddedFramePlacement<'a> {
+    /// Borrowed embedded frame resources.
     pub frame: EmbeddedFrame<'a>,
+    /// Physical-pixel placement origin.
     pub origin: PhysicalPosition<u32>,
 }
 
@@ -281,6 +315,7 @@ impl SharedRenderState {
 }
 
 impl SharedRenderContext {
+    /// Create lazily initialized rendering resources shared by embedded panes.
     pub fn new() -> Self {
         Self(Rc::new(RefCell::new(SharedRenderState {
             context: create_window_render_context(),
@@ -349,6 +384,11 @@ fn retire_window_render_context(context: &SharedRenderContext) {
 }
 
 impl SceneRenderer {
+    /// Create GPU rendering resources for the requested target and dimensions.
+    ///
+    /// # Errors
+    ///
+    /// Returns a renderer error if adapter, device, or target initialization fails.
     pub fn new(
         source: RenderSource,
         size: PhysicalSize<u32>,
@@ -368,6 +408,7 @@ impl SceneRenderer {
                 let current_composition =
                     WindowsComposition::new(&window).map_err(Error::WindowsComposition)?;
                 #[cfg(windows)]
+                // SAFETY: the native window owns these handles and is retained until the GPU surface is dropped.
                 let wgpu_surface = unsafe {
                     context_ref.context.instance.create_surface_unsafe(
                         wgpu::SurfaceTargetUnsafe::CompositionVisual(
@@ -483,6 +524,10 @@ impl SceneRenderer {
     /// reason to lose the terminal, so the whole GPU side is discarded and built again. The caller
     /// re-attaches the Vivid scene and marks the window fully damaged; track textures re-upload
     /// from the scene's retained frames on the next draw.
+    ///
+    /// # Errors
+    ///
+    /// Returns a renderer error when graphics-device or rendering-resource initialization fails.
     pub fn rebuild(
         &mut self,
         source: RenderSource,
@@ -508,6 +553,7 @@ impl SceneRenderer {
         Ok(())
     }
 
+    /// Resize the render target within graphics-device limits.
     pub fn resize(&mut self, size: PhysicalSize<u32>) {
         let size = self.clamp_render_size(size);
         if size.width == 0 || size.height == 0 {
@@ -579,6 +625,7 @@ impl SceneRenderer {
         self.resize(self.target_size);
     }
 
+    /// Clamp physical dimensions to supported render-target limits.
     pub fn clamp_render_size(&self, size: PhysicalSize<u32>) -> PhysicalSize<u32> {
         clamp_render_size(size, self.max_surface_dimension)
     }
@@ -601,16 +648,19 @@ impl SceneRenderer {
         self.corner_radius = radius;
     }
 
+    /// Replace the presented Vivid scene and invalidate cached rendering.
     pub fn set_vivid_scene(&mut self, scene: crate::vivid::scene::SharedScene) {
         self.overlays.clear(&mut self.renderer.borrow_mut());
         self.overlays.scene = Some(scene.clone());
         self.media.set_scene(scene);
     }
 
+    /// Submit a protocol-neutral graphics command and invalidate affected rendering.
     pub fn submit_graphics(&mut self, command: GraphicsCommand) {
         self.media.submit(command);
     }
 
+    /// Return current media upload counters.
     pub fn media_metrics(&self) -> super::media::SourceUploadMetrics {
         self.media.source_upload_metrics()
     }
@@ -619,6 +669,7 @@ impl SceneRenderer {
         self.overlays.metrics()
     }
 
+    /// Prepare media resources needed by the next terminal frame.
     pub fn prepare_media(
         &mut self,
         size: &SizeInfo,
@@ -658,6 +709,11 @@ impl SceneRenderer {
         Some(media)
     }
 
+    /// Render a vector scene and report whether a frame was presented.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the render target or graphics device cannot complete the frame.
     pub fn render(&mut self, scene: &Scene, base_color: Color) -> Result<bool, Error> {
         self.render_composited(scene, base_color, &[], None)
     }
@@ -667,6 +723,10 @@ impl SceneRenderer {
     /// An embedded pane is copied on top of the finished scene, so anything the chrome draws in the
     /// pane's rectangle — a dropdown anchored to the tab strip — would be overwritten. Naming that
     /// rectangle here keeps the overlay visible without a second scene pass.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a composition target or graphics device cannot complete the frame.
     pub fn render_composited(
         &mut self,
         scene: &Scene,
@@ -778,6 +838,7 @@ impl SceneRenderer {
         Ok(true)
     }
 
+    /// Borrow the current embedded frame, when available.
     pub fn embedded_frame(&self) -> Option<EmbeddedFrame<'_>> {
         (self.has_rendered_frame && !self.gpu_health.failed())
             .then_some(EmbeddedFrame { texture: &self.render_target, size: self.target_size })
@@ -791,6 +852,10 @@ impl SceneRenderer {
 
     /// Start asynchronously reading the last rendered frame.
     #[cfg(any(unix, windows))]
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no readable frame exists or GPU readback cannot start.
     pub fn begin_screenshot(&self) -> Result<ScreenshotReadback, ScreenshotError> {
         if !self.has_rendered_frame {
             return Err(ScreenshotError::NoPresentedFrame);
@@ -849,6 +914,10 @@ impl SceneRenderer {
 
     /// Poll an asynchronous screenshot without blocking the renderer thread.
     #[cfg(any(unix, windows))]
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if GPU mapping fails or the captured frame is no longer valid.
     pub fn poll_screenshot(
         &self,
         readback: &ScreenshotReadback,
@@ -1010,19 +1079,28 @@ impl Drop for SceneRenderer {
 pub mod bump_probe {
     use std::sync::Mutex;
 
-    use vello::low_level::BumpAllocators;
+    use vello::low_level::vello_encoding::BumpAllocators;
 
     /// The per-buffer maxima, in elements, as `BumpAllocators` reports them.
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
     pub struct Peak {
+        /// Number of measured frames.
         pub frames: u64,
+        /// Union of allocator-overflow stage flags.
         pub failed: u32,
+        /// Peak binning allocation, in elements.
         pub binning: u32,
+        /// Peak per-tile command allocation, in elements.
         pub ptcl: u32,
+        /// Peak tile allocation, in elements.
         pub tile: u32,
+        /// Peak segment-count allocation, in elements.
         pub seg_counts: u32,
+        /// Peak path-segment allocation, in elements.
         pub segments: u32,
+        /// Peak blend-stack allocation, in elements.
         pub blend: u32,
+        /// Peak flattened-line allocation, in elements.
         pub lines: u32,
     }
 
@@ -1309,6 +1387,34 @@ fn premultiply_blend_state() -> wgpu::BlendState {
 pub(crate) fn gpu_test_lock() -> std::sync::MutexGuard<'static, ()> {
     static GPU: std::sync::Mutex<()> = std::sync::Mutex::new(());
     GPU.lock().unwrap_or_else(|err| err.into_inner())
+}
+
+// Debug omits user content and native resources, and never acquires application locks.
+impl std::fmt::Debug for ScreenshotReadback {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ScreenshotReadback").finish_non_exhaustive()
+    }
+}
+
+// Debug omits user content and native resources, and never acquires application locks.
+impl std::fmt::Debug for SceneRenderer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SceneRenderer").finish_non_exhaustive()
+    }
+}
+
+// Debug omits user content and native resources, and never acquires application locks.
+impl std::fmt::Debug for EmbeddedFrame<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EmbeddedFrame").finish_non_exhaustive()
+    }
+}
+
+// Debug omits user content and native resources, and never acquires application locks.
+impl std::fmt::Debug for SharedRenderContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SharedRenderContext").finish_non_exhaustive()
+    }
 }
 
 #[cfg(test)]

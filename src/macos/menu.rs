@@ -12,12 +12,19 @@ use crate::event::{Event, EventSink, EventType};
 /// the remaining commands to the terminal processor.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MenuCommand {
+    /// Open a new terminal window.
     NewWindow,
+    /// Open a new terminal tab.
     NewTab,
+    /// Copy the terminal selection.
     Copy,
+    /// Paste clipboard text.
     Paste,
+    /// Start terminal text search.
     Find,
+    /// Clear terminal scrollback.
     Clear,
+    /// Request an application update check.
     CheckForUpdates,
 }
 

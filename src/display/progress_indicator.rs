@@ -1,7 +1,7 @@
 //! Mirror OSC 9;4 progress onto the platform's application indicator.
 //!
 //! Windows draws progress in each top-level window's taskbar button through `ITaskbarList3`, so
-//! [`set_taskbar_progress`] takes the window. The macOS Dock tile belongs to the application, so
+//! `set_taskbar_progress` takes the window. The macOS Dock tile belongs to the application, so
 //! [`set_dock_progress`] takes one combined state (see [`super::progress::most_urgent`]) and shows
 //! it as a badge. Wayland has no portable equivalent, so Linux has neither.
 //!

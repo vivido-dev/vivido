@@ -62,7 +62,7 @@ pub struct Options {
     #[clap(long, value_name = "NAME", requires = "headless")]
     pub session: Option<String>,
 
-    /// Stable same-user automation name for a headed instance [default: vivido-<pid>].
+    /// Stable same-user automation name for a headed instance (default: `vivido-<pid>`).
     #[cfg(any(unix, windows))]
     #[clap(long, value_name = "NAME", conflicts_with_all = ["session", "headless"])]
     pub automation_name: Option<String>,
@@ -127,6 +127,7 @@ pub struct Options {
 }
 
 impl Options {
+    /// Parse process command-line arguments and resolve configuration overrides.
     pub fn new() -> Self {
         let mut options = Self::parse();
 
@@ -183,8 +184,20 @@ impl Options {
 #[cfg(any(unix, windows))]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum HeadlessSize {
-    Cells { columns: u16, lines: u16 },
-    Pixels { width: u32, height: u32 },
+    /// Terminal dimensions expressed in grid cells.
+    Cells {
+        /// Number of terminal columns.
+        columns: u16,
+        /// Number of terminal lines.
+        lines: u16,
+    },
+    /// Terminal dimensions expressed in physical pixels.
+    Pixels {
+        /// Width in this value's coordinate system.
+        width: u32,
+        /// Height in this value's coordinate system.
+        height: u32,
+    },
 }
 
 #[cfg(any(unix, windows))]
@@ -350,8 +363,8 @@ impl WindowIdentity {
 #[derive(Subcommand, Debug)]
 // `Msg` carries the whole message payload while the session verbs carry at most a name. Boxing it
 // would only move the same bytes behind a pointer on a path that runs once per process.
-#[allow(clippy::large_enum_variant)]
 pub enum Subcommands {
+    /// Send a local automation request.
     Msg(MessageOptions),
 
     /// List running headless sessions.
@@ -630,6 +643,7 @@ pub enum SocketMessage {
     /// Inspect or trace the Vivid presenter.
     Vivid {
         #[clap(subcommand)]
+        /// Vivid inspection or wait operation to execute.
         command: IpcVividCommand,
     },
 
@@ -733,6 +747,7 @@ pub struct IpcCapture {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct IpcAutomationPlan {
+    /// Version identifier for this value.
     pub version: u16,
     /// Suite name used by JUnit/SARIF reports; defaults to the plan file stem.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -746,6 +761,7 @@ pub struct IpcAutomationPlan {
     /// Other plan files whose steps run first, resolved relative to this file.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub include: Vec<PathBuf>,
+    /// Ordered automation-plan steps.
     pub steps: Vec<IpcAutomationPlanStep>,
 }
 
@@ -754,17 +770,24 @@ pub struct IpcAutomationPlan {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct IpcAutomationPlanStep {
+    /// Identifier scoped to this value's owning context.
     pub id: String,
+    /// Automation method name.
     pub method: String,
     #[serde(default = "default_plan_params")]
+    /// Method parameters encoded as a JSON object.
     pub params: serde_json::Value,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    /// Bindings from reply JSON pointers to plan variable names.
     pub bind: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Optional condition controlling whether the step runs.
     pub when: Option<IpcPlanCondition>,
     #[serde(default)]
+    /// Policy applied when this step fails.
     pub on_error: IpcPlanErrorPolicy,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Optional post-step verification.
     pub verify: Option<IpcPlanVerification>,
     /// Assertion evaluated against the step's result after a successful action.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -815,7 +838,9 @@ fn default_plan_params() -> serde_json::Value {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct IpcPlanCondition {
+    /// Name of the plan variable being compared.
     pub reference: String,
+    /// JSON value the referenced variable must equal.
     pub equals: serde_json::Value,
 }
 
@@ -825,7 +850,9 @@ pub struct IpcPlanCondition {
 #[serde(rename_all = "snake_case")]
 pub enum IpcPlanErrorPolicy {
     #[default]
+    /// Stop the plan when a step fails.
     Abort,
+    /// Continue with subsequent steps after a failure.
     Continue,
 }
 
@@ -834,12 +861,16 @@ pub enum IpcPlanErrorPolicy {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct IpcPlanVerification {
+    /// Target window identifier or an automation-plan reference resolving to one.
     pub window_id: serde_json::Value,
     #[serde(default = "default_true")]
+    /// Require the rendered frame to change.
     pub frame_changed: bool,
     #[serde(default)]
+    /// Capture a screenshot for verification.
     pub screenshot: bool,
     #[serde(default = "default_ipc_timeout")]
+    /// Maximum wait in milliseconds.
     pub timeout: u64,
 }
 
@@ -849,8 +880,11 @@ const fn default_true() -> bool {
 }
 
 #[cfg(any(unix, windows))]
+// Thirty seconds accommodates shell startup and frame waits while bounding unattended clients.
+const DEFAULT_IPC_TIMEOUT_MS: u64 = 30_000;
+
 const fn default_ipc_timeout() -> u64 {
-    30_000
+    DEFAULT_IPC_TIMEOUT_MS
 }
 
 /// A raw parent handle that can cross the event-loop proxy boundary.
@@ -884,6 +918,7 @@ impl ParentWindowHandle {
 #[cfg(any(target_os = "macos", windows))]
 unsafe impl Send for ParentWindowHandle {}
 #[cfg(any(target_os = "macos", windows))]
+// SAFETY: the constructor requires the parent to outlive children; shared handles are only consumed on the event-loop thread.
 unsafe impl Sync for ParentWindowHandle {}
 
 /// Subset of options that we pass to 'create-window' IPC subcommand.
@@ -1152,12 +1187,16 @@ pub struct IpcDiagnose {
 #[derive(Args, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct IpcVividTrackIdentity {
     #[clap(long)]
+    /// Session component of the complete Vivid owner identity.
     pub session_id: u64,
     #[clap(long)]
+    /// Context component of the complete Vivid owner identity.
     pub context_id: u64,
     #[clap(long)]
+    /// Surface component of the complete Vivid owner identity.
     pub surface_id: u64,
     #[clap(long)]
+    /// Track component of the complete Vivid owner identity.
     pub track_id: u64,
 }
 
@@ -1166,10 +1205,13 @@ pub struct IpcVividTrackIdentity {
 #[derive(Args, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct IpcVividSurfaceIdentity {
     #[clap(long)]
+    /// Session component of the complete Vivid owner identity.
     pub session_id: u64,
     #[clap(long)]
+    /// Context component of the complete Vivid owner identity.
     pub context_id: u64,
     #[clap(long)]
+    /// Surface component of the complete Vivid owner identity.
     pub surface_id: u64,
 }
 
@@ -1177,27 +1219,40 @@ pub struct IpcVividSurfaceIdentity {
 #[cfg(any(unix, windows))]
 #[derive(Subcommand, Debug, Clone, PartialEq)]
 pub enum IpcVividCommand {
+    /// Inspect live Vivid sessions.
     Sessions(IpcTarget),
+    /// Inspect owned Vivid surfaces.
     Surfaces(IpcTarget),
+    /// Inspect one fully addressed Vivid surface.
     SurfaceStatus {
         #[clap(flatten)]
+        /// Complete identity of the addressed object.
         identity: IpcVividSurfaceIdentity,
         #[clap(flatten)]
+        /// Terminal window selection for this request.
         target: IpcTarget,
     },
+    /// Inspect owned Vivid tracks.
     Tracks(IpcTarget),
+    /// Inspect one fully addressed Vivid track.
     TrackStatus {
         #[clap(flatten)]
+        /// Complete identity of the addressed object.
         identity: IpcVividTrackIdentity,
         #[clap(flatten)]
+        /// Terminal window selection for this request.
         target: IpcTarget,
     },
+    /// Inspect one owned Vivid scene.
     SceneStatus {
         #[clap(long)]
+        /// Session component of the complete Vivid owner identity.
         session_id: u64,
         #[clap(flatten)]
+        /// Terminal window selection for this request.
         target: IpcTarget,
     },
+    /// Query bounded Vivid trace records.
     Trace(IpcVividTrace),
 }
 
@@ -1206,12 +1261,19 @@ pub enum IpcVividCommand {
 #[derive(ValueEnum, Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum IpcVividTraceCategory {
+    /// Connection and authentication activity.
     Connection,
+    /// Owned resource creation, closure, reset, and restart activity.
     Lifecycle,
+    /// Flow-control activity.
     Flow,
+    /// Media playback activity.
     Playback,
+    /// Resource recovery activity.
     Recovery,
+    /// Media decoding activity.
     Decode,
+    /// Media rendering activity.
     Render,
 }
 
@@ -1221,15 +1283,20 @@ pub enum IpcVividTraceCategory {
 pub struct IpcVividTrace {
     #[clap(flatten)]
     #[serde(flatten)]
+    /// Terminal window selection for this request.
     pub target: IpcTarget,
     #[clap(long, conflicts_with_all = ["tail", "before", "around"])]
+    /// Exclusive lower sequence bound.
     pub after: Option<u64>,
     #[clap(long, conflicts_with_all = ["after", "before", "around"])]
+    /// Select the most recent matching records.
     pub tail: bool,
     #[clap(long, conflicts_with_all = ["after", "tail", "around"])]
+    /// Exclusive upper sequence bound.
     pub before: Option<u64>,
     #[clap(long, conflicts_with_all = ["after", "tail", "before", "follow"])]
     #[serde(skip_serializing)]
+    /// Sequence around which to center the query.
     pub around: Option<u64>,
     #[clap(
         long,
@@ -1238,6 +1305,7 @@ pub struct IpcVividTrace {
         value_parser = clap::value_parser!(u16).range(0..=512)
     )]
     #[serde(skip_serializing)]
+    /// Number of preceding records to include.
     pub preceding: u16,
     #[clap(
         long,
@@ -1246,24 +1314,34 @@ pub struct IpcVividTrace {
         value_parser = clap::value_parser!(u16).range(0..=512)
     )]
     #[serde(skip_serializing)]
+    /// Number of following records to include.
     pub following: u16,
     #[clap(long, default_value_t = 128, value_parser = clap::value_parser!(u16).range(1..=512))]
+    /// Maximum number of records to return.
     pub limit: u16,
     #[clap(long, default_value = "30s", value_parser = parse_ipc_duration)]
+    /// Maximum wait in milliseconds.
     pub timeout: u64,
     #[clap(long, conflicts_with_all = ["tail", "before", "around"])]
+    /// Continue waiting for newly available records.
     pub follow: bool,
     #[clap(long)]
+    /// Session component of the complete Vivid owner identity.
     pub session_id: Option<u64>,
     #[clap(long, requires = "session_id")]
+    /// Context component of the complete Vivid owner identity.
     pub context_id: Option<u64>,
     #[clap(long, requires = "context_id")]
+    /// Surface component of the complete Vivid owner identity.
     pub surface_id: Option<u64>,
     #[clap(long, requires = "surface_id")]
+    /// Track component of the complete Vivid owner identity.
     pub track_id: Option<u64>,
     #[clap(long, value_enum)]
+    /// Optional trace-category filter.
     pub category: Option<IpcVividTraceCategory>,
     #[clap(long)]
+    /// Restrict trace output to recovery-related events.
     pub recovery_only: bool,
 }
 
@@ -1300,6 +1378,7 @@ pub struct IpcKey {
     pub route: IpcInputRoute,
 
     #[clap(flatten)]
+    /// Terminal window selection for this request.
     pub target: IpcTarget,
 
     /// Print the tagged PTY-write completion as JSON.
@@ -1321,6 +1400,7 @@ pub struct IpcPaste {
     pub route: IpcInputRoute,
 
     #[clap(flatten)]
+    /// Terminal window selection for this request.
     pub target: IpcTarget,
 
     /// Print the tagged PTY-write completion as JSON.
@@ -1367,6 +1447,7 @@ pub struct IpcDropFile {
     pub timeout: u64,
 
     #[clap(flatten)]
+    /// Terminal window selection for this request.
     pub target: IpcTarget,
 }
 
@@ -1423,6 +1504,7 @@ pub struct IpcMousePosition {
     pub route: IpcInputRoute,
 
     #[clap(flatten)]
+    /// Terminal window selection for this request.
     pub target: IpcTarget,
 }
 
@@ -1432,8 +1514,11 @@ pub struct IpcMousePosition {
 #[serde(rename_all = "snake_case")]
 pub enum IpcMouseButton {
     #[default]
+    /// The left direction, cell edge, or mouse button.
     Left,
+    /// The middle mouse button.
     Middle,
+    /// The right direction, cell edge, or mouse button.
     Right,
 }
 
@@ -1446,6 +1531,7 @@ pub struct IpcMouseButtonAction {
     pub button: IpcMouseButton,
 
     #[clap(flatten)]
+    /// Coordinates and routing information for this mouse action.
     pub position: IpcMousePosition,
 }
 
@@ -1462,6 +1548,7 @@ pub struct IpcMouseScroll {
     pub horizontal: f64,
 
     #[clap(flatten)]
+    /// Coordinates and routing information for this mouse action.
     pub position: IpcMousePosition,
 }
 
@@ -1470,14 +1557,21 @@ pub struct IpcMouseScroll {
 #[derive(Subcommand, Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum IpcMouseAction {
+    /// Move the mouse pointer.
     Move(IpcMousePosition),
+    /// A single mouse click.
     Click(IpcMouseButtonAction),
+    /// Two consecutive mouse clicks.
     DoubleClick(IpcMouseButtonAction),
+    /// Press a mouse button.
     Down(IpcMouseButtonAction),
+    /// Release a mouse button.
     Up(IpcMouseButtonAction),
+    /// Move with a mouse button held.
     Drag(IpcMouseButtonAction),
     /// Draw one bounded press/move/release gesture.
     Path(IpcMousePath),
+    /// Change the visible scrollback offset.
     Scroll(IpcMouseScroll),
 }
 
@@ -1485,7 +1579,9 @@ pub enum IpcMouseAction {
 #[cfg(any(unix, windows))]
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
 pub struct IpcMousePoint {
+    /// Horizontal coordinate.
     pub x: f64,
+    /// Vertical coordinate.
     pub y: f64,
 }
 
@@ -1541,6 +1637,7 @@ pub struct IpcMousePath {
     pub timeout: u64,
 
     #[clap(flatten)]
+    /// Terminal window selection for this request.
     pub target: IpcTarget,
 }
 
@@ -1549,6 +1646,7 @@ pub struct IpcMousePath {
 #[derive(Args, Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct IpcMouse {
     #[clap(subcommand)]
+    /// Action to execute.
     pub action: IpcMouseAction,
 }
 
@@ -1573,6 +1671,7 @@ pub struct IpcResize {
     pub height: Option<u32>,
 
     #[clap(flatten)]
+    /// Terminal window selection for this request.
     pub target: IpcTarget,
 }
 
@@ -1597,6 +1696,7 @@ pub struct IpcSetGeometry {
     pub height: Option<u32>,
 
     #[clap(flatten)]
+    /// Terminal window selection for this request.
     pub target: IpcTarget,
 }
 
@@ -1621,6 +1721,7 @@ pub struct IpcSetVisible {
     pub visible: bool,
 
     #[clap(flatten)]
+    /// Terminal window selection for this request.
     pub target: IpcTarget,
 }
 
@@ -1658,6 +1759,7 @@ pub struct IpcSetLevel {
     pub level: IpcWindowLevel,
 
     #[clap(flatten)]
+    /// Terminal window selection for this request.
     pub target: IpcTarget,
 }
 
@@ -1666,14 +1768,23 @@ pub struct IpcSetLevel {
 #[derive(ValueEnum, Serialize, Deserialize, Debug, Copy, Clone, PartialEq, Eq)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum IpcSignalName {
+    /// Send SIGINT.
     Int,
+    /// Send SIGTERM.
     Term,
+    /// Send SIGHUP.
     Hup,
+    /// Send SIGQUIT.
     Quit,
+    /// Send SIGTSTP.
     Tstp,
+    /// Send SIGCONT.
     Cont,
+    /// Send SIGWINCH.
     Winch,
+    /// Send SIGKILL.
     Kill,
+    /// Stop the addressed process or media playback.
     Stop,
 }
 
@@ -1686,6 +1797,7 @@ pub struct IpcSignal {
     pub signal: IpcSignalName,
 
     #[clap(flatten)]
+    /// Terminal window selection for this request.
     pub target: IpcTarget,
 }
 
@@ -1711,6 +1823,7 @@ pub struct IpcGetGrid {
     pub since_screen: Option<u64>,
 
     #[clap(flatten)]
+    /// Terminal window selection for this request.
     pub target: IpcTarget,
 }
 
@@ -1747,6 +1860,7 @@ pub struct IpcWaitCommon {
     pub timeout: u64,
 
     #[clap(flatten)]
+    /// Terminal window selection for this request.
     pub target: IpcTarget,
 }
 
@@ -1755,9 +1869,13 @@ pub struct IpcWaitCommon {
 #[cfg(any(unix, windows))]
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IpcTextRect {
+    /// Grid column coordinate.
     pub col: u16,
+    /// Grid row coordinate.
     pub row: u16,
+    /// Width in this value's coordinate system.
     pub width: u16,
+    /// Height in this value's coordinate system.
     pub height: u16,
 }
 
@@ -1790,12 +1908,15 @@ impl std::str::FromStr for IpcTextRect {
 #[cfg(any(unix, windows))]
 #[derive(Args, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct IpcWaitText {
+    /// Text content carried by this value.
     pub text: String,
     #[clap(long)]
     #[serde(default)]
+    /// Interpret the pattern as a regular expression.
     pub regex: bool,
     #[clap(long)]
     #[serde(default)]
+    /// Require a screen sequence newer than this value.
     pub after_screen: Option<u64>,
     /// Restrict matching to one viewport row: 0 is the top row, -1 the bottom row.
     #[clap(long, conflicts_with = "rect", allow_hyphen_values = true)]
@@ -1806,6 +1927,7 @@ pub struct IpcWaitText {
     #[serde(default)]
     pub rect: Option<IpcTextRect>,
     #[clap(flatten)]
+    /// Window selection and timeout shared by this wait.
     pub common: IpcWaitCommon,
 }
 
@@ -1813,14 +1935,19 @@ pub struct IpcWaitText {
 #[cfg(any(unix, windows))]
 #[derive(Args, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct IpcWaitOutput {
+    /// Text or encoded bytes to match.
     pub pattern: String,
     #[clap(long, conflicts_with = "base64")]
+    /// Interpret the pattern as a regular expression.
     pub regex: bool,
     #[clap(long, conflicts_with = "regex")]
+    /// Interpret the pattern as base64-encoded bytes.
     pub base64: bool,
     #[clap(long)]
+    /// Exclusive transcript byte offset from which to inspect output.
     pub after_offset: Option<u64>,
     #[clap(flatten)]
+    /// Window selection and timeout shared by this wait.
     pub common: IpcWaitCommon,
 }
 
@@ -1829,8 +1956,10 @@ pub struct IpcWaitOutput {
 #[derive(Args, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct IpcWaitSequence {
     #[clap(long)]
+    /// Require a screen sequence newer than this value.
     pub after_screen: Option<u64>,
     #[clap(flatten)]
+    /// Window selection and timeout shared by this wait.
     pub common: IpcWaitCommon,
 }
 
@@ -1842,8 +1971,10 @@ pub struct IpcWaitStable {
     #[clap(long, default_value = "250ms", value_parser = parse_ipc_duration)]
     pub quiet: u64,
     #[clap(long)]
+    /// Require a screen sequence newer than this value.
     pub after_screen: Option<u64>,
     #[clap(flatten)]
+    /// Window selection and timeout shared by this wait.
     pub common: IpcWaitCommon,
 }
 
@@ -1852,8 +1983,10 @@ pub struct IpcWaitStable {
 #[derive(Args, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct IpcWaitFrame {
     #[clap(long)]
+    /// Require a frame sequence newer than this value.
     pub after_frame: Option<u64>,
     #[clap(flatten)]
+    /// Window selection and timeout shared by this wait.
     pub common: IpcWaitCommon,
 }
 
@@ -1862,12 +1995,19 @@ pub struct IpcWaitFrame {
 #[derive(Subcommand, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum IpcWaitCondition {
+    /// Wait for terminal text.
     Text(IpcWaitText),
+    /// Wait for transcript output.
     Output(IpcWaitOutput),
+    /// Wait for a newer screen sequence.
     ScreenChange(IpcWaitSequence),
+    /// Wait for the screen to remain unchanged.
     ScreenStable(IpcWaitStable),
+    /// Wait for the next presented terminal frame.
     Frame(IpcWaitFrame),
+    /// Wait for an addressed Vivid track condition.
     VividTrack(IpcWaitVividTrack),
+    /// Wait for the terminal process to exit.
     Exit(IpcWaitCommon),
     /// Block until the shell sits at a prompt. Requires OSC 133 shell integration; a shell
     /// that never emits markers never resolves this wait.
@@ -1882,19 +2022,29 @@ pub enum IpcWaitCondition {
 #[derive(ValueEnum, Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum IpcVividWaitCondition {
+    /// Wait for a revision newer than the supplied value.
     RevisionAfter,
+    /// Wait for the requested track milestones.
     Milestones,
+    /// Wait for a newer presentation sequence.
     PresentationAfter,
+    /// Wait for a later presentation timestamp.
     PtsAfter,
+    /// Wait for the playback clock to start.
     ClockStarted,
+    /// Wait for buffered playback to end.
     BufferedEnded,
+    /// Wait for channel acceptance.
     ChannelAccepted,
+    /// Wait for channel detachment.
     ChannelDetached,
+    /// Wait for the addressed track to be lost.
     TrackLost,
 }
 
 #[cfg(any(unix, windows))]
 impl IpcVividWaitCondition {
+    /// Return this condition's numeric wire identifier.
     pub fn wire_value(self) -> u64 {
         match self {
             Self::RevisionAfter => 1,
@@ -1909,6 +2059,7 @@ impl IpcVividWaitCondition {
         }
     }
 
+    /// Whether this condition requires an accompanying comparison value.
     pub fn requires_value(self) -> bool {
         matches!(
             self,
@@ -1922,12 +2073,15 @@ impl IpcVividWaitCondition {
 #[derive(Args, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct IpcWaitVividTrack {
     #[clap(value_enum)]
+    /// Condition that completes this wait.
     pub condition: IpcVividWaitCondition,
 
     #[clap(flatten)]
+    /// Complete identity of the addressed object.
     pub identity: IpcVividTrackIdentity,
 
     #[clap(long)]
+    /// Expected generation of the addressed media channel.
     pub channel_generation: u64,
 
     /// Threshold or milestone mask for value-bearing conditions.
@@ -1935,9 +2089,11 @@ pub struct IpcWaitVividTrack {
     pub value: Option<u64>,
 
     #[clap(long, default_value = "30s", value_parser = parse_ipc_duration)]
+    /// Maximum wait in milliseconds.
     pub timeout: u64,
 
     #[clap(flatten)]
+    /// Terminal window selection for this request.
     pub target: IpcTarget,
 }
 
@@ -1946,6 +2102,7 @@ pub struct IpcWaitVividTrack {
 #[derive(Args, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct IpcWait {
     #[clap(subcommand)]
+    /// Condition that completes this wait.
     pub condition: IpcWaitCondition,
 }
 
@@ -1966,6 +2123,7 @@ pub struct IpcTranscript {
     pub raw: bool,
 
     #[clap(flatten)]
+    /// Terminal window selection for this request.
     pub target: IpcTarget,
 }
 

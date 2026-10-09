@@ -40,6 +40,11 @@ pub struct SelectionRange {
 }
 
 impl SelectionRange {
+    /// Create an inclusive terminal selection range.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `start` follows `end` in grid order.
     pub fn new(start: Point, end: Point, is_block: bool) -> Self {
         assert!(start <= end);
         Self { start, end, is_block }
@@ -91,9 +96,13 @@ impl SelectionRange {
 /// Different kinds of selection.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum SelectionType {
+    /// A character-wise selection.
     Simple,
+    /// A rectangular selection independent of line boundaries.
     Block,
+    /// A semantic word selection.
     Semantic,
+    /// A whole-line selection.
     Lines,
 }
 
@@ -103,11 +112,13 @@ pub enum SelectionType {
 /// rectangular region.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Selection {
+    /// Selection behavior.
     pub ty: SelectionType,
     region: Range<Anchor>,
 }
 
 impl Selection {
+    /// Start a selection at a grid point and cell side.
     pub fn new(ty: SelectionType, location: Point, side: Side) -> Selection {
         Self {
             region: Range { start: Anchor::new(location, side), end: Anchor::new(location, side) },
@@ -120,6 +131,7 @@ impl Selection {
         self.region.end = Anchor::new(point, side);
     }
 
+    /// Adjust selection endpoints after scrolling a terminal region.
     pub fn rotate<D: Dimensions>(
         mut self,
         dimensions: &D,
@@ -176,6 +188,7 @@ impl Selection {
         Some(self)
     }
 
+    /// Whether this selection contains no cells.
     pub fn is_empty(&self) -> bool {
         match self.ty {
             SelectionType::Simple => {
@@ -374,9 +387,8 @@ impl Selection {
 mod tests {
     use super::*;
 
-    use crate::terminal::index::{Column, Point, Side};
+    use crate::terminal::term::Config;
     use crate::terminal::term::test::TermSize;
-    use crate::terminal::term::{Config, Term};
 
     fn term(height: usize, width: usize) -> Term<()> {
         let size = TermSize::new(width, height);

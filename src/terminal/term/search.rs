@@ -15,6 +15,7 @@ use crate::terminal::index::{Boundary, Column, Direction, Point, Side};
 use crate::terminal::term::Term;
 use crate::terminal::term::cell::{Cell, Flags};
 
+/// Inclusive grid-point range occupied by one regular-expression match.
 pub type Match = RangeInclusive<Point>;
 
 /// Terminal regex search state.
@@ -28,6 +29,10 @@ pub struct RegexSearch {
 
 impl RegexSearch {
     /// Build the forward and backward search DFAs.
+    ///
+    /// # Errors
+    ///
+    /// Returns a regex build error if the pattern is invalid or exceeds compilation limits.
     pub fn new(search: &str) -> Result<RegexSearch, Box<BuildError>> {
         // Setup configs for both DFA directions.
         //
@@ -606,6 +611,7 @@ pub struct RegexIter<'a, T> {
 }
 
 impl<'a, T> RegexIter<'a, T> {
+    /// Iterate matches between grid points in the requested search direction.
     pub fn new(
         start: Point,
         end: Point,
@@ -663,11 +669,18 @@ impl<T> Iterator for RegexIter<'_, T> {
     }
 }
 
+// Debug omits user content and native resources, and never acquires application locks.
+impl<T> std::fmt::Debug for RegexIter<'_, T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RegexIter").finish_non_exhaustive()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    use crate::terminal::index::{Column, Line};
+    use crate::terminal::index::Line;
     use crate::terminal::term::Config;
     use crate::terminal::term::test::{TermSize, mock_term};
 

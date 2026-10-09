@@ -3,9 +3,11 @@ use serde::Serialize;
 use crate::terminal::term::SEMANTIC_ESCAPE_CHARS;
 
 #[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+/// Terminal selection settings.
 pub struct Selection {
     /// Characters which end a word for double-click selection.
     pub semantic_escape_chars: String,
+    /// Copy completed selections to the system clipboard.
     pub save_to_clipboard: bool,
 }
 

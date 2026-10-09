@@ -4,47 +4,71 @@ use serde::{Deserialize, Deserializer, Serialize};
 use crate::display::color::{CellRgb, Rgb};
 
 #[derive(Serialize, Clone, Debug, Default, PartialEq, Eq)]
+/// Terminal palette and special-purpose cell colors.
 pub struct Colors {
+    /// Default terminal colors.
     pub primary: PrimaryColors,
+    /// Cursor appearance or current cursor state.
     pub cursor: InvertedCellColors,
+    /// Current selection or its configured appearance.
     pub selection: InvertedCellColors,
+    /// Normal ANSI palette colors.
     pub normal: NormalColors,
+    /// Bright ANSI palette colors.
     pub bright: BrightColors,
+    /// Optional dim ANSI palette overrides.
     pub dim: Option<DimColors>,
+    /// Explicit overrides for indexed palette entries.
     pub indexed_colors: Vec<IndexedColor>,
+    /// Appearance of terminal search matches.
     pub search: SearchColors,
+    /// Line-indicator color overrides.
     pub line_indicator: LineIndicatorColors,
+    /// Keyboard hint-label appearance.
     pub hints: HintColors,
+    /// Apply window transparency to explicit cell background colors.
     pub transparent_background_colors: bool,
+    /// Use bright palette entries for bold text.
     pub draw_bold_text_with_bright_colors: bool,
     footer_bar: BarColors,
 }
 
 impl Colors {
+    /// Return the configured footer-bar foreground color.
     pub fn footer_bar_foreground(&self) -> Rgb {
         self.footer_bar.foreground.unwrap_or(self.primary.background)
     }
 
+    /// Return the configured footer-bar background color.
     pub fn footer_bar_background(&self) -> Rgb {
         self.footer_bar.background.unwrap_or(self.primary.foreground)
     }
 }
 
 #[derive(Serialize, Copy, Clone, Default, Debug, PartialEq, Eq)]
+/// Foreground and background overrides for the line indicator.
 pub struct LineIndicatorColors {
+    /// Foreground color or an override of the existing cell color.
     pub foreground: Option<Rgb>,
+    /// Background color or an override of the existing cell color.
     pub background: Option<Rgb>,
 }
 
 #[derive(Serialize, Default, Copy, Clone, Debug, PartialEq, Eq)]
+/// Colors used for keyboard hint labels.
 pub struct HintColors {
+    /// Start of this range.
     pub start: HintStartColors,
+    /// End of this range.
     pub end: HintEndColors,
 }
 
 #[derive(Serialize, Copy, Clone, Debug, PartialEq, Eq)]
+/// Colors for the first character of a hint label.
 pub struct HintStartColors {
+    /// Foreground color or an override of the existing cell color.
     pub foreground: CellRgb,
+    /// Background color or an override of the existing cell color.
     pub background: CellRgb,
 }
 
@@ -58,8 +82,11 @@ impl Default for HintStartColors {
 }
 
 #[derive(Serialize, Copy, Clone, Debug, PartialEq, Eq)]
+/// Colors for subsequent hint-label characters.
 pub struct HintEndColors {
+    /// Foreground color or an override of the existing cell color.
     pub foreground: CellRgb,
+    /// Background color or an override of the existing cell color.
     pub background: CellRgb,
 }
 
@@ -74,7 +101,9 @@ impl Default for HintEndColors {
 
 #[derive(Deserialize, Serialize, Copy, Clone, Default, Debug, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+/// An override for one indexed terminal palette entry.
 pub struct IndexedColor {
+    /// Color used to paint this item.
     pub color: Rgb,
 
     index: ColorIndex,
@@ -82,6 +111,7 @@ pub struct IndexedColor {
 
 impl IndexedColor {
     #[inline]
+    /// Return the indexed palette entry being overridden.
     pub fn index(&self) -> u8 {
         self.index.0
     }
@@ -109,8 +139,11 @@ impl<'de> Deserialize<'de> for ColorIndex {
 }
 
 #[derive(Serialize, Debug, Copy, Clone, PartialEq, Eq)]
+/// Foreground and background overrides that can reference existing cell colors.
 pub struct InvertedCellColors {
+    /// Foreground color or an override of the existing cell color.
     pub foreground: CellRgb,
+    /// Background color or an override of the existing cell color.
     pub background: CellRgb,
 }
 
@@ -121,14 +154,20 @@ impl Default for InvertedCellColors {
 }
 
 #[derive(Serialize, Debug, Copy, Clone, Default, PartialEq, Eq)]
+/// Colors for focused and other search matches.
 pub struct SearchColors {
+    /// Appearance of the focused search match.
     pub focused_match: FocusedMatchColors,
+    /// Appearance of other visible search matches.
     pub matches: MatchColors,
 }
 
 #[derive(Serialize, Debug, Copy, Clone, PartialEq, Eq)]
+/// Colors for the currently focused search match.
 pub struct FocusedMatchColors {
+    /// Foreground color or an override of the existing cell color.
     pub foreground: CellRgb,
+    /// Background color or an override of the existing cell color.
     pub background: CellRgb,
 }
 
@@ -142,8 +181,11 @@ impl Default for FocusedMatchColors {
 }
 
 #[derive(Serialize, Debug, Copy, Clone, PartialEq, Eq)]
+/// Colors for other visible search matches.
 pub struct MatchColors {
+    /// Foreground color or an override of the existing cell color.
     pub foreground: CellRgb,
+    /// Background color or an override of the existing cell color.
     pub background: CellRgb,
 }
 
@@ -157,16 +199,22 @@ impl Default for MatchColors {
 }
 
 #[derive(Serialize, Debug, Copy, Clone, Default, PartialEq, Eq)]
+/// Foreground and background colors for a display bar.
 pub struct BarColors {
     foreground: Option<Rgb>,
     background: Option<Rgb>,
 }
 
 #[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+/// Default terminal foreground and background colors.
 pub struct PrimaryColors {
+    /// Foreground color or an override of the existing cell color.
     pub foreground: Rgb,
+    /// Background color or an override of the existing cell color.
     pub background: Rgb,
+    /// Optional foreground override for bright text.
     pub bright_foreground: Option<Rgb>,
+    /// Optional foreground override for dim text.
     pub dim_foreground: Option<Rgb>,
 }
 
@@ -182,14 +230,23 @@ impl Default for PrimaryColors {
 }
 
 #[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+/// The eight normal ANSI palette colors.
 pub struct NormalColors {
+    /// Black palette entry.
     pub black: Rgb,
+    /// Red palette entry.
     pub red: Rgb,
+    /// Green palette entry.
     pub green: Rgb,
+    /// Yellow palette entry.
     pub yellow: Rgb,
+    /// Blue palette entry.
     pub blue: Rgb,
+    /// Magenta palette entry.
     pub magenta: Rgb,
+    /// Cyan palette entry.
     pub cyan: Rgb,
+    /// White palette entry.
     pub white: Rgb,
 }
 
@@ -209,14 +266,23 @@ impl Default for NormalColors {
 }
 
 #[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+/// The eight bright ANSI palette colors.
 pub struct BrightColors {
+    /// Black palette entry.
     pub black: Rgb,
+    /// Red palette entry.
     pub red: Rgb,
+    /// Green palette entry.
     pub green: Rgb,
+    /// Yellow palette entry.
     pub yellow: Rgb,
+    /// Blue palette entry.
     pub blue: Rgb,
+    /// Magenta palette entry.
     pub magenta: Rgb,
+    /// Cyan palette entry.
     pub cyan: Rgb,
+    /// White palette entry.
     pub white: Rgb,
 }
 
@@ -239,14 +305,23 @@ impl Default for BrightColors {
 }
 
 #[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+/// The eight dim ANSI palette colors.
 pub struct DimColors {
+    /// Black palette entry.
     pub black: Rgb,
+    /// Red palette entry.
     pub red: Rgb,
+    /// Green palette entry.
     pub green: Rgb,
+    /// Yellow palette entry.
     pub yellow: Rgb,
+    /// Blue palette entry.
     pub blue: Rgb,
+    /// Magenta palette entry.
     pub magenta: Rgb,
+    /// Cyan palette entry.
     pub cyan: Rgb,
+    /// White palette entry.
     pub white: Rgb,
 }
 

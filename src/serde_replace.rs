@@ -8,6 +8,11 @@ use toml::Value;
 
 /// Update an existing configuration value from a partial TOML value.
 pub trait SerdeReplace {
+    /// Replace this configuration value from a JSON representation.
+    ///
+    /// # Errors
+    ///
+    /// Returns a conversion error if the JSON value cannot represent this configuration type.
     fn replace(&mut self, value: Value) -> Result<(), Box<dyn Error>>;
 }
 

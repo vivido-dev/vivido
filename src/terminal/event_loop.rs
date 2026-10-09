@@ -40,8 +40,10 @@ const MAX_LOCKED_READ: usize = u16::MAX as usize;
 pub enum Msg {
     /// Data that should be written to the PTY.
     Input {
+        /// Payload bytes or the declared payload byte count.
         bytes: Cow<'static, [u8]>,
         #[cfg(any(unix, windows))]
+        /// Optional completion token echoed after the operation finishes.
         completion: Option<u64>,
     },
 
@@ -50,14 +52,19 @@ pub enum Msg {
 
     /// Instruction to resize the PTY.
     Resize {
+        /// Requested terminal grid and cell geometry.
         window_size: WindowSize,
         #[cfg(any(unix, windows))]
+        /// Optional completion token echoed after the operation finishes.
         completion: Option<u64>,
     },
 
-    /// Reset parser and client-controlled terminal state, resuming a quarantined pane.
+    /// Reset parser and client-controlled terminal state in a healthy pane.
     #[cfg(any(unix, windows))]
-    ResetClient { completion: u64 },
+    ResetClient {
+        /// Optional completion token echoed after the operation finishes.
+        completion: u64,
+    },
 }
 
 /// The main event loop.
@@ -83,6 +90,10 @@ where
     U: EventListener + Send + 'static,
 {
     /// Create a new event loop.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if poller creation or PTY registration fails.
     pub fn new(
         terminal: Arc<FairMutex<Term<U>>>,
         event_proxy: U,
@@ -107,6 +118,7 @@ where
         })
     }
 
+    /// Clone the PTY-worker command sender.
     pub fn channel(&self) -> EventLoopSender {
         EventLoopSender { sender: self.tx.clone(), poller: self.poll.clone() }
     }
@@ -145,6 +157,9 @@ where
                 },
                 #[cfg(any(unix, windows))]
                 Msg::ResetClient { completion } => {
+                    if *quarantined {
+                        continue;
+                    }
                     state.reset_client_state();
                     self.terminal.lock().reset_client_state();
                     *quarantined = false;
@@ -272,6 +287,11 @@ where
         Ok(())
     }
 
+    /// Start the owned PTY polling worker.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the operating system cannot spawn the PTY worker thread.
     pub fn spawn(mut self) -> JoinHandle<(Self, State)> {
         thread::spawn_named("PTY reader", move || {
             let mut state = State::default();
@@ -283,6 +303,7 @@ where
             let mut registered = true;
 
             // Register TTY through EventedRW interface.
+            // SAFETY: this worker owns the PTY until deregistration and outlives every poll.
             if let Err(err) = unsafe { self.pty.register(&self.poll, interest, poll_opts) } {
                 error!("Event loop registration error: {err}");
                 return (self, state);
@@ -326,6 +347,7 @@ where
                 }
 
                 if !registered && !quarantined {
+                    // SAFETY: the worker still owns this live PTY, and deregisters it before drop.
                     match unsafe { self.pty.register(&self.poll, interest, poll_opts) } {
                         Ok(()) => registered = true,
                         Err(error) => {
@@ -377,6 +399,8 @@ where
                                     Ok(Ok(())) => None,
                                     Ok(Err(err)) => Some((ClientFaultClass::PtyIo, err)),
                                     Err(fault) => {
+                                        // Discard pending writes, parser buffers, and marker fragments immediately.
+                                        state.reset_client_state();
                                         error!(
                                             "contained client fault {} ({})",
                                             fault.id,
@@ -430,6 +454,8 @@ where
                                         quarantined = true;
                                     },
                                     Err(fault) => {
+                                        // Discard pending writes, parser buffers, and marker fragments immediately.
+                                        state.reset_client_state();
                                         error!(
                                             "contained client fault {} ({})",
                                             fault.id,
@@ -501,6 +527,7 @@ struct PendingInput {
 }
 
 #[derive(Debug)]
+/// A terminal input notifier backed by the PTY worker channel.
 pub struct Notifier(pub EventLoopSender);
 
 impl event::Notify for Notifier {
@@ -533,6 +560,7 @@ impl event::OnResize for Notifier {
 }
 
 #[derive(Debug)]
+/// A failure to queue a command for the PTY worker.
 pub enum EventLoopSendError {
     /// Error polling the event loop.
     Io(io::Error),
@@ -560,15 +588,35 @@ impl std::error::Error for EventLoopSendError {
 }
 
 #[derive(Debug, Clone)]
+/// A clonable PTY-worker command sender that wakes the polling loop.
 pub struct EventLoopSender {
     sender: Sender<Msg>,
     poller: Arc<Poller>,
 }
 
 impl EventLoopSender {
+    /// Queue a PTY command and wake its polling loop.
+    ///
+    /// # Errors
+    ///
+    /// Returns `EventLoopSendError` if the worker channel closes or its poller cannot be awakened.
     pub fn send(&self, msg: Msg) -> Result<(), EventLoopSendError> {
         self.sender.send(msg).map_err(EventLoopSendError::Send)?;
         self.poller.notify().map_err(EventLoopSendError::Io)
+    }
+}
+
+// Debug omits user content and native resources, and never acquires application locks.
+impl<T: tty::EventedPty, U: EventListener> std::fmt::Debug for EventLoop<T, U> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EventLoop").finish_non_exhaustive()
+    }
+}
+
+// Debug omits user content and native resources, and never acquires application locks.
+impl std::fmt::Debug for State {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("State").finish_non_exhaustive()
     }
 }
 
@@ -589,6 +637,42 @@ mod terminal_reply_tests {
         };
         assert_eq!(bytes.as_ref(), expected);
         assert_eq!(completion, None);
+    }
+
+    #[test]
+    fn parser_and_writer_faults_discard_partial_state_without_touching_another_owner() {
+        use crate::terminal::event::VoidListener;
+        use crate::terminal::index::{Column, Line};
+        use crate::terminal::term::Config;
+        use crate::terminal::term::test::TermSize;
+        let size = TermSize::new(12, 2);
+        for class in [ClientFaultClass::TerminalParser, ClientFaultClass::PtyIo] {
+            let mut failed = Term::new(Config::default(), &size, VoidListener);
+            let mut failed_state = State::default();
+            let mut surviving = Term::new(Config::default(), &size, VoidListener);
+            let mut surviving_state = State::default();
+            surviving_state.advance_test_chunks(&mut surviving, [b"other"]);
+            let fault = client_fault::catch(class, "injected terminal worker failure", || {
+                failed_state.advance_test_chunks(&mut failed, [b"partial"]);
+                failed_state.write_list.push_back(PendingInput {
+                    bytes: Cow::Borrowed(b"pending"),
+                    #[cfg(any(unix, windows))]
+                    completion: Some(9),
+                });
+                panic!("partial parser or writer mutation");
+            });
+            assert!(fault.is_err());
+            // The worker clears pending parser/write state; its owner replaces the terminal.
+            failed_state.reset_client_state();
+            failed = Term::new(Config::default(), &size, VoidListener);
+            assert!(!failed_state.needs_write());
+            failed_state.advance_test_chunks(&mut failed, [b"fresh"]);
+            assert_eq!(failed.grid()[Line(0)][Column(0)].c, 'f');
+            assert_eq!(surviving.grid()[Line(0)][Column(0)].c, 'o');
+            assert_eq!(surviving.grid()[Line(0)][Column(4)].c, 'r');
+            surviving_state.advance_test_chunks(&mut surviving, [b"!"]);
+            assert_eq!(surviving.grid()[Line(0)][Column(5)].c, '!');
+        }
     }
 
     #[test]

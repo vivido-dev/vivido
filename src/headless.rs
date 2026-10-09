@@ -22,7 +22,7 @@ use crate::cli::{HeadlessSize, Options};
 use crate::event::{EventSink, HeadlessLoop, Processor};
 use crate::polling::IoListener;
 use crate::session::{RegistryGuard, SessionPaths, validate_session_name};
-use crate::{config, logging, tty};
+use crate::{config, logging};
 
 #[cfg(all(unix, not(target_os = "macos")))]
 #[path = "headless/unix.rs"]
@@ -56,6 +56,10 @@ const HEADLESS_SCALE_FACTOR: f64 = 1.0;
 ///
 /// Returns in the parent once the daemon is serving; the daemon itself only returns when its loop
 /// ends. With `--foreground` there is no daemon and this blocks until shutdown.
+///
+/// # Errors
+///
+/// Returns an error if event-loop initialization or execution fails.
 pub fn run(mut options: Options) -> Result<(), Box<dyn Error>> {
     let session = match options.session.as_deref() {
         Some(session) => {
@@ -103,11 +107,6 @@ fn serve(
     let pixel_size = apply_headless_size(&mut options);
     let config = config::load(&mut options);
     log::set_max_level(config.debug.log_level);
-
-    let _terminfo_guard = tty::setup_env();
-    for (key, value) in config.env.iter() {
-        unsafe { env::set_var(key, value) };
-    }
 
     // A headless session is a runtime instance like any other: its windows are addressable, and an
     // agent in one can be woken. Publish the name before the first window is built, since that is
@@ -267,9 +266,11 @@ fn scrub_environment() {
     for key in
         ["VIVID_ENDPOINT_CONTROL", "VIVID_ENDPOINT_BULK", "VIVID_ROOT_SECRET", "VIVID_REMOTE"]
     {
+        // SAFETY: all callers run during single-threaded daemon startup, before serve creates workers.
         unsafe { env::remove_var(key) };
     }
     for key in ["TMUX", "TMUX_PANE", "STY", "VIVIDO_SOCKET", "VIVIDO_SESSION"] {
+        // SAFETY: all callers run during single-threaded daemon startup, before serve creates workers.
         unsafe { env::remove_var(key) };
     }
 }

@@ -1,6 +1,34 @@
-//! Vivido terminal emulator library.
+//! Terminal emulation, rendering, and local automation for native embedding hosts.
+//!
+//! [`Processor`] owns each host's terminal windows, automation claims, and event handling.
+//! [`EventSink`] delivers worker events through a native window loop or a headless channel.
+//! [`host::IoListener`] starts the owner-only local automation endpoint; the host must continue
+//! pumping events so the processor can answer its handshake and requests.
+//!
+//! Start with `examples/library_api.rs` for a headless handshake and host-request example.
+//! Native windows require a supported desktop, a graphics adapter, and linked FFmpeg libraries.
+//! Terminal-only data structures under [`terminal`] do not require a running window loop.
+//!
+//! ```
+//! use vivido::terminal::grid::Row;
+//! let row = Row::<u8>::new(3);
+//! assert_eq!(row.len(), 3);
+//! ```
+//!
+//! # Features
+//! `wayland` and `x11` select Linux window-system support. `vello-bump-probe` enables GPU
+//! allocator diagnostics. `test-util` adds isolated service controllers for deterministic tests.
+//!
+//! # Failure and recovery
+//! Malformed terminal, IPC, and Vivid input returns bounded errors or revokes only its owner.
+//! A panicking terminal worker is quarantined and its terminal state discarded; recovery requires
+//! restarting that pane's client. In-process panic containment is a documented project exception
+//! in `docs/panic-recovery.md`, not a guarantee for arbitrary host callbacks.
+//!
+//! PTY constructors apply terminal defaults to child environments without changing the host's
+//! environment. Retain [`tty::TerminfoGuard`] while custom children use its temporary resources.
 
-#![warn(rust_2018_idioms, future_incompatible)]
+#![warn(rust_2018_idioms, future_incompatible, missing_docs)]
 #![deny(clippy::all, clippy::if_not_else, clippy::enum_glob_use)]
 #![cfg_attr(clippy, deny(warnings))]
 
@@ -10,6 +38,7 @@ compile_error!(r#"the "wayland" feature must be enabled on Linux and other Unix 
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 mod accessibility;
 mod automation;
+/// Command-line options and serializable local automation requests.
 pub mod cli;
 mod client_fault;
 mod clipboard;
@@ -17,6 +46,7 @@ mod clipboard_prompt;
 mod command_palette;
 #[macro_use]
 mod config_derive;
+/// Terminal configuration loading, merging, and user-interface settings.
 pub mod config;
 mod daemon;
 pub mod display;
@@ -61,7 +91,7 @@ pub use config::monitor::ConfigMonitor;
 /// Surface an in-process host needs to run and extend Vivido's automation endpoint.
 ///
 /// Embedding [`Processor`] gives a host windows and terminals but no automation service: the
-/// listener is started by the caller. Spawning [`IoListener`] offers the documented IPC endpoint on
+/// listener is started by the caller. Spawning [`host::IoListener`] offers the documented IPC endpoint on
 /// behalf of the embedding process, and [`Processor::claim_ipc_methods`] lets the host answer
 /// methods Vivido cannot — or place a window itself rather than letting `create_window` build a
 /// top-level one.

@@ -4,8 +4,10 @@ use serde::Serialize;
 /// Debugging options.
 #[derive(Serialize, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Debug {
+    /// Minimum configured diagnostic level.
     pub log_level: LevelFilter,
 
+    /// Log incoming window events for diagnostics.
     pub print_events: bool,
 
     /// Keep the log file after quitting.

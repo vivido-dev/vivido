@@ -7,6 +7,7 @@ use crate::config::ui_config::Program;
 use crate::terminal::term::{ClipboardAccess, Osc52};
 
 #[derive(Serialize, Clone, Debug, PartialEq)]
+/// Terminal behavior and child-process settings.
 pub struct Terminal {
     /// OSC52 clipboard policy.
     pub osc52: SerdeOsc52,
@@ -104,6 +105,7 @@ impl Default for NotifyOnCommandFinishAction {
 }
 
 #[derive(Serialize, Default, Copy, Clone, Debug, PartialEq)]
+/// Configuration serialization for the terminal clipboard policy.
 pub struct SerdeOsc52(pub Osc52);
 
 impl<'de> Deserialize<'de> for SerdeOsc52 {
