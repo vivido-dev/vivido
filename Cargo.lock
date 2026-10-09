@@ -3991,7 +3991,7 @@ dependencies = [
 
 [[package]]
 name = "vivid_sdk"
-version = "1.5.10"
+version = "1.5.11"
 dependencies = [
  "getrandom 0.4.3",
  "vivid_protocol",
@@ -4000,7 +4000,7 @@ dependencies = [
 
 [[package]]
 name = "vivido"
-version = "0.5.3"
+version = "0.5.4"
 dependencies = [
  "accesskit",
  "accesskit_consumer",
