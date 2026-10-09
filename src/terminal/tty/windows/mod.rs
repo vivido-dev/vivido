@@ -1,3 +1,5 @@
+//! Windows ConPTY lifecycle, shell setup, and asynchronous terminal pipe adapters.
+
 use std::ffi::OsStr;
 use std::io::{self, Result};
 use std::iter::once;

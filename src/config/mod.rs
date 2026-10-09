@@ -365,6 +365,7 @@ pub fn installed_config() -> Option<PathBuf> {
 }
 
 #[cfg(windows)]
+/// Find the first existing configuration in the Windows per-user search paths.
 pub fn installed_config() -> Option<PathBuf> {
     let user_profile = env::var_os("USERPROFILE").map(PathBuf::from).or_else(home::home_dir);
     first_existing_windows_config(windows_config_candidates(user_profile))

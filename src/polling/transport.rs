@@ -313,6 +313,7 @@ mod platform {
         }
     }
 
+    /// Owner-authenticated Windows named-pipe connection for local automation.
     pub struct LocalStream {
         handle: Arc<OwnedHandle>,
         server_end: bool,

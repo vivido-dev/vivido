@@ -21,6 +21,7 @@ use super::launch::LaunchEntry;
 use super::menu::NewTabMenu;
 use super::{PhysicalRect, Tabs};
 
+/// Tab strip height in logical pixels.
 pub const TAB_BAR_LOGICAL: f64 = 35.0;
 const TAB_WIDTH_LOGICAL: f64 = 150.0;
 const MIN_TAB_WIDTH_LOGICAL: f64 = 80.0;
@@ -45,26 +46,40 @@ const ACCENT: Rgb = Rgb::new(129, 140, 248);
 /// edge reads against both the bar and the pane behind it.
 pub(super) const SURFACE: Rgb = Rgb::new(38, 38, 46);
 
+/// Physical bounds of the tab strip and terminal content.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ChromeLayout {
+    /// Bounds reserved for tabs and window controls.
     pub tab_bar: PhysicalRect,
+    /// Bounds available for the active terminal pane.
     pub content: PhysicalRect,
 }
 
+/// Physical hit regions produced while rendering the chrome.
 #[derive(Clone, Debug, Default)]
 pub struct ChromeHitMap {
+    /// Tab indices and their clickable bounds.
     pub tabs: Vec<(usize, PhysicalRect)>,
+    /// Tab indices and their close-button bounds.
     pub tab_closes: Vec<(usize, PhysicalRect)>,
+    /// Button scrolling toward earlier tabs.
     pub previous: PhysicalRect,
+    /// Button scrolling toward later tabs.
     pub next: PhysicalRect,
+    /// Button opening a tab with the default shell.
     pub new_tab: PhysicalRect,
+    /// Button opening the shell selection menu.
     pub new_tab_menu: PhysicalRect,
+    /// Window minimize button.
     pub minimize: PhysicalRect,
+    /// Window maximize or restore button.
     pub maximize: PhysicalRect,
+    /// Window close button.
     pub close: PhysicalRect,
 }
 
 impl ChromeHitMap {
+    /// Return the hovered launch button index: zero for new tab, one for menu.
     pub fn hovered_tab_action(&self, cursor: Option<PhysicalPosition<f64>>) -> Option<usize> {
         let cursor = cursor?;
         [self.new_tab, self.new_tab_menu]
@@ -73,6 +88,7 @@ impl ChromeHitMap {
     }
 }
 
+/// Compute physical chrome bounds for the window size and scale factor.
 pub fn compute_layout(size: PhysicalSize<u32>, scale: f64) -> ChromeLayout {
     let bottom_gutter = if cfg!(windows) { (10.0 * scale).round() as u32 } else { 0 };
     let available = size.height.saturating_sub(bottom_gutter);
@@ -89,6 +105,8 @@ pub fn compute_layout(size: PhysicalSize<u32>, scale: f64) -> ChromeLayout {
     }
 }
 
+/// GPU renderer and text resources for the integrated title and tab strip.
+#[derive(Debug)]
 pub struct ChromeRenderer {
     window: Arc<Window>,
     renderer: SceneRenderer,
@@ -101,6 +119,10 @@ pub struct ChromeRenderer {
 }
 
 impl ChromeRenderer {
+    /// Create rendering resources for the chrome window.
+    ///
+    /// # Errors
+    /// Returns an error if GPU or window-surface initialization fails.
     pub fn new(window: Arc<Window>, config: &UiConfig) -> Result<Self, Error> {
         let scale = window.scale_factor();
         Ok(Self {
@@ -119,6 +141,7 @@ impl ChromeRenderer {
         })
     }
 
+    /// Update the surface size, scale, and configured chrome appearance.
     pub fn resize(&mut self, size: PhysicalSize<u32>, scale: f64, config: &UiConfig) {
         self.renderer.resize(size);
         self.background = config.colors.primary.background;

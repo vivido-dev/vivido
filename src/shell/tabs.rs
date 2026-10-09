@@ -7,15 +7,20 @@ use winit::window::WindowId;
 /// One standalone Vivido tab.
 #[derive(Clone, Debug)]
 pub struct Tab {
+    /// Stable identity of the terminal pane backing this tab.
     pub window_id: WindowId,
+    /// Label displayed in the tab strip.
     pub title: String,
 }
 
 /// The visible portion of an overflowing tab strip.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VisibleTabs {
+    /// Tab indices included in the visible strip.
     pub range: Range<usize>,
+    /// Whether tabs precede the visible range.
     pub has_previous: bool,
+    /// Whether tabs follow the visible range.
     pub has_next: bool,
 }
 
@@ -28,31 +33,38 @@ pub struct Tabs {
 }
 
 impl Tabs {
+    /// Return all tabs in display order.
     pub fn as_slice(&self) -> &[Tab] {
         &self.tabs
     }
 
+    /// Return the active tab's index, if any.
     pub fn active_index(&self) -> Option<usize> {
         self.active
     }
 
+    /// Return the active tab, if any.
     pub fn active(&self) -> Option<&Tab> {
         self.active.and_then(|index| self.tabs.get(index))
     }
 
+    /// Return the active terminal pane's window identity.
     pub fn active_window(&self) -> Option<WindowId> {
         self.active().map(|tab| tab.window_id)
     }
 
+    /// Report whether no tabs remain.
     pub fn is_empty(&self) -> bool {
         self.tabs.is_empty()
     }
 
+    /// Append a tab and make it active.
     pub fn add(&mut self, window_id: WindowId, title: String) {
         self.tabs.push(Tab { window_id, title });
         self.active = Some(self.tabs.len() - 1);
     }
 
+    /// Select an existing tab, returning whether the active selection changed.
     pub fn select(&mut self, index: usize) -> bool {
         if index >= self.tabs.len() || self.active == Some(index) {
             return false;
@@ -61,6 +73,7 @@ impl Tabs {
         true
     }
 
+    /// Select a pane's tab, returning whether the active selection changed.
     pub fn select_window(&mut self, window_id: WindowId) -> bool {
         self.tabs
             .iter()
@@ -68,6 +81,7 @@ impl Tabs {
             .is_some_and(|index| self.select(index))
     }
 
+    /// Move the active selection by `delta`, wrapping around the tab list.
     pub fn cycle(&mut self, delta: isize) -> bool {
         let Some(active) = self.active else { return false };
         let Ok(len) = isize::try_from(self.tabs.len()) else { return false };
@@ -90,6 +104,7 @@ impl Tabs {
         true
     }
 
+    /// Update a pane's tab label, returning whether it changed.
     pub fn update_title(&mut self, window_id: WindowId, title: String) -> bool {
         let Some(tab) = self.tabs.iter_mut().find(|tab| tab.window_id == window_id) else {
             return false;
@@ -120,6 +135,7 @@ impl Tabs {
         }
     }
 
+    /// Shift the visible strip by `delta`, bounded by the available tabs.
     pub fn shift_visible(&mut self, delta: isize, capacity: usize) {
         let max_start = self.tabs.len().saturating_sub(capacity.max(1));
         let current = isize::try_from(self.visible_start).unwrap_or(isize::MAX);

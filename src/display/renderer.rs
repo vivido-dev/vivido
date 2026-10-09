@@ -201,6 +201,7 @@ impl WindowsComposition {
         // SAFETY: this native window was obtained on its owning event-loop thread.
         unsafe { super::windows_live_move::install(hwnd.0) }?;
 
+        // SAFETY: No external device pointer is supplied; the call returns an owned COM interface.
         let device: IDCompositionDevice = unsafe { DCompositionCreateDevice2(None::<&IUnknown>) }?;
         // Put the visual above any HWND client/child content. The HWND itself has no redirection
         // bitmap, so transparent visual pixels reach the desktop compositor directly.

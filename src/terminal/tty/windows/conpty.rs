@@ -163,7 +163,7 @@ pub fn new(config: &Options, window_size: WindowSize) -> Result<Pty> {
     // SAFETY: a null handler with FALSE only clears this process's ignore-Ctrl+C flag.
     unsafe { SetConsoleCtrlHandler(None, 0) };
 
-    let mut proc_info: PROCESS_INFORMATION = unsafe { mem::zeroed() };
+    let mut proc_info = PROCESS_INFORMATION::default();
     // SAFETY: The command line is writable NUL-terminated UTF-16; environment, directory, startup attributes, and output storage remain live through the call.
     unsafe {
         success = CreateProcessW(
@@ -188,7 +188,7 @@ pub fn new(config: &Options, window_size: WindowSize) -> Result<Pty> {
     let conout = UnblockedReader::new(conout, PIPE_CAPACITY);
 
     let child_watcher = ChildExitWatcher::new(proc_info.hProcess)?;
-    let conpty = Conpty { handle: pty_handle as HPCON };
+    let conpty = Conpty { handle: pty_handle };
 
     Ok(Pty::new(conpty, conout, conin, child_watcher))
 }

@@ -80,7 +80,19 @@ pub struct TabbedApplication {
     touch_capture: std::collections::HashSet<u64>,
 }
 
+impl std::fmt::Debug for TabbedApplication {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TabbedApplication")
+            .field("chrome_id", &self.chrome_id)
+            .field("tabs", &self.tabs)
+            .field("closing", &self.closing)
+            .finish_non_exhaustive()
+    }
+}
+
 impl TabbedApplication {
+    /// Create a tab host and claim its application-level automation methods.
     pub fn new(mut processor: Processor, config: UiConfig) -> Self {
         let initial_options = processor.take_initial_window_options();
         processor.claim_ipc_methods(&CLAIMED_METHODS);
@@ -112,6 +124,7 @@ impl TabbedApplication {
         }
     }
 
+    /// Run the tab host, returning its processor and event-loop outcome.
     pub fn run(mut self, event_loop: EventLoop<Event>) -> (Processor, Result<(), Box<dyn Error>>) {
         let result = event_loop.run_app(&mut self).map_err(|error| error.into());
         (self.processor, result)

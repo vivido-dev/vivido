@@ -163,7 +163,6 @@ impl std::fmt::Debug for ChildExitWatcher {
 mod tests {
     use std::os::windows::io::AsRawHandle;
     use std::process::Command;
-    use std::sync::Arc;
     use std::time::Duration;
 
     use super::super::PTY_CHILD_EVENT_TOKEN;

@@ -3971,8 +3971,6 @@ mod tests {
         assert_eq!(sorted.len(), unique, "an advertised kind is listed twice");
     }
 
-    #[cfg(windows)]
-    use std::io::Read;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     #[cfg(unix)]

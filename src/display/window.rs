@@ -716,6 +716,7 @@ impl Window {
     }
 
     #[cfg(windows)]
+    /// Build Windows window attributes with configured decorations and application icons.
     pub fn get_platform_window(_: &Identity, window_config: &WindowConfig) -> WindowAttributes {
         let icon = winit::window::Icon::from_resource(IDI_ICON, None);
 

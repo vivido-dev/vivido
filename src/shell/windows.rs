@@ -18,12 +18,13 @@ use crate::cli::TerminalOptions;
 use crate::{ParentWindowHandle, Processor, WindowOptions};
 
 /// Hosts native Vivido child windows inside one Win32 chrome window.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct NativePaneHost {
     chrome: Arc<Window>,
 }
 
 impl NativePaneHost {
+    /// Create a pane host retaining its parent chrome window.
     pub fn new(chrome: Arc<Window>) -> Self {
         Self { chrome }
     }

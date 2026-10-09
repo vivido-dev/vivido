@@ -7,8 +7,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 
 use crate::terminal::tty::windows::win32_string;
 
-// Install a panic handler that renders the panic in a classical Windows error
-// dialog box as well as writes the panic to STDERR.
+/// Install a panic hook writing to stderr and displaying uncontained Windows failures.
 pub fn attach_handler() {
     panic::set_hook(Box::new(|panic_info| {
         // Worker boundaries handling untrusted terminal, Vivid, and IPC input catch their own
