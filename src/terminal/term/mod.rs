@@ -15,7 +15,10 @@ use unicode_width::UnicodeWidthChar;
 
 use crate::osc_notification::OscWorkingDirectory;
 use crate::terminal::event::{Event, EventListener};
-use crate::terminal::graphics::GraphicsCommand;
+use crate::terminal::graphics::{
+    CellPixels, Cursor as GraphicsCursor, FinishedJob, KittyGraphics, QueuedJob,
+    Scroll as GraphicsScroll,
+};
 use crate::terminal::grid::{Dimensions, Grid, GridIterator, Scroll};
 use crate::terminal::index::{self, Boundary, Column, Direction, Line, Point};
 use crate::terminal::selection::{Selection, SelectionRange, SelectionType};
@@ -38,6 +41,9 @@ pub mod search;
 
 #[cfg(test)]
 mod rep_tests;
+
+#[cfg(test)]
+mod graphics_tests;
 
 /// Minimum number of columns.
 ///
@@ -535,6 +541,9 @@ pub struct Term<T> {
 
     /// Grid scroll accumulated since the last delivery. See [`PendingGridScroll`].
     pending_grid_scroll: Option<PendingGridScroll>,
+
+    /// Kitty graphics images and placements of both screens.
+    graphics: KittyGraphics,
 }
 
 /// A grid scroll awaiting delivery to the Vivid scene.
@@ -752,6 +761,7 @@ impl<T> Term<T> {
         self.grid.cursor.point.line -= start.0;
         self.grid.clear_history();
         self.selection = None;
+        self.graphics.clear_screen(true);
 
         self.flush_grid_scroll();
         self.event_proxy.send_event(Event::VividClear);
@@ -775,6 +785,11 @@ impl<T> Term<T> {
         // Initialize terminal damage, covering the entire terminal upon launch.
         let damage = TermDamageState::new(num_cols, num_lines);
 
+        let mut graphics = KittyGraphics::new();
+        if let Some((width, height)) = dimensions.cell_pixels() {
+            graphics.set_cell(CellPixels::new(width.into(), height.into()));
+        }
+
         Term {
             inactive_grid,
             scroll_region,
@@ -797,6 +812,7 @@ impl<T> Term<T> {
             mode: Default::default(),
             dcs_scanner: Default::default(),
             pending_grid_scroll: None,
+            graphics,
         }
     }
 
@@ -808,6 +824,17 @@ impl<T> Term<T> {
     where
         T: EventListener,
     {
+        // Images live with the grid, so they move with it now rather than when the scene hears.
+        if self.graphics.has_placements() {
+            self.graphics.scroll(GraphicsScroll {
+                top: origin,
+                end,
+                lines,
+                screen_lines: i32::try_from(self.screen_lines()).unwrap_or(i32::MAX),
+                history_top: i32::try_from(history_size).map_or(i32::MIN, |size| -size),
+            });
+        }
+
         match &mut self.pending_grid_scroll {
             Some(pending)
                 if pending.origin == origin
@@ -1285,6 +1312,11 @@ impl<T> Term<T> {
         let num_cols = size.columns();
         let num_lines = size.screen_lines();
 
+        // A font change resizes the cells without necessarily changing how many there are.
+        if let Some((width, height)) = size.cell_pixels() {
+            self.graphics.set_cell(CellPixels::new(width.into(), height.into()));
+        }
+
         if old_cols == num_cols && old_lines == num_lines {
             debug!("Term::resize dimensions unchanged");
             return;
@@ -1322,42 +1354,64 @@ impl<T> Term<T> {
 
     /// Resize the terminal while carrying semantic positions through the exact grid operations.
     ///
-    /// Positions which are erased or evicted during resize are returned as `None`.
+    /// Positions which are erased or evicted during resize are returned as `None`. Kitty graphics
+    /// placements are carried the same way, so an image stays with the text it was placed beside
+    /// when the grid reflows.
     pub fn resize_with_tracking<S: Dimensions>(
         &mut self,
         size: S,
         positions: &mut [Option<ResizePoint>],
     ) {
-        if positions.is_empty() {
+        let anchors = self.graphics.anchors();
+        if positions.is_empty() && anchors.is_empty() {
             self.resize(size);
             return;
         }
 
+        // Placements are tracked after the caller's positions, in the order the stores hold them.
+        let mut tracked = Vec::with_capacity(positions.len() + anchors.len());
+        tracked.extend_from_slice(positions);
+        tracked.extend(anchors.iter().map(|&(alternate, _, line, column)| {
+            let column = Column(usize::try_from(column).ok()?);
+            Some(ResizePoint { point: Point::new(Line(line), column), alternate })
+        }));
+
         let active_is_alternate = self.mode.contains(TermMode::ALT_SCREEN);
-        for (index, position) in positions.iter_mut().enumerate() {
-            let Some(tracked) = *position else {
+        for (index, position) in tracked.iter_mut().enumerate() {
+            let Some(point) = *position else {
                 continue;
             };
-            let grid = if tracked.alternate == active_is_alternate {
+            let grid = if point.alternate == active_is_alternate {
                 &mut self.grid
             } else {
                 &mut self.inactive_grid
             };
-            if tracked.point.line < grid.topmost_line()
-                || tracked.point.line > grid.bottommost_line()
-                || tracked.point.column >= grid.columns()
+            if point.point.line < grid.topmost_line()
+                || point.point.line > grid.bottommost_line()
+                || point.point.column >= grid.columns()
             {
                 *position = None;
                 continue;
             }
-            grid[tracked.point].push_vivid_resize_tracking(index);
+            grid[point.point].push_vivid_resize_tracking(index);
         }
 
         self.resize(size);
-        positions.fill(None);
+        tracked.fill(None);
 
-        Self::collect_resize_tracking(&mut self.grid, active_is_alternate, positions);
-        Self::collect_resize_tracking(&mut self.inactive_grid, !active_is_alternate, positions);
+        Self::collect_resize_tracking(&mut self.grid, active_is_alternate, &mut tracked);
+        Self::collect_resize_tracking(&mut self.inactive_grid, !active_is_alternate, &mut tracked);
+
+        let (caller, placements) = tracked.split_at(positions.len());
+        positions.copy_from_slice(caller);
+        if !anchors.is_empty() {
+            // `apply_anchors` visits placements in the order `anchors` listed them.
+            let mut moved = placements.iter();
+            self.graphics.apply_anchors(|_, _| {
+                let point = (*moved.next()?)?.point;
+                Some((point.line.0, i32::try_from(point.column.0).ok()?))
+            });
+        }
     }
 
     fn collect_resize_tracking(
@@ -1409,6 +1463,7 @@ impl<T> Term<T> {
         mem::swap(&mut self.grid, &mut self.inactive_grid);
         self.mode ^= TermMode::ALT_SCREEN;
         self.selection = None;
+        self.graphics.set_alternate(self.mode.contains(TermMode::ALT_SCREEN));
         self.flush_grid_scroll();
         self.event_proxy.send_event(Event::VividScreenSwap {
             alternate: self.mode.contains(TermMode::ALT_SCREEN),
@@ -1483,6 +1538,7 @@ impl<T> Term<T> {
 
         // Clear grid.
         self.grid.reset_region(..);
+        self.graphics.clear_screen(false);
         self.mark_fully_damaged();
     }
 
@@ -1563,15 +1619,78 @@ impl<T> Term<T> {
         self.event_proxy.send_event(Event::Progress(report));
     }
 
-    /// Forward a decoded graphics/media command to the UI renderer.
+    /// Kitty graphics images and placements of this terminal.
+    pub fn graphics(&self) -> &KittyGraphics {
+        &self.graphics
+    }
+
+    /// Queue compressed-image decodes for [`Self::take_graphics_jobs`] instead of running them
+    /// while the command is parsed.
     ///
-    /// Escape-sequence parsers can call this after translating Sixel, Kitty, or custom protocol
-    /// data into the protocol-neutral command model.
-    pub fn submit_graphics(&self, command: GraphicsCommand)
+    /// Only a driver that drains the queue after every batch of input may turn this on; an image
+    /// whose decode nobody runs never appears.
+    pub(crate) fn set_deferred_graphics_decode(&mut self, defer: bool) {
+        self.graphics.set_deferred_decode(defer);
+    }
+
+    /// Whether [`Self::take_graphics_jobs`] would return anything.
+    pub(crate) fn has_graphics_jobs(&self) -> bool {
+        self.graphics.has_jobs()
+    }
+
+    /// Image decodes waiting to be run, which needs no access to the terminal.
+    pub(crate) fn take_graphics_jobs(&mut self) -> Vec<QueuedJob> {
+        self.graphics.take_jobs()
+    }
+
+    /// Install the results of [`Self::take_graphics_jobs`] and send the replies they were holding.
+    pub(crate) fn finish_graphics_jobs(&mut self, finished: Vec<FinishedJob>)
     where
         T: EventListener,
     {
-        self.event_proxy.send_event(Event::Graphics(command));
+        self.graphics.finish_jobs(finished);
+        self.flush_graphics_replies();
+    }
+
+    /// Input consumed by graphics commands since the last call that changed nothing visible, and
+    /// whether any graphics command did change something.
+    pub(crate) fn take_graphics_activity(&mut self) -> (usize, bool) {
+        (self.graphics.take_quiet_bytes(), self.graphics.take_dirty())
+    }
+
+    /// Write every graphics reply that is ready to the application.
+    fn flush_graphics_replies(&mut self)
+    where
+        T: EventListener,
+    {
+        while let Some(reply) = self.graphics.pop_reply() {
+            self.event_proxy.send_event(Event::PtyWrite(reply));
+        }
+    }
+
+    /// Move the cursor past an image placed at it, the way Kitty does.
+    ///
+    /// The cursor ends on the image's last row, in the column after its right edge, or at the
+    /// start of the following line when the image reaches the right margin. It moves down by line
+    /// feeds, so an image placed near the bottom scrolls the screen, and itself with it.
+    fn advance_past_image(&mut self, columns: u32, rows: u32)
+    where
+        T: EventListener,
+    {
+        let mut column = self.grid.cursor.point.column.0.saturating_add(columns as usize);
+        let mut down = rows.saturating_sub(1) as usize;
+        if column >= self.columns() {
+            column = 0;
+            down += 1;
+        }
+        // After a screenful of line feeds everything has scrolled away; more would do nothing.
+        for _ in 0..down.min(self.screen_lines()) {
+            self.linefeed();
+        }
+        self.damage_cursor();
+        self.grid.cursor.point.column = Column(column);
+        self.grid.cursor.input_needs_wrap = false;
+        self.damage_cursor();
     }
 
     /// Scroll display to point if it is outside of viewport.
@@ -1748,6 +1867,8 @@ impl<T: EventListener> Term<T> {
         self.scroll_region = Line(0)..Line(self.screen_lines() as i32);
         self.tabs = TabStops::new(self.columns());
         self.mode = TermMode::default();
+        // Like the Vivid scene, images are client state: recovery starts without them.
+        self.graphics.reset();
 
         if was_alternate {
             self.event_proxy.send_event(Event::VividScreenSwap { alternate: false });
@@ -2579,7 +2700,18 @@ impl<T: EventListener> Handler for Term<T> {
                 if self.mode.contains(TermMode::ALT_SCREEN) {
                     self.grid.reset_region(..);
                 } else {
-                    self.grid.clear_viewport();
+                    let preserved = self.grid.clear_viewport();
+                    // The text went into scrollback rather than away, and an image beside it
+                    // goes with it. Whatever that leaves on screen is erased below.
+                    if preserved > 0 && self.graphics.has_placements() {
+                        self.graphics.scroll(GraphicsScroll {
+                            top: 0,
+                            end: i32::try_from(screen_lines).unwrap_or(i32::MAX),
+                            lines: i32::try_from(preserved).unwrap_or(i32::MAX),
+                            screen_lines: i32::try_from(screen_lines).unwrap_or(i32::MAX),
+                            history_top: self.grid.topmost_line().0,
+                        });
+                    }
                 }
 
                 self.selection = None;
@@ -2591,6 +2723,14 @@ impl<T: EventListener> Handler for Term<T> {
             },
             // We have no history to clear.
             ansi::ClearMode::Saved => (),
+        }
+
+        match mode {
+            ansi::ClearMode::All => self.graphics.clear_screen(false),
+            // On Windows this is how a console clear arrives; see `clears_vivid_scene`.
+            ansi::ClearMode::Saved if clears_vivid_scene => self.graphics.clear_screen(true),
+            ansi::ClearMode::Saved => self.graphics.clear_history(),
+            ansi::ClearMode::Above | ansi::ClearMode::Below => (),
         }
 
         if clears_vivid_scene {
@@ -2633,6 +2773,7 @@ impl<T: EventListener> Handler for Term<T> {
         self.selection = None;
         self.keyboard_mode_stack = Default::default();
         self.inactive_keyboard_mode_stack = Default::default();
+        self.graphics.reset();
 
         self.mode = TermMode::default();
 
@@ -3072,6 +3213,36 @@ impl<T: EventListener> Handler for Term<T> {
     fn text_area_size_chars(&mut self) {
         let text = format!("\x1b[8;{};{}t", self.screen_lines(), self.columns());
         self.event_proxy.send_event(Event::PtyWrite(text));
+    }
+
+    #[inline]
+    fn text_area_cell_size_pixels(&mut self) {
+        self.event_proxy.send_event(Event::TextAreaSizeRequest(Arc::new(move |window_size| {
+            format!("\x1b[6;{};{}t", window_size.cell_height, window_size.cell_width)
+        })));
+    }
+
+    #[inline]
+    fn apc_start(&mut self) {
+        self.graphics.apc_start();
+    }
+
+    #[inline]
+    fn apc_put(&mut self, bytes: &[u8]) {
+        self.graphics.apc_put(bytes);
+    }
+
+    fn apc_end(&mut self, cancelled: bool) {
+        let point = self.grid.cursor.point;
+        let cursor = GraphicsCursor {
+            row: point.line.0,
+            col: i32::try_from(point.column.0).unwrap_or(i32::MAX),
+        };
+        let outcome = self.graphics.apc_end(cancelled, cursor);
+        if let Some((columns, rows)) = outcome.advance {
+            self.advance_past_image(columns, rows);
+        }
+        self.flush_graphics_replies();
     }
 }
 

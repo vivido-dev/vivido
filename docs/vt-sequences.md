@@ -20,13 +20,18 @@ is therefore decided in three places:
 
 1. **`vte`'s state machine** (`vte::ansi`) — decides whether a sequence is dispatched at all.
    Sequences it does not know are consumed and dropped with a debug log; they never error.
+   Application program commands (`ESC _ … ESC \`) are delivered to the handler in bulk; `Term`
+   routes the ones that begin with `G` to the Kitty graphics state in `src/terminal/graphics/`
+   and ignores the rest.
 2. **`Term`'s `Handler` impl** (`src/terminal/term/mod.rs`) — decides what a dispatched
    sequence does. `vte`'s `Handler` trait gives every method an empty default, so a method
    Vivido does not override is a parse-only no-op.
 3. **Pre-parser scanners** (`src/terminal/event_loop.rs`, `src/osc_notification.rs`) — intercept
    OSC 7 working-directory reports, OSC 9/99 desktop notifications, OSC 9;4 progress, DCS
    queries, and Vivid media
-   anchors before `vte` sees them.
+   anchors before `vte` sees them. The same scanner marks Kitty graphics commands so they stay
+   out of the automation transcript; it does not interpret them, and they are still parsed by
+   `vte` in stream order.
 
 ## Client compatibility and recovery
 
@@ -169,7 +174,7 @@ DEC private modes (`CSI ? Ps h/l`):
 | DECRQM (ANSI) | `CSI Ps $ p` | ✅ | IRM, LNM only; others reply 0. |
 | DECSCUSR | `CSI Ps SP q` | ✅ | 0–6 → block/underline/beam × blinking. |
 | XTSHIFTESCAPE | `CSI > Ps s` | ❌ | Unhandled. |
-| Window ops | `CSI Ps t` | ⚠️ | 14 (pixel size, replies `CSI 4 ; h ; w t`), 18 (char size, replies `CSI 8 ; rows ; cols t`), 22/23 (title stack push/pop) are supported. All other XTWINOPS (resize, iconify, raise, title query) are unhandled. |
+| Window ops | `CSI Ps t` | ⚠️ | 14 (pixel size, replies `CSI 4 ; h ; w t`), 16 (cell size in pixels, replies `CSI 6 ; h ; w t`), 18 (char size, replies `CSI 8 ; rows ; cols t`), 22/23 (title stack push/pop) are supported. All other XTWINOPS (resize, iconify, raise, title query) are unhandled. |
 | Bidirectional SCP | `CSI Ps ; Ps SP k` | ⚠️ | Dispatched by `vte`; `set_scp` is not implemented — no-op, no BiDi state. |
 
 ## SGR — character attributes (`CSI … m`)
@@ -225,9 +230,28 @@ not fit at end-of-line get a leading spacer cell when DECAWM is on.
 | DECRQSS | `DCS $ q … ST` | ✅ | Intercepts before `vte`. Reports `m` (full SGR status), `r` (DECSTBM), `"p` (`61;1`), `"q` (`0`); anything else gets the error reply `DCS 0 $ r ST`. Bodies bounded to 4 KiB, then resynchronized. |
 | XTGETTCAP | `DCS + q … ST` | ✅ | Reports `TN=xterm-vivido`, `Co=256`, `RGB=8`, `Tc`. |
 | XTSETTCAP | `DCS + p … ST` | ⚠️ | Parsed and hex-validated, then ignored — applications cannot change the identity. |
-| Sixel | `DCS … q … ST` | ⚠️ | Consumed cleanly (never rendered as garbage); no decoder yet. `terminal/graphics.rs` defines protocol-neutral `GraphicsCommand` extension points (Sixel/Kitty/custom) that nothing currently emits. |
-| Kitty graphics | `APC G … ST` | ⚠️ | Silently consumed by the parser; not rendered. |
+| Sixel | `DCS … q … ST` | ⚠️ | Consumed cleanly (never rendered as garbage); no decoder. |
+| Kitty graphics | `APC G … ST` | ⚠️ | Still images. Transmit `a=t`/`a=T` directly (`t=d`) as 24-bit, 32-bit or PNG (`f=24/32/100`), optionally zlib-compressed (`o=z`) and chunked (`m`); place `a=p` with source rectangle (`x,y,w,h`), size in cells (`c,r`), cell offset (`X,Y`), z-index, placement id and `C=1`; delete `a=d` with every selector except frames; query `a=q`; image ids and numbers; replies honoring `q`. Unicode placeholders (`U=1` with `U+10EEEE` cells) for use through tmux. Images scroll, reflow and erase with the grid, and each screen has its own. Not supported, each answered with an error so applications fall back: file, temp-file and shared-memory transmission (`t=f/t/s`), animation (`a=f/a/c`), relative placements (`P/Q`). Limits: 8192 px per side, 320 MiB of decoded pixels per screen. See below. |
 | **Vivid 1.5 anchors** | `ESC _ VIVID ; 3 ; … ST` (ConPTY path: bare `VIVID;3;…;VIVID-END`) | ✅ | The authenticated media anchor is the only escape Vivido adds to the PTY stream. The event loop accepts either bounded envelope so a remote Windows ConPTY hop can reach a macOS/Linux presenter, attaches the anchor to the cursor's grid position (`Event::VividMarker`), and drives the side-channel media pipeline (images/video/audio). Media bytes themselves never touch the PTY. |
+
+### Kitty graphics notes
+
+- **Z-index** follows the protocol: below `-1073741824` an image is drawn under cell
+  backgrounds, other negative values under the text, zero and above over it.
+- **Erasing.** `CSI 2 J` removes the images on screen. On the primary screen Vivido keeps the
+  erased text in scrollback, and an image that sat among that text is kept there with it; one
+  that would still be on screen is removed. `CSI 3 J` removes the images in scrollback. Erasing
+  part of the screen or overwriting cells leaves images alone, as in Kitty.
+- **Scrolling and resizing.** Images move with their lines into scrollback and are dropped when
+  those lines are. Inside a scroll region an image is clipped at the margins. When the window is
+  resized an image follows the cell it was placed on through the reflow.
+- **Alternate screen.** It starts with no images each time it is entered, and what was drawn on
+  it is released on leaving. Image ids on the two screens are unrelated.
+- **Replacing in place.** A program that redraws an opaque image at exactly the same position
+  with no image id, as a video player does for every frame, replaces the previous one instead of
+  stacking on it. Nothing could ever have shown or addressed the covered image again.
+- **Sizes** are in physical pixels. `TIOCGWINSZ` reports the window's pixel size, and `CSI 14 t`
+  and `CSI 16 t` report it and the cell size.
 
 ## Input-side protocols (what Vivido sends)
 

@@ -22,8 +22,6 @@ use windows::Win32::Graphics::DirectComposition::{
 #[cfg(windows)]
 use windows::core::{IUnknown, Interface};
 
-use crate::terminal::graphics::GraphicsCommand;
-
 use crate::display::SizeInfo;
 use crate::display::corners::CornerMask;
 #[cfg(any(unix, windows))]
@@ -656,11 +654,6 @@ impl SceneRenderer {
         self.media.set_scene(scene);
     }
 
-    /// Submit a protocol-neutral graphics command and invalidate affected rendering.
-    pub fn submit_graphics(&mut self, command: GraphicsCommand) {
-        self.media.submit(command);
-    }
-
     /// Return current media upload counters.
     pub fn media_metrics(&self) -> super::media::SourceUploadMetrics {
         self.media.source_upload_metrics()
@@ -675,12 +668,14 @@ impl SceneRenderer {
         &mut self,
         size: &SizeInfo,
         display_offset: usize,
+        kitty: &super::kitty::KittyFrame,
     ) -> Option<super::media::PreparedMedia> {
         if self.gpu_health.failed() {
             return None;
         }
         let mut renderer = self.renderer.borrow_mut();
-        let media = self.media.draw(&self.device, &self.queue, &mut renderer, size, display_offset);
+        let media =
+            self.media.draw(&self.device, &self.queue, &mut renderer, size, display_offset, kitty);
         let (overlay, changed) = match self.overlays.draw(
             &self.device,
             &self.queue,
@@ -1849,7 +1844,8 @@ mod tests {
             SceneRenderer::new(RenderSource::Offscreen, PhysicalSize::new(64, 32), false).unwrap();
         renderer.set_vivid_scene(shared);
         let size = crate::display::SizeInfo::new(64., 32., 8., 8., 0., 0., false);
-        let media = renderer.prepare_media(&size, 0).unwrap();
+        let no_images = crate::display::kitty::KittyFrame::default();
+        let media = renderer.prepare_media(&size, 0, &no_images).unwrap();
         assert!(media.layers.iter().all(Option::is_some));
         let mut scene = Scene::new();
         scene.draw_image(media.layers[0].as_ref().unwrap(), kurbo::Affine::IDENTITY);
@@ -1891,8 +1887,115 @@ mod tests {
         assert_eq!(pixel(24, 8), [0, 255, 0, 255], "layer one belongs below glyph/cursor coverage");
         assert_eq!(pixel(40, 8), [255, 0, 0, 255], "layer two belongs above glyph/cursor coverage");
         let uploads = renderer.media_metrics().uploaded_pixels;
-        assert!(!renderer.prepare_media(&size, 0).unwrap().changed);
+        assert!(!renderer.prepare_media(&size, 0, &no_images).unwrap().changed);
         assert_eq!(renderer.media_metrics().uploaded_pixels, uploads);
+    }
+
+    /// Kitty images share the three media targets, selected by z-index: far-negative under cell
+    /// backgrounds, negative under text, the rest over it. No Vivid scene is attached here, so
+    /// this also covers the compositor drawing images on its own.
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn kitty_images_composite_into_the_layer_their_z_index_names() {
+        use base64::Engine;
+
+        use crate::display::kitty::KittyFrame;
+        use crate::terminal::event::VoidListener;
+        use crate::terminal::term::{Config, Term};
+        use crate::terminal::vvte::ansi;
+
+        let _gpu = gpu_lock();
+        if offscreen_device().is_err() {
+            eprintln!("Skipping Kitty layer rendering test: no wgpu adapter");
+            return;
+        }
+        // Eight columns by four lines of 8x8 cells.
+        let size = crate::display::SizeInfo::new(64., 32., 8., 8., 0., 0., false);
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+        let mut parser = ansi::Processor::new();
+        let mut image = |id: u32, rgba: [u8; 4], placements: &str| {
+            let data = base64::engine::general_purpose::STANDARD.encode(rgba.repeat(64));
+            let bytes = format!("\x1b_Ga=t,i={id},s=8,v=8,q=2;{data}\x1b\\{placements}");
+            term.advance(&mut parser, bytes.as_bytes());
+        };
+        // Red under the backgrounds, at column 0 and again at column 5.
+        image(
+            1,
+            [255, 0, 0, 255],
+            "\x1b[1;1H\x1b_Ga=p,i=1,C=1,z=-1073741825,q=2\x1b\\\x1b[1;6H\x1b_Ga=p,i=1,C=1,\
+             z=-1073741825,p=2,q=2\x1b\\",
+        );
+        // Yellow under the text at column 1, white over it at column 2.
+        image(2, [255, 255, 0, 255], "\x1b[1;2H\x1b_Ga=p,i=2,C=1,z=-1,q=2\x1b\\");
+        image(3, [255, 255, 255, 255], "\x1b[1;3H\x1b_Ga=p,i=3,C=1,q=2\x1b\\");
+        // Half-transparent red at column 6, line 2.
+        image(4, [255, 0, 0, 128], "\x1b[3;7H\x1b_Ga=p,i=4,C=1,q=2\x1b\\");
+
+        let mut frame = KittyFrame::default();
+        assert!(frame.update(&term, &size, 0, true));
+        assert_eq!(frame.quads().len(), 5);
+
+        let mut renderer =
+            SceneRenderer::new(RenderSource::Offscreen, PhysicalSize::new(64, 32), false).unwrap();
+        let media = renderer.prepare_media(&size, 0, &frame).unwrap();
+        assert!(media.changed);
+        assert!(media.layers.iter().all(Option::is_some));
+        let fill = |scene: &mut Scene, color: Color, rect: kurbo::Rect| {
+            scene.fill(vello::peniko::Fill::NonZero, kurbo::Affine::IDENTITY, color, None, &rect);
+        };
+        let mut scene = Scene::new();
+        scene.draw_image(media.layers[0].as_ref().unwrap(), kurbo::Affine::IDENTITY);
+        // Cell backgrounds over the left half only.
+        fill(&mut scene, Color::from_rgb8(0, 0, 255), kurbo::Rect::new(0., 0., 32., 32.));
+        scene.draw_image(media.layers[1].as_ref().unwrap(), kurbo::Affine::IDENTITY);
+        // Glyph coverage across the lower half of the yellow and the white image.
+        fill(&mut scene, Color::from_rgb8(0, 255, 0), kurbo::Rect::new(8., 4., 24., 8.));
+        scene.draw_image(media.layers[2].as_ref().unwrap(), kurbo::Affine::IDENTITY);
+        renderer.render(&scene, Color::BLACK).unwrap();
+
+        let readback = renderer.begin_screenshot().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let pixels = loop {
+            if let Some(pixels) = renderer.poll_screenshot(&readback).unwrap() {
+                break pixels;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        };
+        let pixel = |x: usize, y: usize| {
+            let offset = y * pixels.padded_bytes_per_row as usize + x * 4;
+            &pixels.bytes[offset..offset + 4]
+        };
+        assert_eq!(pixel(4, 4), [0, 0, 255, 255], "far-negative z is hidden by a cell background");
+        assert_eq!(pixel(44, 4), [255, 0, 0, 255], "and shows where there is none");
+        assert_eq!(pixel(12, 2), [255, 255, 0, 255], "negative z is above cell backgrounds");
+        assert_eq!(pixel(12, 6), [0, 255, 0, 255], "and below glyph coverage");
+        assert_eq!(pixel(20, 6), [255, 255, 255, 255], "zero z is above glyph coverage");
+        assert_eq!(pixel(28, 4), [0, 0, 255, 255], "nothing is drawn where nothing was placed");
+        let blended = pixel(52, 20);
+        assert!(
+            blended[0].abs_diff(128) <= 2 && blended[1] == 0 && blended[2] == 0,
+            "straight alpha is premultiplied on the way in: {blended:?}"
+        );
+
+        // Image 1 is placed twice and uploaded once; a frame that did not change uploads nothing.
+        let uploads = renderer.media_metrics();
+        assert_eq!((uploads.frames, uploads.uploaded_pixels), (4, 4 * 64));
+        assert!(!renderer.prepare_media(&size, 0, &frame).unwrap().changed);
+        assert_eq!(renderer.media_metrics().uploaded_pixels, uploads.uploaded_pixels);
+
+        // Replacing an image with another of its size is one more upload, and deleting them all
+        // empties the layers without any.
+        term.advance(&mut parser, b"\x1b[1;3H");
+        let data = base64::engine::general_purpose::STANDARD.encode([0, 255, 255, 255].repeat(64));
+        term.advance(&mut parser, format!("\x1b_Ga=T,i=3,s=8,v=8,C=1,q=2;{data}\x1b\\").as_bytes());
+        assert!(frame.update(&term, &size, 0, false));
+        assert!(renderer.prepare_media(&size, 0, &frame).unwrap().changed);
+        assert_eq!(renderer.media_metrics().frames, 5);
+        term.advance(&mut parser, b"\x1b_Ga=d,d=A\x1b\\");
+        assert!(frame.update(&term, &size, 0, false));
+        assert!(renderer.prepare_media(&size, 0, &frame).unwrap().changed);
+        assert_eq!(renderer.media_metrics().frames, 5);
     }
 
     #[cfg(any(unix, windows))]

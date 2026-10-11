@@ -6717,7 +6717,7 @@ mod tests {
             ) {
                 renderer.set_vivid_scene(service.scene());
                 let size = SizeInfo::new(800., 600., 10., 25., 0., 0., false);
-                let media = renderer.prepare_media(&size, 0).unwrap();
+                let media = renderer.prepare_media(&size, 0, &Default::default()).unwrap();
                 assert_eq!(renderer.overlay_metrics().render_passes, 1);
                 assert_eq!(renderer.overlay_metrics().target_allocations, 1);
                 let mut composed = vello::Scene::new();
@@ -6744,14 +6744,14 @@ mod tests {
                     "overlay remains clipped to its bounds"
                 );
                 assert!(
-                    !renderer.prepare_media(&size, 0).unwrap().changed,
+                    !renderer.prepare_media(&size, 0, &Default::default()).unwrap().changed,
                     "unchanged overlays reuse their GPU target"
                 );
                 assert_eq!(renderer.overlay_metrics().skipped_passes, 1);
                 let generation = media.image_generation;
                 let compiled = lock(&service.shared.overlays).compiled_scene_count();
                 window.set_bounds(Rect::new(20., 20., 100., 80.).unwrap()).unwrap();
-                let moved = renderer.prepare_media(&size, 0).unwrap();
+                let moved = renderer.prepare_media(&size, 0, &Default::default()).unwrap();
                 assert!(moved.changed);
                 assert_eq!(renderer.overlay_metrics().render_passes, 2);
                 assert_eq!(lock(&service.shared.overlays).compiled_scene_count(), compiled);
@@ -6928,7 +6928,7 @@ mod tests {
         .expect("overlay performance measurement requires a Vello adapter");
         renderer.set_vivid_scene(service.scene());
         let size = SizeInfo::new(800., 600., 10., 25., 0., 0., false);
-        let prepared = renderer.prepare_media(&size, 0).unwrap();
+        let prepared = renderer.prepare_media(&size, 0, &Default::default()).unwrap();
         let mut scene = vello::Scene::new();
         scene.draw_image(prepared.overlay.as_ref().unwrap(), vello::kurbo::Affine::IDENTITY);
         renderer.render(&scene, vello::peniko::Color::BLACK).unwrap();
@@ -6941,7 +6941,7 @@ mod tests {
             let y = 20. + f64::from((frame % 120) as u16);
             let started = Instant::now();
             window.set_bounds(Rect::new(x, y, 240., 160.).unwrap()).unwrap();
-            assert!(renderer.prepare_media(&size, 0).unwrap().changed);
+            assert!(renderer.prepare_media(&size, 0, &Default::default()).unwrap().changed);
             samples.push(started.elapsed());
         }
         samples.sort_unstable();
@@ -7086,7 +7086,11 @@ mod tests {
             // Read actual Vello pixels while the child holds its scene until the release marker.
             renderer.set_vivid_scene(service.scene());
             let media = renderer
-                .prepare_media(&SizeInfo::new(800., 600., 10., 25., 0., 0., false), 0)
+                .prepare_media(
+                    &SizeInfo::new(800., 600., 10., 25., 0., 0., false),
+                    0,
+                    &Default::default(),
+                )
                 .unwrap();
             let mut scene = vello::Scene::new();
             scene.draw_image(media.overlay.as_ref().unwrap(), vello::kurbo::Affine::IDENTITY);
@@ -7141,7 +7145,11 @@ mod tests {
                         .any(|d| d.revision == 3)
                 {
                     let media = renderer
-                        .prepare_media(&SizeInfo::new(800., 600., 10., 25., 0., 0., false), 0)
+                        .prepare_media(
+                            &SizeInfo::new(800., 600., 10., 25., 0., 0., false),
+                            0,
+                            &Default::default(),
+                        )
                         .unwrap();
                     let mut scene = vello::Scene::new();
                     scene.draw_image(

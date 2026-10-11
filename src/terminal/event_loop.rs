@@ -22,6 +22,7 @@ use polling::{Event as PollingEvent, Events, PollMode, Poller};
 use crate::automation::Transcript;
 use crate::osc_notification::{OscMessage, OscNotificationParser};
 use crate::terminal::event::{self, Event, EventListener, WindowSize};
+use crate::terminal::graphics::QueuedJob;
 use crate::terminal::sync::FairMutex;
 use crate::terminal::term::Term;
 use crate::terminal::{thread, tty};
@@ -185,10 +186,13 @@ where
     {
         let mut unprocessed = 0;
         let mut processed = 0;
+        // Bytes of `processed` that were image data still accumulating, which show nothing yet.
+        let mut quiet = 0;
+        let mut graphics_changed = false;
 
         // Reserve the next terminal lock for PTY reading.
-        let _terminal_lease = Some(self.terminal.lease());
-        let mut terminal = None;
+        let mut _terminal_lease = Some(self.terminal.lease());
+        let mut terminal_slot = None;
 
         loop {
             // Read from the PTY.
@@ -208,9 +212,9 @@ where
             }
 
             // Attempt to lock the terminal.
-            let terminal = match &mut terminal {
+            let terminal = match &mut terminal_slot {
                 Some(terminal) => terminal,
-                None => terminal.insert(match self.terminal.try_lock_unfair() {
+                None => terminal_slot.insert(match self.terminal.try_lock_unfair() {
                     // Force block if we are at the buffer size limit.
                     None if unprocessed >= READ_BUFFER_SIZE => self.terminal.lock_unfair(),
                     None => continue,
@@ -225,6 +229,7 @@ where
 
             // Parse the incoming bytes, observing only the bounded authenticated-marker envelope.
             // The complete APC is still passed to VTE, which keeps it zero-width and invisible.
+            let synchronized = state.parser.sync_bytes_count() != 0;
             processed += state.advance(
                 &mut **terminal,
                 &buf[..unprocessed],
@@ -237,14 +242,35 @@ where
             }
             unprocessed = 0;
 
+            let (quiet_bytes, changed) = terminal.take_graphics_activity();
+            graphics_changed |= changed;
+            // The count is exact only when every byte it covers arrived in this call. A
+            // synchronized update replays input from earlier calls, so then it is not used and
+            // the wakeup below falls back to treating everything as visible.
+            if !synchronized && state.parser.sync_bytes_count() == 0 {
+                quiet += quiet_bytes;
+            }
+
+            if terminal.has_graphics_jobs() {
+                let jobs = terminal.take_graphics_jobs();
+                // Decoding a compressed image is the one slow step in receiving it, and needs
+                // nothing from the terminal. Give the terminal up, lease included, so the UI can
+                // keep drawing: it would otherwise wait out the decode on its next frame.
+                terminal_slot = None;
+                _terminal_lease = None;
+                let finished = jobs.into_iter().map(QueuedJob::run).collect();
+                _terminal_lease = Some(self.terminal.lease());
+                terminal_slot.insert(self.terminal.lock_unfair()).finish_graphics_jobs(finished);
+                graphics_changed = true;
+            }
+
             // Assure we're not blocking the terminal too long unnecessarily.
             if processed >= MAX_LOCKED_READ {
                 break;
             }
         }
 
-        // Queue terminal redraw unless all processed bytes were synchronized.
-        if state.parser.sync_bytes_count() < processed && processed > 0 {
+        if wakeup_needed(processed, state.parser.sync_bytes_count(), quiet, graphics_changed) {
             self.event_proxy.send_event(Event::Wakeup);
         }
 
@@ -296,6 +322,9 @@ where
         thread::spawn_named("PTY reader", move || {
             let mut state = State::default();
             let mut buf = vec![0u8; READ_BUFFER_SIZE].into_boxed_slice();
+
+            // This loop runs queued image decodes itself, after each read and without the lock.
+            self.terminal.lock_unfair().set_deferred_graphics_decode(true);
 
             let poll_opts = PollMode::Level;
             let mut interest = PollingEvent::readable(0);
@@ -727,6 +756,21 @@ mod terminal_reply_tests {
 
 /// All of the mutable state needed to run the event loop.
 ///
+/// Whether a PTY read left the UI anything new to draw.
+///
+/// Of the `processed` bytes, `synchronized` are held back by a synchronized update and `quiet`
+/// were image data that has not yet added up to an image. A read made of nothing else changed
+/// nothing on screen, and waking the UI for it would redraw an identical frame; at the megabytes
+/// per second an image transfer runs at, that is a redraw per display refresh for nothing.
+fn wakeup_needed(
+    processed: usize,
+    synchronized: usize,
+    quiet: usize,
+    graphics_changed: bool,
+) -> bool {
+    processed > 0 && (graphics_changed || synchronized.saturating_add(quiet) < processed)
+}
+
 /// Contains list of items to write, current write state, etc. Anything that
 /// would otherwise be mutated on the `EventLoop` goes here.
 #[derive(Default)]
@@ -823,6 +867,13 @@ impl State {
                 }
                 terminal.vivid_marker(marker.to_owned());
             },
+            // Parsed like everything else, but kept out of the transcript: image data is megabytes
+            // of base64 that would push every line of real output out of a 1 MiB ring, and
+            // announcing it as output would wake the UI for bytes that show nothing.
+            VividChunk::Graphics(bytes) => {
+                processed += bytes.len();
+                terminal.advance(parser, bytes);
+            },
         });
         self.vivid_markers = scanner;
         processed
@@ -886,18 +937,58 @@ const CONPTY_VIVID_MARKER: VividMarkerEnvelope = VividMarkerEnvelope {
 #[cfg(test)]
 const VIVID_MARKER_ENVELOPES: [VividMarkerEnvelope; 2] = [APC_VIVID_MARKER, CONPTY_VIVID_MARKER];
 
-/// One span of scanned PTY bytes: ordinary terminal data, or one authenticated anchor marker.
+/// One span of scanned PTY bytes: ordinary terminal data, one authenticated anchor marker, or
+/// part of a Kitty graphics command.
 ///
 /// Spans borrow either the caller's read buffer or the scanner's own bounded `pending` buffer, so
 /// ordinary output reaches the terminal without being copied.
 enum VividChunk<'a> {
     Bytes(&'a [u8]),
-    Marker { raw: &'a [u8], marker: &'a str, pass_to_terminal: bool },
+    Marker {
+        raw: &'a [u8],
+        marker: &'a str,
+        pass_to_terminal: bool,
+    },
+    /// Bytes of an `ESC _ G … ESC \` command, introducer and terminator included.
+    Graphics(&'a [u8]),
+}
+
+/// Introducer of a Kitty graphics command.
+const GRAPHICS_INTRODUCER: &[u8] = b"\x1b_G";
+
+/// Where a Kitty graphics command that has begun ends within a buffer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GraphicsEnd {
+    /// It ends at this offset; what follows is ordinary input.
+    Closed(usize),
+    /// The buffer ends on an ESC at this offset that may be the terminator's first byte.
+    Undecided(usize),
+    /// It runs past the end of the buffer.
+    Open,
+}
+
+/// Find the end of the graphics command that `buf` continues.
+///
+/// This mirrors what the parser does with an application program command: it runs to the next
+/// ESC, CAN or SUB. An ESC followed by `\` is the terminator and belongs to the command; any other
+/// byte there cancels the command and is itself ordinary input.
+fn graphics_end(buf: &[u8]) -> GraphicsEnd {
+    match memchr::memchr3(0x1B, 0x18, 0x1A, buf) {
+        None => GraphicsEnd::Open,
+        Some(at) if buf[at] != 0x1B => GraphicsEnd::Closed(at),
+        Some(at) => match buf.get(at + 1) {
+            None => GraphicsEnd::Undecided(at),
+            Some(b'\\') => GraphicsEnd::Closed(at + 2),
+            Some(_) => GraphicsEnd::Closed(at),
+        },
+    }
 }
 
 #[derive(Default)]
 struct VividMarkerScanner {
     pending: Vec<u8>,
+    /// Whether the input so far ends inside a Kitty graphics command.
+    graphics: bool,
 }
 
 impl VividMarkerScanner {
@@ -911,21 +1002,56 @@ impl VividMarkerScanner {
         F: FnMut(VividChunk<'_>),
     {
         if self.pending.is_empty() {
-            let consumed = scan_markers(bytes, emit);
+            let consumed = self.scan(bytes, emit);
             self.pending.extend_from_slice(&bytes[consumed..]);
         } else {
             self.pending.extend_from_slice(bytes);
-            let consumed = scan_markers(&self.pending, emit);
+            let pending = mem::take(&mut self.pending);
+            let consumed = self.scan(&pending, emit);
+            self.pending = pending;
             self.pending.drain(..consumed);
         }
     }
+
+    /// Emit every complete chunk in `buf`, returning how many leading bytes were consumed.
+    ///
+    /// A graphics command left open by the previous call is continued first. Its data is handed
+    /// on as it arrives, never accumulated: the only byte ever held back for it is a trailing ESC
+    /// whose meaning the next read decides.
+    fn scan<F>(&mut self, buf: &[u8], emit: &mut F) -> usize
+    where
+        F: FnMut(VividChunk<'_>),
+    {
+        let mut start = 0;
+        if self.graphics {
+            match graphics_end(buf) {
+                GraphicsEnd::Open => {
+                    emit_graphics(emit, buf);
+                    return buf.len();
+                },
+                GraphicsEnd::Undecided(at) => {
+                    emit_graphics(emit, &buf[..at]);
+                    return at;
+                },
+                GraphicsEnd::Closed(end) => {
+                    emit_graphics(emit, &buf[..end]);
+                    self.graphics = false;
+                    start = end;
+                },
+            }
+        }
+        let (consumed, graphics) = scan_markers(&buf[start..], emit);
+        self.graphics = graphics;
+        start + consumed
+    }
 }
 
-/// Emit every complete chunk in `buf`, returning how many leading bytes were consumed.
+/// Emit every complete chunk in `buf`, returning how many leading bytes were consumed and whether
+/// the consumed input ends inside a Kitty graphics command.
 ///
 /// The unconsumed tail is a partial prefix or an unterminated marker still short enough to
 /// complete in a later read.
-fn scan_markers<F>(buf: &[u8], emit: &mut F) -> usize
+fn scan_markers<F>(buf: &[u8], emit: &mut F) -> (usize, bool)
 where
     F: FnMut(VividChunk<'_>),
 {
@@ -953,13 +1079,33 @@ where
                 let keep = usize::from(buf[cursor..].ends_with(b"\x1b"));
                 let end = buf.len() - keep;
                 emit_bytes(emit, &buf[text_start..end]);
-                return end;
+                return (end, false);
             },
         };
         if envelope.payload_skip != 0 && !buf[start..].starts_with(envelope.prefix) {
             if envelope.prefix.starts_with(&buf[start..]) {
                 emit_bytes(emit, &buf[text_start..start]);
-                return start;
+                return (start, false);
+            }
+            if buf[start..].starts_with(GRAPHICS_INTRODUCER) {
+                emit_bytes(emit, &buf[text_start..start]);
+                let body = start + GRAPHICS_INTRODUCER.len();
+                match graphics_end(&buf[body..]) {
+                    GraphicsEnd::Open => {
+                        emit_graphics(emit, &buf[start..]);
+                        return (buf.len(), true);
+                    },
+                    GraphicsEnd::Undecided(at) => {
+                        emit_graphics(emit, &buf[start..body + at]);
+                        return (body + at, true);
+                    },
+                    GraphicsEnd::Closed(end) => {
+                        emit_graphics(emit, &buf[start..body + end]);
+                        cursor = body + end;
+                        text_start = cursor;
+                        continue;
+                    },
+                }
             }
             cursor = start + 1;
             continue;
@@ -980,7 +1126,7 @@ where
                 },
                 Scan::Incomplete => {
                     emit_bytes(emit, &buf[text_start..start]);
-                    return start;
+                    return (start, false);
                 },
                 Scan::Invalid => cursor = start + 1,
             }
@@ -999,7 +1145,7 @@ where
                 continue;
             }
             emit_bytes(emit, &buf[text_start..start]);
-            return start;
+            return (start, false);
         };
 
         let terminator = terminator_search + relative_end;
@@ -1023,6 +1169,15 @@ where
 {
     if !bytes.is_empty() {
         emit(VividChunk::Bytes(bytes));
+    }
+}
+
+fn emit_graphics<F>(emit: &mut F, bytes: &[u8])
+where
+    F: FnMut(VividChunk<'_>),
+{
+    if !bytes.is_empty() {
+        emit(VividChunk::Graphics(bytes));
     }
 }
 
@@ -1096,6 +1251,182 @@ impl<T> PeekableReceiver<T> {
 mod parser_benchmark;
 
 #[cfg(test)]
+mod graphics_tests {
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD;
+
+    use super::*;
+    use crate::terminal::event::VoidListener;
+    use crate::terminal::term::Config;
+    use crate::terminal::term::test::TermSize;
+
+    fn pipeline() -> (Term<VoidListener>, State, Arc<Mutex<Transcript>>) {
+        let term = Term::new(Config::default(), &TermSize::new(80, 24), VoidListener);
+        (term, State::default(), Arc::new(Mutex::new(Transcript::default())))
+    }
+
+    /// Run `bytes` through the whole input pipeline as one PTY read, and report what the read
+    /// loop would conclude from it: bytes processed, quiet bytes, and whether to wake the UI.
+    fn read(
+        (term, state, transcript): &mut (Term<VoidListener>, State, Arc<Mutex<Transcript>>),
+        bytes: &[u8],
+    ) -> (usize, usize, bool) {
+        let synchronized = state.parser.sync_bytes_count() != 0;
+        let processed = state.advance(term, bytes, transcript);
+        let (mut quiet, changed) = term.take_graphics_activity();
+        if synchronized || state.parser.sync_bytes_count() != 0 {
+            quiet = 0;
+        }
+        let wake = wakeup_needed(processed, state.parser.sync_bytes_count(), quiet, changed);
+        (processed, quiet, wake)
+    }
+
+    /// One 64x64 frame in three chunks, as kitim sends video.
+    fn frame() -> [Vec<u8>; 3] {
+        let data = STANDARD.encode([7, 7, 7, 255].repeat(64 * 64));
+        let chunk =
+            |control: &str, payload: &str| format!("\x1b_G{control};{payload}\x1b\\").into_bytes();
+        [
+            chunk("a=T,f=32,s=64,v=64,C=1,q=2,m=1", &data[..4096]),
+            chunk("q=2,m=1", &data[4096..8192]),
+            chunk("q=2,m=0", &data[8192..]),
+        ]
+    }
+
+    #[test]
+    fn image_data_wakes_the_ui_only_when_it_completes_an_image() {
+        let mut pipeline = pipeline();
+        let [first, second, last] = frame();
+        assert_eq!(read(&mut pipeline, &first), (first.len(), first.len(), false));
+        assert_eq!(read(&mut pipeline, &second), (second.len(), second.len(), false));
+        assert_eq!(read(&mut pipeline, &last), (last.len(), last.len(), true));
+        assert_eq!(pipeline.0.graphics().store().placements().len(), 1);
+    }
+
+    #[test]
+    fn a_read_that_ends_inside_a_chunk_is_still_quiet() {
+        let mut pipeline = pipeline();
+        let stream = frame().concat();
+        let (head, tail) = stream.split_at(5000);
+        assert_eq!(read(&mut pipeline, head), (5000, 5000, false));
+        assert!(read(&mut pipeline, tail).2, "the image completes in the second read");
+    }
+
+    #[test]
+    fn anything_else_in_the_read_wakes_the_ui() {
+        let [first, second, _] = frame();
+        for extra in [&b"x"[..], b"\x1b[H", b"\r", b"\x1b]0;title\x07"] {
+            let mut pipeline = pipeline();
+            let mut bytes = first.clone();
+            bytes.extend_from_slice(extra);
+            bytes.extend_from_slice(&second);
+            let (processed, quiet, wake) = read(&mut pipeline, &bytes);
+            assert_eq!(processed - quiet, extra.len(), "{extra:?}");
+            assert!(wake, "{extra:?}");
+        }
+    }
+
+    /// A command that is not closed by its terminator ends in bytes that mean something else.
+    /// Those must never be counted as quiet: `ESC M` here scrolls the screen.
+    #[test]
+    fn a_command_cut_off_by_another_sequence_wakes_the_ui_for_that_sequence() {
+        let mut pipeline = pipeline();
+        let [first, ..] = frame();
+        let mut bytes = first[..first.len() - 2].to_vec();
+        bytes.extend_from_slice(b"\x1bM");
+        let (processed, quiet, wake) = read(&mut pipeline, &bytes);
+        assert_eq!(processed - quiet, 2);
+        assert!(wake);
+    }
+
+    #[test]
+    fn a_synchronized_update_falls_back_to_the_plain_rule() {
+        let mut pipeline = pipeline();
+        let [first, second, last] = frame();
+        let mut held = b"\x1b[?2026h".to_vec();
+        held.extend_from_slice(&first);
+        read(&mut pipeline, &held);
+        assert!(pipeline.0.graphics().store().is_empty(), "the update holds the command back");
+        let (_, quiet, wake) = read(&mut pipeline, &second);
+        assert_eq!(quiet, 0, "held bytes never reached the graphics state");
+        assert!(!wake, "everything in this read is held by the update");
+        let mut released = last.clone();
+        released.extend_from_slice(b"\x1b[?2026l");
+        let (_, quiet, wake) = read(&mut pipeline, &released);
+        assert_eq!(quiet, 0, "replayed bytes are not counted against this read");
+        assert!(wake);
+        assert_eq!(pipeline.0.graphics().store().placements().len(), 1);
+    }
+
+    /// Image data would otherwise flush every line of real output out of the 1 MiB transcript,
+    /// and announce megabytes of "output" to the UI that changed nothing.
+    #[test]
+    fn graphics_commands_stay_out_of_the_transcript_and_announce_no_output() {
+        let mut pipeline = pipeline();
+        let [first, second, last] = frame();
+
+        read(&mut pipeline, b"before ");
+        assert_eq!(pipeline.1.take_output_range(), Some((0, 7)));
+        for chunk in [&first, &second] {
+            read(&mut pipeline, chunk);
+            assert_eq!(pipeline.1.take_output_range(), None, "nothing was added to the transcript");
+        }
+        let mut mixed = last.clone();
+        mixed.extend_from_slice(b"after");
+        read(&mut pipeline, &mixed);
+        assert_eq!(pipeline.1.take_output_range(), Some((7, 12)));
+
+        let transcript = pipeline.2.lock().unwrap();
+        assert_eq!(transcript.range(0, 64).unwrap(), b"before after");
+        assert_eq!(pipeline.0.graphics().store().placements().len(), 1, "and it still ran");
+    }
+
+    #[test]
+    fn the_wakeup_rule_itself() {
+        assert!(!wakeup_needed(0, 0, 0, false));
+        assert!(!wakeup_needed(0, 0, 0, true), "nothing was read");
+        assert!(wakeup_needed(10, 0, 0, false));
+        assert!(!wakeup_needed(10, 10, 0, false));
+        assert!(!wakeup_needed(10, 0, 10, false));
+        assert!(!wakeup_needed(10, 4, 6, false));
+        assert!(wakeup_needed(10, 4, 5, false));
+        assert!(wakeup_needed(10, 0, 10, true));
+        assert!(!wakeup_needed(10, usize::MAX, usize::MAX, false), "no overflow");
+    }
+
+    /// The sequence the read loop goes through for a compressed image: take the decode out,
+    /// run it with no terminal in hand, and put the result back.
+    #[test]
+    fn a_compressed_image_is_decoded_outside_the_terminal_and_installed_after() {
+        use image::ImageEncoder;
+
+        let mut file = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut file)
+            .write_image(&[90; 20 * 40 * 4], 20, 40, image::ExtendedColorType::Rgba8)
+            .unwrap();
+        let command = format!("\x1b_Ga=T,f=100,i=1,q=2;{}\x1b\\", STANDARD.encode(file));
+
+        let mut pipeline = pipeline();
+        pipeline.0.set_deferred_graphics_decode(true);
+        let (_, _, wake) = read(&mut pipeline, command.as_bytes());
+        assert!(wake, "the placement exists already, if without pixels");
+        let term = &mut pipeline.0;
+        assert!(term.has_graphics_jobs());
+        let jobs = term.take_graphics_jobs();
+        assert!(!term.has_graphics_jobs());
+
+        // No reference to the terminal is held here.
+        let finished: Vec<_> = jobs.into_iter().map(QueuedJob::run).collect();
+
+        term.finish_graphics_jobs(finished);
+        let store = term.graphics().store();
+        let image = store.image(store.key_by_id(1).unwrap()).unwrap();
+        assert_eq!(image.pixels.as_ref().unwrap().len(), 20 * 40 * 4);
+        assert!(term.take_graphics_activity().1, "the pixels arriving must reach the screen");
+    }
+}
+
+#[cfg(test)]
 mod vivid_marker_tests {
     use super::*;
 
@@ -1103,6 +1434,108 @@ mod vivid_marker_tests {
         b"A;AAAAAAAAAAAAAAAAAAAAAA;0000000000000003;0000000000000007;AAAAAAAAAAAAAAAAAAAAAA";
     const MARKER_BODY: &str =
         "VIVID;3;A;AAAAAAAAAAAAAAAAAAAAAA;0000000000000003;0000000000000007;AAAAAAAAAAAAAAAAAAAAAA";
+
+    /// Run `reads` through one scanner, returning the ordinary bytes, the graphics bytes, and the
+    /// markers, each concatenated in order.
+    fn classify(reads: &[&[u8]]) -> (Vec<u8>, Vec<u8>, Vec<String>, VividMarkerScanner) {
+        let mut scanner = VividMarkerScanner::default();
+        let (mut text, mut graphics, mut markers) = (Vec::new(), Vec::new(), Vec::new());
+        for read in reads {
+            scanner.push(read, &mut |chunk| match chunk {
+                VividChunk::Bytes(bytes) => text.extend_from_slice(bytes),
+                VividChunk::Graphics(bytes) => graphics.extend_from_slice(bytes),
+                VividChunk::Marker { marker, .. } => markers.push(marker.to_owned()),
+            });
+        }
+        (text, graphics, markers, scanner)
+    }
+
+    /// The payload is full of `V`s and even spells the marker prefix, none of which may be taken
+    /// for a marker candidate or leak into the ordinary bytes.
+    #[test]
+    fn graphics_commands_are_set_apart_across_every_read_boundary() {
+        let first = b"\x1b_Ga=T,f=32,s=2,v=2,m=1;VVVVVIVIDVVVV/VIVID+3+AAAA\x1b\\".as_slice();
+        let second = b"\x1b_Gm=0;VVVV\x1b\\".as_slice();
+        let marker =
+            [APC_VIVID_MARKER.prefix, MARKER_PAYLOAD, APC_VIVID_MARKER.terminator].concat();
+        let input = [b"before V ", first, b" between \x1b[31m", &marker, second, b"after"].concat();
+        let graphics = [first, second].concat();
+
+        for split in 0..=input.len() {
+            let (text, found, markers, scanner) = classify(&[&input[..split], &input[split..]]);
+            assert_eq!(text, b"before V  between \x1b[31mafter", "split at {split}");
+            assert_eq!(found, graphics, "split at {split}");
+            assert_eq!(markers, [MARKER_BODY], "split at {split}");
+            assert!(scanner.pending.is_empty() && !scanner.graphics, "split at {split}");
+        }
+        let bytes: Vec<&[u8]> = input.chunks(1).collect();
+        let (text, found, markers, _) = classify(&bytes);
+        assert_eq!(text, b"before V  between \x1b[31mafter");
+        assert_eq!(found, graphics);
+        assert_eq!(markers, [MARKER_BODY]);
+    }
+
+    /// The parser cancels a command that anything but its terminator interrupts, and treats the
+    /// interrupting byte as ordinary input. The scanner has to draw the line in the same place.
+    #[test]
+    fn a_graphics_command_ends_where_the_parser_ends_it() {
+        for (input, graphics, text) in [
+            (&b"\x1b_Gabc\x1b\\x"[..], &b"\x1b_Gabc\x1b\\"[..], &b"x"[..]),
+            (b"\x1b_Gabc\x1b[31mx", b"\x1b_Gabc", b"\x1b[31mx"),
+            (b"\x1b_Gabc\x18x", b"\x1b_Gabc", b"\x18x"),
+            (b"\x1b_Gabc\x1ax", b"\x1b_Gabc", b"\x1ax"),
+            (b"\x1b_Gabc\x1b_Gdef\x1b\\", b"\x1b_Gabc\x1b_Gdef\x1b\\", b""),
+            (b"\x1b_G\x1b\\", b"\x1b_G\x1b\\", b""),
+            (b"\x1b_Xnot graphics\x1b\\", b"", b"\x1b_Xnot graphics\x1b\\"),
+        ] {
+            for split in 0..=input.len() {
+                let (found_text, found, _, scanner) = classify(&[&input[..split], &input[split..]]);
+                let shown = String::from_utf8_lossy(input);
+                assert_eq!(found, graphics, "{shown:?} split at {split}");
+                assert_eq!(found_text, text, "{shown:?} split at {split}");
+                assert!(scanner.pending.is_empty(), "{shown:?} split at {split}");
+            }
+        }
+    }
+
+    #[test]
+    fn an_unterminated_graphics_command_is_passed_on_as_it_arrives_not_accumulated() {
+        let mut scanner = VividMarkerScanner::default();
+        let mut passed = 0;
+        scanner.push(b"\x1b_Ga=T;", &mut |_| {});
+        for _ in 0..64 {
+            scanner.push(&[b'V'; 65_536], &mut |chunk| match chunk {
+                VividChunk::Graphics(bytes) => passed += bytes.len(),
+                _ => panic!("payload must stay graphics"),
+            });
+            assert!(scanner.pending.is_empty());
+        }
+        assert_eq!(passed, 64 * 65_536);
+        assert!(scanner.graphics);
+
+        // The one byte ever held back is an ESC that may or may not begin the terminator.
+        scanner.push(b"AAAA\x1b", &mut |_| {});
+        assert_eq!(scanner.pending, b"\x1b");
+        let mut text = Vec::new();
+        scanner.push(b"\\ok", &mut |chunk| {
+            if let VividChunk::Bytes(bytes) = chunk {
+                text.extend_from_slice(bytes);
+            }
+        });
+        assert_eq!(text, b"ok");
+        assert!(scanner.pending.is_empty() && !scanner.graphics);
+    }
+
+    /// A marker printed inside a graphics command is image data, not an anchor.
+    #[test]
+    fn a_marker_inside_a_graphics_command_is_not_a_marker() {
+        let conpty =
+            [CONPTY_VIVID_MARKER.prefix, MARKER_PAYLOAD, CONPTY_VIVID_MARKER.terminator].concat();
+        let input = [b"\x1b_Ga=T;".as_slice(), &conpty, b"\x1b\\"].concat();
+        let (text, graphics, markers, _) = classify(&[&input]);
+        assert!(text.is_empty() && markers.is_empty());
+        assert_eq!(graphics, input);
+    }
 
     #[test]
     fn both_marker_envelopes_are_recognized_across_every_read_boundary() {
@@ -1127,6 +1560,7 @@ mod vivid_marker_tests {
                     assert!(raw.starts_with(envelope.prefix));
                     markers.push((marker.to_owned(), pass_to_terminal));
                 },
+                VividChunk::Graphics(_) => panic!("no graphics command in this input"),
             });
         }
 
@@ -1148,6 +1582,7 @@ mod vivid_marker_tests {
                 assert!(!pass_to_terminal);
                 markers += 1;
             },
+            VividChunk::Graphics(_) => panic!("no graphics command in this input"),
         });
 
         assert_eq!((printable, markers), (0, 1));
@@ -1173,6 +1608,7 @@ mod vivid_marker_tests {
                         assert!(!pass_to_terminal);
                         markers.push(marker.to_owned());
                     },
+                    VividChunk::Graphics(_) => panic!("no graphics command in this input"),
                 });
             }
             assert_eq!(text, b"beforeafter");
@@ -1235,6 +1671,7 @@ mod vivid_marker_tests {
                         assert_eq!(marker, MARKER_BODY);
                         markers += 1;
                     },
+                    VividChunk::Graphics(_) => panic!("no graphics command in this input"),
                 };
                 scanner.push(&input[..split], &mut emit);
                 scanner.push(&input[split..], &mut emit);
@@ -1263,6 +1700,7 @@ mod vivid_marker_tests {
                             assert_eq!(raw, input);
                             markers += 1;
                         },
+                        VividChunk::Graphics(_) => panic!("no graphics command in this input"),
                     };
                     scanner.push(&input[..split], &mut emit);
                     scanner.push(&input[split..], &mut emit);

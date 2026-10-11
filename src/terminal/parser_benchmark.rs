@@ -46,6 +46,28 @@ fn workload(name: &str) -> Vec<u8> {
                 continue;
             },
             "unicode" => "漢字😀e\u{301}\t\n".as_bytes(),
+            "kitty" => {
+                // One 256x192 frame the way kitim sends video: raw RGBA as base64 in
+                // 4096-character chunks, no image id, the cursor left where it was.
+                use base64::Engine;
+                let mut rgba = vec![255_u8; 256 * 192 * 4];
+                for pixel in rgba.as_chunks_mut::<4>().0 {
+                    pixel[..3].fill(random(256) as u8);
+                }
+                let encoded = base64::engine::general_purpose::STANDARD.encode(&rgba);
+                for (index, chunk) in encoded.as_bytes().chunks(4096).enumerate() {
+                    let more = u8::from((index + 1) * 4096 < encoded.len());
+                    let control = if index == 0 {
+                        format!("\x1b_Ga=T,f=32,s=256,v=192,C=1,q=2,m={more};")
+                    } else {
+                        format!("\x1b_Gq=2,m={more};")
+                    };
+                    data.extend_from_slice(control.as_bytes());
+                    data.extend_from_slice(chunk);
+                    data.extend_from_slice(b"\x1b\\");
+                }
+                continue;
+            },
             "long_escape" => {
                 data.extend_from_slice(b"\x1b]6;");
                 // Match kitty's printable payload, including ordinary `V` candidates.

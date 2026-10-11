@@ -319,7 +319,11 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
     }
 
     /// Clear visible cells and preserve scrollback according to the terminal policy.
-    pub fn clear_viewport<D>(&mut self)
+    ///
+    /// Returns how many lines were scrolled into history to preserve them, which is the number
+    /// of lines down to the last one with content. Anything tied to grid lines has to move up by
+    /// the same amount to stay with its text.
+    pub fn clear_viewport<D>(&mut self) -> usize
     where
         T: ResetDiscriminant<D>,
         D: PartialEq,
@@ -343,6 +347,8 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
         for line in (0..(self.lines - positions)).map(Line::from) {
             self.raw[line].reset(&self.cursor.template);
         }
+
+        positions
     }
 
     /// Completely reset the grid state.
@@ -532,6 +538,15 @@ pub trait Dimensions {
     #[inline]
     fn history_size(&self) -> usize {
         self.total_lines().saturating_sub(self.screen_lines())
+    }
+
+    /// Width and height of one cell in physical pixels, when the implementer knows them.
+    ///
+    /// Only something backed by a display does. The terminal uses it to work out how many cells
+    /// an image covers.
+    #[inline]
+    fn cell_pixels(&self) -> Option<(u16, u16)> {
+        None
     }
 }
 

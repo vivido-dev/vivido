@@ -4017,6 +4017,7 @@ dependencies = [
  "cpal",
  "dirs",
  "embed-resource",
+ "flate2",
  "futures-lite",
  "futures-timer",
  "getrandom 0.4.3",
@@ -4094,7 +4095,7 @@ dependencies = [
 
 [[package]]
 name = "vvte"
-version = "0.15.1"
+version = "0.15.2"
 dependencies = [
  "bitflags 2.13.1",
  "cursor-icon",

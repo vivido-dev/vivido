@@ -6724,10 +6724,6 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                         }
                     },
                     TerminalEvent::DesktopNotification(_) => (),
-                    TerminalEvent::Graphics(command) => {
-                        self.ctx.display.submit_graphics(command);
-                        self.ctx.mark_dirty();
-                    },
                     TerminalEvent::VividMarker { marker, line, column, alternate } => {
                         self.ctx
                             .vivid_service

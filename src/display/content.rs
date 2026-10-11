@@ -4,6 +4,7 @@ use std::ops::Deref;
 use std::{cmp, mem};
 
 use crate::terminal::event::EventListener;
+use crate::terminal::graphics::PLACEHOLDER;
 use crate::terminal::grid::{Dimensions, Indexed};
 use crate::terminal::index::{Column, Line, Point};
 use crate::terminal::selection::SelectionRange;
@@ -297,7 +298,13 @@ impl RenderableCell {
             .underline_color()
             .map_or(fg, |underline| Self::compute_fg_rgb(content, underline, flags));
 
-        let zerowidth = cell.zerowidth();
+        // A placeholder cell stands for part of an image; its character and the combining marks
+        // that carry coordinates are data, not text to draw.
+        let placeholder = character == PLACEHOLDER;
+        if placeholder {
+            character = ' ';
+        }
+        let zerowidth = cell.zerowidth().filter(|_| !placeholder);
         let hyperlink = cell.hyperlink();
 
         let extra = (zerowidth.is_some() || hyperlink.is_some()).then(|| {

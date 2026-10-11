@@ -6,7 +6,6 @@ use std::sync::Arc;
 use crate::client_fault::ClientFault;
 use crate::osc_notification::OscNotification;
 use crate::terminal::event_loop::EventLoopSendError;
-use crate::terminal::graphics::GraphicsCommand;
 use crate::terminal::term::ClipboardType;
 use crate::terminal::vvte::ansi::Rgb;
 
@@ -94,9 +93,6 @@ pub enum Event {
     /// A bounded OSC 9 or OSC 99 desktop-notification request.
     DesktopNotification(OscNotification),
 
-    /// Protocol-neutral image, animation, or video operation.
-    Graphics(GraphicsCommand),
-
     /// Authenticated Vivid marker observed at a terminal text position.
     VividMarker {
         /// Authenticated Vivid anchor marker.
@@ -171,7 +167,6 @@ impl Debug for Event {
             Event::RecoveryPrompt => write!(f, "RecoveryPrompt"),
             Event::Bell => write!(f, "Bell"),
             Event::DesktopNotification(_) => write!(f, "DesktopNotification"),
-            Event::Graphics(command) => write!(f, "Graphics({command:?})"),
             Event::VividMarker { marker, line, column, alternate } => {
                 write!(f, "VividMarker({marker:?}, {line}, {column}, alternate={alternate})")
             },

@@ -503,8 +503,10 @@ resume material through automation.
 
 ### Transcript and subscriptions
 
-Each window retains a 1 MiB sanitized byte-exact PTY ring after Vivid marker envelopes have been
-removed. `transcript` params are `after_offset`, `max_bytes` (default 65536, maximum 1048576),
+Each window retains a 1 MiB sanitized byte-exact PTY ring after Vivid marker envelopes and Kitty
+graphics commands (`ESC _ G … ESC \`) have been removed. Image data is megabytes of base64 that
+would otherwise push every line of real output out of the ring, so it is neither retained nor
+announced as output. `transcript` params are `after_offset`, `max_bytes` (default 65536, maximum 1048576),
 `raw`, and `target`. JSON results include oldest/start/returned-end/current-end offsets, a truncation
 flag, and base64 data. An explicit evicted offset returns `sequence_gap`. `transcript --raw` decodes
 and writes the exact bytes without a newline.

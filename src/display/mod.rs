@@ -17,7 +17,6 @@ use winit::keyboard::ModifiersState;
 use winit::window::CursorIcon;
 
 use crate::terminal::event::{EventListener, OnResize, WindowSize};
-use crate::terminal::graphics::GraphicsCommand;
 use crate::terminal::grid::Dimensions as TermDimensions;
 use crate::terminal::index::{Column, Direction, Line, Point};
 use crate::terminal::selection::Selection;
@@ -75,6 +74,7 @@ pub mod window;
 mod bell;
 mod corners;
 mod damage;
+mod kitty;
 mod media;
 mod meter;
 mod overlay;
@@ -310,6 +310,11 @@ impl TermDimensions for SizeInfo {
     fn total_lines(&self) -> usize {
         self.screen_lines()
     }
+
+    #[inline]
+    fn cell_pixels(&self) -> Option<(u16, u16)> {
+        Some((self.cell_width() as u16, self.cell_height() as u16))
+    }
 }
 
 #[derive(Default, Clone, Debug, PartialEq, Eq)]
@@ -404,6 +409,8 @@ pub struct Display {
     cached_media_generation: u64,
     cached_base_color: Color,
     vivid_frame_requested: bool,
+    /// Kitty graphics placements of the frame being drawn, in window pixels.
+    kitty_frame: kitty::KittyFrame,
     text_scene_builds: u64,
     cached_scene_frames: u64,
     text_system: TextSystem,
@@ -441,13 +448,6 @@ impl Display {
         self.invalidate_cached_scene();
         self.vivid_scene = Some(scene.clone());
         self.scene_renderer.set_vivid_scene(scene);
-    }
-
-    /// Submit a protocol-neutral graphics command and invalidate affected rendering.
-    pub fn submit_graphics(&mut self, command: GraphicsCommand) {
-        self.invalidate_cached_scene();
-        self.scene_renderer.submit_graphics(command);
-        self.damage_tracker.frame().mark_fully_damaged();
     }
 
     /// Borrow the current embedded frame, when available.
@@ -605,6 +605,7 @@ impl Display {
             cached_media_generation: 0,
             cached_base_color: Color::BLACK,
             vivid_frame_requested: false,
+            kitty_frame: kitty::KittyFrame::default(),
             text_scene_builds: 0,
             cached_scene_frames: 0,
             text_system,
@@ -802,13 +803,20 @@ impl Display {
         let scrollbar_visual =
             self.scrollbar.visual_at(Instant::now(), &size_info, scrollbar_scale);
         let progress_visual = self.progress.visual_at(Instant::now());
-        let prepared_media = self.scene_renderer.prepare_media(&size_info, early_display_offset);
+        // An image can change with no text changing at all, a frame of an animation drawn in
+        // place being the usual case. Like a Vivid frame, that makes the cached text scene
+        // eligible for reuse below when nothing else changed either.
+        let grid_changed = !self.damage_tracker.frame().is_empty();
+        let kitty_changed =
+            self.kitty_frame.update(&terminal, &size_info, early_display_offset, grid_changed);
+        let prepared_media =
+            self.scene_renderer.prepare_media(&size_info, early_display_offset, &self.kitty_frame);
         let media_generation = prepared_media.as_ref().map_or(0, |media| media.image_generation);
         let _media_changed = prepared_media.as_ref().is_some_and(|media| media.changed);
         let mic_label =
             self.vivid_scene.as_ref().map(|s| s.microphone().label()).unwrap_or_default();
         let can_reuse_scene = mic_label == self.cached_microphone_label
-            && self.vivid_frame_requested
+            && (self.vivid_frame_requested || kitty_changed)
             && self.cached_scene.is_some()
             && self.cached_media_generation == media_generation
             && self.damage_tracker.frame().is_empty()

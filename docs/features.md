@@ -143,8 +143,15 @@ the prompt, the way a local drag types a local path. An AI-agent CLI running on 
 therefore sees an image path and attaches it, exactly as it would locally. Set
 `[file_drop] paste_remote_path = false` to copy the file and type nothing. Vivido
 decodes frames independently of the renderer, uploads visible sources through wgpu, and
-composites them between terminal backgrounds and glyphs. Other escape-sequence media commands are
-recognized as extension points but are not rendered yet.
+composites them between terminal backgrounds and glyphs.
+
+Programs written for the Kitty graphics protocol work as well: image viewers and file managers
+such as `kitim`, `chafa`, `timg`, `kitten icat` and `yazi` draw still images, and players that
+send one image per frame play video. Images scroll with the text, stay with it when the window is
+resized, and are shown through tmux by way of Unicode placeholders. Image data must be sent over
+the terminal itself; Vivido does not read image files or shared memory on a program's behalf, and
+does not implement the protocol's animation commands. The supported subset and its limits are
+listed in [VT sequence support](vt-sequences.md).
 
 ## Presentation targets
 
