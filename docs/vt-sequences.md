@@ -42,9 +42,11 @@ enable enhanced keyboard input. In particular, Vivido understanding Kitty keyboa
 sequences does not imply that a Windows console library can enable or decode those sequences over
 ConPTY.
 
-Vivido uses Windows' built-in ConPTY APIs. It does not load `conpty.dll` from other terminal
-installations on `PATH`: older console hosts can discard enhanced key-release reports, leaving
-game controls stuck. Clients reading enhanced input must still enable VT input and decode the
+Vivido ships a pinned Microsoft ConPTY runtime (see `windows/conpty/README.md`), which forwards
+Kitty graphics APC commands that the system console host can silently discard. It loads the
+matching DLL and helper from its executable directory, never from other terminal installations on
+`PATH`: older console hosts can also discard enhanced key-release reports, leaving game controls
+stuck. Clients reading enhanced input must still enable VT input and decode the
 escape sequences themselves rather than relying on synthesized native key records.
 
 If an application exits without leaving the alternate screen or disabling mouse, focus,

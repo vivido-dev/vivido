@@ -17,6 +17,7 @@ mod blocking;
 mod child;
 mod conpty;
 mod powershell;
+mod runtime;
 
 use blocking::{UnblockedReader, UnblockedWriter};
 use conpty::Conpty as Backend;

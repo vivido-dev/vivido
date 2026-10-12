@@ -902,6 +902,146 @@ fn test_runner_executes_a_plan_and_tears_down() {
     }
 }
 
+/// Verify a real Kitty producer through ConPTY, the parser, and the GPU compositor.
+#[cfg(windows)]
+#[test]
+#[ignore = "requires KITIM_BINARY, real processes, and a wgpu adapter"]
+fn kitim_image_is_rendered_through_windows_conpty() {
+    let kitim = env::var("KITIM_BINARY").expect("set KITIM_BINARY to a built kitim.exe");
+    let fixture = tempfile::tempdir().unwrap();
+    let supplied_image = env::var_os("KITIM_TEST_IMAGE");
+    let image = supplied_image.as_ref().map(PathBuf::from).unwrap_or_else(|| {
+        let image = fixture.path().join("kitty-image.png");
+        image::RgbaImage::from_pixel(40, 40, image::Rgba([255, 0, 0, 255])).save(&image).unwrap();
+        image
+    });
+    let trigger = fixture.path().join("ready");
+    let program = vec![
+        "powershell.exe".into(),
+        "-NoProfile".into(),
+        "-NonInteractive".into(),
+        "-Command".into(),
+        format!(
+            "while (-not (Test-Path -LiteralPath '{}')) {{ Start-Sleep -Milliseconds 10 }}; & '{}' '{}'; Write-Output 'KITIM-IMAGE-DONE'; Start-Sleep -Seconds 300",
+            trigger.display().to_string().replace('\'', "''"),
+            kitim.replace('\'', "''"),
+            image.display().to_string().replace('\'', "''")
+        ),
+    ];
+    let session = Session::start_with_env("kitim-image", &program, &[("AGENT_MESH_WATCH", "off")]);
+    session.msg(&["resize", "--width", "1000", "--height", "700"]);
+    fs::write(trigger, b"").unwrap();
+    session.msg(&["wait", "text", "KITIM-IMAGE-DONE"]);
+    let screenshot = PathBuf::from(session.msg(&["screenshot"]).trim());
+    let pixels = image::open(&screenshot).unwrap().into_rgba8();
+    if supplied_image.is_some() {
+        let reference = image::open(&image).unwrap().into_rgb8();
+        let colors: std::collections::HashSet<_> =
+            reference.pixels().map(|pixel| pixel.0).collect();
+        let matched = pixels
+            .pixels()
+            .filter(|pixel| {
+                let color = [pixel[0], pixel[1], pixel[2]];
+                color != [0, 0, 0] && color != [255, 255, 255] && colors.contains(&color)
+            })
+            .count();
+        assert!(matched >= 1500, "source image should be visible; found {matched} matching pixels");
+    } else {
+        let red = pixels
+            .pixels()
+            .filter(|pixel| pixel[0] > 240 && pixel[1] < 10 && pixel[2] < 10)
+            .count();
+        assert!(red >= 1500, "kitim's 40x40 image should be visible; found {red} red pixels");
+    }
+    if let Some(destination) = env::var_os("KITIM_TEST_SCREENSHOT") {
+        fs::copy(&screenshot, destination).unwrap();
+    }
+    let _ = fs::remove_file(screenshot);
+}
+
+/// Existing Vivid producers retain raster rendering, input, resizing, and cleanup.
+#[cfg(windows)]
+#[test]
+#[ignore = "requires VVRD_BINARY, VVPAINT_BINARY, real processes, and a wgpu adapter"]
+fn vivid_raster_apps_work_through_windows_conpty() {
+    let fixture = tempfile::tempdir().unwrap();
+    let image = fixture.path().join("red.png");
+    image::RgbaImage::from_pixel(200, 200, image::Rgba([255, 0, 0, 255])).save(&image).unwrap();
+    let document = fixture.path().join("compat.md");
+    fs::write(&document, "# Compatibility\n\n![Red square](red.png)\n").unwrap();
+    for (variable, name, input, key, text) in [
+        ("VVRD_BINARY", "vvrd-compat", &document, "i", ""),
+        ("VVPAINT_BINARY", "vvpaint-compat", &image, "b", "Brush"),
+    ] {
+        let executable = env::var(variable).unwrap_or_else(|_| panic!("set {variable}"));
+        let program = vec![
+            "powershell.exe".into(),
+            "-NoProfile".into(),
+            "-NonInteractive".into(),
+            "-Command".into(),
+            format!(
+                "& '{}' '{}'; Write-Output 'VIVID-APP-DONE'; Start-Sleep -Seconds 300",
+                executable.replace('\'', "''"),
+                input.display().to_string().replace('\'', "''"),
+            ),
+        ];
+        let session = Session::start_with_env(name, &program, &[("AGENT_MESH_WATCH", "off")]);
+        let raster = || -> Option<serde_json::Value> {
+            let state: serde_json::Value =
+                serde_json::from_str(&session.msg(&["vivid", "tracks"])).unwrap();
+            state["tracks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|track| {
+                    track["kind"] == "raster"
+                        && track["last_presentation_id"].as_u64().unwrap_or(0) > 0
+                })
+                .cloned()
+        };
+        let wait_raster = |previous: Option<(u64, u64)>| {
+            let deadline = Instant::now() + READY_TIMEOUT;
+            loop {
+                if let Some(track) = raster() {
+                    let identity = (
+                        track["track_id"].as_u64().unwrap(),
+                        track["last_presentation_id"].as_u64().unwrap(),
+                    );
+                    if previous != Some(identity) {
+                        break identity;
+                    }
+                }
+                assert!(Instant::now() < deadline, "{name} did not present a new raster frame");
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        };
+        let first = wait_raster(None);
+        let screenshot = PathBuf::from(session.msg(&["screenshot"]).trim());
+        let pixels = image::open(&screenshot).unwrap().into_rgb8();
+        assert!(
+            pixels.pixels().filter(|p| p[0] > 240 && p[1] < 10 && p[2] < 10).count() > 1000,
+            "{name}'s Vivid image was not rendered"
+        );
+        let _ = fs::remove_file(screenshot);
+        session.msg(&["key", key]);
+        if !text.is_empty() {
+            session.msg(&["wait", "text", text]);
+            session.msg(&["mouse", "path", "--route", "ui", "--point", "60,60", "160,160"]);
+        }
+        let changed = wait_raster(Some(first));
+        session.msg(&["resize", "--width", "1100", "--height", "750"]);
+        wait_raster(Some(changed));
+        session.msg(&["key", "q"]);
+        session.msg(&["wait", "text", "VIVID-APP-DONE"]);
+        let tracks: serde_json::Value =
+            serde_json::from_str(&session.msg(&["vivid", "tracks"])).unwrap();
+        assert!(
+            tracks["tracks"].as_array().unwrap().is_empty(),
+            "{name} retained tracks after exit"
+        );
+    }
+}
+
 /// The whole point: a session with no compositor still answers text and pixel queries.
 #[test]
 #[ignore = "spawns processes and needs a wgpu adapter"]

@@ -12,6 +12,8 @@ The suite installer is built from the parent repository's `installer/` directory
 - `setup-helper/`: the signed helper the installer runs to seed the default configuration and to
   refuse upgrade or uninstall while a vvmux session is live.
 - `default-vivido.toml`: the configuration the setup helper writes on first install.
+- `conpty/`: the pinned Microsoft app-local console runtime for Windows PTYs, with provenance,
+  checksums, and license. This preserves Kitty graphics APC sequences on older Windows hosts.
 - `wix/license.rtf`: the license shown by the installer UI.
 
 ## Configuration ownership and upgrades
