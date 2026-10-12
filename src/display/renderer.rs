@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 #[cfg(any(unix, windows))]
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::{Arc, LazyLock};
@@ -152,6 +152,8 @@ impl std::error::Error for Error {}
 pub struct SceneRenderer {
     /// Owns the wgpu instance and the surface's device. Absent when rendering offscreen.
     context: Option<SharedRenderContext>,
+    /// Keeps shared offscreen setup alive until the last offscreen window closes.
+    _offscreen_context: Option<Rc<OffscreenContext>>,
     /// Absent when rendering offscreen: there is no windowing-system surface to present to.
     surface: Option<Box<RenderSurface<'static>>>,
     /// Owns the DirectComposition visual tree backing a Windows surface.
@@ -252,6 +254,14 @@ struct SharedRenderState {
     device_health: Vec<GpuHealth>,
 }
 
+/// Offscreen windows share device and pipeline setup, but keep their own render targets.
+struct OffscreenContext {
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    renderer: Rc<RefCell<Renderer>>,
+    health: GpuHealth,
+}
+
 /// wgpu reports device loss through a callback, then returns invalid resources from subsequent
 /// allocations. Creating a view of such a texture invokes its default panic handler. Retain the
 /// first failure instead, so resize and rendering can enter recovery without a modal panic dialog.
@@ -332,6 +342,28 @@ impl Default for SharedRenderContext {
 
 thread_local! {
     static WINDOW_RENDER_CONTEXT: RefCell<Option<SharedRenderContext>> = const { RefCell::new(None) };
+    static OFFSCREEN_RENDER_CONTEXT: RefCell<Weak<OffscreenContext>> = const { RefCell::new(Weak::new()) };
+}
+
+fn offscreen_render_context() -> Result<Rc<OffscreenContext>, Error> {
+    OFFSCREEN_RENDER_CONTEXT.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if let Some(context) = slot.upgrade()
+            && !context.health.failed()
+        {
+            return Ok(context);
+        }
+        // Existing windows retain a lost device until they rebuild. All recovering and newly
+        // created windows share the healthy replacement. The weak cache releases GPU resources
+        // with the last window, before platform thread-local teardown.
+        let (device, queue) = offscreen_device()?;
+        let health = GpuHealth::monitor(&device);
+        let renderer =
+            Rc::new(RefCell::new(create_renderer(&device).map_err(Error::CreateRenderer)?));
+        let context = Rc::new(OffscreenContext { device, queue, renderer, health });
+        *slot = Rc::downgrade(&context);
+        Ok(context)
+    })
 }
 
 fn window_render_context() -> SharedRenderContext {
@@ -366,10 +398,13 @@ fn create_window_render_context() -> RenderContext {
     RenderContext { instance, devices: Vec::new() }
 }
 
-/// Drop the main-thread window render context before platform thread-local teardown begins.
+/// Drop main-thread render contexts before platform thread-local teardown begins.
 pub fn shutdown_window_render_context() {
     WINDOW_RENDER_CONTEXT.with(|slot| {
         slot.borrow_mut().take();
+    });
+    OFFSCREEN_RENDER_CONTEXT.with(|slot| {
+        *slot.borrow_mut() = Weak::new();
     });
 }
 
@@ -394,6 +429,7 @@ impl SceneRenderer {
         transparent: bool,
     ) -> Result<Self, Error> {
         let size = clamp_render_size(size, wgpu::Limits::default().max_texture_dimension_2d);
+        let mut offscreen_context = None;
         let valid_target = size.width != 0 && size.height != 0;
         #[cfg(windows)]
         let mut composition = None;
@@ -461,13 +497,15 @@ impl SceneRenderer {
                 )
             },
             RenderSource::Offscreen => {
-                let (device, queue) = offscreen_device()?;
-                let gpu_health = GpuHealth::monitor(&device);
+                let shared = offscreen_render_context()?;
+                let device = shared.device.clone();
+                let queue = shared.queue.clone();
+                let renderer = Rc::clone(&shared.renderer);
+                let gpu_health = shared.health.clone();
+                offscreen_context = Some(shared);
                 // Nothing can refuse an offscreen size, but keep the same minimum-1 clamp so the
                 // texture is always creatable.
                 let target_size = PhysicalSize::new(size.width.max(1), size.height.max(1));
-                let renderer =
-                    Rc::new(RefCell::new(create_renderer(&device).map_err(Error::CreateRenderer)?));
                 (None, None, device, queue, target_size, renderer, gpu_health)
             },
             RenderSource::Embedded => {
@@ -495,6 +533,7 @@ impl SceneRenderer {
 
         Ok(Self {
             context,
+            _offscreen_context: offscreen_context,
             surface,
             #[cfg(windows)]
             composition,
@@ -1661,6 +1700,44 @@ mod tests {
         let first = context.0.borrow_mut().renderer_for(0, &device).expect("first renderer");
         let second = context.0.borrow_mut().renderer_for(0, &device).expect("shared renderer");
         assert!(Rc::ptr_eq(&first, &second));
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn offscreen_windows_share_setup_keep_pixels_separate_and_recover_together() {
+        let _gpu = gpu_lock();
+        shutdown_window_render_context();
+        let size = PhysicalSize::new(32, 16);
+        let Ok(mut first) = SceneRenderer::new(RenderSource::Offscreen, size, false) else {
+            eprintln!("Skipping offscreen sharing test: no wgpu adapter");
+            return;
+        };
+        let mut second = SceneRenderer::new(RenderSource::Offscreen, size, false).expect("second");
+        assert!(Rc::ptr_eq(&first.renderer, &second.renderer));
+        first.render(&Scene::new(), Color::from_rgb8(255, 0, 0)).expect("red frame");
+        second.render(&Scene::new(), Color::from_rgb8(0, 0, 255)).expect("blue frame");
+        for (renderer, expected) in [(&first, [255, 0, 0, 255]), (&second, [0, 0, 255, 255])] {
+            let readback = renderer.begin_screenshot().expect("screenshot");
+            let pixels = loop {
+                if let Some(pixels) = renderer.poll_screenshot(&readback).expect("readback") {
+                    break pixels;
+                }
+            };
+            assert_eq!(&pixels.bytes[..4], &expected);
+        }
+
+        let old_renderer = Rc::clone(&first.renderer);
+        first.device.destroy();
+        let _ = first.device.poll(wgpu::PollType::wait_indefinitely());
+        assert!(first.gpu_failed());
+        assert!(second.gpu_failed());
+        first.rebuild(RenderSource::Offscreen, size, false).expect("first recovery");
+        second.rebuild(RenderSource::Offscreen, size, false).expect("second recovery");
+        assert!(!Rc::ptr_eq(&old_renderer, &first.renderer));
+        assert!(Rc::ptr_eq(&first.renderer, &second.renderer));
+        assert!(first.render(&Scene::new(), Color::BLACK).expect("first recovered frame"));
+        assert!(second.render(&Scene::new(), Color::BLACK).expect("second recovered frame"));
+        shutdown_window_render_context();
     }
 
     /// Render a solid frame with no windowing system and read the pixels back.
