@@ -72,6 +72,7 @@ impl std::fmt::Debug for Quad {
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Key {
     revision: u64,
+    screen_epoch: u64,
     display_offset: usize,
     size: SizeInfo,
 }
@@ -118,8 +119,24 @@ impl KittyFrame {
             self.generation = self.generation.wrapping_add(1);
             return true;
         }
-        let key = Key { revision: graphics.revision(), display_offset, size: *size };
+        let key = Key {
+            revision: graphics.revision(),
+            screen_epoch: graphics.screen_epoch(),
+            display_offset,
+            size: *size,
+        };
         if self.key == Some(key) && !(grid_changed && store.has_virtual()) {
+            return false;
+        }
+        // A synchronized erase-and-replace has already changed the store when the PTY reader
+        // drops the terminal lock to decode. Keep the previous image frame until every placed
+        // image has pixels, while text, Vivid media and the rest of the UI can still draw.
+        // Screen switches and resets must never retain another screen lifetime's images.
+        if self.key.is_some_and(|previous| previous.screen_epoch == key.screen_epoch)
+            && store.placements().iter().any(|placement| {
+                store.image(placement.image).is_some_and(|image| image.pixels.is_none())
+            })
+        {
             return false;
         }
         self.key = Some(key);
@@ -334,10 +351,124 @@ mod tests {
         format!("\x1b_Ga=T,f=32,s={width},v={height},q=2{keys};{data}\x1b\\")
     }
 
+    /// A chunked zlib RGB replacement, as kitdoom transmits it.
+    fn compressed_image(keys: &str) -> String {
+        use std::io::Write;
+
+        use base64::Engine;
+        use flate2::{Compression, write::ZlibEncoder};
+
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
+        encoder.write_all(&[70, 80, 90].repeat(20 * 40)).unwrap();
+        let data = base64::engine::general_purpose::STANDARD.encode(encoder.finish().unwrap());
+        format!(
+            "\x1b_Ga=T,f=24,o=z,s=20,v=40,C=1,q=2{keys},m=1;{}\x1b\\\x1b_Gq=2,m=0;{}\x1b\\",
+            &data[..4],
+            &data[4..],
+        )
+    }
+
     fn frame(term: &Term<VoidListener>, display_offset: usize) -> KittyFrame {
         let mut frame = KittyFrame::default();
         frame.update(term, &size(), display_offset, true);
         frame
+    }
+
+    /// kitdoom clears and replaces an anonymous RGB image inside each synchronized update.
+    /// The PTY reader releases the terminal while decoding its zlib payload, allowing a draw
+    /// between parsing the erase and installing the new pixels.
+    #[test]
+    fn a_synchronized_compressed_replacement_keeps_the_previous_frame_until_decoded() {
+        let (mut term, mut parser) = term();
+        feed(&mut term, &mut parser, "\x1b[?1049h");
+        feed(&mut term, &mut parser, &image(20, 40, ",C=1"));
+        let mut frame = frame(&term, 0);
+        let previous = frame.quads()[0].clone();
+        let generation = frame.generation();
+
+        let update = format!("\x1b[?2026h\x1b[H\x1b[2J{}\x1b[?2026l", compressed_image(""));
+        term.set_deferred_graphics_decode(true);
+        // Include a split inside the final APC terminator, as PTY reads can end anywhere.
+        let split = update.len() - "\\\x1b[?2026l".len();
+        feed(&mut term, &mut parser, &update[..split]);
+        assert!(!frame.update(&term, &size(), 0, true));
+        feed(&mut term, &mut parser, &update[split..]);
+        assert!(term.has_graphics_jobs());
+        let jobs = term.take_graphics_jobs();
+        assert!(!term.has_graphics_jobs(), "the decode is now outside the terminal lock");
+
+        assert!(!frame.update(&term, &size(), 0, true), "a draw during decode keeps the old image");
+        assert_eq!(frame.generation(), generation);
+        assert_eq!(frame.quads()[0].uid, previous.uid);
+        assert!(Arc::ptr_eq(&frame.quads()[0].pixels, &previous.pixels));
+
+        term.finish_graphics_jobs(jobs.into_iter().map(|job| job.run()).collect());
+        assert!(frame.update(&term, &size(), 0, true));
+        assert_eq!(frame.quads().len(), 1);
+        assert_ne!(frame.quads()[0].uid, previous.uid);
+        assert_eq!(&frame.quads()[0].pixels[..4], &[70, 80, 90, 255]);
+        assert_eq!(frame.generation(), generation + 1);
+    }
+
+    #[test]
+    fn a_pending_image_never_retains_quads_from_a_previous_screen_lifetime() {
+        for (enter, switch) in
+            [("", "\x1b[?1049h"), ("\x1b[?1049h", "\x1b[?1049l\x1b[?1049h"), ("", "\x1bc")]
+        {
+            let (mut term, mut parser) = term();
+            feed(&mut term, &mut parser, &image(20, 40, ",i=1,C=1"));
+            let primary = frame(&term, 0).quads()[0].clone();
+            if !enter.is_empty() {
+                feed(&mut term, &mut parser, enter);
+                feed(&mut term, &mut parser, &image(20, 40, ",i=1,C=1"));
+            }
+            let mut frame = frame(&term, 0);
+            term.set_deferred_graphics_decode(true);
+            feed(&mut term, &mut parser, &format!("{switch}{}", compressed_image(",i=1")));
+            let jobs = term.take_graphics_jobs();
+
+            assert!(frame.update(&term, &size(), 0, true), "{switch:?}");
+            assert!(frame.quads().is_empty(), "another screen's images must disappear at once");
+            term.finish_graphics_jobs(jobs.into_iter().map(|job| job.run()).collect());
+            assert!(frame.update(&term, &size(), 0, true));
+            assert_eq!(frame.quads().len(), 1);
+            assert_eq!(&frame.quads()[0].pixels[..4], &[70, 80, 90, 255]);
+
+            if switch != "\x1bc" {
+                feed(&mut term, &mut parser, "\x1b[?1049l");
+                assert!(frame.update(&term, &size(), 0, true));
+                assert_eq!(frame.quads()[0].uid, primary.uid);
+                assert!(Arc::ptr_eq(&frame.quads()[0].pixels, &primary.pixels));
+            }
+        }
+    }
+
+    #[test]
+    fn a_failed_replacement_decode_releases_the_retained_frame() {
+        use base64::Engine;
+
+        let (mut term, mut parser) = term();
+        feed(&mut term, &mut parser, "\x1b[?1049h");
+        feed(&mut term, &mut parser, &image(20, 40, ",C=1"));
+        let mut frame = frame(&term, 0);
+        term.set_deferred_graphics_decode(true);
+        let data = base64::engine::general_purpose::STANDARD.encode(b"invalid zlib");
+        feed(
+            &mut term,
+            &mut parser,
+            &format!("\x1b[2J\x1b_Ga=T,f=24,o=z,s=20,v=40,C=1,q=2;{data}\x1b\\"),
+        );
+        let jobs = term.take_graphics_jobs();
+        assert!(!jobs.is_empty());
+        assert!(!frame.update(&term, &size(), 0, true));
+        assert_eq!(frame.quads().len(), 1);
+
+        term.finish_graphics_jobs(jobs.into_iter().map(|job| job.run()).collect());
+        assert!(frame.update(&term, &size(), 0, true));
+        assert!(frame.quads().is_empty(), "an invalid image must not freeze the old frame");
+        feed(&mut term, &mut parser, &image(20, 40, ",C=1"));
+        assert!(frame.update(&term, &size(), 0, true));
+        assert_eq!(frame.quads().len(), 1);
     }
 
     #[test]

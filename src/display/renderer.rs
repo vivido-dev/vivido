@@ -1716,8 +1716,17 @@ mod tests {
     #[cfg(any(unix, windows))]
     #[test]
     fn media_text_layers_have_separate_gpu_targets() {
-        use crate::vivid::scene::{Frame, RgbaBuffer, SharedScene};
+        use std::io::Write;
         use std::sync::Arc;
+
+        use base64::Engine;
+        use flate2::{Compression, write::ZlibEncoder};
+
+        use crate::display::kitty::KittyFrame;
+        use crate::terminal::event::VoidListener;
+        use crate::terminal::term::{Config, Term};
+        use crate::terminal::vvte::ansi;
+        use crate::vivid::scene::{Frame, RgbaBuffer, SharedScene};
         use vivid_protocol::{
             cbor::Value,
             identity::{PresenterInstanceId, SessionIdentity},
@@ -1842,7 +1851,7 @@ mod tests {
         }
         let mut renderer =
             SceneRenderer::new(RenderSource::Offscreen, PhysicalSize::new(64, 32), false).unwrap();
-        renderer.set_vivid_scene(shared);
+        renderer.set_vivid_scene(shared.clone());
         let size = crate::display::SizeInfo::new(64., 32., 8., 8., 0., 0., false);
         let no_images = crate::display::kitty::KittyFrame::default();
         let media = renderer.prepare_media(&size, 0, &no_images).unwrap();
@@ -1889,6 +1898,93 @@ mod tests {
         let uploads = renderer.media_metrics().uploaded_pixels;
         assert!(!renderer.prepare_media(&size, 0, &no_images).unwrap().changed);
         assert_eq!(renderer.media_metrics().uploaded_pixels, uploads);
+
+        // A pending Kitty replacement retains only the Kitty frame. Vivid frames in every text
+        // layer must keep advancing through the shared compositor, without re-uploading Kitty.
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+        let mut parser = ansi::Processor::new();
+        let data = base64::engine::general_purpose::STANDARD.encode([240; 8 * 8 * 3]);
+        term.advance(
+            &mut parser,
+            format!("\x1b[?1049h\x1b[1;8H\x1b_Ga=T,f=24,s=8,v=8,C=1,q=2;{data}\x1b\\").as_bytes(),
+        );
+        let mut kitty = KittyFrame::default();
+        assert!(kitty.update(&term, &size, 0, true));
+        assert!(renderer.prepare_media(&size, 0, &kitty).unwrap().changed);
+        let kitty_generation = kitty.generation();
+        let uploads = renderer.media_metrics().uploaded_pixels;
+
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
+        encoder.write_all(&[90; 8 * 8 * 3]).unwrap();
+        let data = base64::engine::general_purpose::STANDARD.encode(encoder.finish().unwrap());
+        term.set_deferred_graphics_decode(true);
+        term.advance(
+            &mut parser,
+            format!(
+                "\x1b[?2026h\x1b[2J\x1b[1;8H\x1b_Ga=T,f=24,o=z,s=8,v=8,C=1,q=2;{data}\x1b\\\x1b[?2026l"
+            )
+            .as_bytes(),
+        );
+        let jobs = term.take_graphics_jobs();
+        assert_eq!(jobs.len(), 1);
+
+        for (frame_id, rgba) in [(2, [0, 0, 255, 255]), (3, [0, 255, 255, 255])] {
+            assert!(!kitty.update(&term, &size, 0, true));
+            assert_eq!(kitty.generation(), kitty_generation);
+            for layer in 0..3 {
+                shared
+                    .publish_frame(
+                        context.surface(layer + 1).unwrap().track(1).unwrap(),
+                        ChannelGeneration::ONE,
+                        80,
+                        1,
+                        frame_id,
+                        true,
+                        frame_id + 1,
+                        Frame {
+                            frame_id,
+                            pts_us: frame_id as i64,
+                            width: 1,
+                            height: 1,
+                            sar_num: 1,
+                            sar_den: 1,
+                            alpha_mode: 1,
+                            rgba: Arc::new(RgbaBuffer::new(rgba.to_vec())),
+                            damage: None,
+                        },
+                    )
+                    .unwrap();
+            }
+            let media = renderer.prepare_media(&size, 0, &kitty).unwrap();
+            assert!(media.changed, "a retained Kitty frame must not suppress Vivid updates");
+            let mut scene = Scene::new();
+            for layer in media.layers.iter().flatten() {
+                scene.draw_image(layer, kurbo::Affine::IDENTITY);
+            }
+            renderer.render(&scene, Color::BLACK).unwrap();
+            let readback = renderer.begin_screenshot().unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let pixels = loop {
+                if let Some(pixels) = renderer.poll_screenshot(&readback).unwrap() {
+                    break pixels;
+                }
+                assert!(std::time::Instant::now() < deadline);
+                std::thread::yield_now();
+            };
+            let pixel = |x: usize| {
+                let offset = pixels.padded_bytes_per_row as usize + x * 4;
+                &pixels.bytes[offset..offset + 4]
+            };
+            for x in [1, 17, 33] {
+                assert_eq!(pixel(x), rgba, "Vivid frame {frame_id}, column {x}");
+            }
+            assert_eq!(pixel(57), [240, 240, 240, 255], "Kitty keeps its previous pixels");
+        }
+        assert_eq!(renderer.media_metrics().uploaded_pixels, uploads + 6);
+        term.finish_graphics_jobs(jobs.into_iter().map(|job| job.run()).collect());
+        assert!(kitty.update(&term, &size, 0, true));
+        assert!(renderer.prepare_media(&size, 0, &kitty).unwrap().changed);
+        assert_eq!(renderer.media_metrics().uploaded_pixels, uploads + 6 + 8 * 8);
     }
 
     /// Kitty images share the three media targets, selected by z-index: far-negative under cell

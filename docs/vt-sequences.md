@@ -250,6 +250,9 @@ not fit at end-of-line get a leading spacer cell when DECAWM is on.
 - **Replacing in place.** A program that redraws an opaque image at exactly the same position
   with no image id, as a video player does for every frame, replaces the previous one instead of
   stacking on it. Nothing could ever have shown or addressed the covered image again.
+- **Compressed replacements.** The previous image frame stays visible while replacement pixels
+  decode outside the terminal lock, including after a synchronized erase-and-replace. Text, Vivid
+  media, and the UI can still draw. Screen switches and resets discard the retained frame.
 - **Sizes** are in physical pixels. `TIOCGWINSZ` reports the window's pixel size, and `CSI 14 t`
   and `CSI 16 t` report it and the cell size.
 

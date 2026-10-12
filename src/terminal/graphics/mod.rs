@@ -158,6 +158,8 @@ pub struct KittyGraphics {
     cell: CellPixels,
     /// Changes on every visible change; what the renderer compares to know it is current.
     revision: u64,
+    /// Changes on screen switches and resets, invalidating retained renderer frames.
+    screen_epoch: u64,
     /// Set by a visible change and cleared by [`Self::take_dirty`].
     dirty: bool,
     /// Bytes consumed since [`Self::take_quiet_bytes`] that changed nothing on screen.
@@ -187,6 +189,7 @@ impl KittyGraphics {
             loader: None,
             cell: CellPixels::FALLBACK,
             revision: 0,
+            screen_epoch: 0,
             dirty: false,
             quiet_bytes: 0,
             defer_decode: false,
@@ -200,6 +203,11 @@ impl KittyGraphics {
     #[must_use]
     pub fn revision(&self) -> u64 {
         self.revision
+    }
+
+    /// Identity of the current screen lifetime for retaining a frame during decoding.
+    pub(crate) fn screen_epoch(&self) -> u64 {
+        self.screen_epoch
     }
 
     /// Cell size placements are currently fitted to.
@@ -645,6 +653,7 @@ impl KittyGraphics {
         self.loader = None;
         self.screens[ALTERNATE].clear(true);
         self.active = active;
+        self.screen_epoch = self.screen_epoch.wrapping_add(1);
         self.touch();
     }
 
@@ -655,6 +664,7 @@ impl KittyGraphics {
         let empty = self.screens.iter().all(ImageStore::is_empty);
         self.screens = [ImageStore::default(), ImageStore::default()];
         self.active = 0;
+        self.screen_epoch = self.screen_epoch.wrapping_add(1);
         self.sink = Sink::Idle;
         self.command = None;
         self.loader = None;
