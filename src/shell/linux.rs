@@ -13,12 +13,13 @@ use crate::cli::TerminalOptions;
 use crate::{Processor, WindowOptions};
 
 /// Hosts offscreen Vivido panes inside one Wayland chrome surface.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct NativePaneHost {
     chrome: Arc<Window>,
 }
 
 impl NativePaneHost {
+    /// Create a pane host retaining its parent chrome window.
     pub fn new(chrome: Arc<Window>) -> Self {
         Self { chrome }
     }

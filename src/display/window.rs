@@ -706,6 +706,7 @@ impl Window {
     }
 
     #[cfg(not(any(target_os = "macos", windows)))]
+    /// Build Wayland window attributes with the configured application identity and decorations.
     pub fn get_platform_window(
         identity: &Identity,
         window_config: &WindowConfig,

@@ -53,7 +53,8 @@ fn set_controlling_terminal(fd: c_int) -> Result<()> {
         // is disabled.
         #[allow(
             clippy::cast_lossless,
-            reason = "the native uid type varies across supported Unix targets"
+            trivial_numeric_casts,
+            reason = "the native ioctl request type varies across supported Unix targets"
         )]
         libc::ioctl(fd, TIOCSCTTY as _, 0)
     };

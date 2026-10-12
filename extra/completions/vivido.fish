@@ -27,7 +27,7 @@ end
 complete -c vivido -n "__fish_vivido_needs_command" -l config-file -d 'Specify alternative configuration file [default: $XDG_CONFIG_HOME/vivido/vivido.toml]' -r -F
 complete -c vivido -n "__fish_vivido_needs_command" -s s -l socket -d 'Local IPC endpoint (a filesystem path on Unix, a named-pipe path on Windows)' -r -F
 complete -c vivido -n "__fish_vivido_needs_command" -l session -d 'Name of the headless session, for `--target` on `msg` [default: derived from the PID]' -r
-complete -c vivido -n "__fish_vivido_needs_command" -l automation-name -d 'Stable same-user automation name for a headed instance [default: vivido-<pid>]' -r
+complete -c vivido -n "__fish_vivido_needs_command" -l automation-name -d 'Stable same-user automation name for a headed instance (default: `vivido-<pid>`)' -r
 complete -c vivido -n "__fish_vivido_needs_command" -l headless-size -d 'Size of the headless window, as COLUMNSxLINES or WIDTHxHEIGHTpx' -r
 complete -c vivido -n "__fish_vivido_needs_command" -l vivid-target -d 'Present a `desktop-surface-v1` Vivid target instead of the terminal target' -r -f -a "terminal\t'`terminal-surface-v1`: a grid of cells with a text plane and anchors'
 desktop\t'`desktop-surface-v1`: a virtual desktop in logical pixels, with no grid and no anchors'"
@@ -49,7 +49,7 @@ complete -c vivido -n "__fish_vivido_needs_command" -l no-activate -d 'Map the w
 complete -c vivido -n "__fish_vivido_needs_command" -l hold -d 'Remain open after child process exit'
 complete -c vivido -n "__fish_vivido_needs_command" -s h -l help -d 'Print help (see more with \'--help\')'
 complete -c vivido -n "__fish_vivido_needs_command" -s V -l version -d 'Print version'
-complete -c vivido -n "__fish_vivido_needs_command" -f -a "msg" -d 'Send a message to the Vivido socket'
+complete -c vivido -n "__fish_vivido_needs_command" -f -a "msg" -d 'Send a local automation request'
 complete -c vivido -n "__fish_vivido_needs_command" -f -a "list" -d 'List running headless sessions'
 complete -c vivido -n "__fish_vivido_needs_command" -f -a "doctor" -d 'Check discovery, IPC, rendering, and presenter health'
 complete -c vivido -n "__fish_vivido_needs_command" -f -a "debug-bundle" -d 'Write a bounded, versioned diagnostic ZIP bundle'
@@ -172,14 +172,14 @@ complete -c vivido -n "__fish_vivido_using_subcommand msg; and __fish_seen_subco
 complete -c vivido -n "__fish_vivido_using_subcommand msg; and __fish_seen_subcommand_from drop-file" -l type-path -d 'Type the committed remote path into the terminal afterwards, exactly as a drag would. Off by default: the typed text lands in whatever has focus'
 complete -c vivido -n "__fish_vivido_using_subcommand msg; and __fish_seen_subcommand_from drop-file" -s h -l help -d 'Print help (see more with \'--help\')'
 complete -c vivido -n "__fish_vivido_using_subcommand msg; and __fish_seen_subcommand_from mouse" -s h -l help -d 'Print help'
-complete -c vivido -n "__fish_vivido_using_subcommand msg; and __fish_seen_subcommand_from mouse" -f -a "move" -d 'Mouse coordinate and modifier arguments'
-complete -c vivido -n "__fish_vivido_using_subcommand msg; and __fish_seen_subcommand_from mouse" -f -a "click" -d 'Mouse arguments requiring a button'
-complete -c vivido -n "__fish_vivido_using_subcommand msg; and __fish_seen_subcommand_from mouse" -f -a "double-click" -d 'Mouse arguments requiring a button'
-complete -c vivido -n "__fish_vivido_using_subcommand msg; and __fish_seen_subcommand_from mouse" -f -a "down" -d 'Mouse arguments requiring a button'
-complete -c vivido -n "__fish_vivido_using_subcommand msg; and __fish_seen_subcommand_from mouse" -f -a "up" -d 'Mouse arguments requiring a button'
-complete -c vivido -n "__fish_vivido_using_subcommand msg; and __fish_seen_subcommand_from mouse" -f -a "drag" -d 'Mouse arguments requiring a button'
+complete -c vivido -n "__fish_vivido_using_subcommand msg; and __fish_seen_subcommand_from mouse" -f -a "move" -d 'Move the mouse pointer'
+complete -c vivido -n "__fish_vivido_using_subcommand msg; and __fish_seen_subcommand_from mouse" -f -a "click" -d 'A single mouse click'
+complete -c vivido -n "__fish_vivido_using_subcommand msg; and __fish_seen_subcommand_from mouse" -f -a "double-click" -d 'Two consecutive mouse clicks'
+complete -c vivido -n "__fish_vivido_using_subcommand msg; and __fish_seen_subcommand_from mouse" -f -a "down" -d 'Press a mouse button'
+complete -c vivido -n "__fish_vivido_using_subcommand msg; and __fish_seen_subcommand_from mouse" -f -a "up" -d 'Release a mouse button'
+complete -c vivido -n "__fish_vivido_using_subcommand msg; and __fish_seen_subcommand_from mouse" -f -a "drag" -d 'Move with a mouse button held'
 complete -c vivido -n "__fish_vivido_using_subcommand msg; and __fish_seen_subcommand_from mouse" -f -a "path" -d 'Draw one bounded press/move/release gesture'
-complete -c vivido -n "__fish_vivido_using_subcommand msg; and __fish_seen_subcommand_from mouse" -f -a "scroll" -d 'Mouse scrolling arguments'
+complete -c vivido -n "__fish_vivido_using_subcommand msg; and __fish_seen_subcommand_from mouse" -f -a "scroll" -d 'Change the visible scrollback offset'
 complete -c vivido -n "__fish_vivido_using_subcommand msg; and __fish_seen_subcommand_from mouse" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
 complete -c vivido -n "__fish_vivido_using_subcommand msg; and __fish_seen_subcommand_from resize" -l columns -d 'Exact terminal grid column count' -r
 complete -c vivido -n "__fish_vivido_using_subcommand msg; and __fish_seen_subcommand_from resize" -l rows -d 'Exact terminal grid row count' -r
@@ -202,7 +202,7 @@ complete -c vivido -n "__fish_vivido_using_subcommand msg; and __fish_seen_subco
 complete -c vivido -n "__fish_vivido_using_subcommand msg; and __fish_seen_subcommand_from focus" -s w -l window-id -d 'Window ID. The focused window is used when this is omitted' -r
 complete -c vivido -n "__fish_vivido_using_subcommand msg; and __fish_seen_subcommand_from focus" -s h -l help -d 'Print help'
 complete -c vivido -n "__fish_vivido_using_subcommand msg; and __fish_seen_subcommand_from signal" -s w -l window-id -d 'Window ID. The focused window is used when this is omitted' -r
-complete -c vivido -n "__fish_vivido_using_subcommand msg; and __fish_seen_subcommand_from signal" -s h -l help -d 'Print help'
+complete -c vivido -n "__fish_vivido_using_subcommand msg; and __fish_seen_subcommand_from signal" -s h -l help -d 'Print help (see more with \'--help\')'
 complete -c vivido -n "__fish_vivido_using_subcommand msg; and __fish_seen_subcommand_from list-windows" -s h -l help -d 'Print help'
 complete -c vivido -n "__fish_vivido_using_subcommand msg; and __fish_seen_subcommand_from inspect" -s w -l window-id -d 'Window ID. The focused window is used when this is omitted' -r
 complete -c vivido -n "__fish_vivido_using_subcommand msg; and __fish_seen_subcommand_from inspect" -s h -l help -d 'Print help'
@@ -210,13 +210,13 @@ complete -c vivido -n "__fish_vivido_using_subcommand msg; and __fish_seen_subco
 complete -c vivido -n "__fish_vivido_using_subcommand msg; and __fish_seen_subcommand_from diagnose" -l trace-limit -d 'Maximum recent Vivid trace events to include' -r
 complete -c vivido -n "__fish_vivido_using_subcommand msg; and __fish_seen_subcommand_from diagnose" -s h -l help -d 'Print help'
 complete -c vivido -n "__fish_vivido_using_subcommand msg; and __fish_seen_subcommand_from vivid" -s h -l help -d 'Print help'
-complete -c vivido -n "__fish_vivido_using_subcommand msg; and __fish_seen_subcommand_from vivid" -f -a "sessions" -d 'Common target selection for IPC commands'
-complete -c vivido -n "__fish_vivido_using_subcommand msg; and __fish_seen_subcommand_from vivid" -f -a "surfaces" -d 'Common target selection for IPC commands'
-complete -c vivido -n "__fish_vivido_using_subcommand msg; and __fish_seen_subcommand_from vivid" -f -a "surface-status" -d 'Common target selection for IPC commands'
-complete -c vivido -n "__fish_vivido_using_subcommand msg; and __fish_seen_subcommand_from vivid" -f -a "tracks" -d 'Common target selection for IPC commands'
-complete -c vivido -n "__fish_vivido_using_subcommand msg; and __fish_seen_subcommand_from vivid" -f -a "track-status" -d 'Common target selection for IPC commands'
-complete -c vivido -n "__fish_vivido_using_subcommand msg; and __fish_seen_subcommand_from vivid" -f -a "scene-status" -d 'Common target selection for IPC commands'
-complete -c vivido -n "__fish_vivido_using_subcommand msg; and __fish_seen_subcommand_from vivid" -f -a "trace" -d 'Parameters for a bounded Vivid trace query or follow loop'
+complete -c vivido -n "__fish_vivido_using_subcommand msg; and __fish_seen_subcommand_from vivid" -f -a "sessions" -d 'Inspect live Vivid sessions'
+complete -c vivido -n "__fish_vivido_using_subcommand msg; and __fish_seen_subcommand_from vivid" -f -a "surfaces" -d 'Inspect owned Vivid surfaces'
+complete -c vivido -n "__fish_vivido_using_subcommand msg; and __fish_seen_subcommand_from vivid" -f -a "surface-status" -d 'Inspect one fully addressed Vivid surface'
+complete -c vivido -n "__fish_vivido_using_subcommand msg; and __fish_seen_subcommand_from vivid" -f -a "tracks" -d 'Inspect owned Vivid tracks'
+complete -c vivido -n "__fish_vivido_using_subcommand msg; and __fish_seen_subcommand_from vivid" -f -a "track-status" -d 'Inspect one fully addressed Vivid track'
+complete -c vivido -n "__fish_vivido_using_subcommand msg; and __fish_seen_subcommand_from vivid" -f -a "scene-status" -d 'Inspect one owned Vivid scene'
+complete -c vivido -n "__fish_vivido_using_subcommand msg; and __fish_seen_subcommand_from vivid" -f -a "trace" -d 'Query bounded Vivid trace records'
 complete -c vivido -n "__fish_vivido_using_subcommand msg; and __fish_seen_subcommand_from vivid" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
 complete -c vivido -n "__fish_vivido_using_subcommand msg; and __fish_seen_subcommand_from get-grid" -l start-line -d 'First signed physical grid line in retained scrollback/live-screen coordinates' -r
 complete -c vivido -n "__fish_vivido_using_subcommand msg; and __fish_seen_subcommand_from get-grid" -l row-count -d 'Number of physical rows to return' -r
@@ -224,13 +224,13 @@ complete -c vivido -n "__fish_vivido_using_subcommand msg; and __fish_seen_subco
 complete -c vivido -n "__fish_vivido_using_subcommand msg; and __fish_seen_subcommand_from get-grid" -s w -l window-id -d 'Window ID. The focused window is used when this is omitted' -r
 complete -c vivido -n "__fish_vivido_using_subcommand msg; and __fish_seen_subcommand_from get-grid" -s h -l help -d 'Print help'
 complete -c vivido -n "__fish_vivido_using_subcommand msg; and __fish_seen_subcommand_from wait" -s h -l help -d 'Print help'
-complete -c vivido -n "__fish_vivido_using_subcommand msg; and __fish_seen_subcommand_from wait" -f -a "text" -d 'Text wait parameters'
-complete -c vivido -n "__fish_vivido_using_subcommand msg; and __fish_seen_subcommand_from wait" -f -a "output" -d 'Output wait parameters'
-complete -c vivido -n "__fish_vivido_using_subcommand msg; and __fish_seen_subcommand_from wait" -f -a "screen-change" -d 'Screen/frame sequence wait parameters'
-complete -c vivido -n "__fish_vivido_using_subcommand msg; and __fish_seen_subcommand_from wait" -f -a "screen-stable" -d 'Screen stability wait parameters'
-complete -c vivido -n "__fish_vivido_using_subcommand msg; and __fish_seen_subcommand_from wait" -f -a "frame" -d 'Frame wait parameters'
-complete -c vivido -n "__fish_vivido_using_subcommand msg; and __fish_seen_subcommand_from wait" -f -a "vivid-track" -d 'Parameters for a generation-scoped Vivid track wait'
-complete -c vivido -n "__fish_vivido_using_subcommand msg; and __fish_seen_subcommand_from wait" -f -a "exit" -d 'Common timeout for wait commands, represented as milliseconds on the wire'
+complete -c vivido -n "__fish_vivido_using_subcommand msg; and __fish_seen_subcommand_from wait" -f -a "text" -d 'Wait for terminal text'
+complete -c vivido -n "__fish_vivido_using_subcommand msg; and __fish_seen_subcommand_from wait" -f -a "output" -d 'Wait for transcript output'
+complete -c vivido -n "__fish_vivido_using_subcommand msg; and __fish_seen_subcommand_from wait" -f -a "screen-change" -d 'Wait for a newer screen sequence'
+complete -c vivido -n "__fish_vivido_using_subcommand msg; and __fish_seen_subcommand_from wait" -f -a "screen-stable" -d 'Wait for the screen to remain unchanged'
+complete -c vivido -n "__fish_vivido_using_subcommand msg; and __fish_seen_subcommand_from wait" -f -a "frame" -d 'Wait for the next presented terminal frame'
+complete -c vivido -n "__fish_vivido_using_subcommand msg; and __fish_seen_subcommand_from wait" -f -a "vivid-track" -d 'Wait for an addressed Vivid track condition'
+complete -c vivido -n "__fish_vivido_using_subcommand msg; and __fish_seen_subcommand_from wait" -f -a "exit" -d 'Wait for the terminal process to exit'
 complete -c vivido -n "__fish_vivido_using_subcommand msg; and __fish_seen_subcommand_from wait" -f -a "prompt" -d 'Block until the shell sits at a prompt. Requires OSC 133 shell integration; a shell that never emits markers never resolves this wait'
 complete -c vivido -n "__fish_vivido_using_subcommand msg; and __fish_seen_subcommand_from wait" -f -a "command-finish" -d 'Block until the running command finishes, reporting its exit code. Resolves on the next finish after registration, never on a command that already finished'
 complete -c vivido -n "__fish_vivido_using_subcommand msg; and __fish_seen_subcommand_from wait" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
@@ -306,7 +306,7 @@ complete -c vivido -n "__fish_vivido_using_subcommand test" -l set -d 'Set a pla
 complete -c vivido -n "__fish_vivido_using_subcommand test" -l on-failure-dump -d 'Write a diagnostic bundle per failed step (frame.png, grid.json, transcript.bin, presenter_trace.json, metadata.json). Secrets are masked in text artifacts; pixel data in frame.png is not' -r -f -a "(__fish_complete_directories)"
 complete -c vivido -n "__fish_vivido_using_subcommand test" -l keep-failed -d 'Keep a failed session running and print how to reattach to it'
 complete -c vivido -n "__fish_vivido_using_subcommand test" -s h -l help -d 'Print help (see more with \'--help\')'
-complete -c vivido -n "__fish_vivido_using_subcommand help; and not __fish_seen_subcommand_from msg list doctor debug-bundle kill-session test help" -f -a "msg" -d 'Send a message to the Vivido socket'
+complete -c vivido -n "__fish_vivido_using_subcommand help; and not __fish_seen_subcommand_from msg list doctor debug-bundle kill-session test help" -f -a "msg" -d 'Send a local automation request'
 complete -c vivido -n "__fish_vivido_using_subcommand help; and not __fish_seen_subcommand_from msg list doctor debug-bundle kill-session test help" -f -a "list" -d 'List running headless sessions'
 complete -c vivido -n "__fish_vivido_using_subcommand help; and not __fish_seen_subcommand_from msg list doctor debug-bundle kill-session test help" -f -a "doctor" -d 'Check discovery, IPC, rendering, and presenter health'
 complete -c vivido -n "__fish_vivido_using_subcommand help; and not __fish_seen_subcommand_from msg list doctor debug-bundle kill-session test help" -f -a "debug-bundle" -d 'Write a bounded, versioned diagnostic ZIP bundle'
