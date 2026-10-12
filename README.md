@@ -1,54 +1,50 @@
 # Vivido
 
-**The fast, cross-platform, GPU terminal for developers and their AI agents.**
+**A cross-platform GPU terminal for developers and AI agents.**
 
-Vivido is a blazing-fast, GPU-native terminal emulator for macOS, Windows, and Linux. It renders
-text like a champion — and then goes where no terminal has gone before: images, video, and audio
-play *inside* your shell, and AI agents get a first-class API to drive, read, and observe every
-window. One terminal, built for the two users who share it: you and your agent.
+Vivido is a GPU-rendered terminal emulator for macOS, Windows, and Linux. In addition to text, it
+can display images, video, and audio inside the terminal window, and it provides an automation API
+that lets AI agents drive, read, and observe its windows.
 
 <img width="1915" height="1077" alt="vivida_screenshot" src="https://github.com/user-attachments/assets/752ddf5b-f8e6-46b0-b4a1-b8ce5133eece" />
 
 (screenshot is [Vivida](https://github.com/vivido-dev/vivida), a wrapper of vivido, vivido does not have workspaces and split panes, but you can use [vvmux](https://github.com/vivido-dev/vvmux) to similar effects in Vivido)
 
-## Why developers love Vivido
+## For developers
 
-### Speed you can feel
+### Performance
 
-Vivido is one of the fastest terminals, ([see benchmark](docs/benchmarks.md), vivido is the fastest on benchmark average).
+Vivido renders text on the GPU through [wgpu](https://github.com/gfx-rs/wgpu), using Metal on
+macOS, DirectX 12 on Windows, and Vulkan on Linux. It has the best average result across the
+terminals in our [benchmarks](docs/benchmarks.md).
 
-Text is rendered on the GPU through [wgpu](https://github.com/gfx-rs/wgpu),
-riding Metal on macOS, DirectX 12 on Windows, and Vulkan on Linux.
-Scrolling through a build log feels effortless — that's the whole point.
+### Inline media
 
-### Your media lives where you work
+Images, encoded video, audio, and camera feeds are displayed in the terminal window alongside
+text, so you can look at a plot or screenshot without copying the file somewhere else first. Over
+SSH, the bundled `vvssh` forwards the same media from remote hosts and supports drag-and-drop file
+transfer.
 
-Charts, screenshots, webcam feeds, encoded video, audio — streamed straight into the terminal
-window, right between the text. Stop `scp`-ing files around just to glance at a plot. And over SSH,
-the bundled `vvssh` brings the same rich media to your remote boxes, with drag-and-drop file
-transfer into the bargain.
+### Windows
 
-### First-class on Windows
+Vivido runs natively on Windows using DirectX 12 and ConPTY, with the same rendering, inline media,
+and automation features as on macOS and Linux. PowerShell and each installed WSL distribution open
+as tabs in the same window, and WSL shells get `TERM=vivido` and true color automatically.
+`vivido msg` and headless sessions work over an owner-only named pipe. The signed installer sets up
+PowerShell 7, WSL with Ubuntu, and your PATH. See [Using Vivido on Windows](docs/windows.md).
 
-Windows is a first-class platform for Vivido, not a port. You get the same GPU speed, inline media,
-and agent automation as on macOS, running natively on DirectX 12 and Windows' built-in ConPTY.
-PowerShell and every installed WSL distribution sit side by side as tabs in one window, and WSL
-shells get `TERM=vivido` and true color automatically. `vivido msg` and headless sessions work the
-same way they do on macOS and Linux, over an owner-only named pipe. The signed installer sets up
-PowerShell 7, WSL with Ubuntu, and your PATH in one go. See [Using Vivido on Windows](docs/windows.md).
+### Accessibility
 
-### Accessible by design
+On macOS, screen readers receive the actual text, its geometry, the caret position, and scrollback
+rather than a rendered bitmap.
 
-Screen readers get real text geometry, caret position, and scrollback on macOS — not a rasterized
-bitmap. Accessibility is a feature, not an afterthought.
+## For AI agents
 
-## Why AI agents love Vivido
+Vivido is designed to be controlled programmatically as well as typed into.
 
-Vivido is the first terminal designed from day one to be *driven*, not just typed into.
-
-- **A real automation API.** `vivido msg` gives agents structured grid snapshots, typed input,
+- **Automation API.** `vivido msg` gives agents structured grid snapshots, typed input,
   window and process control, screenshots, sanitized transcripts, state waits, and replayable event
-  subscriptions. No fragile screen-scraping — agents read the terminal as data.
+  subscriptions, so agents can read the terminal as data instead of scraping the screen.
 - **Headless sessions.** Run a full terminal — renderer and all — in the background with no window,
   addressable by name, discoverable, and safe to script:
 
@@ -58,10 +54,10 @@ Vivido is the first terminal designed from day one to be *driven*, not just type
   vivido msg screenshot
   ```
 
-  CI, agents, and bots get a real terminal surface on demand.
+  This gives CI jobs, agents, and scripts a real terminal without a visible window.
 
-- **Deterministic discovery.** Find windows, wait for the prompt, watch for changes. Agents stop
-  guessing and start knowing.
+- **Discovery and waits.** Agents can find windows, wait for a prompt, and watch for changes
+  instead of polling.
 
 Start with `vivido msg capabilities`, then read the
 [Agent automation guide](docs/ipc.md) and [Headless sessions](docs/headless.md).

@@ -118,6 +118,7 @@ impl Clipboard {
         match display {
             #[cfg(all(feature = "wayland", not(any(target_os = "macos", windows))))]
             RawDisplayHandle::Wayland(display) => {
+                // SAFETY: The caller guarantees a live Wayland display; the clipboard objects remain tied to that display lifetime.
                 let (selection, clipboard) = unsafe {
                     wayland_clipboard::create_clipboards_from_external(display.display.as_ptr())
                 };
@@ -178,10 +179,16 @@ impl Clipboard {
 impl Default for Clipboard {
     fn default() -> Self {
         #[cfg(any(target_os = "macos", windows))]
-        return Self {
-            clipboard: Box::new(ClipboardContext::new().unwrap()),
-            selection: None,
-            media: MediaClipboard::Unopened,
+        return match ClipboardContext::new() {
+            Ok(clipboard) => Self {
+                clipboard: Box::new(clipboard),
+                selection: None,
+                media: MediaClipboard::Unopened,
+            },
+            Err(err) => {
+                warn!("Unable to open the system clipboard; text clipboard stays disabled: {err}");
+                Self::new_nop()
+            },
         };
 
         #[cfg(not(any(target_os = "macos", windows)))]
@@ -190,6 +197,12 @@ impl Default for Clipboard {
 }
 
 impl Clipboard {
+    /// Whether this platform has a primary selection. Without one, loading the selection reads
+    /// the clipboard instead and storing to it does nothing.
+    pub fn has_selection(&self) -> bool {
+        self.selection.is_some()
+    }
+
     pub fn store(&mut self, ty: ClipboardType, text: impl Into<String>) {
         let clipboard = match (ty, &mut self.selection) {
             (ClipboardType::Selection, Some(provider)) => provider,
@@ -273,6 +286,13 @@ fn pasted_image_name() -> String {
     let seconds =
         SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |elapsed| elapsed.as_secs());
     format!("pasted-image-{seconds}.png")
+}
+
+// Debug omits user content and native resources, and never acquires application locks.
+impl std::fmt::Debug for Clipboard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Clipboard").finish_non_exhaustive()
+    }
 }
 
 #[cfg(test)]

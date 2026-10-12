@@ -2,7 +2,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use bitflags::bitflags;
-#[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
 use crate::terminal::grid::{self, GridCell};
@@ -10,26 +9,45 @@ use crate::terminal::index::Column;
 use crate::terminal::vvte::ansi::{Color, Hyperlink as VteHyperlink, NamedColor};
 
 bitflags! {
+    /// Styling and grid-occupancy flags attached to a terminal cell.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-    #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+    #[derive(Serialize, Deserialize)]
     pub struct Flags: u16 {
+        /// Exchange cell foreground and background.
         const INVERSE                   = 0b0000_0000_0000_0001;
+        /// Render with bold weight.
         const BOLD                      = 0b0000_0000_0000_0010;
+        /// Render with italic styling.
         const ITALIC                    = 0b0000_0000_0000_0100;
+        /// Combine bold and italic styling.
         const BOLD_ITALIC               = 0b0000_0000_0000_0110;
+        /// Draw a single underline.
         const UNDERLINE                 = 0b0000_0000_0000_1000;
+        /// The following row continues this wrapped line.
         const WRAPLINE                  = 0b0000_0000_0001_0000;
+        /// The cell starts a double-width character.
         const WIDE_CHAR                 = 0b0000_0000_0010_0000;
+        /// The cell is the trailing half of a double-width character.
         const WIDE_CHAR_SPACER          = 0b0000_0000_0100_0000;
+        /// Render with reduced intensity.
         const DIM                       = 0b0000_0000_1000_0000;
+        /// Combine reduced intensity with bold weight.
         const DIM_BOLD                  = 0b0000_0000_1000_0010;
+        /// Suppress visible glyph rendering.
         const HIDDEN                    = 0b0000_0001_0000_0000;
+        /// Draw a strike-through decoration.
         const STRIKEOUT                 = 0b0000_0010_0000_0000;
+        /// Reserve the final column before a wrapped double-width character.
         const LEADING_WIDE_CHAR_SPACER  = 0b0000_0100_0000_0000;
+        /// Draw a double underline.
         const DOUBLE_UNDERLINE          = 0b0000_1000_0000_0000;
+        /// Draw a wavy underline.
         const UNDERCURL                 = 0b0001_0000_0000_0000;
+        /// Draw a dotted underline.
         const DOTTED_UNDERLINE          = 0b0010_0000_0000_0000;
+        /// Draw a dashed underline.
         const DASHED_UNDERLINE          = 0b0100_0000_0000_0000;
+        /// All supported underline styles.
         const ALL_UNDERLINES            = Self::UNDERLINE.bits() | Self::DOUBLE_UNDERLINE.bits()
                                         | Self::UNDERCURL.bits() | Self::DOTTED_UNDERLINE.bits()
                                         | Self::DASHED_UNDERLINE.bits();
@@ -39,22 +57,25 @@ bitflags! {
 /// Counter for hyperlinks without explicit ID.
 static HYPERLINK_ID_SUFFIX: AtomicU32 = AtomicU32::new(0);
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// An OSC 8 hyperlink identifier and destination URI.
 pub struct Hyperlink {
     inner: Arc<HyperlinkInner>,
 }
 
 impl Hyperlink {
+    /// Create an OSC 8 hyperlink, generating an identifier when absent.
     pub fn new<T: ToString>(id: Option<T>, uri: String) -> Self {
         let inner = Arc::new(HyperlinkInner::new(id, uri));
         Self { inner }
     }
 
+    /// Return the identifier assigned to this object.
     pub fn id(&self) -> &str {
         &self.inner.id
     }
 
+    /// Borrow the OSC 8 hyperlink destination URI.
     pub fn uri(&self) -> &str {
         &self.inner.uri
     }
@@ -72,8 +93,7 @@ impl From<Hyperlink> for VteHyperlink {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 struct HyperlinkInner {
     /// Identifier for the given hyperlink.
     id: String,
@@ -120,8 +140,7 @@ impl ResetDiscriminant<Color> for Cell {
 /// This storage is reserved for cell attributes which are rarely set. This allows reducing the
 /// allocation required ahead of time for every cell, with some additional overhead when the extra
 /// storage is actually required.
-#[derive(Default, Debug, Clone, Eq, PartialEq)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Default, Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CellExtra {
     zerowidth: Vec<char>,
     underline_color: Option<Color>,
@@ -129,18 +148,22 @@ pub struct CellExtra {
     /// Temporary indices used to carry authenticated Vivid anchors through grid resize/reflow.
     ///
     /// These never survive a resize operation and are not part of serialized terminal state.
-    #[cfg_attr(feature = "serde", serde(skip))]
+    #[serde(skip)]
     vivid_resize_tracking: Vec<usize>,
 }
 
 /// Content and attributes of a single cell in the terminal grid.
-#[derive(Clone, Debug, Eq, PartialEq)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Cell {
+    /// Character stored in this terminal cell.
     pub c: char,
+    /// Foreground color.
     pub fg: Color,
+    /// Background color.
     pub bg: Color,
+    /// Terminal cell or mode flags.
     pub flags: Flags,
+    /// Optional extended cell attributes.
     pub extra: Option<Arc<CellExtra>>,
 }
 
@@ -334,7 +357,6 @@ mod tests {
     use std::mem;
 
     use crate::terminal::grid::Row;
-    use crate::terminal::index::Column;
 
     #[test]
     fn cell_size_is_below_cap() {

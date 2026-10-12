@@ -17,7 +17,6 @@ use winit::keyboard::ModifiersState;
 use winit::window::CursorIcon;
 
 use crate::terminal::event::{EventListener, OnResize, WindowSize};
-use crate::terminal::graphics::GraphicsCommand;
 use crate::terminal::grid::Dimensions as TermDimensions;
 use crate::terminal::index::{Column, Direction, Line, Point};
 use crate::terminal::selection::Selection;
@@ -27,6 +26,8 @@ use crate::terminal::term::{
 };
 use crate::terminal::vvte::ansi::{CursorShape, NamedColor};
 
+use crate::clipboard_prompt::ClipboardPrompt;
+use crate::command_palette::{CommandPalette, Entry as PaletteEntry};
 use crate::config::UiConfig;
 use crate::config::font::{Font, FontSize};
 use crate::config::window::Dimensions;
@@ -39,6 +40,9 @@ use crate::display::cursor::IntoRects;
 use crate::display::damage::{DamageTracker, damage_y_to_viewport_y};
 use crate::display::hint::{HintMatch, HintState};
 use crate::display::meter::Meter;
+use crate::display::progress::{
+    BAR_HEIGHT, ProgressBar, ProgressTone, ProgressVisual, SEGMENT_FRACTION, TRACK_ALPHA,
+};
 use crate::display::rects::{RenderLine, RenderLines, RenderRect, paint_rect, paint_rects};
 use crate::display::renderer::{EmbeddedFrame, SceneRenderer};
 use crate::display::scrollbar::{ScrollbarModel, ScrollbarState, THUMB_ALPHA, THUMB_COLOR};
@@ -50,22 +54,32 @@ use crate::scheduler::{Scheduler, TimerId, Topic};
 use crate::string::{ShortenDirection, StrShortener};
 use crate::vivid::VividService;
 
+/// Color types and operations.
 pub mod color;
+/// Content types and operations.
 pub mod content;
 pub mod cursor;
+/// Hint types and operations.
 pub mod hint;
+/// Rects types and operations.
 pub mod rects;
+/// Renderer types and operations.
 pub mod renderer;
+/// Text types and operations.
 pub mod text;
 pub mod vector;
+/// Window types and operations.
 pub mod window;
 
 mod bell;
 mod corners;
 mod damage;
+mod kitty;
 mod media;
 mod meter;
 mod overlay;
+pub mod progress;
+pub mod progress_indicator;
 mod scrollbar;
 #[cfg(windows)]
 mod windows_live_move;
@@ -111,8 +125,11 @@ struct TerminalShapingCell {
 }
 
 #[derive(Debug)]
+/// A failure while creating or using this module's display resources.
 pub enum Error {
+    /// Window state or a window-operation failure.
     Window(window::Error),
+    /// Rendering failed or produced a render-related event.
     Render(renderer::Error),
 }
 
@@ -187,38 +204,44 @@ impl From<SizeInfo<f32>> for WindowSize {
 
 impl<T: Clone + Copy> SizeInfo<T> {
     #[inline]
+    /// Return the width in this geometry's coordinate system.
     pub fn width(&self) -> T {
         self.width
     }
 
     #[inline]
+    /// Return the height in this geometry's coordinate system.
     pub fn height(&self) -> T {
         self.height
     }
 
     #[inline]
+    /// Return one cell's physical-pixel width.
     pub fn cell_width(&self) -> T {
         self.cell_width
     }
 
     #[inline]
+    /// Return one cell's physical-pixel height.
     pub fn cell_height(&self) -> T {
         self.cell_height
     }
 
     #[inline]
+    /// Return horizontal physical-pixel padding.
     pub fn padding_x(&self) -> T {
         self.padding_x
     }
 
     #[inline]
+    /// Return vertical physical-pixel padding.
     pub fn padding_y(&self) -> T {
         self.padding_y
     }
 }
 
 impl SizeInfo<f32> {
-    #[allow(clippy::too_many_arguments)]
+    /// Compute terminal geometry from window, cell, and padding dimensions.
     pub fn new(
         width: f32,
         height: f32,
@@ -252,11 +275,13 @@ impl SizeInfo<f32> {
     }
 
     #[inline]
+    /// Reserve viewport lines for UI while preserving the minimum terminal height.
     pub fn reserve_lines(&mut self, count: usize) {
         self.screen_lines = cmp::max(self.screen_lines.saturating_sub(count), MIN_SCREEN_LINES);
     }
 
     #[inline]
+    /// Whether physical-pixel coordinates fall inside terminal text bounds.
     pub fn contains_point(&self, x: usize, y: usize) -> bool {
         x <= (self.padding_x + self.columns as f32 * self.cell_width) as usize
             && x > self.padding_x as usize
@@ -285,57 +310,92 @@ impl TermDimensions for SizeInfo {
     fn total_lines(&self) -> usize {
         self.screen_lines()
     }
+
+    #[inline]
+    fn cell_pixels(&self) -> Option<(u16, u16)> {
+        Some((self.cell_width() as u16, self.cell_height() as u16))
+    }
 }
 
 #[derive(Default, Clone, Debug, PartialEq, Eq)]
+/// Pending changes to terminal layout and text rendering.
 pub struct DisplayUpdate {
+    /// Whether this state requires a display update.
     pub dirty: bool,
     dimensions: Option<PhysicalSize<u32>>,
     font: Option<Font>,
 }
 
 impl DisplayUpdate {
+    /// Return the pending or configured window dimensions, when explicitly set.
     pub fn dimensions(&self) -> Option<PhysicalSize<u32>> {
         self.dimensions
     }
 
+    /// Borrow the pending font change, if any.
     pub fn font(&self) -> Option<&Font> {
         self.font.as_ref()
     }
 
+    /// Queue a display geometry update.
     pub fn set_dimensions(&mut self, dimensions: PhysicalSize<u32>) {
         self.dimensions = Some(dimensions);
         self.dirty = true;
     }
 
+    /// Queue a display font update.
     pub fn set_font(&mut self, font: Font) {
         self.font = Some(font);
         self.dirty = true;
     }
 
+    /// Mark cursor appearance as needing an update.
     pub fn set_cursor_dirty(&mut self) {
         self.dirty = true;
     }
 }
 
+/// Window rendering resources and the state needed to compose terminal frames.
 pub struct Display {
+    /// Native or embedded window resources.
     pub window: Window,
+    /// Terminal grid geometry and physical-pixel dimensions.
     pub size_info: SizeInfo,
     /// The cursor a pane overlay asks for, ranked below Vivido's own chrome and above the
     /// terminal's. Refreshed from the service on every update.
     overlay_cursor: Option<CursorIcon>,
+    /// The hint currently highlighted by pointer or keyboard input.
     pub highlighted_hint: Option<HintMatch>,
     highlighted_hint_age: usize,
+    /// Whether terminal cursor rendering is suppressed.
     pub cursor_hidden: bool,
+    /// Current visual-bell animation.
     pub visual_bell: VisualBell,
+    /// Scrollbar interaction and presentation state.
     pub scrollbar: ScrollbarState,
+    /// OSC 9;4 progress reported by the terminal's programs.
+    pub progress: ProgressBar,
+    /// The progress visual the cached scene shows.
+    drawn_progress: Option<ProgressVisual>,
+    /// Resolved terminal palette.
     pub colors: List,
+    /// Active keyboard hint selection state.
     pub hint_state: HintState,
+    /// The command palette while it is open.
+    command_palette: Option<CommandPalette>,
+    /// The clipboard request waiting for the user's answer, drawn above the palette.
+    clipboard_prompt: Option<ClipboardPrompt>,
+    /// Changes awaiting display layout processing.
     pub pending_update: DisplayUpdate,
+    /// Changes awaiting native renderer processing.
     pub pending_renderer_update: Option<RendererUpdate>,
+    /// Input-method editor state.
     pub ime: Ime,
+    /// Frame pacing state.
     pub frame_timer: FrameTimer,
+    /// Regions that need repainting.
     pub damage_tracker: DamageTracker,
+    /// Current terminal font size.
     pub font_size: FontSize,
 
     hint_mouse_point: Option<Point>,
@@ -349,6 +409,8 @@ pub struct Display {
     cached_media_generation: u64,
     cached_base_color: Color,
     vivid_frame_requested: bool,
+    /// Kitty graphics placements of the frame being drawn, in window pixels.
+    kitty_frame: kitty::KittyFrame,
     text_scene_builds: u64,
     cached_scene_frames: u64,
     text_system: TextSystem,
@@ -378,20 +440,17 @@ impl Display {
         self.cached_scene = None;
         self.vivid_frame_requested = false;
         self.scrollbar.record_drawn(None);
+        self.drawn_progress = None;
     }
 
+    /// Replace the presented Vivid scene and invalidate cached rendering.
     pub fn set_vivid_scene(&mut self, scene: crate::vivid::scene::SharedScene) {
         self.invalidate_cached_scene();
         self.vivid_scene = Some(scene.clone());
         self.scene_renderer.set_vivid_scene(scene);
     }
 
-    pub fn submit_graphics(&mut self, command: GraphicsCommand) {
-        self.invalidate_cached_scene();
-        self.scene_renderer.submit_graphics(command);
-        self.damage_tracker.frame().mark_fully_damaged();
-    }
-
+    /// Borrow the current embedded frame, when available.
     pub fn embedded_frame(&self) -> Option<EmbeddedFrame<'_>> {
         (!self.renderer_unavailable && self.display_window_is_embedded())
             .then(|| self.scene_renderer.embedded_frame())
@@ -409,6 +468,11 @@ impl Display {
     }
 
     #[cfg(any(unix, windows))]
+    /// Begin asynchronous readback of the most recently rendered frame.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no readable frame exists or GPU readback cannot start.
     pub fn begin_screenshot(&self) -> Result<ScreenshotReadback, ScreenshotError> {
         if self.renderer_unavailable {
             return Err(ScreenshotError::NoPresentedFrame);
@@ -417,6 +481,11 @@ impl Display {
     }
 
     #[cfg(any(unix, windows))]
+    /// Poll GPU readback and return pixels once the capture completes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if GPU mapping fails or the captured frame is no longer valid.
     pub fn poll_screenshot(
         &self,
         readback: &ScreenshotReadback,
@@ -425,13 +494,20 @@ impl Display {
     }
 
     #[cfg(any(unix, windows))]
+    /// Whether these physical dimensions fit the current graphics-device limits.
     pub fn supports_render_size(&self, width: u32, height: u32) -> bool {
         self.scene_renderer.clamp_render_size(PhysicalSize::new(width, height))
             == PhysicalSize::new(width, height)
     }
 
     /// Build the renderer for an initially hidden `window`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if font, renderer, or display initialization fails.
     pub fn new(window: Window, config: &UiConfig) -> Result<Display, Error> {
+        #[cfg(target_os = "macos")]
+        let mut window = window;
         let scale_factor = window.scale_factor as f32;
         let font_size = config.font.size().scale(scale_factor);
         let font = config.font.clone().with_size(font_size);
@@ -450,12 +526,29 @@ impl Display {
             window.request_inner_size(viewport_size);
         }
 
-        let scene_renderer = SceneRenderer::new(
+        let mut scene_renderer = SceneRenderer::new(
             window.render_source(),
             viewport_size,
             config.window_opacity() < 1.0,
         )?;
         let viewport_size = scene_renderer.clamp_render_size(viewport_size);
+        // Seed native and embedded panes before mapping them. Waiting for a redraw exposes
+        // an empty transparent surface while the PTY and host topology are being initialized.
+        let background = config.colors.primary.background;
+        #[cfg(target_os = "macos")]
+        window.set_titlebar_appearance(background, config.window_opacity(), config.window.theme());
+        window.pre_present_notify();
+        if scene_renderer.render(
+            &Scene::new(),
+            Color::from_rgba8(
+                background.r,
+                background.g,
+                background.b,
+                (config.window_opacity() * 255.) as u8,
+            ),
+        )? {
+            window.did_present();
+        }
         let size_info = scaled_size_info(
             viewport_size,
             metrics.cell_width,
@@ -490,8 +583,12 @@ impl Display {
             cursor_hidden: Default::default(),
             visual_bell: VisualBell::from(&config.bell),
             scrollbar: ScrollbarState::new(),
+            progress: ProgressBar::default(),
+            drawn_progress: None,
             colors: List::from(&config.colors),
             hint_state,
+            command_palette: None,
+            clipboard_prompt: None,
             pending_update: Default::default(),
             pending_renderer_update: Default::default(),
             ime: Default::default(),
@@ -508,6 +605,7 @@ impl Display {
             cached_media_generation: 0,
             cached_base_color: Color::BLACK,
             vivid_frame_requested: false,
+            kitty_frame: kitty::KittyFrame::default(),
             text_scene_builds: 0,
             cached_scene_frames: 0,
             text_system,
@@ -517,6 +615,10 @@ impl Display {
 
     /// Map the window after platform accessibility has been attached.
     pub fn map_window(&self, config: &UiConfig, tabbed: bool, no_activate: bool) {
+        // The layout owner reveals native panes after placing them in their final rectangles.
+        if self.window.is_hosted() {
+            return;
+        }
         #[cfg(windows)]
         let _ = (config, tabbed);
 
@@ -534,7 +636,10 @@ impl Display {
             self.window.set_visible(true);
         }
 
-        #[allow(clippy::single_match)]
+        #[allow(
+            clippy::single_match,
+            reason = "platform-specific branches share this match with additional arms on other targets"
+        )]
         #[cfg(not(windows))]
         if !tabbed {
             match config.window.startup_mode {
@@ -546,6 +651,7 @@ impl Display {
         }
     }
 
+    /// Apply pending display, terminal geometry, and font changes.
     pub fn handle_update<T>(
         &mut self,
         terminal: &mut Term<T>,
@@ -631,6 +737,7 @@ impl Display {
         self.size_info = new_size;
     }
 
+    /// Apply queued native renderer changes.
     pub fn process_renderer_update(&mut self) {
         let renderer_update = match self.pending_renderer_update.take() {
             Some(update) => update,
@@ -649,6 +756,11 @@ impl Display {
         info!("Width: {}, Height: {}", self.size_info.width(), self.size_info.height());
     }
 
+    /// Compose and present one terminal frame.
+    ///
+    /// # Panics
+    ///
+    /// Panics if internal scene-cache invariants are violated.
     pub fn draw<T: EventListener>(
         &mut self,
         mut terminal: MutexGuard<'_, Term<T>>,
@@ -690,22 +802,33 @@ impl Display {
         let scrollbar_scale = self.window.scale_factor as f32;
         let scrollbar_visual =
             self.scrollbar.visual_at(Instant::now(), &size_info, scrollbar_scale);
-        let prepared_media = self.scene_renderer.prepare_media(&size_info, early_display_offset);
+        let progress_visual = self.progress.visual_at(Instant::now());
+        // An image can change with no text changing at all, a frame of an animation drawn in
+        // place being the usual case. Like a Vivid frame, that makes the cached text scene
+        // eligible for reuse below when nothing else changed either.
+        let grid_changed = !self.damage_tracker.frame().is_empty();
+        let kitty_changed =
+            self.kitty_frame.update(&terminal, &size_info, early_display_offset, grid_changed);
+        let prepared_media =
+            self.scene_renderer.prepare_media(&size_info, early_display_offset, &self.kitty_frame);
         let media_generation = prepared_media.as_ref().map_or(0, |media| media.image_generation);
         let _media_changed = prepared_media.as_ref().is_some_and(|media| media.changed);
         let mic_label =
             self.vivid_scene.as_ref().map(|s| s.microphone().label()).unwrap_or_default();
         let can_reuse_scene = mic_label == self.cached_microphone_label
-            && self.vivid_frame_requested
+            && (self.vivid_frame_requested || kitty_changed)
             && self.cached_scene.is_some()
             && self.cached_media_generation == media_generation
             && self.damage_tracker.frame().is_empty()
             && self.visual_bell.intensity() == 0.
             && !self.hint_state.active()
             && search_state.regex().is_none()
+            && self.command_palette.is_none()
+            && self.clipboard_prompt.is_none()
             && !self.damage_tracker.debug
             // The cached scene must show exactly the scrollbar visual this frame would.
-            && self.scrollbar.drawn_visual() == scrollbar_visual;
+            && self.scrollbar.drawn_visual() == scrollbar_visual
+            && self.drawn_progress == progress_visual;
         if can_reuse_scene {
             self.cached_scene_frames = self.cached_scene_frames.saturating_add(1);
             drop(terminal);
@@ -724,6 +847,9 @@ impl Display {
                     false
                 },
             };
+            if presented {
+                self.window.did_present();
+            }
             self.vivid_frame_requested = false;
             self.request_frame(scheduler);
             self.damage_tracker.swap_damage();
@@ -756,7 +882,9 @@ impl Display {
 
         let requires_full_damage = self.visual_bell.intensity() != 0.
             || self.hint_state.active()
-            || search_state.regex().is_some();
+            || search_state.regex().is_some()
+            || self.command_palette.is_some()
+            || self.clipboard_prompt.is_some();
         if requires_full_damage {
             self.damage_tracker.frame().mark_fully_damaged();
             self.damage_tracker.next_frame().mark_fully_damaged();
@@ -945,6 +1073,13 @@ impl Display {
                 );
                 self.damage_tracker.frame().mark_fully_damaged();
             }
+            if let Some(visual) = progress_visual {
+                self.draw_progress(&mut scene, config, visual);
+            }
+            // The palette is modal, so it draws above every other piece of host UI, and a
+            // clipboard prompt, which also takes the keys from the palette, above that.
+            self.draw_command_palette(&mut scene, config);
+            self.draw_clipboard_prompt(&mut scene, config);
             self.draw_render_timer(&mut scene, config);
 
             if has_highlighted_hint {
@@ -991,6 +1126,9 @@ impl Display {
                 (false, false)
             },
         };
+        if presented {
+            self.window.did_present();
+        }
 
         if cacheable {
             self.cached_scene = Some(scene);
@@ -998,6 +1136,7 @@ impl Display {
             self.cached_media_generation = media_generation;
             self.cached_base_color = base_color;
             self.scrollbar.record_drawn(scrollbar_visual);
+            self.drawn_progress = progress_visual;
         }
         self.vivid_frame_requested = false;
 
@@ -1006,6 +1145,7 @@ impl Display {
         presented
     }
 
+    /// Apply updated terminal appearance settings.
     pub fn update_config(&mut self, config: &UiConfig) {
         self.invalidate_cached_scene();
         self.damage_tracker.debug = config.debug.highlight_damage;
@@ -1013,9 +1153,13 @@ impl Display {
         if !config.scrolling.scrollbar {
             self.scrollbar.hide();
         }
+        if !config.terminal.progress {
+            self.progress.clear();
+        }
         self.colors = List::from(&config.colors);
     }
 
+    /// Recompute pointer and keyboard hint highlighting.
     pub fn update_highlighted_hints<T>(
         &mut self,
         term: &Term<T>,
@@ -1441,6 +1585,197 @@ impl Display {
         );
     }
 
+    /// The command palette, if it is open.
+    pub(crate) fn command_palette(&self) -> Option<&CommandPalette> {
+        self.command_palette.as_ref()
+    }
+
+    /// The open command palette, for editing its query or selection.
+    pub(crate) fn command_palette_mut(&mut self) -> Option<&mut CommandPalette> {
+        self.command_palette.as_mut()
+    }
+
+    /// Open the command palette over `entries`, replacing any open one.
+    pub(crate) fn open_command_palette(&mut self, entries: Vec<PaletteEntry>) {
+        self.command_palette = Some(CommandPalette::new(entries));
+        self.invalidate_cached_scene();
+        self.damage_tracker.frame().mark_fully_damaged();
+    }
+
+    /// Close the command palette, returning whether it was open.
+    pub(crate) fn close_command_palette(&mut self) -> bool {
+        let was_open = self.command_palette.take().is_some();
+        if was_open {
+            // The cached scene still shows it.
+            self.invalidate_cached_scene();
+            self.damage_tracker.frame().mark_fully_damaged();
+        }
+        was_open
+    }
+
+    /// Draw the command palette over the top rows of the grid: the query, then the matches.
+    ///
+    /// It is drawn in terminal cells with the search bar's colours, centred and at most
+    /// [`PALETTE_MAX_COLUMNS`] wide; the highlighted match swaps foreground and background.
+    fn draw_command_palette(&mut self, scene: &mut Scene, config: &UiConfig) {
+        let Some(palette) = self.command_palette.as_ref() else { return };
+        let size_info = self.size_info;
+        let columns = size_info.columns();
+        let lines = size_info.screen_lines();
+        if columns < PALETTE_MIN_COLUMNS || lines < 2 {
+            return;
+        }
+        let width = columns.min(PALETTE_MAX_COLUMNS);
+        let left = (columns - width) / 2;
+        let fg = config.colors.footer_bar_foreground();
+        let bg = config.colors.footer_bar_background();
+
+        // One cell stays free after the query for the caret.
+        let prompt = fit_cells_end(&format!("> {}", palette.query()), width - 1);
+        let caret_column = left + text_cell_width(&prompt);
+        let mut rows = palette
+            .visible(lines - 1)
+            .map(|(entry, selected)| (palette_row(entry, width), selected))
+            .collect::<Vec<_>>();
+        if rows.is_empty() {
+            rows.push((pad_cells(" No matching commands", width), false));
+        }
+
+        self.paint_string_cells(
+            scene,
+            Point::new(0, Column(left)),
+            fg,
+            bg,
+            &pad_cells(&prompt, width),
+        );
+        let caret = RenderRect::new(
+            size_info.padding_x() + caret_column as f32 * size_info.cell_width(),
+            size_info.padding_y(),
+            (size_info.cell_width() / 8.).max(1.),
+            size_info.cell_height(),
+            fg,
+            1.,
+        );
+        paint_rect(scene, &caret);
+        for (index, (text, selected)) in rows.iter().enumerate() {
+            let (fg, bg) = if *selected { (bg, fg) } else { (fg, bg) };
+            self.paint_string_cells(scene, Point::new(index + 1, Column(left)), fg, bg, text);
+        }
+    }
+
+    /// The clipboard request waiting for an answer, if any.
+    pub(crate) fn clipboard_prompt(&self) -> Option<&ClipboardPrompt> {
+        self.clipboard_prompt.as_ref()
+    }
+
+    /// The open clipboard prompt, for moving its highlight.
+    pub(crate) fn clipboard_prompt_mut(&mut self) -> Option<&mut ClipboardPrompt> {
+        self.clipboard_prompt.as_mut()
+    }
+
+    /// Show `prompt` unless another is still waiting, returning whether it is shown.
+    ///
+    /// One request waits at a time, so a program repeating OSC 52 cannot queue up prompts.
+    pub(crate) fn open_clipboard_prompt(&mut self, prompt: ClipboardPrompt) -> bool {
+        if self.clipboard_prompt.is_some() {
+            return false;
+        }
+        self.clipboard_prompt = Some(prompt);
+        self.invalidate_cached_scene();
+        self.damage_tracker.frame().mark_fully_damaged();
+        true
+    }
+
+    /// Remove the clipboard prompt, returning its request to be carried out or dropped.
+    pub(crate) fn close_clipboard_prompt(&mut self) -> Option<ClipboardPrompt> {
+        let prompt = self.clipboard_prompt.take();
+        if prompt.is_some() {
+            // The cached scene still shows it.
+            self.invalidate_cached_scene();
+            self.damage_tracker.frame().mark_fully_damaged();
+        }
+        prompt
+    }
+
+    /// Draw the clipboard prompt over the top rows of the grid: the question, why it is asked,
+    /// the text in question in the terminal's own colours, and the two choices.
+    ///
+    /// Short grids drop the text first, then the reason, then the question; the choices always
+    /// show. The highlighted choice swaps foreground and background.
+    fn draw_clipboard_prompt(&mut self, scene: &mut Scene, config: &UiConfig) {
+        let Some(prompt) = self.clipboard_prompt.as_ref() else { return };
+        let size_info = self.size_info;
+        let columns = size_info.columns();
+        let lines = size_info.screen_lines();
+        if columns < PALETTE_MIN_COLUMNS || lines == 0 {
+            return;
+        }
+        let width = columns.min(PROMPT_MAX_COLUMNS);
+        let left = (columns - width) / 2;
+        let fg = config.colors.footer_bar_foreground();
+        let bg = config.colors.footer_bar_background();
+
+        let heading = [prompt.title(), prompt.detail()];
+        let heading = &heading[..lines.saturating_sub(1).min(2)];
+        let mut preview = prompt.preview().to_vec();
+        if prompt.hidden_lines() > 0 {
+            let hidden = prompt.hidden_lines();
+            preview.push(format!("… {hidden} more line{}", if hidden == 1 { "" } else { "s" }));
+        }
+        preview.truncate(lines.saturating_sub(heading.len() + 1));
+        let (confirm, refuse) = prompt.choices();
+        let confirm_focused = prompt.confirm_focused();
+
+        let mut line = 0;
+        for text in heading {
+            let text = pad_cells(&fit_cells_start(&format!(" {text}"), width), width);
+            self.paint_string_cells(scene, Point::new(line, Column(left)), fg, bg, &text);
+            line += 1;
+        }
+        // The text sits in a box of the terminal's colours, one cell in from either edge.
+        let (text_fg, text_bg) =
+            (config.colors.primary.foreground, config.colors.primary.background);
+        for text in &preview {
+            let text = pad_cells(&fit_cells_start(text, width - 2), width - 2);
+            self.paint_string_cells(scene, Point::new(line, Column(left)), fg, bg, " ");
+            self.paint_string_cells(
+                scene,
+                Point::new(line, Column(left + 1)),
+                text_fg,
+                text_bg,
+                &text,
+            );
+            self.paint_string_cells(scene, Point::new(line, Column(left + width - 1)), fg, bg, " ");
+            line += 1;
+        }
+
+        let buttons = [(format!("[ {confirm} ]"), true), (format!("[ {refuse} ]"), false)];
+        let hint = format!("Tab switches · Esc = {refuse} ");
+        let buttons_width =
+            buttons.iter().map(|(label, _)| text_cell_width(label) + 1).sum::<usize>() + 1;
+        let row = if buttons_width + text_cell_width(&hint) <= width {
+            format!("{:>width$}", hint)
+        } else {
+            String::new()
+        };
+        self.paint_string_cells(
+            scene,
+            Point::new(line, Column(left)),
+            fg,
+            bg,
+            &pad_cells(&row, width),
+        );
+        let mut column = left + 1;
+        for (label, confirms) in &buttons {
+            if column + text_cell_width(label) > left + width {
+                break;
+            }
+            let (fg, bg) = if *confirms == confirm_focused { (bg, fg) } else { (fg, bg) };
+            self.paint_string_cells(scene, Point::new(line, Column(column)), fg, bg, label);
+            column += text_cell_width(label) + 1;
+        }
+    }
+
     fn draw_render_timer(&mut self, scene: &mut Scene, config: &UiConfig) {
         if !config.debug.render_timer {
             return;
@@ -1486,6 +1821,43 @@ impl Display {
     }
 
     /// Draw the overlay scrollbar thumb at `intensity` and damage its gutter.
+    /// Draw the OSC 9;4 progress bar along the top edge of the grid.
+    ///
+    /// It sits in the top padding when there is room for it and overlays the first row's top
+    /// edge when there is not, so it never shifts terminal content.
+    fn draw_progress(&mut self, scene: &mut Scene, config: &UiConfig, visual: ProgressVisual) {
+        let size_info = self.size_info;
+        let height = (BAR_HEIGHT * self.window.scale_factor as f32).round().max(1.);
+        let y = (size_info.padding_y() - height).max(0.);
+        let width = size_info.width();
+        let accent = config.colors.normal.blue;
+
+        let rects = match visual {
+            ProgressVisual::Fill { tone, fraction } => {
+                let color = match tone {
+                    ProgressTone::Normal => accent,
+                    ProgressTone::Paused => config.colors.normal.yellow,
+                    ProgressTone::Error => config.colors.normal.red,
+                };
+                vec![RenderRect::new(0., y, width * fraction.clamp(0., 1.), height, color, 1.)]
+            },
+            ProgressVisual::Bounce { offset } => vec![
+                RenderRect::new(0., y, width, height, accent, TRACK_ALPHA),
+                RenderRect::new(width * offset, y, width * SEGMENT_FRACTION, height, accent, 1.),
+            ],
+        };
+        paint_rects(scene, rects);
+
+        // Damage the whole strip: the fill shrinks as well as grows, and the segment moves.
+        self.damage_tracker.frame().add_viewport_rect(
+            &size_info,
+            0,
+            y as i32,
+            width.ceil() as i32,
+            height as i32,
+        );
+    }
+
     fn draw_scrollbar(&mut self, scene: &mut Scene, intensity: f32, scale_factor: f32) {
         let geometry = self.scrollbar.geometry(&self.size_info, scale_factor);
         let Some(thumb) = geometry.thumb else {
@@ -1722,6 +2094,73 @@ fn scene_glyph_from_layout(
     positioned
 }
 
+/// Widest the command palette gets, in cells.
+const PALETTE_MAX_COLUMNS: usize = 72;
+/// Narrowest grid the command palette draws in; below it there is no room for a title.
+const PALETTE_MIN_COLUMNS: usize = 12;
+/// Widest the clipboard prompt gets, in cells; wider than the palette to show more of the text.
+const PROMPT_MAX_COLUMNS: usize = 80;
+
+/// One palette row: the title on the left and its shortcut on the right, exactly `width` cells.
+///
+/// A title too long for the row is cut short with `…`; a shortcut that leaves no room for a
+/// title is dropped.
+fn palette_row(entry: &PaletteEntry, width: usize) -> String {
+    let shortcut =
+        entry.shortcut.as_deref().map(|shortcut| format!("{shortcut} ")).unwrap_or_default();
+    let shortcut_width = text_cell_width(&shortcut);
+    // A leading space, then the title, then at least one space before the shortcut.
+    let (shortcut, shortcut_width) =
+        if shortcut_width + 8 <= width { (shortcut, shortcut_width) } else { (String::new(), 0) };
+    let title = fit_cells_start(&entry.title, width.saturating_sub(shortcut_width + 2));
+    let gap = width.saturating_sub(1 + text_cell_width(&title) + shortcut_width);
+    format!(" {title}{:gap$}{shortcut}", "")
+}
+
+/// `text` cut to at most `width` cells from its start, ending in `…` when cut.
+fn fit_cells_start(text: &str, width: usize) -> String {
+    if text_cell_width(text) <= width {
+        return text.to_owned();
+    }
+    let mut fitted = String::new();
+    let mut used = 0;
+    for character in text.chars() {
+        let cells = char_cell_width(character);
+        if used + cells + 1 > width {
+            break;
+        }
+        fitted.push(character);
+        used += cells;
+    }
+    fitted.push('…');
+    fitted
+}
+
+/// `text` cut to at most `width` cells from its end, starting with `…` when cut, so the part
+/// being typed stays visible.
+fn fit_cells_end(text: &str, width: usize) -> String {
+    if text_cell_width(text) <= width {
+        return text.to_owned();
+    }
+    let mut kept = Vec::new();
+    let mut used = 0;
+    for character in text.chars().rev() {
+        let cells = char_cell_width(character);
+        if used + cells + 1 > width {
+            break;
+        }
+        kept.push(character);
+        used += cells;
+    }
+    std::iter::once('…').chain(kept.into_iter().rev()).collect()
+}
+
+/// `text` padded with spaces to exactly `width` cells; callers pass text that already fits.
+fn pad_cells(text: &str, width: usize) -> String {
+    let padding = width.saturating_sub(text_cell_width(text));
+    format!("{text}{:padding$}", "")
+}
+
 fn char_cell_width(character: char) -> usize {
     character.width().unwrap_or(1).max(1)
 }
@@ -1927,6 +2366,13 @@ fn terminal_font_variant(flags: Flags) -> (bool, bool) {
     (flags.intersects(Flags::BOLD | Flags::DIM_BOLD), flags.contains(Flags::ITALIC))
 }
 
+// Debug omits user content and native resources, and never acquires application locks.
+impl std::fmt::Debug for Display {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Display").finish_non_exhaustive()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -1942,6 +2388,55 @@ mod tests {
     use crate::terminal::term::cell::Flags;
     use winit::dpi::PhysicalSize;
     use winit::window::CursorIcon;
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn a_new_display_has_the_configured_background_before_terminal_output() {
+        let _gpu = super::renderer::gpu_test_lock();
+        for (opacity, expected) in [("1.0", [200, 100, 50, 255]), ("0.5", [200, 100, 50, 127])] {
+            let config: crate::config::UiConfig = toml::from_str(&format!(
+                "[window]\nopacity = {opacity}\n[colors.primary]\nbackground = '#c86432'\n"
+            ))
+            .unwrap();
+            let window = super::Window::headless(
+                &config,
+                &config.window.identity,
+                &crate::cli::WindowOptions::default(),
+                PhysicalSize::new(32, 32),
+                1.,
+            );
+            let display = match super::Display::new(window, &config) {
+                Ok(display) => display,
+                Err(super::Error::Render(super::renderer::Error::NoOffscreenAdapter(error))) => {
+                    eprintln!("Skipping initial background test: {error}");
+                    return;
+                },
+                Err(error) => panic!("initial display: {error}"),
+            };
+            let readback = display.begin_screenshot().expect("initial background frame");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let pixels = loop {
+                if let Some(pixels) = display.poll_screenshot(&readback).unwrap() {
+                    break pixels;
+                }
+                assert!(std::time::Instant::now() < deadline, "GPU readback timed out");
+                std::thread::yield_now();
+            };
+            for y in 0..pixels.height as usize {
+                for x in 0..pixels.width as usize {
+                    let offset = y * pixels.padded_bytes_per_row as usize + x * 4;
+                    let pixel = &pixels.bytes[offset..offset + 4];
+                    assert_eq!(pixel[3], expected[3]);
+                    // Premultiplying into an 8-bit render target and unpremultiplying for
+                    // capture can round a translucent RGB channel by one.
+                    let tolerance = u8::from(expected[3] < 255);
+                    for channel in 0..3 {
+                        assert!(pixel[channel].abs_diff(expected[channel]) <= tolerance);
+                    }
+                }
+            }
+        }
+    }
 
     fn renderable_cell(line: usize, column: usize, character: char) -> RenderableCell {
         RenderableCell {
@@ -2241,6 +2736,7 @@ mod tests {
 }
 
 #[derive(Debug, Default)]
+/// Input-method editor state for terminal text entry.
 pub struct Ime {
     enabled: bool,
     preedit: Option<Preedit>,
@@ -2248,6 +2744,7 @@ pub struct Ime {
 
 impl Ime {
     #[inline]
+    /// Enable or disable input-method composition.
     pub fn set_enabled(&mut self, is_enabled: bool) {
         if is_enabled {
             self.enabled = is_enabled
@@ -2257,22 +2754,26 @@ impl Ime {
     }
 
     #[inline]
+    /// Whether input-method composition is enabled.
     pub fn is_enabled(&self) -> bool {
         self.enabled
     }
 
     #[inline]
+    /// Replace the input-method composition text.
     pub fn set_preedit(&mut self, preedit: Option<Preedit>) {
         self.preedit = preedit;
     }
 
     #[inline]
+    /// Borrow the current input-method composition, if any.
     pub fn preedit(&self) -> Option<&Preedit> {
         self.preedit.as_ref()
     }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// Uncommitted input-method text and its cursor range.
 pub struct Preedit {
     text: String,
     cursor_byte_offset: Option<(usize, usize)>,
@@ -2280,6 +2781,7 @@ pub struct Preedit {
 }
 
 impl Preedit {
+    /// Store composition text and its optional byte-index cursor range.
     pub fn new(text: String, cursor_byte_offset: Option<(usize, usize)>) -> Self {
         let cursor_end_offset = if let Some(byte_offset) = cursor_byte_offset {
             let start_to_end_offset =
@@ -2296,10 +2798,13 @@ impl Preedit {
 }
 
 #[derive(Debug, Default, Copy, Clone)]
+/// Pending native-surface or renderer changes.
 pub struct RendererUpdate {
     resize: bool,
 }
 
+#[derive(Debug)]
+/// Frame pacing against the current display refresh interval.
 pub struct FrameTimer {
     base: Instant,
     last_synced_timestamp: Instant,
@@ -2313,11 +2818,13 @@ impl Default for FrameTimer {
 }
 
 impl FrameTimer {
+    /// Start a frame timer at the current monotonic instant.
     pub fn new() -> Self {
         let now = Instant::now();
         Self { base: now, last_synced_timestamp: now, refresh_interval: Duration::ZERO }
     }
 
+    /// Compute the wait until the next refresh-aligned frame.
     pub fn compute_timeout(&mut self, refresh_interval: Duration) -> Duration {
         let now = Instant::now();
 

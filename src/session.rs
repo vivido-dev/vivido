@@ -53,6 +53,7 @@ pub fn publish_instance_name(name: &str) {
 /// Call before any thread is started. Removing an environment variable is not thread-safe.
 pub unsafe fn scrub_inherited_mesh_environment() {
     for key in ["AGENT_MESH_RUNTIME", "AGENT_MESH_INSTANCE", "AGENT_MESH_ADDRESS"] {
+        // SAFETY: the caller guarantees single-threaded startup and no concurrent environment readers.
         unsafe { std::env::remove_var(key) };
     }
 }
@@ -126,7 +127,9 @@ const MAX_SESSION_NAME: usize = 64;
 /// Filesystem names for one session.
 #[derive(Debug, Clone)]
 pub struct SessionPaths {
+    /// Local automation endpoint path.
     pub socket: PathBuf,
+    /// Session registry file path.
     pub registry: PathBuf,
     endpoint_id: String,
 }
@@ -144,18 +147,30 @@ pub enum ProcessBirth {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SessionRegistry {
+    /// Document schema version.
     pub schema: u32,
+    /// Name identifying this item.
     pub name: String,
+    /// Owning process identifier.
     pub pid: u32,
+    /// Nonce distinguishing successive processes that reuse a PID.
     pub instance_nonce: String,
+    /// Vivido application version.
     pub vivido_version: String,
+    /// Local automation protocol version.
     pub protocol_version: u16,
+    /// Stable automation endpoint identity.
     pub endpoint_id: String,
+    /// Operating-system process birth identity used to detect PID reuse.
     pub process_birth: ProcessBirth,
+    /// Local automation endpoint path.
     pub socket: PathBuf,
     #[serde(default = "default_headless_registry")]
+    /// Whether this session has no native terminal window.
     pub headless: bool,
+    /// Number of terminal columns.
     pub columns: u16,
+    /// Number of terminal lines.
     pub lines: u16,
 }
 
@@ -164,11 +179,20 @@ fn default_headless_registry() -> bool {
 }
 
 impl SessionPaths {
+    /// Validate a session name and derive its owner-scoped endpoint paths.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if the session name or owner runtime directory is invalid.
     pub fn for_session(name: &str) -> io::Result<Self> {
         Self::for_session_in_root(name, &runtime_root()?)
     }
 
     /// Build registry paths for a process whose IPC endpoint was explicitly selected.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if the session name or endpoint location is invalid.
     pub fn for_endpoint(name: &str, socket: PathBuf) -> io::Result<Self> {
         Self::for_endpoint_in_root(name, &runtime_root()?, socket)
     }
@@ -203,6 +227,10 @@ impl SessionPaths {
     }
 
     /// Publish rendezvous once the IPC socket is bound.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if registry validation, serialization, or atomic file publication fails.
     pub fn write_registry(
         &self,
         name: &str,
@@ -234,6 +262,10 @@ impl SessionPaths {
     ///
     /// The endpoint listener must already be bound before this is called. Dropping the returned
     /// guard removes only registry/socket state which still belongs to this exact process.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if session registry validation or publication fails.
     pub fn register(
         self,
         name: &str,
@@ -246,6 +278,11 @@ impl SessionPaths {
         Ok(RegistryGuard::new(self, registry))
     }
 
+    /// Read and validate this session's registry metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error for a missing, unreadable, malformed, or mismatched registry file.
     pub fn read_registry(&self) -> io::Result<SessionRegistry> {
         let registry = read_registry_file(&self.registry)?;
         self.validate_identity(&registry)?;
@@ -253,6 +290,10 @@ impl SessionPaths {
     }
 
     /// Reserve this session's names, reaping only a proven-stale prior instance.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if the endpoint is live, unsafe to replace, or cannot be prepared.
     pub fn prepare_endpoint(&self, name: &str) -> io::Result<()> {
         match self.read_registry() {
             Ok(registry) if registry_process_matches(&registry) => {
@@ -323,6 +364,10 @@ impl SessionPaths {
     }
 
     /// Remove artifacts only if the registry still records the exact expected daemon instance.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if registry verification or removal fails.
     pub fn remove_instance(&self, expected: &SessionRegistry) -> io::Result<bool> {
         let actual = match self.read_registry() {
             Ok(actual) => actual,
@@ -361,6 +406,7 @@ pub struct RegistryGuard {
 }
 
 impl RegistryGuard {
+    /// Own registry cleanup for this process instance.
     pub fn new(paths: SessionPaths, registry: SessionRegistry) -> Self {
         Self { paths, registry }
     }
@@ -389,6 +435,10 @@ pub fn validate_session_name(name: &str) -> io::Result<()> {
 }
 
 /// Every live session, reaping registries whose process is gone.
+///
+/// # Errors
+///
+/// Returns an I/O error if the owner runtime directory cannot be enumerated.
 pub fn list_registries() -> io::Result<Vec<SessionRegistry>> {
     list_registries_in_root(&runtime_root()?)
 }
@@ -446,6 +496,11 @@ pub fn registered_instance(name: &str) -> io::Result<SessionRegistry> {
     Ok(registry)
 }
 
+/// Print live session metadata as the command-line user interface.
+///
+/// # Errors
+///
+/// Returns an I/O error if session discovery or output fails.
 pub fn print_sessions() -> io::Result<()> {
     for session in list_registries()?.into_iter().filter(|session| session.headless) {
         println!(
@@ -461,6 +516,10 @@ pub fn print_sessions() -> io::Result<()> {
 }
 
 /// Ask a session's daemon to shut down, refusing to signal a recycled PID.
+///
+/// # Errors
+///
+/// Returns an I/O error if the session cannot be found, verified, or signaled.
 pub fn terminate_session(name: &str) -> io::Result<()> {
     let registry = registered_instance(name).map_err(|error| {
         if error.kind() == io::ErrorKind::NotFound {
@@ -488,6 +547,7 @@ pub fn terminate_session(name: &str) -> io::Result<()> {
 fn signal_session(paths: &SessionPaths, registry: &SessionRegistry) -> io::Result<()> {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
+    // SAFETY: The syscall arguments are scalar IDs or a live owned pidfd; the null siginfo requests the documented default.
     let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, registry.pid, 0) };
     if fd < 0 {
         let error = io::Error::last_os_error();
@@ -509,6 +569,7 @@ fn signal_session(paths: &SessionPaths, registry: &SessionRegistry) -> io::Resul
         ));
     }
 
+    // SAFETY: The syscall arguments are scalar IDs or a live owned pidfd; the null siginfo requests the documented default.
     let result = unsafe {
         libc::syscall(
             libc::SYS_pidfd_send_signal,
@@ -534,6 +595,7 @@ fn signal_session(paths: &SessionPaths, registry: &SessionRegistry) -> io::Resul
         ));
     }
 
+    // SAFETY: kill accepts the validated scalar PID and signal without accessing Rust memory.
     let result = unsafe { libc::kill(registry.pid as libc::pid_t, libc::SIGTERM) };
     if result < 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
 }
@@ -559,6 +621,7 @@ fn signal_session(paths: &SessionPaths, registry: &SessionRegistry) -> io::Resul
     }
 
     // This forceful path cannot run RegistryGuard; the next registry listing reaps its artifact.
+    // SAFETY: The process handle was successfully opened with termination rights and remains live until the call returns.
     if unsafe { TerminateProcess(process.raw(), 1) } == 0 {
         Err(io::Error::last_os_error())
     } else {
@@ -748,6 +811,7 @@ fn process_birth_from_handle(
     let mut exit = creation;
     let mut kernel = creation;
     let mut user = creation;
+    // SAFETY: The process handle is live and all four FILETIME outputs are initialized writable locals.
     if unsafe { GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) } == 0 {
         return Err(io::Error::last_os_error());
     }
@@ -764,6 +828,7 @@ impl WindowsProcessHandle {
     fn open(pid: u32, access: u32) -> io::Result<Self> {
         use windows_sys::Win32::System::Threading::OpenProcess;
 
+        // SAFETY: Only scalar access flags and a PID are supplied; the returned handle is checked before use.
         let handle = unsafe { OpenProcess(access, 0, pid) };
         if handle.is_null() { Err(io::Error::last_os_error()) } else { Ok(Self(handle)) }
     }
@@ -776,6 +841,7 @@ impl WindowsProcessHandle {
 #[cfg(windows)]
 impl Drop for WindowsProcessHandle {
     fn drop(&mut self) {
+        // SAFETY: This scope owns the checked native handle and releases it exactly once after its final use.
         unsafe { windows_sys::Win32::Foundation::CloseHandle(self.0) };
     }
 }
@@ -874,6 +940,7 @@ fn ensure_private_directory(path: &Path, _uid: u32) -> io::Result<()> {
 
 #[cfg(unix)]
 fn effective_uid() -> u32 {
+    // SAFETY: geteuid has no arguments or memory effects requiring a Rust lifetime.
     unsafe { libc::geteuid() }
 }
 
@@ -904,6 +971,13 @@ fn hex(bytes: &[u8]) -> String {
 fn is_lower_hex(value: &str, expected_length: usize) -> bool {
     value.len() == expected_length
         && value.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+// Debug omits user content and native resources, and never acquires application locks.
+impl std::fmt::Debug for RegistryGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RegistryGuard").finish_non_exhaustive()
+    }
 }
 
 #[cfg(test)]

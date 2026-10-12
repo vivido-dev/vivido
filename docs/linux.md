@@ -4,7 +4,7 @@ Vivido does not currently provide a Linux package or installer. Install the exec
 Cargo, then install the system integration files from the source checkout. Keep that checkout until
 the post-installation steps are complete.
 
-Vivido requires Rust 1.88 or newer, a Wayland session, FFmpeg development libraries, ALSA
+Vivido requires Rust 1.95 or newer, a Wayland session, FFmpeg development libraries, ALSA
 development libraries, and a Vulkan-capable driver. It has no supported X11 fallback.
 
 ## 1. Install build and runtime dependencies
@@ -25,7 +25,7 @@ Use the equivalent packages on other distributions (`ncurses` rather than `ncurs
 where appropriate. `scdoc` is needed only to build the optional manual pages.
 
 Install Rust with [rustup](https://rustup.rs/) if the distribution's Rust compiler is older than
-1.88, then confirm that Cargo is available:
+1.95, then confirm that Cargo is available:
 
 ```sh
 rustc --version

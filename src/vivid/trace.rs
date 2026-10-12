@@ -34,10 +34,10 @@ pub struct TraceTrackIdentity {
 impl From<TrackIdentity> for TraceTrackIdentity {
     fn from(identity: TrackIdentity) -> Self {
         Self {
-            session_id: identity.surface.context.session.session_id,
-            context_id: identity.surface.context.context_id,
-            surface_id: identity.surface.surface_id,
-            track_id: identity.track_id,
+            session_id: identity.surface().context().session().session_id(),
+            context_id: identity.surface().context().context_id(),
+            surface_id: identity.surface().surface_id(),
+            track_id: identity.track_id(),
         }
     }
 }

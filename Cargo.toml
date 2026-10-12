@@ -1,6 +1,6 @@
 [package]
 name = "vivido"
-version = "0.5.0"
+version = "0.5.4"
 authors = ["Wensheng Wang <wenshengwang@gmail.com>"]
 license = "Apache-2.0"
 description = "A fast cross-platform terminal emulator with protocol-neutral media hooks"
@@ -8,7 +8,7 @@ readme = "README.md"
 homepage = "https://vivido.dev"
 repository = "https://github.com/vivido-dev/vivido"
 edition = "2024"
-rust-version = "1.88.0"
+rust-version = "1.95.0"
 links = "vivido_runtime"
 exclude = ["src/terminal/ref_tests.rs", "tests/ref"]
 
@@ -32,9 +32,17 @@ harness = false
 name = "macos_panes"
 harness = false
 
+[[test]]
+name = "macos_background_panes"
+harness = false
+
+[[test]]
+name = "macos_output_frames"
+harness = false
+
 [dependencies]
 ahash = { version = "0.8", features = ["no-rng"] }
-hashbrown = { version = "0.15", default-features = false }
+hashbrown = { version = "0.17", default-features = false }
 arboard = { version = "3.6", default-features = false, features = [
   "image-data",
 ] }
@@ -43,6 +51,7 @@ base64 = "0.23.0"
 bitflags = { version = "2.13", features = ["serde"] }
 bytemuck = { version = "1.25", features = ["derive"] }
 clap = { version = "4.6", features = ["derive", "env"] }
+flate2 = "1.1"
 copypasta = { version = "0.10", default-features = false }
 futures-lite = "2.6.1"
 futures-timer = "3.0.4"
@@ -54,7 +63,7 @@ image = { version = "0.25", default-features = false, features = [
   "jpeg",
 ] }
 libc = "0.2"
-log = { version = "0.4", features = ["std", "serde"] }
+log = { version = "0.4", features = ["std", "serde", "kv"] }
 memchr = "2.8"
 percent-encoding = "2.3"
 notify = "8.2"
@@ -72,24 +81,24 @@ sha2 = "0.11"
 signal-hook = { version = "0.4", default-features = false }
 tempfile = "3.27"
 toml = "1.1"
-toml_edit = "0.25"
 ureq = { version = "3.4", default-features = false, features = ["rustls"] }
 unicode-width = "0.2"
 unicode-script = "0.5"
 unicode-segmentation = "1.12"
-vivid_protocol = { version = "1.5.9", path = "../vivid_protocol" }
+vivid_protocol = { version = "1.5", path = "../vivid_protocol" }
 vvte = { version = "0.15", path = "../vvte", default-features = false, features = [
   "std",
   "ansi",
   "serde",
 ] }
 zeroize = "1.8.1"
-vivid_sdk = { version = "1.5.8", path = "../vivid_sdk" }
-vello = { version = "0.10", default-features = false, features = ["wgpu"] }
+vivid_sdk = { version = "1.5", path = "../vivid_sdk" }
+vello = { version = "0.11", default-features = false, features = ["wgpu"] }
 winit = { version = "0.30", default-features = false, features = [
   "rwh_06",
   "serde",
 ] }
+mimalloc = { version = "0.1", default-features = false }
 
 [build-dependencies]
 pkg-config = "0.3"
@@ -136,6 +145,7 @@ objc2-foundation = { version = "0.3.1", default-features = false, features = [
   "std",
   "NSString",
   "NSLocale",
+  "NSProcessInfo",
   "NSValue",
   "NSUserDefaults",
 ] }
@@ -153,6 +163,7 @@ objc2-app-kit = { version = "0.3.1", default-features = false, features = [
   "NSColor",
   "NSColorSpace",
   "NSControl",
+  "NSDockTile",
   "NSEvent",
   "NSGraphics",
   "NSLayoutAnchor",
@@ -166,18 +177,19 @@ objc2-app-kit = { version = "0.3.1", default-features = false, features = [
   "NSWindowTab",
   "NSWorkspace",
 ] }
-wgpu = { version = "29.0", default-features = false, features = [
+wgpu = { version = "30.0", default-features = false, features = [
   "metal",
   "std",
   "wgsl",
 ] }
 
 [target.'cfg(windows)'.dependencies]
+libloading = "0.8.9"
 accesskit = "0.25"
 accesskit_winit = { version = "0.34", default-features = false, features = [
   "rwh_06",
 ] }
-dirs = "6.0.0"
+dirs = "7.0.0"
 miow = "0.6.0"
 piper = "0.2.1"
 windows-sys = { version = "0.61.2", features = [
@@ -201,12 +213,14 @@ windows-sys = { version = "0.61.2", features = [
 windows = { version = "0.62.2", default-features = false, features = [
   "Win32_Foundation",
   "Win32_Graphics_DirectComposition",
+  "Win32_System_Com",
+  "Win32_UI_Shell",
   "Win32_Security_Cryptography",
   "Win32_Security_Cryptography_Catalog",
   "Win32_Security_Cryptography_Sip",
   "Win32_Security_WinTrust",
 ] }
-wgpu = { version = "29.0", default-features = false, features = [
+wgpu = { version = "30.0", default-features = false, features = [
   "dx12",
   "std",
   "wgsl",
@@ -219,7 +233,7 @@ accesskit_winit = { version = "0.34", default-features = false, features = [
   "async-io",
   "rwh_06",
 ] }
-wgpu = { version = "29.0", default-features = false, features = [
+wgpu = { version = "30.0", default-features = false, features = [
   "std",
   "vulkan",
   "wgsl",
@@ -229,7 +243,10 @@ wgpu = { version = "29.0", default-features = false, features = [
 embed-resource = "3.0.2"
 
 [features]
+# Deterministic service controls for embedding tests; never enabled by default.
+test-util = []
 default = ["serde", "wayland", "x11"]
+# Kept as a feature spelling; serialization is required by the always-available config API.
 serde = []
 # Winit picks its backend at runtime: Wayland when WAYLAND_DISPLAY is set, X11 otherwise.
 x11 = ["winit/x11"]
@@ -240,7 +257,6 @@ wayland = [
   "winit/wayland-dlopen",
   "winit/wayland-csd-adwaita",
 ]
-nightly = []
 # Reads Vello's bump allocators back after every frame and records the high-water mark, which is
 # the only way to learn what a terminal scene actually costs: Vello sizes those buffers from
 # constants and reports an overrun by setting a flag nobody reads. Drives the ignored
@@ -262,3 +278,21 @@ codegen-units = 1
 
 [profile.dev]
 debug = "line-tables-only"
+
+[lints.rust]
+ambiguous_negative_literals = "warn"
+missing_debug_implementations = "warn"
+redundant_imports = "warn"
+redundant_lifetimes = "warn"
+trivial_numeric_casts = "warn"
+unsafe_op_in_unsafe_fn = "deny"
+unused_lifetimes = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+allow_attributes_without_reason = "deny"
+undocumented_unsafe_blocks = "deny"
+
+[package.metadata.cargo-udeps.ignore]
+# Completion generation tests are compiled only on Linux; the dependency is used there.
+development = ["clap_complete"]

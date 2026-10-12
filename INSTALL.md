@@ -47,10 +47,10 @@ and Intel Rust targets are installed.
 Vivido first reads `%USERPROFILE%\.config\vivido\vivido.toml`. The signed Windows suite installer
 writes its default to `%USERPROFILE%\vivido\vivido.toml` when no dot-config file exists.
 The consumer EXE also installs PowerShell 7 LTS when absent and provisions WSL with Ubuntu; the
-standalone MSI is intended for managed systems where those prerequisites already exist. See
-[`windows/README.md`](windows/README.md) for signing, packaging, silent-install, and release steps.
-See [`windows/LOCAL-TESTING.md`](windows/LOCAL-TESTING.md) for a complete local Windows build and
-installation-verification procedure. See [Using Vivido on Windows](docs/windows.md) for the
+standalone MSI is intended for managed systems where those prerequisites already exist. The
+installers are built, signed, and released from the parent repository's `installer/` directory;
+[`windows/README.md`](windows/README.md) describes the Windows resources kept here. See
+[Using Vivido on Windows](docs/windows.md) for the
 PowerShell and WSL shortcuts, installing the `vivido` terminfo entry inside WSL, and other
 Windows-specific notes.
 

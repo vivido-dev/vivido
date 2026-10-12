@@ -6,7 +6,6 @@ use std::sync::Arc;
 use crate::client_fault::ClientFault;
 use crate::osc_notification::OscNotification;
 use crate::terminal::event_loop::EventLoopSendError;
-use crate::terminal::graphics::GraphicsCommand;
 use crate::terminal::term::ClipboardType;
 use crate::terminal::vvte::ansi::Rgb;
 
@@ -30,6 +29,9 @@ pub enum Event {
 
     /// Shell-lifecycle marker reported with OSC 133.
     ShellIntegration(crate::osc_notification::ShellIntegrationMarker),
+
+    /// Progress state reported with OSC 9;4.
+    Progress(crate::osc_notification::ProgressReport),
 
     /// Request to store a text string in the clipboard.
     ClipboardStore(ClipboardType, String),
@@ -60,7 +62,12 @@ pub enum Event {
 
     /// Sanitized PTY bytes were retained at this absolute transcript range.
     #[cfg(any(unix, windows))]
-    PtyOutput { start: u64, end: u64 },
+    PtyOutput {
+        /// Start of this range.
+        start: u64,
+        /// End of this range.
+        end: u64,
+    },
 
     /// A tagged IPC input buffer was completely written to the PTY master.
     #[cfg(any(unix, windows))]
@@ -86,20 +93,38 @@ pub enum Event {
     /// A bounded OSC 9 or OSC 99 desktop-notification request.
     DesktopNotification(OscNotification),
 
-    /// Protocol-neutral image, animation, or video operation.
-    Graphics(GraphicsCommand),
-
     /// Authenticated Vivid marker observed at a terminal text position.
-    VividMarker { marker: String, line: i32, column: usize, alternate: bool },
+    VividMarker {
+        /// Authenticated Vivid anchor marker.
+        marker: String,
+        /// Grid line coordinate.
+        line: i32,
+        /// Grid column coordinate.
+        column: usize,
+        /// Whether the alternate screen is active.
+        alternate: bool,
+    },
 
     /// Text-model rows moved within a terminal scroll region. Positive values move text upward.
-    VividGridScroll { origin: i32, end: i32, lines: i32, history_size: usize },
+    VividGridScroll {
+        /// Physical-pixel placement origin.
+        origin: i32,
+        /// End of this range.
+        end: i32,
+        /// Number of terminal lines.
+        lines: i32,
+        /// Number of available scrollback lines.
+        history_size: usize,
+    },
 
     /// The live terminal viewport was cleared.
     VividClear,
 
     /// The terminal switched between the primary and alternate screens.
-    VividScreenSwap { alternate: bool },
+    VividScreenSwap {
+        /// Whether the alternate screen is active.
+        alternate: bool,
+    },
 
     /// Shutdown request.
     Exit,
@@ -119,6 +144,7 @@ impl Debug for Event {
             Event::Title(title) => write!(f, "Title({title})"),
             Event::WorkingDirectory(path) => write!(f, "WorkingDirectory({path})"),
             Event::ShellIntegration(marker) => write!(f, "ShellIntegration({marker:?})"),
+            Event::Progress(report) => write!(f, "Progress({report:?})"),
             Event::CursorBlinkingChange => write!(f, "CursorBlinkingChange"),
             Event::MouseCursorDirty => write!(f, "MouseCursorDirty"),
             Event::ResetTitle => write!(f, "ResetTitle"),
@@ -141,7 +167,6 @@ impl Debug for Event {
             Event::RecoveryPrompt => write!(f, "RecoveryPrompt"),
             Event::Bell => write!(f, "Bell"),
             Event::DesktopNotification(_) => write!(f, "DesktopNotification"),
-            Event::Graphics(command) => write!(f, "Graphics({command:?})"),
             Event::VividMarker { marker, line, column, alternate } => {
                 write!(f, "VividMarker({marker:?}, {line}, {column}, alternate={alternate})")
             },
@@ -165,28 +190,40 @@ pub trait Notify {
     /// Fails when the response cannot be delivered, e.g. because the PTY event loop has
     /// already shut down. Callers log and continue; a failed response must not disrupt the
     /// event processing that triggered it.
+    ///
+    /// # Errors
+    ///
+    /// Returns `EventLoopSendError` after the PTY worker command channel closes.
     fn notify<B: Into<Cow<'static, [u8]>>>(&self, _: B) -> Result<(), EventLoopSendError>;
 }
 
 #[derive(Copy, Clone, Debug)]
+/// Terminal grid dimensions and physical-pixel cell dimensions.
 pub struct WindowSize {
+    /// Number of visible terminal lines.
     pub num_lines: u16,
+    /// Number of terminal columns.
     pub num_cols: u16,
+    /// Physical-pixel width of one terminal cell.
     pub cell_width: u16,
+    /// Physical-pixel height of one terminal cell.
     pub cell_height: u16,
 }
 
 /// Types that are interested in when the display is resized.
 pub trait OnResize {
+    /// Apply updated terminal grid and cell dimensions.
     fn on_resize(&mut self, window_size: WindowSize);
 }
 
 /// Event Loop for notifying the renderer about terminal events.
 pub trait EventListener {
+    /// Forward an event to the owning host loop.
     fn send_event(&self, _event: Event) {}
 }
 
 /// Null sink for events.
+#[derive(Debug)]
 pub struct VoidListener;
 
 impl EventListener for VoidListener {}

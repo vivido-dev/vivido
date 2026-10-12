@@ -56,14 +56,20 @@ pub fn cwd(pid: c_int) -> Result<PathBuf, Error> {
     let info_ptr = info.as_mut_ptr() as *mut c_void;
     let size = mem::size_of::<sys::proc_vnodepathinfo>() as c_int;
 
-    let c_str = unsafe {
-        let pidinfo_size = sys::proc_pidinfo(pid, sys::PROC_PIDVNODEPATHINFO, 0, info_ptr, size);
-        match pidinfo_size {
-            c if c < 0 => return Err(io::Error::last_os_error().into()),
-            s if s != size => return Err(Error::InvalidSize),
-            _ => CStr::from_ptr(info.assume_init().pvi_cdir.vip_path.as_ptr()),
-        }
-    };
+    // SAFETY: proc_pidinfo writes at most `size` bytes to this correctly aligned local buffer.
+    let pidinfo_size =
+        unsafe { sys::proc_pidinfo(pid, sys::PROC_PIDVNODEPATHINFO, 0, info_ptr, size) };
+    match pidinfo_size {
+        c if c < 0 => return Err(io::Error::last_os_error().into()),
+        s if s != size => return Err(Error::InvalidSize),
+        _ => (),
+    }
+    // SAFETY: the exact-size successful result initialized all fields; keep the owner alive.
+    let info = unsafe { info.assume_init() };
+    let bytes = info.pvi_cdir.vip_path.map(|byte| byte as u8);
+    let c_str = CStr::from_bytes_until_nul(&bytes).map_err(|_| {
+        io::Error::new(io::ErrorKind::InvalidData, "process path lacks a terminator")
+    })?;
 
     Ok(CString::from(c_str).into_string().map(PathBuf::from)?)
 }
@@ -73,6 +79,7 @@ pub fn start_time_micros(pid: c_int) -> io::Result<u64> {
     let mut info = MaybeUninit::<sys::proc_bsdinfo>::uninit();
     let size = mem::size_of::<sys::proc_bsdinfo>() as c_int;
     let result =
+        // SAFETY: proc_pidinfo receives a correctly aligned writable buffer of its exact size; initialization is checked before reading.
         unsafe { sys::proc_pidinfo(pid, sys::PROC_PIDTBSDINFO, 0, info.as_mut_ptr().cast(), size) };
     if result != size {
         return if result <= 0 {
@@ -90,7 +97,7 @@ pub fn start_time_micros(pid: c_int) -> io::Result<u64> {
 }
 
 /// Bindings for libproc.
-#[allow(non_camel_case_types)]
+#[expect(non_camel_case_types, reason = "the name matches the native proc_info ABI typedef")]
 mod sys {
     use std::os::raw::{c_char, c_int, c_longlong, c_void};
 

@@ -1,5 +1,3 @@
-#![allow(clippy::enum_glob_use)]
-
 use std::fmt::{self, Debug, Display};
 
 use bitflags::bitflags;
@@ -47,6 +45,7 @@ pub type MouseBinding = Binding<MouseEvent>;
 
 impl<T: Eq> Binding<T> {
     #[inline]
+    /// Whether this input, modifier set, and mode activate the binding.
     pub fn is_triggered_by(&self, mode: BindingMode, mods: ModifiersState, input: &T) -> bool {
         // Check input first since bindings are stored in one big list. This is
         // the most likely item to fail so prioritizing it here allows more
@@ -58,6 +57,7 @@ impl<T: Eq> Binding<T> {
     }
 
     #[inline]
+    /// Whether two bindings overlap in trigger, modifier, and mode requirements.
     pub fn triggers_match(&self, binding: &Binding<T>) -> bool {
         // Check the binding's key and modifiers.
         if self.trigger != binding.trigger || self.mods != binding.mods {
@@ -82,6 +82,7 @@ impl<T: Eq> Binding<T> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// An action invoked by a configured keyboard or mouse binding.
 pub enum Action {
     /// Enable or mute the selected remote microphone.
     ToggleMicrophone,
@@ -150,7 +151,7 @@ pub enum Action {
     /// Scroll all the way to the bottom.
     ScrollToBottom,
 
-    /// Clear the display buffer(s) to remove history.
+    /// Clear scrollback and the viewport, keeping the current input line at the top.
     ClearHistory,
 
     /// Hide the Vivido window.
@@ -234,6 +235,9 @@ pub enum Action {
     /// Start a backward buffer search.
     SearchBackward,
 
+    /// Open or close the command palette.
+    ToggleCommandPalette,
+
     /// No action.
     None,
 }
@@ -258,7 +262,6 @@ impl Display for Action {
 }
 
 /// Search mode specific actions.
-#[allow(clippy::enum_variant_names)]
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum SearchAction {
     /// Move the focus to the next search match.
@@ -282,8 +285,11 @@ pub enum SearchAction {
 /// Mouse binding specific events.
 #[derive(Debug, Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
 pub enum MouseEvent {
+    /// A physical mouse button.
     Button(MouseButton),
+    /// An upward mouse-wheel step.
     WheelUp,
+    /// A downward mouse-wheel step.
     WheelDown,
 }
 
@@ -334,7 +340,10 @@ macro_rules! trigger {
 
 pub fn default_mouse_bindings() -> Vec<MouseBinding> {
     // Extended only by the Windows-specific bindings below.
-    #[cfg_attr(not(target_os = "windows"), allow(unused_mut))]
+    #[cfg_attr(
+        not(target_os = "windows"),
+        allow(unused_mut, reason = "Windows adds platform-specific default bindings")
+    )]
     let mut bindings = bindings!(
         MouseBinding;
         MouseButton::Middle; Action::PasteSelection;
@@ -363,6 +372,7 @@ pub fn default_key_bindings() -> Vec<KeyBinding> {
         "m", ModifiersState::CONTROL | ModifiersState::SHIFT; Action::ToggleMicrophone;
         "n", ModifiersState::CONTROL | ModifiersState::SHIFT; Action::NextMicrophone;
         Paste; Action::Paste;
+        "k",       ModifiersState::SUPER, ~BindingMode::SEARCH; Action::ClearHistory;
         "l",       ModifiersState::CONTROL; Action::ClearLogNotice;
         "l",       ModifiersState::CONTROL; Action::ReceiveChar;
         Home,      ModifiersState::SHIFT, ~BindingMode::ALT_SCREEN; Action::ScrollToTop;
@@ -416,6 +426,7 @@ fn common_keybindings() -> Vec<KeyBinding> {
         "b",    ModifiersState::CONTROL | ModifiersState::SHIFT, ~BindingMode::SEARCH;                   Action::SearchBackward;
         "t",    ModifiersState::CONTROL | ModifiersState::SHIFT;                                         Action::CreateNewTab;
         "u",    ModifiersState::CONTROL | ModifiersState::SHIFT;                                         Action::CheckForUpdates;
+        "p",    ModifiersState::CONTROL | ModifiersState::SHIFT;                                         Action::ToggleCommandPalette;
         "w",    ModifiersState::CONTROL | ModifiersState::SHIFT;                                         Action::Quit;
         Tab,    ModifiersState::CONTROL;                                                                  Action::SelectNextTab;
         Tab,    ModifiersState::CONTROL | ModifiersState::SHIFT;                                          Action::SelectPreviousTab;
@@ -489,8 +500,6 @@ fn macos_keybindings() -> Vec<KeyBinding> {
         "=",    ModifiersState::SUPER;                                         Action::IncreaseFontSize;
         "+",    ModifiersState::SUPER;                                         Action::IncreaseFontSize;
         "-",    ModifiersState::SUPER;                                         Action::DecreaseFontSize;
-        "k",    ModifiersState::SUPER, ~BindingMode::SEARCH; Action::Esc("\x0c".into());
-        "k",    ModifiersState::SUPER, ~BindingMode::SEARCH; Action::ClearHistory;
         "v",    ModifiersState::SUPER;                                         Action::Paste;
         "n",    ModifiersState::SUPER;                                         Action::CreateNewWindow;
         "f",    ModifiersState::CONTROL | ModifiersState::SUPER;               Action::ToggleFullscreen;
@@ -502,6 +511,7 @@ fn macos_keybindings() -> Vec<KeyBinding> {
         "w",    ModifiersState::SUPER;                                         Action::Quit;
         "f",    ModifiersState::SUPER, ~BindingMode::SEARCH;                   Action::SearchForward;
         "b",    ModifiersState::SUPER, ~BindingMode::SEARCH;                   Action::SearchBackward;
+        "p",    ModifiersState::SUPER | ModifiersState::SHIFT;                 Action::ToggleCommandPalette;
         "+" => KeyLocation::Numpad, ModifiersState::SUPER;                     Action::IncreaseFontSize;
         "-" => KeyLocation::Numpad, ModifiersState::SUPER;                     Action::DecreaseFontSize;
     )
@@ -514,9 +524,17 @@ pub fn platform_key_bindings() -> Vec<KeyBinding> {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// A logical or physical key matched by an input binding.
 pub enum BindingKey {
+    /// A physical key position.
     Scancode(PhysicalKey),
-    Keycode { key: Key, location: KeyLocation },
+    /// A logical key with its keyboard location.
+    Keycode {
+        /// Key matched by this binding.
+        key: Key,
+        /// Physical location of the logical key.
+        location: KeyLocation,
+    },
 }
 
 /// Key location for matching bindings.
@@ -646,16 +664,23 @@ bitflags! {
     /// Modes available for key bindings.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
     pub struct BindingMode: u8 {
+        /// Use application cursor-key sequences.
         const APP_CURSOR             = 0b0000_0001;
+        /// Use application keypad sequences.
         const APP_KEYPAD             = 0b0000_0010;
+        /// Select the alternate terminal screen.
         const ALT_SCREEN             = 0b0000_0100;
+        /// Enable interactive search bindings.
         const SEARCH                 = 0b0001_0000;
+        /// Disambiguate escape-key sequences using the keyboard protocol.
         const DISAMBIGUATE_ESC_CODES = 0b0010_0000;
+        /// Encode every key through the extended keyboard protocol.
         const REPORT_ALL_KEYS_AS_ESC = 0b0100_0000;
     }
 }
 
 impl BindingMode {
+    /// Derive binding modes from terminal flags and interactive search state.
     pub fn new(mode: &TermMode, search: bool) -> BindingMode {
         let mut binding_mode = BindingMode::empty();
         binding_mode.set(BindingMode::APP_CURSOR, mode.contains(TermMode::APP_CURSOR));
@@ -1140,6 +1165,7 @@ impl_config_deserialize_enum!(Action {
     ReceiveChar,
     SearchForward,
     SearchBackward,
+    ToggleCommandPalette,
     None,
 });
 impl_config_deserialize_enum!(SearchAction {
@@ -1158,9 +1184,24 @@ impl_serde_replace!(ModsWrapper);
 mod tests {
     use super::*;
 
-    use winit::keyboard::ModifiersState;
-
     type MockBinding = Binding<usize>;
+
+    #[test]
+    fn super_k_only_clears_the_terminal_buffer() {
+        let key =
+            BindingKey::Keycode { key: Key::Character("k".into()), location: KeyLocation::Any };
+        let actions: Vec<_> = default_key_bindings()
+            .into_iter()
+            .filter(|binding| {
+                binding.is_triggered_by(BindingMode::empty(), ModifiersState::SUPER, &key)
+            })
+            .map(|binding| binding.action)
+            .collect();
+        assert_eq!(actions, [Action::ClearHistory]);
+        assert!(!macos_keybindings().iter().any(|binding| {
+            binding.is_triggered_by(BindingMode::empty(), ModifiersState::SUPER, &key)
+        }));
+    }
 
     impl Default for MockBinding {
         fn default() -> Self {
@@ -1466,6 +1507,22 @@ mod tests {
                 && binding.mods == ModifiersState::CONTROL | ModifiersState::SHIFT
                 && binding.action == Action::CheckForUpdates
         }));
+    }
+
+    #[test]
+    fn command_palette_defaults_to_shift_p_with_the_platform_modifier() {
+        let trigger =
+            BindingKey::Keycode { key: Key::Character("p".into()), location: KeyLocation::Any };
+        let bound = |bindings: Vec<KeyBinding>, mods: ModifiersState| {
+            bindings.iter().any(|binding| {
+                binding.trigger == trigger
+                    && binding.mods == mods
+                    && binding.action == Action::ToggleCommandPalette
+            })
+        };
+
+        assert!(bound(common_keybindings(), ModifiersState::CONTROL | ModifiersState::SHIFT));
+        assert!(bound(macos_keybindings(), ModifiersState::SUPER | ModifiersState::SHIFT));
     }
 
     #[test]

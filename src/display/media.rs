@@ -1,16 +1,15 @@
-//! WebGPU compositor for Vivid media and compatibility graphics commands.
+//! WebGPU compositor for Vivid media and Kitty graphics.
 
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use bytemuck::{Pod, Zeroable};
+use vello::Renderer;
 use vello::peniko::{ImageAlphaType, ImageData};
 use vello::wgpu::util::DeviceExt;
-use vello::{Renderer, wgpu};
-
-use crate::terminal::graphics::{DeleteTarget, GraphicsCommand, GraphicsProtocol};
 
 use crate::display::SizeInfo;
+use crate::display::kitty::{KittyFrame, Quad};
 use crate::vivid::scene::{
     MAX_RENDER_ITEMS, PresentationRejection, RenderItem, SharedScene, TrackKey,
 };
@@ -38,6 +37,14 @@ const TEXTURE_GRACE: Duration = Duration::from_secs(5);
 /// of RGBA8 — several 4K desktops, or every tab of a large `vvmux` layout — which is as much as a
 /// switch-away-and-back can plausibly need.
 const MAX_RETAINED_PIXELS: u64 = 32 * 1024 * 1024;
+
+/// Kitty image textures kept after their image stopped being drawn, for the next image to reuse.
+///
+/// A program that plays video through the Kitty protocol sends every frame as a new image of the
+/// same size. Handing the new frame the texture the previous one just gave up turns a texture
+/// allocation per frame into a plain upload. Two covers that case with one to spare; the pool
+/// holds nothing for a program that is not replacing images.
+const KITTY_TEXTURE_POOL: usize = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CaptureRedaction {
@@ -117,6 +124,29 @@ impl SourceTexture {
     }
 }
 
+/// Everything the media layers were last drawn from; unchanged means nothing to redraw.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct SnapshotKey {
+    /// Topology, content and capture revisions of the Vivid scene.
+    scene: (u64, u64, u64),
+    width: u32,
+    height: u32,
+    display_offset: usize,
+    /// Generation of the Kitty graphics frame.
+    kitty: u64,
+}
+
+/// GPU copy of one Kitty graphics image.
+struct ImageTexture {
+    texture: wgpu::Texture,
+    _options: wgpu::Buffer,
+    bind_group: wgpu::BindGroup,
+    width: u32,
+    height: u32,
+    /// Whether the shader premultiplies on sampling, which an opaque image does not need.
+    straight_alpha: bool,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SourceUploadMetrics {
     pub frames: u64,
@@ -144,7 +174,6 @@ struct MediaTarget {
 
 /// Vivid media renderer sharing Vello's wgpu device and queue.
 pub struct VividMediaRenderer {
-    reported_protocols: HashSet<GraphicsProtocol>,
     bind_group_layout: wgpu::BindGroupLayout,
     pipeline: wgpu::RenderPipeline,
     sampler: wgpu::Sampler,
@@ -156,12 +185,19 @@ pub struct VividMediaRenderer {
     scene: Option<SharedScene>,
     capture_redactions: Vec<CaptureRedaction>,
     source_upload_metrics: SourceUploadMetrics,
-    last_snapshot: Option<(u64, u64, u64, u32, u32, usize)>,
+    last_snapshot: Option<SnapshotKey>,
     image_generation: u64,
     rendered: Vec<(usize, [Vertex; 6])>,
     active_tracks: HashSet<TrackKey>,
     upload_tracks: HashSet<TrackKey>,
     vertex_data: Vec<Vertex>,
+    /// Textures of the Kitty images drawn last frame, by image identity.
+    kitty_textures: HashMap<u64, ImageTexture>,
+    kitty_pool: Vec<ImageTexture>,
+    /// Largest texture the device accepts; a larger image is skipped rather than failing a
+    /// validation that would take the window down.
+    max_texture_dimension: u32,
+    reported_oversized_image: bool,
 }
 
 impl VividMediaRenderer {
@@ -213,7 +249,7 @@ impl VividMediaRenderer {
                 module: &shader,
                 entry_point: Some("vs_main"),
                 compilation_options: Default::default(),
-                buffers: &[wgpu::VertexBufferLayout {
+                buffers: &[Some(wgpu::VertexBufferLayout {
                     array_stride: std::mem::size_of::<Vertex>() as u64,
                     step_mode: wgpu::VertexStepMode::Vertex,
                     attributes: &[
@@ -228,7 +264,7 @@ impl VividMediaRenderer {
                             shader_location: 1,
                         },
                     ],
-                }],
+                })],
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
@@ -254,7 +290,6 @@ impl VividMediaRenderer {
         });
         let vertex_buffer = create_vertex_buffer(device, INITIAL_QUADS);
         Self {
-            reported_protocols: HashSet::new(),
             bind_group_layout,
             pipeline,
             sampler,
@@ -272,6 +307,10 @@ impl VividMediaRenderer {
             active_tracks: HashSet::new(),
             upload_tracks: HashSet::new(),
             vertex_data: Vec::with_capacity(INITIAL_QUADS * 6),
+            kitty_textures: HashMap::new(),
+            kitty_pool: Vec::new(),
+            max_texture_dimension: device.limits().max_texture_dimension_2d,
+            reported_oversized_image: false,
         }
     }
 
@@ -279,23 +318,10 @@ impl VividMediaRenderer {
         self.scene = Some(scene);
     }
 
-    pub fn submit(&mut self, command: GraphicsCommand) {
-        match command {
-            GraphicsCommand::Transmit { protocol, .. }
-                if self.reported_protocols.insert(protocol.clone()) =>
-            {
-                log::warn!(
-                    "Compatibility graphics protocol {protocol:?} is recognized but not rendered; use Vivid"
-                );
-            },
-            GraphicsCommand::Delete(DeleteTarget::All) => self.clear_sources(),
-            _ => (),
-        }
-    }
-
     pub fn clear_sources(&mut self) {
-        self.reported_protocols.clear();
         self.tracks.clear();
+        self.kitty_textures.clear();
+        self.kitty_pool.clear();
     }
 
     /// Cumulative track-texture traffic for targeted-performance diagnostics.
@@ -319,23 +345,27 @@ impl VividMediaRenderer {
         renderer: &mut Renderer,
         size: &SizeInfo,
         display_offset: usize,
+        kitty: &KittyFrame,
     ) -> Option<PreparedMedia> {
-        let Some(scene) = self.scene.as_ref().cloned() else {
+        let scene = self.scene.as_ref().cloned();
+        let quads = kitty.quads();
+        if scene.is_none() && quads.is_empty() && self.targets.iter().all(Option::is_none) {
             self.capture_redactions.clear();
             return None;
-        };
-        let snapshot = scene.snapshot();
-        let items = &snapshot.items;
+        }
+        let snapshot = scene.as_ref().map(SharedScene::snapshot);
+        let items: &[RenderItem] = snapshot.as_ref().map_or(&[], |snapshot| &snapshot.items);
         let width = size.width() as u32;
         let height = size.height() as u32;
-        let snapshot_key = (
-            snapshot.topology_revision,
-            snapshot.content_revision,
-            snapshot.capture_revision,
+        let snapshot_key = SnapshotKey {
+            scene: snapshot.as_ref().map_or((0, 0, 0), |snapshot| {
+                (snapshot.topology_revision, snapshot.content_revision, snapshot.capture_revision)
+            }),
             width,
             height,
             display_offset,
-        );
+            kitty: kitty.generation(),
+        };
         if self.last_snapshot == Some(snapshot_key) {
             self.source_upload_metrics.skipped_passes =
                 self.source_upload_metrics.skipped_passes.saturating_add(1);
@@ -351,12 +381,14 @@ impl VividMediaRenderer {
         }
         // The target owns what a placement unit means: cells for a terminal, logical pixels for a
         // desktop. The renderer only needs the conversion.
-        let placement_scale = scene.target().placement_scale(size);
-        if items.is_empty() && self.targets.iter().all(Option::is_none) {
+        let placement_scale =
+            scene.as_ref().map_or((1., 1.), |scene| scene.target().placement_scale(size));
+        if items.is_empty() && quads.is_empty() && self.targets.iter().all(Option::is_none) {
             // An empty scene is usually a momentary one — everything hidden while a producer
             // redraws — so the textures are retained on the same terms as any other frame in which
             // a track does not render.
             self.retain_tracks(&HashSet::new(), Instant::now());
+            self.retain_kitty_textures(&[]);
             self.capture_redactions.clear();
             self.last_snapshot = Some(snapshot_key);
             self.source_upload_metrics.skipped_passes =
@@ -366,6 +398,7 @@ impl VividMediaRenderer {
         for layer in 0..3 {
             if self.targets[layer].is_some()
                 || items.iter().any(|item| item.text_layer == layer as u64)
+                || quads.iter().any(|quad| quad.layer == layer)
             {
                 self.ensure_target(device, renderer, width, height, layer);
             }
@@ -388,7 +421,8 @@ impl VividMediaRenderer {
             }
             self.rendered.truncate(MAX_RENDER_ITEMS);
         }
-        self.ensure_vertex_capacity(device, self.rendered.len());
+        // Kitty quads follow the scene's in the same buffer; the frame already capped their count.
+        self.ensure_vertex_capacity(device, self.rendered.len() + quads.len());
         self.capture_redactions.clear();
         self.capture_redactions.extend(
             self.rendered
@@ -411,13 +445,19 @@ impl VividMediaRenderer {
             let Some(item) = items.iter().find(|item| item.track_key == *key) else {
                 continue;
             };
-            debug_assert_eq!(item.track_key.surface, item.surface_key);
+            debug_assert_eq!(item.track_key.surface(), item.surface_key);
             self.upload_track(device, queue, item.track_key, item);
         }
         self.upload_tracks = upload_tracks;
+        // Retire first, so an image that replaced another of its size inherits that texture.
+        self.retain_kitty_textures(quads);
+        for quad in quads {
+            self.upload_kitty_image(device, queue, quad);
+        }
 
         self.vertex_data.clear();
         self.vertex_data.extend(self.rendered.iter().flat_map(|(_, vertices)| *vertices));
+        self.vertex_data.extend(quads.iter().flat_map(|quad| quad_vertices(quad, size)));
         if !self.vertex_data.is_empty() {
             queue.write_buffer(&self.vertex_buffer, 0, bytemuck::cast_slice(&self.vertex_data));
         }
@@ -456,30 +496,43 @@ impl VividMediaRenderer {
                     pass.draw(start..start + 6, 0..1);
                 }
             }
+            // Kitty images go over Vivid media of the same layer; the frame sorted them by z.
+            for (index, quad) in quads.iter().enumerate() {
+                if quad.layer != layer {
+                    continue;
+                }
+                if let Some(texture) = self.kitty_textures.get(&quad.uid) {
+                    pass.set_bind_group(0, &texture.bind_group, &[]);
+                    let start = ((self.rendered.len() + index) * 6) as u32;
+                    pass.draw(start..start + 6, 0..1);
+                }
+            }
         }
         queue.submit([encoder.finish()]);
         self.source_upload_metrics.media_passes =
             self.source_upload_metrics.media_passes.saturating_add(1);
-        for (item_index, _) in &self.rendered {
-            let item = &items[*item_index];
-            match scene.mark_presented(
-                item.track_key,
-                item.channel_generation,
-                item.surface_generation,
-                item.frame.frame_id,
-                item.frame.pts_us,
-            ) {
-                Ok(()) => {},
-                // Every resize supersedes frames already in flight. Reporting that as a presenter
-                // problem puts a warning on screen for ordinary window movement.
-                Err(error @ PresentationRejection::Superseded(_)) => log::debug!(
-                    "Vivid presentation for track {:?} was superseded: {error}",
-                    item.track_key
-                ),
-                Err(error @ PresentationRejection::Failed(_)) => log::warn!(
-                    "Could not record Vivid presentation for track {:?}: {error}",
-                    item.track_key
-                ),
+        if let Some(scene) = &scene {
+            for (item_index, _) in &self.rendered {
+                let item = &items[*item_index];
+                match scene.mark_presented(
+                    item.track_key,
+                    item.channel_generation,
+                    item.surface_generation,
+                    item.frame.frame_id,
+                    item.frame.pts_us,
+                ) {
+                    Ok(()) => {},
+                    // Every resize supersedes frames already in flight. Reporting that as a
+                    // presenter problem puts a warning on screen for ordinary window movement.
+                    Err(error @ PresentationRejection::Superseded(_)) => log::debug!(
+                        "Vivid presentation for track {:?} was superseded: {error}",
+                        item.track_key
+                    ),
+                    Err(error @ PresentationRejection::Failed(_)) => log::warn!(
+                        "Could not record Vivid presentation for track {:?}: {error}",
+                        item.track_key
+                    ),
+                }
             }
         }
         for target in self.targets.iter().flatten() {
@@ -492,6 +545,169 @@ impl VividMediaRenderer {
             image_generation: self.image_generation,
             changed: true,
         })
+    }
+
+    /// Drop the textures of Kitty images that `quads` no longer draws, pooling a few for reuse.
+    fn retain_kitty_textures(&mut self, quads: &[Quad]) {
+        if self.kitty_textures.is_empty() {
+            return;
+        }
+        let retired: Vec<u64> = self
+            .kitty_textures
+            .keys()
+            .filter(|uid| !quads.iter().any(|quad| quad.uid == **uid))
+            .copied()
+            .collect();
+        for uid in retired {
+            if let Some(texture) = self.kitty_textures.remove(&uid)
+                && self.kitty_pool.len() < KITTY_TEXTURE_POOL
+            {
+                self.kitty_pool.push(texture);
+            }
+        }
+        // Nothing was replaced this frame, so nothing is about to claim what is pooled.
+        if quads.iter().all(|quad| self.kitty_textures.contains_key(&quad.uid)) {
+            self.kitty_pool.clear();
+        }
+    }
+
+    /// Make sure the image `quad` shows has a texture holding its pixels.
+    ///
+    /// An image's pixels never change once it has an identity, so a texture is uploaded once and
+    /// then only drawn.
+    fn upload_kitty_image(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, quad: &Quad) {
+        if self.kitty_textures.contains_key(&quad.uid) {
+            return;
+        }
+        if quad.width > self.max_texture_dimension || quad.height > self.max_texture_dimension {
+            if !self.reported_oversized_image {
+                self.reported_oversized_image = true;
+                log::warn!(
+                    "Kitty image of {}x{} exceeds this GPU's {} pixel texture limit; not drawn",
+                    quad.width,
+                    quad.height,
+                    self.max_texture_dimension
+                );
+            }
+            return;
+        }
+        let straight_alpha = !quad.opaque;
+        let extent =
+            wgpu::Extent3d { width: quad.width, height: quad.height, depth_or_array_layers: 1 };
+        let layout = wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(quad.width * 4),
+            rows_per_image: Some(quad.height),
+        };
+        let pooled = self.kitty_pool.iter().position(|texture| {
+            texture.width == quad.width
+                && texture.height == quad.height
+                && texture.straight_alpha == straight_alpha
+        });
+        let texture = match pooled {
+            Some(index) => {
+                let texture = self.kitty_pool.swap_remove(index);
+                queue.write_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &texture.texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    &quad.pixels,
+                    layout,
+                    extent,
+                );
+                texture
+            },
+            None => {
+                let (texture, options, bind_group) = self.create_source_texture(
+                    device,
+                    queue,
+                    "vivido.kitty.image",
+                    (quad.width, quad.height),
+                    &quad.pixels,
+                    straight_alpha,
+                );
+                ImageTexture {
+                    texture,
+                    _options: options,
+                    bind_group,
+                    width: quad.width,
+                    height: quad.height,
+                    straight_alpha,
+                }
+            },
+        };
+        self.kitty_textures.insert(quad.uid, texture);
+        let pixels = u64::from(quad.width) * u64::from(quad.height);
+        self.source_upload_metrics.frames = self.source_upload_metrics.frames.saturating_add(1);
+        self.source_upload_metrics.uploaded_pixels =
+            self.source_upload_metrics.uploaded_pixels.saturating_add(pixels);
+        self.source_upload_metrics.full_frame_pixels =
+            self.source_upload_metrics.full_frame_pixels.saturating_add(pixels);
+    }
+
+    /// Create a texture holding `rgba` and the bind group that samples it.
+    fn create_source_texture(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        label: &'static str,
+        (width, height): (u32, u32),
+        rgba: &[u8],
+        straight_alpha: bool,
+    ) -> (wgpu::Texture, wgpu::Buffer, wgpu::BindGroup) {
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some(label),
+            size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            rgba,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(width * 4),
+                rows_per_image: Some(height),
+            },
+            wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+        );
+        let options = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("vivido.vivid.source_options"),
+            contents: bytemuck::bytes_of(&SourceOptions {
+                straight_alpha: u32::from(straight_alpha),
+                _padding: [0; 3],
+            }),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        let view = texture.create_view(&Default::default());
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("vivido.vivid.source_bind_group"),
+            layout: &self.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+                wgpu::BindGroupEntry { binding: 2, resource: options.as_entire_binding() },
+            ],
+        });
+        (texture, options, bind_group)
     }
 
     #[cfg(any(unix, windows))]
@@ -608,59 +824,14 @@ impl VividMediaRenderer {
                 self.source_upload_metrics.full_frame_pixels.saturating_add(full_frame_pixels);
             return;
         }
-        let texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("vivido.vivid.track"),
-            size: wgpu::Extent3d {
-                width: frame.width,
-                height: frame.height,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
+        let (texture, options, bind_group) = self.create_source_texture(
+            device,
+            queue,
+            "vivido.vivid.track",
+            (frame.width, frame.height),
             frame.rgba.as_ref(),
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(frame.width * 4),
-                rows_per_image: Some(frame.height),
-            },
-            wgpu::Extent3d { width: frame.width, height: frame.height, depth_or_array_layers: 1 },
+            frame.alpha_mode == crate::vivid::scene::ALPHA_STRAIGHT,
         );
-        let options = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("vivido.vivid.source_options"),
-            contents: bytemuck::bytes_of(&SourceOptions {
-                straight_alpha: u32::from(frame.alpha_mode == crate::vivid::scene::ALPHA_STRAIGHT),
-                _padding: [0; 3],
-            }),
-            usage: wgpu::BufferUsages::UNIFORM,
-        });
-        let view = texture.create_view(&Default::default());
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("vivido.vivid.source_bind_group"),
-            layout: &self.bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&self.sampler),
-                },
-                wgpu::BindGroupEntry { binding: 2, resource: options.as_entire_binding() },
-            ],
-        });
         self.tracks.insert(
             key,
             SourceTexture {
@@ -846,6 +1017,24 @@ fn vertices(
         Vertex { position: [left, bottom], tex_coord: [u0, v1] },
         Vertex { position: [right, bottom], tex_coord: [u1, v1] },
     ])
+}
+
+/// Two triangles for a Kitty quad, whose rectangle is already in clipped window pixels.
+fn quad_vertices(quad: &Quad, size: &SizeInfo) -> [Vertex; 6] {
+    let [left, top, right, bottom] = quad.dest;
+    let [u0, v0, u1, v1] = quad.uv;
+    let left = left / size.width() * 2.0 - 1.0;
+    let right = right / size.width() * 2.0 - 1.0;
+    let top = 1.0 - top / size.height() * 2.0;
+    let bottom = 1.0 - bottom / size.height() * 2.0;
+    [
+        Vertex { position: [left, top], tex_coord: [u0, v0] },
+        Vertex { position: [left, bottom], tex_coord: [u0, v1] },
+        Vertex { position: [right, top], tex_coord: [u1, v0] },
+        Vertex { position: [right, top], tex_coord: [u1, v0] },
+        Vertex { position: [left, bottom], tex_coord: [u0, v1] },
+        Vertex { position: [right, bottom], tex_coord: [u1, v1] },
+    ]
 }
 
 fn redaction_from_vertices(vertices: &[Vertex; 6], size: &SizeInfo) -> CaptureRedaction {

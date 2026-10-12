@@ -1,6 +1,7 @@
 use serde::Serialize;
 
 #[derive(Serialize, Clone, Debug, PartialEq)]
+/// Dropped-file handling and remote-path paste settings.
 pub struct FileDrop {
     /// After a remote receiver commits a dropped or pasted file, type its committed absolute
     /// remote path into the terminal, the way a local drag types a local path.

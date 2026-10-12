@@ -15,10 +15,14 @@ use super::{
     serve,
 };
 
-/// Re-enter the daemon after [`spawn_detached`] starts a fresh executable image.
+/// Re-enter the daemon after `spawn_detached` starts a fresh executable image.
 ///
 /// Metal cannot be initialized reliably in a process that has returned from `fork`, even when the
 /// parent was single-threaded. Re-executing before wgpu starts gives the daemon a clean process.
+///
+/// # Errors
+///
+/// Returns an error when the macOS child cannot be launched or its startup status cannot be read.
 pub fn run_reexec(
     mut options: Options,
     session: String,
@@ -32,6 +36,7 @@ pub fn run_reexec(
     let raw_readiness = c_int::try_from(readiness_handle).map_err(|_| {
         io::Error::new(io::ErrorKind::InvalidInput, "internal readiness descriptor is invalid")
     })?;
+    // SAFETY: fcntl operates on the live readiness descriptor with scalar descriptor flags.
     if unsafe { libc::fcntl(raw_readiness, libc::F_GETFD) } < 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -92,12 +97,14 @@ pub(super) fn spawn_detached(
 
 /// Create a readiness pipe whose write end alone crosses the re-exec.
 pub(super) fn readiness_pipe() -> io::Result<(File, File)> {
-    let mut descriptors = [0 as c_int; 2];
+    let mut descriptors: [c_int; 2] = [0; 2];
+    // SAFETY: descriptors is a writable two-element integer array; pipe initializes both on success.
     if unsafe { libc::pipe(descriptors.as_mut_ptr()) } != 0 {
         return Err(io::Error::last_os_error());
     }
     // SAFETY: `pipe` returned two fresh descriptors and ownership transfers to these files.
     let read = unsafe { File::from_raw_fd(descriptors[0]) };
+    // SAFETY: pipe returned this fresh write descriptor, whose sole ownership transfers to File.
     let write = unsafe { File::from_raw_fd(descriptors[1]) };
     set_close_on_exec(&read, true)?;
     set_close_on_exec(&write, false)?;
@@ -105,11 +112,13 @@ pub(super) fn readiness_pipe() -> io::Result<(File, File)> {
 }
 
 fn set_close_on_exec(file: &File, close_on_exec: bool) -> io::Result<()> {
+    // SAFETY: fcntl operates on the live readiness descriptor with scalar descriptor flags.
     let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFD) };
     if flags < 0 {
         return Err(io::Error::last_os_error());
     }
     let flags = if close_on_exec { flags | libc::FD_CLOEXEC } else { flags & !libc::FD_CLOEXEC };
+    // SAFETY: fcntl operates on the live readiness descriptor with scalar descriptor flags.
     if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFD, flags) } < 0 {
         Err(io::Error::last_os_error())
     } else {
@@ -156,6 +165,7 @@ pub(super) fn set_read_timeout(file: &File, timeout: Duration) -> io::Result<()>
             return Err(io::Error::from(io::ErrorKind::WouldBlock));
         }
         let timeout_millis = remaining.as_millis().min(c_int::MAX as u128) as c_int;
+        // SAFETY: poll_fd is one initialized writable pollfd, and its File owner remains alive during polling.
         let result = unsafe { libc::poll(&raw mut poll_fd, 1, timeout_millis) };
         match result {
             -1 => {

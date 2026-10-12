@@ -14,8 +14,11 @@ const MIN_BLINK_INTERVAL: u64 = 10;
 const MIN_BLINK_CYCLES_BEFORE_PAUSE: u64 = 1;
 
 #[derive(Serialize, Copy, Clone, Debug, PartialEq)]
+/// Cursor appearance and blink settings.
 pub struct Cursor {
+    /// Font style selection.
     pub style: ConfigCursorStyle,
+    /// Draw an unfocused block cursor as an outline.
     pub unfocused_hollow: bool,
 
     thickness: Percentage,
@@ -37,21 +40,25 @@ impl Default for Cursor {
 
 impl Cursor {
     #[inline]
+    /// Return cursor thickness as a fraction of cell width.
     pub fn thickness(self) -> f32 {
         self.thickness.as_f32()
     }
 
     #[inline]
+    /// Return the configured style.
     pub fn style(self) -> VteCursorStyle {
         self.style.into()
     }
 
     #[inline]
+    /// Return the configured cursor blink interval in milliseconds.
     pub fn blink_interval(self) -> u64 {
         cmp::max(self.blink_interval, MIN_BLINK_INTERVAL)
     }
 
     #[inline]
+    /// Return the cursor blink inactivity timeout.
     pub fn blink_timeout(self) -> Duration {
         if self.blink_timeout == 0 {
             Duration::ZERO
@@ -67,12 +74,17 @@ impl Cursor {
 
 #[derive(Deserialize, Serialize, Debug, Copy, Clone, PartialEq, Eq)]
 #[serde(untagged, deny_unknown_fields)]
+/// A cursor shape with optional blink behavior.
 pub enum ConfigCursorStyle {
+    /// A cursor shape using the configured default blink policy.
     Shape(CursorShape),
+    /// A cursor shape with an explicit blink policy.
     WithBlinking {
         #[serde(default)]
+        /// Cursor geometry.
         shape: CursorShape,
         #[serde(default)]
+        /// Cursor blink policy.
         blinking: CursorBlinking,
     },
 }
@@ -105,11 +117,16 @@ impl From<ConfigCursorStyle> for VteCursorStyle {
 }
 
 #[derive(Serialize, Default, Debug, Copy, Clone, PartialEq, Eq)]
+/// Cursor blink policy, including application-request override behavior.
 pub enum CursorBlinking {
+    /// Never blink, regardless of application requests.
     Never,
     #[default]
+    /// Initially disabled; applications may enable blinking.
     Off,
+    /// Initially enabled; applications may disable blinking.
     On,
+    /// Always blink, regardless of application requests.
     Always,
 }
 
@@ -130,10 +147,14 @@ impl From<CursorBlinking> for bool {
 }
 
 #[derive(Serialize, Debug, Default, Eq, PartialEq, Copy, Clone, Hash)]
+/// The geometric shape of the terminal cursor.
 pub enum CursorShape {
     #[default]
+    /// A filled cell-sized cursor.
     Block,
+    /// A horizontal cursor below the cell.
     Underline,
+    /// A vertical cursor at the cell edge.
     Beam,
 }
 

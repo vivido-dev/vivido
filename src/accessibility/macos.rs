@@ -38,6 +38,7 @@ define_class!(
 
         #[unsafe(method_id(accessibilityRole))]
         fn role(&self) -> Retained<NSAccessibilityRole> {
+            // SAFETY: this SDK role constant has process lifetime and is copied into a retained object.
             unsafe { NSAccessibilityTextAreaRole }.copy()
         }
 
@@ -125,6 +126,7 @@ define_class!(
             };
             let values: Vec<_> = ranges
                 .iter()
+                // SAFETY: NSValue copies this integer range by value; no Rust references escape the call.
                 .map(|range| unsafe { NSValue::valueWithRange(to_ns_range(&range.utf16)) })
                 .collect();
             NSArray::from_retained_slice(&values)
@@ -251,6 +253,7 @@ impl TerminalElement {
     fn new(snapshot: Arc<Mutex<AccessibilitySnapshot>>, parent: &NSView) -> Retained<Self> {
         let this =
             Self::alloc().set_ivars(TerminalElementIvars { snapshot, parent: Weak::new(parent) });
+        // SAFETY: this freshly allocated subclass has initialized ivars and invokes its NSObject initializer.
         unsafe { msg_send![super(this), init] }
     }
 
@@ -305,6 +308,7 @@ impl AccessibilityState {
             return Self { snapshot: None, element: None, parent: None };
         }
         let view = match window.raw_window_handle() {
+            // SAFETY: the live winit AppKit window owns this NSView; use stays on the UI thread.
             Some(RawWindowHandle::AppKit(handle)) => unsafe {
                 handle.ns_view.cast::<NSView>().as_ref()
             },
@@ -314,6 +318,7 @@ impl AccessibilityState {
         let element = TerminalElement::new(Arc::clone(&snapshot), view);
         let child: Retained<AnyObject> = element.clone().into_super().into_super().into_super();
         let children = NSArray::from_retained_slice(&[child]);
+        // SAFETY: view and children are live retained AppKit objects used on their owning UI thread.
         unsafe { NSAccessibility::setAccessibilityChildren(view, Some(&children)) };
         Self { snapshot: Some(snapshot), element: Some(element), parent: Some(Weak::new(view)) }
     }
@@ -338,11 +343,13 @@ impl AccessibilityState {
 
         let object: &AnyObject = element;
         if text_changed {
+            // SAFETY: object is retained on this UI thread and the SDK notification constant has process lifetime.
             unsafe {
                 NSAccessibilityPostNotification(object, NSAccessibilityValueChangedNotification);
             }
         }
         if selection_changed {
+            // SAFETY: object is retained on this UI thread and the SDK notification constant has process lifetime.
             unsafe {
                 NSAccessibilityPostNotification(
                     object,
@@ -351,16 +358,19 @@ impl AccessibilityState {
             }
         }
         if layout_changed {
+            // SAFETY: object is retained on this UI thread and the SDK notification constant has process lifetime.
             unsafe {
                 NSAccessibilityPostNotification(object, NSAccessibilityLayoutChangedNotification);
             }
         }
         if title_changed {
+            // SAFETY: object is retained on this UI thread and the SDK notification constant has process lifetime.
             unsafe {
                 NSAccessibilityPostNotification(object, NSAccessibilityTitleChangedNotification);
             }
         }
         if focus_changed {
+            // SAFETY: object is retained on this UI thread and the SDK notification constant has process lifetime.
             unsafe {
                 NSAccessibilityPostNotification(
                     object,
@@ -374,6 +384,7 @@ impl AccessibilityState {
 impl Drop for AccessibilityState {
     fn drop(&mut self) {
         if let Some(parent) = self.parent.as_ref().and_then(Weak::load) {
+            // SAFETY: Weak::load retained the live parent for this UI-thread update; None removes its children.
             unsafe { NSAccessibility::setAccessibilityChildren(&*parent, None) };
         }
     }

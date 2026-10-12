@@ -2,9 +2,8 @@
 
 use std::cmp::{max, min};
 use std::ops::{Index, IndexMut, Range, RangeFrom, RangeFull, RangeTo, RangeToInclusive};
-use std::{ptr, slice};
+use std::slice;
 
-#[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
 use crate::terminal::grid::GridCell;
@@ -12,8 +11,7 @@ use crate::terminal::index::Column;
 use crate::terminal::term::cell::ResetDiscriminant;
 
 /// A row in the grid.
-#[derive(Default, Clone, Debug)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Default, Clone, Debug, Serialize, Deserialize)]
 pub struct Row<T> {
     inner: Vec<T>,
 
@@ -33,24 +31,15 @@ impl<T: PartialEq> PartialEq for Row<T> {
 impl<T: Default> Row<T> {
     /// Create a new terminal row.
     ///
-    /// Ideally the `template` should be `Copy` in all performance sensitive scenarios.
+    /// Each cell is initialized independently with `T::default()`.
+    ///
+    /// # Panics
+    /// Panics if `columns` is zero or an element's default constructor panics.
     pub fn new(columns: usize) -> Row<T> {
-        debug_assert!(columns >= 1);
+        assert!(columns >= 1, "a terminal row requires at least one column");
 
         let mut inner: Vec<T> = Vec::with_capacity(columns);
-
-        // This is a slightly optimized version of `std::vec::Vec::resize`.
-        unsafe {
-            let mut ptr = inner.as_mut_ptr();
-
-            for _ in 1..columns {
-                ptr::write(ptr, T::default());
-                ptr = ptr.offset(1);
-            }
-            ptr::write(ptr, T::default());
-
-            inner.set_len(columns);
-        }
+        inner.resize_with(columns, T::default);
 
         Row { inner, occ: 0 }
     }
@@ -125,14 +114,20 @@ impl<T: Default> Row<T> {
     }
 }
 
-#[allow(clippy::len_without_is_empty)]
 impl<T> Row<T> {
     #[inline]
+    /// Create a row from cells and an occupied-prefix length.
     pub fn from_vec(vec: Vec<T>, occ: usize) -> Row<T> {
         Row { inner: vec, occ }
     }
 
+    /// Whether this row has no backing cells.
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
     #[inline]
+    /// Return the number of backing cells in this row.
     pub fn len(&self) -> usize {
         self.inner.len()
     }
@@ -143,17 +138,20 @@ impl<T> Row<T> {
     }
 
     #[inline]
+    /// Borrow the last backing cell, if the row is nonempty.
     pub fn last(&self) -> Option<&T> {
         self.inner.last()
     }
 
     #[inline]
+    /// Borrow the last backing cell mutably and mark the row occupied.
     pub fn last_mut(&mut self) -> Option<&mut T> {
         self.occ = self.inner.len();
         self.inner.last_mut()
     }
 
     #[inline]
+    /// Move cells to the row's end and extend its occupied prefix.
     pub fn append(&mut self, vec: &mut Vec<T>)
     where
         T: GridCell,
@@ -163,6 +161,7 @@ impl<T> Row<T> {
     }
 
     #[inline]
+    /// Move cells to the row's beginning and extend its occupied prefix.
     pub fn append_front(&mut self, mut vec: Vec<T>) {
         self.occ += vec.len();
 
@@ -180,6 +179,7 @@ impl<T> Row<T> {
     }
 
     #[inline]
+    /// Remove and return the first `at` cells from this row.
     pub fn front_split_off(&mut self, at: usize) -> Vec<T> {
         self.occ = self.occ.saturating_sub(at);
 

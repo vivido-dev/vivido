@@ -1,4 +1,4 @@
-//! Bounded OSC 7/9/99 parsing and desktop-notification lifecycle management.
+//! Bounded OSC 7/9/99/133 parsing and desktop-notification lifecycle management.
 
 use std::collections::{HashMap, VecDeque};
 #[cfg(target_os = "macos")]
@@ -41,6 +41,30 @@ pub(crate) enum OscMessage {
     Notification(OscNotification),
     WorkingDirectory(OscWorkingDirectory),
     ShellIntegration(ShellIntegrationMarker),
+    Progress(ProgressReport),
+}
+
+/// One ConEmu `OSC 9;4;<state>[;<percent>]` progress report.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProgressReport {
+    pub state: ProgressState,
+    /// Percent complete, clamped to `0..=100`. Absent when the report carried none.
+    pub percent: Option<u8>,
+}
+
+/// The state field of an `OSC 9;4` progress report.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProgressState {
+    /// `0`: remove the progress indicator.
+    Remove,
+    /// `1`: normal determinate progress.
+    Normal,
+    /// `2`: the operation failed.
+    Error,
+    /// `3`: busy, with no known completion.
+    Indeterminate,
+    /// `4`: the operation is paused.
+    Paused,
 }
 
 /// One FinalTerm/FTCS `OSC 133` shell-lifecycle marker.
@@ -48,13 +72,16 @@ pub(crate) enum OscMessage {
 /// Payloads stay tiny (`133;A`, `133;D;0`), so capturing them costs nothing beyond the
 /// terminator scan every other OSC body pays. Markers from a shell that never emits them
 /// simply never arrive, and waiting on them times out rather than guessing.
+///
+/// Every marker may carry `;key=value` options (`aid`, `cl`, `k`, `redraw`, `click_events`, …);
+/// none of them change the lifecycle, so they are accepted and ignored.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ShellIntegrationMarker {
-    /// `133;A`: the shell is drawing a prompt and will soon accept input.
+    /// `133;A`, `133;N`, or `133;P`: the shell is drawing a prompt, or one line of it.
     PromptStart,
-    /// `133;B`: the user submitted a command; the shell is parsing it.
-    CommandStart,
-    /// `133;C`: the command spawned and its output is beginning.
+    /// `133;B` or `133;I`: the prompt ended and the user's input begins; no command runs yet.
+    InputStart,
+    /// `133;C`: input ended; the command runs and its output begins.
     CommandOutputStart,
     /// `133;D[;<exit>]`: the command finished, optionally with an exit code.
     CommandFinished { exit_code: Option<i32> },
@@ -302,6 +329,10 @@ fn parse_osc(raw: &[u8]) -> Option<OscMessage> {
         return parse_working_directory(url).map(OscMessage::WorkingDirectory);
     }
 
+    if let Some(report) = raw.strip_prefix(b"9;4;") {
+        return parse_progress(report).map(OscMessage::Progress);
+    }
+
     if let Some(message) = raw.strip_prefix(b"9;") {
         return parse_legacy(message).map(OscNotification::Legacy).map(OscMessage::Notification);
     }
@@ -317,29 +348,60 @@ fn parse_osc(raw: &[u8]) -> Option<OscMessage> {
         .map(OscMessage::Notification)
 }
 
+/// Parse one `OSC 9;4` progress report body (the bytes after `9;4;`).
+///
+/// The state is one digit. The percent is optional, decimal, and clamped to 100; a malformed one
+/// rejects the whole report rather than guessing a value. Fields past the percent are ignored,
+/// as ConEmu and Windows Terminal ignore them.
+fn parse_progress(report: &[u8]) -> Option<ProgressReport> {
+    let mut fields = report.split(|&byte| byte == b';');
+    let state = match fields.next()? {
+        b"0" => ProgressState::Remove,
+        b"1" => ProgressState::Normal,
+        b"2" => ProgressState::Error,
+        b"3" => ProgressState::Indeterminate,
+        b"4" => ProgressState::Paused,
+        _ => return None,
+    };
+    let percent = match fields.next() {
+        None | Some(b"") => None,
+        Some(digits) if digits.len() <= 10 && digits.iter().all(u8::is_ascii_digit) => {
+            let value = std::str::from_utf8(digits).ok()?.parse::<u64>().ok()?;
+            Some(value.min(100) as u8)
+        },
+        Some(_) => return None,
+    };
+    Some(ProgressReport { state, percent })
+}
+
 /// Parse one `OSC 133` shell-lifecycle marker body (the bytes after `133;`).
 ///
-/// Only the FinalTerm/FTCS single-letter markers are recognized; anything else — including a
-/// bare terminator with no marker — is not shell integration and yields no message.
+/// Only the single-letter markers of the semantic-prompts proposal that move the shell lifecycle
+/// are recognized; anything else — `L` fresh-line, an unknown letter, or a bare terminator with
+/// no marker — is not shell integration and yields no message.
 fn parse_shell_integration(marker: &[u8]) -> Option<ShellIntegrationMarker> {
     let (kind, payload) = match marker.iter().position(|&byte| byte == b';') {
         Some(separator) => (&marker[..separator], Some(&marker[separator + 1..])),
         None => (marker, None),
     };
     match kind {
-        b"A" => Some(ShellIntegrationMarker::PromptStart),
-        b"B" => Some(ShellIntegrationMarker::CommandStart),
+        b"A" | b"N" | b"P" => Some(ShellIntegrationMarker::PromptStart),
+        b"B" | b"I" => Some(ShellIntegrationMarker::InputStart),
         b"C" => Some(ShellIntegrationMarker::CommandOutputStart),
         b"D" => {
-            let exit_code = payload
-                .filter(|payload| !payload.is_empty())
-                .and_then(|payload| std::str::from_utf8(payload).ok())
-                .and_then(|payload| payload.parse::<i32>().ok());
-            // A `D` with a non-numeric payload is malformed, not a finish without a code: a
-            // garbage exit code must never resolve `wait command-finish` as success.
-            if payload.is_some_and(|payload| !payload.is_empty()) && exit_code.is_none() {
-                return None;
-            }
+            // The exit code is the first field; options may follow it (`D;0;aid=7`) or stand in
+            // for it (`D;aid=7`).
+            let field = payload
+                .and_then(|payload| payload.split(|&byte| byte == b';').next())
+                .filter(|field| !field.is_empty() && !field.contains(&b'='));
+            let exit_code = match field {
+                Some(field) => {
+                    // A non-numeric code is malformed, not a finish without a code: a garbage
+                    // exit code must never resolve `wait command-finish` as success.
+                    Some(std::str::from_utf8(field).ok()?.parse::<i32>().ok()?)
+                },
+                None => None,
+            };
             Some(ShellIntegrationMarker::CommandFinished { exit_code })
         },
         _ => None,
@@ -377,7 +439,8 @@ fn parse_legacy(message: &[u8]) -> Option<String> {
         return None;
     }
 
-    // OSC 9 has incompatible numeric subfamilies, including OSC 9;4 progress reports.
+    // OSC 9 has incompatible numeric subfamilies. `9;4` progress is parsed before this; the rest
+    // are not notifications either.
     if message.iter().position(|&byte| byte == b';').is_some_and(|separator| {
         let selector = &message[..separator];
         !selector.is_empty() && selector.iter().all(u8::is_ascii_digit)
@@ -672,6 +735,26 @@ impl NotificationController {
         self.enabled = enabled;
     }
 
+    /// Show a notification Vivido itself composed, such as a finished long command.
+    ///
+    /// Unlike program requests this answers the user's own configuration, so it does not consult
+    /// the OSC allow-switch; it still shares the rate limiter, and clicking it focuses the window
+    /// where the backend supports it.
+    pub(crate) fn notify_local(&mut self, title: String, body: String) {
+        if !self.limiter.take() {
+            return;
+        }
+        self.worker.display(DesktopNotification {
+            id: None,
+            title,
+            body,
+            focus: self.can_focus,
+            urgency: Urgency::Normal,
+            expiry: Expiry::Default,
+            sound: Sound::System,
+        });
+    }
+
     pub(crate) fn handle<N: Notify>(
         &mut self,
         notification: OscNotification,
@@ -794,6 +877,48 @@ fn occasion_matches(occasion: Occasion, state: WindowNotificationState) -> bool 
             !state.focused && (state.headless || !state.visible || state.occluded)
         },
     }
+}
+
+/// Title and body announcing one finished long command.
+pub(crate) fn command_finished_text(
+    exit_code: Option<i32>,
+    duration: Duration,
+) -> (String, String) {
+    let title = match exit_code {
+        None => "Command Finished",
+        Some(0) => "Command Succeeded",
+        Some(_) => "Command Failed",
+    }
+    .to_owned();
+    let runtime = format_command_duration(duration);
+    let body = match exit_code {
+        None => format!("Command took {runtime}."),
+        Some(code) => format!("Command took {runtime} and exited with code {code}."),
+    };
+    (title, body)
+}
+
+/// Compact runtime for a finished command: `900ms`, `7s`, `3m 4s`, `2h 5m`.
+fn format_command_duration(duration: Duration) -> String {
+    let secs = duration.as_secs();
+    if secs < 1 {
+        return format!("{}ms", duration.as_millis());
+    }
+    if secs < 60 {
+        return format!("{secs}s");
+    }
+    let minutes = secs / 60;
+    if minutes < 60 {
+        let remainder = secs % 60;
+        return if remainder == 0 {
+            format!("{minutes}m")
+        } else {
+            format!("{minutes}m {remainder}s")
+        };
+    }
+    let hours = minutes / 60;
+    let remainder = minutes % 60;
+    if remainder == 0 { format!("{hours}h") } else { format!("{hours}h {remainder}m") }
 }
 
 struct RateLimiter {
@@ -1271,7 +1396,9 @@ mod tests {
             .into_iter()
             .filter_map(|message| match message {
                 OscMessage::Notification(notification) => Some(notification),
-                OscMessage::WorkingDirectory(_) | OscMessage::ShellIntegration(_) => None,
+                OscMessage::WorkingDirectory(_)
+                | OscMessage::ShellIntegration(_)
+                | OscMessage::Progress(_) => None,
             })
             .collect()
     }
@@ -1351,6 +1478,74 @@ mod tests {
     #[test]
     fn ignores_numeric_osc9_families() {
         assert!(parse(b"\x1b]9;4;1;50\x1b\\").is_empty());
+        assert!(parse(b"\x1b]9;1;500\x1b\\").is_empty());
+    }
+
+    fn parse_progress_reports(bytes: &[u8]) -> Vec<ProgressReport> {
+        parse_messages(bytes)
+            .into_iter()
+            .filter_map(|message| match message {
+                OscMessage::Progress(report) => Some(report),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn progress_reports_parse_every_state_with_both_terminators() {
+        let report = |state, percent| ProgressReport { state, percent };
+        assert_eq!(
+            parse_progress_reports(
+                b"\x1b]9;4;1;42\x07\x1b]9;4;3\x1b\\\x1b]9;4;2;\x07\x1b]9;4;4;7\x07\x1b]9;4;0\x07"
+            ),
+            [
+                report(ProgressState::Normal, Some(42)),
+                report(ProgressState::Indeterminate, None),
+                report(ProgressState::Error, None),
+                report(ProgressState::Paused, Some(7)),
+                report(ProgressState::Remove, None),
+            ]
+        );
+    }
+
+    #[test]
+    fn progress_percent_clamps_and_trailing_fields_are_ignored() {
+        assert_eq!(
+            parse_progress_reports(b"\x1b]9;4;1;250;extra\x07\x1b]9;4;1;99999999999\x07"),
+            [ProgressReport { state: ProgressState::Normal, percent: Some(100) }],
+            "an over-long percent is malformed, not clamped"
+        );
+    }
+
+    #[test]
+    fn malformed_progress_reports_are_dropped() {
+        for bytes in [
+            b"\x1b]9;4;5;10\x07".as_slice(),
+            b"\x1b]9;4;;10\x07",
+            b"\x1b]9;4;1;-3\x07",
+            b"\x1b]9;4;1;4x\x07",
+            b"\x1b]9;4;01\x07",
+        ] {
+            let messages = parse_messages(bytes);
+            assert!(messages.is_empty(), "{bytes:?} produced {messages:?}");
+        }
+    }
+
+    #[test]
+    fn progress_report_survives_every_byte_boundary() {
+        let bytes = b"\x1b]9;4;1;64\x1b\\";
+        let mut parser = OscNotificationParser::default();
+        let messages = bytes
+            .iter()
+            .flat_map(|byte| parser.advance(std::slice::from_ref(byte)))
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            messages.as_slice(),
+            [OscMessage::Progress(ProgressReport {
+                state: ProgressState::Normal,
+                percent: Some(64)
+            })]
+        ));
     }
 
     #[test]
@@ -1596,7 +1791,7 @@ mod tests {
                 "terminator {terminator:?}",
             );
             assert!(
-                matches!(messages[1], OscMessage::ShellIntegration(Marker::CommandStart)),
+                matches!(messages[1], OscMessage::ShellIntegration(Marker::InputStart)),
                 "terminator {terminator:?}",
             );
             assert!(
@@ -1613,10 +1808,48 @@ mod tests {
     }
 
     #[test]
+    fn shell_integration_markers_accept_options_and_prompt_variants() {
+        use ShellIntegrationMarker as Marker;
+        // What real integrations send (Ghostty's bash, zsh, fish, and elvish scripts, and the
+        // semantic-prompts proposal): options on every marker, explicit prompt lines, and an exit
+        // code followed or replaced by options.
+        let cases: [(&str, Marker); 12] = [
+            ("A;cl=line;aid=4242", Marker::PromptStart),
+            ("A;redraw=last;cl=line;aid=4242", Marker::PromptStart),
+            ("N;aid=4242", Marker::PromptStart),
+            ("P;k=i", Marker::PromptStart),
+            ("P;k=s", Marker::PromptStart),
+            ("B", Marker::InputStart),
+            ("I", Marker::InputStart),
+            ("C;", Marker::CommandOutputStart),
+            ("C;cmdline_url=echo%20hi", Marker::CommandOutputStart),
+            ("D;0;aid=4242", Marker::CommandFinished { exit_code: Some(0) }),
+            ("D;aid=4242", Marker::CommandFinished { exit_code: None }),
+            ("D;;aid=4242", Marker::CommandFinished { exit_code: None }),
+        ];
+        for (body, expected) in cases {
+            let input = format!("\x1b]133;{body}\x07");
+            match parse_messages(input.as_bytes()).as_slice() {
+                [OscMessage::ShellIntegration(marker)] => assert_eq!(*marker, expected, "{body}"),
+                unexpected => panic!("{body} parsed as {unexpected:?}"),
+            }
+        }
+    }
+
+    #[test]
     fn shell_integration_rejects_malformed_markers() {
-        // No marker letter, an unknown letter, and a non-numeric exit code are not
-        // integration events: garbage must never resolve a semantic wait.
-        for body in ["\x1b]133;\x07", "\x1b]133;Q\x07", "\x1b]133;D;ok\x07", "\x1b]1337;foo\x07"] {
+        // No marker letter, an unknown letter, a letter with trailing bytes, fresh-line only, and
+        // a non-numeric exit code are not integration events: garbage must never resolve a
+        // semantic wait.
+        for body in [
+            "\x1b]133;\x07",
+            "\x1b]133;Q\x07",
+            "\x1b]133;Aextra\x07",
+            "\x1b]133;L\x07",
+            "\x1b]133;D;ok\x07",
+            "\x1b]133;D;ok;aid=1\x07",
+            "\x1b]1337;foo\x07",
+        ] {
             assert!(
                 parse_messages(body.as_bytes()).is_empty(),
                 "malformed marker parsed: {body:?}"
@@ -1744,5 +1977,66 @@ mod tests {
             Some(Instant::now() - ASSEMBLY_TIMEOUT - Duration::from_secs(1));
         controller.expire_pending();
         assert!(!controller.pending.contains_key("old"));
+    }
+
+    #[test]
+    fn local_notifications_ignore_the_osc_switch_but_keep_the_limiter() {
+        let (mut controller, state) = controller();
+        controller.set_enabled(false);
+
+        controller.notify_local("done".into(), "a command finished".into());
+
+        {
+            let state = state.lock().unwrap();
+            assert_eq!(state.displayed.len(), 1);
+            assert_eq!(state.displayed[0].title, "done");
+            assert_eq!(state.displayed[0].body, "a command finished");
+            assert!(state.displayed[0].focus);
+            assert!(matches!(state.displayed[0].urgency, Urgency::Normal));
+        }
+
+        for _ in 0..10 {
+            controller.notify_local("done".into(), "a command finished".into());
+        }
+        assert!(state.lock().unwrap().displayed.len() <= RATE_BURST as usize + 1);
+    }
+
+    #[test]
+    fn finished_command_text_names_exit_code_and_runtime() {
+        assert_eq!(
+            command_finished_text(Some(0), Duration::from_secs(7)),
+            (
+                String::from("Command Succeeded"),
+                String::from("Command took 7s and exited with code 0.")
+            )
+        );
+        assert_eq!(
+            command_finished_text(Some(2), Duration::from_secs(184)),
+            (
+                String::from("Command Failed"),
+                String::from("Command took 3m 4s and exited with code 2.")
+            )
+        );
+        assert_eq!(
+            command_finished_text(None, Duration::from_millis(900)),
+            (String::from("Command Finished"), String::from("Command took 900ms."))
+        );
+    }
+
+    #[test]
+    fn command_durations_format_compactly() {
+        for (duration, expected) in [
+            (Duration::from_millis(0), "0ms"),
+            (Duration::from_millis(999), "999ms"),
+            (Duration::from_secs(1), "1s"),
+            (Duration::from_secs(59), "59s"),
+            (Duration::from_secs(60), "1m"),
+            (Duration::from_secs(61), "1m 1s"),
+            (Duration::from_secs(3599), "59m 59s"),
+            (Duration::from_secs(3600), "1h"),
+            (Duration::from_secs(7500), "2h 5m"),
+        ] {
+            assert_eq!(format_command_duration(duration), expected);
+        }
     }
 }

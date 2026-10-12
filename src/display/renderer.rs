@@ -1,14 +1,16 @@
 use std::cell::RefCell;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 #[cfg(any(unix, windows))]
 use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::{Arc, LazyLock};
 #[cfg(any(unix, windows))]
 use std::time::Instant;
 
+use parking_lot::Mutex;
 use pollster::block_on;
 use vello::peniko::Color;
 use vello::util::{RenderContext, RenderSurface};
-use vello::{AaConfig, AaSupport, RenderParams, Renderer, RendererOptions, Scene, wgpu};
+use vello::{AaConfig, AaSupport, RenderParams, Renderer, RendererOptions, Scene};
 use winit::dpi::{PhysicalPosition, PhysicalSize};
 #[cfg(windows)]
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -20,8 +22,6 @@ use windows::Win32::Graphics::DirectComposition::{
 #[cfg(windows)]
 use windows::core::{IUnknown, Interface};
 
-use crate::terminal::graphics::GraphicsCommand;
-
 use crate::display::SizeInfo;
 use crate::display::corners::CornerMask;
 #[cfg(any(unix, windows))]
@@ -30,13 +30,23 @@ use crate::display::media::VividMediaRenderer;
 use crate::display::window::RenderSource;
 
 #[derive(Debug)]
+/// A failure while creating or using this module's display resources.
 pub enum Error {
+    /// Native GPU surface creation failed.
     CreateSurface(vello::Error),
+    /// GPU renderer initialization failed.
     CreateRenderer(vello::Error),
+    /// Rendering failed or produced a render-related event.
     Render(vello::Error),
+    /// The native surface configuration was rejected.
     SurfaceValidation,
+    /// No compatible offscreen graphics adapter was available.
     NoOffscreenAdapter(String),
+    /// No compatible graphics device was available for the window.
     NoWindowDevice,
+    /// The graphics device is unavailable or lost.
+    GpuUnavailable(String),
+    /// Native Windows composition initialization or presentation failed.
     #[cfg(windows)]
     WindowsComposition(windows::core::Error),
 }
@@ -51,13 +61,18 @@ const SCREENSHOT_PIXEL_BYTES: u32 = 4;
 
 #[cfg(any(unix, windows, test))]
 #[derive(Debug)]
+/// A failure while capturing or reading a rendered frame.
 pub enum ScreenshotError {
     #[cfg(any(unix, windows))]
+    /// No completed frame is available to capture.
     NoPresentedFrame,
+    /// The requested capture exceeds resource limits.
     TooLarge,
     #[cfg(any(unix, windows))]
+    /// GPU device operation failed.
     Device(String),
     #[cfg(any(unix, windows))]
+    /// GPU frame readback failed.
     Readback(String),
 }
 
@@ -83,20 +98,31 @@ impl std::error::Error for ScreenshotError {}
 #[cfg(any(unix, windows))]
 pub struct ScreenshotReadback {
     receiver: Receiver<Result<Vec<u8>, String>>,
+    /// Width in this value's coordinate system.
     pub width: u32,
+    /// Height in this value's coordinate system.
     pub height: u32,
+    /// GPU readback row stride including alignment padding.
     pub padded_bytes_per_row: u32,
+    /// Instant at which this operation began.
     pub started: Instant,
+    /// Capture regions that must be redacted before export.
     pub redactions: Vec<CaptureRedaction>,
 }
 
 /// Completed screenshot pixels with WebGPU row padding still present.
 #[cfg(any(unix, windows))]
+#[derive(Debug)]
 pub struct ScreenshotPixels {
+    /// Payload bytes or the declared payload byte count.
     pub bytes: Vec<u8>,
+    /// Width in this value's coordinate system.
     pub width: u32,
+    /// Height in this value's coordinate system.
     pub height: u32,
+    /// GPU readback row stride including alignment padding.
     pub padded_bytes_per_row: u32,
+    /// Capture regions that must be redacted before export.
     pub redactions: Vec<CaptureRedaction>,
 }
 
@@ -111,6 +137,7 @@ impl std::fmt::Display for Error {
             Self::NoWindowDevice => {
                 f.write_str("an embedded renderer requires an initialized window renderer")
             },
+            Self::GpuUnavailable(error) => write!(f, "GPU is unavailable: {error}"),
             #[cfg(windows)]
             Self::WindowsComposition(err) => {
                 write!(f, "failed to initialize Windows composition: {err}")
@@ -121,9 +148,12 @@ impl std::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+/// GPU resources for rendering window, offscreen, and embedded scenes.
 pub struct SceneRenderer {
     /// Owns the wgpu instance and the surface's device. Absent when rendering offscreen.
     context: Option<SharedRenderContext>,
+    /// Keeps shared offscreen setup alive until the last offscreen window closes.
+    _offscreen_context: Option<Rc<OffscreenContext>>,
     /// Absent when rendering offscreen: there is no windowing-system surface to present to.
     surface: Option<Box<RenderSurface<'static>>>,
     /// Owns the DirectComposition visual tree backing a Windows surface.
@@ -132,6 +162,7 @@ pub struct SceneRenderer {
     renderer: Rc<RefCell<Renderer>>,
     device: wgpu::Device,
     queue: wgpu::Queue,
+    gpu_health: GpuHealth,
     /// Whether the render target has a drawable (non-zero) size.
     valid_target: bool,
     max_surface_dimension: u32,
@@ -170,11 +201,15 @@ impl WindowsComposition {
         // SAFETY: this native window was obtained on its owning event-loop thread.
         unsafe { super::windows_live_move::install(hwnd.0) }?;
 
+        // SAFETY: No external device pointer is supplied; the call returns an owned COM interface.
         let device: IDCompositionDevice = unsafe { DCompositionCreateDevice2(None::<&IUnknown>) }?;
         // Put the visual above any HWND client/child content. The HWND itself has no redirection
         // bitmap, so transparent visual pixels reach the desktop compositor directly.
+        // SAFETY: The HWND belongs to the live event-loop window and the COM device remains retained.
         let target = unsafe { device.CreateTargetForHwnd(hwnd, true) }?;
+        // SAFETY: The retained COM device creates an owned visual interface.
         let visual = unsafe { device.CreateVisual() }?;
+        // SAFETY: Both retained COM interfaces are live and remain owned by the composition object.
         unsafe {
             target.SetRoot(&visual)?;
         }
@@ -183,6 +218,7 @@ impl WindowsComposition {
     }
 
     fn commit(&self) -> windows::core::Result<()> {
+        // SAFETY: The retained composition device is live and this call retains no Rust borrows.
         unsafe { self.device.Commit() }
     }
 }
@@ -190,12 +226,16 @@ impl WindowsComposition {
 /// Latest GPU frame retained by an embedded Vivido window.
 pub struct EmbeddedFrame<'a> {
     texture: &'a wgpu::Texture,
+    /// Physical-pixel dimensions.
     pub size: PhysicalSize<u32>,
 }
 
 /// Placement of an embedded frame in a window render target.
+#[derive(Debug)]
 pub struct EmbeddedFramePlacement<'a> {
+    /// Borrowed embedded frame resources.
     pub frame: EmbeddedFrame<'a>,
+    /// Physical-pixel placement origin.
     pub origin: PhysicalPosition<u32>,
 }
 
@@ -211,9 +251,60 @@ pub struct SharedRenderContext(Rc<RefCell<SharedRenderState>>);
 struct SharedRenderState {
     context: RenderContext,
     renderers: Vec<Option<Rc<RefCell<Renderer>>>>,
+    device_health: Vec<GpuHealth>,
+}
+
+/// Offscreen windows share device and pipeline setup, but keep their own render targets.
+struct OffscreenContext {
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    renderer: Rc<RefCell<Renderer>>,
+    health: GpuHealth,
+}
+
+/// wgpu reports device loss through a callback, then returns invalid resources from subsequent
+/// allocations. Creating a view of such a texture invokes its default panic handler. Retain the
+/// first failure instead, so resize and rendering can enter recovery without a modal panic dialog.
+#[derive(Clone, Default)]
+struct GpuHealth(Arc<Mutex<Option<String>>>);
+
+impl GpuHealth {
+    fn monitor(device: &wgpu::Device) -> Self {
+        let health = Self::default();
+        let errors = health.clone();
+        device.on_uncaptured_error(Arc::new(move |error| errors.record(error.to_string())));
+        let loss = health.clone();
+        device.set_device_lost_callback(move |reason, message| {
+            loss.record(format!("device lost ({reason:?}): {message}"));
+        });
+        health
+    }
+
+    fn record(&self, error: String) {
+        self.0.lock().get_or_insert(error);
+    }
+
+    fn failed(&self) -> bool {
+        self.0.lock().is_some()
+    }
+
+    fn check(&self) -> Result<(), Error> {
+        match &*self.0.lock() {
+            Some(error) => Err(Error::GpuUnavailable(error.clone())),
+            None => Ok(()),
+        }
+    }
 }
 
 impl SharedRenderState {
+    fn health_for(&mut self, device_id: usize) -> GpuHealth {
+        while self.device_health.len() <= device_id {
+            let device = &self.context.devices[self.device_health.len()].device;
+            self.device_health.push(GpuHealth::monitor(device));
+        }
+        self.device_health[device_id].clone()
+    }
+
     fn renderer_for(
         &mut self,
         device_id: usize,
@@ -233,10 +324,12 @@ impl SharedRenderState {
 }
 
 impl SharedRenderContext {
+    /// Create lazily initialized rendering resources shared by embedded panes.
     pub fn new() -> Self {
         Self(Rc::new(RefCell::new(SharedRenderState {
             context: create_window_render_context(),
             renderers: Vec::new(),
+            device_health: Vec::new(),
         })))
     }
 }
@@ -249,11 +342,43 @@ impl Default for SharedRenderContext {
 
 thread_local! {
     static WINDOW_RENDER_CONTEXT: RefCell<Option<SharedRenderContext>> = const { RefCell::new(None) };
+    static OFFSCREEN_RENDER_CONTEXT: RefCell<Weak<OffscreenContext>> = const { RefCell::new(Weak::new()) };
+}
+
+fn offscreen_render_context() -> Result<Rc<OffscreenContext>, Error> {
+    OFFSCREEN_RENDER_CONTEXT.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if let Some(context) = slot.upgrade()
+            && !context.health.failed()
+        {
+            return Ok(context);
+        }
+        // Existing windows retain a lost device until they rebuild. All recovering and newly
+        // created windows share the healthy replacement. The weak cache releases GPU resources
+        // with the last window, before platform thread-local teardown.
+        let (device, queue) = offscreen_device()?;
+        let health = GpuHealth::monitor(&device);
+        let renderer =
+            Rc::new(RefCell::new(create_renderer(&device).map_err(Error::CreateRenderer)?));
+        let context = Rc::new(OffscreenContext { device, queue, renderer, health });
+        *slot = Rc::downgrade(&context);
+        Ok(context)
+    })
 }
 
 fn window_render_context() -> SharedRenderContext {
-    WINDOW_RENDER_CONTEXT
-        .with(|slot| slot.borrow_mut().get_or_insert_with(SharedRenderContext::new).clone())
+    WINDOW_RENDER_CONTEXT.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot
+            .as_ref()
+            .is_some_and(|context| context.0.borrow().device_health.iter().any(GpuHealth::failed))
+        {
+            // Vello reuses any compatible adapter's cached device, including a lost device.
+            // Old windows retain their context until they recover; new renderers share this one.
+            *slot = None;
+        }
+        slot.get_or_insert_with(SharedRenderContext::new).clone()
+    })
 }
 
 #[cfg(not(windows))]
@@ -273,25 +398,43 @@ fn create_window_render_context() -> RenderContext {
     RenderContext { instance, devices: Vec::new() }
 }
 
-/// Drop the main-thread window render context before platform thread-local teardown begins.
+/// Drop main-thread render contexts before platform thread-local teardown begins.
 pub fn shutdown_window_render_context() {
     WINDOW_RENDER_CONTEXT.with(|slot| {
         slot.borrow_mut().take();
     });
+    OFFSCREEN_RENDER_CONTEXT.with(|slot| {
+        *slot.borrow_mut() = Weak::new();
+    });
+}
+
+fn retire_window_render_context(context: &SharedRenderContext) {
+    WINDOW_RENDER_CONTEXT.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.as_ref().is_some_and(|current| Rc::ptr_eq(&current.0, &context.0)) {
+            *slot = None;
+        }
+    });
 }
 
 impl SceneRenderer {
+    /// Create GPU rendering resources for the requested target and dimensions.
+    ///
+    /// # Errors
+    ///
+    /// Returns a renderer error if adapter, device, or target initialization fails.
     pub fn new(
         source: RenderSource,
         size: PhysicalSize<u32>,
         transparent: bool,
     ) -> Result<Self, Error> {
         let size = clamp_render_size(size, wgpu::Limits::default().max_texture_dimension_2d);
+        let mut offscreen_context = None;
         let valid_target = size.width != 0 && size.height != 0;
         #[cfg(windows)]
         let mut composition = None;
 
-        let (context, surface, device, queue, target_size, renderer) = match source {
+        let (context, surface, device, queue, target_size, renderer, gpu_health) = match source {
             RenderSource::Surface(window) => {
                 let context = window_render_context();
                 let mut context_ref = context.0.borrow_mut();
@@ -300,6 +443,7 @@ impl SceneRenderer {
                 let current_composition =
                     WindowsComposition::new(&window).map_err(Error::WindowsComposition)?;
                 #[cfg(windows)]
+                // SAFETY: the native window owns these handles and is retained until the GPU surface is dropped.
                 let wgpu_surface = unsafe {
                     context_ref.context.instance.create_surface_unsafe(
                         wgpu::SurfaceTargetUnsafe::CompositionVisual(
@@ -321,7 +465,7 @@ impl SceneRenderer {
                 // ResizeBuffers, so construct it here and make PreMultiplied part of the very
                 // first configure call.
                 let surface = create_window_surface(
-                    &mut context_ref.context,
+                    &mut context_ref,
                     wgpu_surface,
                     size.width.max(1),
                     size.height.max(1),
@@ -336,21 +480,33 @@ impl SceneRenderer {
 
                 let handle = &context_ref.context.devices[surface.dev_id];
                 let (device, queue) = (handle.device.clone(), handle.queue.clone());
+                let gpu_health = context_ref.health_for(surface.dev_id);
                 let renderer = context_ref
                     .renderer_for(surface.dev_id, &device)
                     .map_err(Error::CreateRenderer)?;
                 let target_size = PhysicalSize::new(surface.config.width, surface.config.height);
                 drop(context_ref);
-                (Some(context), Some(Box::new(surface)), device, queue, target_size, renderer)
+                (
+                    Some(context),
+                    Some(Box::new(surface)),
+                    device,
+                    queue,
+                    target_size,
+                    renderer,
+                    gpu_health,
+                )
             },
             RenderSource::Offscreen => {
-                let (device, queue) = offscreen_device()?;
+                let shared = offscreen_render_context()?;
+                let device = shared.device.clone();
+                let queue = shared.queue.clone();
+                let renderer = Rc::clone(&shared.renderer);
+                let gpu_health = shared.health.clone();
+                offscreen_context = Some(shared);
                 // Nothing can refuse an offscreen size, but keep the same minimum-1 clamp so the
                 // texture is always creatable.
                 let target_size = PhysicalSize::new(size.width.max(1), size.height.max(1));
-                let renderer =
-                    Rc::new(RefCell::new(create_renderer(&device).map_err(Error::CreateRenderer)?));
-                (None, None, device, queue, target_size, renderer)
+                (None, None, device, queue, target_size, renderer, gpu_health)
             },
             RenderSource::Embedded => {
                 let context = window_render_context();
@@ -359,11 +515,13 @@ impl SceneRenderer {
                     return Err(Error::NoWindowDevice);
                 };
                 let (device, queue) = (handle.device.clone(), handle.queue.clone());
+                let gpu_health = context_ref.health_for(0);
+                gpu_health.check()?;
                 let renderer =
                     context_ref.renderer_for(0, &device).map_err(Error::CreateRenderer)?;
                 let target_size = PhysicalSize::new(size.width.max(1), size.height.max(1));
                 drop(context_ref);
-                (Some(context), None, device, queue, target_size, renderer)
+                (Some(context), None, device, queue, target_size, renderer, gpu_health)
             },
         };
 
@@ -371,15 +529,18 @@ impl SceneRenderer {
         let media = VividMediaRenderer::new(&device);
         let (render_target, render_target_view) =
             create_render_target(&device, target_size.width, target_size.height);
+        gpu_health.check()?;
 
         Ok(Self {
             context,
+            _offscreen_context: offscreen_context,
             surface,
             #[cfg(windows)]
             composition,
             renderer,
             device,
             queue,
+            gpu_health,
             valid_target,
             max_surface_dimension,
             media,
@@ -401,6 +562,10 @@ impl SceneRenderer {
     /// reason to lose the terminal, so the whole GPU side is discarded and built again. The caller
     /// re-attaches the Vivid scene and marks the window fully damaged; track textures re-upload
     /// from the scene's retained frames on the next draw.
+    ///
+    /// # Errors
+    ///
+    /// Returns a renderer error when graphics-device or rendering-resource initialization fails.
     pub fn rebuild(
         &mut self,
         source: RenderSource,
@@ -415,19 +580,33 @@ impl SceneRenderer {
         {
             self.composition = None;
         }
-        self.context = None;
+        if let Some(context) = self.context.take() {
+            // Another window may already have replaced this shared device. Do not discard its
+            // healthy replacement when the next window retires the same old context.
+            retire_window_render_context(&context);
+        }
         self.media.clear_sources();
         self.has_rendered_frame = false;
-        shutdown_window_render_context();
         *self = Self::new(source, size, transparent)?;
         Ok(())
     }
 
+    /// Resize the render target within graphics-device limits.
     pub fn resize(&mut self, size: PhysicalSize<u32>) {
         let size = self.clamp_render_size(size);
         if size.width == 0 || size.height == 0 {
             self.valid_target = false;
             self.has_rendered_frame = false;
+            return;
+        }
+
+        // Preserve the requested size for recovery, but never allocate from a device which has
+        // already failed. Errors racing with this check are retained by the callbacks as well.
+        self.target_size = size;
+        self.has_rendered_frame = false;
+        self.hidden_released = false;
+        if self.gpu_health.failed() {
+            self.valid_target = false;
             return;
         }
 
@@ -437,9 +616,7 @@ impl SceneRenderer {
         (self.render_target, self.render_target_view) =
             create_render_target(&self.device, size.width, size.height);
         self.target_size = size;
-        self.valid_target = true;
-        self.has_rendered_frame = false;
-        self.hidden_released = false;
+        self.valid_target = !self.gpu_health.failed();
     }
 
     /// Hand back the window-sized GPU memory a hidden window cannot use.
@@ -454,7 +631,7 @@ impl SceneRenderer {
     /// (see `begin_screenshot`), so releasing it would make `screenshot` fail for exactly the
     /// background tabs automation tends to ask about.
     pub fn release_while_hidden(&mut self) {
-        if self.hidden_released || self.surface.is_none() {
+        if self.hidden_released || self.surface.is_none() || self.gpu_health.failed() {
             return;
         }
 
@@ -486,8 +663,14 @@ impl SceneRenderer {
         self.resize(self.target_size);
     }
 
+    /// Clamp physical dimensions to supported render-target limits.
     pub fn clamp_render_size(&self, size: PhysicalSize<u32>) -> PhysicalSize<u32> {
         clamp_render_size(size, self.max_surface_dimension)
+    }
+
+    /// Whether the device must be replaced before further GPU work.
+    pub fn gpu_failed(&self) -> bool {
+        self.gpu_health.failed()
     }
 
     /// Round the finished frame's corners by `radius` physical pixels.
@@ -503,16 +686,14 @@ impl SceneRenderer {
         self.corner_radius = radius;
     }
 
+    /// Replace the presented Vivid scene and invalidate cached rendering.
     pub fn set_vivid_scene(&mut self, scene: crate::vivid::scene::SharedScene) {
         self.overlays.clear(&mut self.renderer.borrow_mut());
         self.overlays.scene = Some(scene.clone());
         self.media.set_scene(scene);
     }
 
-    pub fn submit_graphics(&mut self, command: GraphicsCommand) {
-        self.media.submit(command);
-    }
-
+    /// Return current media upload counters.
     pub fn media_metrics(&self) -> super::media::SourceUploadMetrics {
         self.media.source_upload_metrics()
     }
@@ -521,13 +702,19 @@ impl SceneRenderer {
         self.overlays.metrics()
     }
 
+    /// Prepare media resources needed by the next terminal frame.
     pub fn prepare_media(
         &mut self,
         size: &SizeInfo,
         display_offset: usize,
+        kitty: &super::kitty::KittyFrame,
     ) -> Option<super::media::PreparedMedia> {
+        if self.gpu_health.failed() {
+            return None;
+        }
         let mut renderer = self.renderer.borrow_mut();
-        let media = self.media.draw(&self.device, &self.queue, &mut renderer, size, display_offset);
+        let media =
+            self.media.draw(&self.device, &self.queue, &mut renderer, size, display_offset, kitty);
         let (overlay, changed) = match self.overlays.draw(
             &self.device,
             &self.queue,
@@ -557,6 +744,11 @@ impl SceneRenderer {
         Some(media)
     }
 
+    /// Render a vector scene and report whether a frame was presented.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the render target or graphics device cannot complete the frame.
     pub fn render(&mut self, scene: &Scene, base_color: Color) -> Result<bool, Error> {
         self.render_composited(scene, base_color, &[], None)
     }
@@ -566,6 +758,10 @@ impl SceneRenderer {
     /// An embedded pane is copied on top of the finished scene, so anything the chrome draws in the
     /// pane's rectangle — a dropdown anchored to the tab strip — would be overwritten. Naming that
     /// rectangle here keeps the overlay visible without a second scene pass.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a composition target or graphics device cannot complete the frame.
     pub fn render_composited(
         &mut self,
         scene: &Scene,
@@ -573,6 +769,7 @@ impl SceneRenderer {
         frames: &[EmbeddedFramePlacement<'_>],
         exclude: Option<(PhysicalPosition<u32>, PhysicalSize<u32>)>,
     ) -> Result<bool, Error> {
+        self.gpu_health.check()?;
         if !self.valid_target {
             return Ok(false);
         }
@@ -605,6 +802,7 @@ impl SceneRenderer {
         };
 
         self.paint_scene(scene, base_color, width, height)?;
+        self.gpu_health.check()?;
 
         if !frames.is_empty() {
             let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -666,16 +864,18 @@ impl SceneRenderer {
                 &surface_view,
             );
             self.queue.submit([encoder.finish()]);
-            surface_texture.present();
+            self.queue.present(surface_texture);
         }
 
+        self.gpu_health.check()?;
         self.has_rendered_frame = true;
         self.overlays.finish(true);
         Ok(true)
     }
 
+    /// Borrow the current embedded frame, when available.
     pub fn embedded_frame(&self) -> Option<EmbeddedFrame<'_>> {
-        self.has_rendered_frame
+        (self.has_rendered_frame && !self.gpu_health.failed())
             .then_some(EmbeddedFrame { texture: &self.render_target, size: self.target_size })
     }
 
@@ -687,6 +887,10 @@ impl SceneRenderer {
 
     /// Start asynchronously reading the last rendered frame.
     #[cfg(any(unix, windows))]
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no readable frame exists or GPU readback cannot start.
     pub fn begin_screenshot(&self) -> Result<ScreenshotReadback, ScreenshotError> {
         if !self.has_rendered_frame {
             return Err(ScreenshotError::NoPresentedFrame);
@@ -722,9 +926,13 @@ impl SceneRenderer {
         let (sender, receiver) = mpsc::channel();
         let callback_buffer = readback.clone();
         readback.slice(..).map_async(wgpu::MapMode::Read, move |result| {
-            let result = result
-                .map_err(|err| err.to_string())
-                .map(|()| callback_buffer.slice(..).get_mapped_range().to_vec());
+            let result = result.map_err(|err| err.to_string()).and_then(|()| {
+                callback_buffer
+                    .slice(..)
+                    .get_mapped_range()
+                    .map(|view| view.to_vec())
+                    .map_err(|err| err.to_string())
+            });
             callback_buffer.unmap();
             let _ = sender.send(result);
         });
@@ -741,6 +949,10 @@ impl SceneRenderer {
 
     /// Poll an asynchronous screenshot without blocking the renderer thread.
     #[cfg(any(unix, windows))]
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if GPU mapping fails or the captured frame is no longer valid.
     pub fn poll_screenshot(
         &self,
         readback: &ScreenshotReadback,
@@ -902,19 +1114,28 @@ impl Drop for SceneRenderer {
 pub mod bump_probe {
     use std::sync::Mutex;
 
-    use vello::low_level::BumpAllocators;
+    use vello::low_level::vello_encoding::BumpAllocators;
 
     /// The per-buffer maxima, in elements, as `BumpAllocators` reports them.
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
     pub struct Peak {
+        /// Number of measured frames.
         pub frames: u64,
+        /// Union of allocator-overflow stage flags.
         pub failed: u32,
+        /// Peak binning allocation, in elements.
         pub binning: u32,
+        /// Peak per-tile command allocation, in elements.
         pub ptcl: u32,
+        /// Peak tile allocation, in elements.
         pub tile: u32,
+        /// Peak segment-count allocation, in elements.
         pub seg_counts: u32,
+        /// Peak path-segment allocation, in elements.
         pub segments: u32,
+        /// Peak blend-stack allocation, in elements.
         pub blend: u32,
+        /// Peak flattened-line allocation, in elements.
         pub lines: u32,
     }
 
@@ -979,14 +1200,17 @@ fn create_renderer(device: &wgpu::Device) -> Result<Renderer, vello::Error> {
 }
 
 fn create_window_surface(
-    context: &mut RenderContext,
+    state: &mut SharedRenderState,
     surface: wgpu::Surface<'static>,
     width: u32,
     height: u32,
     transparent: bool,
 ) -> Result<RenderSurface<'static>, Error> {
-    let dev_id = block_on(context.device(Some(&surface)))
+    let dev_id = block_on(state.context.device(Some(&surface)))
         .ok_or(Error::CreateSurface(vello::Error::NoCompatibleDevice))?;
+    let health = state.health_for(dev_id);
+    health.check()?;
+    let context = &state.context;
     let handle = &context.devices[dev_id];
     let capabilities = surface.get_capabilities(handle.adapter());
     let format = capabilities
@@ -1001,6 +1225,7 @@ fn create_window_surface(
     let config = wgpu::SurfaceConfiguration {
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
         format,
+        color_space: wgpu::SurfaceColorSpace::Auto,
         width,
         height,
         present_mode: wgpu::PresentMode::AutoVsync,
@@ -1027,6 +1252,7 @@ fn create_window_surface(
 
     // This must be the swapchain's first configure; DXGI AlphaMode is immutable afterwards.
     context.configure_surface(&surface);
+    health.check()?;
 
     if matches!(
         alpha_mode,
@@ -1048,8 +1274,13 @@ fn create_window_surface(
 ///
 /// Tries a real GPU first, then falls back to a software adapter (lavapipe on Linux, WARP on
 /// Windows) so a headless terminal still renders on a machine with no display hardware at all.
+///
+/// The instance is created once per process. Creating a Vulkan instance loads every installed ICD,
+/// and some (NVIDIA's) open `$DISPLAY` while doing so; a stale forwarded X display costs seconds
+/// per attempt. Adapters are still requested afresh, so device-loss recovery gets a new device.
 fn offscreen_device() -> Result<(wgpu::Device, wgpu::Queue), Error> {
-    let instance = wgpu::Instance::default();
+    static INSTANCE: LazyLock<wgpu::Instance> = LazyLock::new(wgpu::Instance::default);
+    let instance = &*INSTANCE;
 
     let mut attempts = Vec::new();
     for (power, fallback) in [
@@ -1061,6 +1292,7 @@ fn offscreen_device() -> Result<(wgpu::Device, wgpu::Queue), Error> {
             power_preference: power,
             force_fallback_adapter: fallback,
             compatible_surface: None,
+            apply_limit_buckets: false,
         };
         match block_on(instance.request_adapter(&options)) {
             Ok(adapter) => {
@@ -1192,16 +1424,45 @@ pub(crate) fn gpu_test_lock() -> std::sync::MutexGuard<'static, ()> {
     GPU.lock().unwrap_or_else(|err| err.into_inner())
 }
 
+// Debug omits user content and native resources, and never acquires application locks.
+impl std::fmt::Debug for ScreenshotReadback {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ScreenshotReadback").finish_non_exhaustive()
+    }
+}
+
+// Debug omits user content and native resources, and never acquires application locks.
+impl std::fmt::Debug for SceneRenderer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SceneRenderer").finish_non_exhaustive()
+    }
+}
+
+// Debug omits user content and native resources, and never acquires application locks.
+impl std::fmt::Debug for EmbeddedFrame<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EmbeddedFrame").finish_non_exhaustive()
+    }
+}
+
+// Debug omits user content and native resources, and never acquires application locks.
+impl std::fmt::Debug for SharedRenderContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SharedRenderContext").finish_non_exhaustive()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        RenderSource, SceneRenderer, SharedRenderContext, clamp_render_size, embedded_copy_extent,
-        frame_copy_regions, gpu_test_lock as gpu_lock, offscreen_device, premultiply_blend_state,
-        screenshot_layout, shutdown_window_render_context, surface_alpha_mode,
-        window_render_context,
+        Error, RenderSource, SceneRenderer, SharedRenderContext, clamp_render_size,
+        embedded_copy_extent, frame_copy_regions, gpu_test_lock as gpu_lock, offscreen_device,
+        premultiply_blend_state, retire_window_render_context, screenshot_layout,
+        shutdown_window_render_context, surface_alpha_mode, window_render_context,
     };
     use std::rc::Rc;
 
+    use pollster::block_on;
     use vello::peniko::Color;
     use vello::wgpu::CompositeAlphaMode;
     use vello::{Scene, kurbo};
@@ -1352,6 +1613,64 @@ mod tests {
     }
 
     #[test]
+    fn device_loss_during_resize_returns_an_error_and_a_rebuild_renders_again() {
+        let _gpu = gpu_lock();
+        if offscreen_device().is_err() {
+            eprintln!("Skipping device-loss test: no wgpu adapter");
+            return;
+        }
+        let mut renderer =
+            SceneRenderer::new(RenderSource::Offscreen, PhysicalSize::new(32, 16), false)
+                .expect("offscreen renderer");
+        renderer.render(&Scene::new(), Color::BLACK).expect("first frame");
+        renderer.device.destroy();
+        // `destroy` reports the loss only once the queue drains, and the first frame may still be
+        // in flight; wait so the loss is known before the resize, as with a real device loss.
+        let _ = renderer.device.poll(wgpu::PollType::wait_indefinitely());
+
+        // This was the Windows crash: resizing used the lost device's invalid texture and
+        // panicked in Texture::create_view before Display could enter renderer recovery.
+        renderer.resize(PhysicalSize::new(48, 24));
+        assert!(renderer.gpu_failed());
+        assert!(!renderer.has_rendered_frame());
+        assert!(matches!(
+            renderer.render(&Scene::new(), Color::BLACK),
+            Err(Error::GpuUnavailable(_))
+        ));
+        renderer
+            .rebuild(RenderSource::Offscreen, PhysicalSize::new(48, 24), false)
+            .expect("replace lost device");
+        assert!(renderer.render(&Scene::new(), Color::BLACK).expect("recovered frame"));
+        assert!(!renderer.gpu_failed());
+    }
+
+    #[test]
+    fn a_failed_shared_device_is_replaced_once_for_all_recovering_windows() {
+        let _gpu = gpu_lock();
+        shutdown_window_render_context();
+        let old = window_render_context();
+        let health = {
+            let mut state = old.0.borrow_mut();
+            let Some(id) = block_on(state.context.device(None)) else {
+                eprintln!("Skipping shared device-loss test: no wgpu adapter");
+                shutdown_window_render_context();
+                return;
+            };
+            let health = state.health_for(id);
+            state.context.devices[id].device.destroy();
+            let _ = state.context.devices[id].device.poll(vello::wgpu::PollType::Poll);
+            health
+        };
+        assert!(health.failed());
+        let recovered = window_render_context();
+        assert!(!Rc::ptr_eq(&old.0, &recovered.0), "a lost cached device must not be reused");
+        retire_window_render_context(&old);
+        let second_window = window_render_context();
+        assert!(Rc::ptr_eq(&recovered.0, &second_window.0), "recovery still shares one context");
+        shutdown_window_render_context();
+    }
+
+    #[test]
     fn window_renderers_reuse_the_thread_render_context() {
         let _gpu = gpu_lock();
         let first = window_render_context();
@@ -1381,6 +1700,44 @@ mod tests {
         let first = context.0.borrow_mut().renderer_for(0, &device).expect("first renderer");
         let second = context.0.borrow_mut().renderer_for(0, &device).expect("shared renderer");
         assert!(Rc::ptr_eq(&first, &second));
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn offscreen_windows_share_setup_keep_pixels_separate_and_recover_together() {
+        let _gpu = gpu_lock();
+        shutdown_window_render_context();
+        let size = PhysicalSize::new(32, 16);
+        let Ok(mut first) = SceneRenderer::new(RenderSource::Offscreen, size, false) else {
+            eprintln!("Skipping offscreen sharing test: no wgpu adapter");
+            return;
+        };
+        let mut second = SceneRenderer::new(RenderSource::Offscreen, size, false).expect("second");
+        assert!(Rc::ptr_eq(&first.renderer, &second.renderer));
+        first.render(&Scene::new(), Color::from_rgb8(255, 0, 0)).expect("red frame");
+        second.render(&Scene::new(), Color::from_rgb8(0, 0, 255)).expect("blue frame");
+        for (renderer, expected) in [(&first, [255, 0, 0, 255]), (&second, [0, 0, 255, 255])] {
+            let readback = renderer.begin_screenshot().expect("screenshot");
+            let pixels = loop {
+                if let Some(pixels) = renderer.poll_screenshot(&readback).expect("readback") {
+                    break pixels;
+                }
+            };
+            assert_eq!(&pixels.bytes[..4], &expected);
+        }
+
+        let old_renderer = Rc::clone(&first.renderer);
+        first.device.destroy();
+        let _ = first.device.poll(wgpu::PollType::wait_indefinitely());
+        assert!(first.gpu_failed());
+        assert!(second.gpu_failed());
+        first.rebuild(RenderSource::Offscreen, size, false).expect("first recovery");
+        second.rebuild(RenderSource::Offscreen, size, false).expect("second recovery");
+        assert!(!Rc::ptr_eq(&old_renderer, &first.renderer));
+        assert!(Rc::ptr_eq(&first.renderer, &second.renderer));
+        assert!(first.render(&Scene::new(), Color::BLACK).expect("first recovered frame"));
+        assert!(second.render(&Scene::new(), Color::BLACK).expect("second recovered frame"));
+        shutdown_window_render_context();
     }
 
     /// Render a solid frame with no windowing system and read the pixels back.
@@ -1436,8 +1793,17 @@ mod tests {
     #[cfg(any(unix, windows))]
     #[test]
     fn media_text_layers_have_separate_gpu_targets() {
-        use crate::vivid::scene::{Frame, RgbaBuffer, SharedScene};
+        use std::io::Write;
         use std::sync::Arc;
+
+        use base64::Engine;
+        use flate2::{Compression, write::ZlibEncoder};
+
+        use crate::display::kitty::KittyFrame;
+        use crate::terminal::event::VoidListener;
+        use crate::terminal::term::{Config, Term};
+        use crate::terminal::vvte::ansi;
+        use crate::vivid::scene::{Frame, RgbaBuffer, SharedScene};
         use vivid_protocol::{
             cbor::Value,
             identity::{PresenterInstanceId, SessionIdentity},
@@ -1562,9 +1928,10 @@ mod tests {
         }
         let mut renderer =
             SceneRenderer::new(RenderSource::Offscreen, PhysicalSize::new(64, 32), false).unwrap();
-        renderer.set_vivid_scene(shared);
+        renderer.set_vivid_scene(shared.clone());
         let size = crate::display::SizeInfo::new(64., 32., 8., 8., 0., 0., false);
-        let media = renderer.prepare_media(&size, 0).unwrap();
+        let no_images = crate::display::kitty::KittyFrame::default();
+        let media = renderer.prepare_media(&size, 0, &no_images).unwrap();
         assert!(media.layers.iter().all(Option::is_some));
         let mut scene = Scene::new();
         scene.draw_image(media.layers[0].as_ref().unwrap(), kurbo::Affine::IDENTITY);
@@ -1606,8 +1973,202 @@ mod tests {
         assert_eq!(pixel(24, 8), [0, 255, 0, 255], "layer one belongs below glyph/cursor coverage");
         assert_eq!(pixel(40, 8), [255, 0, 0, 255], "layer two belongs above glyph/cursor coverage");
         let uploads = renderer.media_metrics().uploaded_pixels;
-        assert!(!renderer.prepare_media(&size, 0).unwrap().changed);
+        assert!(!renderer.prepare_media(&size, 0, &no_images).unwrap().changed);
         assert_eq!(renderer.media_metrics().uploaded_pixels, uploads);
+
+        // A pending Kitty replacement retains only the Kitty frame. Vivid frames in every text
+        // layer must keep advancing through the shared compositor, without re-uploading Kitty.
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+        let mut parser = ansi::Processor::new();
+        let data = base64::engine::general_purpose::STANDARD.encode([240; 8 * 8 * 3]);
+        term.advance(
+            &mut parser,
+            format!("\x1b[?1049h\x1b[1;8H\x1b_Ga=T,f=24,s=8,v=8,C=1,q=2;{data}\x1b\\").as_bytes(),
+        );
+        let mut kitty = KittyFrame::default();
+        assert!(kitty.update(&term, &size, 0, true));
+        assert!(renderer.prepare_media(&size, 0, &kitty).unwrap().changed);
+        let kitty_generation = kitty.generation();
+        let uploads = renderer.media_metrics().uploaded_pixels;
+
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
+        encoder.write_all(&[90; 8 * 8 * 3]).unwrap();
+        let data = base64::engine::general_purpose::STANDARD.encode(encoder.finish().unwrap());
+        term.set_deferred_graphics_decode(true);
+        term.advance(
+            &mut parser,
+            format!(
+                "\x1b[?2026h\x1b[2J\x1b[1;8H\x1b_Ga=T,f=24,o=z,s=8,v=8,C=1,q=2;{data}\x1b\\\x1b[?2026l"
+            )
+            .as_bytes(),
+        );
+        let jobs = term.take_graphics_jobs();
+        assert_eq!(jobs.len(), 1);
+
+        for (frame_id, rgba) in [(2, [0, 0, 255, 255]), (3, [0, 255, 255, 255])] {
+            assert!(!kitty.update(&term, &size, 0, true));
+            assert_eq!(kitty.generation(), kitty_generation);
+            for layer in 0..3 {
+                shared
+                    .publish_frame(
+                        context.surface(layer + 1).unwrap().track(1).unwrap(),
+                        ChannelGeneration::ONE,
+                        80,
+                        1,
+                        frame_id,
+                        true,
+                        frame_id + 1,
+                        Frame {
+                            frame_id,
+                            pts_us: frame_id as i64,
+                            width: 1,
+                            height: 1,
+                            sar_num: 1,
+                            sar_den: 1,
+                            alpha_mode: 1,
+                            rgba: Arc::new(RgbaBuffer::new(rgba.to_vec())),
+                            damage: None,
+                        },
+                    )
+                    .unwrap();
+            }
+            let media = renderer.prepare_media(&size, 0, &kitty).unwrap();
+            assert!(media.changed, "a retained Kitty frame must not suppress Vivid updates");
+            let mut scene = Scene::new();
+            for layer in media.layers.iter().flatten() {
+                scene.draw_image(layer, kurbo::Affine::IDENTITY);
+            }
+            renderer.render(&scene, Color::BLACK).unwrap();
+            let readback = renderer.begin_screenshot().unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let pixels = loop {
+                if let Some(pixels) = renderer.poll_screenshot(&readback).unwrap() {
+                    break pixels;
+                }
+                assert!(std::time::Instant::now() < deadline);
+                std::thread::yield_now();
+            };
+            let pixel = |x: usize| {
+                let offset = pixels.padded_bytes_per_row as usize + x * 4;
+                &pixels.bytes[offset..offset + 4]
+            };
+            for x in [1, 17, 33] {
+                assert_eq!(pixel(x), rgba, "Vivid frame {frame_id}, column {x}");
+            }
+            assert_eq!(pixel(57), [240, 240, 240, 255], "Kitty keeps its previous pixels");
+        }
+        assert_eq!(renderer.media_metrics().uploaded_pixels, uploads + 6);
+        term.finish_graphics_jobs(jobs.into_iter().map(|job| job.run()).collect());
+        assert!(kitty.update(&term, &size, 0, true));
+        assert!(renderer.prepare_media(&size, 0, &kitty).unwrap().changed);
+        assert_eq!(renderer.media_metrics().uploaded_pixels, uploads + 6 + 8 * 8);
+    }
+
+    /// Kitty images share the three media targets, selected by z-index: far-negative under cell
+    /// backgrounds, negative under text, the rest over it. No Vivid scene is attached here, so
+    /// this also covers the compositor drawing images on its own.
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn kitty_images_composite_into_the_layer_their_z_index_names() {
+        use base64::Engine;
+
+        use crate::display::kitty::KittyFrame;
+        use crate::terminal::event::VoidListener;
+        use crate::terminal::term::{Config, Term};
+        use crate::terminal::vvte::ansi;
+
+        let _gpu = gpu_lock();
+        if offscreen_device().is_err() {
+            eprintln!("Skipping Kitty layer rendering test: no wgpu adapter");
+            return;
+        }
+        // Eight columns by four lines of 8x8 cells.
+        let size = crate::display::SizeInfo::new(64., 32., 8., 8., 0., 0., false);
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+        let mut parser = ansi::Processor::new();
+        let mut image = |id: u32, rgba: [u8; 4], placements: &str| {
+            let data = base64::engine::general_purpose::STANDARD.encode(rgba.repeat(64));
+            let bytes = format!("\x1b_Ga=t,i={id},s=8,v=8,q=2;{data}\x1b\\{placements}");
+            term.advance(&mut parser, bytes.as_bytes());
+        };
+        // Red under the backgrounds, at column 0 and again at column 5.
+        image(
+            1,
+            [255, 0, 0, 255],
+            "\x1b[1;1H\x1b_Ga=p,i=1,C=1,z=-1073741825,q=2\x1b\\\x1b[1;6H\x1b_Ga=p,i=1,C=1,\
+             z=-1073741825,p=2,q=2\x1b\\",
+        );
+        // Yellow under the text at column 1, white over it at column 2.
+        image(2, [255, 255, 0, 255], "\x1b[1;2H\x1b_Ga=p,i=2,C=1,z=-1,q=2\x1b\\");
+        image(3, [255, 255, 255, 255], "\x1b[1;3H\x1b_Ga=p,i=3,C=1,q=2\x1b\\");
+        // Half-transparent red at column 6, line 2.
+        image(4, [255, 0, 0, 128], "\x1b[3;7H\x1b_Ga=p,i=4,C=1,q=2\x1b\\");
+
+        let mut frame = KittyFrame::default();
+        assert!(frame.update(&term, &size, 0, true));
+        assert_eq!(frame.quads().len(), 5);
+
+        let mut renderer =
+            SceneRenderer::new(RenderSource::Offscreen, PhysicalSize::new(64, 32), false).unwrap();
+        let media = renderer.prepare_media(&size, 0, &frame).unwrap();
+        assert!(media.changed);
+        assert!(media.layers.iter().all(Option::is_some));
+        let fill = |scene: &mut Scene, color: Color, rect: kurbo::Rect| {
+            scene.fill(vello::peniko::Fill::NonZero, kurbo::Affine::IDENTITY, color, None, &rect);
+        };
+        let mut scene = Scene::new();
+        scene.draw_image(media.layers[0].as_ref().unwrap(), kurbo::Affine::IDENTITY);
+        // Cell backgrounds over the left half only.
+        fill(&mut scene, Color::from_rgb8(0, 0, 255), kurbo::Rect::new(0., 0., 32., 32.));
+        scene.draw_image(media.layers[1].as_ref().unwrap(), kurbo::Affine::IDENTITY);
+        // Glyph coverage across the lower half of the yellow and the white image.
+        fill(&mut scene, Color::from_rgb8(0, 255, 0), kurbo::Rect::new(8., 4., 24., 8.));
+        scene.draw_image(media.layers[2].as_ref().unwrap(), kurbo::Affine::IDENTITY);
+        renderer.render(&scene, Color::BLACK).unwrap();
+
+        let readback = renderer.begin_screenshot().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let pixels = loop {
+            if let Some(pixels) = renderer.poll_screenshot(&readback).unwrap() {
+                break pixels;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        };
+        let pixel = |x: usize, y: usize| {
+            let offset = y * pixels.padded_bytes_per_row as usize + x * 4;
+            &pixels.bytes[offset..offset + 4]
+        };
+        assert_eq!(pixel(4, 4), [0, 0, 255, 255], "far-negative z is hidden by a cell background");
+        assert_eq!(pixel(44, 4), [255, 0, 0, 255], "and shows where there is none");
+        assert_eq!(pixel(12, 2), [255, 255, 0, 255], "negative z is above cell backgrounds");
+        assert_eq!(pixel(12, 6), [0, 255, 0, 255], "and below glyph coverage");
+        assert_eq!(pixel(20, 6), [255, 255, 255, 255], "zero z is above glyph coverage");
+        assert_eq!(pixel(28, 4), [0, 0, 255, 255], "nothing is drawn where nothing was placed");
+        let blended = pixel(52, 20);
+        assert!(
+            blended[0].abs_diff(128) <= 2 && blended[1] == 0 && blended[2] == 0,
+            "straight alpha is premultiplied on the way in: {blended:?}"
+        );
+
+        // Image 1 is placed twice and uploaded once; a frame that did not change uploads nothing.
+        let uploads = renderer.media_metrics();
+        assert_eq!((uploads.frames, uploads.uploaded_pixels), (4, 4 * 64));
+        assert!(!renderer.prepare_media(&size, 0, &frame).unwrap().changed);
+        assert_eq!(renderer.media_metrics().uploaded_pixels, uploads.uploaded_pixels);
+
+        // Replacing an image with another of its size is one more upload, and deleting them all
+        // empties the layers without any.
+        term.advance(&mut parser, b"\x1b[1;3H");
+        let data = base64::engine::general_purpose::STANDARD.encode([0, 255, 255, 255].repeat(64));
+        term.advance(&mut parser, format!("\x1b_Ga=T,i=3,s=8,v=8,C=1,q=2;{data}\x1b\\").as_bytes());
+        assert!(frame.update(&term, &size, 0, false));
+        assert!(renderer.prepare_media(&size, 0, &frame).unwrap().changed);
+        assert_eq!(renderer.media_metrics().frames, 5);
+        term.advance(&mut parser, b"\x1b_Ga=d,d=A\x1b\\");
+        assert!(frame.update(&term, &size, 0, false));
+        assert!(renderer.prepare_media(&size, 0, &frame).unwrap().changed);
+        assert_eq!(renderer.media_metrics().frames, 5);
     }
 
     #[cfg(any(unix, windows))]

@@ -13,7 +13,7 @@ use winit::event::TouchPhase;
 use winit::event::{
     ElementState, Event as WinitEvent, KeyEvent, MouseButton, StartCause, WindowEvent,
 };
-use winit::event_loop::{ActiveEventLoop, EventLoop};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{CursorIcon, Fullscreen, ResizeDirection, Window, WindowId};
 
@@ -80,7 +80,19 @@ pub struct TabbedApplication {
     touch_capture: std::collections::HashSet<u64>,
 }
 
+impl std::fmt::Debug for TabbedApplication {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TabbedApplication")
+            .field("chrome_id", &self.chrome_id)
+            .field("tabs", &self.tabs)
+            .field("closing", &self.closing)
+            .finish_non_exhaustive()
+    }
+}
+
 impl TabbedApplication {
+    /// Create a tab host and claim its application-level automation methods.
     pub fn new(mut processor: Processor, config: UiConfig) -> Self {
         let initial_options = processor.take_initial_window_options();
         processor.claim_ipc_methods(&CLAIMED_METHODS);
@@ -112,6 +124,7 @@ impl TabbedApplication {
         }
     }
 
+    /// Run the tab host, returning its processor and event-loop outcome.
     pub fn run(mut self, event_loop: EventLoop<Event>) -> (Processor, Result<(), Box<dyn Error>>) {
         let result = event_loop.run_app(&mut self).map_err(|error| error.into());
         (self.processor, result)
@@ -484,13 +497,45 @@ impl TabbedApplication {
         }
     }
 
+    /// Close one tab at the user's request, asking first if its terminal is running a program.
     fn close_tab(&mut self, index: usize) {
         let Some(window_id) = self.tabs.as_slice().get(index).map(|tab| tab.window_id) else {
             return;
         };
+        if !self.confirm_closing(&[window_id], "Close this tab?", "this tab", "Close") {
+            return;
+        }
         if let Some(window) = self.processor.window_mut(window_id) {
             window.request_close();
         }
+    }
+
+    /// Quit at the user's request, asking first if any tab is running a program.
+    fn quit(&mut self, event_loop: &ActiveEventLoop) {
+        let ids = self.tabs.as_slice().iter().map(|tab| tab.window_id).collect::<Vec<_>>();
+        if self.confirm_closing(&ids, "Quit Vivido?", "Vivido", "Quit") {
+            self.close_all();
+            event_loop.exit();
+        }
+    }
+
+    /// Whether closing these terminals may go ahead: silently when none is running a program,
+    /// otherwise only if the user confirms.
+    fn confirm_closing(
+        &self,
+        windows: &[WindowId],
+        title: &str,
+        subject: &str,
+        action: &str,
+    ) -> bool {
+        let programs = self.processor.running_programs(windows.iter().copied());
+        programs.is_empty()
+            || super::confirm_close(
+                self.chrome
+                    .as_deref()
+                    .map(|chrome| chrome as &dyn winit::raw_window_handle::HasWindowHandle),
+                &super::CloseConfirmation { title, subject, action, programs: &programs },
+            )
     }
 
     fn close_all(&mut self) {
@@ -526,15 +571,20 @@ impl TabbedApplication {
         }
     }
 
+    /// Label a tab by its current folder. Windows always does, like Vivida; elsewhere a title a
+    /// program set wins, and the folder stands in until one is set or after it is cleared.
     fn tab_title(&self, window_id: WindowId) -> Option<String> {
         let window = self.processor.window(window_id)?;
-        #[cfg(windows)]
+        #[cfg(not(windows))]
+        if let Some(title) = window.explicit_title() {
+            return Some(title.to_owned());
+        }
         if let Some(directory) = window.display_directory().or_else(|| {
             self.tab_options
                 .get(&window_id)
                 .and_then(|options| options.terminal_options.working_directory.clone())
         }) {
-            return Some(directory_tab_title(&directory));
+            return Some(crate::window_context::directory_tab_title(&directory));
         }
         Some(window.title().to_owned())
     }
@@ -758,10 +808,7 @@ impl TabbedApplication {
                         chrome.set_maximized(!chrome.is_maximized());
                     }
                 },
-                AccessibilityCommand::CloseWindow => {
-                    self.close_all();
-                    event_loop.exit();
-                },
+                AccessibilityCommand::CloseWindow => self.quit(event_loop),
             }
         }
     }
@@ -814,8 +861,7 @@ impl TabbedApplication {
     fn click_chrome(&mut self, event_loop: &ActiveEventLoop) {
         let Some(position) = self.cursor else { return };
         if self.hits.close.contains(position.x, position.y) {
-            self.close_all();
-            event_loop.exit();
+            self.quit(event_loop);
             return;
         }
         if self.hits.minimize.contains(position.x, position.y) {
@@ -1006,10 +1052,7 @@ impl TabbedApplication {
             accessibility.process_event(chrome, &event);
         }
         match event {
-            WindowEvent::CloseRequested => {
-                self.close_all();
-                event_loop.exit();
-            },
+            WindowEvent::CloseRequested => self.quit(event_loop),
             WindowEvent::Resized(size) => {
                 self.close_menu();
                 if let (Some(renderer), Some(chrome)) = (&mut self.renderer, &self.chrome) {
@@ -1251,6 +1294,21 @@ impl ApplicationHandler<Event> for TabbedApplication {
         if self.processor.has_pending_embedded_redraw() {
             self.request_redraw();
         }
+        if let Some(deadline) = self.renderer.as_ref().and_then(ChromeRenderer::recovery_deadline) {
+            if Instant::now() >= deadline {
+                self.request_redraw();
+            } else {
+                match event_loop.control_flow() {
+                    ControlFlow::Wait => {
+                        event_loop.set_control_flow(ControlFlow::WaitUntil(deadline))
+                    },
+                    ControlFlow::WaitUntil(current) if deadline < current => {
+                        event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
+                    },
+                    _ => (),
+                }
+            }
+        }
     }
 
     fn exiting(&mut self, event_loop: &ActiveEventLoop) {
@@ -1270,39 +1328,10 @@ impl ApplicationHandler<Event> for TabbedApplication {
     }
 }
 
-/// Display native Windows and WSL directories using the same folder-only labels as Vivida.
-#[cfg(windows)]
-fn directory_tab_title(directory: &std::path::Path) -> String {
-    let path = directory.to_string_lossy();
-    let name = path.trim_end_matches(['/', '\\']).rsplit(['/', '\\']).next().unwrap_or_default();
-    let name = name
-        .chars()
-        .map(|character| if character.is_control() { ' ' } else { character })
-        .collect::<String>();
-    let name = name.trim();
-    if name.is_empty() { "root".to_owned() } else { name.to_owned() }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use winit::dpi::PhysicalSize;
-
-    #[cfg(windows)]
-    #[test]
-    fn tab_labels_use_the_current_folder_for_windows_and_wsl() {
-        for (path, expected) in [
-            (r"C:\Users\dev\project", "project"),
-            ("/home/dev/project/", "project"),
-            (r"\\wsl.localhost\Ubuntu\home\dev\project\", "project"),
-            ("/", "root"),
-            (r"C:\", "C:"),
-            ("/home/dev/another", "another"),
-            ("/home/dev/my project", "my project"),
-        ] {
-            assert_eq!(directory_tab_title(std::path::Path::new(path)), expected);
-        }
-    }
 
     fn direction(x: f64, y: f64) -> Option<ResizeDirection> {
         resize_direction_at(PhysicalSize::new(800, 600), 1.0, PhysicalPosition::new(x, y))

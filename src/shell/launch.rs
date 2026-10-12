@@ -18,7 +18,9 @@ pub enum LaunchAction {
 /// One row of the launch menu.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LaunchEntry {
+    /// User-visible label.
     pub label: String,
+    /// Action to execute.
     pub action: LaunchAction,
 }
 

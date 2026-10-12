@@ -21,9 +21,6 @@ use crate::message_bar::{Message, MessageType};
 /// Logging target for IPC config error messages.
 pub const LOG_TARGET_IPC_CONFIG: &str = "vivido_log_window_config";
 
-/// Name for the environment variable containing the log file's path.
-const VIVIDO_LOG_ENV: &str = "VIVIDO_LOG";
-
 /// Logging target for config error messages.
 pub const LOG_TARGET_CONFIG: &str = "vivido_config_derive";
 
@@ -56,6 +53,10 @@ const ALLOWED_TARGETS: &[&str] = &[
 ];
 
 /// Initialize the logger to its defaults.
+///
+/// # Errors
+///
+/// Returns an error when another global logger has already been installed.
 pub fn initialize(
     options: &Options,
     event_proxy: EventSink,
@@ -102,17 +103,11 @@ impl Logger {
             Err(_) => return,
         };
 
-        #[cfg(not(windows))]
-        let env_var = format!("${VIVIDO_LOG_ENV}");
-        #[cfg(windows)]
-        let env_var = format!("%{}%", VIVIDO_LOG_ENV);
-
         let message = format!(
-            "[{}] {}\nSee log at {} ({})",
+            "[{}] {}\nSee log at {}",
             record.level(),
-            record.args(),
+            redact(&record.args().to_string()),
             logfile_path,
-            env_var,
         );
 
         let mut message = Message::new(message, message_type);
@@ -157,26 +152,98 @@ impl log::Log for Logger {
     fn flush(&self) {}
 }
 
-fn create_log_message(record: &log::Record<'_>, target: &str, start: Instant) -> String {
-    let runtime = start.elapsed();
-    let secs = runtime.as_secs();
-    let nanos = runtime.subsec_nanos();
-    let mut message = format!("[{}.{:0>9}s] [{:<5}] [{}] ", secs, nanos, record.level(), target);
-
-    // Alignment for the lines after the first new line character in the payload. We don't deal
-    // with fullwidth/unicode chars here, so just `message.len()` is sufficient.
-    let alignment = message.len();
-
-    // Push lines with added extra padding on the next line, which is trimmed later.
-    let lines = record.args().to_string();
-    for line in lines.split('\n') {
-        let line = format!("{}\n{:width$}", line, "", width = alignment);
-        message.push_str(&line);
+/// Redact sensitive keys, identifying paths, URLs, and long hexadecimal capability material.
+///
+/// This is defense in depth for legacy messages. Call sites must never interpolate secrets or
+/// arbitrary client text; use named scalar fields and stable event messages instead.
+fn redact(message: &str) -> String {
+    let mut result = String::new();
+    let mut redact_next = false;
+    for word in message.split_whitespace() {
+        if result.len() >= 4096 {
+            result.push_str(" [truncated]");
+            break;
+        }
+        let lower = word.to_ascii_lowercase();
+        let sensitive =
+            ["secret", "password", "token", "ticket", "channel_key", "lease_key", "resume_key"]
+                .iter()
+                .any(|key| lower.contains(key));
+        let path_or_url = word.trim_start_matches(['\"', '\'', '(', '[']).starts_with('/')
+            || word.contains(":\\")
+            || word.contains("=/")
+            || word.contains("https://")
+            || word.contains("http://");
+        let capability = word.split(|c: char| !c.is_ascii_hexdigit()).any(|part| part.len() >= 32);
+        if !result.is_empty() {
+            result.push(' ');
+        }
+        if redact_next || sensitive || path_or_url || capability {
+            result.push_str("[redacted]");
+        } else {
+            // The JSON encoder escapes control characters; bound each retained token as well.
+            for ch in word.chars().take(256) {
+                result.push(ch);
+            }
+        }
+        redact_next = sensitive && !word.contains('=');
     }
+    result
+}
 
-    // Drop extra trailing alignment.
-    message.truncate(message.len() - alignment);
-    message
+struct LogFields(serde_json::Map<String, serde_json::Value>);
+
+impl<'kvs> log::kv::VisitSource<'kvs> for LogFields {
+    fn visit_pair(
+        &mut self,
+        key: log::kv::Key<'kvs>,
+        value: log::kv::Value<'kvs>,
+    ) -> Result<(), log::kv::Error> {
+        // Unknown fields are private by default, including paths, commands and credentials.
+        let name = key.as_str();
+        let value = if [
+            "event",
+            "error_kind",
+            "fault_id",
+            "class",
+            "window_id",
+            "connection_id",
+            "count",
+            "bytes",
+            "elapsed_ms",
+        ]
+        .contains(&name)
+        {
+            if let Some(value) = value.to_u64() {
+                serde_json::json!(value)
+            } else if let Some(value) = value.to_bool() {
+                serde_json::json!(value)
+            } else {
+                serde_json::json!(redact(&value.to_string()))
+            }
+        } else {
+            serde_json::json!("[redacted]")
+        };
+        if self.0.len() < 32 {
+            self.0.insert(name.chars().take(64).collect(), value);
+        }
+        Ok(())
+    }
+}
+
+fn create_log_message(record: &log::Record<'_>, _target: &str, start: Instant) -> String {
+    let mut fields = LogFields(serde_json::Map::new());
+    let _ = record.key_values().visit(&mut fields);
+    let event = fields.0.remove("event").unwrap_or_else(|| serde_json::json!("legacy_message"));
+    let record = serde_json::json!({
+        "elapsed_ms": start.elapsed().as_millis(),
+        "level": record.level().as_str(),
+        "target": record.target(),
+        "event": event,
+        "message": redact(&record.args().to_string()),
+        "fields": fields.0,
+    });
+    format!("{record}\n")
 }
 
 /// Check if log messages from a crate should be logged.
@@ -197,9 +264,6 @@ impl OnDemandLogFile {
     fn new() -> Self {
         let mut path = env::temp_dir();
         path.push(format!("Vivido-{}.log", process::id()));
-
-        // Set log path as an environment variable.
-        unsafe { env::set_var(VIVIDO_LOG_ENV, path.as_os_str()) };
 
         OnDemandLogFile { path, file: None, created: Arc::new(AtomicBool::new(false)) }
     }
@@ -243,5 +307,43 @@ impl Write for OnDemandLogFile {
 
     fn flush(&mut self) -> Result<(), io::Error> {
         self.file()?.flush()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn structured_fields_survive_and_sensitive_fields_are_private_by_default() {
+        let fields = [
+            ("event", "client_fault"),
+            ("fault_id", "17"),
+            ("password", "synthetic-password"),
+            ("unclassified", "synthetic-secret"),
+        ];
+        let record = log::Record::builder()
+            .args(format_args!("Client worker stopped"))
+            .target("vivido::worker")
+            .level(Level::Error)
+            .key_values(&fields)
+            .build();
+        let encoded = create_log_message(&record, "vivido", Instant::now());
+        let decoded: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded["event"], "client_fault");
+        assert_eq!(decoded["fields"]["fault_id"], "17");
+        assert!(!encoded.contains("synthetic-password"));
+        assert!(!encoded.contains("synthetic-secret"));
+    }
+
+    #[test]
+    fn legacy_context_redacts_paths_capabilities_and_named_credentials() {
+        let message = redact(
+            "Failed /Users/private/config.toml token=synthetic-token password: synthetic-password 0123456789abcdef0123456789abcdef",
+        );
+        assert!(!message.contains("private"));
+        assert!(!message.contains("synthetic"));
+        assert!(!message.contains("012345"));
+        assert!(message.starts_with("Failed"));
     }
 }

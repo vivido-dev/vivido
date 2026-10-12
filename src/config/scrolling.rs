@@ -7,6 +7,7 @@ pub const MAX_SCROLLBACK_LINES: u32 = 100_000;
 /// Struct for scrolling related settings.
 #[derive(Serialize, Copy, Clone, Debug, PartialEq, Eq)]
 pub struct Scrolling {
+    /// Number of scroll steps per input step.
     pub multiplier: u8,
 
     /// Show the transient overlay scrollbar for the scrollback.
@@ -22,6 +23,7 @@ impl Default for Scrolling {
 }
 
 impl Scrolling {
+    /// Return the configured maximum scrollback line count.
     pub fn history(self) -> u32 {
         self.history.0
     }

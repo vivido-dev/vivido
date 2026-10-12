@@ -2,13 +2,23 @@
 use super::*;
 use vivid_protocol::overlay::wire::text::styled::StyledText;
 
+/// Text geometry with a token that keeps its measurement resources alive.
 pub struct MeasuredLayout {
+    /// Compiled vector drawing commands.
     pub scene: Scene,
+    /// Width in this value's coordinate system.
     pub width: f64,
+    /// Height in this value's coordinate system.
     pub height: f64,
+    /// Shared lifetime token for measurement resources.
     pub token: Arc<()>,
 }
 
+/// Append shaped text to the supplied vector scene.
+///
+/// # Errors
+///
+/// Returns a vector error when text cannot be laid out or painted within the command contract.
 pub fn paint(
     layout: &parley::Layout<usize>,
     text: &StyledText,
@@ -75,4 +85,11 @@ pub fn paint(
     }
     scene.pop_layer();
     Ok(MeasuredLayout { scene, width: clip_width, height, token: Arc::new(()) })
+}
+
+// Debug omits user content and native resources, and never acquires application locks.
+impl std::fmt::Debug for MeasuredLayout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MeasuredLayout").finish_non_exhaustive()
+    }
 }

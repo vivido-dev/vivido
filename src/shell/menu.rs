@@ -94,10 +94,12 @@ impl NewTabMenu {
         })
     }
 
+    /// Return the menu's physical bounds in chrome coordinates.
     pub fn rect(&self) -> PhysicalRect {
         self.rect
     }
 
+    /// Return launch entries in display order.
     pub fn entries(&self) -> &[LaunchEntry] {
         &self.entries
     }
@@ -140,14 +142,17 @@ impl NewTabMenu {
         true
     }
 
+    /// Return the highlighted entry's index, if any.
     pub fn selected_index(&self) -> Option<usize> {
         self.selected
     }
 
+    /// Return the highlighted launch action, if any.
     pub fn selected(&self) -> Option<&LaunchAction> {
         self.entries.get(self.selected?).map(|entry| &entry.action)
     }
 
+    /// Return the launch action at `index`, if it exists.
     pub fn action(&self, index: usize) -> Option<&LaunchAction> {
         self.entries.get(index).map(|entry| &entry.action)
     }

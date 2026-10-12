@@ -74,6 +74,7 @@ where
     let working_directory =
         working_directory.and_then(|path| CString::new(path.into_os_string().into_vec()).ok());
 
+    // SAFETY: pre_exec uses only async-signal-safe libc operations and prebuilt CStrings; it never locks or allocates.
     unsafe {
         command
             .pre_exec(move || {
@@ -156,6 +157,7 @@ pub fn foreground_process_path(
     master_fd: RawFd,
     shell_pid: u32,
 ) -> Result<PathBuf, Box<dyn Error>> {
+    // SAFETY: tcgetpgrp takes only an integer descriptor and returns an error for a closed or invalid PTY.
     let mut pid = unsafe { libc::tcgetpgrp(master_fd) };
     if pid < 0 {
         pid = shell_pid as pid_t;
@@ -180,12 +182,14 @@ pub fn foreground_process_path(
     master_fd: RawFd,
     shell_pid: u32,
 ) -> Result<PathBuf, Box<dyn Error>> {
+    // SAFETY: The descriptor is borrowed from the live PTY; this query returns only a scalar process-group ID.
     let mut pid = unsafe { libc::tcgetpgrp(master_fd) };
     if pid < 0 {
         pid = shell_pid as pid_t;
     }
     let name = [libc::CTL_KERN, libc::KERN_PROC_CWD, pid];
     let mut buf = [0u8; libc::PATH_MAX as usize];
+    // SAFETY: The MIB and output buffer are live, and the supplied capacity bounds the native write.
     let result = unsafe {
         libc::sysctl(
             name.as_ptr(),
@@ -199,7 +203,9 @@ pub fn foreground_process_path(
     if result != 0 {
         Err(io::Error::last_os_error().into())
     } else {
-        let foreground_path = unsafe { CStr::from_ptr(buf.as_ptr().cast()) }.to_str()?;
+        let foreground_path = CStr::from_bytes_until_nul(&buf)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "unterminated process path"))?
+            .to_str()?;
         Ok(PathBuf::from(foreground_path))
     }
 }
@@ -223,6 +229,7 @@ fn local_hostname() -> &'static str {
 #[cfg(not(windows))]
 fn probe_hostname() -> String {
     let mut buffer = [0u8; 256];
+    // SAFETY: gethostname receives a writable buffer of exactly the supplied length; termination is checked below.
     let result = unsafe { libc::gethostname(buffer.as_mut_ptr().cast(), buffer.len()) };
     if result != 0 {
         return String::new();

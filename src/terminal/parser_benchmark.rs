@@ -1,4 +1,6 @@
 //! Opt-in release throughput measurements. Set VIVIDO_BENCH_WORKLOAD and VIVIDO_BENCH_LAYER to select a workload and layer.
+//! Unoptimized builds default to a single 1 MiB sample: their throughput means nothing, so they
+//! only smoke-test the harness instead of spending minutes on it.
 
 use std::hint::black_box;
 
@@ -44,6 +46,28 @@ fn workload(name: &str) -> Vec<u8> {
                 continue;
             },
             "unicode" => "漢字😀e\u{301}\t\n".as_bytes(),
+            "kitty" => {
+                // One 256x192 frame the way kitim sends video: raw RGBA as base64 in
+                // 4096-character chunks, no image id, the cursor left where it was.
+                use base64::Engine;
+                let mut rgba = vec![255_u8; 256 * 192 * 4];
+                for pixel in rgba.as_chunks_mut::<4>().0 {
+                    pixel[..3].fill(random(256) as u8);
+                }
+                let encoded = base64::engine::general_purpose::STANDARD.encode(&rgba);
+                for (index, chunk) in encoded.as_bytes().chunks(4096).enumerate() {
+                    let more = u8::from((index + 1) * 4096 < encoded.len());
+                    let control = if index == 0 {
+                        format!("\x1b_Ga=T,f=32,s=256,v=192,C=1,q=2,m={more};")
+                    } else {
+                        format!("\x1b_Gq=2,m={more};")
+                    };
+                    data.extend_from_slice(control.as_bytes());
+                    data.extend_from_slice(chunk);
+                    data.extend_from_slice(b"\x1b\\");
+                }
+                continue;
+            },
             "long_escape" => {
                 data.extend_from_slice(b"\x1b]6;");
                 // Match kitty's printable payload, including ordinary `V` candidates.
@@ -70,15 +94,17 @@ fn parser_throughput() {
         None => workload(&name),
     };
     assert!(!data.is_empty());
-    let repetitions =
-        (number("VIVIDO_BENCH_MIB", 64).checked_mul(1024 * 1024).unwrap() / data.len()).max(1);
+    let (default_mib, default_samples) = if cfg!(debug_assertions) { (1, 1) } else { (64, 7) };
+    let repetitions = (number("VIVIDO_BENCH_MIB", default_mib).checked_mul(1024 * 1024).unwrap()
+        / data.len())
+    .max(1);
     let columns = number("VIVIDO_BENCH_COLUMNS", 80);
     let lines = number("VIVIDO_BENCH_LINES", 24);
     assert!(columns >= 2 && lines > 0);
     let size = TermSize::new(columns, lines);
     let chunk_size = number("VIVIDO_BENCH_CHUNK", MAX_LOCKED_READ);
     assert!(chunk_size > 0);
-    let samples_count = number("VIVIDO_BENCH_SAMPLES", 7);
+    let samples_count = number("VIVIDO_BENCH_SAMPLES", default_samples);
     assert!(samples_count > 0 && samples_count % 2 == 1);
     let sync = number("VIVIDO_BENCH_SYNC", 0) != 0;
     let layer_filter = std::env::var("VIVIDO_BENCH_LAYER").ok();

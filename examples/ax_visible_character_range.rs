@@ -48,6 +48,7 @@ mod macos {
             .ok_or_else(|| ProbeError("usage: ax_visible_character_range <PID>".into()))?
             .parse::<i32>()
             .map_err(|error| ProbeError(format!("invalid PID: {error}")))?;
+        // SAFETY: the PID is a scalar identifier; the returned Core Foundation object is retained.
         let application = unsafe { AXUIElement::new_application(pid) };
         let window = elements(&application, AX_WINDOWS)?
             .into_iter()
@@ -109,6 +110,7 @@ mod macos {
             .map_err(|_| ProbeError(format!("{attribute} was not an AXValue")))?;
         let mut range = CFRange::new(0, 0);
         let pointer = NonNull::from(&mut range).cast();
+        // SAFETY: range is initialized, aligned CFRange storage; AXValue checks the requested type.
         if unsafe { value.value(AXValueType::CFRange, pointer) } {
             Ok(range)
         } else {
@@ -123,6 +125,7 @@ mod macos {
         let array = copy_attribute(element, attribute)?
             .downcast::<CFArray>()
             .map_err(|_| ProbeError(format!("{attribute} was not an array")))?;
+        // SAFETY: the downcast proved CFArray; CFType is the common retained element representation.
         let array = unsafe { CFRetained::cast_unchecked::<CFArray<CFType>>(array) };
         Ok(array
             .to_vec()
@@ -137,12 +140,14 @@ mod macos {
     ) -> Result<CFRetained<CFType>, Box<dyn Error>> {
         let name = CFString::from_str(attribute);
         let mut value: *const CFType = null();
+        // SAFETY: element and name are live retained objects and value is writable pointer storage.
         let error = unsafe { element.copy_attribute_value(&name, NonNull::from(&mut value)) };
         if error != AXError::Success {
             return Err(ProbeError(format!("{attribute} query returned {error:?}")).into());
         }
         let value = NonNull::new(value.cast_mut())
             .ok_or_else(|| ProbeError(format!("{attribute} returned no value")))?;
+        // SAFETY: the successful Copy call returned a non-null owned +1 Core Foundation reference.
         Ok(unsafe { CFRetained::from_raw(value) })
     }
 }

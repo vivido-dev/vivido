@@ -352,7 +352,22 @@ waiting until it disconnects, the same as any unanswered request.
   arguments, environment values, Vivid root/resume secrets, channel authenticators, or derived
   capabilities. `current_directory` prefers the shell's OSC 7 report when its host is this
   machine and falls back to the foreground-process probe; over Windows OSC 7 is the only
-  source.
+  source. `running_program` names the program a user-initiated close would stop, or is null
+  when the terminal sits at its shell prompt or has exited: on Unix the foreground process group
+  when it is not the shell's, on Windows a direct child of the shell unless OSC 133 reports the
+  prompt (`"a command"` when integration reports a command the shell runs in-process).
+  `shell_integration` names the shell Vivido started with its integration loaded (`"bash"`,
+  `"zsh"`, `"fish"`, or `"powershell"`), or is null when it loaded none, in which case prompt and
+  command waits resolve only if the shell reports OSC 133 some other way.
+  `message` is the message bar's current entry as `{"type":"info|warning|error","text":…}`, or
+  null when the bar is empty, so a client can read notices such as the terminal-recovery hint
+  that are drawn over the grid rather than written into it. `command_palette` is null while the
+  palette is closed and otherwise `{"query":…,"matches":N,"selected":"Title"}`; drive it with
+  UI-routed keys (`key p --mods Ctrl,Shift --route ui`, one `key` per typed character, then
+  `Enter` or `Escape`). `clipboard_prompt` is null unless a paste or an OSC 52 request is waiting
+  for an answer, and otherwise `{"kind":"paste|read|write","title":…,"highlighted":"Cancel"}`; it
+  never includes the text. It takes UI-routed keys ahead of the palette: `Escape` refuses, and
+  `Enter` takes the highlighted choice, which starts on refusing.
   It also reports `ime_cursor_area`, lightweight native-accessibility state, `vivid_overlay`
   resource/submission counters, and overlay render-cache passes, skips, and target allocations.
   These counters are cumulative and are intended for bounded acceptance and performance probes;
@@ -429,8 +444,12 @@ through 24 hours. CLI duration values accept bare milliseconds or `ms`, `s`, `m`
   the shell sits at a prompt. `wait_command_finish`: params are `timeout` and `target`; resolves
   on the next command finish after registration and returns
   `{"status":"completed","exit_code":E,"elapsed_ms":M,"generation":N}`. Both require OSC 133
-  shell integration markers: a shell that never emits them never resolves these waits, and a
-  finish that already happened never resolves a later `wait_command_finish`.
+  shell integration markers, which Vivido's own integration provides in bash, zsh, fish, and
+  PowerShell (see `shell_integration` in `inspect`): a shell that never emits them never resolves
+  these waits, and a finish that already happened never resolves a later `wait_command_finish`,
+  so register the wait before sending the command. The shell is at its
+  prompt from `A` through `B` (where input begins) until `C` starts a command; `generation`
+  counts `C` markers, so it names commands rather than prompts.
 
 Regex patterns are limited to 8 KiB and use linear-time matching. Disconnecting cancels waits,
 pending tagged input, resize/focus requests, and subscriptions immediately.
@@ -484,8 +503,10 @@ resume material through automation.
 
 ### Transcript and subscriptions
 
-Each window retains a 1 MiB sanitized byte-exact PTY ring after Vivid marker envelopes have been
-removed. `transcript` params are `after_offset`, `max_bytes` (default 65536, maximum 1048576),
+Each window retains a 1 MiB sanitized byte-exact PTY ring after Vivid marker envelopes and Kitty
+graphics commands (`ESC _ G … ESC \`) have been removed. Image data is megabytes of base64 that
+would otherwise push every line of real output out of the ring, so it is neither retained nor
+announced as output. `transcript` params are `after_offset`, `max_bytes` (default 65536, maximum 1048576),
 `raw`, and `target`. JSON results include oldest/start/returned-end/current-end offsets, a truncation
 flag, and base64 data. An explicit evicted offset returns `sequence_gap`. `transcript --raw` decodes
 and writes the exact bytes without a newline.
@@ -505,7 +526,7 @@ An event frame carries the same protocol version as requests and responses. Dist
 presence of `subscription_id`, not by `version`.
 
 Kinds are `screen_changed`, `output`, `frame_presented`, `title_changed`, `directory_changed`,
-`focus_changed`, `resized`, `moved`, `bell`, `child_exit`, `window_created`, `window_closed`, and
+`progress_changed`, `focus_changed`, `resized`, `moved`, `bell`, `child_exit`, `window_created`, `window_closed`, and
 `overflow`, plus `client_fault` and `client_recovered`. The handshake's `event_kinds` is the
 authority and is also the `--events` allowlist: a kind it does not list cannot be subscribed to by
 name. A replayable `client_fault` contains the
@@ -514,7 +535,11 @@ payloads, paths, and capability material are never included. `client_recovered` 
 reset. Output data is split into
 at most 64 KiB chunks with start/end offsets and base64 bytes. Screen-change data contains current
 row replacements. `directory_changed` fires when the local shell reports a new working directory
-through OSC 7 and carries `{"directory":"/path"}`. The process replay ring is bounded by both 4 MiB and 4,096 events.
+through OSC 7 and carries `{"directory":"/path"}`. `progress_changed` fires when an OSC 9;4
+report or a program's spinner title changes the window's progress state or percent, or when a
+stale report expires, the child exits, or terminal recovery clears progress, and carries
+`{"state":"normal|error|indeterminate|paused|none","percent":42}`; `percent` is null for
+`indeterminate` and `none`. `inspect` reports the same object as `progress`. The process replay ring is bounded by both 4 MiB and 4,096 events.
 
 `since_event` atomically replays retained matching events before live delivery. If history is gone,
 the first event is `overflow` with the gap and current window sequences so the client can recover

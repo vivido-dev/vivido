@@ -254,8 +254,8 @@ struct Registry {
 impl Registry {
     /// Publish a session under both the ID its producer uses and the tag its markers carry.
     fn insert_session(&mut self, runtime: Arc<SessionRuntime>) {
-        self.by_tag.insert(runtime.session_tag, runtime.identity.session_id);
-        self.sessions.insert(runtime.identity.session_id, runtime);
+        self.by_tag.insert(runtime.session_tag, runtime.identity.session_id());
+        self.sessions.insert(runtime.identity.session_id(), runtime);
     }
 
     /// Retire one session from both indexes, leaving every other session's entries alone.
@@ -303,6 +303,8 @@ struct ServiceShared {
 enum ActorMessage {
     Record(Record),
     Wake,
+    #[cfg(test)]
+    FaultForTest(Box<dyn FnOnce() + Send>),
 }
 
 /// One accepted connection's claim on the global connection budget.
@@ -732,7 +734,10 @@ impl VividService {
     ///
     /// Only the AccessKit adapters take one, so this is unused on macOS, where the AppKit adapter
     /// builds its own tree. It is kept compiled and type-checked there rather than configured away.
-    #[cfg_attr(not(any(target_os = "linux", target_os = "windows")), allow(dead_code))]
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "windows")),
+        allow(dead_code, reason = "transport helpers are used only on Linux and Windows")
+    )]
     pub(crate) fn accessibility_actions(&self) -> AccessibilityActions {
         AccessibilityActions { shared: Arc::clone(&self.shared) }
     }
@@ -806,7 +811,7 @@ impl VividService {
             if !session.post_control(messages::TARGET_CHANGED, 0, body.clone()) {
                 log::debug!(
                     "could not queue TARGET_CHANGED for Vivid session {}",
-                    session.identity.session_id
+                    session.identity.session_id()
                 );
             }
         }
@@ -1010,7 +1015,7 @@ impl VividService {
         let Some((owner, offer)) = offer else {
             return disposition;
         };
-        let session = lock(&self.shared.registry).sessions.get(&owner.session_id).cloned();
+        let session = lock(&self.shared.registry).sessions.get(&owner.session_id()).cloned();
         let Some(session) = session else {
             return file_drop::LocalDropDisposition::Rejected("The remote receiver disconnected");
         };
@@ -1143,7 +1148,7 @@ impl VividService {
     #[cfg(any(unix, windows))]
     pub(crate) fn automation_track_status(&self, identity: TrackIdentity) -> Option<TrackStatus> {
         let mut status = self.scene.track_status(identity)?;
-        let audio = self.scene.active_track(identity.surface, 2).unwrap_or(identity);
+        let audio = self.scene.active_track(identity.surface(), 2).unwrap_or(identity);
         let pts =
             lock(&self.shared.audio_outputs).get(&audio).and_then(|output| output.clock_pts());
         if let Some((state, pts)) = self.scene.playback_state(identity, pts) {
@@ -1228,21 +1233,21 @@ impl VividService {
         }
         let sessions = lock(&self.shared.registry).sessions.clone();
         for identity in anchors {
-            let Some(session) = sessions.get(&identity.context.session.session_id) else {
+            let Some(session) = sessions.get(&identity.context().session().session_id()) else {
                 continue;
             };
             let body = Envelope::new(
                 0,
                 vec![
-                    (0, Value::Unsigned(identity.context.context_id)),
-                    (1, Value::Unsigned(identity.anchor_id)),
+                    (0, Value::Unsigned(identity.context().context_id())),
+                    (1, Value::Unsigned(identity.anchor_id())),
                     (2, Value::Unsigned(2)),
                 ],
             )
             .encode();
             if let Ok(body) = body {
                 // Reached from the PTY parser on every scroll, clear, and screen swap.
-                session.post_control(record_type, identity.anchor_id, body);
+                session.post_control(record_type, identity.anchor_id(), body);
             }
         }
     }
@@ -1280,7 +1285,10 @@ impl SessionRuntime {
 ///
 /// It holds only the shared service state, so the accessibility thread can use it without
 /// touching window or terminal state.
-#[cfg_attr(not(any(target_os = "linux", target_os = "windows")), allow(dead_code))]
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "windows")),
+    allow(dead_code, reason = "transport helpers are used only on Linux and Windows")
+)]
 #[derive(Clone)]
 pub(crate) struct AccessibilityActions {
     shared: Arc<ServiceShared>,
@@ -1289,7 +1297,10 @@ pub(crate) struct AccessibilityActions {
 impl AccessibilityActions {
     /// The callback an accessibility adapter carries, since it is constructed before the window
     /// that will own it.
-    #[cfg_attr(not(any(target_os = "linux", target_os = "windows")), allow(dead_code))]
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "windows")),
+        allow(dead_code, reason = "transport helpers are used only on Linux and Windows")
+    )]
     pub(crate) fn callback(
         &self,
     ) -> Arc<dyn Fn(vivid_protocol::identity::SurfaceIdentity, u64, AccessibleAction) + Send + Sync>
@@ -1605,7 +1616,7 @@ fn handle_control(
     if egress.overflowed() {
         log::debug!(
             "Vivid session {} closed: the producer stopped draining its control replies",
-            session.identity.session_id
+            session.identity.session_id()
         );
     }
     Ok(())
@@ -1665,6 +1676,11 @@ fn actor_loop(
                 }
             },
             Ok(ActorMessage::Wake) => {},
+            #[cfg(test)]
+            Ok(ActorMessage::FaultForTest(mutate)) => {
+                mutate();
+                panic!("injected actor failure after partial mutation");
+            },
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 shared.actor_timeout_services.fetch_add(1, Ordering::Relaxed);
             },
@@ -1834,12 +1850,12 @@ fn observe_surface(session: &Arc<SessionRuntime>, status: &SurfaceStatus, change
         observation::class::SURFACE,
         ObservationKey {
             record_type: messages::SURFACE_CHANGED,
-            context_id: status.identity.context.context_id,
-            object_id: status.identity.surface_id,
+            context_id: status.identity.context().context_id(),
+            object_id: status.identity.surface_id(),
         },
         vec![
-            (0, Value::Unsigned(status.identity.context.context_id)),
-            (1, Value::Unsigned(status.identity.surface_id)),
+            (0, Value::Unsigned(status.identity.context().context_id())),
+            (1, Value::Unsigned(status.identity.surface_id())),
             (2, Value::Unsigned(status.revision.get())),
             (3, Value::Unsigned(status.generation.get())),
             (4, Value::Unsigned(changed)),
@@ -1853,13 +1869,13 @@ fn observe_track(session: &Arc<SessionRuntime>, status: &TrackStatus, changed: u
         observation::class::TRACK,
         ObservationKey {
             record_type: messages::TRACK_CHANGED,
-            context_id: status.identity.surface.context.context_id,
-            object_id: status.identity.track_id,
+            context_id: status.identity.surface().context().context_id(),
+            object_id: status.identity.track_id(),
         },
         vec![
-            (0, Value::Unsigned(status.identity.surface.context.context_id)),
-            (1, Value::Unsigned(status.identity.surface.surface_id)),
-            (2, Value::Unsigned(status.identity.track_id)),
+            (0, Value::Unsigned(status.identity.surface().context().context_id())),
+            (1, Value::Unsigned(status.identity.surface().surface_id())),
+            (2, Value::Unsigned(status.identity.track_id())),
             (3, Value::Unsigned(status.state.revision.get())),
             (4, Value::Unsigned(status.state.channel_generation.get())),
             (5, Value::Unsigned(changed)),
@@ -1923,7 +1939,7 @@ fn suspend_lease(
     revoke_input(session, grant_reason::SUSPENSION);
     shared.scene.suspend_session(session.identity);
     stop_session_audio(shared, session.identity);
-    let issuer = lock(&shared.registry).sessions.get(&key.0.session_id).cloned();
+    let issuer = lock(&shared.registry).sessions.get(&key.0.session_id()).cloned();
     if let Some(issuer) = issuer {
         if let Ok(body) = Envelope::new(0, payload).encode() {
             // The issuer is a different session with a different reader. Writing its socket from
@@ -1941,7 +1957,7 @@ fn stop_session_audio(shared: &Arc<ServiceShared>, session: SessionIdentity) {
         let mut outputs = lock(&shared.audio_outputs);
         let keys = outputs
             .keys()
-            .filter(|identity| identity.surface.context.session == session)
+            .filter(|identity| identity.surface().context().session() == session)
             .copied()
             .collect::<Vec<_>>();
         keys.into_iter().filter_map(|identity| outputs.remove(&identity)).collect::<Vec<_>>()
@@ -1988,7 +2004,7 @@ fn revoke_lease(
     let _ = lease.machine.revoke();
     let child = lease.child.take();
     let payload = lease.changed_payload(key.1, key.2, reason, Instant::now());
-    let child_runtime = child.and_then(|child| registry.remove_session(child.session_id));
+    let child_runtime = child.and_then(|child| registry.remove_session(child.session_id()));
     drop(registry);
 
     // Release the capacity the lease held back from its owning context.
@@ -2023,7 +2039,7 @@ fn finish_session(shared: &Arc<ServiceShared>, session: &Arc<SessionRuntime>, cl
             && lease.awaiting_first
             && lease.machine.confirm_transport_lost(false).is_ok()
         {
-            registry.remove_session(session.identity.session_id);
+            registry.remove_session(session.identity.session_id());
             return;
         }
     }
@@ -2035,10 +2051,10 @@ fn finish_session(shared: &Arc<ServiceShared>, session: &Arc<SessionRuntime>, cl
     // A leased child closing releases its own lease back to the issuer, unless an unclean loss
     // under cleanup policy one suspends it instead (security §7.1).
     if let Some(key) = session.lease {
-        let issuer = lock(&shared.registry).sessions.get(&key.0.session_id).cloned();
+        let issuer = lock(&shared.registry).sessions.get(&key.0.session_id()).cloned();
         if let Some(issuer) = issuer {
             if !clean && suspend_lease(shared, session, key) {
-                lock(&shared.registry).remove_session(session.identity.session_id);
+                lock(&shared.registry).remove_session(session.identity.session_id());
                 shared.request_frame_wake();
                 return;
             }
@@ -2047,12 +2063,12 @@ fn finish_session(shared: &Arc<ServiceShared>, session: &Arc<SessionRuntime>, cl
         }
     }
     lock(&shared.file_drops).remove_session(session.identity);
-    lock(&shared.registry).remove_session(session.identity.session_id);
+    lock(&shared.registry).remove_session(session.identity.session_id());
     let removed_audio = {
         let mut outputs = lock(&shared.audio_outputs);
         let keys = outputs
             .keys()
-            .filter(|identity| identity.surface.context.session == session.identity)
+            .filter(|identity| identity.surface().context().session() == session.identity)
             .copied()
             .collect::<Vec<_>>();
         keys.into_iter().filter_map(|identity| outputs.remove(&identity)).collect::<Vec<_>>()
@@ -2357,7 +2373,7 @@ fn establish_root_session(
     let mut welcome = Welcome {
         session_id,
         session_tag,
-        root_context_id: root_context.context_id,
+        root_context_id: root_context.context_id(),
         target_generation: target.generation(),
         target_profile: target.profile_name().into(),
         target_descriptor: target.descriptor(),
@@ -2479,7 +2495,7 @@ fn establish_root_session(
             lease.begin_retry_window(Instant::now());
             let generation = lease.machine.resume_generation().get();
             let announcement = lease.changed_payload(key.1, key.2, reason::RESUMED, Instant::now());
-            resumed_announcements.push((key.0.session_id, key.2, announcement));
+            resumed_announcements.push((key.0.session_id(), key.2, announcement));
             let prk = auth::extract_handshake_prk(
                 &session_secret,
                 &hello.client_nonce,
@@ -2493,7 +2509,7 @@ fn establish_root_session(
         },
     };
     let identity = SessionIdentity::new(shared.presenter, session_id).map_err(io::Error::other)?;
-    let root_context = identity.context(root_context.context_id).map_err(io::Error::other)?;
+    let root_context = identity.context(root_context.context_id()).map_err(io::Error::other)?;
     if matches!(principal, Principal::Root) {
         registry.root_nonces.insert(hello.client_nonce, Instant::now() + Duration::from_secs(300));
     }
@@ -2528,8 +2544,8 @@ fn establish_root_session(
         actor_ingress: Mutex::new(None),
         control_shutdown: Mutex::new(None),
         contexts: Mutex::new(HashMap::from([(
-            root_context.context_id,
-            ContextState::root(identity, root_context.context_id, classes, contract)
+            root_context.context_id(),
+            ContextState::root(identity, root_context.context_id(), classes, contract)
                 .map_err(io::Error::other)?,
         )])),
         seen_anchors: Mutex::new(HashSet::new()),
@@ -2625,7 +2641,7 @@ fn dispatch_control(
                     envelope.transaction_id.unwrap_or(record.object_id),
                 )
                 .map_err(ControlError::state)?
-                .context_id,
+                .context_id(),
         )
     } else {
         context_field.and_then(|key| {
@@ -2925,7 +2941,7 @@ fn dispatch_control(
                 .map_err(|_| ControlError::bad_message("invalid context revoke"))?;
             let context_id =
                 map.required_u64(0).map_err(|_| ControlError::bad_message("missing context ID"))?;
-            if context_id == session.root_context.context_id {
+            if context_id == session.root_context.context_id() {
                 return Err(ControlError::bad_state("context cannot be revoked"));
             }
             let mut contexts = lock(&session.contexts);
@@ -3056,8 +3072,8 @@ fn dispatch_control(
                 lock(&shared.overlays).remove_surface(identity);
                 lock(&shared.file_drops).remove_surface(
                     session.identity,
-                    identity.context.context_id,
-                    identity.surface_id,
+                    identity.context().context_id(),
+                    identity.surface_id(),
                 );
             }
             observe_surface(session, &status, SURFACE_CHANGED_GEOMETRY);
@@ -3072,8 +3088,8 @@ fn dispatch_control(
             lock(&shared.overlays).remove_surface(identity);
             lock(&shared.file_drops).remove_surface(
                 session.identity,
-                identity.context.context_id,
-                identity.surface_id,
+                identity.context().context_id(),
+                identity.surface_id(),
             );
             (messages::OK, record.object_id, Ok(messages::ok(request_id)))
         },
@@ -3163,9 +3179,9 @@ fn dispatch_control(
                 }),
             );
             let mut payload = vec![
-                (0, Value::Unsigned(identity.surface.context.context_id)),
-                (1, Value::Unsigned(identity.surface.surface_id)),
-                (2, Value::Unsigned(identity.track_id)),
+                (0, Value::Unsigned(identity.surface().context().context_id())),
+                (1, Value::Unsigned(identity.surface().surface_id())),
+                (2, Value::Unsigned(identity.track_id())),
                 (3, Value::Unsigned(status.state.revision.get())),
                 (4, Value::Unsigned(status.state.channel_generation.get())),
                 (5, Value::Unsigned(CHANNEL_OPEN_DEADLINE_US)),
@@ -3234,7 +3250,8 @@ fn dispatch_control(
                 .scene
                 .track_status(identity)
                 .ok_or_else(|| ControlError::not_found("track does not exist"))?;
-            let audio_identity = shared.scene.active_track(identity.surface, 2).unwrap_or(identity);
+            let audio_identity =
+                shared.scene.active_track(identity.surface(), 2).unwrap_or(identity);
             let audio_pts = lock(&shared.audio_outputs)
                 .get(&audio_identity)
                 .and_then(|output| output.clock_pts());
@@ -3312,9 +3329,9 @@ fn dispatch_control(
                 Envelope::new(
                     request_id,
                     vec![
-                        (0, Value::Unsigned(identity.surface.context.context_id)),
-                        (1, Value::Unsigned(identity.surface.surface_id)),
-                        (2, Value::Unsigned(identity.track_id)),
+                        (0, Value::Unsigned(identity.surface().context().context_id())),
+                        (1, Value::Unsigned(identity.surface().surface_id())),
+                        (2, Value::Unsigned(identity.track_id())),
                         (3, Value::Unsigned(status.state.channel_generation.get())),
                         (4, Value::Unsigned(CHANNEL_OPEN_DEADLINE_US)),
                         (5, Value::Unsigned(status.state.revision.get())),
@@ -3723,7 +3740,7 @@ fn dispatch_control(
             })?;
             let output_identity = if matches!(record.record_type, messages::PLAY | messages::PAUSE)
             {
-                shared.scene.active_track(identity.surface, 2).unwrap_or(identity)
+                shared.scene.active_track(identity.surface(), 2).unwrap_or(identity)
             } else {
                 identity
             };
@@ -4181,7 +4198,10 @@ fn io_error_kind_name(kind: ErrorKind) -> &'static str {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "these established rendering and protocol entry points carry independently required context"
+)]
 fn trace_track_channel_rejected(
     shared: &ServiceShared,
     track: Option<TrackIdentity>,
@@ -4321,18 +4341,7 @@ fn handle_track_channel(
         )?;
         return Err(io::Error::new(ErrorKind::InvalidData, "stale channel generation"));
     }
-    let expected_tag = auth::channel_tag(
-        session.channel_key.expose(),
-        open.session_id,
-        open.context_id,
-        open.surface_id,
-        open.track_id,
-        open.channel_generation,
-        open.track_kind as u32,
-        open.lane as u32,
-        &open.client_nonce,
-    );
-    if !auth::verify_tag(&expected_tag, &open.authentication_tag) {
+    if !open.verify(session.channel_key.expose()) {
         trace_track_channel_rejected(
             shared,
             None,
@@ -4601,9 +4610,9 @@ fn handle_track_channel(
         let body = Envelope::new(
             0,
             vec![
-                (0, Value::Unsigned(identity.surface.context.context_id)),
-                (1, Value::Unsigned(identity.surface.surface_id)),
-                (2, Value::Unsigned(identity.track_id)),
+                (0, Value::Unsigned(identity.surface().context().context_id())),
+                (1, Value::Unsigned(identity.surface().surface_id())),
+                (2, Value::Unsigned(identity.track_id())),
                 (3, Value::Unsigned(error_code)),
                 (4, Value::Unsigned(status.state.revision.get())),
                 (5, Value::Map(vec![])),
@@ -4613,7 +4622,7 @@ fn handle_track_channel(
         .encode()?;
         // This is the track channel's thread, not the session's. Queue so a stalled control peer
         // cannot hold a media connection open past its own failure.
-        session.post_control(messages::TRACK_LOST, identity.track_id, body);
+        session.post_control(messages::TRACK_LOST, identity.track_id(), body);
     }
     match result {
         Ok(_) => Ok(()),
@@ -4719,9 +4728,9 @@ fn classify_audio_step(expected_pts_us: Option<i64>, pts_us: i64, live: bool) ->
 
 fn track_address(identity: TrackIdentity, generation: ChannelGeneration) -> track::TrackAddress {
     track::TrackAddress {
-        context_id: identity.surface.context.context_id,
-        surface_id: identity.surface.surface_id,
-        track_id: identity.track_id,
+        context_id: identity.surface().context().context_id(),
+        surface_id: identity.surface().surface_id(),
+        track_id: identity.track_id(),
         channel_generation: generation,
     }
 }
@@ -4746,7 +4755,7 @@ fn request_keyframe(
                 "reason": reason,
             }),
         );
-        if writer.write_record(messages::NEED_KEYFRAME, identity.track_id, &body).is_ok() {
+        if writer.write_record(messages::NEED_KEYFRAME, identity.track_id(), &body).is_ok() {
             shared.trace(
                 trace::TraceCategory::Recovery,
                 "need_keyframe_written",
@@ -4770,7 +4779,7 @@ fn request_full_frame(
 ) {
     let payload = track::need_full_frame_payload(track_address(identity, generation), reason);
     if let Ok(body) = Envelope::new(0, payload).encode() {
-        let _ = writer.write_record(messages::NEED_FULL_FRAME, identity.track_id, &body);
+        let _ = writer.write_record(messages::NEED_FULL_FRAME, identity.track_id(), &body);
     }
 }
 
@@ -4865,7 +4874,7 @@ fn channel_loop(
             Err(error) => return Err(ChannelFailure::read(error, context)),
         };
         context.begin_record(header.record_type, header.sequence, body.len());
-        if header.object_id != identity.track_id {
+        if header.object_id != identity.track_id() {
             return Err(ChannelFailure::message(
                 ChannelFailureKind::RecordIdentity,
                 ErrorKind::InvalidData,
@@ -5151,7 +5160,7 @@ fn channel_loop(
                     )
                 );
                 let linked_audio =
-                    shared.scene.active_track(identity.surface, scene::SLOT_AUDIO).and_then(
+                    shared.scene.active_track(identity.surface(), scene::SLOT_AUDIO).and_then(
                         |audio_identity| lock(&shared.audio_outputs).get(&audio_identity).cloned(),
                     );
                 // Keep sound and picture together by delaying the sound.
@@ -5426,9 +5435,9 @@ fn channel_loop(
                         .map_or(0, |status| status.state.last_media_id),
                     0,
                 );
-                if eos.required_u64(0).ok() != Some(identity.surface.context.context_id)
-                    || eos.required_u64(1).ok() != Some(identity.surface.surface_id)
-                    || eos.required_u64(2).ok() != Some(identity.track_id)
+                if eos.required_u64(0).ok() != Some(identity.surface().context().context_id())
+                    || eos.required_u64(1).ok() != Some(identity.surface().surface_id())
+                    || eos.required_u64(2).ok() != Some(identity.track_id())
                     || eos.required_u64(3).ok() != Some(generation.get())
                 {
                     return Err(ChannelFailure::message(
@@ -5550,7 +5559,7 @@ fn channel_loop(
             );
             channel_io!(
                 ChannelFailureKind::TransportWrite,
-                writer.write_record(messages::MAX_CHANNEL_DATA, identity.track_id, &grant,)
+                writer.write_record(messages::MAX_CHANNEL_DATA, identity.track_id(), &grant,)
             );
             if recovery_unit || last_flow_trace.elapsed() >= Duration::from_millis(250) {
                 shared.trace(
@@ -5635,7 +5644,7 @@ fn try_start_synchronized(shared: &Arc<ServiceShared>, identity: TrackIdentity) 
     let _transition = lock(&shared.playback_transition);
     let output = shared
         .scene
-        .active_track(identity.surface, scene::SLOT_AUDIO)
+        .active_track(identity.surface(), scene::SLOT_AUDIO)
         .and_then(|id| lock(&shared.audio_outputs).get(&id).cloned());
     if shared.scene.try_start_synchronized(
         identity,
@@ -5671,7 +5680,7 @@ fn wait_until_video_due(
         }
         let audio = shared
             .scene
-            .active_track(identity.surface, scene::SLOT_AUDIO)
+            .active_track(identity.surface(), scene::SLOT_AUDIO)
             .and_then(|identity| lock(&shared.audio_outputs).get(&identity).cloned());
         let Some(audio) = audio else {
             return shared.scene.wait_until_due(identity, pts_us, false).map_err(io::Error::other);
@@ -6004,8 +6013,8 @@ fn serve_lane(
 
 fn surface_ready_payload(status: &SurfaceStatus) -> Vec<(u64, Value)> {
     surface::surface_ready_payload(
-        status.identity.context.context_id,
-        status.identity.surface_id,
+        status.identity.context().context_id(),
+        status.identity.surface_id(),
         status.revision,
         status.generation,
         status.definition.policy,
@@ -6015,8 +6024,8 @@ fn surface_ready_payload(status: &SurfaceStatus) -> Vec<(u64, Value)> {
 
 fn surface_status_payload(status: &SurfaceStatus) -> Vec<(u64, Value)> {
     vec![
-        (0, Value::Unsigned(status.identity.context.context_id)),
-        (1, Value::Unsigned(status.identity.surface_id)),
+        (0, Value::Unsigned(status.identity.context().context_id())),
+        (1, Value::Unsigned(status.identity.surface_id())),
         (2, Value::Unsigned(status.revision.get())),
         (3, Value::Unsigned(status.generation.get())),
         (4, Value::Text(status.definition.semantic_profile.clone())),
@@ -6045,9 +6054,9 @@ fn surface_status_payload(status: &SurfaceStatus) -> Vec<(u64, Value)> {
 
 fn track_status_payload(status: &TrackStatus, include_audio_gain: bool) -> Vec<(u64, Value)> {
     let mut payload = vec![
-        (0, Value::Unsigned(status.identity.surface.context.context_id)),
-        (1, Value::Unsigned(status.identity.surface.surface_id)),
-        (2, Value::Unsigned(status.identity.track_id)),
+        (0, Value::Unsigned(status.identity.surface().context().context_id())),
+        (1, Value::Unsigned(status.identity.surface().surface_id())),
+        (2, Value::Unsigned(status.identity.track_id())),
         (3, Value::Unsigned(status.state.revision.get())),
         (4, Value::Unsigned(status.configuration.kind.kind() as u64)),
         (5, Value::Unsigned(status.configuration.mode as u64)),
@@ -6125,9 +6134,9 @@ fn wait_satisfied_payload(
     satisfied: TrackWaitSatisfied,
 ) -> Vec<(u64, Value)> {
     vec![
-        (0, Value::Unsigned(identity.surface.context.context_id)),
-        (1, Value::Unsigned(identity.surface.surface_id)),
-        (2, Value::Unsigned(identity.track_id)),
+        (0, Value::Unsigned(identity.surface().context().context_id())),
+        (1, Value::Unsigned(identity.surface().surface_id())),
+        (2, Value::Unsigned(identity.track_id())),
         (3, Value::Unsigned(satisfied.revision.get())),
         (4, Value::Unsigned(satisfied.channel_generation.get())),
         (5, Value::Unsigned(condition)),
@@ -6477,7 +6486,10 @@ fn apply_raster_delta(base: &Frame, delta: media::ParsedRasterDeltaFrame<'_>) ->
     })
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "these established rendering and protocol entry points carry independently required context"
+)]
 fn copy_raster_rect(
     rgba: &mut [u8],
     frame_width: u32,
@@ -6583,13 +6595,17 @@ fn wake_listener(endpoint: &str) {
     }
 }
 
+// Debug omits user content and native resources, and never acquires application locks.
+impl std::fmt::Debug for VividService {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VividService").finish_non_exhaustive()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vivid_protocol::messages::LaneClass;
-    use vivid_protocol::track::{
-        AudioConfiguration, KindConfiguration, TrackConfiguration, TrackMode,
-    };
+    use vivid_protocol::track::{AudioConfiguration, KindConfiguration};
 
     macro_rules! socket_service {
         ($service:expr) => {
@@ -6608,8 +6624,7 @@ mod tests {
     use vivid_sdk::{
         CoordinateModel, Fit, MILESTONE_CHANNEL_DETACHED, MILESTONE_OUTPUT_READY,
         MILESTONE_PRESENTED, ProducerAuthentication, ProducerConfig, RasterConfiguration,
-        RequestMetadata, SceneNode, SessionEvent, SlotBinding, SurfaceDefinition,
-        SurfaceDescriptor, SurfaceRole, TrackWaitCondition,
+        RequestMetadata, SessionEvent, SlotBinding, SurfaceRole, TrackWaitCondition,
     };
 
     fn test_geometry() -> DisplayGeometry {
@@ -6702,7 +6717,7 @@ mod tests {
             ) {
                 renderer.set_vivid_scene(service.scene());
                 let size = SizeInfo::new(800., 600., 10., 25., 0., 0., false);
-                let media = renderer.prepare_media(&size, 0).unwrap();
+                let media = renderer.prepare_media(&size, 0, &Default::default()).unwrap();
                 assert_eq!(renderer.overlay_metrics().render_passes, 1);
                 assert_eq!(renderer.overlay_metrics().target_allocations, 1);
                 let mut composed = vello::Scene::new();
@@ -6729,14 +6744,14 @@ mod tests {
                     "overlay remains clipped to its bounds"
                 );
                 assert!(
-                    !renderer.prepare_media(&size, 0).unwrap().changed,
+                    !renderer.prepare_media(&size, 0, &Default::default()).unwrap().changed,
                     "unchanged overlays reuse their GPU target"
                 );
                 assert_eq!(renderer.overlay_metrics().skipped_passes, 1);
                 let generation = media.image_generation;
                 let compiled = lock(&service.shared.overlays).compiled_scene_count();
                 window.set_bounds(Rect::new(20., 20., 100., 80.).unwrap()).unwrap();
-                let moved = renderer.prepare_media(&size, 0).unwrap();
+                let moved = renderer.prepare_media(&size, 0, &Default::default()).unwrap();
                 assert!(moved.changed);
                 assert_eq!(renderer.overlay_metrics().render_passes, 2);
                 assert_eq!(lock(&service.shared.overlays).compiled_scene_count(), compiled);
@@ -6745,7 +6760,9 @@ mod tests {
                     "movement preserves the texture used by cached terminal scenes"
                 );
             } else {
-                eprintln!("overlay GPU readback unavailable: no usable adapter");
+                // Everything below needs a presented overlay to hit, focus, and dismiss.
+                eprintln!("overlay GPU readback unavailable: no usable adapter; skipping");
+                return;
             }
         }
         assert_eq!(lock(&service.shared.overlays).drawing(&service.scene).len(), 2);
@@ -6911,7 +6928,7 @@ mod tests {
         .expect("overlay performance measurement requires a Vello adapter");
         renderer.set_vivid_scene(service.scene());
         let size = SizeInfo::new(800., 600., 10., 25., 0., 0., false);
-        let prepared = renderer.prepare_media(&size, 0).unwrap();
+        let prepared = renderer.prepare_media(&size, 0, &Default::default()).unwrap();
         let mut scene = vello::Scene::new();
         scene.draw_image(prepared.overlay.as_ref().unwrap(), vello::kurbo::Affine::IDENTITY);
         renderer.render(&scene, vello::peniko::Color::BLACK).unwrap();
@@ -6924,7 +6941,7 @@ mod tests {
             let y = 20. + f64::from((frame % 120) as u16);
             let started = Instant::now();
             window.set_bounds(Rect::new(x, y, 240., 160.).unwrap()).unwrap();
-            assert!(renderer.prepare_media(&size, 0).unwrap().changed);
+            assert!(renderer.prepare_media(&size, 0, &Default::default()).unwrap().changed);
             samples.push(started.elapsed());
         }
         samples.sort_unstable();
@@ -6993,8 +7010,8 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires built SDK bindings and VIVID_OVERLAY_TEST_PYTHON/VIVID_OVERLAY_TEST_NODE"]
-    fn native_overlay_python_and_typescript_bindings() {
+    #[ignore = "requires built SDK bindings, their .venv (or VIVID_OVERLAY_TEST_PYTHON), Node, and LuaJIT"]
+    fn native_overlay_language_bindings() {
         let _gpu = crate::display::renderer::gpu_test_lock();
         use crate::display::renderer::SceneRenderer;
         use crate::display::window::RenderSource;
@@ -7008,22 +7025,43 @@ mod tests {
             }
         }
         let sdk = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../vivid_sdk");
-        for (runtime, fixture, mode) in [
-            ("VIVID_OVERLAY_TEST_PYTHON", "overlay_python.py", "blocking"),
-            ("VIVID_OVERLAY_TEST_PYTHON", "overlay_python.py", "async"),
-            ("VIVID_OVERLAY_TEST_NODE", "overlay_node.mjs", "async"),
+        let python = test_prerequisite(
+            "VIVID_OVERLAY_TEST_PYTHON",
+            &["vivid_sdk/.venv/bin/python".into(), "vivid_sdk/.venv/Scripts/python.exe".into()],
+        );
+        let node = std::env::var_os("VIVID_OVERLAY_TEST_NODE").unwrap_or_else(|| "node".into());
+        // The Lua fixture loads the module `vivid_sdk/lua/build.sh` stages, for whichever Lua
+        // it was built for; LuaJIT is that script's default.
+        let lua = std::env::var_os("VIVID_OVERLAY_TEST_LUA").unwrap_or_else(|| {
+            let local = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("target/overlay-test-tools/luajit.exe");
+            if cfg!(windows) && local.is_file() { local.into_os_string() } else { "luajit".into() }
+        });
+        let lua_cpath = sdk.join("lua").join(if cfg!(windows) { "?.dll" } else { "?.so" });
+        for (executable, fixture, mode) in [
+            (&python, "overlay_python.py", "blocking"),
+            (&python, "overlay_python.py", "async"),
+            (&node, "overlay_node.mjs", "async"),
+            (&lua, "overlay_lua.lua", "blocking"),
         ] {
-            let executable =
-                std::env::var_os(runtime).expect("binding test runtime must be configured");
             let service =
                 socket_service!(VividService::start_with_wake(test_geometry(), Arc::new(|_| {})));
             service.update_overlay_viewport(800., 600., 2.);
+            // Adapter startup can take seconds, so finish it before the producer's presentation
+            // deadline starts.
+            let mut renderer = SceneRenderer::new(
+                RenderSource::Offscreen,
+                winit::dpi::PhysicalSize::new(800, 600),
+                false,
+            )
+            .expect("binding render acceptance requires a Vello adapter");
             let mut command = Command::new(executable);
             command
                 .arg(sdk.join("bindings/tests").join(fixture))
                 .arg(mode)
                 .env("VIVID_ROOT_SECRET", service.root_secret())
                 .env("PYTHONPATH", sdk.join("python"))
+                .env("LUA_CPATH", lua_cpath.as_os_str())
                 .stdin(Stdio::piped());
             for endpoint in [
                 "VIVID_ENDPOINT_CONTROL",
@@ -7033,7 +7071,9 @@ mod tests {
             ] {
                 command.env(endpoint, service.control_endpoint());
             }
-            let mut child = Child(command.spawn().expect("binding test producer starts"));
+            let mut child = Child(command.spawn().unwrap_or_else(|error| {
+                panic!("cannot start {executable:?} for {fixture} {mode}: {error}");
+            }));
             let deadline = Instant::now() + Duration::from_secs(20);
             while lock(&service.shared.overlays).drawing(&service.scene).is_empty() {
                 assert!(
@@ -7044,15 +7084,13 @@ mod tests {
                 thread::sleep(Duration::from_millis(2));
             }
             // Read actual Vello pixels while the child holds its scene until the release marker.
-            let mut renderer = SceneRenderer::new(
-                RenderSource::Offscreen,
-                winit::dpi::PhysicalSize::new(800, 600),
-                false,
-            )
-            .expect("binding render acceptance requires a Vello adapter");
             renderer.set_vivid_scene(service.scene());
             let media = renderer
-                .prepare_media(&SizeInfo::new(800., 600., 10., 25., 0., 0., false), 0)
+                .prepare_media(
+                    &SizeInfo::new(800., 600., 10., 25., 0., 0., false),
+                    0,
+                    &Default::default(),
+                )
                 .unwrap();
             let mut scene = vello::Scene::new();
             scene.draw_image(media.overlay.as_ref().unwrap(), vello::kurbo::Affine::IDENTITY);
@@ -7107,7 +7145,11 @@ mod tests {
                         .any(|d| d.revision == 3)
                 {
                     let media = renderer
-                        .prepare_media(&SizeInfo::new(800., 600., 10., 25., 0., 0., false), 0)
+                        .prepare_media(
+                            &SizeInfo::new(800., 600., 10., 25., 0., 0., false),
+                            0,
+                            &Default::default(),
+                        )
                         .unwrap();
                     let mut scene = vello::Scene::new();
                     scene.draw_image(
@@ -7144,6 +7186,24 @@ mod tests {
             authentication: ProducerAuthentication::root_hex(service.root_secret()).unwrap(),
             ..ProducerConfig::default()
         }
+    }
+
+    /// An acceptance test's external input: `variable` when set, otherwise the most recently
+    /// modified of `candidates`, relative to the repository that holds Vivido's sibling projects.
+    fn test_prerequisite(variable: &str, candidates: &[String]) -> std::ffi::OsString {
+        if let Some(value) = std::env::var_os(variable) {
+            return value;
+        }
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        candidates
+            .iter()
+            .filter_map(|candidate| {
+                let path = root.join(candidate);
+                Some((path.metadata().ok()?.modified().ok()?, path))
+            })
+            .max()
+            .map(|(_, path)| path.into_os_string())
+            .unwrap_or_else(|| panic!("set {variable} or provide one of {candidates:?}"))
     }
 
     /// Connect a receiver that offers `file-drop-path-v1` the way `vvreceive` does.
@@ -8254,7 +8314,7 @@ mod tests {
             trace::TraceSelection::Tail,
             128,
             trace::TraceFilter {
-                session_id: Some(owner.session_id),
+                session_id: Some(owner.session_id()),
                 context_id: Some(context_id),
                 surface_id: Some(surface.id()),
                 track_id: Some(71),
@@ -8397,7 +8457,7 @@ mod tests {
             let registry = lock(&service.shared.registry);
             let session = registry
                 .sessions
-                .get(&identity.surface.context.session.session_id)
+                .get(&identity.surface().context().session().session_id())
                 .ok_or_else(|| io::Error::new(ErrorKind::NotFound, "session disappeared"))?;
             let status = service
                 .scene
@@ -8406,28 +8466,18 @@ mod tests {
             (*session.channel_key.expose(), status.configuration)
         };
         let client_nonce = [0x52; 16];
-        let authentication_tag = auth::channel_tag(
-            &channel_key,
-            identity.surface.context.session.session_id,
-            identity.surface.context.context_id,
-            identity.surface.surface_id,
-            identity.track_id,
-            generation.get(),
-            configuration.kind.kind() as u32,
-            configuration.lane as u32,
-            &client_nonce,
-        );
-        let open = ChannelOpen {
-            session_id: identity.surface.context.session.session_id,
-            context_id: identity.surface.context.context_id,
-            surface_id: identity.surface.surface_id,
-            track_id: identity.track_id,
+        let mut open = ChannelOpen {
+            session_id: identity.surface().context().session().session_id(),
+            context_id: identity.surface().context().context_id(),
+            surface_id: identity.surface().surface_id(),
+            track_id: identity.track_id(),
             channel_generation: generation.get(),
             track_kind: configuration.kind.kind(),
             lane: configuration.lane,
             client_nonce,
-            authentication_tag,
+            authentication_tag: [0; 16],
         };
+        open.sign(&channel_key);
         let envelope = Envelope::correlated(1, open.payload()).map_err(io::Error::other)?;
         let body = envelope.encode().map_err(io::Error::other)?;
         let mut stream = connect_endpoint(service.control_endpoint())?;
@@ -8435,7 +8485,7 @@ mod tests {
             ConnectionKind::Track,
             vivid_protocol::HARD_MAX_RECORD_BODY,
         ))?;
-        write_raw(&mut stream, 1, messages::CHANNEL_OPEN, identity.track_id, &body)?;
+        write_raw(&mut stream, 1, messages::CHANNEL_OPEN, identity.track_id(), &body)?;
         let accepted = read_raw(&mut stream)?;
         if accepted.record_type != messages::CHANNEL_ACCEPTED {
             return Err(io::Error::other("track channel was not accepted"));
@@ -8488,7 +8538,8 @@ mod tests {
         let first_generation = track.channel_generation();
         let mut superseded = open_raw_track_channel(&service, identity, first_generation).unwrap();
         session.advance_channel(&track, 1, &RequestMetadata::default()).unwrap();
-        write_raw(&mut superseded, 2, messages::RASTER_FRAME, identity.track_id + 1, &[]).unwrap();
+        write_raw(&mut superseded, 2, messages::RASTER_FRAME, identity.track_id() + 1, &[])
+            .unwrap();
 
         let deadline = Instant::now() + Duration::from_secs(2);
         let superseded_detach = loop {
@@ -8496,10 +8547,10 @@ mod tests {
                 trace::TraceSelection::Tail,
                 128,
                 trace::TraceFilter {
-                    session_id: Some(owner.session_id),
+                    session_id: Some(owner.session_id()),
                     context_id: Some(context_id),
                     surface_id: Some(surface.id()),
-                    track_id: Some(identity.track_id),
+                    track_id: Some(identity.track_id()),
                     ..trace::TraceFilter::default()
                 },
             );
@@ -8518,17 +8569,17 @@ mod tests {
 
         let current_generation = track.channel_generation();
         let mut current = open_raw_track_channel(&service, identity, current_generation).unwrap();
-        write_raw(&mut current, 2, messages::RASTER_FRAME, identity.track_id + 1, &[]).unwrap();
+        write_raw(&mut current, 2, messages::RASTER_FRAME, identity.track_id() + 1, &[]).unwrap();
         let deadline = Instant::now() + Duration::from_secs(2);
         let lost = loop {
             let batch = service.automation_trace(
                 trace::TraceSelection::Tail,
                 128,
                 trace::TraceFilter {
-                    session_id: Some(owner.session_id),
+                    session_id: Some(owner.session_id()),
                     context_id: Some(context_id),
                     surface_id: Some(surface.id()),
-                    track_id: Some(identity.track_id),
+                    track_id: Some(identity.track_id()),
                     ..trace::TraceFilter::default()
                 },
             );
@@ -8980,11 +9031,11 @@ mod tests {
                 .track_keys()
                 .into_iter()
                 .find(|key| {
-                    key.surface.context.session.session_id == session.info().session_id
-                        && key.track_id == 12
+                    key.surface().context().session().session_id() == session.info().session_id
+                        && key.track_id() == 12
                 })
                 .unwrap();
-            let video_identity = TrackIdentity { track_id: 11, ..session_identity };
+            let video_identity = session_identity.surface().track(11).unwrap();
             for identity in [video_identity, session_identity] {
                 service
                     .shared
@@ -9405,7 +9456,7 @@ mod tests {
             .scene
             .track_keys()
             .into_iter()
-            .find(|identity| identity.track_id == track.id())
+            .find(|identity| identity.track_id() == track.id())
             .expect("the raster track is registered");
         let deadline = Instant::now() + Duration::from_secs(2);
         let frame = loop {
@@ -10192,7 +10243,7 @@ mod tests {
             .scene
             .anchor_positions()
             .iter()
-            .filter(|(identity, ..)| identity.context.session == session.identity)
+            .filter(|(identity, ..)| identity.context().session() == session.identity)
             .count()
     }
 
@@ -10246,6 +10297,58 @@ mod tests {
             1,
             "the untouched session registers its anchor as usual"
         );
+    }
+
+    #[test]
+    fn actor_panic_retires_only_its_owner_after_partial_mutation() {
+        let service =
+            socket_service!(VividService::start_with_wake(test_geometry(), Arc::new(|_| {})));
+        let mut failed = connect(&service);
+        let failed_surface = grid_surface(&mut failed, 9);
+        let [failed_runtime] = live_sessions(&service).try_into().ok().expect("one session");
+        let mut surviving = connect(&service);
+        let surviving_surface = grid_surface(&mut surviving, 9);
+        assert_eq!(failed_surface.context_id(), surviving_surface.context_id());
+        assert_eq!(failed_surface.id(), surviving_surface.id());
+        let surviving_runtime = live_sessions(&service)
+            .into_iter()
+            .find(|session| session.identity != failed_runtime.identity)
+            .unwrap();
+        let original_contexts = lock(&surviving_runtime.contexts).len();
+        let mutated = failed_runtime.clone();
+        lock(&failed_runtime.actor_ingress)
+            .as_ref()
+            .unwrap()
+            .send(ActorMessage::FaultForTest(Box::new(move || {
+                lock(&mutated.contexts).clear();
+            })))
+            .unwrap();
+        assert!(wait_until(Duration::from_secs(2), || {
+            !lock(&service.shared.registry)
+                .sessions
+                .contains_key(&failed_runtime.identity.session_id())
+        }));
+        let failed_identity = failed_runtime
+            .identity
+            .context(failed_surface.context_id())
+            .unwrap()
+            .surface(9)
+            .unwrap();
+        let surviving_identity = surviving_runtime
+            .identity
+            .context(surviving_surface.context_id())
+            .unwrap()
+            .surface(9)
+            .unwrap();
+        assert!(wait_until(Duration::from_secs(2), || {
+            service.shared.scene.surface_status(failed_identity).is_none()
+        }));
+        assert!(service.shared.scene.surface_status(surviving_identity).is_some());
+        assert_eq!(lock(&surviving_runtime.contexts).len(), original_contexts);
+        // The other owner still accepts mutations after the failed actor and reader exit.
+        let another_surface = grid_surface(&mut surviving, 10);
+        assert_eq!(another_surface.context_id(), surviving_surface.context_id());
+        surviving.close().unwrap();
     }
 
     /// A session that leaves takes its marker tag with it and nothing else.
@@ -10417,7 +10520,7 @@ mod tests {
         // Arm an input grant, so the unclean-loss suspension has an active grant to revoke.
         let child_runtime = live_sessions(&service)
             .into_iter()
-            .find(|session| session.identity.session_id == child_session)
+            .find(|session| session.identity.session_id() == child_session)
             .expect("the child session is registered");
         let binding = InputBinding {
             producer_epoch: vivid_protocol::revision::InputEpoch::ONE,
@@ -10953,10 +11056,13 @@ mod tests {
             SessionIdentity::new(service.shared.presenter, healthy.info().session_id).unwrap();
         let status = service
             .scene
-            .surface_status(SurfaceIdentity {
-                context: healthy_identity.context(healthy_context).unwrap(),
-                surface_id: healthy_surface.id(),
-            })
+            .surface_status(
+                healthy_identity
+                    .context(healthy_context)
+                    .unwrap()
+                    .surface(healthy_surface.id())
+                    .unwrap(),
+            )
             .expect("the healthy producer keeps its surface");
         assert_eq!(status.lifecycle, 1);
     }

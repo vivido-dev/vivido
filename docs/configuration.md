@@ -123,7 +123,7 @@ terminfo entry; SSH forwards `TERM`, but not a locally materialized terminfo dat
 |---|---|---|---|
 | `dimensions` | `{ columns, lines }` | `{ 0, 0 }` | Initial size in cells. **Both** must be non-zero to take effect. |
 | `position` | `{ x, y }` | *auto* | Startup position in physical pixels. Unset lets the window manager decide. |
-| `padding` | `{ x, y }` | `{ 0, 0 }` | Blank space around the grid, in pixels (scaled by DPI). |
+| `padding` | `{ x, y }` | `{ 3, 3 }` | Blank space around the grid, in pixels (scaled by DPI). |
 | `dynamic_padding` | bool | `false` | Distribute leftover space evenly as extra padding. |
 | `decorations` | enum | `Full` | `Full`, `None`, `Transparent`, or `Buttonless`. |
 | `opacity` | float `0.0`–`1.0` | `1.0` | Background opacity. Requires a compositor that honors it. |
@@ -139,7 +139,7 @@ terminfo entry; SSH forwards `TERM`, but not a locally materialized terminfo dat
 
 ```toml
 [window]
-padding = { x = 6, y = 6 }
+padding = { x = 3, y = 3 }
 opacity = 0.95
 decorations = "Full"
 startup_mode = "Windowed"
@@ -297,11 +297,18 @@ command = { program = "paplay", args = ["/usr/share/sounds/freedesktop/stereo/be
 
 | Field | Type | Default | Description |
 |---|---|---|---|
+| `semantic_escape_chars` | string | *see below* | Characters that end a word for double-click selection. |
 | `save_to_clipboard` | bool | `false` | Copy selections to the system clipboard automatically. |
 
-> Vivido has a deliberately minimal selection model: drag for a character selection, hold `Control`
-> while dragging for a block selection. Semantic word/line expansion and
-> `semantic_escape_chars` are not implemented, so there is no such option to configure.
+```toml
+[selection]
+semantic_escape_chars = ",│`|:\"' ()[]{}<>\t"
+save_to_clipboard = false
+```
+
+The default above keeps a path or `key=value` together as one word but splits a URL at its `:`.
+Add `/`, `=`, or `;` to stop at them too, or remove `:` to keep URLs whole. See
+[mouse selection](features.md#mouse-selection) for the gestures.
 
 ## `cursor`
 
@@ -327,16 +334,47 @@ blinking = "Off"
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `osc52` | enum | `onlycopy` | Clipboard access via OSC 52: `disabled`, `onlycopy`, `onlypaste`, `copypaste` (case-insensitive). |
+| `osc52` | `{ read, write }` | `{ read = "ask", write = "allow" }` | Whether programs may read and replace the clipboard through OSC 52; each is `allow`, `ask`, or `deny`. A missing key keeps its default. |
+| `paste_protection` | bool | `true` | Ask before pasting text with line breaks or control characters into a program that has not enabled bracketed paste. |
 | `osc_notifications` | bool | `true` | Allow OSC 9 and OSC 99 desktop notifications. |
+| `progress` | bool | `true` | Show OSC 9;4 progress and activity reported by spinner titles. |
+| `notify_on_command_finish` | enum | `Never` | Signal when a slow shell command finishes: `Never`, `Unfocused`, or `Always`. |
+| `notify_on_command_finish_action` | `{ bell, notify }` | `{ bell = true, notify = false }` | How the finish signals: the normal bell, a desktop notification, or both. A missing key keeps its default. |
+| `notify_on_command_finish_after` | integer (s) | `5` | How long a command must run before its finish signals. |
 | `shell` | string or `{ program, args }` | *system* | Shell to launch instead of the login shell. |
+| `shell_integration` | bool | `true` | Start bash, zsh, fish, and PowerShell with Vivido's integration loaded, so they report prompts, commands, and the working directory. |
 
 ```toml
 [terminal]
-osc52 = "onlycopy"
+osc52 = { read = "ask", write = "allow" }
+paste_protection = true
 osc_notifications = true
+progress = true
+notify_on_command_finish = "Unfocused"
+notify_on_command_finish_action = { bell = true, notify = true }
+notify_on_command_finish_after = 5
 shell = { program = "/usr/bin/fish", args = ["--login"] }
+shell_integration = true
 ```
+
+`ask` shows the text in question and waits for an answer; see
+[paste protection](features.md#paste-protection-and-clipboard-prompts). Replacing the clipboard is
+allowed by default because that is how editors copy over SSH; reading it asks because the clipboard
+can hold a password. The older single-word values still work: `disabled`, `onlycopy`, `onlypaste`,
+and `copypaste` mean `deny` or `allow` for each direction.
+
+A finished command signals only when its runtime *exceeds* `notify_on_command_finish_after`, and
+only when the shell emits OSC 133 integration markers — the runtime runs from the marker that starts
+the command (`C`) to the finish marker (`D`), and a finish without a start never signals. The `bell`
+channel rings exactly as `\x07` would (visual flash per [`bell`](#bell), urgency hint,
+`bell.command`, and a `bell` automation event); the `notify` channel shows a desktop notification —
+"Command Succeeded/Failed" with the runtime and exit code — which answers your own configuration
+rather than a program request, so it works even with `osc_notifications = false`. Clicking it
+focuses the terminal. See [command-finish notifications](features.md#command-finish-notifications).
+
+`shell_integration` applies to a shell Vivido starts, whether the login shell, `shell`, or `-e`;
+it never edits your startup files, and a changed value takes effect for the next terminal. See
+[shell integration](features.md#shell-integration) for what each shell needs.
 
 ## `file_drop`
 
@@ -370,6 +408,36 @@ the desktop backend supports them. Icons, buttons, and callbacks into the PTY ar
 ```sh
 printf '\033]9;Build complete\007'
 printf '\033]99;;Build complete\033\\'
+```
+
+Programs report progress with ConEmu's `OSC 9 ; 4 ; state ; percent ST`. Vivido draws it as a
+thin bar along the top edge of the terminal: `1` fills to the percent in the palette's blue, `2`
+turns it red (error), `4` turns it yellow (paused), `3` shows a segment bouncing over a faint track
+(busy, no percent), and `0` removes it. Error and pause keep the last percent when they carry
+none. A bar with no new report for 15 seconds is removed, so a crashed tool does not leave one
+behind. The bar works the same inside Vivida panes, and IPC `inspect` and the `progress_changed`
+event report its state. `terminal.progress = false` turns it off.
+
+Claude Code and Muse can report activity with a Braille spinner in their window title instead of
+OSC 9;4. Vivido uses that as a busy fallback for both thinking and tool execution, without requiring
+agent hooks or changing agent settings. The fallback stays visible through silent work and OSC
+clears between tools, and ends when the title loses its spinner, the terminal resets, or its child
+exits. Explicit percent, error, and pause reports take precedence while current. This also works
+when `window.dynamic_title` is off. A program must report progress or a spinner title; elapsed
+runtime alone does not start a bar, and a busy indicator does not imply a completion percentage.
+
+Progress also shows outside the terminal. On Windows the window's taskbar button fills in the same
+colour (paused and error use the shell's amber and red, and busy shows its moving indicator). On
+macOS the Dock tile carries a badge — `42%`, `…` while busy, `42% ‖` when paused, `!` on error —
+for the most urgent window; an error outranks a pause, which outranks running work, and among
+running work the least complete wins. Vivida marks each tab with a thin strip in the same colours,
+the sidebar badges each workspace, and its own taskbar button or Dock tile shows the most urgent
+pane. Wayland has no portable taskbar progress, so on Linux only the in-window indicators appear.
+
+```sh
+printf '\033]9;4;1;42\007'   # 42 %
+printf '\033]9;4;3\007'      # busy
+printf '\033]9;4;0\007'      # remove
 ```
 
 ## `mouse`
@@ -469,7 +537,12 @@ Search: `SearchForward`, `SearchBackward`. Inside search mode: `SearchFocusNext`
 `SearchFocusPrevious`, `SearchConfirm`, `SearchCancel`, `SearchClear`, `SearchDeleteWord`,
 `SearchHistoryPrevious`, `SearchHistoryNext`.
 
-Misc: `ClearHistory`, `ClearLogNotice`, `ReceiveChar`, `None`.
+Misc: `ToggleCommandPalette` (bound to `Ctrl+Shift+P`, `Command+Shift+P` on macOS; see
+[the command palette](features.md#command-palette)), `TerminalRecovery`, `ClearHistory`,
+`ClearLogNotice`, `ToggleMicrophone`, `NextMicrophone`, `ReceiveChar`, `None`.
+
+`ClearHistory` (`Super+K`, or `Command+K` / Edit ▸ Clear on macOS) clears scrollback and the
+active viewport locally, keeping the current input line at the top. It sends no input to the shell.
 
 > There is no vi mode, so vi-motion, vi-cursor, and vi-selection actions do not exist in Vivido.
 
@@ -479,6 +552,7 @@ Misc: `ClearHistory`, `ClearLogNotice`, `ReceiveChar`, `None`.
 |---|---|
 | `Ctrl+Shift+T` | Create and activate a tab |
 | `Ctrl+Shift+U` | Check for Vivido updates |
+| `Ctrl+Shift+P` | Open or close the command palette |
 | `Ctrl+Shift+W` | Close the active tab |
 | `Ctrl+Tab` / `Ctrl+Shift+Tab` | Select the next / previous tab, wrapping at either end |
 | `Alt+1`…`Alt+8` | Select the matching tab from the left |

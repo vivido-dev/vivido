@@ -2,9 +2,8 @@
 
 use std::ops::{Index, IndexMut, Range};
 use std::sync::Arc;
-use std::{cmp, mem, ptr, slice, str};
+use std::{cmp, mem, slice, str};
 
-#[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
 use base64::Engine;
@@ -16,7 +15,10 @@ use unicode_width::UnicodeWidthChar;
 
 use crate::osc_notification::OscWorkingDirectory;
 use crate::terminal::event::{Event, EventListener};
-use crate::terminal::graphics::GraphicsCommand;
+use crate::terminal::graphics::{
+    CellPixels, Cursor as GraphicsCursor, FinishedJob, KittyGraphics, QueuedJob,
+    Scroll as GraphicsScroll,
+};
 use crate::terminal::grid::{Dimensions, Grid, GridIterator, Scroll};
 use crate::terminal::index::{self, Boundary, Column, Direction, Line, Point};
 use crate::terminal::selection::{Selection, SelectionRange, SelectionType};
@@ -30,12 +32,18 @@ use crate::terminal::vvte::ansi::{
 // The same `cursor-icon` type winit re-exports, keeping this module winit-free.
 use crate::terminal::vvte::ansi::cursor_icon::CursorIcon;
 
+/// Cell types and operations.
 pub mod cell;
+/// Color types and operations.
 pub mod color;
+/// Search types and operations.
 pub mod search;
 
 #[cfg(test)]
 mod rep_tests;
+
+#[cfg(test)]
+mod graphics_tests;
 
 /// Minimum number of columns.
 ///
@@ -48,8 +56,8 @@ pub const MIN_SCREEN_LINES: usize = 1;
 /// Max size of the window title stack.
 const TITLE_STACK_MAX_DEPTH: usize = 4096;
 
-/// Characters which terminate terminal-friendly semantic token selection.
-const SEMANTIC_ESCAPE_CHARS: &str = ",│`|:\"' ()[]{}<>\t";
+/// Characters which end a word for double-click selection unless configured otherwise.
+pub const SEMANTIC_ESCAPE_CHARS: &str = ",│`|:\"' ()[]{}<>\t";
 
 /// Max size of the keyboard modes.
 const KEYBOARD_MODE_STACK_MAX_DEPTH: usize = TITLE_STACK_MAX_DEPTH;
@@ -211,39 +219,66 @@ impl DcsScanner {
 }
 
 bitflags! {
+    /// Terminal behavior selected by control sequences.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
     pub struct TermMode: u32 {
+        /// No terminal modes.
         const NONE                    = 0;
+        /// Display the terminal cursor.
         const SHOW_CURSOR             = 1;
+        /// Use application cursor-key sequences.
         const APP_CURSOR              = 1 << 1;
+        /// Use application keypad sequences.
         const APP_KEYPAD              = 1 << 2;
+        /// Report mouse-button presses.
         const MOUSE_REPORT_CLICK      = 1 << 3;
+        /// Bracket pasted text with terminal control sequences.
         const BRACKETED_PASTE         = 1 << 4;
+        /// Encode mouse reports with SGR parameters.
         const SGR_MOUSE               = 1 << 5;
+        /// Report mouse movement without requiring a pressed button.
         const MOUSE_MOTION            = 1 << 6;
+        /// Wrap output at the right margin.
         const LINE_WRAP               = 1 << 7;
+        /// Treat line feed as a newline.
         const LINE_FEED_NEW_LINE      = 1 << 8;
+        /// Interpret cursor positions relative to the scroll region.
         const ORIGIN                  = 1 << 9;
+        /// Insert cells instead of replacing them.
         const INSERT                  = 1 << 10;
+        /// Report window focus changes.
         const FOCUS_IN_OUT            = 1 << 11;
+        /// Select the alternate terminal screen.
         const ALT_SCREEN              = 1 << 12;
+        /// Report movement while a mouse button is held.
         const MOUSE_DRAG              = 1 << 13;
+        /// Encode legacy mouse coordinates as UTF-8.
         const UTF8_MOUSE              = 1 << 14;
+        /// Translate scroll input into cursor keys on the alternate screen.
         const ALTERNATE_SCROLL        = 1 << 15;
         /// DECSET 1016: report SGR mouse coordinates in physical pixels.
         const SGR_PIXEL_MOUSE         = 1 << 16;
+        /// Request attention when terminal output signals urgency.
         const URGENCY_HINTS           = 1 << 17;
+        /// Disambiguate escape-key sequences using the keyboard protocol.
         const DISAMBIGUATE_ESC_CODES  = 1 << 18;
+        /// Include press, repeat, and release classifications in key reports.
         const REPORT_EVENT_TYPES      = 1 << 19;
+        /// Include alternate key identities in keyboard reports.
         const REPORT_ALTERNATE_KEYS   = 1 << 20;
+        /// Encode every key through the extended keyboard protocol.
         const REPORT_ALL_KEYS_AS_ESC  = 1 << 21;
+        /// Include associated text in keyboard reports.
         const REPORT_ASSOCIATED_TEXT  = 1 << 22;
+        /// All mouse-reporting modes.
         const MOUSE_MODE              = Self::MOUSE_REPORT_CLICK.bits() | Self::MOUSE_MOTION.bits() | Self::MOUSE_DRAG.bits();
+        /// All supported extended keyboard-protocol flags.
         const KITTY_KEYBOARD_PROTOCOL = Self::DISAMBIGUATE_ESC_CODES.bits()
                                       | Self::REPORT_EVENT_TYPES.bits()
                                       | Self::REPORT_ALTERNATE_KEYS.bits()
                                       | Self::REPORT_ALL_KEYS_AS_ESC.bits()
                                       | Self::REPORT_ASSOCIATED_TEXT.bits();
+        /// Every terminal mode bit, including reserved bits.
          const ANY                    = u32::MAX;
     }
 }
@@ -295,6 +330,7 @@ pub fn viewport_to_point(display_offset: usize, point: Point<usize>) -> Point {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// The inclusive horizontal damage range for one terminal line.
 pub struct LineDamageBounds {
     /// Damaged line number.
     pub line: usize,
@@ -308,27 +344,32 @@ pub struct LineDamageBounds {
 
 impl LineDamageBounds {
     #[inline]
+    /// Create an inclusive damage range for one terminal line.
     pub fn new(line: usize, left: usize, right: usize) -> Self {
         Self { line, left, right }
     }
 
     #[inline]
+    /// Create an empty damage range for one terminal line.
     pub fn undamaged(line: usize, num_cols: usize) -> Self {
         Self { line, left: num_cols, right: 0 }
     }
 
     #[inline]
+    /// Reset line damage to its empty state.
     pub fn reset(&mut self, num_cols: usize) {
         *self = Self::undamaged(self.line, num_cols);
     }
 
     #[inline]
+    /// Expand line damage to include these inclusive column bounds.
     pub fn expand(&mut self, left: usize, right: usize) {
         self.left = cmp::min(self.left, left);
         self.right = cmp::max(self.right, right);
     }
 
     #[inline]
+    /// Whether the line contains a nonempty damage range.
     pub fn is_damaged(&self) -> bool {
         self.left <= self.right
     }
@@ -352,6 +393,7 @@ pub struct TermDamageIterator<'a> {
 }
 
 impl<'a> TermDamageIterator<'a> {
+    /// Iterate damaged line ranges within the visible viewport.
     pub fn new(line_damage: &'a [LineDamageBounds], display_offset: usize) -> Self {
         let num_lines = line_damage.len();
         // Filter out invisible damage.
@@ -426,10 +468,12 @@ impl TermDamageState {
     }
 }
 
+/// Terminal parser state, visible grid, scrollback, modes, and event listener.
 pub struct Term<T> {
     /// Terminal focus controlling the cursor shape.
     pub is_focused: bool,
 
+    /// Current selection or its configured appearance.
     pub selection: Option<Selection>,
 
     /// Currently active grid.
@@ -497,6 +541,9 @@ pub struct Term<T> {
 
     /// Grid scroll accumulated since the last delivery. See [`PendingGridScroll`].
     pending_grid_scroll: Option<PendingGridScroll>,
+
+    /// Kitty graphics images and placements of both screens.
+    graphics: KittyGraphics,
 }
 
 /// A grid scroll awaiting delivery to the Vivid scene.
@@ -520,7 +567,9 @@ struct PendingGridScroll {
 /// A semantic terminal position carried through one grid resize/reflow.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ResizePoint {
+    /// Grid position of this value.
     pub point: Point,
+    /// Whether the alternate screen is active.
     pub alternate: bool,
 }
 
@@ -536,8 +585,11 @@ pub struct Config {
     /// Whether to enable kitty keyboard protocol.
     pub kitty_keyboard: bool,
 
-    /// OSC52 support mode.
+    /// OSC52 clipboard policy.
     pub osc52: Osc52,
+
+    /// Characters which end a word for double-click selection.
+    pub semantic_escape_chars: String,
 }
 
 impl Default for Config {
@@ -547,26 +599,38 @@ impl Default for Config {
             default_cursor_style: Default::default(),
             kitty_keyboard: Default::default(),
             osc52: Default::default(),
+            semantic_escape_chars: SEMANTIC_ESCAPE_CHARS.to_owned(),
         }
     }
 }
 
-/// OSC 52 behavior.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize), serde(rename_all = "lowercase"))]
-pub enum Osc52 {
-    /// The handling of the escape sequence is disabled.
-    Disabled,
-    /// Only copy sequence is accepted.
-    ///
-    /// This option is the default as a compromise between entirely
-    /// disabling it (the most secure) and allowing `paste` (the less secure).
-    #[default]
-    OnlyCopy,
-    /// Only paste sequence is accepted.
-    OnlyPaste,
-    /// Both are accepted.
-    CopyPaste,
+/// What happens when a program uses one direction of the OSC 52 clipboard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ClipboardAccess {
+    /// The request is ignored.
+    Deny,
+    /// The user is asked each time.
+    Ask,
+    /// The request is honored.
+    Allow,
+}
+
+/// OSC 52 clipboard policy, separately for reading and setting the clipboard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Osc52 {
+    /// A program asking for the clipboard's contents.
+    pub read: ClipboardAccess,
+    /// A program replacing the clipboard's contents.
+    pub write: ClipboardAccess,
+}
+
+impl Default for Osc52 {
+    /// Setting the clipboard is how remote editors copy, so it is allowed; reading it could leak
+    /// whatever was copied last, a password included, so the user is asked.
+    fn default() -> Self {
+        Self { read: ClipboardAccess::Ask, write: ClipboardAccess::Allow }
+    }
 }
 
 /// Byte span of row text and the cell column that produced it.
@@ -648,6 +712,7 @@ fn span_at(spans: &[RowTextSpan], offset: usize) -> Option<RowTextSpan> {
 
 impl<T> Term<T> {
     #[inline]
+    /// Move the visible viewport through terminal scrollback.
     pub fn scroll_display(&mut self, scroll: Scroll)
     where
         T: EventListener,
@@ -662,6 +727,49 @@ impl<T> Term<T> {
         }
     }
 
+    /// Clear the active buffer locally, retaining the cursor's logical line at the top.
+    ///
+    /// Unlike ED3, this also removes old viewport contents. No shell redraw is requested, so
+    /// there is no asynchronous clear that can push the discarded contents back into history.
+    pub fn clear_buffer(&mut self)
+    where
+        T: EventListener,
+    {
+        let cursor_line = self.grid.cursor.point.line;
+        let last_column = self.last_column();
+        let mut start = cursor_line;
+        let mut end = cursor_line;
+
+        // Keep wrapped input together, inspecting only the live viewport.
+        while start > Line(0)
+            && self.grid[start - 1usize][last_column].flags.contains(Flags::WRAPLINE)
+        {
+            start -= 1;
+        }
+        while end < self.bottommost_line()
+            && self.grid[end][last_column].flags.contains(Flags::WRAPLINE)
+        {
+            end += 1;
+        }
+
+        let region = Line(0)..Line(self.screen_lines() as i32);
+        self.grid.scroll_up(&region, start.0 as usize);
+        let retained_lines = Line(end.0 - start.0 + 1);
+        if retained_lines < region.end {
+            self.grid.reset_region(retained_lines..);
+        }
+        self.grid.cursor.point.line -= start.0;
+        self.grid.clear_history();
+        self.selection = None;
+        self.graphics.clear_screen(true);
+
+        self.flush_grid_scroll();
+        self.event_proxy.send_event(Event::VividClear);
+        self.event_proxy.send_event(Event::MouseCursorDirty);
+        self.mark_fully_damaged();
+    }
+
+    /// Create terminal state from configuration, dimensions, and an event listener.
     pub fn new<D: Dimensions>(config: Config, dimensions: &D, event_proxy: T) -> Term<T> {
         let num_cols = dimensions.columns();
         let num_lines = dimensions.screen_lines();
@@ -676,6 +784,11 @@ impl<T> Term<T> {
 
         // Initialize terminal damage, covering the entire terminal upon launch.
         let damage = TermDamageState::new(num_cols, num_lines);
+
+        let mut graphics = KittyGraphics::new();
+        if let Some((width, height)) = dimensions.cell_pixels() {
+            graphics.set_cell(CellPixels::new(width.into(), height.into()));
+        }
 
         Term {
             inactive_grid,
@@ -699,6 +812,7 @@ impl<T> Term<T> {
             mode: Default::default(),
             dcs_scanner: Default::default(),
             pending_grid_scroll: None,
+            graphics,
         }
     }
 
@@ -710,6 +824,17 @@ impl<T> Term<T> {
     where
         T: EventListener,
     {
+        // Images live with the grid, so they move with it now rather than when the scene hears.
+        if self.graphics.has_placements() {
+            self.graphics.scroll(GraphicsScroll {
+                top: origin,
+                end,
+                lines,
+                screen_lines: i32::try_from(self.screen_lines()).unwrap_or(i32::MAX),
+                history_top: i32::try_from(history_size).map_or(i32::MIN, |size| -size),
+            });
+        }
+
         match &mut self.pending_grid_scroll {
             Some(pending)
                 if pending.origin == origin
@@ -1187,6 +1312,11 @@ impl<T> Term<T> {
         let num_cols = size.columns();
         let num_lines = size.screen_lines();
 
+        // A font change resizes the cells without necessarily changing how many there are.
+        if let Some((width, height)) = size.cell_pixels() {
+            self.graphics.set_cell(CellPixels::new(width.into(), height.into()));
+        }
+
         if old_cols == num_cols && old_lines == num_lines {
             debug!("Term::resize dimensions unchanged");
             return;
@@ -1224,42 +1354,64 @@ impl<T> Term<T> {
 
     /// Resize the terminal while carrying semantic positions through the exact grid operations.
     ///
-    /// Positions which are erased or evicted during resize are returned as `None`.
+    /// Positions which are erased or evicted during resize are returned as `None`. Kitty graphics
+    /// placements are carried the same way, so an image stays with the text it was placed beside
+    /// when the grid reflows.
     pub fn resize_with_tracking<S: Dimensions>(
         &mut self,
         size: S,
         positions: &mut [Option<ResizePoint>],
     ) {
-        if positions.is_empty() {
+        let anchors = self.graphics.anchors();
+        if positions.is_empty() && anchors.is_empty() {
             self.resize(size);
             return;
         }
 
+        // Placements are tracked after the caller's positions, in the order the stores hold them.
+        let mut tracked = Vec::with_capacity(positions.len() + anchors.len());
+        tracked.extend_from_slice(positions);
+        tracked.extend(anchors.iter().map(|&(alternate, _, line, column)| {
+            let column = Column(usize::try_from(column).ok()?);
+            Some(ResizePoint { point: Point::new(Line(line), column), alternate })
+        }));
+
         let active_is_alternate = self.mode.contains(TermMode::ALT_SCREEN);
-        for (index, position) in positions.iter_mut().enumerate() {
-            let Some(tracked) = *position else {
+        for (index, position) in tracked.iter_mut().enumerate() {
+            let Some(point) = *position else {
                 continue;
             };
-            let grid = if tracked.alternate == active_is_alternate {
+            let grid = if point.alternate == active_is_alternate {
                 &mut self.grid
             } else {
                 &mut self.inactive_grid
             };
-            if tracked.point.line < grid.topmost_line()
-                || tracked.point.line > grid.bottommost_line()
-                || tracked.point.column >= grid.columns()
+            if point.point.line < grid.topmost_line()
+                || point.point.line > grid.bottommost_line()
+                || point.point.column >= grid.columns()
             {
                 *position = None;
                 continue;
             }
-            grid[tracked.point].push_vivid_resize_tracking(index);
+            grid[point.point].push_vivid_resize_tracking(index);
         }
 
         self.resize(size);
-        positions.fill(None);
+        tracked.fill(None);
 
-        Self::collect_resize_tracking(&mut self.grid, active_is_alternate, positions);
-        Self::collect_resize_tracking(&mut self.inactive_grid, !active_is_alternate, positions);
+        Self::collect_resize_tracking(&mut self.grid, active_is_alternate, &mut tracked);
+        Self::collect_resize_tracking(&mut self.inactive_grid, !active_is_alternate, &mut tracked);
+
+        let (caller, placements) = tracked.split_at(positions.len());
+        positions.copy_from_slice(caller);
+        if !anchors.is_empty() {
+            // `apply_anchors` visits placements in the order `anchors` listed them.
+            let mut moved = placements.iter();
+            self.graphics.apply_anchors(|_, _| {
+                let point = (*moved.next()?)?.point;
+                Some((point.line.0, i32::try_from(point.column.0).ok()?))
+            });
+        }
     }
 
     fn collect_resize_tracking(
@@ -1311,6 +1463,7 @@ impl<T> Term<T> {
         mem::swap(&mut self.grid, &mut self.inactive_grid);
         self.mode ^= TermMode::ALT_SCREEN;
         self.selection = None;
+        self.graphics.set_alternate(self.mode.contains(TermMode::ALT_SCREEN));
         self.flush_grid_scroll();
         self.event_proxy.send_event(Event::VividScreenSwap {
             alternate: self.mode.contains(TermMode::ALT_SCREEN),
@@ -1385,10 +1538,12 @@ impl<T> Term<T> {
 
         // Clear grid.
         self.grid.reset_region(..);
+        self.graphics.clear_screen(false);
         self.mark_fully_damaged();
     }
 
     #[inline]
+    /// Mark the terminal as exited and notify its listener.
     pub fn exit(&mut self)
     where
         T: EventListener,
@@ -1456,15 +1611,86 @@ impl<T> Term<T> {
         self.event_proxy.send_event(Event::ShellIntegration(marker));
     }
 
-    /// Forward a decoded graphics/media command to the UI renderer.
-    ///
-    /// Escape-sequence parsers can call this after translating Sixel, Kitty, or custom protocol
-    /// data into the protocol-neutral command model.
-    pub fn submit_graphics(&self, command: GraphicsCommand)
+    /// Forward an OSC 9;4 progress report to the owning window.
+    pub(crate) fn progress_report(&self, report: crate::osc_notification::ProgressReport)
     where
         T: EventListener,
     {
-        self.event_proxy.send_event(Event::Graphics(command));
+        self.event_proxy.send_event(Event::Progress(report));
+    }
+
+    /// Kitty graphics images and placements of this terminal.
+    pub fn graphics(&self) -> &KittyGraphics {
+        &self.graphics
+    }
+
+    /// Queue compressed-image decodes for [`Self::take_graphics_jobs`] instead of running them
+    /// while the command is parsed.
+    ///
+    /// Only a driver that drains the queue after every batch of input may turn this on; an image
+    /// whose decode nobody runs never appears.
+    pub(crate) fn set_deferred_graphics_decode(&mut self, defer: bool) {
+        self.graphics.set_deferred_decode(defer);
+    }
+
+    /// Whether [`Self::take_graphics_jobs`] would return anything.
+    pub(crate) fn has_graphics_jobs(&self) -> bool {
+        self.graphics.has_jobs()
+    }
+
+    /// Image decodes waiting to be run, which needs no access to the terminal.
+    pub(crate) fn take_graphics_jobs(&mut self) -> Vec<QueuedJob> {
+        self.graphics.take_jobs()
+    }
+
+    /// Install the results of [`Self::take_graphics_jobs`] and send the replies they were holding.
+    pub(crate) fn finish_graphics_jobs(&mut self, finished: Vec<FinishedJob>)
+    where
+        T: EventListener,
+    {
+        self.graphics.finish_jobs(finished);
+        self.flush_graphics_replies();
+    }
+
+    /// Input consumed by graphics commands since the last call that changed nothing visible, and
+    /// whether any graphics command did change something.
+    pub(crate) fn take_graphics_activity(&mut self) -> (usize, bool) {
+        (self.graphics.take_quiet_bytes(), self.graphics.take_dirty())
+    }
+
+    /// Write every graphics reply that is ready to the application.
+    fn flush_graphics_replies(&mut self)
+    where
+        T: EventListener,
+    {
+        while let Some(reply) = self.graphics.pop_reply() {
+            self.event_proxy.send_event(Event::PtyWrite(reply));
+        }
+    }
+
+    /// Move the cursor past an image placed at it, the way Kitty does.
+    ///
+    /// The cursor ends on the image's last row, in the column after its right edge, or at the
+    /// start of the following line when the image reaches the right margin. It moves down by line
+    /// feeds, so an image placed near the bottom scrolls the screen, and itself with it.
+    fn advance_past_image(&mut self, columns: u32, rows: u32)
+    where
+        T: EventListener,
+    {
+        let mut column = self.grid.cursor.point.column.0.saturating_add(columns as usize);
+        let mut down = rows.saturating_sub(1) as usize;
+        if column >= self.columns() {
+            column = 0;
+            down += 1;
+        }
+        // After a screenful of line feeds everything has scrolled away; more would do nothing.
+        for _ in 0..down.min(self.screen_lines()) {
+            self.linefeed();
+        }
+        self.damage_cursor();
+        self.grid.cursor.point.column = Column(column);
+        self.grid.cursor.input_needs_wrap = false;
+        self.damage_cursor();
     }
 
     /// Scroll display to point if it is outside of viewport.
@@ -1530,6 +1756,7 @@ impl<T> Term<T> {
         self.working_directory.as_deref()
     }
 
+    /// Borrow dynamic terminal palette overrides.
     pub fn colors(&self) -> &Colors {
         &self.colors
     }
@@ -1640,6 +1867,8 @@ impl<T: EventListener> Term<T> {
         self.scroll_region = Line(0)..Line(self.screen_lines() as i32);
         self.tabs = TabStops::new(self.columns());
         self.mode = TermMode::default();
+        // Like the Vivid scene, images are client state: recovery starts without them.
+        self.graphics.reset();
 
         if was_alternate {
             self.event_proxy.send_event(Event::VividScreenSwap { alternate: false });
@@ -2377,7 +2606,7 @@ impl<T: EventListener> Handler for Term<T> {
     /// Store data into clipboard.
     #[inline]
     fn clipboard_store(&mut self, clipboard: u8, base64: &[u8]) {
-        if !matches!(self.config.osc52, Osc52::OnlyCopy | Osc52::CopyPaste) {
+        if self.config.osc52.write == ClipboardAccess::Deny {
             debug!("Denied osc52 store");
             return;
         }
@@ -2398,7 +2627,7 @@ impl<T: EventListener> Handler for Term<T> {
     /// Load data from clipboard.
     #[inline]
     fn clipboard_load(&mut self, clipboard: u8, terminator: &str) {
-        if !matches!(self.config.osc52, Osc52::OnlyPaste | Osc52::CopyPaste) {
+        if self.config.osc52.read == ClipboardAccess::Deny {
             debug!("Denied osc52 load");
             return;
         }
@@ -2471,7 +2700,18 @@ impl<T: EventListener> Handler for Term<T> {
                 if self.mode.contains(TermMode::ALT_SCREEN) {
                     self.grid.reset_region(..);
                 } else {
-                    self.grid.clear_viewport();
+                    let preserved = self.grid.clear_viewport();
+                    // The text went into scrollback rather than away, and an image beside it
+                    // goes with it. Whatever that leaves on screen is erased below.
+                    if preserved > 0 && self.graphics.has_placements() {
+                        self.graphics.scroll(GraphicsScroll {
+                            top: 0,
+                            end: i32::try_from(screen_lines).unwrap_or(i32::MAX),
+                            lines: i32::try_from(preserved).unwrap_or(i32::MAX),
+                            screen_lines: i32::try_from(screen_lines).unwrap_or(i32::MAX),
+                            history_top: self.grid.topmost_line().0,
+                        });
+                    }
                 }
 
                 self.selection = None;
@@ -2483,6 +2723,14 @@ impl<T: EventListener> Handler for Term<T> {
             },
             // We have no history to clear.
             ansi::ClearMode::Saved => (),
+        }
+
+        match mode {
+            ansi::ClearMode::All => self.graphics.clear_screen(false),
+            // On Windows this is how a console clear arrives; see `clears_vivid_scene`.
+            ansi::ClearMode::Saved if clears_vivid_scene => self.graphics.clear_screen(true),
+            ansi::ClearMode::Saved => self.graphics.clear_history(),
+            ansi::ClearMode::Above | ansi::ClearMode::Below => (),
         }
 
         if clears_vivid_scene {
@@ -2525,6 +2773,7 @@ impl<T: EventListener> Handler for Term<T> {
         self.selection = None;
         self.keyboard_mode_stack = Default::default();
         self.inactive_keyboard_mode_stack = Default::default();
+        self.graphics.reset();
 
         self.mode = TermMode::default();
 
@@ -2906,7 +3155,7 @@ impl<T: EventListener> Handler for Term<T> {
 
     #[inline]
     fn set_title(&mut self, title: Option<String>) {
-        trace!("Setting title to '{title:?}'");
+        trace!(event = "terminal_title_changed"; "Terminal title changed");
 
         self.title.clone_from(&title);
 
@@ -2931,13 +3180,11 @@ impl<T: EventListener> Handler for Term<T> {
 
     #[inline]
     fn push_title(&mut self) {
-        trace!("Pushing '{:?}' onto title stack", self.title);
+        trace!(event = "terminal_title_pushed"; "Terminal title stack extended");
 
         if self.title_stack.len() >= TITLE_STACK_MAX_DEPTH {
-            let removed = self.title_stack.remove(0);
-            trace!(
-                "Removing '{removed:?}' from bottom of title stack that exceeds its maximum depth"
-            );
+            self.title_stack.remove(0);
+            trace!(event = "terminal_title_evicted"; "Terminal title stack reached its limit");
         }
 
         self.title_stack.push(self.title.clone());
@@ -2948,7 +3195,7 @@ impl<T: EventListener> Handler for Term<T> {
         trace!("Attempting to pop title from stack...");
 
         if let Some(popped) = self.title_stack.pop() {
-            trace!("Title '{popped:?}' popped from stack");
+            trace!(event = "terminal_title_popped"; "Terminal title restored");
             self.set_title(popped);
         }
     }
@@ -2966,6 +3213,36 @@ impl<T: EventListener> Handler for Term<T> {
     fn text_area_size_chars(&mut self) {
         let text = format!("\x1b[8;{};{}t", self.screen_lines(), self.columns());
         self.event_proxy.send_event(Event::PtyWrite(text));
+    }
+
+    #[inline]
+    fn text_area_cell_size_pixels(&mut self) {
+        self.event_proxy.send_event(Event::TextAreaSizeRequest(Arc::new(move |window_size| {
+            format!("\x1b[6;{};{}t", window_size.cell_height, window_size.cell_width)
+        })));
+    }
+
+    #[inline]
+    fn apc_start(&mut self) {
+        self.graphics.apc_start();
+    }
+
+    #[inline]
+    fn apc_put(&mut self, bytes: &[u8]) {
+        self.graphics.apc_put(bytes);
+    }
+
+    fn apc_end(&mut self, cancelled: bool) {
+        let point = self.grid.cursor.point;
+        let cursor = GraphicsCursor {
+            row: point.line.0,
+            col: i32::try_from(point.column.0).unwrap_or(i32::MAX),
+        };
+        let outcome = self.graphics.apc_end(cancelled, cursor);
+        if let Some((columns, rows)) = outcome.advance {
+            self.advance_past_image(columns, rows);
+        }
+        self.flush_graphics_replies();
     }
 }
 
@@ -3096,8 +3373,11 @@ fn push_sgr_color(params: &mut Vec<String>, color: Color, foreground: bool) {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The system clipboard or primary selection.
 pub enum ClipboardType {
+    /// The system clipboard.
     Clipboard,
+    /// The primary selection buffer.
     Selection,
 }
 
@@ -3114,9 +3394,7 @@ impl TabStops {
     /// Remove all tabstops.
     #[inline]
     fn clear_all(&mut self) {
-        unsafe {
-            ptr::write_bytes(self.tabs.as_mut_ptr(), 0, self.tabs.len());
-        }
+        self.tabs.fill(false);
     }
 
     /// Increase tabstop capacity.
@@ -3146,9 +3424,11 @@ impl IndexMut<Column> for TabStops {
 }
 
 /// Terminal cursor rendering information.
-#[derive(Copy, Clone, PartialEq, Eq)]
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub struct RenderableCursor {
+    /// Cursor geometry.
     pub shape: CursorShape,
+    /// Grid position of this value.
     pub point: Point,
 }
 
@@ -3175,11 +3455,17 @@ impl RenderableCursor {
 ///
 /// This contains all content required to render the current terminal view.
 pub struct RenderableContent<'a> {
+    /// Iterator over cells in the visible viewport.
     pub display_iter: GridIterator<'a, Cell>,
+    /// Current selection or its configured appearance.
     pub selection: Option<SelectionRange>,
+    /// Cursor appearance or current cursor state.
     pub cursor: RenderableCursor,
+    /// Number of lines scrolled back from the live viewport.
     pub display_offset: usize,
+    /// Resolved terminal palette.
     pub colors: &'a color::Colors,
+    /// Terminal mode selection.
     pub mode: TermMode,
 }
 
@@ -3200,18 +3486,21 @@ impl<'a> RenderableContent<'a> {
 pub mod test {
     use super::*;
 
-    #[cfg(feature = "serde")]
     use serde::{Deserialize, Serialize};
 
     use crate::terminal::event::VoidListener;
 
-    #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+    #[derive(Serialize, Deserialize, Debug)]
+    /// Grid dimensions for terminal examples and test fixtures.
     pub struct TermSize {
+        /// Number of terminal columns.
         pub columns: usize,
+        /// Number of visible grid lines.
         pub screen_lines: usize,
     }
 
     impl TermSize {
+        /// Create terminal dimensions for examples and test fixtures.
         pub fn new(columns: usize, screen_lines: usize) -> Self {
             Self { columns, screen_lines }
         }
@@ -3250,6 +3539,10 @@ pub mod test {
     ///     hello\n:)\r\ntest",
     /// );
     /// ```
+    ///
+    /// # Panics
+    ///
+    /// Panics for characters without a display width or content with no terminal columns.
     pub fn mock_term(content: &str) -> Term<VoidListener> {
         let lines: Vec<&str> = content.split('\n').collect();
         let num_cols = lines
@@ -3288,26 +3581,32 @@ pub mod test {
     }
 }
 
+// Debug omits user content and native resources, and never acquires application locks.
+impl<T> std::fmt::Debug for Term<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Term").finish_non_exhaustive()
+    }
+}
+
+// Debug omits user content and native resources, and never acquires application locks.
+impl std::fmt::Debug for RenderableContent<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RenderableContent").finish_non_exhaustive()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    use std::sync::Arc;
     use std::sync::Mutex;
     #[cfg(windows)]
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use crate::terminal::event::VoidListener;
-    #[cfg(feature = "serde")]
-    use crate::terminal::grid::Grid;
-    use crate::terminal::grid::Scroll;
-    use crate::terminal::index::{Column, Point, Side};
-    use crate::terminal::selection::{Selection, SelectionRange, SelectionType};
-    #[cfg(feature = "serde")]
-    use crate::terminal::term::cell::Cell;
-    use crate::terminal::term::cell::Flags;
+    use crate::terminal::index::Side;
     use crate::terminal::term::test::{TermSize, mock_term};
-    use crate::terminal::vvte::ansi::{self, CharsetIndex, Handler, StandardCharset};
+    use crate::terminal::vvte::ansi::{self};
 
     #[cfg(windows)]
     #[derive(Clone, Default)]
@@ -4002,6 +4301,100 @@ mod tests {
     }
 
     #[test]
+    fn clear_buffer_discards_full_history_and_old_viewport_without_pty_input() {
+        let size = TermSize::new(20, 5);
+        let listener = PtyWriteListener::default();
+        let writes = listener.0.clone();
+        let config = Config::default();
+        let history_limit = config.scrolling_history;
+        let mut term = Term::new(config, &size, listener);
+        let mut parser: ansi::Processor = ansi::Processor::new();
+        for _ in 0..history_limit + size.screen_lines() {
+            parser.advance(&mut term, b"old output\r\n");
+        }
+        parser.advance(&mut term, b"$ input");
+        assert_eq!(term.history_size(), history_limit);
+        term.scroll_display(Scroll::Top);
+        term.selection = Some(Selection::new(
+            SelectionType::Simple,
+            Point::new(Line(-1), Column(0)),
+            Side::Left,
+        ));
+        term.reset_damage();
+
+        term.clear_buffer();
+
+        assert_eq!(term.history_size(), 0);
+        assert_eq!(term.grid.display_offset(), 0);
+        assert_eq!(term.grid.cursor.point, Point::new(Line(0), Column(7)));
+        assert_eq!(term.viewport_line_text(0), "$ input");
+        for line in 1..size.screen_lines() {
+            assert_eq!(term.viewport_line_text(line as i32), "");
+        }
+        assert!(term.selection.is_none());
+        assert!(matches!(term.damage(), TermDamage::Full));
+        assert!(writes.lock().unwrap().is_empty());
+
+        // Repeating the shortcut is harmless; subsequent shell output continues at the prompt.
+        term.clear_buffer();
+        parser.advance(&mut term, b"!\r\nnew output\r\n$ ");
+        term.scroll_display(Scroll::Top);
+        assert_eq!(term.history_size(), 0);
+        assert_eq!(term.grid.display_offset(), 0);
+        assert_eq!(term.viewport_line_text(0), "$ input!");
+        assert_eq!(term.viewport_line_text(1), "new output");
+        assert!(!term.visible_text().contains("old output"));
+        assert!(writes.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn clear_buffer_keeps_wrapped_input_and_cursor_state() {
+        let size = TermSize::new(5, 6);
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+        let mut parser: ansi::Processor = ansi::Processor::new();
+        parser.advance(&mut term, b"old\r\n$ abcdefghijk\r\nstale\x1b[3;3H");
+        term.clear_buffer();
+
+        assert_eq!(term.history_size(), 0);
+        assert_eq!(term.grid.cursor.point, Point::new(Line(1), Column(2)));
+        assert_eq!(term.viewport_line_text(0), "$ abc");
+        assert_eq!(term.viewport_line_text(1), "defgh");
+        assert_eq!(term.viewport_line_text(2), "ijk");
+        for line in 3..6 {
+            assert_eq!(term.viewport_line_text(line), "");
+        }
+        assert!(term.grid[Line(0)][Column(4)].flags.contains(Flags::WRAPLINE));
+        assert!(term.grid[Line(1)][Column(4)].flags.contains(Flags::WRAPLINE));
+    }
+
+    #[test]
+    fn clear_buffer_handles_empty_single_row_and_alternate_screens() {
+        for lines in [1, 5] {
+            let size = TermSize::new(5, lines);
+            let mut term = Term::new(Config::default(), &size, VoidListener);
+            let mut parser: ansi::Processor = ansi::Processor::new();
+            term.clear_buffer();
+            assert_eq!(term.history_size(), 0);
+            assert_eq!(term.grid.cursor.point, Point::new(Line(0), Column(0)));
+
+            parser.advance(&mut term, b"\x1b[?1049h$ abc");
+            assert!(term.grid.cursor.input_needs_wrap);
+            term.clear_buffer();
+            assert!(term.mode.contains(TermMode::ALT_SCREEN));
+            assert!(term.grid.cursor.input_needs_wrap);
+            assert_eq!(term.viewport_line_text(0), "$ abc");
+            assert_eq!(term.grid.cursor.point, Point::new(Line(0), Column(4)));
+        }
+    }
+
+    #[test]
+    fn clear_buffer_notifies_the_media_scene() {
+        let (mut term, events) = scene_term(3);
+        term.clear_buffer();
+        assert_eq!(*events.lock().unwrap(), ["clear"]);
+    }
+
+    #[test]
     fn clearing_viewport_keeps_history_position() {
         let size = TermSize::new(10, 20);
         let mut term = Term::new(Config::default(), &size, VoidListener);
@@ -4674,40 +5067,59 @@ mod tests {
         }
     }
 
-    #[derive(Clone, Default)]
-    struct ClipboardStoreListener(Arc<Mutex<Vec<(ClipboardType, String)>>>);
+    /// OSC 52 requests passed on: a store with its text, or a load.
+    type ClipboardRequests = Vec<(ClipboardType, Option<String>)>;
 
-    impl EventListener for ClipboardStoreListener {
+    /// Records the OSC 52 requests a terminal passes on.
+    #[derive(Clone, Default)]
+    struct ClipboardListener(Arc<Mutex<ClipboardRequests>>);
+
+    impl EventListener for ClipboardListener {
         fn send_event(&self, event: Event) {
-            if let Event::ClipboardStore(ty, text) = event {
-                self.0.lock().unwrap().push((ty, text));
+            match event {
+                Event::ClipboardStore(ty, text) => self.0.lock().unwrap().push((ty, Some(text))),
+                Event::ClipboardLoad(ty, _) => self.0.lock().unwrap().push((ty, None)),
+                _ => (),
+            }
+        }
+    }
+
+    /// Only a denied direction stops at the terminal; asking is the window's business, so an
+    /// `ask` request is passed on exactly like an allowed one.
+    #[test]
+    fn osc52_passes_on_every_direction_that_is_not_denied() {
+        use ClipboardAccess::{Allow, Ask, Deny};
+
+        for read in [Deny, Ask, Allow] {
+            for write in [Deny, Ask, Allow] {
+                let size = TermSize::new(25, 80);
+                let listener = ClipboardListener::default();
+                let requests = listener.0.clone();
+                let config = Config { osc52: Osc52 { read, write }, ..Config::default() };
+                let mut term = Term::new(config, &size, listener);
+                let mut parser: ansi::Processor = ansi::Processor::new();
+
+                parser.advance(&mut term, b"\x1b]52;c;aMOpbGxvIPCfpoA=\x1b\\");
+                parser.advance(&mut term, b"\x1b]52;p;?\x1b\\");
+
+                let mut expected = Vec::new();
+                if write != Deny {
+                    expected.push((ClipboardType::Clipboard, Some("héllo 🦀".to_owned())));
+                }
+                if read != Deny {
+                    expected.push((ClipboardType::Selection, None));
+                }
+                assert_eq!(*requests.lock().unwrap(), expected, "read={read:?} write={write:?}");
             }
         }
     }
 
     #[test]
-    fn osc52_store_obeys_copy_policy() {
-        for (osc52, expected) in [
-            (Osc52::OnlyCopy, true),
-            (Osc52::CopyPaste, true),
-            (Osc52::Disabled, false),
-            (Osc52::OnlyPaste, false),
-        ] {
-            let size = TermSize::new(25, 80);
-            let listener = ClipboardStoreListener::default();
-            let stores = listener.0.clone();
-            let config = Config { osc52, ..Config::default() };
-            let mut term = Term::new(config, &size, listener);
-            let mut parser: ansi::Processor = ansi::Processor::new();
-
-            parser.advance(&mut term, b"\x1b]52;c;aMOpbGxvIPCfpoA=\x1b\\");
-
-            let stores = stores.lock().unwrap();
-            assert_eq!(!stores.is_empty(), expected, "policy={osc52:?}");
-            if expected {
-                assert_eq!(stores.as_slice(), &[(ClipboardType::Clipboard, "héllo 🦀".to_owned())]);
-            }
-        }
+    fn osc52_asks_before_reading_and_allows_setting_by_default() {
+        assert_eq!(
+            Osc52::default(),
+            Osc52 { read: ClipboardAccess::Ask, write: ClipboardAccess::Allow }
+        );
     }
 
     #[test]

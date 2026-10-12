@@ -51,7 +51,10 @@ impl<'a> StrShortener<'a> {
 
         if direction == ShortenDirection::Right {
             return Self {
-                #[allow(clippy::iter_skip_zero)]
+                #[allow(
+                    clippy::iter_skip_zero,
+                    reason = "the string-processing macro accepts zero and nonzero offsets"
+                )]
                 chars: text.chars().skip(0),
                 accumulated_len: 0,
                 text_action: TextAction::Char,

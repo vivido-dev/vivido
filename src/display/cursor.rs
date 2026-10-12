@@ -36,7 +36,7 @@ impl IntoRects for RenderableCursor {
 }
 
 /// Cursor rect iterator.
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct CursorRects {
     rects: [Option<RenderRect>; 4],
     index: usize,

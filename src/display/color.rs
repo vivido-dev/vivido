@@ -14,7 +14,8 @@ use crate::config::color::Colors;
 /// Factor for automatic computation of dim colors.
 pub const DIM_FACTOR: f32 = 0.66;
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug)]
+/// Resolved terminal palette indexed by ANSI color identifiers.
 pub struct List([Rgb; COUNT]);
 
 impl From<&'_ Colors> for List {
@@ -31,6 +32,7 @@ impl From<&'_ Colors> for List {
 }
 
 impl List {
+    /// Resolve named palette colors from the terminal configuration.
     pub fn fill_named(&mut self, colors: &Colors) {
         // Normals.
         self[NamedColor::Black] = colors.normal.black;
@@ -87,6 +89,7 @@ impl List {
         }
     }
 
+    /// Fill the indexed six-level RGB color cube, applying explicit overrides.
     pub fn fill_cube(&mut self, colors: &Colors) {
         let mut index: usize = 16;
         // Build colors.
@@ -113,6 +116,7 @@ impl List {
         debug_assert!(index == 232);
     }
 
+    /// Fill the indexed grayscale ramp, applying explicit overrides.
     pub fn fill_gray_ramp(&mut self, colors: &Colors) {
         let mut index: usize = 232;
 
@@ -171,15 +175,18 @@ impl IndexMut<NamedColor> for List {
 }
 
 #[derive(Debug, Eq, PartialEq, Copy, Clone, Default)]
+/// An eight-bit red, green, and blue color.
 pub struct Rgb(pub VteRgb);
 
 impl Rgb {
     #[inline]
+    /// Create a color from eight-bit red, green, and blue components.
     pub const fn new(r: u8, g: u8, b: u8) -> Self {
         Self(VteRgb { r, g, b })
     }
 
     #[inline]
+    /// Return the red, green, and blue components.
     pub fn as_tuple(self) -> (u8, u8, u8) {
         (self.0.r, self.0.g, self.0.b)
     }
@@ -315,13 +322,17 @@ impl FromStr for Rgb {
 /// RGB color optionally referencing the cell's foreground or background.
 #[derive(Serialize, Copy, Clone, Debug, PartialEq, Eq)]
 pub enum CellRgb {
+    /// Use the existing cell foreground color.
     CellForeground,
+    /// Use the existing cell background color.
     CellBackground,
     #[serde(untagged)]
+    /// Use an explicit RGB color.
     Rgb(Rgb),
 }
 
 impl CellRgb {
+    /// Resolve or return this item's RGB color.
     pub fn color(self, foreground: Rgb, background: Rgb) -> Rgb {
         match self {
             Self::CellForeground => foreground,

@@ -45,11 +45,17 @@ const STATE_FILE_NAME: &str = "update-state.toml";
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct UpdateManifest {
+    /// Document schema version.
     pub schema: u16,
+    /// Product identifier expected to be `vivido`.
     pub product: String,
+    /// Version identifier for this value.
     pub version: Version,
+    /// Publication timestamp supplied by the update feed.
     pub published_utc: String,
+    /// Optional HTTPS release-notes URL.
     pub notes_url: Option<String>,
+    /// Installer metadata selected for this platform.
     pub asset: UpdateAsset,
 }
 
@@ -57,44 +63,73 @@ pub struct UpdateManifest {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct UpdateAsset {
+    /// Name identifying this item.
     pub name: String,
+    /// HTTPS installer download URL.
     pub url: String,
+    /// Lowercase hexadecimal SHA-256 digest of the installer.
     pub sha256: String,
+    /// Payload bytes or the declared payload byte count.
     pub bytes: u64,
+    /// Classification of this item.
     pub kind: String,
+    /// Expected Windows installer publisher.
     pub publisher: Option<String>,
+    /// Expected macOS signing Team ID.
     pub team_id: Option<String>,
 }
 
 /// Events emitted by update workers and consumed by the application processor.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UpdateEvent {
+    /// An explicit update check was requested.
     CheckRequested,
+    /// A newer validated update is available.
     Available {
+        /// Validated update manifest.
         manifest: Box<UpdateManifest>,
+        /// Version identifier for this value.
         version: Version,
+        /// Payload bytes or the declared payload byte count.
         bytes: u64,
+        /// Optional HTTPS release-notes URL.
         notes_url: Option<String>,
+        /// Whether the user explicitly requested the update operation.
         manual: bool,
     },
+    /// No newer update was found.
     UpToDate {
+        /// Currently installed application version.
         current: Version,
     },
+    /// Installer download progress.
     Progress {
+        /// Version identifier for this value.
         version: Version,
+        /// Number of installer bytes received.
         downloaded: u64,
+        /// Declared installer byte count.
         total: u64,
     },
+    /// A verified installer is ready for user approval.
     Ready {
+        /// Version identifier for this value.
         version: Version,
+        /// Path to the verified installer.
         path: PathBuf,
     },
+    /// The user requested installation.
     InstallRequested,
+    /// Suppress this update version.
     Skip {
+        /// Version identifier for this value.
         version: Version,
     },
+    /// An update operation failed.
     Failed {
+        /// Human-readable diagnostic.
         message: String,
+        /// Whether the user explicitly requested the update operation.
         manual: bool,
     },
 }
@@ -102,12 +137,19 @@ pub enum UpdateEvent {
 /// Failure returned while validating, discovering, downloading, or verifying an update.
 #[derive(Debug)]
 pub enum UpdateError {
+    /// The update manifest failed validation.
     InvalidManifest(String),
+    /// Update discovery or download failed.
     Http(String),
+    /// Installer content or signature verification failed.
     Verification(String),
+    /// In-app installation is unavailable on this platform.
     UnsupportedPlatform,
+    /// The operation was canceled.
     Cancelled,
+    /// An operating-system I/O operation failed.
     Io(io::Error),
+    /// Manifest JSON decoding failed.
     Json(serde_json::Error),
 }
 
@@ -168,6 +210,10 @@ impl From<serde_json::Error> for UpdateError {
 }
 
 /// Validate all security- and resource-relevant manifest fields.
+///
+/// # Errors
+///
+/// Returns `UpdateError` for an unsupported schema, product, version, URL, asset size, or digest.
 pub fn validate(manifest: &UpdateManifest) -> Result<(), UpdateError> {
     if manifest.schema != 1 {
         return Err(UpdateError::invalid("unsupported schema"));
@@ -264,17 +310,195 @@ pub fn platform() -> &'static str {
 }
 
 /// Return the suite version compiled into this Vivido build.
+///
+/// # Panics
+///
+/// Panics if the build-time package version is not valid semantic version syntax.
 pub fn current_version() -> Version {
     Version::parse(env!("CARGO_PKG_VERSION"))
         .expect("CARGO_PKG_VERSION must be a valid semantic version")
 }
 
+/// Owns update I/O and worker dispatch for one application context.
+///
+/// Native instances perform bounded HTTPS requests and installer verification. Mocked instances
+/// run synchronously and consume supplied results without network, filesystem, or thread access.
+#[derive(Clone, Debug)]
+pub struct UpdateService {
+    core: UpdateCore,
+}
+
+#[derive(Clone, Debug)]
+enum UpdateCore {
+    Native,
+    #[cfg(feature = "test-util")]
+    Mocked(UpdateControl),
+}
+
+impl UpdateCore {
+    fn fetch(&self) -> Result<UpdateManifest, UpdateError> {
+        match self {
+            Self::Native => {
+                let _ = cleanup_stale_updates();
+                fetch_manifest()
+            },
+            #[cfg(feature = "test-util")]
+            Self::Mocked(control) => {
+                let result = control
+                    .inner
+                    .lock()
+                    .expect("mock update state poisoned")
+                    .manifest
+                    .take()
+                    .ok_or_else(|| UpdateError::invalid("no mock manifest result supplied"))??;
+                validate(&result)?;
+                Ok(result)
+            },
+        }
+    }
+
+    fn download(
+        &self,
+        sink: &EventSink,
+        manifest: &UpdateManifest,
+        cancel: &AtomicBool,
+    ) -> Result<PathBuf, UpdateError> {
+        match self {
+            Self::Native => download_and_verify(sink, manifest, cancel),
+            #[cfg(feature = "test-util")]
+            Self::Mocked(control) => {
+                validate(manifest)?;
+                if cancel.load(Ordering::Relaxed) {
+                    return Err(UpdateError::Cancelled);
+                }
+                control
+                    .inner
+                    .lock()
+                    .expect("mock update state poisoned")
+                    .download
+                    .take()
+                    .ok_or_else(|| UpdateError::invalid("no mock download result supplied"))?
+            },
+        }
+    }
+
+    fn fail_worker_start(&self) -> bool {
+        match self {
+            Self::Native => false,
+            #[cfg(feature = "test-util")]
+            Self::Mocked(control) => {
+                let mut state = control.inner.lock().expect("mock update state poisoned");
+                std::mem::take(&mut state.fail_start)
+            },
+        }
+    }
+
+    fn synchronous(&self) -> bool {
+        match self {
+            Self::Native => false,
+            #[cfg(feature = "test-util")]
+            Self::Mocked(_) => true,
+        }
+    }
+}
+
+/// Supplies deterministic results to one mocked update service.
+#[cfg(feature = "test-util")]
+#[derive(Clone)]
+pub struct UpdateControl {
+    inner: Arc<std::sync::Mutex<MockUpdateState>>,
+}
+
+#[cfg(feature = "test-util")]
+#[derive(Default)]
+struct MockUpdateState {
+    manifest: Option<Result<UpdateManifest, UpdateError>>,
+    download: Option<Result<PathBuf, UpdateError>>,
+    fail_start: bool,
+}
+
+#[cfg(feature = "test-util")]
+impl fmt::Debug for UpdateControl {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("UpdateControl").finish_non_exhaustive()
+    }
+}
+
+#[cfg(feature = "test-util")]
+impl UpdateControl {
+    /// Supply the next manifest result; successful manifests still undergo normal validation.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a prior panic poisoned the mock update state.
+    pub fn set_manifest(&self, result: Result<UpdateManifest, UpdateError>) {
+        self.inner.lock().expect("mock update state poisoned").manifest = Some(result);
+    }
+
+    /// Fail the next worker start without consuming its supplied result.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a prior panic poisoned the mock update state.
+    pub fn fail_next_worker_start(&self) {
+        self.inner.lock().expect("mock update state poisoned").fail_start = true;
+    }
+
+    /// Supply the next installer verification result without creating or executing an installer.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a prior panic poisoned the mock update state.
+    pub fn set_download(&self, result: Result<PathBuf, UpdateError>) {
+        self.inner.lock().expect("mock update state poisoned").download = Some(result);
+    }
+}
+
+impl UpdateService {
+    pub(crate) fn uses_virtual_io(&self) -> bool {
+        self.core.synchronous()
+    }
+
+    /// Create a service backed by bounded native update operations.
+    #[expect(
+        clippy::new_without_default,
+        reason = "creating an I/O service is an explicit runtime choice"
+    )]
+    pub fn new() -> Self {
+        Self { core: UpdateCore::Native }
+    }
+
+    /// Create a service and isolated result controller without performing system operations.
+    #[cfg(feature = "test-util")]
+    pub fn new_mocked() -> (Self, UpdateControl) {
+        let control =
+            UpdateControl { inner: Arc::new(std::sync::Mutex::new(MockUpdateState::default())) };
+        (Self { core: UpdateCore::Mocked(control.clone()) }, control)
+    }
+}
+
 /// Start a bounded background update check.
 pub fn spawn_check(sink: EventSink, manual: bool) {
-    let worker_sink = sink.clone();
-    let spawn = thread::Builder::new().name("vivido-update-check".into()).spawn(move || {
-        let _ = cleanup_stale_updates();
-        match fetch_manifest() {
+    UpdateService::new().check(sink, manual);
+}
+
+/// Start a bounded background installer download and verification.
+pub fn spawn_download(sink: EventSink, manifest: UpdateManifest, cancel: Arc<AtomicBool>) {
+    UpdateService::new().download(sink, manifest, cancel);
+}
+
+impl UpdateService {
+    /// Start a bounded background update check.
+    ///
+    /// Mocked services complete synchronously; native services report completion through `sink`.
+    ///
+    /// # Panics
+    ///
+    /// In `test-util` mode, panics if a prior panic poisoned mocked service state.
+    pub fn check(&self, sink: EventSink, manual: bool) {
+        let core = self.core.clone();
+        let worker_sink = sink.clone();
+        let work = move || match core.fetch() {
             Ok(manifest) if is_newer_version(&manifest.version, &current_version()) => {
                 let event = UpdateEvent::Available {
                     version: manifest.version.clone(),
@@ -294,24 +518,42 @@ pub fn spawn_check(sink: EventSink, manual: bool) {
                     UpdateEvent::Failed { message: error.to_string(), manual },
                 );
             },
+        };
+        if self.core.fail_worker_start() {
+            send_update(
+                &sink,
+                UpdateEvent::Failed { message: "could not start update worker".into(), manual },
+            );
+            return;
         }
-    });
-    if let Err(error) = spawn {
-        send_update(
-            &sink,
-            UpdateEvent::Failed {
-                message: format!("could not start update check: {error}"),
-                manual,
-            },
-        );
+        if self.core.synchronous() {
+            work();
+            return;
+        }
+        let spawn = thread::Builder::new().name("vivido-update-check".into()).spawn(work);
+        if let Err(error) = spawn {
+            send_update(
+                &sink,
+                UpdateEvent::Failed {
+                    message: format!("could not start update check: {error}"),
+                    manual,
+                },
+            );
+        }
     }
-}
 
-/// Start a bounded background installer download and verification.
-pub fn spawn_download(sink: EventSink, manifest: UpdateManifest, cancel: Arc<AtomicBool>) {
-    let worker_sink = sink.clone();
-    let spawn = thread::Builder::new().name("vivido-update-download".into()).spawn(move || {
-        match download_and_verify(&worker_sink, &manifest, &cancel) {
+    /// Start a bounded background installer download and verification.
+    ///
+    /// Mocked services complete synchronously. Native operations report completion through `sink`.
+    /// Cancellation is silent and preserves an unused mocked result.
+    ///
+    /// # Panics
+    ///
+    /// In `test-util` mode, panics if a prior panic poisoned mocked service state.
+    pub fn download(&self, sink: EventSink, manifest: UpdateManifest, cancel: Arc<AtomicBool>) {
+        let core = self.core.clone();
+        let worker_sink = sink.clone();
+        let work = move || match core.download(&worker_sink, &manifest, &cancel) {
             Ok(path) => {
                 send_update(&worker_sink, UpdateEvent::Ready { version: manifest.version, path })
             },
@@ -320,16 +562,31 @@ pub fn spawn_download(sink: EventSink, manifest: UpdateManifest, cancel: Arc<Ato
                 &worker_sink,
                 UpdateEvent::Failed { message: error.to_string(), manual: true },
             ),
+        };
+        if self.core.fail_worker_start() {
+            send_update(
+                &sink,
+                UpdateEvent::Failed {
+                    message: "could not start update worker".into(),
+                    manual: true,
+                },
+            );
+            return;
         }
-    });
-    if let Err(error) = spawn {
-        send_update(
-            &sink,
-            UpdateEvent::Failed {
-                message: format!("could not start update download: {error}"),
-                manual: true,
-            },
-        );
+        if self.core.synchronous() {
+            work();
+            return;
+        }
+        let spawn = thread::Builder::new().name("vivido-update-download".into()).spawn(work);
+        if let Err(error) = spawn {
+            send_update(
+                &sink,
+                UpdateEvent::Failed {
+                    message: format!("could not start update download: {error}"),
+                    manual: true,
+                },
+            );
+        }
     }
 }
 
@@ -340,6 +597,10 @@ pub fn read_skipped_version() -> Option<Version> {
 }
 
 /// Atomically persist the update version suppressed by the user.
+///
+/// # Errors
+///
+/// Returns an I/O error if the preferences directory or skip marker cannot be written.
 pub fn write_skipped_version(version: &Version) -> io::Result<()> {
     let path = state_path().ok_or_else(|| {
         io::Error::other("could not determine the Vivido configuration directory")

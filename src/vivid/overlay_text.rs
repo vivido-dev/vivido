@@ -492,12 +492,14 @@ mod tests {
     fn editor_is_focus_revision_owner_and_viewport_scoped() {
         use vivid_protocol::identity::PresenterInstanceId;
         use vivid_protocol::overlay::{WindowMode, WindowOptions};
-        let first = SessionIdentity { presenter: PresenterInstanceId([1; 16]), session_id: 1 }
+        let first = SessionIdentity::new(PresenterInstanceId([1; 16]), 1)
+            .unwrap()
             .context(1)
             .unwrap()
             .surface(1)
             .unwrap();
-        let other = SessionIdentity { session_id: 2, ..first.context.session }
+        let other = SessionIdentity::new(first.context().session().presenter(), 2)
+            .unwrap()
             .context(1)
             .unwrap()
             .surface(1)
@@ -525,7 +527,7 @@ mod tests {
         };
         host.editor = Some((first, editor));
         assert_eq!(host.editor_rect(), Some(Rect::new(105., 25., 5., 15.).unwrap()));
-        host.remove_owner(other.context.session);
+        host.remove_owner(other.context().session());
         assert!(host.editor_rect().is_some());
         host.windows.publish_scene(first, 1, 8).unwrap();
         assert_eq!(host.editor_rect(), None);

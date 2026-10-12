@@ -82,6 +82,7 @@ impl ScrollbarGeometry {
 }
 
 /// Overlay scrollbar state: visibility timing, hover, and an in-flight drag.
+#[derive(Debug)]
 pub struct ScrollbarState {
     model: ScrollbarModel,
     hovering: bool,

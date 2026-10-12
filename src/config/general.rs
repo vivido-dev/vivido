@@ -23,7 +23,7 @@ pub struct General {
     pub live_config_reload: bool,
 
     /// Offer IPC through a unix socket.
-    #[allow(unused)]
+    #[allow(unused, reason = "legacy configuration fields must remain deserializable")]
     pub ipc_socket: bool,
 }
 

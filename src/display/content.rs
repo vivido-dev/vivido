@@ -4,6 +4,7 @@ use std::ops::Deref;
 use std::{cmp, mem};
 
 use crate::terminal::event::EventListener;
+use crate::terminal::graphics::PLACEHOLDER;
 use crate::terminal::grid::{Dimensions, Indexed};
 use crate::terminal::index::{Column, Line, Point};
 use crate::terminal::selection::SelectionRange;
@@ -38,6 +39,11 @@ pub struct RenderableContent<'a> {
 }
 
 impl<'a> RenderableContent<'a> {
+    /// Borrow visible terminal cells and resolve their rendering attributes.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the terminal cursor is outside the viewport; terminal and display geometry must agree.
     pub fn new<T: EventListener>(
         config: &'a UiConfig,
         display: &'a mut Display,
@@ -105,6 +111,7 @@ impl<'a> RenderableContent<'a> {
         self.terminal_content.colors[color].map(Rgb).unwrap_or(self.colors[color])
     }
 
+    /// Return the visible terminal selection range, if any.
     pub fn selection_range(&self) -> Option<SelectionRange> {
         self.terminal_content.selection
     }
@@ -183,13 +190,21 @@ impl Iterator for RenderableContent<'_> {
 /// Cell ready for rendering.
 #[derive(Clone, Debug)]
 pub struct RenderableCell {
+    /// Character displayed in this cell.
     pub character: char,
+    /// Grid position of this value.
     pub point: Point<usize>,
+    /// Foreground color.
     pub fg: Rgb,
+    /// Background color.
     pub bg: Rgb,
+    /// Background opacity from zero to one.
     pub bg_alpha: f32,
+    /// Underline color.
     pub underline: Rgb,
+    /// Terminal cell or mode flags.
     pub flags: Flags,
+    /// Optional extended cell attributes.
     pub extra: Option<Box<RenderableCellExtra>>,
 }
 
@@ -197,7 +212,9 @@ pub struct RenderableCell {
 /// pass around.
 #[derive(Clone, Debug)]
 pub struct RenderableCellExtra {
+    /// Combining characters attached to this cell.
     pub zerowidth: Option<Vec<char>>,
+    /// Optional OSC 8 hyperlink.
     pub hyperlink: Option<Hyperlink>,
 }
 
@@ -281,7 +298,13 @@ impl RenderableCell {
             .underline_color()
             .map_or(fg, |underline| Self::compute_fg_rgb(content, underline, flags));
 
-        let zerowidth = cell.zerowidth();
+        // A placeholder cell stands for part of an image; its character and the combining marks
+        // that carry coordinates are data, not text to draw.
+        let placeholder = character == PLACEHOLDER;
+        if placeholder {
+            character = ' ';
+        }
+        let zerowidth = cell.zerowidth().filter(|_| !placeholder);
         let hyperlink = cell.hyperlink();
 
         let extra = (zerowidth.is_some() || hyperlink.is_some()).then(|| {
@@ -414,6 +437,7 @@ impl RenderableCursor {
 }
 
 impl RenderableCursor {
+    /// Create a renderable cursor from its shape, color, width, and position.
     pub fn new(
         point: Point<usize>,
         shape: CursorShape,
@@ -423,18 +447,22 @@ impl RenderableCursor {
         Self { shape, cursor_color, text_color: cursor_color, width, point }
     }
 
+    /// Resolve or return this item's RGB color.
     pub fn color(&self) -> Rgb {
         self.cursor_color
     }
 
+    /// Return the cursor's geometric shape.
     pub fn shape(&self) -> CursorShape {
         self.shape
     }
 
+    /// Return the width in this geometry's coordinate system.
     pub fn width(&self) -> NonZeroU32 {
         self.width
     }
 
+    /// Return the cursor's visible grid position.
     pub fn point(&self) -> Point<usize> {
         self.point
     }
@@ -544,5 +572,12 @@ impl Deref for HintMatches<'_> {
 
     fn deref(&self) -> &Self::Target {
         self.matches.deref()
+    }
+}
+
+// Debug omits user content and native resources, and never acquires application locks.
+impl std::fmt::Debug for RenderableContent<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RenderableContent").finish_non_exhaustive()
     }
 }

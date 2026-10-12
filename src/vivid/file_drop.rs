@@ -20,7 +20,7 @@ use vivid_protocol::revision::{
     FileDropGrantGeneration, FileTransferGeneration, SurfaceGeneration,
 };
 use vivid_protocol::wire::ConnectionKind;
-use vivid_protocol::{auth, messages, registry};
+use vivid_protocol::{messages, registry};
 
 use super::{
     PendingConnection, Reader, ServiceShared, SessionRuntime, Writer, lock, protocol_error,
@@ -1091,9 +1091,9 @@ impl FileDropManager {
     ) -> Option<BindingKey> {
         if let Some((surface, generation)) = hit {
             let key = BindingKey {
-                session: surface.context.session,
-                context_id: surface.context.context_id,
-                surface_id: surface.surface_id,
+                session: surface.context().session(),
+                context_id: surface.context().context_id(),
+                surface_id: surface.surface_id(),
             };
             if self.bindings.get(&key).is_some_and(|entry| {
                 entry.binding.surface_generation == generation
@@ -1259,24 +1259,7 @@ fn authenticate_open(
             "file-drop-v1 was not negotiated",
         ));
     }
-    let expected = auth::file_transfer_tag(
-        session.channel_key.expose(),
-        open.session_id,
-        open.context_id,
-        open.surface_id,
-        open.producer_epoch.get(),
-        open.grant_generation.get(),
-        open.surface_generation.get(),
-        open.drop_id,
-        open.transfer_id,
-        open.transfer_generation.get(),
-        open.resume_offset,
-        open.maximum_record_body,
-        open.maximum_body_bytes,
-        open.maximum_records,
-        &open.client_nonce,
-    );
-    if !auth::verify_tag(&expected, &open.authentication_tag) {
+    if !open.verify(session.channel_key.expose()) {
         return Err(reject_open(
             writer,
             open.transfer_id,

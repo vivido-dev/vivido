@@ -1,8 +1,10 @@
 //! TTY related functionality.
 
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::fs;
 use std::path::PathBuf;
+use std::process::Command;
 use std::process::ExitStatus;
 use std::sync::Arc;
 use std::{env, io};
@@ -12,6 +14,8 @@ use log::warn;
 use polling::{Event, PollMode, Poller};
 use tempfile::TempDir;
 
+#[cfg(not(windows))]
+pub mod shell_integration;
 #[cfg(not(windows))]
 mod unix;
 #[cfg(not(windows))]
@@ -39,6 +43,10 @@ pub struct Options {
     /// Extra environment variables.
     pub env: HashMap<String, String>,
 
+    /// Start a supported shell with Vivido's integration loaded, so it reports its prompts,
+    /// commands, and working directory.
+    pub shell_integration: bool,
+
     /// Specifies whether the Windows shell arguments should be escaped.
     ///
     /// - When `true`: Arguments will be escaped according to the standard C runtime rules.
@@ -57,8 +65,34 @@ pub struct Shell {
 }
 
 impl Shell {
+    /// Configure a child shell executable and its arguments.
     pub fn new(program: String, args: Vec<String>) -> Self {
         Self { program, args }
+    }
+}
+
+/// A shell that Vivido started with its integration loaded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IntegratedShell {
+    /// Bash startup integration.
+    Bash,
+    /// Zsh startup integration.
+    Zsh,
+    /// Fish startup integration.
+    Fish,
+    /// PowerShell startup integration.
+    PowerShell,
+}
+
+impl IntegratedShell {
+    /// The name automation reports.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Bash => "bash",
+            Self::Zsh => "zsh",
+            Self::Fish => "fish",
+            Self::PowerShell => "powershell",
+        }
     }
 }
 
@@ -67,17 +101,35 @@ impl Shell {
 /// This defines an abstraction over polling's interface in order to allow either
 /// one read/write object or a separate read and write object.
 pub trait EventedReadWrite {
+    /// Concrete reader type supplied by this implementation.
     type Reader: io::Read;
+    /// Concrete writer type supplied by this implementation.
     type Writer: io::Write;
 
     /// # Safety
     ///
     /// The underlying sources must outlive their registration in the `Poller`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if the resource cannot be registered with the operating system poller.
     unsafe fn register(&mut self, _: &Arc<Poller>, _: Event, _: PollMode) -> io::Result<()>;
+    /// Update interest in an already registered PTY transport.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if the poller cannot update this resource’s interest.
     fn reregister(&mut self, _: &Arc<Poller>, _: Event, _: PollMode) -> io::Result<()>;
+    /// Remove this PTY transport from its polling loop.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if the poller cannot remove this resource.
     fn deregister(&mut self, _: &Arc<Poller>) -> io::Result<()>;
 
+    /// Borrow the readable side of the PTY transport.
     fn reader(&mut self) -> &mut Self::Reader;
+    /// Borrow the writable side of the PTY transport.
     fn writer(&mut self) -> &mut Self::Writer;
 }
 
@@ -106,14 +158,61 @@ const TERMINFO_NAME: &str = "vivido";
 // host ncurses build, `tic` may put the entry below `v/` or hexadecimal `76/`.
 const BUNDLED_TERMINFO: &str = include_str!("../../../extra/vivido.terminfo.b64");
 
-/// Keeps Vivido's private terminfo tree alive until all PTY children have exited.
+/// Owns child-environment defaults and their temporary terminfo and shell resources.
+///
+/// Keep this guard alive until every child using its environment has exited. Provisioning
+/// never mutates the process environment and is safe after other threads have started.
 #[must_use]
 pub struct TerminfoGuard {
     _directory: Option<TempDir>,
+    #[cfg(not(windows))]
+    _shell_integration: Option<TempDir>,
+    variables: HashMap<&'static str, Option<OsString>>,
 }
 
-/// Setup environment variables.
+impl TerminfoGuard {
+    /// Apply terminal defaults to one child before applying user overrides.
+    pub fn apply(&self, command: &mut Command) {
+        for (name, value) in &self.variables {
+            match value {
+                Some(value) => {
+                    command.env(name, value);
+                },
+                None => {
+                    command.env_remove(name);
+                },
+            }
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn integration_directory(&self) -> Option<&std::path::Path> {
+        self._shell_integration.as_ref().map(TempDir::path)
+    }
+
+    #[cfg(windows)]
+    fn apply_options(&self, environment: &mut HashMap<String, String>) {
+        for (name, value) in &self.variables {
+            if let Some(value) = value
+                && !environment.keys().any(|key| key.eq_ignore_ascii_case(name))
+            {
+                environment.insert((*name).to_owned(), value.to_string_lossy().into_owned());
+            }
+        }
+    }
+}
+
+/// Provision terminal environment defaults without mutating the process environment.
+///
+/// PTY constructors apply these defaults automatically. Other child launchers can call
+/// [`TerminfoGuard::apply`] before adding their own environment overrides.
 pub fn setup_env() -> TerminfoGuard {
+    let mut variables = HashMap::new();
+    #[cfg(target_os = "macos")]
+    if crate::macos::locale::needs_child_locale() {
+        let (key, value) = crate::macos::locale::child_locale();
+        variables.insert(key, Some(OsString::from(value)));
+    }
     // Prefer an entry installed by the user or package manager. Source builds and `cargo install`
     // do not install data files, so materialize the bundled entry when the database has no Vivido
     // definition. User-configured environment variables are applied after this function and can
@@ -123,7 +222,7 @@ pub fn setup_env() -> TerminfoGuard {
     } else {
         match provision_bundled_terminfo() {
             Ok(directory) => {
-                unsafe { env::set_var("TERMINFO", directory.path()) };
+                variables.insert("TERMINFO", Some(directory.path().as_os_str().to_owned()));
                 Some(directory)
             },
             Err(error) => {
@@ -138,12 +237,36 @@ pub fn setup_env() -> TerminfoGuard {
     } else {
         "xterm-256color"
     };
-    unsafe { env::set_var("TERM", terminfo) };
+    variables.insert("TERM", Some(OsString::from(terminfo)));
 
     // Advertise 24-bit color support.
-    unsafe { env::set_var("COLORTERM", "truecolor") };
+    variables.insert("COLORTERM", Some(OsString::from("truecolor")));
 
-    TerminfoGuard { _directory: directory }
+    // Shells read the scripts from here, and anyone loading them by hand finds them through the
+    // variable. A value inherited from an enclosing Vivido names that instance's copy, so it is
+    // replaced, or removed when this instance has none.
+    #[cfg(not(windows))]
+    let shell_integration = match shell_integration::provision() {
+        Ok(directory) => {
+            variables.insert(
+                shell_integration::DIRECTORY_ENV,
+                Some(directory.path().as_os_str().to_owned()),
+            );
+            Some(directory)
+        },
+        Err(error) => {
+            warn!("Could not provision shell integration scripts: {error}");
+            variables.insert(shell_integration::DIRECTORY_ENV, None);
+            None
+        },
+    };
+
+    TerminfoGuard {
+        _directory: directory,
+        #[cfg(not(windows))]
+        _shell_integration: shell_integration,
+        variables,
+    }
 }
 
 /// Materialize the bundled compiled entry in both terminfo directory layouts.
@@ -206,6 +329,16 @@ fn terminfo_exists(terminfo: &str) -> bool {
 
     // No valid terminfo path has been found.
     false
+}
+
+// Debug omits user content and native resources, and never acquires application locks.
+impl std::fmt::Debug for TerminfoGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TerminfoGuard")
+            .field("provisioned_terminfo", &self._directory.is_some())
+            .field("variables", &self.variables.len())
+            .finish_non_exhaustive()
+    }
 }
 
 #[cfg(test)]

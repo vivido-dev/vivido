@@ -4,21 +4,19 @@
 //! Keeping dispatch here avoids embedding window policy in the terminal loop.
 
 use crate::display::{text::TextSystem, vector::CompiledScene};
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::VecDeque;
 use std::sync::Weak;
 use vello::peniko::{Blob, ImageAlphaType, ImageData, ImageFormat};
-use winit::window::CursorIcon;
 
 use vivid_protocol::overlay::wire::{
-    Action, Appearance, Clipboard, Environment, EnvironmentChanged, Query, SetSemantics, SetWindow,
-    Status, Viewport, WindowAddress,
+    Action, Clipboard, Environment, EnvironmentChanged, Query, SetSemantics, SetWindow, Status,
+    Viewport, WindowAddress,
 };
 use vivid_protocol::overlay::wire::{
     PresentationOutcome, Submission, SubmissionOutcome, ViewportChanged,
 };
 use vivid_protocol::overlay::{
-    AccessibleAction, DismissReason, Event, MAX_CLICKS, PointerReport, Scroll, ScrollPhase,
-    Semantics, Windows,
+    DismissReason, Event, MAX_CLICKS, PointerReport, Scroll, ScrollPhase, Semantics, Windows,
 };
 use vivid_protocol::vector::Scalar;
 
@@ -294,9 +292,9 @@ impl Host {
             .iter()
             .copied()
             .filter(|(owner, s)| {
-                *owner == identity.context.session
-                    && s.address.context_id == identity.context.context_id
-                    && s.address.surface_id == identity.surface_id
+                *owner == identity.context().session()
+                    && s.address.context_id == identity.context().context_id()
+                    && s.address.surface_id == identity.surface_id()
             })
             .collect();
         for (owner, submission) in pending {
@@ -306,8 +304,8 @@ impl Host {
         self.semantics.remove(&identity);
         self.inflight.remove(&identity);
         self.active.remove(&identity);
-        self.submissions.retain(|id, _| id.surface != identity);
-        self.scenes.retain(|id, _| id.surface != identity);
+        self.submissions.retain(|id, _| id.surface() != identity);
+        self.scenes.retain(|id, _| id.surface() != identity);
         self.assets.retain(|_, (token, _)| token.strong_count() != 0);
     }
 
@@ -327,7 +325,9 @@ impl Host {
             .surfaces
             .iter()
             .copied()
-            .filter(|id| id.context.session == owner && contexts.contains(&id.context.context_id))
+            .filter(|id| {
+                id.context().session() == owner && contexts.contains(&id.context().context_id())
+            })
             .collect();
         for id in ids {
             self.remove_surface(id);
@@ -335,19 +335,20 @@ impl Host {
     }
 
     pub fn remove_owner(&mut self, owner: SessionIdentity) -> Vec<SurfaceIdentity> {
-        self.layouts.retain(|(surface, _), _| surface.context.session != owner);
-        if self.editor.is_some_and(|(id, _)| id.context.session == owner) {
+        self.layouts.retain(|(surface, _), _| surface.context().session() != owner);
+        if self.editor.is_some_and(|(id, _)| id.context().session() == owner) {
             self.editor = None;
         }
-        let ids = self.surfaces.iter().copied().filter(|id| id.context.session == owner).collect();
+        let ids =
+            self.surfaces.iter().copied().filter(|id| id.context().session() == owner).collect();
         self.windows.revoke_owner(owner);
-        self.surfaces.retain(|id| id.context.session != owner);
-        self.scenes.retain(|id, _| id.surface.context.session != owner);
-        self.submissions.retain(|id, _| id.surface.context.session != owner);
-        self.active.retain(|id, _| id.context.session != owner);
-        self.accepted.retain(|id, _| id.context.session != owner);
-        self.displayed.retain(|id, _| id.context.session != owner);
-        self.inflight.retain(|id, _| id.context.session != owner);
+        self.surfaces.retain(|id| id.context().session() != owner);
+        self.scenes.retain(|id, _| id.surface().context().session() != owner);
+        self.submissions.retain(|id, _| id.surface().context().session() != owner);
+        self.active.retain(|id, _| id.context().session() != owner);
+        self.accepted.retain(|id, _| id.context().session() != owner);
+        self.displayed.retain(|id, _| id.context().session() != owner);
+        self.inflight.retain(|id, _| id.context().session() != owner);
         self.assets.retain(|_, (token, _)| token.strong_count() != 0);
         self.pending.retain(|(id, _)| *id != owner);
         self.outcomes.remove(&owner);
@@ -517,7 +518,10 @@ impl Host {
     /// Only the AccessKit adapters can deliver an action, so nothing calls this on macOS, where
     /// the AppKit adapter builds its own tree. It is kept compiled and type-checked there rather
     /// than configured away.
-    #[cfg_attr(not(any(target_os = "linux", target_os = "windows")), allow(dead_code))]
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "windows")),
+        allow(dead_code, reason = "transport helpers are used only on Linux and Windows")
+    )]
     pub(super) fn queue_accessibility(
         &mut self,
         window: SurfaceIdentity,
@@ -536,8 +540,8 @@ impl Host {
         }
         let event = vivid_protocol::overlay::wire::InputEvent {
             address: vivid_protocol::overlay::wire::WindowAddress {
-                context_id: window.context.context_id,
-                surface_id: window.surface_id,
+                context_id: window.context().context_id(),
+                surface_id: window.surface_id(),
                 generation: current.generation,
             },
             // An action is not tied to one scene, so it carries the window's published revision.
@@ -547,14 +551,14 @@ impl Host {
         let Ok(payload) = event.payload() else {
             return false;
         };
-        let owner = window.context.session;
+        let owner = window.context().session();
         let queue = self.accessibility.entry(owner).or_default();
         // Assistive technology cannot generate actions faster than a person presses them, but a
         // stuck client could; the queue is bounded like every other lane queue.
         if queue.len() >= vivid_protocol::overlay::MAX_PENDING_EVENTS {
             return false;
         }
-        queue.push_back((window.surface_id, payload));
+        queue.push_back((window.surface_id(), payload));
         if let Some(actor) = self.actors.get(&owner).and_then(Weak::upgrade) {
             actor.wake_actor();
         }
@@ -651,10 +655,11 @@ impl Host {
     pub fn remove_track(&mut self, identity: TrackIdentity) {
         self.scenes.remove(&identity);
         if let Some(submission) = self.submissions.remove(&identity) {
-            self.supersede(identity.surface.context.session, submission);
+            self.supersede(identity.surface().context().session(), submission);
         }
-        self.active
-            .retain(|surface, s| *surface != identity.surface || s.track_id != identity.track_id);
+        self.active.retain(|surface, s| {
+            *surface != identity.surface() || s.track_id != identity.track_id()
+        });
         // Displayed/in-flight scenes retain their resources after the immutable track retires.
         self.assets.retain(|_, (token, _)| token.strong_count() != 0);
     }
@@ -710,7 +715,7 @@ impl Host {
             && let Some(old) = self.active.insert(surface, submission)
             && old != submission
         {
-            self.supersede(surface.context.session, old);
+            self.supersede(surface.context().session(), old);
         }
     }
 
@@ -743,7 +748,7 @@ impl Host {
         if !self
             .inflight
             .values()
-            .any(|d| d.window.context.session == owner && d.submission == submission)
+            .any(|d| d.window.context().session() == owner && d.submission == submission)
         {
             self.resolve(owner, submission, PresentationOutcome::Superseded);
         }
@@ -774,7 +779,7 @@ impl Host {
                     );
                 }
                 self.resolve(
-                    surface.context.session,
+                    surface.context().session(),
                     drawing.submission,
                     PresentationOutcome::Presented,
                 );
@@ -783,10 +788,10 @@ impl Host {
             if !self
                 .submissions
                 .iter()
-                .any(|(id, s)| id.surface == surface && *s == drawing.submission)
+                .any(|(id, s)| id.surface() == surface && *s == drawing.submission)
             {
                 self.resolve(
-                    surface.context.session,
+                    surface.context().session(),
                     drawing.submission,
                     PresentationOutcome::Superseded,
                 );
@@ -889,7 +894,7 @@ impl VectorWorker {
                 .assets
                 .iter()
                 .filter(|((track, _, _), _)| {
-                    track.surface.context.session == identity.surface.context.session
+                    track.surface().context().session() == identity.surface().context().session()
                 })
                 .try_fold((0_usize, 0_usize), |(count, bytes), (_, (_, b))| {
                     Some((count.checked_add(1)?, bytes.checked_add(*b)?))
@@ -950,7 +955,7 @@ impl VectorWorker {
             if frame.canvas.commands().iter().any(|command| command.requires_paint())
                 && !lock(&shared.overlays)
                     .actors
-                    .get(&identity.surface.context.session)
+                    .get(&identity.surface().context().session())
                     .and_then(Weak::upgrade)
                     .is_some_and(|session| session.supports(registry::OVERLAY_PAINT))
             {
@@ -960,7 +965,7 @@ impl VectorWorker {
             if frame.canvas.commands().iter().any(|command| command.requires_pointer())
                 && !lock(&shared.overlays)
                     .actors
-                    .get(&identity.surface.context.session)
+                    .get(&identity.surface().context().session())
                     .and_then(Weak::upgrade)
                     .is_some_and(|session| session.supports(registry::OVERLAY_POINTER))
             {
@@ -973,7 +978,7 @@ impl VectorWorker {
                     if let vivid_protocol::vector::Command::TextLayout { layout, .. } = command {
                         if !host
                             .actors
-                            .get(&identity.surface.context.session)
+                            .get(&identity.surface().context().session())
                             .and_then(Weak::upgrade)
                             .is_some_and(|session| session.supports(registry::OVERLAY_TEXT_LAYOUT))
                         {
@@ -981,7 +986,7 @@ impl VectorWorker {
                         }
                         let value = host
                             .layouts
-                            .get(&(identity.surface, *layout))
+                            .get(&(identity.surface(), *layout))
                             .ok_or("text layout is absent or released")?;
                         layouts.insert(*layout, value.clone());
                     }
@@ -1011,10 +1016,10 @@ impl VectorWorker {
             );
             let compiled = Arc::new(compiled);
             let mut host = lock(&shared.overlays);
-            if !host.surfaces.contains(&identity.surface) {
+            if !host.surfaces.contains(&identity.surface()) {
                 return Err("vector surface has no overlay window");
             }
-            let owner = identity.surface.context.session;
+            let owner = identity.surface().context().session();
             if host.pending.iter().filter(|(id, _)| *id == owner).count()
                 + host.outcomes.get(&owner).map_or(0, VecDeque::len)
                 >= 256
@@ -1027,26 +1032,27 @@ impl VectorWorker {
             }
             if host
                 .accepted
-                .get(&identity.surface)
+                .get(&identity.surface())
                 .is_some_and(|revision| frame.revision <= *revision)
             {
                 return Err("scene revision must advance across all window tracks");
             }
-            let window = host.windows.get(identity.surface).ok_or("overlay window is absent")?;
+            let window = host.windows.get(identity.surface()).ok_or("overlay window is absent")?;
             let submission = Submission {
                 address: WindowAddress {
-                    context_id: identity.surface.context.context_id,
-                    surface_id: identity.surface.surface_id,
+                    context_id: identity.surface().context().context_id(),
+                    surface_id: identity.surface().surface_id(),
                     generation: window.generation,
                 },
-                track_id: identity.track_id,
+                track_id: identity.track_id(),
                 channel_generation: generation.get(),
                 epoch: frame.epoch,
                 revision: frame.revision,
             };
-            if shared.scene.active_track(identity.surface, vivid_sdk::SLOT_VECTOR) == Some(identity)
+            if shared.scene.active_track(identity.surface(), vivid_sdk::SLOT_VECTOR)
+                == Some(identity)
             {
-                host.validate_revision(identity.surface, frame.revision)?;
+                host.validate_revision(identity.surface(), frame.revision)?;
             }
             shared.scene.admit_media(
                 identity,
@@ -1063,7 +1069,7 @@ impl VectorWorker {
                 .scenes
                 .keys()
                 .copied()
-                .filter(|id| id.surface == identity.surface && *id != identity)
+                .filter(|id| id.surface() == identity.surface() && *id != identity)
                 .collect();
             for track in retired {
                 host.scenes.remove(&track);
@@ -1073,13 +1079,13 @@ impl VectorWorker {
             }
             host.scenes.insert(identity, (generation, frame.revision, compiled));
             host.compiled_scenes = host.compiled_scenes.saturating_add(1);
-            host.accepted.insert(identity.surface, frame.revision);
+            host.accepted.insert(identity.surface(), frame.revision);
             host.pending.insert((owner, submission));
             if let Some(old) = host.submissions.insert(identity, submission) {
                 host.supersede(owner, old);
             }
             shared.scene.mark_output_ready(identity, generation)?;
-            host.sync_active(&shared.scene, identity.surface);
+            host.sync_active(&shared.scene, identity.surface());
         }
         shared.request_frame_wake();
         Ok(())
@@ -1124,7 +1130,7 @@ pub(super) fn dispatch(
             if let Some(parent) = request.options.parent {
                 require_context_operation(
                     session,
-                    parent.context.context_id,
+                    parent.context().context_id(),
                     OP_SURFACE_TRACK_MEDIA,
                 )?;
             }
@@ -1307,7 +1313,7 @@ pub(super) fn service_input(shared: &ServiceShared, session: &SessionRuntime) {
         .surfaces
         .iter()
         .copied()
-        .filter(|id| id.context.session == session.identity && host.windows.get(*id).is_none())
+        .filter(|id| id.context().session() == session.identity && host.windows.get(*id).is_none())
         .collect();
     for surface in dismissed {
         host.layouts.retain(|(owner, _), _| *owner != surface);
@@ -1368,8 +1374,8 @@ pub(super) fn service_input(shared: &ServiceShared, session: &SessionRuntime) {
         while let Some(event) = host.windows.take_event(session.identity) {
             let event = vivid_protocol::overlay::wire::InputEvent {
                 address: WindowAddress {
-                    context_id: event.window.context.context_id,
-                    surface_id: event.window.surface_id,
+                    context_id: event.window.context().context_id(),
+                    surface_id: event.window.surface_id(),
                     generation: event.generation,
                 },
                 scene_revision: event.scene_revision,
@@ -2067,8 +2073,8 @@ mod tests {
         // complete owner identity separates the two trees.
         let first_window = placed(&mut host, first, 1, bounds, None);
         let second_window = placed(&mut host, second, 1, bounds, None);
-        assert_eq!(first_window.surface_id, second_window.surface_id);
-        assert_ne!(first_window.context, second_window.context);
+        assert_eq!(first_window.surface_id(), second_window.surface_id());
+        assert_ne!(first_window.context(), second_window.context());
 
         host.set_semantics(first_window, describing(11)).unwrap();
         host.set_semantics(second_window, describing(22)).unwrap();
@@ -2091,8 +2097,8 @@ mod tests {
         assert_eq!(queued.len(), 1);
         let sent = vivid_protocol::overlay::wire::InputEvent {
             address: vivid_protocol::overlay::wire::WindowAddress {
-                context_id: second_window.context.context_id,
-                surface_id: second_window.surface_id,
+                context_id: second_window.context().context_id(),
+                surface_id: second_window.surface_id(),
                 generation: 1,
             },
             scene_revision: 1,

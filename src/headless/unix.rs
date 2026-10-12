@@ -47,6 +47,7 @@ fn detach_and_serve(
     readiness: File,
 ) -> Result<(), Box<dyn Error>> {
     // Leave the parent's session and controlling terminal so the daemon survives its shell.
+    // SAFETY: This startup child changes only its own session and passes no pointers.
     if unsafe { libc::setsid() } < 0 {
         let error = io::Error::last_os_error();
         let _ = report_failure(&readiness, &format!("setsid failed: {error}"));
@@ -73,12 +74,14 @@ fn detach_and_serve(
 /// available on every supported Unix (notably macOS), and this runs before any thread is started,
 /// making portable `pipe` plus `fcntl` race-free here.
 pub(super) fn readiness_pipe() -> io::Result<(File, File)> {
-    let mut descriptors = [0 as c_int; 2];
+    let mut descriptors: [c_int; 2] = [0; 2];
+    // SAFETY: The two-element initialized output array provides exactly the descriptor storage required by pipe.
     if unsafe { libc::pipe(descriptors.as_mut_ptr()) } != 0 {
         return Err(io::Error::last_os_error());
     }
-    // SAFETY: `pipe` returned two fresh descriptors and ownership transfers to these files.
+    // SAFETY: `pipe` returned this fresh read descriptor and ownership transfers to the file.
     let read = unsafe { File::from_raw_fd(descriptors[0]) };
+    // SAFETY: `pipe` returned this fresh write descriptor and ownership transfers to the file.
     let write = unsafe { File::from_raw_fd(descriptors[1]) };
     set_close_on_exec(&read)?;
     set_close_on_exec(&write)?;
@@ -86,6 +89,7 @@ pub(super) fn readiness_pipe() -> io::Result<(File, File)> {
 }
 
 fn set_close_on_exec(file: &File) -> io::Result<()> {
+    // SAFETY: The File owns this live descriptor and the scalar command sets its close-on-exec flag.
     if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
         Err(io::Error::last_os_error())
     } else {
@@ -136,6 +140,7 @@ pub(super) fn set_read_timeout(file: &File, timeout: Duration) -> io::Result<()>
             return Err(io::Error::from(io::ErrorKind::WouldBlock));
         }
         let timeout_millis = remaining.as_millis().min(c_int::MAX as u128) as c_int;
+        // SAFETY: The initialized pollfd local supplies one valid entry and remains live for the bounded poll.
         let result = unsafe { libc::poll(&raw mut poll_fd, 1, timeout_millis) };
         match result {
             -1 => {
@@ -155,6 +160,7 @@ pub(super) fn set_read_timeout(file: &File, timeout: Duration) -> io::Result<()>
 fn redirect_standard_streams() -> io::Result<()> {
     let null = File::options().read(true).write(true).open("/dev/null")?;
     for target in [libc::STDIN_FILENO, libc::STDOUT_FILENO, libc::STDERR_FILENO] {
+        // SAFETY: The source File owns a live descriptor; the target is one of this startup child’s standard descriptors.
         if unsafe { libc::dup2(null.as_raw_fd(), target) } < 0 {
             return Err(io::Error::last_os_error());
         }

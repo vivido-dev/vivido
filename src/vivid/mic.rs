@@ -112,7 +112,7 @@ pub(super) fn serve(
     let key = (identity, generation);
     let title = shared
         .scene
-        .surface_status(identity.surface)
+        .surface_status(identity.surface())
         .map(|surface| {
             surface
                 .definition
@@ -316,7 +316,7 @@ mod tests {
                 .unwrap()
                 .surface(9)
                 .unwrap();
-            let key = (TrackIdentity { surface, track_id: 11 }, ChannelGeneration::new(1));
+            let key = (surface.track(11).unwrap(), ChannelGeneration::new(1));
             keys.push(key);
             lock(&controller.0).routes.insert(
                 key,

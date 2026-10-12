@@ -268,7 +268,7 @@ impl LeaseTable {
                     && (lease.machine.state() == LeaseState::Suspended
                         || (lease.awaiting_first && lease.resume_key.is_some()))
                     && !lease.expired(Instant::now())
-                    && lease.child.is_some_and(|child| child.session_id == session_id)
+                    && lease.child.is_some_and(|child| child.session_id() == session_id)
             })
             .map(|(key, _)| *key)
     }

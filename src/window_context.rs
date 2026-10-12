@@ -19,11 +19,11 @@ use std::rc::Rc;
 use std::sync::Arc;
 #[cfg(any(unix, windows))]
 use std::sync::Mutex;
-#[cfg(windows)]
+#[cfg(any(target_os = "macos", windows))]
 use std::sync::atomic::AtomicBool;
 #[cfg(any(unix, windows))]
 use std::sync::atomic::{AtomicU64, Ordering};
-#[cfg(windows)]
+#[cfg(any(target_os = "macos", windows))]
 use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -77,6 +77,7 @@ use crate::cli::{ParsedOptions, VividTarget, WindowOptions};
 use crate::client_fault::{ClientFault, ClientHealth};
 use crate::clipboard::Clipboard;
 use crate::config::UiConfig;
+use crate::config::window::WindowConfig;
 use crate::display::Display;
 #[cfg(any(unix, windows))]
 use crate::display::ScreenshotReadback;
@@ -90,7 +91,7 @@ use crate::event::{
 use crate::input;
 #[cfg(any(unix, windows))]
 use crate::logging::LOG_TARGET_IPC_CONFIG;
-use crate::message_bar::MessageBuffer;
+use crate::message_bar::{MessageBuffer, MessageType};
 use crate::osc_notification::{NotificationController, OscNotification, WindowNotificationState};
 #[cfg(any(unix, windows))]
 use crate::polling::ipc::{IpcConnection, IpcError};
@@ -121,8 +122,8 @@ fn terminal_accessibility_focused(terminal_focused: bool, overlay_focused: bool)
     terminal_focused && !overlay_focused
 }
 
-/// Maximum delay between directly presented frames during continuous Windows input or PTY output.
-#[cfg(windows)]
+/// Minimum interval between direct frames during continuous native input or PTY output.
+#[cfg(any(target_os = "macos", windows))]
 const LATENCY_SENSITIVE_FRAME_INTERVAL: Duration = Duration::from_millis(16);
 
 #[cfg(any(unix, windows))]
@@ -158,8 +159,11 @@ pub struct FoundTextMatch {
     pub text: String,
     /// Physical-pixel rectangles in the client area, matching mouse input coordinates.
     pub pixel_x: u32,
+    /// Vertical position in physical pixels.
     pub pixel_y: u32,
+    /// Width in physical pixels.
     pub pixel_width: u32,
+    /// Height in physical pixels.
     pub pixel_height: u32,
 }
 
@@ -171,15 +175,18 @@ fn snap_pixel(value: f32) -> u32 {
 
 /// Event context for one individual Vivido window.
 pub struct WindowContext {
+    /// Messages currently presented by the terminal UI.
     pub message_buffer: MessageBuffer,
     #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
     accessibility: Option<AccessibilityState>,
+    /// Terminal rendering resources.
     pub display: Display,
+    /// Whether this state requires a display update.
     pub dirty: bool,
     event_queue: Vec<WinitEvent<Event>>,
-    #[cfg(windows)]
-    last_latency_sensitive_draw: Option<Instant>,
-    #[cfg(windows)]
+    #[cfg(any(target_os = "macos", windows))]
+    last_draw: Option<Instant>,
+    #[cfg(any(target_os = "macos", windows))]
     latency_sensitive_frame_timer: LatencySensitiveFrameTimer,
     #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     event_proxy: EventProxy,
@@ -187,6 +194,11 @@ pub struct WindowContext {
     cursor_blink_timed_out: bool,
     prev_bell_cmd: Option<Instant>,
     notifications: NotificationController,
+    #[cfg(target_os = "macos")]
+    _terminal_activity: crate::macos::activity::TerminalActivity,
+    /// Progress last shown in this window's taskbar button.
+    #[cfg(windows)]
+    taskbar_progress: Option<crate::display::progress::Progress>,
     modifiers: Modifiers,
     search_state: SearchState,
     notifier: Notifier,
@@ -197,6 +209,8 @@ pub struct WindowContext {
     #[cfg(not(windows))]
     master_fd: RawFd,
     shell_pid: u32,
+    /// The shell started with Vivido's integration loaded, which reports prompts and commands.
+    shell_integration: Option<tty::IntegratedShell>,
     window_config: ParsedOptions,
     config: Rc<UiConfig>,
     vivid_service: VividService,
@@ -211,6 +225,7 @@ pub struct WindowContext {
     #[cfg(any(unix, windows))]
     screenshot_busy: bool,
     #[cfg(any(unix, windows))]
+    /// Window-scoped automation state.
     pub automation: AutomationWindowState,
     client_health: ClientHealth,
     last_client_fault: Option<ClientFault>,
@@ -240,20 +255,20 @@ fn assign_ipc_window_id(requested: Option<u64>) -> u64 {
     }
 }
 
-/// Active Windows wake for the final update accumulated by the direct-draw rate limiter.
+/// Active wake for the final update accumulated by the direct-draw rate limiter.
 ///
-/// The ordinary scheduler advances from winit's `AboutToWait` callback. ConPTY and native input
-/// can keep the Windows message queue busy enough that callback never arrives, so a timer stored
+/// The ordinary scheduler advances from winit's `AboutToWait` callback. Continuous PTY output
+/// can keep the native event queue busy enough that callback never arrives, so a timer stored
 /// only in the scheduler can leave the last prompt or selection change invisible indefinitely.
 /// This worker owns a bounded one-slot queue and coalesces all requests until the main loop
 /// acknowledges the corresponding event.
-#[cfg(windows)]
+#[cfg(any(target_os = "macos", windows))]
 struct LatencySensitiveFrameTimer {
     sender: SyncSender<Duration>,
     pending: Arc<AtomicBool>,
 }
 
-#[cfg(windows)]
+#[cfg(any(target_os = "macos", windows))]
 impl LatencySensitiveFrameTimer {
     fn new(event_sink: EventSink, window_id: WindowId) -> Self {
         let (sender, receiver) = mpsc::sync_channel(1);
@@ -345,7 +360,7 @@ fn flushes_staged_input(event: &WinitEvent<Event>) -> bool {
     ) || is_latency_sensitive_input(event)
 }
 
-#[cfg(windows)]
+#[cfg(any(target_os = "macos", windows))]
 fn latency_sensitive_draw_delay(last_draw: Option<Instant>, now: Instant) -> Option<Duration> {
     last_draw.and_then(|last_draw| {
         LATENCY_SENSITIVE_FRAME_INTERVAL
@@ -355,6 +370,43 @@ fn latency_sensitive_draw_delay(last_draw: Option<Instant>, now: Instant) -> Opt
 }
 
 impl WindowContext {
+    /// The program still running in this terminal, if closing it would stop more than an idle
+    /// shell; `None` at a prompt or once the process has exited.
+    ///
+    /// On Unix the terminal's foreground process group answers exactly: anything but the shell's
+    /// own group is a running program. Windows has no foreground group, so a direct child of the
+    /// shell counts as running, unless OSC 133 shell integration reports the shell at its prompt;
+    /// integration also catches commands a shell runs in-process.
+    #[cfg(any(unix, windows))]
+    pub fn running_program(&self) -> Option<String> {
+        if self.automation.exit_status.is_some() {
+            return None;
+        }
+
+        #[cfg(unix)]
+        {
+            // SAFETY: `master_fd` is this terminal's live PTY master.
+            let foreground = unsafe { libc::tcgetpgrp(self.master_fd) };
+            (foreground > 0 && foreground as u32 != self.shell_pid).then(|| {
+                foreground_executable_basename(foreground)
+                    .unwrap_or_else(|| String::from("a program"))
+            })
+        }
+
+        #[cfg(windows)]
+        {
+            let shell = &self.automation.shell;
+            let integrated = shell.in_prompt || shell.command_generation > 0;
+            if integrated && !shell.command_running {
+                return None;
+            }
+            // Never the reported command line: it can carry arguments, and this name reaches
+            // `inspect` as well as the dialog.
+            child_process_name(self.shell_pid)
+                .or_else(|| integrated.then(|| String::from("a command")))
+        }
+    }
+
     /// Close this terminal even when its configured hold policy is enabled.
     pub fn request_close(&mut self) {
         self.display.window.hold = false;
@@ -376,6 +428,10 @@ impl WindowContext {
     }
 
     /// Create initial window context.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if window, rendering, PTY, or protocol-service initialization fails.
     pub fn initial(
         event_loop: LoopHandle<'_>,
         proxy: EventSink,
@@ -392,6 +448,10 @@ impl WindowContext {
     }
 
     /// Create additional context.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if window, rendering, PTY, or protocol-service initialization fails.
     pub fn additional(
         event_loop: LoopHandle<'_>,
         proxy: EventSink,
@@ -424,7 +484,10 @@ impl WindowContext {
 
     /// Create a new terminal window context.
     fn new(
-        #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
+        #[cfg_attr(
+            not(target_os = "linux"),
+            allow(unused_variables, reason = "Linux startup notification consumes this binding")
+        )]
         event_loop_handle: LoopHandle<'_>,
         mut display: Display,
         config: Rc<UiConfig>,
@@ -447,7 +510,7 @@ impl WindowContext {
             display.size_info.columns()
         );
 
-        #[cfg(windows)]
+        #[cfg(any(target_os = "macos", windows))]
         let latency_sensitive_frame_timer =
             LatencySensitiveFrameTimer::new(proxy.clone(), display.window.id());
         let event_proxy = EventProxy::new(proxy, display.window.id());
@@ -553,6 +616,7 @@ impl WindowContext {
         let shell_pid = pty.child().id();
         #[cfg(windows)]
         let shell_pid = pty.child_watcher().pid().map_or(0, std::num::NonZeroU32::get);
+        let shell_integration = pty.shell_integration();
 
         // Create the pseudoterminal I/O loop.
         //
@@ -575,6 +639,7 @@ impl WindowContext {
         // The event loop channel allows write requests from the event processor
         // to be sent to the pty loop and ultimately written to the pty.
         let loop_tx = event_loop.channel();
+        event_proxy.set_pty_writer(loop_tx.clone());
 
         // Kick off the I/O thread.
         let io_thread = event_loop.spawn();
@@ -596,24 +661,31 @@ impl WindowContext {
             #[cfg(not(windows))]
             master_fd,
             shell_pid,
+            shell_integration,
             config,
             notifier: Notifier(loop_tx),
             cursor_blink_timed_out: Default::default(),
             prev_bell_cmd: Default::default(),
             notifications,
+            #[cfg(target_os = "macos")]
+            _terminal_activity: crate::macos::activity::TerminalActivity::new(),
+            #[cfg(windows)]
+            taskbar_progress: None,
             message_buffer: Default::default(),
             window_config: Default::default(),
             search_state: Default::default(),
             event_queue: Default::default(),
-            #[cfg(windows)]
-            last_latency_sensitive_draw: None,
-            #[cfg(windows)]
+            #[cfg(any(target_os = "macos", windows))]
+            last_draw: None,
+            #[cfg(any(target_os = "macos", windows))]
             latency_sensitive_frame_timer,
             modifiers: Default::default(),
             occluded: Default::default(),
             mouse: Default::default(),
             touch: Default::default(),
-            dirty: Default::default(),
+            // The startup background is only a placeholder; the first real frame must still
+            // draw terminal state, including the cursor, even before any PTY output arrives.
+            dirty: true,
             vivid_service,
             vivid_target,
             restart_pty_config,
@@ -686,6 +758,8 @@ impl WindowContext {
         {
             self.display.window.set_title(self.config.window.identity.title.clone());
         }
+        #[cfg(target_os = "macos")]
+        self.show_native_title();
 
         let opaque = self.config.window_opacity() >= 1.;
 
@@ -777,12 +851,14 @@ impl WindowContext {
             &mut self.search_state,
         );
 
-        // Request immediate re-draw if the visual bell or scrollbar animation is not done
-        // yet. This must run after the draw: the scrollbar wakes inside it, when the
+        // Request immediate re-draw if the visual bell, scrollbar, or progress animation is not
+        // done yet. This must run after the draw: the scrollbar wakes inside it, when the
         // terminal's display offset is sampled, so checking earlier would miss the wake
         // frame and let the fade stall after a single presentation.
+        let now = Instant::now();
         if !self.display.visual_bell.completed()
-            || self.display.scrollbar.is_animating_at(Instant::now())
+            || self.display.scrollbar.is_animating_at(now)
+            || self.display.progress.is_animating_at(now)
         {
             // We can get an OS redraw which bypasses Vivido's frame throttling, thus
             // marking the window as dirty when we don't have frame yet.
@@ -797,16 +873,20 @@ impl WindowContext {
             (winit::dpi::PhysicalPosition::new(x, y), winit::dpi::PhysicalSize::new(w, h))
         });
         self.display.window.set_overlay_ime_area(area);
+        #[cfg(any(target_os = "macos", windows))]
+        {
+            self.last_draw = Some(Instant::now());
+        }
         presented
     }
 
-    /// Present latency-sensitive state without waiting for Windows to synthesize `WM_PAINT`.
+    /// Present latency-sensitive state without waiting for a native redraw callback.
     ///
-    /// `WM_PAINT` has lower priority than posted input and PTY wakeups, so a continuous stream can
-    /// otherwise update the terminal model for seconds without presenting it. The timestamp is
-    /// recorded after the draw, allowing subsequent updates to accumulate for one frame interval
+    /// Native redraws can wait behind posted input and PTY wakeups on macOS and Windows, so a
+    /// continuous stream can update the terminal model for seconds without presenting it. The
+    /// timestamp is recorded after the draw, allowing updates to accumulate for one frame interval
     /// instead of rendering each event and falling behind the stream.
-    #[cfg(windows)]
+    #[cfg(any(target_os = "macos", windows))]
     pub fn draw_latency_sensitive(&mut self, scheduler: &mut Scheduler) -> Option<bool> {
         if !self.dirty
             || self.occluded
@@ -817,51 +897,30 @@ impl WindowContext {
         }
 
         let now = Instant::now();
-        if let Some(delay) = latency_sensitive_draw_delay(self.last_latency_sensitive_draw, now) {
+        if let Some(delay) = latency_sensitive_draw_delay(self.last_draw, now) {
             self.latency_sensitive_frame_timer.schedule(delay);
-            return None;
+            // The update is handled by the active timer. Do not fall back to a native redraw,
+            // which would bypass this same interval when a scheduled Frame just opened its gate.
+            return Some(false);
         }
 
-        let presented = self.draw(scheduler);
-        self.last_latency_sensitive_draw = Some(Instant::now());
-        Some(presented)
+        Some(self.draw(scheduler))
     }
 
-    /// Present the accumulated state when the Windows frame timer expires.
-    ///
-    /// The latency-sensitive path deliberately accumulates updates for one frame interval. Its
-    /// timer must finish that interval with a direct presentation; falling back to `WM_PAINT`
-    /// recreates the starvation this path exists to avoid and can leave the final typed bytes
-    /// invisible until another mouse event arrives.
-    #[cfg(windows)]
-    pub fn draw_scheduled_frame(&mut self, scheduler: &mut Scheduler) -> Option<bool> {
-        if !self.dirty
-            || self.occluded
-            || self.display.window.is_headless()
-            || self.display.window.is_visible() == Some(false)
-        {
-            return None;
-        }
-
-        let presented = self.draw(scheduler);
-        self.last_latency_sensitive_draw = Some(Instant::now());
-        Some(presented)
-    }
-
-    /// Acknowledge the active Windows tail-frame wake so another interval can be queued.
-    #[cfg(windows)]
+    /// Acknowledge the active tail-frame wake so another interval can be queued.
+    #[cfg(any(target_os = "macos", windows))]
     pub fn acknowledge_latency_sensitive_frame(&self) {
         self.latency_sensitive_frame_timer.acknowledge();
     }
 
     /// Open the coalescing gate for another terminal-model notification.
-    #[cfg(windows)]
+    #[cfg(any(target_os = "macos", windows))]
     pub fn acknowledge_terminal_wakeup(&self) {
         self.event_proxy.acknowledge_terminal_wakeup();
     }
 
-    /// Take the complete transcript span accumulated behind one Windows UI notification.
-    #[cfg(windows)]
+    /// Take the complete transcript span accumulated behind one UI notification.
+    #[cfg(any(target_os = "macos", windows))]
     pub fn take_pty_output(&self, fallback: (u64, u64)) -> (u64, u64) {
         self.event_proxy.take_pty_output(fallback)
     }
@@ -1033,8 +1092,15 @@ impl WindowContext {
         {
             self.display.window.request_redraw();
         }
+
+        // A batch carries title changes, OSC 7 reports, and the output of a shell whose folder
+        // changed; the label probe locks the terminal again.
+        drop(terminal);
+        #[cfg(target_os = "macos")]
+        self.show_native_title();
     }
 
+    /// Complete a settled Vivid resize generation.
     pub fn settle_vivid_resize(&mut self, generation: u64) {
         self.vivid_resize_settled = Some(generation);
         self.dirty = true;
@@ -1049,6 +1115,28 @@ impl WindowContext {
     /// Current terminal window title.
     pub fn title(&self) -> &str {
         self.display.window.title()
+    }
+
+    /// Title chosen for this terminal: one set by a program through OSC 0/2, given at launch, or
+    /// the configured title when programs may not change it. `None` while the terminal shows
+    /// only the configured default or a cleared title.
+    pub fn explicit_title(&self) -> Option<&str> {
+        let title = self.display.window.title();
+        is_explicit_title(title, self.preserve_title, &self.config.window).then_some(title)
+    }
+
+    /// Label a native macOS tab by its current folder until a program sets a title, and again
+    /// once the title is reset or cleared. The terminal title itself is left untouched.
+    #[cfg(target_os = "macos")]
+    pub fn show_native_title(&self) {
+        let label = match self.explicit_title() {
+            Some(title) => title.to_owned(),
+            None => match self.display_directory() {
+                Some(directory) => directory_tab_title(&directory),
+                None => self.title().to_owned(),
+            },
+        };
+        self.display.window.show_title(&label);
     }
 
     /// Working directory of the local shell: its OSC 7 report when available, otherwise the
@@ -1135,6 +1223,10 @@ impl WindowContext {
 
     /// Write bytes and notify the main event loop after the PTY master accepted all of them.
     #[cfg(any(unix, windows))]
+    ///
+    /// # Errors
+    ///
+    /// Returns an IPC error if the PTY worker has exited or its command channel has closed.
     pub fn write_to_pty_with_completion(
         &self,
         bytes: Vec<u8>,
@@ -1148,6 +1240,10 @@ impl WindowContext {
 
     /// Write automation bytes without creating a correlated completion response.
     #[cfg(any(unix, windows))]
+    ///
+    /// # Errors
+    ///
+    /// Returns `EventLoopSendError` after the PTY worker command channel closes.
     pub fn write_automation_bytes(&self, bytes: Vec<u8>) -> Result<(), EventLoopSendError> {
         if bytes.is_empty() {
             return Ok(());
@@ -1157,6 +1253,10 @@ impl WindowContext {
 
     /// Apply the current terminal dimensions to the PTY and report completion.
     #[cfg(any(unix, windows))]
+    ///
+    /// # Errors
+    ///
+    /// Returns an IPC error if the PTY worker has exited or the resize cannot be queued.
     pub fn write_pty_resize_with_completion(
         &self,
         completion: u64,
@@ -1296,13 +1396,25 @@ impl WindowContext {
 
     /// Queue a deterministic reset of parser and client-controlled terminal state.
     #[cfg(any(unix, windows))]
+    ///
+    /// # Errors
+    ///
+    /// Returns an IPC error if the pane is quarantined or its PTY worker cannot accept a reset.
     pub fn reset_terminal_client(&mut self, completion: u64) -> Result<(), IpcError> {
+        if self.client_health == ClientHealth::Quarantined {
+            return Err(IpcError::new(
+                "invalid_state",
+                "quarantined terminals require restart_terminal",
+            ));
+        }
         if self.io_thread.as_ref().is_none_or(JoinHandle::is_finished) {
             return Err(IpcError::new("pty_closed", "terminal PTY worker has exited"));
         }
         self.notifier.0.send(Msg::ResetClient { completion }).map_err(|error| {
             IpcError::new("pty_closed", format!("failed to reset terminal: {error}"))
         })?;
+        // A clipboard answer meant for the old client must not reach its replacement.
+        self.display.close_clipboard_prompt();
         self.vivid_service.disconnect_clients();
         self.client_health = ClientHealth::Recovering;
         Ok(())
@@ -1310,6 +1422,10 @@ impl WindowContext {
 
     /// Replace this pane's PTY and Vivid service without changing its window or stable IPC ID.
     #[cfg(any(unix, windows))]
+    ///
+    /// # Errors
+    ///
+    /// Returns an IPC error if replacement protocol, PTY, or polling resources cannot be created.
     pub fn restart_terminal_client(&mut self) -> Result<(), IpcError> {
         let mut pty_config = self.restart_pty_config.clone();
         let new_service = match self.vivid_target {
@@ -1341,8 +1457,15 @@ impl WindowContext {
         let shell_pid = pty.child().id();
         #[cfg(windows)]
         let shell_pid = pty.child_watcher().pid().map_or(0, std::num::NonZeroU32::get);
+        let shell_integration = pty.shell_integration();
+        // Never reuse state that may have been partially mutated before a parser panic.
+        let terminal = Arc::new(FairMutex::new(Term::new(
+            self.config.term_options(),
+            &self.display.size_info,
+            self.event_proxy.clone(),
+        )));
         let event_loop = PtyEventLoop::new(
-            Arc::clone(&self.terminal),
+            Arc::clone(&terminal),
             self.event_proxy.clone(),
             pty,
             pty_config.drain_on_exit,
@@ -1360,7 +1483,9 @@ impl WindowContext {
         // A fresh PTY means a fresh shell: stale prompt state would resolve semantic waits
         // against a command line that no longer exists.
         self.automation.shell = crate::automation::CommandExecutionState::default();
-        self.terminal.lock().reset_client_state();
+        self.terminal = terminal;
+        // A clipboard answer meant for the old shell must not reach the new one.
+        self.display.close_clipboard_prompt();
         self.display.set_vivid_scene(new_service.scene());
         self.vivid_service = new_service;
         self.vivid_service.set_overlay_font(self.config.font.clone());
@@ -1374,7 +1499,9 @@ impl WindowContext {
             self.master_fd = master_fd;
         }
         self.shell_pid = shell_pid;
+        self.shell_integration = shell_integration;
         self.notifier = Notifier(event_loop.channel());
+        self.event_proxy.set_pty_writer(self.notifier.0.clone());
         self.io_thread = Some(event_loop.spawn());
         self.automation.exit_status = None;
         self.complete_client_reset();
@@ -1385,6 +1512,17 @@ impl WindowContext {
     pub(crate) fn record_client_fault(&mut self, fault: ClientFault, quarantined: bool) {
         if quarantined {
             self.client_health = ClientHealth::Quarantined;
+            let _ = self.notifier.0.send(Msg::Shutdown);
+            if let Some(worker) = self.io_thread.take() {
+                let _ = worker.join();
+            }
+            self.terminal = Arc::new(FairMutex::new(Term::new(
+                self.config.term_options(),
+                &self.display.size_info,
+                self.event_proxy.clone(),
+            )));
+            self.display.close_clipboard_prompt();
+            self.vivid_service.disconnect_clients();
         }
         self.last_client_fault = Some(fault);
     }
@@ -1392,11 +1530,16 @@ impl WindowContext {
     #[cfg(any(unix, windows))]
     pub(crate) fn complete_client_reset(&mut self) {
         self.client_health = ClientHealth::Healthy;
+        self.display.progress.clear();
         self.dirty = true;
     }
 
     /// Process a neutral key through Vivido's normal UI input processor.
     #[cfg(any(unix, windows))]
+    ///
+    /// # Errors
+    ///
+    /// Returns an IPC error for invalid key parameters or a closed PTY worker.
     pub fn ui_key(
         &mut self,
         key: &IpcKey,
@@ -1434,9 +1577,10 @@ impl WindowContext {
             clipboard,
             scheduler,
         };
-        let encoded =
-            input::Processor::new(context).ipc_key_input(&key.key, &key.mods, repeated)?;
+        let encoded = input::Processor::new(context).ipc_key_input(&key.key, &key.mods, repeated);
         drop(terminal);
+        self.redraw_if_dirty();
+        let encoded = encoded?;
         let mut bytes = notifier.into_bytes();
         if let Some(encoded) = encoded {
             bytes.extend(encoded);
@@ -1446,6 +1590,10 @@ impl WindowContext {
 
     /// Process mouse actions through Vivido's normal UI mouse processor.
     #[cfg(any(unix, windows))]
+    ///
+    /// # Errors
+    ///
+    /// Returns an IPC error for invalid mouse coordinates, buttons, or delivery state.
     pub fn ui_mouse(
         &mut self,
         mouse: &IpcMouse,
@@ -1542,11 +1690,16 @@ impl WindowContext {
                 ),
             }
         }
+        self.redraw_if_dirty();
         Ok(notifier.into_bytes())
     }
 
     /// Process one bounded physical-pixel gesture through Vivido's UI mouse processor.
     #[cfg(any(unix, windows))]
+    ///
+    /// # Errors
+    ///
+    /// Returns an IPC error for invalid path geometry, duration, or delivery state.
     pub fn ui_mouse_path(
         &mut self,
         path: &IpcMousePath,
@@ -1606,11 +1759,29 @@ impl WindowContext {
             }
             processor.mouse_input(ElementState::Released, button);
         }
+        self.redraw_if_dirty();
         Ok(notifier.into_bytes())
+    }
+
+    /// Ask for a frame when UI-routed automation input changed what is shown.
+    ///
+    /// Native input reaches the window through [`Self::handle_event`], which requests the frame
+    /// itself. Automation input runs the same processor directly, and the idle turn that follows
+    /// returns early with nothing queued, so without this a search bar, hint, or command palette
+    /// opened by automation stayed off screen until something else redrew the window.
+    #[cfg(any(unix, windows))]
+    fn redraw_if_dirty(&mut self) {
+        if self.dirty && self.display.window.has_frame && !self.occluded {
+            self.display.window.request_redraw();
+        }
     }
 
     /// Encode one application mouse action without entering Vivido's UI input path.
     #[cfg(any(unix, windows))]
+    ///
+    /// # Errors
+    ///
+    /// Returns an IPC error for invalid coordinates, unsupported actions, or mouse-reporting mode.
     pub fn application_mouse(&self, mouse: &IpcMouse) -> Result<Vec<u8>, IpcError> {
         let terminal = self.terminal.lock();
         let mode = *terminal.mode();
@@ -1751,6 +1922,14 @@ impl WindowContext {
 
     /// Encode one complete physical-pixel application gesture into one PTY write.
     #[cfg(any(unix, windows))]
+    ///
+    /// # Panics
+    ///
+    /// Panics if internal validation accepts a path with fewer than two positions.
+    ///
+    /// # Errors
+    ///
+    /// Returns an IPC error for invalid path points, duration, or mouse-reporting mode.
     pub fn application_mouse_path(&self, path: &IpcMousePath) -> Result<Vec<u8>, IpcError> {
         validate_mouse_path(path)?;
         let terminal = self.terminal.lock();
@@ -1904,6 +2083,10 @@ impl WindowContext {
 
     /// Send an explicit signal to the foreground process group, falling back to the child group.
     #[cfg(unix)]
+    ///
+    /// # Errors
+    ///
+    /// Returns an IPC error if the foreground process group cannot be found or signaled.
     pub fn signal_process_group(&self, signal: IpcSignalName) -> Result<i32, IpcError> {
         let signal = match signal {
             IpcSignalName::Int => libc::SIGINT,
@@ -1916,8 +2099,10 @@ impl WindowContext {
             IpcSignalName::Kill => libc::SIGKILL,
             IpcSignalName::Stop => libc::SIGSTOP,
         };
+        // SAFETY: tcgetpgrp takes a scalar PTY descriptor and reports closed or invalid descriptors as errors.
         let foreground = unsafe { libc::tcgetpgrp(self.master_fd) };
         let process_group = if foreground > 0 { foreground } else { self.shell_pid as i32 };
+        // SAFETY: the target process group and signal were validated above; kill takes only scalar arguments.
         if unsafe { libc::killpg(process_group, signal) } == -1 {
             return Err(IpcError::new(
                 "unsupported",
@@ -1943,6 +2128,7 @@ impl WindowContext {
                 "this signal cannot be delivered through a Windows pseudoconsole",
             ));
         }
+        // SAFETY: Only scalar access flags and a PID are supplied; the returned handle is checked before use.
         let process = unsafe { OpenProcess(PROCESS_TERMINATE, 0, self.shell_pid) };
         if process.is_null() {
             return Err(IpcError::new(
@@ -1950,7 +2136,9 @@ impl WindowContext {
                 format!("failed to open child process: {}", std::io::Error::last_os_error()),
             ));
         }
+        // SAFETY: The process handle was successfully opened with termination rights and remains live until the call returns.
         let result = unsafe { TerminateProcess(process, 1) };
+        // SAFETY: This scope owns the checked native handle and releases it exactly once after its final use.
         unsafe { CloseHandle(process) };
         if result == 0 {
             return Err(IpcError::new(
@@ -1964,6 +2152,10 @@ impl WindowContext {
 
     /// Request an exact client-area size.
     #[cfg(any(unix, windows))]
+    ///
+    /// # Errors
+    ///
+    /// Returns an IPC error for invalid geometry, unsupported sizes, or an unavailable target.
     pub fn request_automation_resize(
         &self,
         columns: Option<u16>,
@@ -2028,6 +2220,7 @@ impl WindowContext {
     }
 
     #[cfg(any(unix, windows))]
+    /// Whether the window's terminal dimensions match the automation request.
     pub fn automation_size_matches(
         &self,
         columns: Option<u16>,
@@ -2069,6 +2262,105 @@ impl WindowContext {
         self.notifications.handle(notification, state, &self.notifier);
     }
 
+    /// Announce one finished long command with a desktop notification of Vivido's own composing.
+    pub(crate) fn notify_command_finished(&mut self, exit_code: Option<i32>, duration: Duration) {
+        let (title, body) = crate::osc_notification::command_finished_text(exit_code, duration);
+        self.notifications.notify_local(title, body);
+    }
+
+    /// Fold an OSC 9;4 progress report into the progress bar, returning whether it changed.
+    ///
+    /// Every report re-arms the staleness timer, including repeats that change nothing visible.
+    pub(crate) fn apply_progress(
+        &mut self,
+        report: crate::osc_notification::ProgressReport,
+        scheduler: &mut Scheduler,
+    ) -> bool {
+        if !self.config.terminal.progress {
+            return false;
+        }
+        let changed = self.display.progress.apply(report, Instant::now());
+        self.schedule_progress_timeout(scheduler);
+        if changed {
+            self.request_progress_frame();
+        }
+        changed
+    }
+
+    /// Fold activity from an OSC title into the progress shown inside and outside the terminal.
+    /// This consumes the reported title even when dynamic title display is off.
+    pub(crate) fn apply_progress_title(&mut self, title: &str, scheduler: &mut Scheduler) -> bool {
+        if !self.config.terminal.progress {
+            return false;
+        }
+        let changed = self.display.progress.apply_title(title, Instant::now());
+        self.schedule_progress_timeout(scheduler);
+        if changed {
+            self.request_progress_frame();
+        }
+        changed
+    }
+
+    /// End progress when this terminal process exits, including held windows.
+    pub(crate) fn clear_progress(&mut self, scheduler: &mut Scheduler) -> bool {
+        let changed = self.display.progress.clear();
+        self.schedule_progress_timeout(scheduler);
+        if changed {
+            self.request_progress_frame();
+        }
+        changed
+    }
+
+    /// Drop a progress bar whose program stopped reporting, returning whether one was removed.
+    pub(crate) fn expire_progress(&mut self, scheduler: &mut Scheduler) -> bool {
+        let expired = self.display.progress.expire(Instant::now());
+        if expired {
+            self.request_progress_frame();
+        } else {
+            // A report arrived after this timer was armed and moved the deadline.
+            self.schedule_progress_timeout(scheduler);
+        }
+        expired
+    }
+
+    fn schedule_progress_timeout(&self, scheduler: &mut Scheduler) {
+        let window_id = self.display.window.id();
+        let timer_id = TimerId::new(Topic::ProgressTimeout, window_id);
+        scheduler.unschedule(timer_id);
+        if let Some(deadline) = self.display.progress.deadline() {
+            let event = Event::new(EventType::ProgressTimeout, window_id);
+            scheduler.schedule(
+                event,
+                deadline.saturating_duration_since(Instant::now()),
+                false,
+                timer_id,
+            );
+        }
+    }
+
+    /// The progress this terminal shows, for an embedding host's tab or indicator.
+    pub fn progress(&self) -> Option<crate::display::progress::Progress> {
+        self.display.progress.current(Instant::now())
+    }
+
+    /// Mirror the current progress into this window's taskbar button when it changed.
+    ///
+    /// Embedded and headless windows have no button of their own; their host mirrors them.
+    #[cfg(windows)]
+    pub(crate) fn sync_taskbar_progress(&mut self, now: Instant) {
+        let progress = self.display.progress.current(now);
+        if progress != self.taskbar_progress && self.display.window.set_taskbar_progress(progress) {
+            self.taskbar_progress = progress;
+        }
+    }
+
+    fn request_progress_frame(&mut self) {
+        self.dirty = true;
+        if self.display.window.has_frame {
+            self.display.window.request_redraw();
+        }
+    }
+
     /// Focus the live originating native window after its notification is activated.
     pub(crate) fn activate_desktop_notification(&self) {
         if !self.display.window.is_headless() && !self.display.window.is_embedded() {
@@ -2083,6 +2375,10 @@ impl WindowContext {
     /// per-request handshake would serialize the drag against the compositor. Callers that need
     /// confirmation subscribe to `moved` and `resized`.
     #[cfg(any(unix, windows))]
+    ///
+    /// # Errors
+    ///
+    /// Returns an IPC error for invalid geometry or an unavailable native window.
     pub fn request_automation_geometry(
         &self,
         x: Option<i32>,
@@ -2346,6 +2642,8 @@ impl WindowContext {
     /// Detailed, secret-free terminal/window inspection.
     #[cfg(any(unix, windows))]
     pub fn automation_inspect(&self, event_sequence: u64, live_pty_count: usize) -> Value {
+        // Probed before the terminal lock is taken; it reads only process state.
+        let running_program = self.running_program();
         let terminal = self.terminal.lock();
         let grid = terminal.grid();
         let size = self.display.size_info;
@@ -2353,6 +2651,7 @@ impl WindowContext {
         let selection =
             terminal.selection.as_ref().and_then(|selection| selection.to_range(&terminal));
         #[cfg(unix)]
+        // SAFETY: tcgetpgrp takes a scalar PTY descriptor and reports closed or invalid descriptors as errors.
         let foreground_pgid = unsafe { libc::tcgetpgrp(self.master_fd) };
         #[cfg(unix)]
         let foreground_pgid = (foreground_pgid > 0).then_some(foreground_pgid);
@@ -2372,6 +2671,7 @@ impl WindowContext {
         #[cfg(unix)]
         let mut attributes = std::mem::MaybeUninit::<libc::termios>::uninit();
         #[cfg(unix)]
+        // SAFETY: attributes is an aligned writable termios; assume_init executes only after tcgetattr succeeds.
         let echo = unsafe {
             (libc::tcgetattr(self.master_fd, attributes.as_mut_ptr()) == 0)
                 .then(|| attributes.assume_init().c_lflag & libc::ECHO != 0)
@@ -2384,8 +2684,17 @@ impl WindowContext {
         let native_accessibility = false;
         let (text_scene_builds, cached_scene_frames, media_metrics, overlay_metrics) =
             self.display.optimization_metrics();
+        // Never the text itself, which can be a password on its way to the clipboard.
+        let clipboard_prompt = self.display.clipboard_prompt().map(|prompt| {
+            let (confirm, refuse) = prompt.choices();
+            json_value!({
+                "kind": prompt.kind(),
+                "title": prompt.title(),
+                "highlighted": if prompt.confirm_focused() { confirm } else { refuse },
+            })
+        });
 
-        json_value!({
+        let mut inspect = json_value!({
             "window": self.automation_summary_with_terminal(&terminal),
             "cell": {"width": size.cell_width(), "height": size.cell_height()},
             "ime_cursor_area": self.display.window.ime_area().map(|(overlay,position,size)| json_value!({
@@ -2407,6 +2716,21 @@ impl WindowContext {
             "foreground_process_group_id": foreground_pgid,
             "executable": executable,
             "current_directory": current_directory,
+            "running_program": running_program,
+            "command_palette": self.display.command_palette().map(|palette| json_value!({
+                "query": palette.query(),
+                "matches": palette.match_count(),
+                "selected": palette.selected().map(|entry| entry.title.as_str()),
+            })),
+            "message": self.message_buffer.message().map(|message| json_value!({
+                "type": match message.ty() {
+                    MessageType::Info => "info",
+                    MessageType::Warning => "warning",
+                    MessageType::Error => "error",
+                },
+                "text": message.raw_text(),
+            })),
+            "progress": self.display.progress.automation_json(),
             "echo": echo,
             "exit_status": exit_status_json(self.automation.exit_status.as_ref()),
             "event_sequence": event_sequence,
@@ -2442,10 +2766,16 @@ impl WindowContext {
                 "grid_rows": 1000,
                 "reply_bytes": crate::polling::ipc::MAX_REPLY_FRAME_BYTES,
             },
-        })
+        });
+        // Set apart because the literal above is at the macro's recursion limit.
+        inspect["clipboard_prompt"] = clipboard_prompt.into();
+        inspect["shell_integration"] =
+            self.shell_integration.map(tty::IntegratedShell::name).into();
+        inspect
     }
 
     #[cfg(any(unix, windows))]
+    /// Return bounded status for this pane's Vivid sessions.
     pub fn automation_vivid_sessions(&self) -> Value {
         let sessions = self
             .vivid_service
@@ -2453,8 +2783,8 @@ impl WindowContext {
             .into_iter()
             .map(|identity| {
                 json_value!({
-                    "session_id": identity.session_id,
-                    "presenter_instance_id": hex_bytes(&identity.presenter.0),
+                    "session_id": identity.session_id(),
+                    "presenter_instance_id": hex_bytes(&identity.presenter().0),
                 })
             })
             .collect::<Vec<_>>();
@@ -2462,6 +2792,7 @@ impl WindowContext {
     }
 
     #[cfg(any(unix, windows))]
+    /// Return bounded status for this pane's owned Vivid surfaces.
     pub fn automation_vivid_surfaces(&self) -> Value {
         let surfaces = self
             .vivid_service
@@ -2477,6 +2808,11 @@ impl WindowContext {
     }
 
     #[cfg(any(unix, windows))]
+    /// Inspect one Vivid surface using its complete owner and object identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an IPC error if the fully addressed owner, context, or surface is unknown.
     pub fn automation_vivid_surface(
         &self,
         session_id: u64,
@@ -2487,9 +2823,9 @@ impl WindowContext {
             .automation_surface_keys()
             .into_iter()
             .find(|identity| {
-                identity.context.session.session_id == session_id
-                    && identity.context.context_id == context_id
-                    && identity.surface_id == surface_id
+                identity.context().session().session_id() == session_id
+                    && identity.context().context_id() == context_id
+                    && identity.surface_id() == surface_id
             })
             .and_then(|identity| self.vivid_service.automation_surface_status(identity))
             .map(|status| vivid_surface_status_json(self.ipc_window_id, &status))
@@ -2497,6 +2833,7 @@ impl WindowContext {
     }
 
     #[cfg(any(unix, windows))]
+    /// Return bounded status for this pane's owned Vivid tracks.
     pub fn automation_vivid_tracks(&self) -> Value {
         let tracks = self
             .vivid_service
@@ -2512,6 +2849,11 @@ impl WindowContext {
     }
 
     #[cfg(any(unix, windows))]
+    /// Inspect one Vivid track using its complete owner and object identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an IPC error if the fully addressed owner, surface, or track is unknown.
     pub fn automation_vivid_track(
         &self,
         session_id: u64,
@@ -2523,10 +2865,10 @@ impl WindowContext {
             .automation_track_keys()
             .into_iter()
             .find(|identity| {
-                identity.surface.context.session.session_id == session_id
-                    && identity.surface.context.context_id == context_id
-                    && identity.surface.surface_id == surface_id
-                    && identity.track_id == track_id
+                identity.surface().context().session().session_id() == session_id
+                    && identity.surface().context().context_id() == context_id
+                    && identity.surface().surface_id() == surface_id
+                    && identity.track_id() == track_id
             })
             .and_then(|identity| self.vivid_service.automation_track_status(identity))
             .map(|status| vivid_track_status_json(self.ipc_window_id, &status))
@@ -2534,6 +2876,11 @@ impl WindowContext {
     }
 
     #[cfg(any(unix, windows))]
+    /// Inspect one fully addressed Vivid scene.
+    ///
+    /// # Errors
+    ///
+    /// Returns an IPC error if the addressed owner or context is unknown.
     pub fn automation_vivid_scene(
         &self,
         session_id: u64,
@@ -2546,7 +2893,7 @@ impl WindowContext {
             .vivid_service
             .automation_sessions()
             .into_iter()
-            .find(|identity| identity.session_id == session_id)
+            .find(|identity| identity.session_id() == session_id)
             .ok_or_else(|| IpcError::new("session_not_found", "Vivid session does not exist"))?;
         let status = self.vivid_service.automation_scene_status(session, maximum_nodes);
         let nodes = status
@@ -2554,7 +2901,7 @@ impl WindowContext {
             .into_iter()
             .map(|node| {
                 json_value!({
-                    "presenter_instance_id": hex_bytes(&node.identity.context.session.presenter.0),
+                    "presenter_instance_id": hex_bytes(&node.identity.context().session().presenter().0),
                     "node_id": node.node.node_id,
                     "owning_context_id": node.node.owning_context_id,
                     "surface_context_id": node.node.surface_context_id,
@@ -2569,7 +2916,7 @@ impl WindowContext {
             .collect::<Vec<_>>();
         Ok(json_value!({
             "window_id": self.ipc_window_id,
-            "presenter_instance_id": hex_bytes(&status.session.presenter.0),
+            "presenter_instance_id": hex_bytes(&status.session.presenter().0),
             "session_id": session_id,
             "scene_revision": status.revision.get(),
             "target_generation": status.target_generation.get(),
@@ -2580,6 +2927,7 @@ impl WindowContext {
     }
 
     #[cfg(any(unix, windows))]
+    /// Query bounded Vivid trace records with the supplied filters.
     pub fn automation_vivid_trace(
         &self,
         selection: crate::vivid::trace::TraceSelection,
@@ -2591,6 +2939,7 @@ impl WindowContext {
     }
 
     #[cfg(any(unix, windows))]
+    /// Collect bounded terminal, renderer, and Vivid diagnostic status.
     pub fn automation_diagnose(
         &self,
         event_sequence: u64,
@@ -2606,7 +2955,7 @@ impl WindowContext {
             .into_iter()
             .filter_map(|identity| {
                 self.automation_vivid_scene(
-                    identity.session_id,
+                    identity.session_id(),
                     crate::vivid::MAX_SCENE_NODES as u64,
                 )
                 .ok()
@@ -2676,7 +3025,11 @@ impl WindowContext {
     }
 
     #[cfg(any(unix, windows))]
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "these established rendering and protocol entry points carry independently required context"
+    )]
+    /// Evaluate a wait against the addressed Vivid track and generation.
     pub fn automation_vivid_wait(
         &self,
         session_id: u64,
@@ -2688,10 +3041,10 @@ impl WindowContext {
         value: Option<u64>,
     ) -> TrackWaitEvaluation {
         let identity = self.vivid_service.automation_track_keys().into_iter().find(|identity| {
-            identity.surface.context.session.session_id == session_id
-                && identity.surface.context.context_id == context_id
-                && identity.surface.surface_id == surface_id
-                && identity.track_id == track_id
+            identity.surface().context().session().session_id() == session_id
+                && identity.surface().context().context_id() == context_id
+                && identity.surface().surface_id() == surface_id
+                && identity.track_id() == track_id
         });
         let Some(identity) = identity else {
             return TrackWaitEvaluation::NotFound;
@@ -2706,6 +3059,10 @@ impl WindowContext {
 
     /// Structured physical-cell grid snapshot or current-state delta.
     #[cfg(any(unix, windows))]
+    ///
+    /// # Errors
+    ///
+    /// Returns an IPC error for invalid or oversized grid ranges.
     pub fn automation_grid(
         &self,
         start_line: Option<i32>,
@@ -2907,6 +3264,10 @@ impl WindowContext {
 
     /// Start reading back the last successfully presented frame.
     #[cfg(any(unix, windows))]
+    ///
+    /// # Errors
+    ///
+    /// Returns an IPC error for unsupported formats, an unavailable frame, or a pending capture.
     pub fn request_screenshot(
         &mut self,
         connection: IpcConnection,
@@ -2950,6 +3311,10 @@ impl WindowContext {
 
     /// Poll screenshot readback and move PNG encoding off the event-loop thread.
     #[cfg(any(unix, windows))]
+    ///
+    /// # Panics
+    ///
+    /// Panics if internal screenshot-state invariants are violated.
     pub fn poll_screenshot(&mut self, scheduler: &mut Scheduler, event_proxy: &EventSink) {
         let Some(pending) = self.screenshot.as_ref() else {
             return;
@@ -3052,6 +3417,10 @@ impl WindowContext {
     }
 
     /// Write the ref test results to the disk.
+    ///
+    /// # Panics
+    ///
+    /// Panics if terminal snapshot serialization or writing the reference files fails.
     pub fn write_ref_test_results(&self) {
         // Dump grid state.
         let mut grid = self.terminal.lock().grid().clone();
@@ -3114,9 +3483,9 @@ fn configure_vivid_pty_environment(
         "VIVIDO_INPUT_TRANSPORT".into(),
         if cfg!(windows) { "win32-console" } else { "pty-bytes" }.into(),
     );
-    // ConPTY strips APC control strings before they reach Vivido's terminal parser. Producers
-    // must therefore emit the bounded printable marker form that the Windows PTY scanner removes
-    // and authenticates before ordinary terminal parsing.
+    // Keep the bounded printable anchor form for Windows routes that may include older system
+    // ConPTY hops (for example, nested multiplexers), even though our bundled host preserves APC.
+    // The PTY scanner removes and authenticates these markers before ordinary terminal parsing.
     #[cfg(windows)]
     {
         environment.insert("VIVID_ANCHOR_TRANSPORT".into(), "conpty".into());
@@ -3205,10 +3574,12 @@ fn process_memory_mb() -> Option<f64> {
         // SAFETY: `usage` is a plain zeroed struct that `getrusage` fills before the
         // return value is checked; no other thread observes the intermediate state.
         let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
+        // SAFETY: usage is a correctly aligned writable rusage buffer whose size the native ABI defines.
         let ok = unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) == 0 };
         if !ok {
             return None;
         }
+        // SAFETY: the preceding getrusage call succeeded and initialized this complete rusage value.
         let usage = unsafe { usage.assume_init() };
         if usage.ru_maxrss <= 0 {
             return None;
@@ -3289,9 +3660,9 @@ fn vivid_surface_status_json(window_id: u64, status: &crate::vivid::scene::Surfa
     let descriptor = &status.definition.descriptor;
     json_value!({
         "window_id": window_id,
-        "session_id": status.identity.context.session.session_id,
-        "context_id": status.identity.context.context_id,
-        "surface_id": status.identity.surface_id,
+        "session_id": status.identity.context().session().session_id(),
+        "context_id": status.identity.context().context_id(),
+        "surface_id": status.identity.surface_id(),
         "surface_revision": status.revision.get(),
         "surface_generation": status.generation.get(),
         "semantic_profile": status.definition.semantic_profile,
@@ -3319,10 +3690,10 @@ fn vivid_surface_status_json(window_id: u64, status: &crate::vivid::scene::Surfa
 fn vivid_track_status_json(window_id: u64, status: &crate::vivid::scene::TrackStatus) -> Value {
     json_value!({
         "window_id": window_id,
-        "session_id": status.identity.surface.context.session.session_id,
-        "context_id": status.identity.surface.context.context_id,
-        "surface_id": status.identity.surface.surface_id,
-        "track_id": status.identity.track_id,
+        "session_id": status.identity.surface().context().session().session_id(),
+        "context_id": status.identity.surface().context().context_id(),
+        "surface_id": status.identity.surface().surface_id(),
+        "track_id": status.identity.track_id(),
         "track_revision": status.state.revision.get(),
         "channel_generation": status.state.channel_generation.get(),
         "kind": crate::vivid::scene::track_kind_name(&status.configuration),
@@ -3382,6 +3753,53 @@ fn hex_bytes(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+/// Executable name of the first live direct child of `parent`, skipping console hosts.
+#[cfg(windows)]
+fn child_process_name(parent: u32) -> Option<String> {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+        TH32CS_SNAPPROCESS,
+    };
+
+    if parent == 0 {
+        return None;
+    }
+    // SAFETY: the snapshot handle is checked before use and always closed; `entry` is a plain
+    // struct the API fills after `dwSize` versions it.
+    unsafe {
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snapshot == INVALID_HANDLE_VALUE {
+            return None;
+        }
+        let mut entry = PROCESSENTRY32W {
+            dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+            ..Default::default()
+        };
+        let mut found = None;
+        let mut more = Process32FirstW(snapshot, &mut entry) != 0;
+        while more {
+            if entry.th32ParentProcessID == parent {
+                let length = entry
+                    .szExeFile
+                    .iter()
+                    .position(|&unit| unit == 0)
+                    .unwrap_or(entry.szExeFile.len());
+                let name = String::from_utf16_lossy(&entry.szExeFile[..length]);
+                if !name.eq_ignore_ascii_case("conhost.exe")
+                    && !name.eq_ignore_ascii_case("OpenConsole.exe")
+                {
+                    found = Some(name);
+                    break;
+                }
+            }
+            more = Process32NextW(snapshot, &mut entry) != 0;
+        }
+        CloseHandle(snapshot);
+        found
+    }
+}
+
 #[cfg(all(unix, target_os = "linux"))]
 fn foreground_executable_basename(pid: libc::pid_t) -> Option<String> {
     std::fs::read_link(format!("/proc/{pid}/exe"))
@@ -3395,13 +3813,14 @@ fn foreground_executable_basename(pid: libc::pid_t) -> Option<String> {
     use std::ffi::CStr;
 
     let mut buffer = [0_u8; 4096];
+    // SAFETY: buffer is writable for the exact supplied length; its returned path is checked for a terminator below.
     let length = unsafe {
         libc::proc_pidpath(pid, buffer.as_mut_ptr().cast(), buffer.len().try_into().ok()?)
     };
     if length <= 0 {
         return None;
     }
-    let path = unsafe { CStr::from_ptr(buffer.as_ptr().cast()) };
+    let path = CStr::from_bytes_until_nul(&buffer).ok()?;
     std::path::Path::new(path.to_str().ok()?)
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
@@ -3687,6 +4106,84 @@ fn hash_color<H: Hasher>(color: Option<Color>, hasher: &mut H) {
     }
 }
 
+/// Display native Windows and WSL directories using the same folder-only labels as Vivida. On
+/// other platforms the home directory reads `~`, as shells show it.
+pub(crate) fn directory_tab_title(directory: &std::path::Path) -> String {
+    #[cfg(not(windows))]
+    if home::home_dir().is_some_and(|home| home == directory) {
+        return "~".to_owned();
+    }
+    let path = directory.to_string_lossy();
+    let name = path.trim_end_matches(['/', '\\']).rsplit(['/', '\\']).next().unwrap_or_default();
+    let name = name
+        .chars()
+        .map(|character| if character.is_control() { ' ' } else { character })
+        .collect::<String>();
+    let name = name.trim();
+    if name.is_empty() { "root".to_owned() } else { name.to_owned() }
+}
+
+fn is_explicit_title(title: &str, preserve_title: bool, window: &WindowConfig) -> bool {
+    preserve_title
+        || !window.dynamic_title
+        || (!title.trim().is_empty() && title != window.identity.title)
+}
+
+// Debug omits user content and native resources, and never acquires application locks.
+impl std::fmt::Debug for WindowContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WindowContext")
+            .field("client_health", &self.client_health)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod title_tests {
+    use super::{directory_tab_title, is_explicit_title};
+    use crate::config::window::WindowConfig;
+
+    #[test]
+    fn tab_labels_use_the_current_folder_for_windows_and_wsl() {
+        for (path, expected) in [
+            (r"C:\Users\dev\project", "project"),
+            ("/home/dev/project/", "project"),
+            (r"\\wsl.localhost\Ubuntu\home\dev\project\", "project"),
+            ("/", "root"),
+            (r"C:\", "C:"),
+            ("/home/dev/another", "another"),
+            ("/home/dev/my project", "my project"),
+        ] {
+            assert_eq!(directory_tab_title(std::path::Path::new(path)), expected);
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn home_tab_label_reads_as_tilde() {
+        let home = home::home_dir().unwrap();
+        assert_eq!(directory_tab_title(&home), "~");
+        assert_eq!(directory_tab_title(&home.join("project")), "project");
+    }
+
+    #[test]
+    fn only_program_or_launch_titles_are_explicit() {
+        let window = WindowConfig::default();
+        let default = window.identity.title.clone();
+        // Unset, reset to the default, or cleared by an exiting program: fall back to the folder.
+        assert!(!is_explicit_title(&default, false, &window));
+        assert!(!is_explicit_title("", false, &window));
+        assert!(!is_explicit_title("  ", false, &window));
+        // A running program's OSC title, and a title given at launch, stay.
+        assert!(is_explicit_title("vim README.md", false, &window));
+        assert!(is_explicit_title(&default, true, &window));
+        // A configured title that programs may not change is the user's choice.
+        let mut fixed = WindowConfig::default();
+        fixed.dynamic_title = false;
+        assert!(is_explicit_title(&default, false, &fixed));
+    }
+}
+
 #[cfg(test)]
 mod vivid_environment_tests {
     #[cfg(any(unix, windows))]
@@ -3701,9 +4198,10 @@ mod vivid_environment_tests {
     #[cfg(windows)]
     use super::vivid_wslenv;
     #[cfg(windows)]
+    use super::windows_path_from_shell_report;
+    #[cfg(any(target_os = "macos", windows))]
     use super::{
         LATENCY_SENSITIVE_FRAME_INTERVAL, LatencySensitiveFrameTimer, latency_sensitive_draw_delay,
-        windows_path_from_shell_report,
     };
     #[cfg(any(unix, windows))]
     use super::{ResolvedMousePosition, append_mouse_report};
@@ -3844,7 +4342,7 @@ mod vivid_environment_tests {
         assert!(is_latency_sensitive_input(&event));
     }
 
-    #[cfg(windows)]
+    #[cfg(any(target_os = "macos", windows))]
     #[test]
     fn latency_sensitive_draws_are_bounded_to_one_per_frame_interval() {
         let start = std::time::Instant::now();
@@ -3863,7 +4361,7 @@ mod vivid_environment_tests {
         );
     }
 
-    #[cfg(windows)]
+    #[cfg(any(target_os = "macos", windows))]
     #[test]
     fn latency_sensitive_tail_wake_is_active_and_coalesced() {
         let (sink, receiver) = crate::event::EventSink::headless();

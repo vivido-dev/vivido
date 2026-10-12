@@ -7,8 +7,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 
 use crate::terminal::tty::windows::win32_string;
 
-// Install a panic handler that renders the panic in a classical Windows error
-// dialog box as well as writes the panic to STDERR.
+/// Install a panic hook writing to stderr and displaying uncontained Windows failures.
 pub fn attach_handler() {
     panic::set_hook(Box::new(|panic_info| {
         // Worker boundaries handling untrusted terminal, Vivid, and IPC input catch their own
@@ -20,6 +19,7 @@ pub fn attach_handler() {
         }
         let _ = writeln!(io::stderr(), "{}", panic_info);
         let msg = format!("{}\n\nPress Ctrl-C to Copy", panic_info);
+        // SAFETY: The temporary UTF-16 message and title remain live for the synchronous dialog; the owner HWND is null.
         unsafe {
             MessageBoxW(
                 ptr::null_mut(),

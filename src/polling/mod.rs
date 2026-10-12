@@ -8,7 +8,6 @@ use std::io::Error as IoError;
 use std::path::PathBuf;
 
 use log::error;
-use std::result::Result;
 
 use crate::terminal::thread;
 
@@ -46,6 +45,14 @@ pub struct IoListener {
 #[cfg(unix)]
 impl IoListener {
     /// Create background thread to listen for I/O events.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if the listener or polling thread cannot be started.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the operating system cannot create the background thread.
     pub fn spawn(
         config: &UiConfig,
         options: &Options,
@@ -69,6 +76,7 @@ impl IoListener {
         // SAFETY: Correct drop order is taken care of by `Drop` implementation.
         unsafe { poller.add(&signal_listener.pipe, PollEvent::readable(SIGNAL_READ_KEY))? };
         if let Some(ipc_listener) = &ipc_listener {
+            // SAFETY: ipc_listener and its socket outlive this poller; the worker owns both until it stops polling.
             unsafe { poller.add(&ipc_listener.socket, PollEvent::readable(IPC_READ_KEY))? };
         }
 
@@ -131,6 +139,15 @@ pub struct IoListener;
 
 #[cfg(windows)]
 impl IoListener {
+    /// Start the console handler and background named-pipe listener.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if console registration or endpoint creation fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the operating system cannot create the background thread.
     pub fn spawn(
         config: &UiConfig,
         options: &Options,
@@ -179,6 +196,15 @@ unsafe extern "system" fn console_handler(_event: u32) -> i32 {
 }
 
 /// Public I/O event listener state.
+#[derive(Debug)]
 pub struct IoListenerHandle {
+    /// Bound local automation endpoint, when IPC is enabled.
     pub ipc_socket_path: Option<PathBuf>,
+}
+
+// Debug omits user content and native resources, and never acquires application locks.
+impl std::fmt::Debug for IoListener {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IoListener").finish_non_exhaustive()
+    }
 }

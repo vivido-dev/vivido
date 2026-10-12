@@ -12,6 +12,8 @@ use base64::Engine;
 
 #[path = "vvssh/askpass.rs"]
 mod askpass;
+#[path = "vvssh/media.rs"]
+mod media;
 #[path = "vvssh/mesh.rs"]
 mod mesh;
 
@@ -74,6 +76,10 @@ struct BuiltSshArguments {
     secret_path: String,
     media: Vec<MediaForward>,
 }
+
+// The allocator belongs to the executable; embedding hosts retain their own allocator.
+#[global_allocator]
+static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 fn main() -> ExitCode {
     if askpass::is_helper() {
@@ -191,10 +197,17 @@ fn run() -> Result<u8, String> {
     }
     let mut media = Vec::with_capacity(built.media.len());
     for forward in built.media {
+        let (lane, arguments) = (forward.lane, forward.arguments.clone());
         match start_media_forward(&credential_broker, &ssh, forward) {
-            Ok(child) => media.push(child),
+            Ok(child) => media.push(media::MediaLane::start(
+                lane,
+                ssh.clone(),
+                arguments,
+                credential_broker.unattended(),
+                child,
+            )),
             Err(error) => {
-                stop_media_forwards(&mut media);
+                drop(media);
                 let _ = cleanup_remote_paths(
                     &credential_broker,
                     &ssh,
@@ -220,7 +233,7 @@ fn run() -> Result<u8, String> {
         match credential_broker.command(&ssh, "interactive").args(&built.interactive).status() {
             Ok(status) => status,
             Err(error) => {
-                stop_media_forwards(&mut media);
+                drop(media);
                 let _ = cleanup_remote_paths(
                     &credential_broker,
                     &ssh,
@@ -236,7 +249,7 @@ fn run() -> Result<u8, String> {
     if let Some(lane) = mesh_lane {
         lane.stop();
     }
-    stop_media_forwards(&mut media);
+    drop(media);
     let _ = cleanup_remote_paths(
         &credential_broker,
         &ssh,
@@ -289,13 +302,6 @@ fn start_media_forward(
         ));
     }
     Ok(child)
-}
-
-fn stop_media_forwards(children: &mut [Child]) {
-    for child in children {
-        let _ = child.kill();
-        let _ = child.wait();
-    }
 }
 
 fn take_media_transport_flags(arguments: &mut Vec<OsString>) -> Result<bool, String> {
@@ -613,6 +619,10 @@ fn posix_media_forward(
         OsString::from("-o"),
         OsString::from("ControlPath=none"),
         OsString::from("-o"),
+        OsString::from("ServerAliveInterval=15"),
+        OsString::from("-o"),
+        OsString::from("ServerAliveCountMax=3"),
+        OsString::from("-o"),
         OsString::from("ExitOnForwardFailure=yes"),
         OsString::from("-o"),
         OsString::from("StreamLocalBindMask=0177"),
@@ -702,6 +712,10 @@ fn windows_media_forward(
         OsString::from("ControlMaster=no"),
         OsString::from("-o"),
         OsString::from("ControlPath=none"),
+        OsString::from("-o"),
+        OsString::from("ServerAliveInterval=15"),
+        OsString::from("-o"),
+        OsString::from("ServerAliveCountMax=3"),
         OsString::from("-o"),
         OsString::from("ExitOnForwardFailure=yes"),
         OsString::from("-R"),

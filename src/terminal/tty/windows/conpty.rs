@@ -7,9 +7,7 @@ use std::os::windows::io::IntoRawHandle;
 use std::{mem, ptr};
 
 use windows_sys::Win32::Foundation::{HANDLE, S_OK};
-use windows_sys::Win32::System::Console::{
-    COORD, ClosePseudoConsole, CreatePseudoConsole, HPCON, ResizePseudoConsole,
-};
+use windows_sys::Win32::System::Console::{COORD, HPCON, SetConsoleCtrlHandler};
 use windows_sys::core::PWSTR;
 
 use windows_sys::Win32::System::Threading::{
@@ -18,6 +16,7 @@ use windows_sys::Win32::System::Threading::{
     STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW, UpdateProcThreadAttribute,
 };
 
+use super::runtime::Runtime;
 use crate::terminal::event::{OnResize, WindowSize};
 use crate::terminal::tty::Options;
 use crate::terminal::tty::windows::blocking::{UnblockedReader, UnblockedWriter};
@@ -26,11 +25,10 @@ use crate::terminal::tty::windows::{Pty, cmdline, win32_string};
 
 const PIPE_CAPACITY: usize = crate::terminal::event_loop::READ_BUFFER_SIZE;
 
-// Use the OS ConPTY implementation. Loading conpty.dll through PATH can select an
-// unrelated terminal's older console host, which can silently drop Kitty key releases.
 /// RAII Pseudoconsole.
 pub struct Conpty {
     pub handle: HPCON,
+    runtime: Runtime,
 }
 
 impl Drop for Conpty {
@@ -40,14 +38,17 @@ impl Drop for Conpty {
         // always runs first.
         //
         // See PR #3084 and https://docs.microsoft.com/en-us/windows/console/closepseudoconsole.
-        unsafe { ClosePseudoConsole(self.handle) }
+        // SAFETY: This object owns the live pseudoconsole; its output-drain pipe outlives this close.
+        unsafe { (self.runtime.close)(self.handle) }
     }
 }
 
 // The ConPTY handle can be sent between threads.
+// SAFETY: The pseudoconsole handle has no thread affinity; ownership and close ordering move together.
 unsafe impl Send for Conpty {}
 
 pub fn new(config: &Options, window_size: WindowSize) -> Result<Pty> {
+    let runtime = Runtime::load()?;
     let mut pty_handle: HPCON = 0;
 
     // Passing 0 as the size parameter allows the "system default" buffer
@@ -58,8 +59,9 @@ pub fn new(config: &Options, window_size: WindowSize) -> Result<Pty> {
     let (conin_pty_handle, conin) = miow::pipe::anonymous(0)?;
 
     // Create the Pseudo Console, using the pipes.
+    // SAFETY: Both pipe handles are live and the initialized output receives the new pseudoconsole handle.
     let result = unsafe {
-        CreatePseudoConsole(
+        (runtime.create)(
             window_size.into(),
             conin_pty_handle.into_raw_handle() as HANDLE,
             conout_pty_handle.into_raw_handle() as HANDLE,
@@ -76,6 +78,7 @@ pub fn new(config: &Options, window_size: WindowSize) -> Result<Pty> {
 
     let mut size: usize = 0;
 
+    // SAFETY: The Windows startup/output structure consists of integer and pointer fields for which zero is valid.
     let mut startup_info_ex: STARTUPINFOEXW = unsafe { mem::zeroed() };
 
     startup_info_ex.StartupInfo.lpTitle = std::ptr::null_mut() as PWSTR;
@@ -87,6 +90,7 @@ pub fn new(config: &Options, window_size: WindowSize) -> Result<Pty> {
     startup_info_ex.StartupInfo.dwFlags |= STARTF_USESTDHANDLES;
 
     // Create the appropriately sized thread attribute list.
+    // SAFETY: The documented sizing query uses null storage and a writable byte-count output.
     unsafe {
         let failure =
             InitializeProcThreadAttributeList(ptr::null_mut(), 1, 0, &mut size as *mut usize) > 0;
@@ -97,19 +101,12 @@ pub fn new(config: &Options, window_size: WindowSize) -> Result<Pty> {
         }
     }
 
-    let mut attr_list: Box<[u8]> = vec![0; size].into_boxed_slice();
+    let mut attr_list = vec![0usize; size.div_ceil(mem::size_of::<usize>())];
 
-    // Set startup info's attribute list & initialize it
-    //
-    // Lint failure is spurious; it's because winapi's definition of PROC_THREAD_ATTRIBUTE_LIST
-    // implies it is one pointer in size (32 or 64 bits) but really this is just a dummy value.
-    // Casting a *mut u8 (pointer to 8 bit type) might therefore not be aligned correctly in
-    // the compiler's eyes.
-    #[allow(clippy::cast_ptr_alignment)]
-    {
-        startup_info_ex.lpAttributeList = attr_list.as_mut_ptr() as _;
-    }
+    // Native attribute lists require pointer-aligned storage; usize elements supply that.
+    startup_info_ex.lpAttributeList = attr_list.as_mut_ptr().cast();
 
+    // SAFETY: The attribute buffer is pointer-aligned and has the previously reported byte capacity.
     unsafe {
         success = InitializeProcThreadAttributeList(
             startup_info_ex.lpAttributeList,
@@ -124,6 +121,7 @@ pub fn new(config: &Options, window_size: WindowSize) -> Result<Pty> {
     }
 
     // Set thread attribute list's Pseudo Console to the specified ConPTY.
+    // SAFETY: The initialized attribute list and referenced pseudoconsole or handle-list storage remain live through process creation.
     unsafe {
         success = UpdateProcThreadAttribute(
             startup_info_ex.lpAttributeList,
@@ -141,7 +139,7 @@ pub fn new(config: &Options, window_size: WindowSize) -> Result<Pty> {
     }
 
     // Prepare child process creation arguments.
-    let cmdline = win32_string(&cmdline(config));
+    let mut cmdline = win32_string(&cmdline(config));
     let cwd = config.working_directory.as_ref().map(win32_string);
     let mut creation_flags = EXTENDED_STARTUPINFO_PRESENT;
     let custom_env_block = convert_custom_env(&config.env);
@@ -153,11 +151,22 @@ pub fn new(config: &Options, window_size: WindowSize) -> Result<Pty> {
         None => ptr::null_mut(),
     };
 
-    let mut proc_info: PROCESS_INFORMATION = unsafe { mem::zeroed() };
+    // A process started with `CREATE_NEW_PROCESS_GROUP` — the detached headless daemon, a
+    // `spawn_daemon` instance, or a launcher's background job — ignores Ctrl+C, and every process
+    // it creates inherits that. The shell would then drop the CTRL_C_EVENT the pseudoconsole raises
+    // for `^C`, so neither the keyboard nor automation could interrupt a program. Clear the flag
+    // so the child inherits normal Ctrl+C handling. Vivido is never attached to this
+    // pseudoconsole, so this does not expose it to the child's interrupts.
+    //
+    // SAFETY: a null handler with FALSE only clears this process's ignore-Ctrl+C flag.
+    unsafe { SetConsoleCtrlHandler(None, 0) };
+
+    let mut proc_info = PROCESS_INFORMATION::default();
+    // SAFETY: The command line is writable NUL-terminated UTF-16; environment, directory, startup attributes, and output storage remain live through the call.
     unsafe {
         success = CreateProcessW(
             ptr::null(),
-            cmdline.as_ptr() as PWSTR,
+            cmdline.as_mut_ptr(),
             ptr::null_mut(),
             ptr::null_mut(),
             false as i32,
@@ -177,7 +186,7 @@ pub fn new(config: &Options, window_size: WindowSize) -> Result<Pty> {
     let conout = UnblockedReader::new(conout, PIPE_CAPACITY);
 
     let child_watcher = ChildExitWatcher::new(proc_info.hProcess)?;
-    let conpty = Conpty { handle: pty_handle as HPCON };
+    let conpty = Conpty { handle: pty_handle, runtime };
 
     Ok(Pty::new(conpty, conout, conin, child_watcher))
 }
@@ -203,10 +212,7 @@ fn convert_custom_env(custom_env: &HashMap<String, String>) -> Option<Vec<u16>> 
                 OsStr::new(&custom_value),
             );
         } else {
-            warn!(
-                "Omitting environment variable pair with duplicate key: \
-                 '{custom_key}={custom_value}'"
-            );
+            warn!("Omitting a duplicate environment variable");
         }
     }
 
@@ -241,7 +247,8 @@ fn add_windows_env_key_value_to_block(block: &mut Vec<u16>, key: &OsStr, value: 
 
 impl OnResize for Conpty {
     fn on_resize(&mut self, window_size: WindowSize) {
-        let result = unsafe { ResizePseudoConsole(self.handle, window_size.into()) };
+        // SAFETY: The object owns the live pseudoconsole and the new size is passed by value.
+        let result = unsafe { (self.runtime.resize)(self.handle, window_size.into()) };
         assert_eq!(result, S_OK);
     }
 }
@@ -251,5 +258,11 @@ impl From<WindowSize> for COORD {
         let lines = window_size.num_lines;
         let columns = window_size.num_cols;
         COORD { X: columns as i16, Y: lines as i16 }
+    }
+}
+
+impl std::fmt::Debug for Conpty {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("Conpty").finish_non_exhaustive()
     }
 }

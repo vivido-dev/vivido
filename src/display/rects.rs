@@ -14,47 +14,67 @@ use crate::display::content::RenderableCell;
 use crate::display::text::{TextMetrics, color_from_rgb};
 
 #[derive(Debug, Copy, Clone)]
+/// A colored rectangle in display pixel coordinates.
 pub struct RenderRect {
+    /// Horizontal coordinate.
     pub x: f32,
+    /// Vertical coordinate.
     pub y: f32,
+    /// Width in this value's coordinate system.
     pub width: f32,
+    /// Height in this value's coordinate system.
     pub height: f32,
     /// Stroke width for path-backed decorations; filled rectangles use `height`.
     pub stroke_width: f32,
+    /// Color used to paint this item.
     pub color: Rgb,
+    /// Opacity from zero to one.
     pub alpha: f32,
+    /// Classification of this item.
     pub kind: RectKind,
 }
 
 impl RenderRect {
+    /// Create a physical-pixel rectangle with its color and opacity.
     pub fn new(x: f32, y: f32, width: f32, height: f32, color: Rgb, alpha: f32) -> Self {
         Self { x, y, width, height, stroke_width: height, color, alpha, kind: RectKind::Normal }
     }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+/// A colored line spanning terminal grid cells.
 pub struct RenderLine {
+    /// Start of this range.
     pub start: Point<usize>,
+    /// End of this range.
     pub end: Point<usize>,
+    /// Color used to paint this item.
     pub color: Rgb,
 }
 
 #[repr(u8)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+/// The terminal decoration represented by a rectangle.
 pub enum RectKind {
+    /// Normal presentation or stacking behavior.
     Normal = 0,
+    /// Curved underline decoration.
     Undercurl = 1,
+    /// Dotted underline decoration.
     DottedUnderline = 2,
+    /// Dashed underline decoration.
     DashedUnderline = 3,
 }
 
 impl RenderLine {
+    /// Generate physical-pixel rectangles for accumulated terminal decorations.
     pub fn rects(&self, metrics: &TextMetrics, size: &SizeInfo, flag: Flags) -> Vec<RenderRect> {
         let mut rects = Vec::new();
         self.push_rects_into(&mut rects, metrics, size, flag);
         rects
     }
 
+    /// Append this decoration's physical-pixel rectangles to caller-owned storage.
     pub fn push_rects_into(
         &self,
         rects: &mut Vec<RenderRect>,
@@ -157,6 +177,7 @@ impl RenderLine {
     }
 }
 
+/// Accumulated terminal decoration lines for one rendered frame.
 pub struct RenderLines {
     inner: [Vec<RenderLine>; LINE_FLAGS.len()],
 }
@@ -177,10 +198,12 @@ impl Default for RenderLines {
 }
 
 impl RenderLines {
+    /// Create an empty accumulator for terminal decoration lines.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Generate physical-pixel rectangles for accumulated terminal decorations.
     pub fn rects(&self, metrics: &TextMetrics, size: &SizeInfo) -> Vec<RenderRect> {
         let mut rects = Vec::with_capacity(self.inner.iter().map(Vec::len).sum::<usize>());
         for (index, lines) in self.inner.iter().enumerate() {
@@ -192,6 +215,7 @@ impl RenderLines {
         rects
     }
 
+    /// Extend accumulated decorations with one renderable terminal cell.
     pub fn update(&mut self, cell: &RenderableCell) {
         self.update_flag(cell, Flags::UNDERLINE);
         self.update_flag(cell, Flags::DOUBLE_UNDERLINE);
@@ -240,6 +264,7 @@ fn line_flag_index(flag: Flags) -> usize {
     }
 }
 
+/// Append one terminal rectangle to a vector scene.
 pub fn paint_rect(scene: &mut Scene, rect: &RenderRect) {
     let brush = color_from_rgb(rect.color).with_alpha(rect.alpha);
     match rect.kind {
@@ -261,6 +286,7 @@ pub fn paint_rect(scene: &mut Scene, rect: &RenderRect) {
     }
 }
 
+/// Append terminal rectangles to a vector scene.
 pub fn paint_rects(scene: &mut Scene, rects: impl IntoIterator<Item = RenderRect>) {
     for rect in rects {
         paint_rect(scene, &rect);
@@ -294,6 +320,13 @@ fn paint_undercurl(scene: &mut Scene, rect: &RenderRect, brush: vello::peniko::C
         None,
         &path,
     );
+}
+
+// Debug omits user content and native resources, and never acquires application locks.
+impl std::fmt::Debug for RenderLines {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RenderLines").finish_non_exhaustive()
+    }
 }
 
 #[cfg(test)]

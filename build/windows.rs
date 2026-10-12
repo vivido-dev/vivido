@@ -24,8 +24,33 @@ pub fn configure() {
     println!("cargo:ffmpeg_delay_load={}", runtime_dlls.join(","));
     configure_ffmpeg_delay_load(&runtime_dlls);
     stage_dxc_runtime();
+    stage_conpty_runtime();
 
     embed_resources();
+}
+
+/// Stage the matching Microsoft DLL and console host for applications and test binaries.
+fn stage_conpty_runtime() {
+    let architecture = match env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default().as_str() {
+        "x86_64" => "x64",
+        "aarch64" => "arm64",
+        "x86" => "x86",
+        architecture => panic!("unsupported Windows target architecture {architecture:?}"),
+    };
+    let source = Path::new("windows/conpty").join(architecture);
+    let profile = cargo_profile_directory();
+    for name in ["conpty.dll", "OpenConsole.exe"] {
+        let source = source.join(name);
+        println!("cargo:rerun-if-changed={}", source.display());
+        for directory in [profile.clone(), profile.join("deps")] {
+            fs::create_dir_all(&directory).expect("cannot create Cargo output directory");
+            let destination = directory.join(name);
+            if !files_are_equal(&source, &destination) {
+                fs::copy(&source, &destination)
+                    .unwrap_or_else(|error| panic!("cannot stage {}: {error}", source.display()));
+            }
+        }
+    }
 }
 
 fn embed_resources() {

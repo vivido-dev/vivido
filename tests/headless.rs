@@ -138,7 +138,9 @@ fn base_command(runtime: &Path) -> Command {
         .env_remove("WAYLAND_DISPLAY")
         .env_remove("DISPLAY")
         .env_remove("VIVIDO_SOCKET")
-        .env_remove("VIVIDO_SESSION");
+        .env_remove("VIVIDO_SESSION")
+        // Every omitted `--window-id` falls back to it, and it is set inside a Vivido window.
+        .env_remove("VIVIDO_WINDOW_ID");
     command
 }
 
@@ -267,18 +269,24 @@ fn marker_program(marker: &str) -> Vec<String> {
 }
 
 /// A shell emitting OSC 133 markers drives semantic prompt/finish tracking.
+///
+/// The sequence is what real integrations send: `A` with options, the prompt text, `B` where
+/// input begins, `C` once a command runs, and `D` with its exit code followed by options. The
+/// first prompt idles for six seconds, as a user would before typing.
 #[cfg(unix)]
 fn integration_program() -> Vec<String> {
     vec![
         String::from("sh"),
         String::from("-c"),
         String::from(
-            "printf '\\033]133;A\\a'; i=0; while true; do printf '\\033]133;B\\a'; sleep 2; echo \"WORK-$i\"; printf '\\033]133;C\\a'; echo \"OUT-$i\"; printf '\\033]133;D;0\\a'; sleep 2; printf '\\033]133;A\\a'; sleep 2; i=$((i+1)); done",
+            "p() { printf '\\033]133;A;cl=line;aid=%s\\aPROMPT> \\033]133;B\\a' $$; }; p; sleep 6; i=0; while true; do echo; printf '\\033]133;C;\\a'; echo \"OUT-$i\"; printf '\\033]133;D;0;aid=%s\\a' $$; p; sleep 2; i=$((i+1)); done",
         ),
     ]
 }
 
 /// Windows ConPTY forwards unrecognized OSC sequences, so the same markers work there.
+///
+/// No double quotes: `-e` arguments containing them do not currently reach PowerShell intact.
 #[cfg(windows)]
 fn integration_program() -> Vec<String> {
     vec![
@@ -288,7 +296,7 @@ fn integration_program() -> Vec<String> {
         String::from("-NonInteractive"),
         String::from("-Command"),
         String::from(
-            "$e=[char]27; $b=[char]7; $i=0; [Console]::Write(\"$e]133;A$b\"); while ($true) { [Console]::Write(\"$e]133;B$b\"); Start-Sleep -Seconds 2; Write-Output \"WORK-$i\"; [Console]::Write(\"$e]133;C$b\"); Write-Output \"OUT-$i\"; [Console]::Write(\"$e]133;D;0$b\"); Start-Sleep -Seconds 2; [Console]::Write(\"$e]133;A$b\"); Start-Sleep -Seconds 2; $i++ }",
+            "$e=[char]27; $b=[char]7; function Write-TestPrompt { [Console]::Write($e + ']133;A;cl=line;aid=' + $PID + $b + 'PROMPT> ' + $e + ']133;B' + $b) }; Write-TestPrompt; Start-Sleep -Seconds 6; $i=0; while ($true) { [Console]::WriteLine(); [Console]::Write($e + ']133;C;' + $b); Write-Output ('OUT-' + $i); [Console]::Write($e + ']133;D;0;aid=' + $PID + $b); Write-TestPrompt; Start-Sleep -Seconds 2; $i++ }",
         ),
     ]
 }
@@ -323,14 +331,19 @@ fn static_program() -> Vec<String> {
 fn semantic_waits_follow_shell_integration_markers() {
     let session = Session::start("shell", &integration_program());
 
-    // The prompt marker predates the wait: tracked state resolves it immediately.
-    let ready = session.msg(&["wait", "prompt", "--timeout", "10s"]);
+    // The shell sits idle after `B`, the way every real integration leaves it. Tracked state
+    // resolves the wait at once; the first command is still seconds away.
+    session.msg(&["wait", "text", "PROMPT>", "--timeout", "10s"]);
+    let ready = session.msg(&["wait", "prompt", "--timeout", "2s"]);
     assert!(ready.contains(r#""ready":true"#), "prompt wait: {ready}");
+    assert!(ready.contains(r#""generation":0"#), "a prompt is not a command: {ready}");
 
-    // The next finish resolves with its own exit code, never an earlier command's.
+    // The next finish resolves with its own exit code, never an earlier command's, even though
+    // options follow the code.
     let finished = session.msg(&["wait", "command-finish", "--timeout", "15s"]);
     assert!(finished.contains(r#""status":"completed""#), "finish wait: {finished}");
     assert!(finished.contains(r#""exit_code":0"#), "finish wait: {finished}");
+    assert!(finished.contains(r#""generation":1"#), "finish wait: {finished}");
 
     // A shell emitting no markers never resolves a semantic wait.
     let plain = Session::start("plain", &shell_program());
@@ -352,6 +365,344 @@ fn scoped_text_waits_restrict_matching() {
     let wrong_row =
         session.try_msg(&["wait", "text", "STATUS-42", "--line", "0", "--timeout", "2s"]);
     assert!(!wrong_row.status.success(), "row scope matched outside its row");
+}
+
+/// Report full progress, then clear it once `trigger` exists.
+#[cfg(unix)]
+fn progress_program(trigger: &Path) -> Vec<String> {
+    vec![
+        String::from("sh"),
+        String::from("-c"),
+        format!(
+            "printf '\\033]9;4;1;100\\a'; echo PROGRESS-SET; while [ ! -e '{}' ]; do sleep 0.1; done; printf '\\033]9;4;0\\a'; echo PROGRESS-CLEARED; sleep 300",
+            trigger.display()
+        ),
+    ]
+}
+
+/// No double quotes: `-e` arguments containing them do not currently reach PowerShell intact.
+#[cfg(windows)]
+fn progress_program(trigger: &Path) -> Vec<String> {
+    vec![
+        String::from("powershell.exe"),
+        String::from("-NoLogo"),
+        String::from("-NoProfile"),
+        String::from("-NonInteractive"),
+        String::from("-Command"),
+        format!(
+            "$e=[char]27; $b=[char]7; [Console]::Write($e + ']9;4;1;100' + $b); Write-Output 'PROGRESS-SET'; while (-not (Test-Path -LiteralPath '{}')) {{ Start-Sleep -Milliseconds 100 }}; [Console]::Write($e + ']9;4;0' + $b); Write-Output 'PROGRESS-CLEARED'; Start-Sleep -Seconds 300",
+            trigger.display()
+        ),
+    ]
+}
+
+/// Whether the top padding contains a full-width band unlike the terminal background.
+fn has_progress_band(path: &Path, window: &serde_json::Value) -> bool {
+    let image = image::open(path).expect("decode screenshot PNG").into_rgba8();
+    let (width, height) = image.dimensions();
+    let background = image.get_pixel(width - 1, height - 1).0;
+    let padding_y = window["padding"]["y"].as_f64().expect("window top padding");
+    // Padding moves the bar below row zero. Scan the padding, or the first row when there is
+    // none, without entering the text area where glyphs could be mistaken for progress.
+    let rows = padding_y.ceil().max(1.).min(f64::from(height)) as u32;
+    (0..rows).any(|y| {
+        [width / 4, width / 2, width * 3 / 4]
+            .into_iter()
+            .all(|x| image.get_pixel(x, y).0[..3] != background[..3])
+    })
+}
+
+/// Emit the agent's busy title without OSC progress, including an intermediate OSC clear, and
+/// stay silent until the test requests the idle title. File triggers keep the phases deterministic.
+#[cfg(unix)]
+fn agent_title_program(trigger: &Path, title: &str) -> Vec<String> {
+    vec![
+        String::from("sh"),
+        String::from("-c"),
+        format!(
+            "printf '\\033]0;⠋ {title}\\a\\033]9;4;0\\a'; echo TITLE-BUSY; while [ ! -e '{}' ]; do sleep 0.1; done; printf '\\033]0;{title}\\a'; echo TITLE-IDLE; sleep 300",
+            trigger.display()
+        ),
+    ]
+}
+
+#[cfg(windows)]
+fn agent_title_program(trigger: &Path, title: &str) -> Vec<String> {
+    vec![
+        String::from("powershell.exe"),
+        String::from("-NoLogo"),
+        String::from("-NoProfile"),
+        String::from("-NonInteractive"),
+        String::from("-Command"),
+        format!(
+            "[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); $e=[char]27; $b=[char]7; [Console]::Write($e + ']0;' + [char]0x280b + ' {title}' + $b + $e + ']9;4;0' + $b); Write-Output 'TITLE-BUSY'; while (-not (Test-Path -LiteralPath '{}')) {{ Start-Sleep -Milliseconds 100 }}; [Console]::Write($e + ']0;{title}' + $b); Write-Output 'TITLE-IDLE'; Start-Sleep -Seconds 300",
+            trigger.display()
+        ),
+    ]
+}
+
+/// Exercise real title delivery, rendering, and owner isolation, including Windows ConPTY.
+#[test]
+#[ignore = "spawns processes and needs a wgpu adapter"]
+fn agent_titles_draw_progress_without_osc_reports_and_clear_only_their_own_window() {
+    let triggers = tempfile::tempdir().expect("agent title triggers");
+    let claude_trigger = triggers.path().join("claude-idle");
+    let muse_trigger = triggers.path().join("muse-idle");
+    let claude =
+        Session::start("title-claude", &agent_title_program(&claude_trigger, "Claude Code"));
+    let muse = Session::start("title-muse", &agent_title_program(&muse_trigger, "project"));
+    let inspect = |session: &Session| -> serde_json::Value {
+        serde_json::from_str(&session.msg(&["inspect", "--window-id", "1"])).expect("inspect JSON")
+    };
+    let busy = serde_json::json!({"state": "indeterminate", "percent": null});
+    let idle = serde_json::json!({"state": "none", "percent": null});
+
+    for session in [&claude, &muse] {
+        session.msg(&["wait", "text", "TITLE-BUSY", "--window-id", "1", "--timeout", "10s"]);
+        let state = inspect(session);
+        assert_eq!(state["window"]["window_id"], 1, "owners reuse the same local ID");
+        assert_eq!(state["progress"], busy);
+        let path = PathBuf::from(session.msg(&["screenshot", "--window-id", "1"]).trim());
+        assert!(
+            has_progress_band(&path, &state["window"]),
+            "title activity draws the busy track and segment"
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    // No PTY bytes arrive after the initial title. Thinking must outlast the OSC keepalive timeout.
+    std::thread::sleep(Duration::from_secs(16));
+    assert_eq!(inspect(&claude)["progress"], busy);
+    assert_eq!(inspect(&muse)["progress"], busy);
+    fs::write(&claude_trigger, b"").expect("finish the Claude turn");
+    claude.msg(&["wait", "text", "TITLE-IDLE", "--window-id", "1", "--timeout", "10s"]);
+    let state = inspect(&claude);
+    assert_eq!(state["progress"], idle);
+    assert_eq!(inspect(&muse)["progress"], busy, "the other owner stays busy");
+    let path = PathBuf::from(claude.msg(&["screenshot", "--window-id", "1"]).trim());
+    assert!(!has_progress_band(&path, &state["window"]), "the idle title removes the visible bar");
+    let _ = fs::remove_file(&path);
+
+    muse.msg(&["reset-terminal", "--window-id", "1"]);
+    assert_eq!(inspect(&muse)["progress"], idle, "reset also clears title activity");
+    assert_eq!(inspect(&claude)["progress"], idle);
+}
+
+/// Poll `inspect` until `accept` takes the value at `pointer`, failing with `what` after 15 s.
+fn wait_for_inspect(
+    session: &Session,
+    pointer: &str,
+    accept: &dyn Fn(&serde_json::Value) -> bool,
+    what: &str,
+) -> serde_json::Value {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let inspect: serde_json::Value =
+            serde_json::from_str(&session.msg(&["inspect"])).expect("inspect JSON");
+        let value = inspect.pointer(pointer).cloned().unwrap_or(serde_json::Value::Null);
+        if accept(&value) {
+            return value;
+        }
+        assert!(Instant::now() < deadline, "{what}; last saw {value}");
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// Ctrl+C interrupts the program the shell is running.
+///
+/// On Windows the headless daemon is started in a new process group, which ignores Ctrl+C and
+/// used to hand that to every shell it spawned: the pseudoconsole's CTRL_C_EVENT for `^C` was
+/// dropped, and nothing — keyboard or automation — could interrupt a program.
+#[test]
+#[ignore = "spawns processes and needs a wgpu adapter"]
+fn ctrl_c_interrupts_a_running_child() {
+    let session = Session::start("interrupt", &shell_program());
+    wait_for_inspect(&session, "/running_program", &|value| value.is_null(), "never idle");
+
+    #[cfg(unix)]
+    session.msg(&["typing", "sleep 60\n"]);
+    #[cfg(windows)]
+    session.msg(&["typing", "ping -n 60 127.0.0.1\r"]);
+    wait_for_inspect(&session, "/running_program", &|value| value.is_string(), "never ran");
+
+    session.msg(&["key", "c", "--mods", "Ctrl"]);
+    wait_for_inspect(
+        &session,
+        "/running_program",
+        &|value| value.is_null(),
+        "Ctrl+C did not interrupt the running child",
+    );
+}
+
+/// The command palette opens on its binding, filters as keys arrive, runs the highlighted action
+/// on Enter, and closes on Escape, without any of the typing reaching the shell.
+#[test]
+#[ignore = "spawns processes and needs a wgpu adapter"]
+fn command_palette_filters_runs_and_closes() {
+    let session = Session::start("palette", &static_program());
+    let inspect = || -> serde_json::Value {
+        serde_json::from_str(&session.msg(&["inspect"])).expect("inspect JSON")
+    };
+    let key = |key: &str, mods: Option<&str>| {
+        let mut arguments = vec!["key", key, "--route", "ui"];
+        if let Some(mods) = mods {
+            arguments.extend(["--mods", mods]);
+        }
+        session.msg(&arguments);
+    };
+    #[cfg(target_os = "macos")]
+    let open = "Super,Shift";
+    #[cfg(not(target_os = "macos"))]
+    let open = "Ctrl,Shift";
+
+    session.msg(&["wait", "text", "STATUS-42", "--timeout", "10s"]);
+    assert!(inspect()["command_palette"].is_null(), "the palette starts closed");
+    assert!(inspect()["message"].is_null(), "no message is up yet");
+    let frame = inspect()["window"]["sequences"]["frame"].as_u64().expect("frame sequence");
+
+    key("p", Some(open));
+    let palette =
+        wait_for_inspect(&session, "/command_palette", &|value| value.is_object(), "never opened");
+    // UI-routed automation input used to change state without asking for a frame, so the
+    // palette stayed off screen until something else redrew the window.
+    wait_for_inspect(
+        &session,
+        "/window/sequences/frame",
+        &|value| value.as_u64().is_some_and(|sequence| sequence > frame),
+        "opening the palette presented no new frame",
+    );
+    assert_eq!(palette["query"], "");
+    assert!(
+        palette["matches"].as_u64().unwrap() > 10,
+        "an empty query lists everything: {palette}"
+    );
+
+    for character in "rec term".chars() {
+        key(&character.to_string(), None);
+    }
+    let palette = inspect()["command_palette"].clone();
+    assert_eq!(palette["query"], "rec term");
+    assert_eq!(palette["selected"], "Recover terminal", "{palette}");
+
+    // Recovery is one of the actions a headless session can show: its hint lands in the message
+    // bar, where `inspect` reads it.
+    key("Enter", None);
+    wait_for_inspect(&session, "/command_palette", &|value| value.is_null(), "Enter left it open");
+    let message = wait_for_inspect(
+        &session,
+        "/message",
+        &|value| value.is_object(),
+        "the chosen action did not run",
+    );
+    assert!(message["text"].as_str().unwrap_or_default().contains("reset-terminal"), "{message}");
+    let text = session.msg(&["get-text"]);
+    assert!(!text.contains("rec term"), "palette typing reached the terminal: {text:?}");
+
+    key("p", Some(open));
+    wait_for_inspect(&session, "/command_palette", &|value| value.is_object(), "never reopened");
+    key("Escape", None);
+    wait_for_inspect(&session, "/command_palette", &|value| value.is_null(), "Escape left it open");
+}
+
+/// The terminal-recovery binding reaches its own window. In a headless session, where nobody can
+/// answer a dialog, it shows the recovery commands in the message bar instead.
+///
+/// The prompt used to be sent without a window, so the broadcast path handed it to every window's
+/// input handler, which ignored it: the binding did nothing on any platform.
+#[test]
+#[ignore = "spawns processes and needs a wgpu adapter"]
+fn terminal_recovery_binding_reaches_its_window() {
+    let session = Session::start("recovery-binding", &shell_program());
+    wait_for_inspect(&session, "/message", &|value| value.is_null(), "a message was already up");
+
+    session.msg(&["key", "F12", "--mods", "Ctrl,Shift", "--route", "ui"]);
+    let message = wait_for_inspect(
+        &session,
+        "/message",
+        &|value| value.is_object(),
+        "the recovery binding showed nothing",
+    );
+    assert_eq!(message["type"], "warning", "unexpected message {message}");
+    let text = message["text"].as_str().unwrap_or_default();
+    assert!(
+        text.contains("reset-terminal --window-id") && text.contains("restart-terminal"),
+        "the hint names both recovery commands: {text:?}"
+    );
+}
+
+/// A terminal at its prompt has no running program, so closing it would not ask; a child the
+/// shell is waiting on is named, and the terminal is idle again once it exits.
+#[test]
+#[ignore = "spawns processes and needs a wgpu adapter"]
+fn running_program_distinguishes_an_idle_shell_from_a_running_child() {
+    let session = Session::start("running", &shell_program());
+    let running = || -> serde_json::Value {
+        let inspect: serde_json::Value =
+            serde_json::from_str(&session.msg(&["inspect"])).expect("inspect JSON");
+        inspect["running_program"].clone()
+    };
+    let wait_for = |expected: &dyn Fn(&serde_json::Value) -> bool, what: &str| {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let value = running();
+            if expected(&value) {
+                return value;
+            }
+            assert!(Instant::now() < deadline, "{what}; last saw {value}");
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    };
+
+    wait_for(&|value| value.is_null(), "an idle shell never reported no running program");
+
+    #[cfg(unix)]
+    let (command, program) = ("sleep 4\n", "sleep");
+    #[cfg(windows)]
+    let (command, program) = ("ping -n 5 127.0.0.1\r", "ping");
+    session.msg(&["typing", command]);
+    let name = wait_for(&|value| value.is_string(), "the running child was never reported");
+    assert!(
+        name.as_str().unwrap().to_ascii_lowercase().starts_with(program),
+        "expected {program}, got {name}"
+    );
+
+    wait_for(&|value| value.is_null(), "the shell never returned to idle after the child exited");
+}
+
+/// OSC 9;4 draws a bar in the headless renderer — the path Vivida's embedded panes render
+/// through — reports it in `inspect`, and clears it on removal.
+#[test]
+#[ignore = "spawns processes and needs a wgpu adapter"]
+fn osc_progress_draws_a_bar_and_clears_it() {
+    // The session recreates its runtime directory, so the trigger lives beside it.
+    let trigger = env::temp_dir().join(format!("vivido-it-{}-progress-clear", std::process::id()));
+    let _ = fs::remove_file(&trigger);
+    let session = Session::start("progress", &progress_program(&trigger));
+    let inspect = || -> serde_json::Value {
+        serde_json::from_str(&session.msg(&["inspect"])).expect("inspect JSON")
+    };
+
+    session.msg(&["wait", "text", "PROGRESS-SET", "--timeout", "10s"]);
+    let state = inspect();
+    assert_eq!(state["progress"], serde_json::json!({"state": "normal", "percent": 100}));
+
+    // Let the 200 ms fill ease settle so the bar spans the full width.
+    std::thread::sleep(Duration::from_millis(400));
+    let path = PathBuf::from(session.msg(&["screenshot"]).trim());
+    assert!(
+        has_progress_band(&path, &state["window"]),
+        "a full progress bar crosses the top padding"
+    );
+    let _ = fs::remove_file(&path);
+
+    fs::write(&trigger, b"").expect("write the clear trigger");
+    session.msg(&["wait", "text", "PROGRESS-CLEARED", "--timeout", "10s"]);
+    let state = inspect();
+    assert_eq!(state["progress"], serde_json::json!({"state": "none", "percent": null}));
+    let path = PathBuf::from(session.msg(&["screenshot"]).trim());
+    assert!(!has_progress_band(&path, &state["window"]), "a removed bar is no longer drawn");
+    let _ = fs::remove_file(&path);
+    let _ = fs::remove_file(&trigger);
 }
 
 /// run-plan asserts terminal state and result shapes, and exports JUnit for CI.
@@ -548,6 +899,146 @@ fn test_runner_executes_a_plan_and_tears_down() {
         }
         assert!(Instant::now() < deadline, "kept session survived kill-session");
         std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// Verify a real Kitty producer through ConPTY, the parser, and the GPU compositor.
+#[cfg(windows)]
+#[test]
+#[ignore = "requires KITIM_BINARY, real processes, and a wgpu adapter"]
+fn kitim_image_is_rendered_through_windows_conpty() {
+    let kitim = env::var("KITIM_BINARY").expect("set KITIM_BINARY to a built kitim.exe");
+    let fixture = tempfile::tempdir().unwrap();
+    let supplied_image = env::var_os("KITIM_TEST_IMAGE");
+    let image = supplied_image.as_ref().map(PathBuf::from).unwrap_or_else(|| {
+        let image = fixture.path().join("kitty-image.png");
+        image::RgbaImage::from_pixel(40, 40, image::Rgba([255, 0, 0, 255])).save(&image).unwrap();
+        image
+    });
+    let trigger = fixture.path().join("ready");
+    let program = vec![
+        "powershell.exe".into(),
+        "-NoProfile".into(),
+        "-NonInteractive".into(),
+        "-Command".into(),
+        format!(
+            "while (-not (Test-Path -LiteralPath '{}')) {{ Start-Sleep -Milliseconds 10 }}; & '{}' '{}'; Write-Output 'KITIM-IMAGE-DONE'; Start-Sleep -Seconds 300",
+            trigger.display().to_string().replace('\'', "''"),
+            kitim.replace('\'', "''"),
+            image.display().to_string().replace('\'', "''")
+        ),
+    ];
+    let session = Session::start_with_env("kitim-image", &program, &[("AGENT_MESH_WATCH", "off")]);
+    session.msg(&["resize", "--width", "1000", "--height", "700"]);
+    fs::write(trigger, b"").unwrap();
+    session.msg(&["wait", "text", "KITIM-IMAGE-DONE"]);
+    let screenshot = PathBuf::from(session.msg(&["screenshot"]).trim());
+    let pixels = image::open(&screenshot).unwrap().into_rgba8();
+    if supplied_image.is_some() {
+        let reference = image::open(&image).unwrap().into_rgb8();
+        let colors: std::collections::HashSet<_> =
+            reference.pixels().map(|pixel| pixel.0).collect();
+        let matched = pixels
+            .pixels()
+            .filter(|pixel| {
+                let color = [pixel[0], pixel[1], pixel[2]];
+                color != [0, 0, 0] && color != [255, 255, 255] && colors.contains(&color)
+            })
+            .count();
+        assert!(matched >= 1500, "source image should be visible; found {matched} matching pixels");
+    } else {
+        let red = pixels
+            .pixels()
+            .filter(|pixel| pixel[0] > 240 && pixel[1] < 10 && pixel[2] < 10)
+            .count();
+        assert!(red >= 1500, "kitim's 40x40 image should be visible; found {red} red pixels");
+    }
+    if let Some(destination) = env::var_os("KITIM_TEST_SCREENSHOT") {
+        fs::copy(&screenshot, destination).unwrap();
+    }
+    let _ = fs::remove_file(screenshot);
+}
+
+/// Existing Vivid producers retain raster rendering, input, resizing, and cleanup.
+#[cfg(windows)]
+#[test]
+#[ignore = "requires VVRD_BINARY, VVPAINT_BINARY, real processes, and a wgpu adapter"]
+fn vivid_raster_apps_work_through_windows_conpty() {
+    let fixture = tempfile::tempdir().unwrap();
+    let image = fixture.path().join("red.png");
+    image::RgbaImage::from_pixel(200, 200, image::Rgba([255, 0, 0, 255])).save(&image).unwrap();
+    let document = fixture.path().join("compat.md");
+    fs::write(&document, "# Compatibility\n\n![Red square](red.png)\n").unwrap();
+    for (variable, name, input, key, text) in [
+        ("VVRD_BINARY", "vvrd-compat", &document, "i", ""),
+        ("VVPAINT_BINARY", "vvpaint-compat", &image, "b", "Brush"),
+    ] {
+        let executable = env::var(variable).unwrap_or_else(|_| panic!("set {variable}"));
+        let program = vec![
+            "powershell.exe".into(),
+            "-NoProfile".into(),
+            "-NonInteractive".into(),
+            "-Command".into(),
+            format!(
+                "& '{}' '{}'; Write-Output 'VIVID-APP-DONE'; Start-Sleep -Seconds 300",
+                executable.replace('\'', "''"),
+                input.display().to_string().replace('\'', "''"),
+            ),
+        ];
+        let session = Session::start_with_env(name, &program, &[("AGENT_MESH_WATCH", "off")]);
+        let raster = || -> Option<serde_json::Value> {
+            let state: serde_json::Value =
+                serde_json::from_str(&session.msg(&["vivid", "tracks"])).unwrap();
+            state["tracks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|track| {
+                    track["kind"] == "raster"
+                        && track["last_presentation_id"].as_u64().unwrap_or(0) > 0
+                })
+                .cloned()
+        };
+        let wait_raster = |previous: Option<(u64, u64)>| {
+            let deadline = Instant::now() + READY_TIMEOUT;
+            loop {
+                if let Some(track) = raster() {
+                    let identity = (
+                        track["track_id"].as_u64().unwrap(),
+                        track["last_presentation_id"].as_u64().unwrap(),
+                    );
+                    if previous != Some(identity) {
+                        break identity;
+                    }
+                }
+                assert!(Instant::now() < deadline, "{name} did not present a new raster frame");
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        };
+        let first = wait_raster(None);
+        let screenshot = PathBuf::from(session.msg(&["screenshot"]).trim());
+        let pixels = image::open(&screenshot).unwrap().into_rgb8();
+        assert!(
+            pixels.pixels().filter(|p| p[0] > 240 && p[1] < 10 && p[2] < 10).count() > 1000,
+            "{name}'s Vivid image was not rendered"
+        );
+        let _ = fs::remove_file(screenshot);
+        session.msg(&["key", key]);
+        if !text.is_empty() {
+            session.msg(&["wait", "text", text]);
+            session.msg(&["mouse", "path", "--route", "ui", "--point", "60,60", "160,160"]);
+        }
+        let changed = wait_raster(Some(first));
+        session.msg(&["resize", "--width", "1100", "--height", "750"]);
+        wait_raster(Some(changed));
+        session.msg(&["key", "q"]);
+        session.msg(&["wait", "text", "VIVID-APP-DONE"]);
+        let tracks: serde_json::Value =
+            serde_json::from_str(&session.msg(&["vivid", "tracks"])).unwrap();
+        assert!(
+            tracks["tracks"].as_array().unwrap().is_empty(),
+            "{name} retained tracks after exit"
+        );
     }
 }
 

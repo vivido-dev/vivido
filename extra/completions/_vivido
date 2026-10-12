@@ -19,7 +19,7 @@ _vivido() {
 '-s+[Local IPC endpoint (a filesystem path on Unix, a named-pipe path on Windows)]:SOCKET:_files' \
 '--socket=[Local IPC endpoint (a filesystem path on Unix, a named-pipe path on Windows)]:SOCKET:_files' \
 '--session=[Name of the headless session, for \`--target\` on \`msg\` \[default\: derived from the PID\]]:NAME:_default' \
-'(--session --headless)--automation-name=[Stable same-user automation name for a headed instance \[default\: vivido-<pid>\]]:NAME:_default' \
+'(--session --headless)--automation-name=[Stable same-user automation name for a headed instance (default\: \`vivido-<pid>\`)]:NAME:_default' \
 '--headless-size=[Size of the headless window, as COLUMNSxLINES or WIDTHxHEIGHTpx]:SIZE:_default' \
 '--vivid-target=[Present a \`desktop-surface-v1\` Vivid target instead of the terminal target]:TARGET:((terminal\:"\`terminal-surface-v1\`\: a grid of cells with a text plane and anchors"
 desktop\:"\`desktop-surface-v1\`\: a virtual desktop in logical pixels, with no grid and no anchors"))' \
@@ -304,7 +304,9 @@ ui\:"Process input through Vivido'\''s normal UI input pipeline"))' \
 ;;
 (click)
 _arguments "${_arguments_options[@]}" : \
-'--button=[Mouse button]:BUTTON:(left middle right)' \
+'--button=[Mouse button]:BUTTON:((left\:"The left direction, cell edge, or mouse button"
+middle\:"The middle mouse button"
+right\:"The right direction, cell edge, or mouse button"))' \
 '(--x --y)--cell-column=[Zero-based terminal cell column]:CELL_COLUMN:_default' \
 '(--x --y)--cell-row=[Zero-based terminal cell row]:CELL_ROW:_default' \
 '(--cell-column --cell-row)--x=[Physical-pixel X coordinate in the client area]:X:_default' \
@@ -322,7 +324,9 @@ ui\:"Process input through Vivido'\''s normal UI input pipeline"))' \
 ;;
 (double-click)
 _arguments "${_arguments_options[@]}" : \
-'--button=[Mouse button]:BUTTON:(left middle right)' \
+'--button=[Mouse button]:BUTTON:((left\:"The left direction, cell edge, or mouse button"
+middle\:"The middle mouse button"
+right\:"The right direction, cell edge, or mouse button"))' \
 '(--x --y)--cell-column=[Zero-based terminal cell column]:CELL_COLUMN:_default' \
 '(--x --y)--cell-row=[Zero-based terminal cell row]:CELL_ROW:_default' \
 '(--cell-column --cell-row)--x=[Physical-pixel X coordinate in the client area]:X:_default' \
@@ -340,7 +344,9 @@ ui\:"Process input through Vivido'\''s normal UI input pipeline"))' \
 ;;
 (down)
 _arguments "${_arguments_options[@]}" : \
-'--button=[Mouse button]:BUTTON:(left middle right)' \
+'--button=[Mouse button]:BUTTON:((left\:"The left direction, cell edge, or mouse button"
+middle\:"The middle mouse button"
+right\:"The right direction, cell edge, or mouse button"))' \
 '(--x --y)--cell-column=[Zero-based terminal cell column]:CELL_COLUMN:_default' \
 '(--x --y)--cell-row=[Zero-based terminal cell row]:CELL_ROW:_default' \
 '(--cell-column --cell-row)--x=[Physical-pixel X coordinate in the client area]:X:_default' \
@@ -358,7 +364,9 @@ ui\:"Process input through Vivido'\''s normal UI input pipeline"))' \
 ;;
 (up)
 _arguments "${_arguments_options[@]}" : \
-'--button=[Mouse button]:BUTTON:(left middle right)' \
+'--button=[Mouse button]:BUTTON:((left\:"The left direction, cell edge, or mouse button"
+middle\:"The middle mouse button"
+right\:"The right direction, cell edge, or mouse button"))' \
 '(--x --y)--cell-column=[Zero-based terminal cell column]:CELL_COLUMN:_default' \
 '(--x --y)--cell-row=[Zero-based terminal cell row]:CELL_ROW:_default' \
 '(--cell-column --cell-row)--x=[Physical-pixel X coordinate in the client area]:X:_default' \
@@ -376,7 +384,9 @@ ui\:"Process input through Vivido'\''s normal UI input pipeline"))' \
 ;;
 (drag)
 _arguments "${_arguments_options[@]}" : \
-'--button=[Mouse button]:BUTTON:(left middle right)' \
+'--button=[Mouse button]:BUTTON:((left\:"The left direction, cell edge, or mouse button"
+middle\:"The middle mouse button"
+right\:"The right direction, cell edge, or mouse button"))' \
 '(--x --y)--cell-column=[Zero-based terminal cell column]:CELL_COLUMN:_default' \
 '(--x --y)--cell-row=[Zero-based terminal cell row]:CELL_ROW:_default' \
 '(--cell-column --cell-row)--x=[Physical-pixel X coordinate in the client area]:X:_default' \
@@ -395,7 +405,9 @@ ui\:"Process input through Vivido'\''s normal UI input pipeline"))' \
 (path)
 _arguments "${_arguments_options[@]}" : \
 '*--point=[Ordered physical-pixel points, each written as X,Y]:X,Y:_default:X,Y:_default' \
-'--button=[Mouse button held for the gesture]:BUTTON:(left middle right)' \
+'--button=[Mouse button held for the gesture]:BUTTON:((left\:"The left direction, cell edge, or mouse button"
+middle\:"The middle mouse button"
+right\:"The right direction, cell edge, or mouse button"))' \
 '*--mods=[Comma-separated Ctrl, Alt, Shift, and Super modifiers]:MODS:_default' \
 '--route=[Input routing mode]:ROUTE:((application\:"Bypass Vivido bindings and encode input for the terminal application"
 ui\:"Process input through Vivido'\''s normal UI input pipeline"))' \
@@ -539,9 +551,17 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 '-w+[Window ID. The focused window is used when this is omitted]:WINDOW_ID:_default' \
 '--window-id=[Window ID. The focused window is used when this is omitted]:WINDOW_ID:_default' \
-'-h[Print help]' \
-'--help[Print help]' \
-':signal -- Signal name without a SIG prefix:(int term hup quit tstp cont winch kill stop)' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+':signal -- Signal name without a SIG prefix:((int\:"Send SIGINT"
+term\:"Send SIGTERM"
+hup\:"Send SIGHUP"
+quit\:"Send SIGQUIT"
+tstp\:"Send SIGTSTP"
+cont\:"Send SIGCONT"
+winch\:"Send SIGWINCH"
+kill\:"Send SIGKILL"
+stop\:"Stop the addressed process or media playback"))' \
 && ret=0
 ;;
 (list-windows)
@@ -599,9 +619,9 @@ _arguments "${_arguments_options[@]}" : \
 ;;
 (surface-status)
 _arguments "${_arguments_options[@]}" : \
-'--session-id=[]:SESSION_ID:_default' \
-'--context-id=[]:CONTEXT_ID:_default' \
-'--surface-id=[]:SURFACE_ID:_default' \
+'--session-id=[Session component of the complete Vivid owner identity]:SESSION_ID:_default' \
+'--context-id=[Context component of the complete Vivid owner identity]:CONTEXT_ID:_default' \
+'--surface-id=[Surface component of the complete Vivid owner identity]:SURFACE_ID:_default' \
 '-w+[Window ID. The focused window is used when this is omitted]:WINDOW_ID:_default' \
 '--window-id=[Window ID. The focused window is used when this is omitted]:WINDOW_ID:_default' \
 '-h[Print help]' \
@@ -618,10 +638,10 @@ _arguments "${_arguments_options[@]}" : \
 ;;
 (track-status)
 _arguments "${_arguments_options[@]}" : \
-'--session-id=[]:SESSION_ID:_default' \
-'--context-id=[]:CONTEXT_ID:_default' \
-'--surface-id=[]:SURFACE_ID:_default' \
-'--track-id=[]:TRACK_ID:_default' \
+'--session-id=[Session component of the complete Vivid owner identity]:SESSION_ID:_default' \
+'--context-id=[Context component of the complete Vivid owner identity]:CONTEXT_ID:_default' \
+'--surface-id=[Surface component of the complete Vivid owner identity]:SURFACE_ID:_default' \
+'--track-id=[Track component of the complete Vivid owner identity]:TRACK_ID:_default' \
 '-w+[Window ID. The focused window is used when this is omitted]:WINDOW_ID:_default' \
 '--window-id=[Window ID. The focused window is used when this is omitted]:WINDOW_ID:_default' \
 '-h[Print help]' \
@@ -630,7 +650,7 @@ _arguments "${_arguments_options[@]}" : \
 ;;
 (scene-status)
 _arguments "${_arguments_options[@]}" : \
-'--session-id=[]:SESSION_ID:_default' \
+'--session-id=[Session component of the complete Vivid owner identity]:SESSION_ID:_default' \
 '-w+[Window ID. The focused window is used when this is omitted]:WINDOW_ID:_default' \
 '--window-id=[Window ID. The focused window is used when this is omitted]:WINDOW_ID:_default' \
 '-h[Print help]' \
@@ -641,23 +661,29 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 '-w+[Window ID. The focused window is used when this is omitted]:WINDOW_ID:_default' \
 '--window-id=[Window ID. The focused window is used when this is omitted]:WINDOW_ID:_default' \
-'(--tail --before --around)--after=[]:AFTER:_default' \
-'(--after --tail --around)--before=[]:BEFORE:_default' \
-'(--after --tail --before --follow)--around=[]:AROUND:_default' \
-'--preceding=[]:PRECEDING:_default' \
-'--following=[]:FOLLOWING:_default' \
-'--limit=[]:LIMIT:_default' \
-'--timeout=[]:TIMEOUT:_default' \
-'--session-id=[]:SESSION_ID:_default' \
-'--context-id=[]:CONTEXT_ID:_default' \
-'--surface-id=[]:SURFACE_ID:_default' \
-'--track-id=[]:TRACK_ID:_default' \
-'--category=[]:CATEGORY:(connection lifecycle flow playback recovery decode render)' \
-'(--after --before --around)--tail[]' \
-'(--tail --before --around)--follow[]' \
-'--recovery-only[]' \
-'-h[Print help]' \
-'--help[Print help]' \
+'(--tail --before --around)--after=[Exclusive lower sequence bound]:AFTER:_default' \
+'(--after --tail --around)--before=[Exclusive upper sequence bound]:BEFORE:_default' \
+'(--after --tail --before --follow)--around=[Sequence around which to center the query]:AROUND:_default' \
+'--preceding=[Number of preceding records to include]:PRECEDING:_default' \
+'--following=[Number of following records to include]:FOLLOWING:_default' \
+'--limit=[Maximum number of records to return]:LIMIT:_default' \
+'--timeout=[Maximum wait in milliseconds]:TIMEOUT:_default' \
+'--session-id=[Session component of the complete Vivid owner identity]:SESSION_ID:_default' \
+'--context-id=[Context component of the complete Vivid owner identity]:CONTEXT_ID:_default' \
+'--surface-id=[Surface component of the complete Vivid owner identity]:SURFACE_ID:_default' \
+'--track-id=[Track component of the complete Vivid owner identity]:TRACK_ID:_default' \
+'--category=[Optional trace-category filter]:CATEGORY:((connection\:"Connection and authentication activity"
+lifecycle\:"Owned resource creation, closure, reset, and restart activity"
+flow\:"Flow-control activity"
+playback\:"Media playback activity"
+recovery\:"Resource recovery activity"
+decode\:"Media decoding activity"
+render\:"Media rendering activity"))' \
+'(--after --before --around)--tail[Select the most recent matching records]' \
+'(--tail --before --around)--follow[Continue waiting for newly available records]' \
+'--recovery-only[Restrict trace output to recovery-related events]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
 ;;
 (help)
@@ -739,34 +765,34 @@ _arguments "${_arguments_options[@]}" : \
         case $line[1] in
             (text)
 _arguments "${_arguments_options[@]}" : \
-'--after-screen=[]:AFTER_SCREEN:_default' \
+'--after-screen=[Require a screen sequence newer than this value]:AFTER_SCREEN:_default' \
 '(--rect)--line=[Restrict matching to one viewport row\: 0 is the top row, -1 the bottom row]:LINE:_default' \
 '(--line)--rect=[Restrict matching to a viewport rectangle as COL,ROW,WIDTH,HEIGHT]:COL,ROW,WIDTH,HEIGHT:_default' \
 '--timeout=[Maximum wait (for example 500ms, 30s, 2m, or 1h)]:TIMEOUT:_default' \
 '-w+[Window ID. The focused window is used when this is omitted]:WINDOW_ID:_default' \
 '--window-id=[Window ID. The focused window is used when this is omitted]:WINDOW_ID:_default' \
-'--regex[]' \
+'--regex[Interpret the pattern as a regular expression]' \
 '-h[Print help]' \
 '--help[Print help]' \
-':text:_default' \
+':text -- Text content carried by this value:_default' \
 && ret=0
 ;;
 (output)
 _arguments "${_arguments_options[@]}" : \
-'--after-offset=[]:AFTER_OFFSET:_default' \
+'--after-offset=[Exclusive transcript byte offset from which to inspect output]:AFTER_OFFSET:_default' \
 '--timeout=[Maximum wait (for example 500ms, 30s, 2m, or 1h)]:TIMEOUT:_default' \
 '-w+[Window ID. The focused window is used when this is omitted]:WINDOW_ID:_default' \
 '--window-id=[Window ID. The focused window is used when this is omitted]:WINDOW_ID:_default' \
-'(--base64)--regex[]' \
-'(--regex)--base64[]' \
+'(--base64)--regex[Interpret the pattern as a regular expression]' \
+'(--regex)--base64[Interpret the pattern as base64-encoded bytes]' \
 '-h[Print help]' \
 '--help[Print help]' \
-':pattern:_default' \
+':pattern -- Text or encoded bytes to match:_default' \
 && ret=0
 ;;
 (screen-change)
 _arguments "${_arguments_options[@]}" : \
-'--after-screen=[]:AFTER_SCREEN:_default' \
+'--after-screen=[Require a screen sequence newer than this value]:AFTER_SCREEN:_default' \
 '--timeout=[Maximum wait (for example 500ms, 30s, 2m, or 1h)]:TIMEOUT:_default' \
 '-w+[Window ID. The focused window is used when this is omitted]:WINDOW_ID:_default' \
 '--window-id=[Window ID. The focused window is used when this is omitted]:WINDOW_ID:_default' \
@@ -777,7 +803,7 @@ _arguments "${_arguments_options[@]}" : \
 (screen-stable)
 _arguments "${_arguments_options[@]}" : \
 '--quiet=[Required period without semantic screen changes]:QUIET:_default' \
-'--after-screen=[]:AFTER_SCREEN:_default' \
+'--after-screen=[Require a screen sequence newer than this value]:AFTER_SCREEN:_default' \
 '--timeout=[Maximum wait (for example 500ms, 30s, 2m, or 1h)]:TIMEOUT:_default' \
 '-w+[Window ID. The focused window is used when this is omitted]:WINDOW_ID:_default' \
 '--window-id=[Window ID. The focused window is used when this is omitted]:WINDOW_ID:_default' \
@@ -787,7 +813,7 @@ _arguments "${_arguments_options[@]}" : \
 ;;
 (frame)
 _arguments "${_arguments_options[@]}" : \
-'--after-frame=[]:AFTER_FRAME:_default' \
+'--after-frame=[Require a frame sequence newer than this value]:AFTER_FRAME:_default' \
 '--timeout=[Maximum wait (for example 500ms, 30s, 2m, or 1h)]:TIMEOUT:_default' \
 '-w+[Window ID. The focused window is used when this is omitted]:WINDOW_ID:_default' \
 '--window-id=[Window ID. The focused window is used when this is omitted]:WINDOW_ID:_default' \
@@ -797,18 +823,26 @@ _arguments "${_arguments_options[@]}" : \
 ;;
 (vivid-track)
 _arguments "${_arguments_options[@]}" : \
-'--session-id=[]:SESSION_ID:_default' \
-'--context-id=[]:CONTEXT_ID:_default' \
-'--surface-id=[]:SURFACE_ID:_default' \
-'--track-id=[]:TRACK_ID:_default' \
-'--channel-generation=[]:CHANNEL_GENERATION:_default' \
+'--session-id=[Session component of the complete Vivid owner identity]:SESSION_ID:_default' \
+'--context-id=[Context component of the complete Vivid owner identity]:CONTEXT_ID:_default' \
+'--surface-id=[Surface component of the complete Vivid owner identity]:SURFACE_ID:_default' \
+'--track-id=[Track component of the complete Vivid owner identity]:TRACK_ID:_default' \
+'--channel-generation=[Expected generation of the addressed media channel]:CHANNEL_GENERATION:_default' \
 '--value=[Threshold or milestone mask for value-bearing conditions]:VALUE:_default' \
-'--timeout=[]:TIMEOUT:_default' \
+'--timeout=[Maximum wait in milliseconds]:TIMEOUT:_default' \
 '-w+[Window ID. The focused window is used when this is omitted]:WINDOW_ID:_default' \
 '--window-id=[Window ID. The focused window is used when this is omitted]:WINDOW_ID:_default' \
-'-h[Print help]' \
-'--help[Print help]' \
-':condition:(revision-after milestones presentation-after pts-after clock-started buffered-ended channel-accepted channel-detached track-lost)' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+':condition -- Condition that completes this wait:((revision-after\:"Wait for a revision newer than the supplied value"
+milestones\:"Wait for the requested track milestones"
+presentation-after\:"Wait for a newer presentation sequence"
+pts-after\:"Wait for a later presentation timestamp"
+clock-started\:"Wait for the playback clock to start"
+buffered-ended\:"Wait for buffered playback to end"
+channel-accepted\:"Wait for channel acceptance"
+channel-detached\:"Wait for channel detachment"
+track-lost\:"Wait for the addressed track to be lost"))' \
 && ret=0
 ;;
 (exit)
@@ -1600,7 +1634,7 @@ esac
 (( $+functions[_vivido_commands] )) ||
 _vivido_commands() {
     local commands; commands=(
-'msg:Send a message to the Vivido socket' \
+'msg:Send a local automation request' \
 'list:List running headless sessions' \
 'doctor:Check discovery, IPC, rendering, and presenter health' \
 'debug-bundle:Write a bounded, versioned diagnostic ZIP bundle' \
@@ -1623,7 +1657,7 @@ _vivido__subcmd__doctor_commands() {
 (( $+functions[_vivido__subcmd__help_commands] )) ||
 _vivido__subcmd__help_commands() {
     local commands; commands=(
-'msg:Send a message to the Vivido socket' \
+'msg:Send a local automation request' \
 'list:List running headless sessions' \
 'doctor:Check discovery, IPC, rendering, and presenter health' \
 'debug-bundle:Write a bounded, versioned diagnostic ZIP bundle' \
@@ -1781,14 +1815,14 @@ _vivido__subcmd__help__subcmd__msg__subcmd__list-windows_commands() {
 (( $+functions[_vivido__subcmd__help__subcmd__msg__subcmd__mouse_commands] )) ||
 _vivido__subcmd__help__subcmd__msg__subcmd__mouse_commands() {
     local commands; commands=(
-'move:Mouse coordinate and modifier arguments' \
-'click:Mouse arguments requiring a button' \
-'double-click:Mouse arguments requiring a button' \
-'down:Mouse arguments requiring a button' \
-'up:Mouse arguments requiring a button' \
-'drag:Mouse arguments requiring a button' \
+'move:Move the mouse pointer' \
+'click:A single mouse click' \
+'double-click:Two consecutive mouse clicks' \
+'down:Press a mouse button' \
+'up:Release a mouse button' \
+'drag:Move with a mouse button held' \
 'path:Draw one bounded press/move/release gesture' \
-'scroll:Mouse scrolling arguments' \
+'scroll:Change the visible scrollback offset' \
     )
     _describe -t commands 'vivido help msg mouse commands' commands "$@"
 }
@@ -1910,13 +1944,13 @@ _vivido__subcmd__help__subcmd__msg__subcmd__typing_commands() {
 (( $+functions[_vivido__subcmd__help__subcmd__msg__subcmd__vivid_commands] )) ||
 _vivido__subcmd__help__subcmd__msg__subcmd__vivid_commands() {
     local commands; commands=(
-'sessions:Common target selection for IPC commands' \
-'surfaces:Common target selection for IPC commands' \
-'surface-status:Common target selection for IPC commands' \
-'tracks:Common target selection for IPC commands' \
-'track-status:Common target selection for IPC commands' \
-'scene-status:Common target selection for IPC commands' \
-'trace:Parameters for a bounded Vivid trace query or follow loop' \
+'sessions:Inspect live Vivid sessions' \
+'surfaces:Inspect owned Vivid surfaces' \
+'surface-status:Inspect one fully addressed Vivid surface' \
+'tracks:Inspect owned Vivid tracks' \
+'track-status:Inspect one fully addressed Vivid track' \
+'scene-status:Inspect one owned Vivid scene' \
+'trace:Query bounded Vivid trace records' \
     )
     _describe -t commands 'vivido help msg vivid commands' commands "$@"
 }
@@ -1958,13 +1992,13 @@ _vivido__subcmd__help__subcmd__msg__subcmd__vivid__subcmd__tracks_commands() {
 (( $+functions[_vivido__subcmd__help__subcmd__msg__subcmd__wait_commands] )) ||
 _vivido__subcmd__help__subcmd__msg__subcmd__wait_commands() {
     local commands; commands=(
-'text:Text wait parameters' \
-'output:Output wait parameters' \
-'screen-change:Screen/frame sequence wait parameters' \
-'screen-stable:Screen stability wait parameters' \
-'frame:Frame wait parameters' \
-'vivid-track:Parameters for a generation-scoped Vivid track wait' \
-'exit:Common timeout for wait commands, represented as milliseconds on the wire' \
+'text:Wait for terminal text' \
+'output:Wait for transcript output' \
+'screen-change:Wait for a newer screen sequence' \
+'screen-stable:Wait for the screen to remain unchanged' \
+'frame:Wait for the next presented terminal frame' \
+'vivid-track:Wait for an addressed Vivid track condition' \
+'exit:Wait for the terminal process to exit' \
 'prompt:Block until the shell sits at a prompt. Requires OSC 133 shell integration; a shell that never emits markers never resolves this wait' \
 'command-finish:Block until the running command finishes, reporting its exit code. Resolves on the next finish after registration, never on a command that already finished' \
     )
@@ -2265,14 +2299,14 @@ _vivido__subcmd__msg__subcmd__help__subcmd__list-windows_commands() {
 (( $+functions[_vivido__subcmd__msg__subcmd__help__subcmd__mouse_commands] )) ||
 _vivido__subcmd__msg__subcmd__help__subcmd__mouse_commands() {
     local commands; commands=(
-'move:Mouse coordinate and modifier arguments' \
-'click:Mouse arguments requiring a button' \
-'double-click:Mouse arguments requiring a button' \
-'down:Mouse arguments requiring a button' \
-'up:Mouse arguments requiring a button' \
-'drag:Mouse arguments requiring a button' \
+'move:Move the mouse pointer' \
+'click:A single mouse click' \
+'double-click:Two consecutive mouse clicks' \
+'down:Press a mouse button' \
+'up:Release a mouse button' \
+'drag:Move with a mouse button held' \
 'path:Draw one bounded press/move/release gesture' \
-'scroll:Mouse scrolling arguments' \
+'scroll:Change the visible scrollback offset' \
     )
     _describe -t commands 'vivido msg help mouse commands' commands "$@"
 }
@@ -2394,13 +2428,13 @@ _vivido__subcmd__msg__subcmd__help__subcmd__typing_commands() {
 (( $+functions[_vivido__subcmd__msg__subcmd__help__subcmd__vivid_commands] )) ||
 _vivido__subcmd__msg__subcmd__help__subcmd__vivid_commands() {
     local commands; commands=(
-'sessions:Common target selection for IPC commands' \
-'surfaces:Common target selection for IPC commands' \
-'surface-status:Common target selection for IPC commands' \
-'tracks:Common target selection for IPC commands' \
-'track-status:Common target selection for IPC commands' \
-'scene-status:Common target selection for IPC commands' \
-'trace:Parameters for a bounded Vivid trace query or follow loop' \
+'sessions:Inspect live Vivid sessions' \
+'surfaces:Inspect owned Vivid surfaces' \
+'surface-status:Inspect one fully addressed Vivid surface' \
+'tracks:Inspect owned Vivid tracks' \
+'track-status:Inspect one fully addressed Vivid track' \
+'scene-status:Inspect one owned Vivid scene' \
+'trace:Query bounded Vivid trace records' \
     )
     _describe -t commands 'vivido msg help vivid commands' commands "$@"
 }
@@ -2442,13 +2476,13 @@ _vivido__subcmd__msg__subcmd__help__subcmd__vivid__subcmd__tracks_commands() {
 (( $+functions[_vivido__subcmd__msg__subcmd__help__subcmd__wait_commands] )) ||
 _vivido__subcmd__msg__subcmd__help__subcmd__wait_commands() {
     local commands; commands=(
-'text:Text wait parameters' \
-'output:Output wait parameters' \
-'screen-change:Screen/frame sequence wait parameters' \
-'screen-stable:Screen stability wait parameters' \
-'frame:Frame wait parameters' \
-'vivid-track:Parameters for a generation-scoped Vivid track wait' \
-'exit:Common timeout for wait commands, represented as milliseconds on the wire' \
+'text:Wait for terminal text' \
+'output:Wait for transcript output' \
+'screen-change:Wait for a newer screen sequence' \
+'screen-stable:Wait for the screen to remain unchanged' \
+'frame:Wait for the next presented terminal frame' \
+'vivid-track:Wait for an addressed Vivid track condition' \
+'exit:Wait for the terminal process to exit' \
 'prompt:Block until the shell sits at a prompt. Requires OSC 133 shell integration; a shell that never emits markers never resolves this wait' \
 'command-finish:Block until the running command finishes, reporting its exit code. Resolves on the next finish after registration, never on a command that already finished' \
     )
@@ -2517,14 +2551,14 @@ _vivido__subcmd__msg__subcmd__list-windows_commands() {
 (( $+functions[_vivido__subcmd__msg__subcmd__mouse_commands] )) ||
 _vivido__subcmd__msg__subcmd__mouse_commands() {
     local commands; commands=(
-'move:Mouse coordinate and modifier arguments' \
-'click:Mouse arguments requiring a button' \
-'double-click:Mouse arguments requiring a button' \
-'down:Mouse arguments requiring a button' \
-'up:Mouse arguments requiring a button' \
-'drag:Mouse arguments requiring a button' \
+'move:Move the mouse pointer' \
+'click:A single mouse click' \
+'double-click:Two consecutive mouse clicks' \
+'down:Press a mouse button' \
+'up:Release a mouse button' \
+'drag:Move with a mouse button held' \
 'path:Draw one bounded press/move/release gesture' \
-'scroll:Mouse scrolling arguments' \
+'scroll:Change the visible scrollback offset' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'vivido msg mouse commands' commands "$@"
@@ -2552,14 +2586,14 @@ _vivido__subcmd__msg__subcmd__mouse__subcmd__drag_commands() {
 (( $+functions[_vivido__subcmd__msg__subcmd__mouse__subcmd__help_commands] )) ||
 _vivido__subcmd__msg__subcmd__mouse__subcmd__help_commands() {
     local commands; commands=(
-'move:Mouse coordinate and modifier arguments' \
-'click:Mouse arguments requiring a button' \
-'double-click:Mouse arguments requiring a button' \
-'down:Mouse arguments requiring a button' \
-'up:Mouse arguments requiring a button' \
-'drag:Mouse arguments requiring a button' \
+'move:Move the mouse pointer' \
+'click:A single mouse click' \
+'double-click:Two consecutive mouse clicks' \
+'down:Press a mouse button' \
+'up:Release a mouse button' \
+'drag:Move with a mouse button held' \
 'path:Draw one bounded press/move/release gesture' \
-'scroll:Mouse scrolling arguments' \
+'scroll:Change the visible scrollback offset' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'vivido msg mouse help commands' commands "$@"
@@ -2707,13 +2741,13 @@ _vivido__subcmd__msg__subcmd__typing_commands() {
 (( $+functions[_vivido__subcmd__msg__subcmd__vivid_commands] )) ||
 _vivido__subcmd__msg__subcmd__vivid_commands() {
     local commands; commands=(
-'sessions:Common target selection for IPC commands' \
-'surfaces:Common target selection for IPC commands' \
-'surface-status:Common target selection for IPC commands' \
-'tracks:Common target selection for IPC commands' \
-'track-status:Common target selection for IPC commands' \
-'scene-status:Common target selection for IPC commands' \
-'trace:Parameters for a bounded Vivid trace query or follow loop' \
+'sessions:Inspect live Vivid sessions' \
+'surfaces:Inspect owned Vivid surfaces' \
+'surface-status:Inspect one fully addressed Vivid surface' \
+'tracks:Inspect owned Vivid tracks' \
+'track-status:Inspect one fully addressed Vivid track' \
+'scene-status:Inspect one owned Vivid scene' \
+'trace:Query bounded Vivid trace records' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'vivido msg vivid commands' commands "$@"
@@ -2721,13 +2755,13 @@ _vivido__subcmd__msg__subcmd__vivid_commands() {
 (( $+functions[_vivido__subcmd__msg__subcmd__vivid__subcmd__help_commands] )) ||
 _vivido__subcmd__msg__subcmd__vivid__subcmd__help_commands() {
     local commands; commands=(
-'sessions:Common target selection for IPC commands' \
-'surfaces:Common target selection for IPC commands' \
-'surface-status:Common target selection for IPC commands' \
-'tracks:Common target selection for IPC commands' \
-'track-status:Common target selection for IPC commands' \
-'scene-status:Common target selection for IPC commands' \
-'trace:Parameters for a bounded Vivid trace query or follow loop' \
+'sessions:Inspect live Vivid sessions' \
+'surfaces:Inspect owned Vivid surfaces' \
+'surface-status:Inspect one fully addressed Vivid surface' \
+'tracks:Inspect owned Vivid tracks' \
+'track-status:Inspect one fully addressed Vivid track' \
+'scene-status:Inspect one owned Vivid scene' \
+'trace:Query bounded Vivid trace records' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'vivido msg vivid help commands' commands "$@"
@@ -2810,13 +2844,13 @@ _vivido__subcmd__msg__subcmd__vivid__subcmd__tracks_commands() {
 (( $+functions[_vivido__subcmd__msg__subcmd__wait_commands] )) ||
 _vivido__subcmd__msg__subcmd__wait_commands() {
     local commands; commands=(
-'text:Text wait parameters' \
-'output:Output wait parameters' \
-'screen-change:Screen/frame sequence wait parameters' \
-'screen-stable:Screen stability wait parameters' \
-'frame:Frame wait parameters' \
-'vivid-track:Parameters for a generation-scoped Vivid track wait' \
-'exit:Common timeout for wait commands, represented as milliseconds on the wire' \
+'text:Wait for terminal text' \
+'output:Wait for transcript output' \
+'screen-change:Wait for a newer screen sequence' \
+'screen-stable:Wait for the screen to remain unchanged' \
+'frame:Wait for the next presented terminal frame' \
+'vivid-track:Wait for an addressed Vivid track condition' \
+'exit:Wait for the terminal process to exit' \
 'prompt:Block until the shell sits at a prompt. Requires OSC 133 shell integration; a shell that never emits markers never resolves this wait' \
 'command-finish:Block until the running command finishes, reporting its exit code. Resolves on the next finish after registration, never on a command that already finished' \
 'help:Print this message or the help of the given subcommand(s)' \
@@ -2841,13 +2875,13 @@ _vivido__subcmd__msg__subcmd__wait__subcmd__frame_commands() {
 (( $+functions[_vivido__subcmd__msg__subcmd__wait__subcmd__help_commands] )) ||
 _vivido__subcmd__msg__subcmd__wait__subcmd__help_commands() {
     local commands; commands=(
-'text:Text wait parameters' \
-'output:Output wait parameters' \
-'screen-change:Screen/frame sequence wait parameters' \
-'screen-stable:Screen stability wait parameters' \
-'frame:Frame wait parameters' \
-'vivid-track:Parameters for a generation-scoped Vivid track wait' \
-'exit:Common timeout for wait commands, represented as milliseconds on the wire' \
+'text:Wait for terminal text' \
+'output:Wait for transcript output' \
+'screen-change:Wait for a newer screen sequence' \
+'screen-stable:Wait for the screen to remain unchanged' \
+'frame:Wait for the next presented terminal frame' \
+'vivid-track:Wait for an addressed Vivid track condition' \
+'exit:Wait for the terminal process to exit' \
 'prompt:Block until the shell sits at a prompt. Requires OSC 133 shell integration; a shell that never emits markers never resolves this wait' \
 'command-finish:Block until the running command finishes, reporting its exit code. Resolves on the next finish after registration, never on a command that already finished' \
 'help:Print this message or the help of the given subcommand(s)' \
