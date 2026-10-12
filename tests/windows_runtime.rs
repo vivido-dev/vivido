@@ -31,4 +31,11 @@ fn cargo_build_stages_native_runtimes_beside_vivido() {
             binary.display()
         );
     }
+    for runtime in ["conpty.dll", "OpenConsole.exe"] {
+        assert!(
+            names.iter().any(|name| name.eq_ignore_ascii_case(runtime)),
+            "{runtime} was not staged beside {}",
+            binary.display()
+        );
+    }
 }

@@ -184,6 +184,7 @@ wgpu = { version = "30.0", default-features = false, features = [
 ] }
 
 [target.'cfg(windows)'.dependencies]
+libloading = "0.8.9"
 accesskit = "0.25"
 accesskit_winit = { version = "0.34", default-features = false, features = [
   "rwh_06",

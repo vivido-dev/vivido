@@ -3483,9 +3483,9 @@ fn configure_vivid_pty_environment(
         "VIVIDO_INPUT_TRANSPORT".into(),
         if cfg!(windows) { "win32-console" } else { "pty-bytes" }.into(),
     );
-    // ConPTY strips APC control strings before they reach Vivido's terminal parser. Producers
-    // must therefore emit the bounded printable marker form that the Windows PTY scanner removes
-    // and authenticates before ordinary terminal parsing.
+    // Keep the bounded printable anchor form for Windows routes that may include older system
+    // ConPTY hops (for example, nested multiplexers), even though our bundled host preserves APC.
+    // The PTY scanner removes and authenticates these markers before ordinary terminal parsing.
     #[cfg(windows)]
     {
         environment.insert("VIVID_ANCHOR_TRANSPORT".into(), "conpty".into());

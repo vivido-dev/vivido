@@ -7,10 +7,7 @@ use std::os::windows::io::IntoRawHandle;
 use std::{mem, ptr};
 
 use windows_sys::Win32::Foundation::{HANDLE, S_OK};
-use windows_sys::Win32::System::Console::{
-    COORD, ClosePseudoConsole, CreatePseudoConsole, HPCON, ResizePseudoConsole,
-    SetConsoleCtrlHandler,
-};
+use windows_sys::Win32::System::Console::{COORD, HPCON, SetConsoleCtrlHandler};
 use windows_sys::core::PWSTR;
 
 use windows_sys::Win32::System::Threading::{
@@ -19,6 +16,7 @@ use windows_sys::Win32::System::Threading::{
     STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW, UpdateProcThreadAttribute,
 };
 
+use super::runtime::Runtime;
 use crate::terminal::event::{OnResize, WindowSize};
 use crate::terminal::tty::Options;
 use crate::terminal::tty::windows::blocking::{UnblockedReader, UnblockedWriter};
@@ -27,11 +25,10 @@ use crate::terminal::tty::windows::{Pty, cmdline, win32_string};
 
 const PIPE_CAPACITY: usize = crate::terminal::event_loop::READ_BUFFER_SIZE;
 
-// Use the OS ConPTY implementation. Loading conpty.dll through PATH can select an
-// unrelated terminal's older console host, which can silently drop Kitty key releases.
 /// RAII Pseudoconsole.
 pub struct Conpty {
     pub handle: HPCON,
+    runtime: Runtime,
 }
 
 impl Drop for Conpty {
@@ -42,7 +39,7 @@ impl Drop for Conpty {
         //
         // See PR #3084 and https://docs.microsoft.com/en-us/windows/console/closepseudoconsole.
         // SAFETY: This object owns the live pseudoconsole; its output-drain pipe outlives this close.
-        unsafe { ClosePseudoConsole(self.handle) }
+        unsafe { (self.runtime.close)(self.handle) }
     }
 }
 
@@ -51,6 +48,7 @@ impl Drop for Conpty {
 unsafe impl Send for Conpty {}
 
 pub fn new(config: &Options, window_size: WindowSize) -> Result<Pty> {
+    let runtime = Runtime::load()?;
     let mut pty_handle: HPCON = 0;
 
     // Passing 0 as the size parameter allows the "system default" buffer
@@ -63,7 +61,7 @@ pub fn new(config: &Options, window_size: WindowSize) -> Result<Pty> {
     // Create the Pseudo Console, using the pipes.
     // SAFETY: Both pipe handles are live and the initialized output receives the new pseudoconsole handle.
     let result = unsafe {
-        CreatePseudoConsole(
+        (runtime.create)(
             window_size.into(),
             conin_pty_handle.into_raw_handle() as HANDLE,
             conout_pty_handle.into_raw_handle() as HANDLE,
@@ -188,7 +186,7 @@ pub fn new(config: &Options, window_size: WindowSize) -> Result<Pty> {
     let conout = UnblockedReader::new(conout, PIPE_CAPACITY);
 
     let child_watcher = ChildExitWatcher::new(proc_info.hProcess)?;
-    let conpty = Conpty { handle: pty_handle };
+    let conpty = Conpty { handle: pty_handle, runtime };
 
     Ok(Pty::new(conpty, conout, conin, child_watcher))
 }
@@ -250,7 +248,7 @@ fn add_windows_env_key_value_to_block(block: &mut Vec<u16>, key: &OsStr, value: 
 impl OnResize for Conpty {
     fn on_resize(&mut self, window_size: WindowSize) {
         // SAFETY: The object owns the live pseudoconsole and the new size is passed by value.
-        let result = unsafe { ResizePseudoConsole(self.handle, window_size.into()) };
+        let result = unsafe { (self.runtime.resize)(self.handle, window_size.into()) };
         assert_eq!(result, S_OK);
     }
 }

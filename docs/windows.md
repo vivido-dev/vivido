@@ -147,9 +147,11 @@ Windows Vivido window. Install that Linux build as described in
 - Do not remove `TERM/u:COLORTERM/u` from your user `WSLENV`. Vivido preserves any other entries
   you add, and it rewrites its own entries for each window, so stale endpoint entries are cleaned
   up automatically.
-- ConPTY strips APC control strings, so on Windows producers use a printable anchor marker that
+- The system ConPTY can strip APC control strings. Vivido ships a pinned Microsoft runtime
+  that forwards Kitty graphics; see `windows/conpty/README.md`. For compatibility with other
+  Windows console hops, Vivid producers still use a printable anchor marker that
   Vivido authenticates and removes (`VIVID_ANCHOR_TRANSPORT=conpty`). Current `vivi` builds handle
-  this; older or third-party producers that emit APC anchors will not place media correctly.
+  this; APC-only producers cannot place media across console hops that discard those anchors.
 - Only programs started from a Vivido window inherit these values. A WSL shell started from Windows
   Terminal, or a `wsl.exe` launched outside Vivido, has no Vivid endpoint.
 
