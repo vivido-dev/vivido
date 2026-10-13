@@ -502,7 +502,7 @@ impl TextSystem {
                     .hint(false)
                     .transform(transform)
                     .font_size(run.font_size())
-                    .normalized_coords(run.normalized_coords())
+                    .normalized_coords(bytemuck::cast_slice(run.normalized_coords()))
                     .draw(
                         Fill::NonZero,
                         glyph_run.glyphs().map(|glyph| {
@@ -706,10 +706,10 @@ impl TextSystem {
         let run_metrics = line
             .items()
             .find_map(|item| match item {
-                PositionedLayoutItem::GlyphRun(glyph_run) => Some(*glyph_run.run().metrics()),
+                PositionedLayoutItem::GlyphRun(glyph_run) => Some(*glyph_run.run().font_metrics()),
                 _ => None,
             })
-            .unwrap_or_default();
+            .unwrap_or_else(|| parley::FontMetrics::fallback(font_size));
 
         TextMetrics {
             cell_width: (layout.full_width() + f32::from(self.font.offset.x)).floor().max(1.0),
@@ -717,7 +717,7 @@ impl TextSystem {
                 .floor()
                 .max(1.0),
             baseline: line.metrics().baseline,
-            descent: line.metrics().descent,
+            descent: line.metrics().content_block_max_coord - line.metrics().baseline,
             underline_position: run_metrics.underline_offset,
             underline_thickness: run_metrics.underline_size.max(1.0),
             strikeout_position: run_metrics.strikethrough_offset,
@@ -1470,11 +1470,11 @@ mod tests {
 
     #[test]
     fn character_scripts_are_mapped_to_fontique_tags() {
-        assert_eq!(fontique_script_for_char('今'), Some(Script::from_str_unchecked("Hani")));
-        assert_eq!(fontique_script_for_char('あ'), Some(Script::from_str_unchecked("Hira")));
-        assert_eq!(fontique_script_for_char('한'), Some(Script::from_str_unchecked("Hang")));
+        assert_eq!(fontique_script_for_char('今'), Some(Script::from_bytes(*b"Hani")));
+        assert_eq!(fontique_script_for_char('あ'), Some(Script::from_bytes(*b"Hira")));
+        assert_eq!(fontique_script_for_char('한'), Some(Script::from_bytes(*b"Hang")));
         assert_eq!(fontique_script_for_char('!'), None);
-        assert_eq!(fontique_script_for_char('\u{f026}'), Some(Script::from_str_unchecked("Zzzz")));
+        assert_eq!(fontique_script_for_char('\u{f026}'), Some(Script::from_bytes(*b"Zzzz")));
         assert!(is_private_use('\u{f0001}'));
     }
 
@@ -1604,7 +1604,7 @@ mod tests {
 
         let key = text.fallback_key_for_char('今').expect("han fallback key");
 
-        assert_eq!(key, FallbackKey::from(Script::from_str_unchecked("Hani")));
+        assert_eq!(key, FallbackKey::from(Script::from_bytes(*b"Hani")));
         assert!(key.is_tracked());
         assert!(key.is_default());
     }

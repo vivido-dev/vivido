@@ -276,7 +276,9 @@ pub fn compile_with_layouts(
                                     .draw_glyphs(run.font())
                                     .font_size(run.font_size())
                                     .transform(transform)
-                                    .normalized_coords(run.normalized_coords())
+                                    .normalized_coords(bytemuck::cast_slice(
+                                        run.normalized_coords(),
+                                    ))
                                     .brush(color(value.color))
                                     .hint(false)
                                     .draw(

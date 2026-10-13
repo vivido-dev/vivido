@@ -49,7 +49,7 @@ pub fn paint(
             scene
                 .draw_glyphs(run.font())
                 .font_size(run.font_size())
-                .normalized_coords(run.normalized_coords())
+                .normalized_coords(bytemuck::cast_slice(run.normalized_coords()))
                 .brush(color(style.color))
                 .hint(false)
                 .draw(
@@ -60,7 +60,7 @@ pub fn paint(
                         glyph
                     }),
                 );
-            let metrics = run.metrics();
+            let metrics = run.font_metrics();
             for (enabled, offset, thickness) in [
                 (style.underline, metrics.underline_offset, metrics.underline_size),
                 (style.strikethrough, metrics.strikethrough_offset, metrics.strikethrough_size),
