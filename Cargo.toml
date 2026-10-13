@@ -10,7 +10,13 @@ repository = "https://github.com/vivido-dev/vivido"
 edition = "2024"
 rust-version = "1.95.0"
 links = "vivido_runtime"
-exclude = ["src/terminal/ref_tests.rs", "tests/ref"]
+exclude = [
+  "src/terminal/ref_tests.rs",
+  "tests/ref",
+  # macOS app-bundle artwork is retained in Git for make app / make dmg.
+  "extra/osx/Vivido.app/Contents/Resources/Assets.car",
+  "extra/osx/Vivido.app/Contents/Resources/vivido.icns",
+]
 
 [lib]
 name = "vivido"
