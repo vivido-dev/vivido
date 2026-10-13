@@ -3843,6 +3843,8 @@ impl Processor {
             let mut message = Message::new(text.clone(), ty);
             message.set_target(UPDATE_MESSAGE_TARGET.into());
             window.message_buffer.push(message);
+            // Reserve complete text rows before the next redraw paints the banner.
+            window.display.pending_update.dirty = true;
             window.dirty = true;
             window.display.window.request_redraw();
         }
@@ -3851,6 +3853,7 @@ impl Processor {
     fn remove_update_message(&mut self) {
         for window in self.windows.values_mut() {
             window.message_buffer.remove_target(UPDATE_MESSAGE_TARGET);
+            window.display.pending_update.dirty = true;
             window.dirty = true;
             window.display.window.request_redraw();
         }
@@ -3867,6 +3870,7 @@ impl Processor {
             let mut notice = Message::new(format!("{title}: {message}"), MessageType::Info);
             notice.set_target(UPDATE_INFORMATION_MESSAGE_TARGET.into());
             window.message_buffer.push(notice);
+            window.display.pending_update.dirty = true;
             window.dirty = true;
             window.display.window.request_redraw();
         }
@@ -7571,6 +7575,51 @@ mod update_event_tests {
             update_available_message(&Version::new(1, 2, 3), 1024 * 1024 + 1),
             "Vivido 1.2.3 is available (2 MiB). Click to review the update."
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "requires an offscreen GPU, a PTY, and private Unix sockets"]
+    fn update_banner_reserves_complete_rows_and_releases_them() {
+        use super::*;
+        use crate::config::ui_config::Program;
+
+        let _gpu = crate::display::renderer::gpu_test_lock();
+        for scale in [1.0, 2.0] {
+            let (sink, _events) = EventSink::headless();
+            let mut processor =
+                Processor::new_headless(UiConfig::default(), CliOptions::default(), sink);
+            let headless = HeadlessLoop::new(
+                PhysicalSize::new((960.0 * scale) as u32, (480.0 * scale) as u32 + 11),
+                scale,
+            );
+            let handle = LoopHandle::Headless(&headless);
+            let mut options = WindowOptions::default();
+            options.terminal_options.set_command(&Program::Just("/bin/cat".into()));
+            processor.create_initial_window(handle, options).expect("headless terminal");
+            processor.on_about_to_wait(handle);
+            let original = processor.windows.values().next().unwrap().display.size_info;
+
+            let notice = update_available_message(&Version::new(1, 2, 3), 1024 * 1024);
+            for text in [notice.clone(), notice.repeat(4)] {
+                processor.replace_update_message(text, MessageType::Info);
+                processor.on_about_to_wait(handle);
+
+                let window = processor.windows.values().next().unwrap();
+                let size = window.display.size_info;
+                let rows = window.message_buffer.message().unwrap().text(&size).len();
+                assert!(rows > 0);
+                assert_eq!(size.screen_lines() + rows, original.screen_lines());
+                let bottom =
+                    size.padding_y() + (size.screen_lines() + rows) as f32 * size.cell_height();
+                assert!(bottom <= size.height(), "update banner is clipped at scale {scale}");
+            }
+
+            processor.remove_update_message();
+            processor.on_about_to_wait(handle);
+            assert_eq!(processor.windows.values().next().unwrap().display.size_info, original);
+            processor.on_exiting();
+        }
     }
 }
 
