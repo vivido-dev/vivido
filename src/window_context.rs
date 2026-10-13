@@ -851,6 +851,10 @@ impl WindowContext {
             &mut self.search_state,
         );
 
+        // A just-revealed native pane can still have an unavailable swapchain. Keep its update
+        // pending for the frame timer instead of waiting for more PTY output or keyboard input.
+        self.dirty |= !presented;
+
         // Request immediate re-draw if the visual bell, scrollbar, or progress animation is not
         // done yet. This must run after the draw: the scrollbar wakes inside it, when the
         // terminal's display offset is sampled, so checking earlier would miss the wake
