@@ -125,6 +125,10 @@ fn get_pw_entry(buf: &mut [i8; 1024]) -> Result<Passwd<'_>> {
 pub struct Pty {
     child: Child,
     file: File,
+    #[cfg(target_os = "macos")]
+    gather: Option<super::gather::Gather>,
+    #[cfg(target_os = "macos")]
+    draining: bool,
     signals: UnixStream,
     sig_id: SigId,
     shell_integration: Option<IntegratedShell>,
@@ -377,6 +381,10 @@ fn spawn(
             Ok(Pty {
                 child,
                 file: File::from(master),
+                #[cfg(target_os = "macos")]
+                gather: None,
+                #[cfg(target_os = "macos")]
+                draining: false,
                 signals,
                 sig_id,
                 shell_integration: injection.map(|injection| injection.shell),
@@ -439,7 +447,10 @@ impl Drop for Pty {
 }
 
 impl EventedReadWrite for Pty {
+    #[cfg(not(target_os = "macos"))]
     type Reader = File;
+    #[cfg(target_os = "macos")]
+    type Reader = Self;
     type Writer = File;
 
     #[inline]
@@ -450,19 +461,53 @@ impl EventedReadWrite for Pty {
         poll_opts: PollMode,
     ) -> Result<()> {
         interest.key = PTY_READ_WRITE_TOKEN;
-        // SAFETY: this Pty owns file until deregistration; its event-loop owner outlives the poll registration.
-        unsafe {
-            poll.add_with_mode(&self.file, interest, poll_opts)?;
+        #[cfg(target_os = "macos")]
+        if self.gather.is_some() {
+            interest.readable = false;
         }
 
-        // SAFETY: this Pty owns signals until deregistration; its event-loop owner outlives the poll registration.
-        unsafe {
-            poll.add_with_mode(
-                &self.signals,
-                Event::readable(PTY_CHILD_EVENT_TOKEN),
-                PollMode::Level,
-            )
+        #[cfg(target_os = "macos")]
+        // The measured macOS path is enabled by default; 0 supports diagnostic comparisons.
+        if std::env::var_os("VIVIDO_PTY_GATHER").is_none_or(|value| value != "0") {
+            self.draining = false;
+            self.gather = Some(super::gather::Gather::new(self.file.try_clone()?)?);
+            let gather = self.gather.as_ref().unwrap();
+            // SAFETY: the gather notification socket lives until deregistration.
+            let result = unsafe {
+                poll.add_with_mode(&gather.ready, Event::readable(PTY_READ_WRITE_TOKEN), poll_opts)
+            };
+            if let Err(error) = result {
+                self.gather = None;
+                return Err(error);
+            }
+            interest.readable = false;
         }
+        let result = (|| {
+            // SAFETY: this Pty owns both descriptors until deregistration.
+            unsafe {
+                poll.add_with_mode(&self.file, interest, poll_opts)?;
+                poll.add_with_mode(
+                    &self.signals,
+                    Event::readable(PTY_CHILD_EVENT_TOKEN),
+                    PollMode::Level,
+                )
+            }
+        })();
+        if result.is_err() {
+            // A failed registration must not leave a reader or a poll source behind.
+            let _ = poll.delete(&self.file);
+            let _ = poll.delete(&self.signals);
+            #[cfg(target_os = "macos")]
+            if let Some(mut gather) = self.gather.take() {
+                gather.stop();
+                let _ = poll.delete(&gather.ready);
+            }
+        }
+        #[cfg(target_os = "macos")]
+        if result.is_ok() && self.gather.is_some() {
+            super::gather::set_qos();
+        }
+        result
     }
 
     #[inline]
@@ -473,6 +518,11 @@ impl EventedReadWrite for Pty {
         poll_opts: PollMode,
     ) -> Result<()> {
         interest.key = PTY_READ_WRITE_TOKEN;
+        #[cfg(target_os = "macos")]
+        if self.gather.is_some() {
+            interest.readable = false;
+        }
+
         poll.modify_with_mode(&self.file, interest, poll_opts)?;
 
         poll.modify_with_mode(
@@ -484,18 +534,75 @@ impl EventedReadWrite for Pty {
 
     #[inline]
     fn deregister(&mut self, poll: &Arc<Poller>) -> Result<()> {
-        poll.delete(&self.file)?;
-        poll.delete(&self.signals)
+        #[cfg(target_os = "macos")]
+        let gather_result = if let Some(mut gather) = self.gather.take() {
+            gather.stop();
+            poll.delete(&gather.ready)
+        } else {
+            Ok(())
+        };
+        let file_result = poll.delete(&self.file);
+        let signal_result = poll.delete(&self.signals);
+        #[cfg(target_os = "macos")]
+        gather_result?;
+        file_result?;
+        signal_result
     }
 
     #[inline]
+    #[cfg(not(target_os = "macos"))]
     fn reader(&mut self) -> &mut File {
         &mut self.file
+    }
+
+    #[cfg(target_os = "macos")]
+    fn reader(&mut self) -> &mut Self {
+        self
+    }
+
+    #[cfg(target_os = "macos")]
+    fn reset_read(&mut self) {
+        if let Some(gather) = &mut self.gather {
+            gather.reset();
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn finish_read(&mut self) {
+        if let Some(gather) = &mut self.gather {
+            gather.stop();
+        }
+        self.draining = true;
+    }
+
+    #[cfg(target_os = "macos")]
+    fn read_idle(&mut self) {
+        if let Some(gather) = &mut self.gather {
+            gather.idle();
+        }
     }
 
     #[inline]
     fn writer(&mut self) -> &mut File {
         &mut self.file
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Read for Pty {
+    fn read(&mut self, out: &mut [u8]) -> Result<usize> {
+        if let Some(gather) = &mut self.gather {
+            match gather.read(out) {
+                Ok(0) if self.draining => {},
+                result => return result,
+            }
+        }
+        let result = self.file.read(out);
+        #[cfg(feature = "perf")]
+        if let Ok(n) = result {
+            crate::performance::READ_BYTES.record(n as u64);
+        }
+        result
     }
 }
 

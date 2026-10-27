@@ -413,6 +413,9 @@ pub struct Display {
     kitty_frame: kitty::KittyFrame,
     text_scene_builds: u64,
     cached_scene_frames: u64,
+    #[cfg(feature = "perf")]
+    perf_last_frame: Option<Instant>,
+    snapshot_cells: Vec<crate::terminal::grid::Indexed<crate::terminal::term::cell::Cell>>,
     text_system: TextSystem,
     meter: Meter,
 }
@@ -608,6 +611,9 @@ impl Display {
             kitty_frame: kitty::KittyFrame::default(),
             text_scene_builds: 0,
             cached_scene_frames: 0,
+            #[cfg(feature = "perf")]
+            perf_last_frame: None,
+            snapshot_cells: Vec::new(),
             text_system,
             meter: Default::default(),
         })
@@ -769,6 +775,10 @@ impl Display {
         config: &UiConfig,
         search_state: &mut SearchState,
     ) -> bool {
+        #[cfg(feature = "perf")]
+        let _frame = crate::performance::Timer::new(&crate::performance::FRAME);
+        #[cfg(feature = "perf")]
+        let snapshot_time = crate::performance::Timer::new(&crate::performance::SNAPSHOT);
         if self.renderer_unavailable {
             return false;
         }
@@ -809,6 +819,21 @@ impl Display {
         let grid_changed = !self.damage_tracker.frame().is_empty();
         let kitty_changed =
             self.kitty_frame.update(&terminal, &size_info, early_display_offset, grid_changed);
+        let screen_cells = terminal.grid().screen_lines() * terminal.grid().columns();
+        let cursor_point = terminal.grid().cursor.point;
+        let total_lines = terminal.grid().total_lines();
+        let app_cursor_icon = terminal.mouse_cursor_icon();
+        let mouse_reporting = terminal.mode().intersects(TermMode::MOUSE_MODE);
+        let snapshot = content::Snapshot::capture(
+            &terminal,
+            &mut self.snapshot_cells,
+            grid_changed,
+            search_state,
+            &mut self.hint_state,
+        );
+        drop(terminal);
+        #[cfg(feature = "perf")]
+        drop(snapshot_time);
         let prepared_media =
             self.scene_renderer.prepare_media(&size_info, early_display_offset, &self.kitty_frame);
         let media_generation = prepared_media.as_ref().map_or(0, |media| media.image_generation);
@@ -831,7 +856,6 @@ impl Display {
             && self.drawn_progress == progress_visual;
         if can_reuse_scene {
             self.cached_scene_frames = self.cached_scene_frames.saturating_add(1);
-            drop(terminal);
             self.window.pre_present_notify();
             let result = {
                 let scene = self.cached_scene.as_ref().expect("cached scene checked above");
@@ -848,6 +872,8 @@ impl Display {
                 },
             };
             if presented {
+                #[cfg(feature = "perf")]
+                crate::performance::presented(&mut self.perf_last_frame);
                 self.window.did_present();
             }
             self.vivid_frame_requested = false;
@@ -856,8 +882,7 @@ impl Display {
             return presented;
         }
 
-        let mut content = RenderableContent::new(config, self, &terminal, search_state);
-        let screen_cells = terminal.grid().screen_lines() * terminal.grid().columns();
+        let mut content = RenderableContent::from_snapshot(config, self, snapshot, search_state);
         let mut grid_cells = Vec::with_capacity(screen_cells);
         for cell in &mut content {
             grid_cells.push(cell);
@@ -869,14 +894,7 @@ impl Display {
         let display_offset = content.display_offset();
         let cursor = content.cursor();
 
-        let cursor_point = terminal.grid().cursor.point;
-        let total_lines = terminal.grid().total_lines();
         let metrics = self.text_system.metrics();
-
-        let app_cursor_icon = terminal.mouse_cursor_icon();
-        let mouse_reporting = terminal.mode().intersects(TermMode::MOUSE_MODE);
-
-        drop(terminal);
 
         self.validate_hint_highlights(display_offset, app_cursor_icon, mouse_reporting);
 
@@ -1127,6 +1145,8 @@ impl Display {
             },
         };
         if presented {
+            #[cfg(feature = "perf")]
+            crate::performance::presented(&mut self.perf_last_frame);
             self.window.did_present();
         }
 

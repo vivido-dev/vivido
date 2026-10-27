@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use bitflags::bitflags;
 use serde::{Deserialize, Serialize};
+use smallvec::SmallVec;
 
 use crate::terminal::grid::{self, GridCell};
 use crate::terminal::index::Column;
@@ -142,7 +143,8 @@ impl ResetDiscriminant<Color> for Cell {
 /// storage is actually required.
 #[derive(Default, Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CellExtra {
-    zerowidth: Vec<char>,
+    // Four suffixes fit without a second allocation; longer graphemes spill without truncation.
+    zerowidth: SmallVec<[char; 4]>,
     underline_color: Option<Color>,
     hyperlink: Option<Hyperlink>,
     /// Temporary indices used to carry authenticated Vivid anchors through grid resize/reflow.
@@ -194,6 +196,12 @@ impl Cell {
         Arc::make_mut(extra).zerowidth.push(character);
     }
 
+    /// Append a combining run with one copy-on-write ownership check.
+    pub(crate) fn push_zerowidths(&mut self, characters: impl Iterator<Item = char>) {
+        let extra = self.extra.get_or_insert_with(Default::default);
+        Arc::make_mut(extra).zerowidth.extend(characters);
+    }
+
     /// Attach a temporary Vivid anchor index before terminal resize/reflow.
     pub(crate) fn push_vivid_resize_tracking(&mut self, index: usize) {
         let extra = self.extra.get_or_insert_with(Default::default);
@@ -221,7 +229,7 @@ impl Cell {
     pub fn clear_wide(&mut self) {
         self.flags.remove(Flags::WIDE_CHAR);
         if let Some(extra) = self.extra.as_mut() {
-            Arc::make_mut(extra).zerowidth = Vec::new();
+            Arc::make_mut(extra).zerowidth = SmallVec::new();
         }
         self.c = ' ';
     }
@@ -385,6 +393,32 @@ mod tests {
         cell.set_underline_color(None);
         cell.set_hyperlink(None);
         assert_eq!(cell.zerowidth(), Some(['\u{301}', '\u{302}'].as_slice()));
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn inline_suffixes_preserve_the_previous_storage_layout_size() {
+        assert_eq!(mem::size_of::<SmallVec<[char; 4]>>(), mem::size_of::<Vec<char>>());
+    }
+
+    #[test]
+    fn combining_storage_spills_and_preserves_serialization_and_cow() {
+        let mut cell = Cell::default();
+        cell.push_zerowidths(['\u{301}'; 4].into_iter());
+        assert!(!cell.extra.as_ref().unwrap().zerowidth.spilled());
+        let original = cell.clone();
+        cell.push_zerowidths(std::iter::repeat_n('\u{302}', 128));
+        assert!(cell.extra.as_ref().unwrap().zerowidth.spilled());
+        assert_eq!(original.zerowidth().unwrap(), ['\u{301}'; 4]);
+        assert_eq!(cell.zerowidth().unwrap().len(), 132);
+        let value = serde_json::to_value(&cell).unwrap();
+        let suffix: Vec<char> =
+            serde_json::from_value(value["extra"]["zerowidth"].clone()).unwrap();
+        assert_eq!(suffix, cell.zerowidth().unwrap());
+        assert_eq!(serde_json::from_value::<Cell>(value).unwrap(), cell);
+        cell.clear_wide();
+        assert!(cell.zerowidth().unwrap().is_empty());
+        assert_eq!(original.zerowidth().unwrap().len(), 4);
     }
 
     #[test]

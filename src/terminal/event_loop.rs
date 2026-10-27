@@ -161,6 +161,7 @@ where
                     if *quarantined {
                         continue;
                     }
+                    self.pty.reset_read();
                     state.reset_client_state();
                     self.terminal.lock().reset_client_state();
                     *quarantined = false;
@@ -180,26 +181,40 @@ where
         state: &mut State,
         buf: &mut [u8],
         mut writer: Option<&mut X>,
-    ) -> io::Result<()>
+    ) -> io::Result<usize>
     where
         X: Write,
     {
         let mut unprocessed = 0;
+        let mut received = 0;
         let mut processed = 0;
         // Bytes of `processed` that were image data still accumulating, which show nothing yet.
         let mut quiet = 0;
         let mut graphics_changed = false;
 
         // Reserve the next terminal lock for PTY reading.
+        #[cfg(feature = "perf")]
+        let mut wait = Some(crate::performance::Timer::new(&crate::performance::LOCK_WAIT));
+        #[cfg(feature = "perf")]
+        let mut hold = None;
         let mut _terminal_lease = Some(self.terminal.lease());
         let mut terminal_slot = None;
 
         loop {
             // Read from the PTY.
-            match self.pty.reader().read(&mut buf[unprocessed..]) {
+            match self
+                .pty
+                .reader()
+                .read(&mut buf[unprocessed..unprocessed + MAX_LOCKED_READ - received])
+            {
                 // This is received on Windows/macOS when no more data is readable from the PTY.
                 Ok(0) if unprocessed == 0 => break,
-                Ok(got) => unprocessed += got,
+                Ok(got) => {
+                    #[cfg(all(feature = "perf", not(target_os = "macos")))]
+                    crate::performance::READ_BYTES.record(got as u64);
+                    unprocessed += got;
+                    received += got;
+                },
                 Err(err) => match err.kind() {
                     ErrorKind::Interrupted | ErrorKind::WouldBlock => {
                         // Go back to mio if we're caught up on parsing and the PTY would block.
@@ -216,12 +231,19 @@ where
                 Some(terminal) => terminal,
                 None => terminal_slot.insert(match self.terminal.try_lock_unfair() {
                     // Force block if we are at the buffer size limit.
-                    None if unprocessed >= READ_BUFFER_SIZE => self.terminal.lock_unfair(),
+                    None if unprocessed >= MAX_LOCKED_READ => self.terminal.lock_unfair(),
                     None => continue,
                     Some(terminal) => terminal,
                 }),
             };
 
+            #[cfg(feature = "perf")]
+            {
+                drop(wait.take());
+                hold.get_or_insert_with(|| {
+                    crate::performance::Timer::new(&crate::performance::LOCK_HOLD)
+                });
+            }
             // Write a copy of the bytes to the ref test file.
             if let Some(writer) = &mut writer {
                 writer.write_all(&buf[..unprocessed]).unwrap();
@@ -229,6 +251,8 @@ where
 
             // Parse the incoming bytes, observing only the bounded authenticated-marker envelope.
             // The complete APC is still passed to VTE, which keeps it zero-width and invisible.
+            #[cfg(feature = "perf")]
+            crate::performance::PARSE_BYTES.record(unprocessed as u64);
             let synchronized = state.parser.sync_bytes_count() != 0;
             processed += state.advance(
                 &mut **terminal,
@@ -257,24 +281,41 @@ where
                 // nothing from the terminal. Give the terminal up, lease included, so the UI can
                 // keep drawing: it would otherwise wait out the decode on its next frame.
                 terminal_slot = None;
+                #[cfg(feature = "perf")]
+                drop(hold.take());
                 _terminal_lease = None;
                 let finished = jobs.into_iter().map(QueuedJob::run).collect();
+                #[cfg(feature = "perf")]
+                let wait = crate::performance::Timer::new(&crate::performance::LOCK_WAIT);
                 _terminal_lease = Some(self.terminal.lease());
-                terminal_slot.insert(self.terminal.lock_unfair()).finish_graphics_jobs(finished);
+                let terminal = terminal_slot.insert(self.terminal.lock_unfair());
+                #[cfg(feature = "perf")]
+                {
+                    drop(wait);
+                    hold = Some(crate::performance::Timer::new(&crate::performance::LOCK_HOLD));
+                }
+                terminal.finish_graphics_jobs(finished);
                 graphics_changed = true;
             }
 
             // Assure we're not blocking the terminal too long unnecessarily.
-            if processed >= MAX_LOCKED_READ {
+            if received >= MAX_LOCKED_READ {
                 break;
             }
         }
 
+        drop(terminal_slot);
+        drop(_terminal_lease);
+        #[cfg(feature = "perf")]
+        drop(hold);
+        self.pty.read_idle();
         if wakeup_needed(processed, state.parser.sync_bytes_count(), quiet, graphics_changed) {
             self.event_proxy.send_event(Event::Wakeup);
         }
 
-        Ok(())
+        // A partial anchor marker can consume bytes without dispatching anything yet.
+        // Exit draining must continue based on bytes read, not parser dispatch counts.
+        Ok(received)
     }
 
     #[inline]
@@ -404,7 +445,22 @@ where
                                     self.event_proxy.send_event(Event::ChildExit(status));
                                 }
                                 if self.drain_on_exit {
-                                    let _ = self.pty_read(&mut state, &mut buf, pipe.as_mut());
+                                    self.pty.finish_read();
+                                    let drained = client_fault::catch(
+                                        ClientFaultClass::TerminalParser,
+                                        "terminal parser panicked while draining child output",
+                                        || {
+                                            while self
+                                                .pty_read(&mut state, &mut buf, pipe.as_mut())
+                                                .is_ok_and(|n| n > 0)
+                                            {
+                                            }
+                                        },
+                                    );
+                                    if let Err(fault) = drained {
+                                        state.reset_client_state();
+                                        self.event_proxy.send_event(Event::ClientFault(fault));
+                                    }
                                 }
                                 self.terminal.lock().exit();
                                 self.event_proxy.send_event(Event::Wakeup);
@@ -425,7 +481,7 @@ where
                                     || self.pty_read(&mut state, &mut buf, pipe.as_mut()),
                                 );
                                 let failure = match read {
-                                    Ok(Ok(())) => None,
+                                    Ok(Ok(_)) => None,
                                     Ok(Err(err)) => Some((ClientFaultClass::PtyIo, err)),
                                     Err(fault) => {
                                         // Discard pending writes, parser buffers, and marker fragments immediately.

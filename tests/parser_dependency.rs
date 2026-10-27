@@ -11,9 +11,12 @@ fn published_parser_dependency_requires_apc_and_cell_size_callbacks() {
     let requirement = VersionReq::parse(requirement).unwrap();
 
     // Packaging removes the local path, so older registry releases must be rejected.
-    for patch in 0..2 {
+    for patch in 0..3 {
         let version = Version::new(0, 15, patch);
-        assert!(!requirement.matches(&version), "vvte {version} lacks the required callbacks");
+        assert!(
+            !requirement.matches(&version),
+            "vvte {version} lacks the required batch callbacks"
+        );
     }
-    assert!(requirement.matches(&Version::new(0, 15, 2)));
+    assert!(requirement.matches(&Version::new(0, 15, 3)));
 }

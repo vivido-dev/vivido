@@ -1848,6 +1848,92 @@ impl<T> Term<T> {
 }
 
 impl<T: EventListener> Term<T> {
+    /// Write simple row spans, returning exceptional cells to scalar input.
+    fn write_run<I>(&mut self, mut chars: I)
+    where
+        I: Iterator<Item = char> + Clone,
+    {
+        if self.grid.cursor.charsets[self.active_charset] != StandardCharset::Ascii
+            || self.mode.contains(TermMode::INSERT)
+            || !self.mode.contains(TermMode::LINE_WRAP)
+            || self.grid.cursor.template.extra.is_some()
+        {
+            for c in chars {
+                self.input(c);
+            }
+            return;
+        }
+        let special = Flags::WIDE_CHAR | Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER;
+        while let Some(c) = chars.clone().next() {
+            let width = if c.is_ascii() && !c.is_ascii_control() { Some(1) } else { c.width() };
+            if width == Some(0) {
+                let count = chars.clone().take_while(|c| c.width() == Some(0)).count();
+                let mut point = self.grid.cursor.point;
+                if !self.grid.cursor.input_needs_wrap {
+                    point.column.0 = point.column.saturating_sub(1);
+                }
+                if self.grid[point].flags.contains(Flags::WIDE_CHAR_SPACER) {
+                    point.column.0 = point.column.saturating_sub(1);
+                }
+                self.grid[point].push_zerowidths(chars.by_ref().take(count));
+                continue;
+            }
+            let width = match width {
+                Some(width @ (1 | 2)) if !self.grid.cursor.input_needs_wrap => width,
+                _ => {
+                    chars.next();
+                    self.input(c);
+                    continue;
+                },
+            };
+            let point = self.grid.cursor.point;
+            let columns = self.columns();
+            let available = columns - point.column.0;
+            let count = chars
+                .clone()
+                .take(available / width)
+                .take_while(|c| {
+                    if c.is_ascii() && !c.is_ascii_control() {
+                        width == 1
+                    } else {
+                        c.width() == Some(width)
+                    }
+                })
+                .count();
+            let simple = self.grid[point.line][point.column..point.column + count * width]
+                .iter()
+                .take_while(|cell| cell.extra.is_none() && !cell.flags.intersects(special))
+                .count();
+            let count = count.min(simple / width);
+            if count == 0 {
+                chars.next();
+                self.input(c);
+                continue;
+            }
+            let end = point.column + count * width;
+            let template = &self.grid.cursor.template;
+            let (fg, bg, flags) = (template.fg, template.bg, template.flags);
+            for (cells, c) in self.grid[point.line][point.column..end]
+                .chunks_exact_mut(width)
+                .zip(chars.by_ref().take(count))
+            {
+                cells[0].c = c;
+                cells[0].fg = fg;
+                cells[0].bg = bg;
+                cells[0].flags = flags;
+                if width == 2 {
+                    cells[0].flags.insert(Flags::WIDE_CHAR);
+                    cells[1].c = ' ';
+                    cells[1].fg = fg;
+                    cells[1].bg = bg;
+                    cells[1].flags = flags | Flags::WIDE_CHAR_SPACER;
+                }
+            }
+            self.grid.cursor.input_needs_wrap = end.0 == columns;
+            self.grid.cursor.point.column = Column(end.0.min(columns - 1));
+        }
+    }
+
     /// Restore host input/display semantics after an application failed to tear them down.
     ///
     /// Unlike RIS, this preserves the primary grid and its scrollback so recovery does not erase
@@ -1898,57 +1984,12 @@ impl<T> Dimensions for Term<T> {
 }
 
 impl<T: EventListener> Handler for Term<T> {
-    /// REP's ordinary ASCII path writes one row span at a time. Boundaries and cells requiring
-    /// cleanup still go through `input`, preserving its wrapping, scroll and metadata semantics.
-    fn repeat_char(&mut self, c: char, mut count: usize) {
-        if !(' '..='~').contains(&c)
-            || self.grid.cursor.charsets[self.active_charset] != StandardCharset::Ascii
-            || self.mode.contains(TermMode::INSERT)
-            || !self.mode.contains(TermMode::LINE_WRAP)
-            || self.grid.cursor.template.extra.is_some()
-        {
-            for _ in 0..count {
-                self.input(c);
-            }
-            return;
-        }
+    fn input_str(&mut self, text: &str) {
+        self.write_run(text.chars());
+    }
 
-        let wide = Flags::WIDE_CHAR | Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER;
-        while count > 0 {
-            if self.grid.cursor.input_needs_wrap {
-                self.input(c);
-                count -= 1;
-                continue;
-            }
-
-            let point = self.grid.cursor.point;
-            let columns = self.columns();
-            let end = point.column + count.min(columns - point.column.0);
-            // Inspect through an immutable slice: rejected cells must not increase row occupancy.
-            let run = self.grid[point.line][point.column..end]
-                .iter()
-                .take_while(|cell| cell.extra.is_none() && !cell.flags.intersects(wide))
-                .count();
-            if run == 0 {
-                self.input(c);
-                count -= 1;
-                continue;
-            }
-
-            let end = point.column + run;
-            let template = &self.grid.cursor.template;
-            let (fg, bg, flags) = (template.fg, template.bg, template.flags);
-            // Row's range accessor advances occupancy exactly to the last written cell.
-            for cell in &mut self.grid[point.line][point.column..end] {
-                cell.c = c;
-                cell.fg = fg;
-                cell.bg = bg;
-                cell.flags = flags;
-            }
-            self.grid.cursor.input_needs_wrap = end.0 == columns;
-            self.grid.cursor.point.column = Column(end.0.min(columns - 1));
-            count -= run;
-        }
+    fn repeat_char(&mut self, c: char, count: usize) {
+        self.write_run(std::iter::repeat_n(c, count));
     }
 
     /// A character to be displayed.

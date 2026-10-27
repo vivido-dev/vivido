@@ -1,0 +1,71 @@
+{
+  "arguments": {
+    "before": "/private/tmp/vivido-accepted-perf",
+    "after": "/private/tmp/vivido-accepted-perf",
+    "benchmark": "/private/tmp/vivido-benchmark-final",
+    "corpus": "/private/tmp/vivido-corpus2",
+    "output": "/private/tmp/vivido-diagnostics",
+    "after_gather": "1",
+    "samples": 1,
+    "repetitions": 20,
+    "latency_samples": 100,
+    "timeout": 600,
+    "modes": [
+      "sync",
+      "render"
+    ],
+    "workloads": [
+      "ascii",
+      "unicode",
+      "unique_unicode",
+      "csi",
+      "long_escape_codes",
+      "images"
+    ]
+  },
+  "platform": "macOS-27.0.1-arm64-arm-64bit",
+  "binaries": {
+    "before": {
+      "bytes": 29301272,
+      "sha256": "63d67c45a6069da14716aad65198fe92350700ddec77d901f99c81379ba8ff41"
+    },
+    "after": {
+      "bytes": 29301272,
+      "sha256": "63d67c45a6069da14716aad65198fe92350700ddec77d901f99c81379ba8ff41"
+    },
+    "benchmark": {
+      "bytes": 3050978,
+      "sha256": "3c223c779d4a6da8b02792c8ee48c60dcb73d2b8a18afe63602ae58eb1ddeda9"
+    }
+  },
+  "corpus": {
+    "111a4d2e2ef3e4223aef706c955ee3a90cd3bcbccf999208b7411d99156b5dfb.bin": {
+      "bytes": 12279,
+      "sha256": "e2ca07aafd9d79f00fb8a212d187ebf576b59b083b3c069e1724f48ccaef8a6c"
+    },
+    "58759b295feccc9e7056f24787ba0906e82b504ae0d3f44f8204371364c81611.bin": {
+      "bytes": 1060416,
+      "sha256": "3402691d90d6f3dea0210b31c31757e350d71ba8f2b1b228b00709d51f681f68"
+    },
+    "67d5aa91ef605eda214e9304d4ace616dd223f01c5c1d2ab84c496b951059eb5.bin": {
+      "bytes": 1048603,
+      "sha256": "3a200dbb06ecfb8e7b1d6d07dc52bc0fa0ec0dfdc7d5a57f2d3e79fbe74ee747"
+    },
+    "92a03c5b8d8bef37009ba39c4e811b7fbc6e0b5ee5fb098d25b809987cd2f5fa.bin": {
+      "bytes": 8221696,
+      "sha256": "50d819ac14ca2b50601fdd2b91ffe445d678e25b26e84984547619bf714942c3"
+    },
+    "ac90f64492758008fd68c3d9b60aee29d8ed89c4fe44cf6a17e18deb46a219f6.bin": {
+      "bytes": 1032192,
+      "sha256": "a20c37fd1ebfd6afbe6d220126f121d5e6ea7f3952dc39ffa4e9cd5b7b0d17cf"
+    },
+    "be7e2f20129365c2899b2c11bfc465541e61b1858f45bf0248cf99b9271bc707.bin": {
+      "bytes": 5593188,
+      "sha256": "e4730d103d7884549c931d3a4ec19ca31fc25e1ee8a126b310a9ec3bddb5e664"
+    },
+    "c628fbdfb3dc4f7c567f021ec7152814b3610ad181f2cbf9465d16f5b06c1297.bin": {
+      "bytes": 1048576,
+      "sha256": "5d2966c01d3e82e72790a042c91eee1e0f0bb6e39145125f03ddc72ec0f089ea"
+    }
+  }
+}

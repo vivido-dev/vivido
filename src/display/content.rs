@@ -10,7 +10,7 @@ use crate::terminal::index::{Column, Line, Point};
 use crate::terminal::selection::SelectionRange;
 use crate::terminal::term::cell::{Cell, Flags, Hyperlink};
 use crate::terminal::term::search::{Match, RegexSearch};
-use crate::terminal::term::{self, RenderableContent as TerminalContent, Term};
+use crate::terminal::term::{self, Term};
 use crate::terminal::vvte::ansi::{Color, CursorShape, NamedColor};
 
 use crate::config::UiConfig;
@@ -22,11 +22,54 @@ use crate::event::SearchState;
 /// Minimum contrast between a fixed cursor color and the cell's background.
 pub const MIN_CURSOR_CONTRAST: f64 = 1.5;
 
+/// Owned metadata accompanying a reusable viewport cell snapshot.
+pub(super) struct Snapshot {
+    selection: Option<SelectionRange>,
+    cursor: term::RenderableCursor,
+    display_offset: usize,
+    colors: term::color::Colors,
+    focused: bool,
+    search: Option<HintMatches<'static>>,
+}
+
+impl Snapshot {
+    pub(super) fn capture<T: EventListener>(
+        term: &Term<T>,
+        cells: &mut Vec<Indexed<Cell>>,
+        refresh: bool,
+        search: &mut SearchState,
+        hints: &mut HintState,
+    ) -> Self {
+        let content = term.renderable_content();
+        if refresh || cells.len() != term.screen_lines() * term.columns() {
+            cells.clear();
+            cells.extend(
+                content
+                    .display_iter
+                    .map(|cell| Indexed { point: cell.point, cell: cell.cell.clone() }),
+            );
+        }
+        if hints.active() {
+            hints.update_matches(term);
+        }
+        Self {
+            selection: content.selection,
+            cursor: content.cursor,
+            display_offset: content.display_offset,
+            colors: *content.colors,
+            focused: term.is_focused,
+            search: search.dfas().map(|dfas| HintMatches::visible_regex_matches(term, dfas)),
+        }
+    }
+}
+
 /// Renderable terminal content.
 ///
 /// This provides the terminal cursor and an iterator over all non-empty cells.
 pub struct RenderableContent<'a> {
-    terminal_content: TerminalContent<'a>,
+    terminal_content: Snapshot,
+    cells: &'a mut Vec<Indexed<Cell>>,
+    cell_index: usize,
     cursor: RenderableCursor,
     cursor_shape: CursorShape,
     cursor_point: Point<usize>,
@@ -39,20 +82,39 @@ pub struct RenderableContent<'a> {
 }
 
 impl<'a> RenderableContent<'a> {
+    /// Capture visible cells while preserving the public renderer construction API.
+    ///
+    /// # Panics
+    /// Panics if terminal and display cursor geometry disagree.
+    pub fn new<T: EventListener>(
+        config: &'a UiConfig,
+        display: &'a mut Display,
+        term: &Term<T>,
+        search_state: &'a mut SearchState,
+    ) -> Self {
+        let snapshot = Snapshot::capture(
+            term,
+            &mut display.snapshot_cells,
+            true,
+            search_state,
+            &mut display.hint_state,
+        );
+        Self::from_snapshot(config, display, snapshot, search_state)
+    }
+
     /// Borrow visible terminal cells and resolve their rendering attributes.
     ///
     /// # Panics
     ///
     /// Panics if the terminal cursor is outside the viewport; terminal and display geometry must agree.
-    pub fn new<T: EventListener>(
+    pub(super) fn from_snapshot(
         config: &'a UiConfig,
         display: &'a mut Display,
-        term: &'a Term<T>,
+        mut terminal_content: Snapshot,
         search_state: &'a mut SearchState,
     ) -> Self {
-        let search = search_state.dfas().map(|dfas| HintMatches::visible_regex_matches(term, dfas));
+        let search = terminal_content.search.take();
         let focused_match = search_state.focused_match();
-        let terminal_content = term.renderable_content();
 
         // Find terminal cursor shape.
         let cursor_shape = if terminal_content.cursor.shape == CursorShape::Hidden
@@ -61,7 +123,7 @@ impl<'a> RenderableContent<'a> {
             || display.ime.preedit().is_some()
         {
             CursorShape::Hidden
-        } else if !term.is_focused && config.cursor.unfocused_hollow {
+        } else if !terminal_content.focused && config.cursor.unfocused_hollow {
             CursorShape::HollowBlock
         } else {
             terminal_content.cursor.shape
@@ -72,18 +134,16 @@ impl<'a> RenderableContent<'a> {
         let display_offset = terminal_content.display_offset;
         let cursor_point = term::point_to_viewport(display_offset, cursor_point).unwrap();
 
-        let hint = if display.hint_state.active() {
-            display.hint_state.update_matches(term);
-            Some(Hint::from(&display.hint_state))
-        } else {
-            None
-        };
+        let hint =
+            if display.hint_state.active() { Some(Hint::from(&display.hint_state)) } else { None };
 
         Self {
             colors: &display.colors,
             size: &display.size_info,
             cursor: RenderableCursor::new_hidden(),
             terminal_content,
+            cells: &mut display.snapshot_cells,
+            cell_index: 0,
             focused_match,
             cursor_shape,
             cursor_point,
@@ -163,8 +223,11 @@ impl Iterator for RenderableContent<'_> {
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            let cell = self.terminal_content.display_iter.next()?;
-            let mut cell = RenderableCell::new(self, cell);
+            let slot = self.cells.get_mut(self.cell_index)?;
+            self.cell_index += 1;
+            let cell = Indexed { point: slot.point, cell: slot.cell.clone() };
+            let mut cell =
+                RenderableCell::new(self, Indexed { point: cell.point, cell: &cell.cell });
 
             if self.cursor_point == cell.point {
                 // Store the cursor which should be rendered.
@@ -579,5 +642,37 @@ impl Deref for HintMatches<'_> {
 impl std::fmt::Debug for RenderableContent<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RenderableContent").finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+    use crate::terminal::event::VoidListener;
+    use crate::terminal::term::{Config, test::TermSize};
+    use crate::terminal::vvte::ansi::{Handler, Processor};
+
+    #[test]
+    fn owned_cells_survive_mutation_and_reuse_capacity() {
+        let mut term = Term::new(Config::default(), &TermSize::new(8, 3), VoidListener);
+        let mut parser = Processor::new();
+        term.advance(&mut parser, "a\u{301}界".as_bytes());
+        let mut cells = Vec::new();
+        let mut search = SearchState::default();
+        let mut hints = HintState::new("asdf");
+        let snapshot = Snapshot::capture(&term, &mut cells, true, &mut search, &mut hints);
+        let cursor = snapshot.cursor;
+        let capacity = cells.capacity();
+        term.input('z');
+        term.goto(0, 0);
+        term.input('x');
+        assert_eq!(cells[0].c, 'a');
+        assert_eq!(cells[0].zerowidth(), Some(['\u{301}'].as_slice()));
+        assert_eq!(snapshot.cursor, cursor);
+        Snapshot::capture(&term, &mut cells, false, &mut search, &mut hints);
+        assert_eq!(cells[0].c, 'a', "an undamaged viewport reuses its owned cells");
+        Snapshot::capture(&term, &mut cells, true, &mut search, &mut hints);
+        assert_eq!(cells[0].c, 'x');
+        assert_eq!(cells.capacity(), capacity);
     }
 }

@@ -180,3 +180,81 @@ fn maximum_rep_count_matches_scalar() {
     expected.flush_grid_scroll();
     assert_same(&actual, &expected);
 }
+
+#[test]
+fn printable_runs_match_scalar_at_every_character_boundary() {
+    let setups: &[&[u8]] = &[
+        b"",
+        b"\x1b[?1049h",
+        b"\x1b[?7l",
+        b"\x1b[4h",
+        b"\x1b(0",
+        b"\x1b[1;31;44m",
+        b"\x1b[58;5;44m",
+        b"\x1b]8;id=batch;https://example.invalid\x1b\\",
+        "界e\u{301}界abc\x1b[H".as_bytes(),
+        b"\x1b[2;3r\x1b[3;5H",
+    ];
+    for (columns, lines) in [(2, 1), (5, 4), (80, 24)] {
+        for setup in setups {
+            for text in [
+                "hello world abcdefghijklmnopqrstuvwxyz",
+                "界你好界abc界",
+                "a\u{301}\u{302}\u{303}界\u{301}e",
+                "😀\u{200d}😀x\u{fe0f}🇺🇸",
+                "abc\u{7f}xyz",
+            ] {
+                for split in text.char_indices().map(|(i, _)| i).chain(std::iter::once(text.len()))
+                {
+                    let mut actual = terminal(columns, lines, setup);
+                    let mut expected = terminal(columns, lines, setup);
+                    for part in [&text[..split], &text[split..]] {
+                        actual.input_str(part);
+                        for c in part.chars() {
+                            expected.input(c);
+                        }
+                        actual.flush_grid_scroll();
+                        expected.flush_grid_scroll();
+                        assert_same(&actual, &expected);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "release-mode timing; run alone with --nocapture"]
+fn benchmark_printable_runs() {
+    use std::hint::black_box;
+    use std::time::Instant;
+    for (name, unit) in [
+        ("ascii", "abcdefghijklmnopqrstuvwxyz "),
+        ("unicode", "你好世界αΩ😀abc"),
+        ("combining", "a\u{301}\u{302}\u{303}"),
+    ] {
+        let text = unit.repeat(16_384);
+        for sample in 0..5 {
+            for batch in if sample % 2 == 0 { [false, true] } else { [true, false] } {
+                let mut term = terminal(120, 40, b"\x1b[?1049h");
+                let start = Instant::now();
+                for _ in 0..20 {
+                    if batch {
+                        term.input_str(black_box(&text));
+                    } else {
+                        for c in black_box(&text).chars() {
+                            term.input(c);
+                        }
+                    }
+                    term.flush_grid_scroll();
+                }
+                let elapsed = start.elapsed().as_secs_f64();
+                black_box(&term);
+                println!(
+                    "{name},{sample},{batch},{:.3}",
+                    text.len() as f64 * 20. / elapsed / 1048576.
+                );
+            }
+        }
+    }
+}

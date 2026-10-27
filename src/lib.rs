@@ -61,6 +61,8 @@ mod message_bar;
 mod osc_notification;
 #[cfg(windows)]
 mod panic;
+#[cfg(feature = "perf")]
+pub mod performance;
 mod polling;
 mod scheduler;
 mod screenshot;
