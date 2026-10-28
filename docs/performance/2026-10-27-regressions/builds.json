@@ -1,0 +1,29 @@
+{
+  "original": {
+    "vivido": "7eb31aa8ddd464eae4c26e2c1cab718eb16f89fa",
+    "vvte": "c4b3f66b28991dc6e989699dca333b9373ff45ce"
+  },
+  "regressed": {
+    "vivido": "2246d26b98fc267787d23242536f0260e19f8b3b",
+    "vvte": "fe1697c2c7b85d4cbb8286a70e5ee3cc9b50058a",
+    "vivid_sdk": "4e4dd4a3f7225f474ed49bb6e9a98aa1a730fdee",
+    "vivid_protocol": "7c7af8c676b0910bb28c932f71971f02738226b4"
+  },
+  "kitten_version": "kitten 0.42.2 created by Kovid Goyal",
+  "rustc": "rustc 1.98.1 (48a229cea 2026-09-01)",
+  "notes": [
+    "Original binaries were built from git archive of the commits above using the same unchanged SDK/protocol dependencies.",
+    "The regressed binaries are the normal release binaries preserved from the preceding performance implementation.",
+    "Kitty uses its own random payloads and nonblocking PTY writer; replay comparisons use identical exported bytes and a blocking writer.",
+    "Final comparison metadata records exact binary hashes. Production changes are confined to Vivido.",
+    "The current terminal_stream example was copied into the original source archive only to benchmark the original library with the same driver; the original application sources were not modified."
+  ],
+  "rejected_direct": {
+    "base": "2246d26b98fc267787d23242536f0260e19f8b3b",
+    "implementation_patch_sha256": "12e87a572463a3b0ff914efd7dff6a5ed94ddb0aa6b783a668577b00e068e667"
+  },
+  "fixed": {
+    "base": "2246d26b98fc267787d23242536f0260e19f8b3b",
+    "implementation_patch_sha256": "2218600b7bd132dc82379b7cc3b80c89245f6aaa2e8258a0e8dd8d5978b29562"
+  }
+}

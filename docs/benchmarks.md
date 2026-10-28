@@ -67,8 +67,9 @@ workload, identical replay bytes, 120×40 geometry, and no concurrent compilatio
 or other benchmarks. The production headless GPU renderer uses its existing
 16 ms minimum draw interval; native desktop frame/pane tests are separate.
 
-MacOS gathering is enabled by default; `VIVIDO_PTY_GATHER=0` disables it for
-comparison. Four reusable 64 KiB buffers bound read-ahead. Small bursts publish
+That stage enabled macOS gathering by default. The standalone regression repair
+below supersedes that choice: gathering now requires `VIVIDO_PTY_GATHER=1`.
+Four reusable 64 KiB buffers bound read-ahead. Small bursts publish
 immediately. Saturated refill gaps receive at most 16 immediate retries; only a
 busy parser permits 1 ms bridge polls, within a 3 ms bridging budget. Both workers
 request user-initiated QoS. Reset, EOF, backpressure, and shutdown preserve ordering
@@ -262,3 +263,200 @@ make a bounded-byte parser batch expensive. Snapshot capture is viewport-bounded
 font shaping, GPU work, active search/hints, and foreign-library allocations remain
 outside the terminal parser optimizations. The measurements do not establish video,
 physical-keyboard, or native Linux/Windows speedups.
+
+## Standalone escape/image regression repair (2026-10-27)
+
+The standalone measurements restore CSI, long-escape, and image throughput to
+within 3% of the release before the performance work, in both synchronized output
+and live rendering. ASCII and Unicode remain faster than that original release.
+There is a measured tradeoff against the intervening performance commit: disabling
+its gather worker costs about 15–16% on live ASCII/Unicode while recovering the
+escape/image workloads. Synchronized ASCII/Unicode retain their gains. The data
+below includes that regression; this is not an across-the-board improvement over
+the gather-enabled commit.
+
+### Baselines and method
+
+The original baseline is Vivido `7eb31aa` with vvte `c4b3f66`; the regressed baseline
+is Vivido `2246d26` with vvte `fe1697c`. The earlier pipeline measurements above
+started after the parser/printable-run work, so they did not compare the entire
+change against the original release. Baseline application sources were built
+from Git archives. SDK/protocol sources and release build settings were held
+constant. [Build identities](performance/2026-10-27-regressions/builds.json) and
+[the measured implementation patch](performance/2026-10-27-regressions/implementation.patch)
+identify this comparison independently of later commits.
+
+Measurements used an Apple M4 with 32 GiB RAM, macOS 27.0.1, Rust 1.98.1, and a
+standalone visible Vivido window with an empty configuration and 120×40 geometry.
+Normal release builds ran with no concurrent compilation. Each table reports the
+median of five samples per build/mode, alternating build order. Each binary used
+its default reader: original direct, regressed gather, fixed direct.
+
+The native driver was installed Kitty 0.42.2's `kitten __benchmark__`, exercising
+the five workloads from `study_ghostty/main.go` with its own PTY writer. It used
+100 repetitions per workload and both default synchronized output and `--render`.
+This is the installed benchmark, not a new build of the reference source; the
+reference's extra unique-Unicode case is covered by replay below. Kitty creates
+random payloads per run, so native samples are not byte-identical. Its `MB/s`
+label divides by 1024²; these tables call the unit MiB/s.
+
+### Changes retained
+
+- REP passes its known width and exact iterator length to the shared row fill,
+  avoiding a second character scan. Narrow cells use a fixed-stride loop;
+  one-byte printable spans avoid row-span setup. Scalar fallbacks still handle
+  wrapping, insert mode, character sets, and complex cell ownership.
+- The macOS direct reader is the default again. `VIVIDO_PTY_GATHER=1` retains the
+  bounded gather worker as an opt-in for workloads that benefit from read-ahead.
+  The parser retains user-initiated QoS with either reader.
+- The direct reader coalesces already-available packets only when the existing
+  OSC capture scanner reports an unfinished body. It stops on `WouldBlock`, has
+  no retries, sleeps, or polling delay, and retains the 64 KiB batch budget.
+  The hint changes batching only, never parsing or notification semantics.
+  Pending bytes are dispatched before a subsequent read error is reported.
+- The benchmark harness now supports native windows and the installed Kitty
+  writer, with explicit reader overrides and binary/corpus fingerprints.
+
+Simply disabling gathering passed the native Kitty comparison but lost 25–44%
+on long escapes from the blocking replay writer. That candidate was rejected;
+[its replay results](performance/2026-10-27-regressions/rejected-direct-replay/summary.json)
+and [patch](performance/2026-10-27-regressions/rejected-direct.patch) are retained.
+General read coalescing, immediate retries, larger read batches, and QoS changes
+did not provide a consistent improvement across both writers. OSC-only
+coalescing fixes the blocking-writer regression without adding a wait to small
+interactive bursts. Separate diagnostic runs observed roughly 1 KiB reads with
+both writers; native packet size alone did not explain the difference.
+
+### Installed Kitty: original release → fixed
+
+| Workload | Default before → after MiB/s | Change | `--render` before → after MiB/s | Change |
+|---|---:|---:|---:|---:|
+| Only ASCII chars | 125.1 → 161.6 | +29.2% | 139.3 → 172.7 | +24.0% |
+| Unicode chars | 177.3 → 197.8 | +11.6% | 200.7 → 221.7 | +10.5% |
+| CSI codes with few chars | 92.6 → 90.1 | -2.7% | 104.0 → 101.8 | -2.1% |
+| Long escape codes | 539.3 → 564.2 | +4.6% | 609.0 → 597.5 | -1.9% |
+| Images | 523.9 → 538.1 | +2.7% | 585.2 → 584.6 | -0.1% |
+
+All ten original-baseline throughput comparisons pass the 5% regression gate.
+[Raw samples, binary fingerprints, and summaries](performance/2026-10-27-regressions/native-original/summary.json)
+are stored together in the linked directory.
+
+### Installed Kitty: regressed performance commit → fixed
+
+| Workload | Default before → after MiB/s | Change | `--render` before → after MiB/s | Change |
+|---|---:|---:|---:|---:|
+| Only ASCII chars | 160.6 → 161.5 | +0.6% | 203.5 → 172.1 | -15.4% |
+| Unicode chars | 195.3 → 197.8 | +1.3% | 261.4 → 220.5 | -15.6% |
+| CSI codes with few chars | 69.3 → 90.1 | +30.0% | 73.9 → 102.0 | +38.0% |
+| Long escape codes | 505.8 → 567.7 | +12.2% | 511.5 → 591.9 | +15.7% |
+| Images | 525.2 → 536.9 | +2.2% | 535.4 → 581.6 | +8.6% |
+
+Live ASCII/Unicode fail the 5% gate against the gather-enabled commit. Isolation
+runs traced this to removing read-ahead, not to losing the printable-run parser
+optimization. The default favors restoring the three reported regressions while
+retaining gains over the original release. Gathering remains available explicitly;
+these results do not establish that it is best for all producers.
+[Raw comparison](performance/2026-10-27-regressions/native-regressed/summary.json),
+[initial reproduction](performance/2026-10-27-regressions/reproduction/summary.json),
+and [gather isolation](performance/2026-10-27-regressions/gather-isolation/summary.json).
+
+### Deterministic blocking replay: original release → fixed
+
+These are independent standalone-window measurements using identical exported
+original-size payloads, the portable benchmark's blocking writer, 50 repetitions,
+and five alternating samples. The unique-Unicode workload is included. The
+metadata records corpus hashes. Do not compare absolute rates between the two
+writers: their backpressure and write scheduling differ.
+
+| Workload | Default before → after MiB/s | Change | `--render` before → after MiB/s | Change |
+|---|---:|---:|---:|---:|
+| Only ASCII chars | 97.0 → 121.1 | +24.8% | 114.7 → 139.3 | +21.4% |
+| Unicode chars | 138.2 → 155.5 | +12.5% | 171.3 → 175.0 | +2.2% |
+| Unique multi-codepoint Unicode cells | 110.4 → 118.4 | +7.2% | 128.9 → 135.1 | +4.8% |
+| CSI codes with few chars | 81.0 → 79.1 | -2.3% | 86.7 → 85.0 | -2.0% |
+| Long escape codes | 280.6 → 327.0 | +16.5% | 353.7 → 357.4 | +1.0% |
+| Images | 198.7 → 205.3 | +3.3% | 199.3 → 201.6 | +1.2% |
+
+The replay driver also takes 100 status-query samples both idle and during output.
+The limit is original p99 plus the larger of 5% or 1 ms. These measure terminal
+query round trips, not physical keyboard or display latency.
+
+| Mode | Query load | p99 before → after ms | Allowed after ms | Gate |
+|---|---|---:|---:|---|
+| sync | idle | 0.017 → 0.025 | 1.017 | pass |
+| sync | loaded | 4.089 → 3.951 | 5.089 | pass |
+| render | idle | 0.052 → 0.054 | 1.052 | pass |
+| render | loaded | 3.985 → 3.847 | 4.985 | pass |
+
+[Replay samples and summaries](performance/2026-10-27-regressions/replay-original/summary.json).
+
+### CPU, memory, and terminal-only diagnosis
+
+CPU and peak RSS below are medians for the complete process invocation, including
+startup, warmup, all workloads, queries where applicable, and rendering. They are
+not per-workload allocation measurements. The direct reader uses less CPU than
+the gather-enabled commit; its live-render peak RSS is higher in this sample set.
+
+| Comparison | Mode | CPU seconds before → after | Peak RSS MiB before → after |
+|---|---|---:|---:|
+| native-original | sync | 13.37 → 12.18 | 187.8 → 176.2 |
+| native-original | render | 11.87 → 11.16 | 174.7 → 178.5 |
+| native-regressed | sync | 15.33 → 12.20 | 171.7 → 175.0 |
+| native-regressed | render | 14.26 → 11.19 | 153.1 → 173.5 |
+| replay-original | sync | 8.50 → 7.94 | 203.7 → 213.9 |
+| replay-original | render | 7.70 → 7.45 | 256.5 → 238.5 |
+
+The same deterministic payloads were also processed by `terminal_stream` in
+terminal mode, five alternating samples and 100 repetitions each. The current
+driver was copied into the original source archive solely to measure that
+original library. This excludes PTY transport, notification scanning, and GPU
+presentation. It confirms that REP regressed in the row-fill implementation,
+while long escapes and images were primarily limited elsewhere in the pipeline.
+
+| Workload | Original MiB/s | Regressed MiB/s | Fixed MiB/s |
+|---|---:|---:|---:|
+| ascii | 196.2 | 239.1 | 243.0 |
+| unicode | 290.7 | 357.2 | 364.2 |
+| csi | 130.8 | 91.0 | 129.6 |
+| osc | 1964.8 | 3721.2 | 3736.5 |
+| images | 4386.4 | 4387.2 | 4402.8 |
+
+[Raw terminal-only samples](performance/2026-10-27-regressions/terminal-stream.json).
+The image workload uploads and deletes a 1024×1024 RGBA image; it does not place
+the image on screen, so its `--render` number is not image-compositing throughput.
+Image bytes, decoding bounds, synchronized-update limits, and history are unchanged.
+macOS syscall/scheduling costs remain a major limit, particularly with 1 KiB reads.
+
+### Validation and reproduction
+
+Workspace formatting, check, all-target tests, and Clippy with warnings denied
+passed. The normal test run passed 1,097 tests, including 1,066 library tests and
+all 45 reference fixtures. The `perf` feature compiles. All three native macOS
+frame/pane test executables passed. The 20 headless integration tests passed with
+each reader, including owner-scoped lifecycle coverage. New regressions exercise
+CSI/REP differential behavior, bounded read continuation, OSC terminators, and
+pending bytes before EOF, `WouldBlock`, or fatal read errors.
+[Validation record](performance/2026-10-27-regressions/validation.json).
+
+This repair changes Vivido only. vvte, vivid_sdk, vivid_protocol, dependency
+lockfiles, the performance report, and both Ghostty reference trees are unchanged.
+No Vivid protocol behavior was changed. Native Linux/Windows execution remains
+outside this macOS measurement; their transport implementations are preserved.
+
+From `vivido/`, reproduce the native comparison with separately built releases:
+
+```sh
+python3 scripts/performance-e2e.py \
+  --before /path/to/original/vivido --after /path/to/fixed/vivido \
+  --driver kitten --benchmark /Applications/kitty.app/Contents/MacOS/kitten \
+  --frontend native --samples 5 --repetitions 100 --modes sync render \
+  --output /tmp/native-results
+python3 scripts/performance-summary.py /tmp/native-results/results.jsonl
+```
+
+For deterministic replay use `--driver replay --benchmark /path/to/benchmark`,
+`--corpus /path/to/exported-original-size-corpus`, `--repetitions 50`, and
+`--latency-samples 100`. Keep the same frontend, modes, and sample count. Use
+`--before-gather 0|1` and `--after-gather 0|1` only for reader isolation; the default
+uses each build's own default and removes an inherited environment override.
+An unlocked desktop is required for native presentation.

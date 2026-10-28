@@ -34,7 +34,13 @@ use crate::client_fault::{self, ClientFault, ClientFaultClass};
 pub(crate) const READ_BUFFER_SIZE: usize = 0x10_0000;
 
 /// Max bytes to read from the PTY while the terminal is locked.
-const MAX_LOCKED_READ: usize = u16::MAX as usize;
+/// Match the gather buffer so a full batch does not leave a one-byte tail.
+const MAX_LOCKED_READ: usize = 64 * 1024;
+
+// Measured macOS streams arrive in 1 KiB packets. Coalesce an ongoing OSC body
+// when a full packet is available, but dispatch smaller bursts immediately.
+#[cfg(target_os = "macos")]
+const MIN_OSC_READ_BATCH: usize = 1024;
 
 /// Messages that may be sent to the `EventLoop`.
 #[derive(Debug)]
@@ -188,6 +194,7 @@ where
         let mut unprocessed = 0;
         let mut received = 0;
         let mut processed = 0;
+        let mut read_error = None;
         // Bytes of `processed` that were image data still accumulating, which show nothing yet.
         let mut quiet = 0;
         let mut graphics_changed = false;
@@ -214,6 +221,17 @@ where
                     crate::performance::READ_BYTES.record(got as u64);
                     unprocessed += got;
                     received += got;
+                    #[cfg(target_os = "macos")]
+                    if got != 0
+                        && unprocessed >= MIN_OSC_READ_BATCH
+                        && received < MAX_LOCKED_READ
+                        && state.osc_notifications.has_pending_osc()
+                    {
+                        // OSC scanning is cheap; per-packet pipeline/wakeup overhead can
+                        // dominate it. Read only what is already available, stopping on
+                        // WouldBlock without retries, sleeps, or another worker.
+                        continue;
+                    }
                 },
                 Err(err) => match err.kind() {
                     ErrorKind::Interrupted | ErrorKind::WouldBlock => {
@@ -222,7 +240,8 @@ where
                             break;
                         }
                     },
-                    _ => return Err(err),
+                    _ if unprocessed == 0 => return Err(err),
+                    _ => read_error = Some(err),
                 },
             }
 
@@ -230,8 +249,10 @@ where
             let terminal = match &mut terminal_slot {
                 Some(terminal) => terminal,
                 None => terminal_slot.insert(match self.terminal.try_lock_unfair() {
-                    // Force block if we are at the buffer size limit.
-                    None if unprocessed >= MAX_LOCKED_READ => self.terminal.lock_unfair(),
+                    // A full buffer or failed read must dispatch its pending bytes now.
+                    None if unprocessed >= MAX_LOCKED_READ || read_error.is_some() => {
+                        self.terminal.lock_unfair()
+                    },
                     None => continue,
                     Some(terminal) => terminal,
                 }),
@@ -299,7 +320,7 @@ where
             }
 
             // Assure we're not blocking the terminal too long unnecessarily.
-            if received >= MAX_LOCKED_READ {
+            if received >= MAX_LOCKED_READ || read_error.is_some() {
                 break;
             }
         }
@@ -315,7 +336,7 @@ where
 
         // A partial anchor marker can consume bytes without dispatching anything yet.
         // Exit draining must continue based on bytes read, not parser dispatch counts.
-        Ok(received)
+        read_error.map_or(Ok(received), Err)
     }
 
     #[inline]
@@ -1305,6 +1326,10 @@ impl<T> PeekableReceiver<T> {
 #[cfg(test)]
 #[path = "parser_benchmark.rs"]
 mod parser_benchmark;
+
+#[cfg(all(test, target_os = "macos"))]
+#[path = "read_tests.rs"]
+mod read_tests;
 
 #[cfg(test)]
 mod graphics_tests {

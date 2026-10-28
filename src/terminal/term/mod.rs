@@ -1849,8 +1849,12 @@ impl<T> Term<T> {
 
 impl<T: EventListener> Term<T> {
     /// Write simple row spans, returning exceptional cells to scalar input.
-    fn write_run<I>(&mut self, mut chars: I)
-    where
+    // A fixed width for ASCII REP keeps the shared row fill as cheap as a narrow-cell loop.
+    fn write_run<I, const ASCII_REPEAT: bool>(
+        &mut self,
+        mut chars: I,
+        repeated_width: Option<usize>,
+    ) where
         I: Iterator<Item = char> + Clone,
     {
         if self.grid.cursor.charsets[self.active_charset] != StandardCharset::Ascii
@@ -1865,7 +1869,13 @@ impl<T: EventListener> Term<T> {
         }
         let special = Flags::WIDE_CHAR | Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER;
         while let Some(c) = chars.clone().next() {
-            let width = if c.is_ascii() && !c.is_ascii_control() { Some(1) } else { c.width() };
+            let width = if ASCII_REPEAT {
+                Some(1)
+            } else {
+                repeated_width.or_else(|| {
+                    if c.is_ascii() && !c.is_ascii_control() { Some(1) } else { c.width() }
+                })
+            };
             if width == Some(0) {
                 let count = chars.clone().take_while(|c| c.width() == Some(0)).count();
                 let mut point = self.grid.cursor.point;
@@ -1889,17 +1899,23 @@ impl<T: EventListener> Term<T> {
             let point = self.grid.cursor.point;
             let columns = self.columns();
             let available = columns - point.column.0;
-            let count = chars
-                .clone()
-                .take(available / width)
-                .take_while(|c| {
-                    if c.is_ascii() && !c.is_ascii_control() {
-                        width == 1
-                    } else {
-                        c.width() == Some(width)
-                    }
-                })
-                .count();
+            // REP already knows every character's width and its iterator's exact length.
+            // Walking that iterator to rediscover the run costs as much as filling it.
+            let count = if ASCII_REPEAT || repeated_width.is_some() {
+                chars.size_hint().0.min(available / width)
+            } else {
+                chars
+                    .clone()
+                    .take(available / width)
+                    .take_while(|c| {
+                        if c.is_ascii() && !c.is_ascii_control() {
+                            width == 1
+                        } else {
+                            c.width() == Some(width)
+                        }
+                    })
+                    .count()
+            };
             let simple = self.grid[point.line][point.column..point.column + count * width]
                 .iter()
                 .take_while(|cell| cell.extra.is_none() && !cell.flags.intersects(special))
@@ -1913,15 +1929,22 @@ impl<T: EventListener> Term<T> {
             let end = point.column + count * width;
             let template = &self.grid.cursor.template;
             let (fg, bg, flags) = (template.fg, template.bg, template.flags);
-            for (cells, c) in self.grid[point.line][point.column..end]
-                .chunks_exact_mut(width)
-                .zip(chars.by_ref().take(count))
-            {
-                cells[0].c = c;
-                cells[0].fg = fg;
-                cells[0].bg = bg;
-                cells[0].flags = flags;
-                if width == 2 {
+            let cells = &mut self.grid[point.line][point.column..end];
+            if width == 1 {
+                for (cell, c) in cells.iter_mut().zip(chars.by_ref().take(count)) {
+                    cell.c = c;
+                    cell.fg = fg;
+                    cell.bg = bg;
+                    cell.flags = flags;
+                }
+            } else {
+                for (cells, c) in
+                    cells.as_chunks_mut::<2>().0.iter_mut().zip(chars.by_ref().take(count))
+                {
+                    cells[0].c = c;
+                    cells[0].fg = fg;
+                    cells[0].bg = bg;
+                    cells[0].flags = flags;
                     cells[0].flags.insert(Flags::WIDE_CHAR);
                     cells[1].c = ' ';
                     cells[1].fg = fg;
@@ -1985,11 +2008,21 @@ impl<T> Dimensions for Term<T> {
 
 impl<T: EventListener> Handler for Term<T> {
     fn input_str(&mut self, text: &str) {
-        self.write_run(text.chars());
+        // Escape-heavy output often prints one character between commands. It cannot
+        // amortize row-span setup, and is common immediately before REP.
+        if text.len() == 1 {
+            self.input(char::from(text.as_bytes()[0]));
+        } else {
+            self.write_run::<_, false>(text.chars(), None);
+        }
     }
 
     fn repeat_char(&mut self, c: char, count: usize) {
-        self.write_run(std::iter::repeat_n(c, count));
+        if (' '..='~').contains(&c) {
+            self.write_run::<_, true>(std::iter::repeat_n(c, count), Some(1));
+        } else {
+            self.write_run::<_, false>(std::iter::repeat_n(c, count), c.width());
+        }
     }
 
     /// A character to be displayed.

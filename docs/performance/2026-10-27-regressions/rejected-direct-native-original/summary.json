@@ -1,0 +1,96 @@
+[
+  {
+    "mode": "sync",
+    "samples": 5,
+    "workloads": {
+      "Only ASCII chars": {
+        "before": 126.4,
+        "after": 163.4,
+        "change_percent": 29.27215189873418,
+        "passes": true
+      },
+      "Unicode chars": {
+        "before": 179.0,
+        "after": 199.4,
+        "change_percent": 11.396648044692736,
+        "passes": true
+      },
+      "CSI codes with few chars": {
+        "before": 92.7,
+        "after": 90.1,
+        "change_percent": -2.80474649406689,
+        "passes": true
+      },
+      "Long escape codes": {
+        "before": 551.7,
+        "after": 559.6,
+        "change_percent": 1.4319376472720746,
+        "passes": true
+      },
+      "Images": {
+        "before": 551.5,
+        "after": 548.5,
+        "change_percent": -0.5439709882139598,
+        "passes": true
+      }
+    },
+    "query_p99_ms": {},
+    "costs": {
+      "before": {
+        "cpu_seconds": 25.96,
+        "peak_rss_bytes": 199180288
+      },
+      "after": {
+        "cpu_seconds": 24.240000000000002,
+        "peak_rss_bytes": 181207040
+      }
+    }
+  },
+  {
+    "mode": "render",
+    "samples": 5,
+    "workloads": {
+      "Only ASCII chars": {
+        "before": 139.6,
+        "after": 174.0,
+        "change_percent": 24.641833810888247,
+        "passes": true
+      },
+      "Unicode chars": {
+        "before": 200.8,
+        "after": 222.2,
+        "change_percent": 10.657370517928278,
+        "passes": true
+      },
+      "CSI codes with few chars": {
+        "before": 103.1,
+        "after": 101.9,
+        "change_percent": -1.1639185257031892,
+        "passes": true
+      },
+      "Long escape codes": {
+        "before": 616.1,
+        "after": 597.9,
+        "change_percent": -2.954065898393121,
+        "passes": true
+      },
+      "Images": {
+        "before": 588.6,
+        "after": 594.5,
+        "change_percent": 1.002378525314307,
+        "passes": true
+      }
+    },
+    "query_p99_ms": {},
+    "costs": {
+      "before": {
+        "cpu_seconds": 23.28,
+        "peak_rss_bytes": 200130560
+      },
+      "after": {
+        "cpu_seconds": 21.869999999999997,
+        "peak_rss_bytes": 189448192
+      }
+    }
+  }
+]

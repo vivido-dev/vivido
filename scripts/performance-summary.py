@@ -24,6 +24,8 @@ def summarize(path):
             workloads[name] = dict(values, change_percent=change, passes=change >= -5)
         queries = {}
         for loaded in (False, True):
+            if not any(r["latency"] for group in groups.values() for r in group):
+                break  # Kitty's own driver reports throughput only.
             values = {label: median(next(q["p99_ms"] for q in r["latency"] if q["loaded"] == loaded)
                                     for r in group) for label, group in groups.items()}
             limit = values["before"] + max(1, values["before"] * .05)

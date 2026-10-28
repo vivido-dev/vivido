@@ -134,6 +134,10 @@ fn rep_stream_matches_expansion_at_every_read_boundary() {
     let cases = [
         ("a", "\x1b[b\x1b[0b\x1b[2b", "aaaa"),
         ("a", "\x1b[100b", ""),
+        // The escape-heavy benchmark repeatedly changes SGR, positions the cursor,
+        // prints one byte, then expands it with REP.
+        ("\x1b[38:5:24;48:2:125:136:147m\x1b[39m\x1b[10`a", "\x1b[100b", ""),
+        ("\x1b[58;5;44;2m\x1b[2Ka", "\x1b[100b", ""),
         ("界", "\x1b[3b", "界界界"),
         ("e\u{301}", "\x1b[3b", "\u{301}\u{301}\u{301}"),
         ("\x1b(0q", "\x1b[3b", "qqq"),

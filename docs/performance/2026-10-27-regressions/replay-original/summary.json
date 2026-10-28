@@ -1,0 +1,134 @@
+[
+  {
+    "mode": "sync",
+    "samples": 5,
+    "workloads": {
+      "Only ASCII chars": {
+        "before": 97.0,
+        "after": 121.1,
+        "change_percent": 24.84536082474227,
+        "passes": true
+      },
+      "Unicode chars": {
+        "before": 138.2,
+        "after": 155.5,
+        "change_percent": 12.518089725036186,
+        "passes": true
+      },
+      "Unique multi-codepoint Unicode cells": {
+        "before": 110.4,
+        "after": 118.4,
+        "change_percent": 7.246376811594213,
+        "passes": true
+      },
+      "CSI codes with few chars": {
+        "before": 81.0,
+        "after": 79.1,
+        "change_percent": -2.3456790123456805,
+        "passes": true
+      },
+      "Long escape codes": {
+        "before": 280.6,
+        "after": 327.0,
+        "change_percent": 16.535994297932998,
+        "passes": true
+      },
+      "Images": {
+        "before": 198.7,
+        "after": 205.3,
+        "change_percent": 3.321590337191749,
+        "passes": true
+      }
+    },
+    "query_p99_ms": {
+      "idle": {
+        "before": 0.017208,
+        "after": 0.024541,
+        "limit_ms": 1.0172080000000001,
+        "passes": true
+      },
+      "loaded": {
+        "before": 4.08925,
+        "after": 3.951417,
+        "limit_ms": 5.08925,
+        "passes": true
+      }
+    },
+    "costs": {
+      "before": {
+        "cpu_seconds": 8.5,
+        "peak_rss_bytes": 213598208
+      },
+      "after": {
+        "cpu_seconds": 7.9399999999999995,
+        "peak_rss_bytes": 224329728
+      }
+    }
+  },
+  {
+    "mode": "render",
+    "samples": 5,
+    "workloads": {
+      "Only ASCII chars": {
+        "before": 114.7,
+        "after": 139.3,
+        "change_percent": 21.447253705318236,
+        "passes": true
+      },
+      "Unicode chars": {
+        "before": 171.3,
+        "after": 175.0,
+        "change_percent": 2.159953298307049,
+        "passes": true
+      },
+      "Unique multi-codepoint Unicode cells": {
+        "before": 128.9,
+        "after": 135.1,
+        "change_percent": 4.809930178432875,
+        "passes": true
+      },
+      "CSI codes with few chars": {
+        "before": 86.7,
+        "after": 85.0,
+        "change_percent": -1.9607843137254943,
+        "passes": true
+      },
+      "Long escape codes": {
+        "before": 353.7,
+        "after": 357.4,
+        "change_percent": 1.0460842521911262,
+        "passes": true
+      },
+      "Images": {
+        "before": 199.3,
+        "after": 201.6,
+        "change_percent": 1.1540391369794234,
+        "passes": true
+      }
+    },
+    "query_p99_ms": {
+      "idle": {
+        "before": 0.051917,
+        "after": 0.054291,
+        "limit_ms": 1.051917,
+        "passes": true
+      },
+      "loaded": {
+        "before": 3.984708,
+        "after": 3.846667,
+        "limit_ms": 4.9847079999999995,
+        "passes": true
+      }
+    },
+    "costs": {
+      "before": {
+        "cpu_seconds": 7.699999999999999,
+        "peak_rss_bytes": 268959744
+      },
+      "after": {
+        "cpu_seconds": 7.45,
+        "peak_rss_bytes": 250134528
+      }
+    }
+  }
+]

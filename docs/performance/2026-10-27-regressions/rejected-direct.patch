@@ -1,0 +1,451 @@
+diff --git a/scripts/performance-e2e.py b/scripts/performance-e2e.py
+index 8c32a71..1f11e1d 100755
+--- a/scripts/performance-e2e.py
++++ b/scripts/performance-e2e.py
+@@ -1,8 +1,8 @@
+ #!/usr/bin/env python3
+-"""Alternate real Vivido processes against identical replay corpora on macOS.
++"""Alternate real Vivido processes using replay corpora or Kitty's driver on macOS.
+ 
+-The benchmark runs inside Vivido's PTY. Headless uses the production terminal,
+-GPU renderer, and event loop; these measurements are not parser microbenchmarks.
++The benchmark runs inside Vivido's PTY. Use --frontend native to include visible
++window presentation; headless uses the production offscreen GPU renderer.
+ """
+ import argparse
+ import hashlib
+@@ -29,30 +29,41 @@ def run(args, binary, label, mode, sample, output):
+         status = runtime / "status"
+         startup = runtime / "startup"
+         env = dict(os.environ, XDG_RUNTIME_DIR=temp, AGENT_MESH_WATCH="off",
+-                   VIVIDO_PTY_GATHER="0" if label == "before" else args.after_gather,
+                    VIVIDO_PERF_FILE=str(metrics))
++        gather = args.before_gather if label == "before" else args.after_gather
++        if gather == "default":
++            env.pop("VIVIDO_PTY_GATHER", None)
++        else:
++            env["VIVIDO_PTY_GATHER"] = gather
+         env.pop("VIVIDO_SOCKET", None)
+-        command = [args.benchmark, "--replay", args.corpus, "--repetitions", str(args.repetitions),
+-                   "--latency-samples", str(args.latency_samples)]
++        if args.driver == "kitten":
++            command = [args.benchmark, "__benchmark__", "--repetitions", str(args.repetitions)]
++        else:
++            command = [args.benchmark, "--replay", args.corpus, "--repetitions", str(args.repetitions),
++                       "--latency-samples", str(args.latency_samples)]
+         if "render" in mode:
+             command.append("--render")
+         if "scroll" in mode:
+             command.append("--with-scrollback")
+         command.extend(args.workloads)
+         child = f"{shlex.join(command)} > {shlex.quote(str(result))} 2>&1; printf '%s' \"$?\" > {shlex.quote(str(status))}"
+-        launch = ["/usr/bin/time", "-l", "-o", str(usage), binary, "--headless", "--foreground",
+-                  "--session", "performance", "--headless-size", "120x40", "-e", "/bin/sh", "-c", child]
+-        socket = None
++        socket = str(runtime / "vivido.sock")
++        launch = ["/usr/bin/time", "-l", "-o", str(usage), binary, "--socket", socket]
++        if args.frontend == "headless":
++            launch.extend(["--headless", "--foreground", "--session", "performance",
++                           "--headless-size", "120x40"])
++        else:
++            launch.extend(["--hold", "--config-file", "/dev/null", "-o",
++                           "window.dimensions.columns=120", "window.dimensions.lines=40"])
++            # Let the native window settle before the benchmark's own warmup.
++            child = "sleep 1; " + child
++        launch.extend(["-e", "/bin/sh", "-c", child])
+         with startup.open("w") as stdout, log.open("w") as stderr:
+             process = subprocess.Popen(launch, env=env, stdout=stdout, stderr=stderr, start_new_session=True)
+             try:
+                 deadline = time.monotonic() + args.timeout
+                 while time.monotonic() < deadline:
+-                    text = startup.read_text()
+-                    match = re.search(r"VIVIDO_SOCKET=([^;\n]+)", text)
+-                    if match:
+-                        socket = match.group(1)
+-                    if status.exists() and socket:
++                    if status.exists() and Path(socket).exists():
+                         break
+                     if process.poll() is not None:
+                         raise RuntimeError(f"{prefix}: process exited: {log.read_text()[-2000:]}")
+@@ -80,7 +91,9 @@ def run(args, binary, label, mode, sample, output):
+                         os.killpg(process.pid, signal.SIGKILL)
+                         process.wait()
+         clean = re.sub(r"\x1b\[[0-9;]*m", "", result.read_text())
+-        rates = {name.strip(): float(rate) for name, rate in re.findall(r"^\s*(.*?)\s+:.*?@\s*([0-9.]+)\s*MiB/s", clean, re.M)}
++        rates = {name.strip(): float(rate) for name, rate in re.findall(r"^\s*(.*?)\s+:.*?@\s*([0-9.]+)\s*Mi?B/s", clean, re.M)}
++        if not rates:
++            raise RuntimeError(f"{prefix}: no benchmark rates found")
+         latency = [dict(loaded=m[0] == "true", p50_ms=float(m[1]), p99_ms=float(m[2]), max_ms=float(m[3]))
+                    for m in re.findall(r"LATENCY loaded=(true|false) samples=\d+ p50_ms=([0-9.]+) p99_ms=([0-9.]+) max_ms=([0-9.]+)", clean)]
+         record = dict(label=label, mode=mode, sample=sample, rates=rates, latency=latency,
+@@ -93,20 +106,31 @@ def run(args, binary, label, mode, sample, output):
+ 
+ def main():
+     parser = argparse.ArgumentParser(description=__doc__)
+-    for name in ("before", "after", "benchmark", "corpus", "output"):
++    for name in ("before", "after", "benchmark", "output"):
+         parser.add_argument("--" + name, required=True)
+-    parser.add_argument("--after-gather", choices=["0", "1"], default="1")
++    parser.add_argument("--corpus")
++    parser.add_argument("--driver", choices=["replay", "kitten"], default="replay")
++    parser.add_argument("--after-gather", choices=["default", "0", "1"], default="default")
++    parser.add_argument("--before-gather", choices=["default", "0", "1"], default="default")
++    parser.add_argument("--frontend", choices=["headless", "native"], default="headless")
+     parser.add_argument("--samples", type=int, default=5)
+     parser.add_argument("--repetitions", type=int, default=200)
+     parser.add_argument("--latency-samples", type=int, default=100)
+     parser.add_argument("--timeout", type=int, default=600)
+     parser.add_argument("--modes", nargs="+", choices=["sync", "render", "scroll", "render-scroll"], default=["sync", "render", "scroll", "render-scroll"])
+-    parser.add_argument("--workloads", nargs="+", default=["ascii", "unicode", "unique_unicode", "csi", "long_escape_codes", "images"])
++    parser.add_argument("--workloads", nargs="+")
+     args = parser.parse_args()
++    if args.driver == "replay" and not args.corpus:
++        parser.error("--corpus is required for the replay driver")
++    if args.workloads is None:
++        args.workloads = ["ascii", "unicode", "csi", "long_escape_codes", "images"]
++        if args.driver == "replay":
++            args.workloads.insert(2, "unique_unicode")
+     if min(args.samples, args.repetitions, args.latency_samples, args.timeout) <= 0:
+         parser.error("sample counts, repetitions, and timeout must be positive")
+     for name in ("before", "after", "benchmark", "corpus", "output"):
+-        setattr(args, name, str(Path(getattr(args, name)).resolve()))
++        if getattr(args, name) is not None:
++            setattr(args, name, str(Path(getattr(args, name)).resolve()))
+     output = Path(args.output)
+     output.mkdir(parents=True, exist_ok=True)
+     if (output / "results.jsonl").exists():
+@@ -116,7 +140,9 @@ def main():
+         return {"bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
+     metadata = {"arguments": vars(args), "platform": platform.platform(),
+                 "binaries": {label: fingerprint(getattr(args, label)) for label in ("before", "after", "benchmark")},
+-                "corpus": {path.name: fingerprint(path) for path in sorted(Path(args.corpus).glob("*.bin"))}}
++                "corpus": {path.name: fingerprint(path) for path in sorted(Path(args.corpus).glob("*.bin"))} if args.corpus else {}}
++    if args.driver == "kitten":
++        metadata["benchmark_version"] = subprocess.check_output([args.benchmark, "--version"], text=True).strip()
+     (output / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
+     with (output / "results.jsonl").open("a") as records:
+         for mode in args.modes:
+diff --git a/scripts/performance-summary.py b/scripts/performance-summary.py
+index ec68c37..8147590 100644
+--- a/scripts/performance-summary.py
++++ b/scripts/performance-summary.py
+@@ -24,6 +24,8 @@ def summarize(path):
+             workloads[name] = dict(values, change_percent=change, passes=change >= -5)
+         queries = {}
+         for loaded in (False, True):
++            if not any(r["latency"] for group in groups.values() for r in group):
++                break  # Kitty's own driver reports throughput only.
+             values = {label: median(next(q["p99_ms"] for q in r["latency"] if q["loaded"] == loaded)
+                                     for r in group) for label, group in groups.items()}
+             limit = values["before"] + max(1, values["before"] * .05)
+diff --git a/src/terminal/event_loop.rs b/src/terminal/event_loop.rs
+index d6c54af..c36d376 100644
+--- a/src/terminal/event_loop.rs
++++ b/src/terminal/event_loop.rs
+@@ -34,7 +34,8 @@ use crate::client_fault::{self, ClientFault, ClientFaultClass};
+ pub(crate) const READ_BUFFER_SIZE: usize = 0x10_0000;
+ 
+ /// Max bytes to read from the PTY while the terminal is locked.
+-const MAX_LOCKED_READ: usize = u16::MAX as usize;
++/// Match the gather buffer so a full batch does not leave a one-byte tail.
++const MAX_LOCKED_READ: usize = 64 * 1024;
+ 
+ /// Messages that may be sent to the `EventLoop`.
+ #[derive(Debug)]
+@@ -1306,6 +1307,10 @@ impl<T> PeekableReceiver<T> {
+ #[path = "parser_benchmark.rs"]
+ mod parser_benchmark;
+ 
++#[cfg(all(test, target_os = "macos"))]
++#[path = "read_tests.rs"]
++mod read_tests;
++
+ #[cfg(test)]
+ mod graphics_tests {
+     use base64::Engine;
+diff --git a/src/terminal/term/mod.rs b/src/terminal/term/mod.rs
+index 21fefa1..a8302ad 100644
+--- a/src/terminal/term/mod.rs
++++ b/src/terminal/term/mod.rs
+@@ -1849,8 +1849,12 @@ impl<T> Term<T> {
+ 
+ impl<T: EventListener> Term<T> {
+     /// Write simple row spans, returning exceptional cells to scalar input.
+-    fn write_run<I>(&mut self, mut chars: I)
+-    where
++    // A fixed width for ASCII REP keeps the shared row fill as cheap as a narrow-cell loop.
++    fn write_run<I, const ASCII_REPEAT: bool>(
++        &mut self,
++        mut chars: I,
++        repeated_width: Option<usize>,
++    ) where
+         I: Iterator<Item = char> + Clone,
+     {
+         if self.grid.cursor.charsets[self.active_charset] != StandardCharset::Ascii
+@@ -1865,7 +1869,13 @@ impl<T: EventListener> Term<T> {
+         }
+         let special = Flags::WIDE_CHAR | Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER;
+         while let Some(c) = chars.clone().next() {
+-            let width = if c.is_ascii() && !c.is_ascii_control() { Some(1) } else { c.width() };
++            let width = if ASCII_REPEAT {
++                Some(1)
++            } else {
++                repeated_width.or_else(|| {
++                    if c.is_ascii() && !c.is_ascii_control() { Some(1) } else { c.width() }
++                })
++            };
+             if width == Some(0) {
+                 let count = chars.clone().take_while(|c| c.width() == Some(0)).count();
+                 let mut point = self.grid.cursor.point;
+@@ -1889,17 +1899,23 @@ impl<T: EventListener> Term<T> {
+             let point = self.grid.cursor.point;
+             let columns = self.columns();
+             let available = columns - point.column.0;
+-            let count = chars
+-                .clone()
+-                .take(available / width)
+-                .take_while(|c| {
+-                    if c.is_ascii() && !c.is_ascii_control() {
+-                        width == 1
+-                    } else {
+-                        c.width() == Some(width)
+-                    }
+-                })
+-                .count();
++            // REP already knows every character's width and its iterator's exact length.
++            // Walking that iterator to rediscover the run costs as much as filling it.
++            let count = if ASCII_REPEAT || repeated_width.is_some() {
++                chars.size_hint().0.min(available / width)
++            } else {
++                chars
++                    .clone()
++                    .take(available / width)
++                    .take_while(|c| {
++                        if c.is_ascii() && !c.is_ascii_control() {
++                            width == 1
++                        } else {
++                            c.width() == Some(width)
++                        }
++                    })
++                    .count()
++            };
+             let simple = self.grid[point.line][point.column..point.column + count * width]
+                 .iter()
+                 .take_while(|cell| cell.extra.is_none() && !cell.flags.intersects(special))
+@@ -1913,15 +1929,22 @@ impl<T: EventListener> Term<T> {
+             let end = point.column + count * width;
+             let template = &self.grid.cursor.template;
+             let (fg, bg, flags) = (template.fg, template.bg, template.flags);
+-            for (cells, c) in self.grid[point.line][point.column..end]
+-                .chunks_exact_mut(width)
+-                .zip(chars.by_ref().take(count))
+-            {
+-                cells[0].c = c;
+-                cells[0].fg = fg;
+-                cells[0].bg = bg;
+-                cells[0].flags = flags;
+-                if width == 2 {
++            let cells = &mut self.grid[point.line][point.column..end];
++            if width == 1 {
++                for (cell, c) in cells.iter_mut().zip(chars.by_ref().take(count)) {
++                    cell.c = c;
++                    cell.fg = fg;
++                    cell.bg = bg;
++                    cell.flags = flags;
++                }
++            } else {
++                for (cells, c) in
++                    cells.as_chunks_mut::<2>().0.iter_mut().zip(chars.by_ref().take(count))
++                {
++                    cells[0].c = c;
++                    cells[0].fg = fg;
++                    cells[0].bg = bg;
++                    cells[0].flags = flags;
+                     cells[0].flags.insert(Flags::WIDE_CHAR);
+                     cells[1].c = ' ';
+                     cells[1].fg = fg;
+@@ -1985,11 +2008,21 @@ impl<T> Dimensions for Term<T> {
+ 
+ impl<T: EventListener> Handler for Term<T> {
+     fn input_str(&mut self, text: &str) {
+-        self.write_run(text.chars());
++        // Escape-heavy output often prints one character between commands. It cannot
++        // amortize row-span setup, and is common immediately before REP.
++        if text.len() == 1 {
++            self.input(char::from(text.as_bytes()[0]));
++        } else {
++            self.write_run::<_, false>(text.chars(), None);
++        }
+     }
+ 
+     fn repeat_char(&mut self, c: char, count: usize) {
+-        self.write_run(std::iter::repeat_n(c, count));
++        if (' '..='~').contains(&c) {
++            self.write_run::<_, true>(std::iter::repeat_n(c, count), Some(1));
++        } else {
++            self.write_run::<_, false>(std::iter::repeat_n(c, count), c.width());
++        }
+     }
+ 
+     /// A character to be displayed.
+diff --git a/src/terminal/term/rep_tests.rs b/src/terminal/term/rep_tests.rs
+index fbf8dc4..154ee1e 100644
+--- a/src/terminal/term/rep_tests.rs
++++ b/src/terminal/term/rep_tests.rs
+@@ -134,6 +134,10 @@ fn rep_stream_matches_expansion_at_every_read_boundary() {
+     let cases = [
+         ("a", "\x1b[b\x1b[0b\x1b[2b", "aaaa"),
+         ("a", "\x1b[100b", ""),
++        // The escape-heavy benchmark repeatedly changes SGR, positions the cursor,
++        // prints one byte, then expands it with REP.
++        ("\x1b[38:5:24;48:2:125:136:147m\x1b[39m\x1b[10`a", "\x1b[100b", ""),
++        ("\x1b[58;5;44;2m\x1b[2Ka", "\x1b[100b", ""),
+         ("界", "\x1b[3b", "界界界"),
+         ("e\u{301}", "\x1b[3b", "\u{301}\u{301}\u{301}"),
+         ("\x1b(0q", "\x1b[3b", "qqq"),
+diff --git a/src/terminal/tty/unix.rs b/src/terminal/tty/unix.rs
+index c13cf67..66388d5 100644
+--- a/src/terminal/tty/unix.rs
++++ b/src/terminal/tty/unix.rs
+@@ -467,8 +467,9 @@ impl EventedReadWrite for Pty {
+         }
+ 
+         #[cfg(target_os = "macos")]
+-        // The measured macOS path is enabled by default; 0 supports diagnostic comparisons.
+-        if std::env::var_os("VIVIDO_PTY_GATHER").is_none_or(|value| value != "0") {
++        // Read-ahead helps some producers, but regresses fast escape/image streams with
++        // Kitty's nonblocking writer. Keep it opt-in until it passes both producer paths.
++        if std::env::var_os("VIVIDO_PTY_GATHER").is_some_and(|value| value == "1") {
+             self.draining = false;
+             self.gather = Some(super::gather::Gather::new(self.file.try_clone()?)?);
+             let gather = self.gather.as_ref().unwrap();
+@@ -504,7 +505,7 @@ impl EventedReadWrite for Pty {
+             }
+         }
+         #[cfg(target_os = "macos")]
+-        if result.is_ok() && self.gather.is_some() {
++        if result.is_ok() {
+             super::gather::set_qos();
+         }
+         result
+diff --git a/src/terminal/read_tests.rs b/src/terminal/read_tests.rs
+new file mode 100644
+index 0000000..364c1e8
+--- /dev/null
++++ b/src/terminal/read_tests.rs
+@@ -0,0 +1,115 @@
++//! Bounded nonblocking PTY batches must retain their tail on every read outcome.
++
++// Rust guideline compliant 2026-10-07
++
++use super::*;
++use crate::terminal::event::VoidListener;
++use crate::terminal::index::{Column, Line};
++use crate::terminal::term::{Config, test::TermSize};
++use crate::terminal::tty::EventedReadWrite;
++use std::io::Cursor;
++
++struct ScriptedPty {
++    input: Cursor<Vec<u8>>,
++    chunk: usize,
++    end: Option<ErrorKind>,
++    output: Vec<u8>,
++}
++
++impl Read for ScriptedPty {
++    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
++        if self.input.position() as usize == self.input.get_ref().len() {
++            return self.end.map_or(Ok(0), |kind| Err(kind.into()));
++        }
++        let len = out.len().min(self.chunk);
++        self.input.read(&mut out[..len])
++    }
++}
++
++impl EventedReadWrite for ScriptedPty {
++    type Reader = Self;
++    type Writer = Vec<u8>;
++    unsafe fn register(&mut self, _: &Arc<Poller>, _: PollingEvent, _: PollMode) -> io::Result<()> {
++        unreachable!("scripted reads have no poll source")
++    }
++    fn reregister(&mut self, _: &Arc<Poller>, _: PollingEvent, _: PollMode) -> io::Result<()> {
++        unreachable!("scripted reads have no poll source")
++    }
++    fn deregister(&mut self, _: &Arc<Poller>) -> io::Result<()> {
++        Ok(())
++    }
++    fn reader(&mut self) -> &mut Self {
++        self
++    }
++    fn writer(&mut self) -> &mut Vec<u8> {
++        &mut self.output
++    }
++}
++impl tty::EventedPty for ScriptedPty {
++    fn next_child_event(&mut self) -> Option<tty::ChildEvent> {
++        None
++    }
++}
++impl event::OnResize for ScriptedPty {
++    fn on_resize(&mut self, _: WindowSize) {}
++}
++
++fn worker(
++    input: Vec<u8>,
++    chunk: usize,
++    end: Option<ErrorKind>,
++) -> EventLoop<ScriptedPty, VoidListener> {
++    let terminal = Term::new(Config::default(), &TermSize::new(80, 24), VoidListener);
++    EventLoop::new(
++        Arc::new(FairMutex::new(terminal)),
++        VoidListener,
++        ScriptedPty { input: Cursor::new(input), chunk, end, output: Vec::new() },
++        true,
++        false,
++        Arc::new(Mutex::new(Transcript::default())),
++    )
++    .unwrap()
++}
++
++#[test]
++fn burst_tail_is_parsed_before_would_block_eof_or_error() {
++    let input = b"before\x1b[31m!\x1b[Hlast";
++    for end in [None, Some(ErrorKind::WouldBlock), Some(ErrorKind::BrokenPipe)] {
++        for chunk in [1, 7, 1024] {
++            let mut worker = worker(input.to_vec(), chunk, end);
++            let mut state = State::default();
++            let mut buffer = vec![0; READ_BUFFER_SIZE];
++            let mut observed = Vec::new();
++            let result = worker.pty_read(&mut state, &mut buffer, Some(&mut observed));
++            if end == Some(ErrorKind::BrokenPipe) {
++                assert_eq!(result.unwrap_err().kind(), ErrorKind::BrokenPipe);
++            } else {
++                assert_eq!(result.unwrap(), input.len());
++            }
++            assert_eq!(observed, input);
++            let terminal = worker.terminal.lock();
++            for (column, c) in "last".chars().enumerate() {
++                assert_eq!(terminal.grid()[Line(0)][Column(column)].c, c);
++            }
++        }
++    }
++}
++
++#[test]
++fn saturated_reads_stop_at_the_batch_budget_and_resume_in_order() {
++    let mut input = vec![b'a'; MAX_LOCKED_READ];
++    input.extend_from_slice(b"\r\ntail");
++    let mut worker = worker(input.clone(), 997, Some(ErrorKind::WouldBlock));
++    let mut state = State::default();
++    let mut buffer = vec![0; READ_BUFFER_SIZE];
++    let mut observed = Vec::new();
++    assert_eq!(
++        worker.pty_read(&mut state, &mut buffer, Some(&mut observed)).unwrap(),
++        MAX_LOCKED_READ
++    );
++    assert_eq!(worker.pty.input.position() as usize, MAX_LOCKED_READ);
++    assert_eq!(observed, input[..MAX_LOCKED_READ]);
++    assert_eq!(worker.pty_read(&mut state, &mut buffer, Some(&mut observed)).unwrap(), 6);
++    assert_eq!(observed, input);
++    assert_eq!(worker.pty_read::<Vec<u8>>(&mut state, &mut buffer, None).unwrap(), 0);
++}

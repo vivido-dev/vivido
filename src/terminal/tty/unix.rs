@@ -467,8 +467,9 @@ impl EventedReadWrite for Pty {
         }
 
         #[cfg(target_os = "macos")]
-        // The measured macOS path is enabled by default; 0 supports diagnostic comparisons.
-        if std::env::var_os("VIVIDO_PTY_GATHER").is_none_or(|value| value != "0") {
+        // Read-ahead helps some producers, but regresses fast escape/image streams with
+        // Kitty's nonblocking writer. Keep it opt-in until it passes both producer paths.
+        if std::env::var_os("VIVIDO_PTY_GATHER").is_some_and(|value| value == "1") {
             self.draining = false;
             self.gather = Some(super::gather::Gather::new(self.file.try_clone()?)?);
             let gather = self.gather.as_ref().unwrap();
@@ -504,7 +505,7 @@ impl EventedReadWrite for Pty {
             }
         }
         #[cfg(target_os = "macos")]
-        if result.is_ok() && self.gather.is_some() {
+        if result.is_ok() {
             super::gather::set_qos();
         }
         result

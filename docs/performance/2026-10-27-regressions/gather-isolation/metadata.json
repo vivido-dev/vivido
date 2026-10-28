@@ -1,0 +1,44 @@
+{
+  "arguments": {
+    "before": "/private/tmp/vivido-fix1",
+    "after": "/private/tmp/vivido-fix1",
+    "benchmark": "/Applications/kitty.app/Contents/MacOS/kitten",
+    "output": "/private/tmp/vivido-native-gather-isolation",
+    "corpus": null,
+    "driver": "kitten",
+    "after_gather": "1",
+    "before_gather": "0",
+    "frontend": "native",
+    "samples": 2,
+    "repetitions": 100,
+    "latency_samples": 100,
+    "timeout": 600,
+    "modes": [
+      "sync",
+      "render"
+    ],
+    "workloads": [
+      "ascii",
+      "unicode",
+      "csi",
+      "long_escape_codes",
+      "images"
+    ]
+  },
+  "platform": "macOS-27.0.1-arm64-arm-64bit-Mach-O",
+  "binaries": {
+    "before": {
+      "bytes": 28351496,
+      "sha256": "01006c210875a2ff29705118c9a8673c2486afd253036bb32181b39b875a4c82"
+    },
+    "after": {
+      "bytes": 28351496,
+      "sha256": "01006c210875a2ff29705118c9a8673c2486afd253036bb32181b39b875a4c82"
+    },
+    "benchmark": {
+      "bytes": 44595776,
+      "sha256": "c25944a988e1aa75c5a3e6e5478718e8794578d166c58115ebf9f0dca71b2425"
+    }
+  },
+  "corpus": {}
+}

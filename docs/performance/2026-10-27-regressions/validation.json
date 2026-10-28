@@ -1,0 +1,19 @@
+{
+  "format_check": "passed",
+  "workspace_check": "passed",
+  "workspace_all_targets_test": {
+    "passed": 1097,
+    "library_passed": 1066,
+    "reference_fixtures_passed": 45
+  },
+  "workspace_clippy_warnings_denied": "passed",
+  "performance_feature_check": "passed",
+  "macos_native_frame_pane_tests": "passed (three executables)",
+  "headless_direct": {
+    "passed": 20
+  },
+  "headless_gather": {
+    "passed": 20
+  },
+  "protocol_and_sdk_changes": false
+}
