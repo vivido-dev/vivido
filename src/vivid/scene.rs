@@ -1337,7 +1337,13 @@ impl SharedScene {
         }
         track
             .state
-            .admit_media(generation, body_length, media_epoch, media_id, random_access)
+            .admit_media(vivid_protocol::track::ReceivedMedia {
+                generation,
+                body_length,
+                epoch: media_epoch,
+                media_id,
+                random_access,
+            })
             .map_err(|_| "stale media epoch, media ID, or flow allowance")?;
         track.last_media_record_sequence = record_sequence;
         self.0.changed.notify_all();

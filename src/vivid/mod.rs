@@ -56,12 +56,10 @@ use vivid_protocol::observation::{self, ObservationKey, ObservationQueue};
 use vivid_protocol::registry;
 use vivid_protocol::resource::{Resource, ResourceContract, TokenBucket};
 use vivid_protocol::revision::{
-    ChannelGeneration, SceneRevision, SurfaceGeneration, SurfaceRevision, TargetGeneration,
+    ChannelGeneration, SceneRevision, SurfaceGeneration, TargetGeneration,
 };
 use vivid_protocol::scene::SceneNode;
-use vivid_protocol::surface::{
-    self, DesktopSurfaceParameters, SurfaceDefinition, SurfaceDescriptor,
-};
+use vivid_protocol::surface::{self, DesktopSurfaceParameters, SurfaceDefinition};
 use vivid_protocol::track::{
     self, ChannelOpenDecision, ChannelOpenState, KindConfiguration, TrackConfiguration, TrackMode,
 };
@@ -2163,7 +2161,7 @@ fn establish_root_session(
             session_id,
             resume_generation,
             attempt_id,
-            proof,
+            ..
         } => {
             let candidate =
                 lock(&shared.registry).leases.find_resume(*context_id, *lease_id, *session_id);
@@ -2190,16 +2188,7 @@ fn establish_root_session(
             };
             // The proof binds the preface, the complete lease and session identity, the exact
             // generation, the attempt, and the whole `HELLO` minus the proof itself.
-            let expected = auth::resume_hello_proof(
-                prior.expose(),
-                preface,
-                *lease_id,
-                *session_id,
-                *resume_generation,
-                attempt_id,
-                &hello.authless_payload()?,
-            );
-            if !auth::verify_proof(&expected, proof) {
+            if !hello.verify_resume(&auth::ResumeKey::new(*prior.expose()), preface)? {
                 return Err(fail_authentication(&writer, request_id, "resume failed"));
             }
             Principal::Resume {
@@ -2373,8 +2362,11 @@ fn establish_root_session(
         clamp_contract_for_web(&mut contract);
     }
 
-    let prk =
-        auth::extract_handshake_prk(&session_secret, &hello.client_nonce, &server_nonce, &[0; 32]);
+    let prk = auth::extract_handshake_prk(
+        &session_secret,
+        &vivid_protocol::auth::HandshakeNonces { client: hello.client_nonce, server: server_nonce },
+        &[0; 32],
+    );
     let (keys, anchor_key) = auth::derive_session_keys(&prk, session_id, 0, &session_tag);
 
     let observation_capacity = contract.get(Resource::ObservationQueueEntries);
@@ -2439,15 +2431,15 @@ fn establish_root_session(
                 .ok_or_else(|| io::Error::other("lease disappeared during activation"))?;
             let decision = lease
                 .machine
-                .begin_activation(
-                    *attempt_id,
-                    hello.client_nonce,
-                    &hello.authless_payload()?,
-                    fingerprint,
+                .begin_activation(vivid_protocol::lease::EstablishmentAttempt {
+                    attempt_id: *attempt_id,
+                    client_nonce: hello.client_nonce,
+                    hello_bytes: &hello.authless_payload()?,
+                    profile_fingerprint: fingerprint,
                     session_id,
                     server_nonce,
-                    welcome_body,
-                )
+                    welcome: welcome_body,
+                })
                 .map_err(|_| {
                     io::Error::new(ErrorKind::PermissionDenied, "lease activation was refused")
                 })?;
@@ -2464,8 +2456,10 @@ fn establish_root_session(
             // A replay reuses the original nonce, so the derived keys match the first attempt's.
             let prk = auth::extract_handshake_prk(
                 &session_secret,
-                &hello.client_nonce,
-                &decided_nonce,
+                &vivid_protocol::auth::HandshakeNonces {
+                    client: hello.client_nonce,
+                    server: decided_nonce,
+                },
                 &[0; 32],
             );
             let decided_tag = session_tag_of(&decided_welcome).unwrap_or(session_tag);
@@ -2485,13 +2479,15 @@ fn establish_root_session(
                 .machine
                 .begin_resume(
                     vivid_protocol::revision::ResumeGeneration::new(*resume_generation),
-                    *attempt_id,
-                    hello.client_nonce,
-                    &hello.authless_payload()?,
-                    fingerprint,
-                    *suspended,
-                    server_nonce,
-                    welcome_body,
+                    vivid_protocol::lease::EstablishmentAttempt {
+                        attempt_id: *attempt_id,
+                        client_nonce: hello.client_nonce,
+                        hello_bytes: &hello.authless_payload()?,
+                        profile_fingerprint: fingerprint,
+                        session_id: *suspended,
+                        server_nonce,
+                        welcome: welcome_body,
+                    },
                 )
                 .map_err(|_| io::Error::new(ErrorKind::PermissionDenied, "resume was refused"))?;
             let (decided_session, decided_nonce, decided_welcome) = match decision {
@@ -2506,8 +2502,10 @@ fn establish_root_session(
             resumed_announcements.push((key.0.session_id(), key.2, announcement));
             let prk = auth::extract_handshake_prk(
                 &session_secret,
-                &hello.client_nonce,
-                &decided_nonce,
+                &vivid_protocol::auth::HandshakeNonces {
+                    client: hello.client_nonce,
+                    server: decided_nonce,
+                },
                 &[0; 32],
             );
             let decided_tag = session_tag_of(&decided_welcome).unwrap_or(session_tag);
@@ -2545,7 +2543,7 @@ fn establish_root_session(
         identity,
         root_context,
         session_tag,
-        channel_key: Secret32::new(*keys.channel_key()),
+        channel_key: Secret32::new(*keys.channel_key().expose()),
         anchor_key,
         accepted_profiles: welcome.accepted_profiles.clone(),
         egress: Mutex::new(Some(egress)),
@@ -2561,7 +2559,7 @@ fn establish_root_session(
             Principal::Root => None,
             Principal::Lease { key, .. } | Principal::Resume { key, .. } => Some(*key),
         },
-        resume_key: Secret32::new(*keys.resume_key()),
+        resume_key: Secret32::new(*keys.resume_key().expose()),
         lane: Mutex::new(None),
         lane_writer: Mutex::new(None),
         lane_egress: Mutex::new(None),
@@ -2932,12 +2930,9 @@ fn dispatch_control(
             )
         },
         messages::REVOKE_SESSION_LEASE => {
-            let map = StrictMap::new("REVOKE_SESSION_LEASE", &value, &[0, 1])
-                .map_err(|_| ControlError::bad_message("invalid lease revoke"))?;
-            let context_id =
-                map.required_u64(0).map_err(|_| ControlError::bad_message("missing context ID"))?;
-            let lease_id =
-                map.required_u64(1).map_err(|_| ControlError::bad_message("missing lease ID"))?;
+            let vivid_protocol::lease::RevokeSessionLease { context_id, lease_id } =
+                vivid_protocol::lease::RevokeSessionLease::decode(&value)
+                    .map_err(|_| ControlError::bad_message("invalid lease revoke"))?;
             require_context_operation(session, context_id, OP_DELEGATE)?;
             let key = (session.identity, context_id, lease_id);
             revoke_lease(shared, session, key, reason::EXPLICIT_REVOKE)
@@ -2945,10 +2940,9 @@ fn dispatch_control(
             (messages::OK, record.object_id, Ok(messages::ok(request_id)))
         },
         messages::REVOKE_CONTEXT => {
-            let map = StrictMap::new("REVOKE_CONTEXT", &value, &[0, 1])
-                .map_err(|_| ControlError::bad_message("invalid context revoke"))?;
-            let context_id =
-                map.required_u64(0).map_err(|_| ControlError::bad_message("missing context ID"))?;
+            let context_id = vivid_protocol::context::RevokeContext::decode(&value)
+                .map_err(|_| ControlError::bad_message("invalid context revoke"))?
+                .context_id;
             if context_id == session.root_context.context_id() {
                 return Err(ControlError::bad_state("context cannot be revoked"));
             }
@@ -3020,59 +3014,20 @@ fn dispatch_control(
             )
         },
         messages::UPDATE_SURFACE => {
-            let map =
-                StrictMap::new("UPDATE_SURFACE", &value, &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11])
-                    .map_err(|_| ControlError::bad_message("invalid surface update"))?;
-            let context_id =
-                map.required_u64(0).map_err(|_| ControlError::bad_message("context"))?;
-            let surface_id =
-                map.required_u64(1).map_err(|_| ControlError::bad_message("surface"))?;
-            let identity = surface_identity(session, context_id, surface_id)?;
+            let update = surface::UpdateSurface::decode(&value)
+                .map_err(|_| ControlError::bad_message("invalid surface update"))?;
+            let identity = surface_identity(session, update.context_id, update.surface_id)?;
             let current = shared
                 .scene
                 .surface_status(identity)
                 .ok_or_else(|| ControlError::not_found("surface does not exist"))?;
-            let replacement = SurfaceDefinition {
-                context_id,
-                surface_id,
-                semantic_profile: current.definition.semantic_profile.clone(),
-                coordinate_model: current.definition.coordinate_model,
-                logical_width: map
-                    .required_u64(4)
-                    .map_err(|_| ControlError::bad_message("width"))?,
-                logical_height: map
-                    .required_u64(5)
-                    .map_err(|_| ControlError::bad_message("height"))?,
-                scale_numerator: map
-                    .required_u64(6)
-                    .map_err(|_| ControlError::bad_message("scale"))?,
-                scale_denominator: map
-                    .required_u64(7)
-                    .map_err(|_| ControlError::bad_message("scale"))?,
-                rotation: u16::try_from(
-                    map.required_u64(8).map_err(|_| ControlError::bad_message("rotation"))?,
-                )
-                .map_err(|_| ControlError::bad_message("rotation"))?,
-                descriptor: SurfaceDescriptor::from_value(
-                    map.required(9).map_err(|_| ControlError::bad_message("descriptor"))?,
-                )
-                .map_err(|_| ControlError::bad_message("descriptor"))?,
-                policy: map.required_u64(10).map_err(|_| ControlError::bad_message("policy"))?,
-                profile_parameters: map
-                    .required_map(11)
-                    .map_err(|_| ControlError::bad_message("profile parameters"))?
-                    .to_vec(),
-            };
+            let replacement = update.replacement(&current.definition);
             let status = shared
                 .scene
                 .update_surface(
                     identity,
-                    SurfaceRevision::new(
-                        map.required_u64(2).map_err(|_| ControlError::bad_message("revision"))?,
-                    ),
-                    SurfaceGeneration::new(
-                        map.required_u64(3).map_err(|_| ControlError::bad_message("generation"))?,
-                    ),
+                    update.expected_revision,
+                    update.expected_generation,
                     replacement,
                 )
                 .map_err(ControlError::state)?;
@@ -3281,16 +3236,11 @@ fn dispatch_control(
         },
         messages::ADVANCE_CHANNEL => {
             let identity = payload_track_identity(session, &value)?;
-            let map =
-                StrictMap::new("ADVANCE_CHANNEL", &value, &[0, 1, 2, 3, 4, 5]).map_err(|_| {
-                    ControlError::bad_message("invalid channel advance").with_track(identity)
-                })?;
-            let current = map.required_u64(3).map_err(|_| {
-                ControlError::bad_message("current generation").with_track(identity)
+            let advance = vivid_protocol::track::AdvanceChannel::decode(&value).map_err(|_| {
+                ControlError::bad_message("invalid channel advance").with_track(identity)
             })?;
-            let next = map
-                .required_u64(4)
-                .map_err(|_| ControlError::bad_message("next generation").with_track(identity))?;
+            let current = advance.current_generation.get();
+            let next = advance.next_generation.get();
             let before = shared.scene.track_status(identity).ok_or_else(|| {
                 ControlError::not_found("track does not exist").with_track(identity)
             })?;
@@ -3353,15 +3303,12 @@ fn dispatch_control(
                 return Err(ControlError::unsupported_profile("audio-gain-v1 was not negotiated"));
             }
             let identity = payload_track_identity(session, &value)?;
-            let map = StrictMap::new("SET_AUDIO_GAIN", &value, &[0, 1, 2, 3]).map_err(|_| {
-                ControlError::bad_message("invalid audio gain").with_track(identity)
-            })?;
-            let raw = map
-                .required_u64(3)
-                .map_err(|_| ControlError::bad_message("audio gain").with_track(identity))?;
-            let gain = vivid_protocol::track::AudioGain::new(raw).ok_or_else(|| {
-                ControlError::bad_message("audio gain exceeds 200 percent").with_track(identity)
-            })?;
+            let gain = vivid_protocol::track::SetAudioGain::decode(&value)
+                .map_err(|_| {
+                    ControlError::bad_message("invalid audio gain or gain above 200 percent")
+                        .with_track(identity)
+                })?
+                .gain;
             let before = shared.scene.track_status(identity).ok_or_else(|| {
                 ControlError::not_found("track does not exist").with_track(identity)
             })?;
@@ -3397,49 +3344,28 @@ fn dispatch_control(
             (messages::OK, record.object_id, Ok(messages::ok(request_id)))
         },
         messages::ACTIVATE_TRACK => {
-            let map = StrictMap::new("ACTIVATE_TRACK", &value, &[0, 1, 2, 3])
+            let activation = vivid_protocol::track::ActivateTrack::decode(&value)
                 .map_err(|_| ControlError::bad_message("invalid slot activation"))?;
-            let context_id =
-                map.required_u64(0).map_err(|_| ControlError::bad_message("context"))?;
-            let surface_id =
-                map.required_u64(1).map_err(|_| ControlError::bad_message("surface"))?;
-            let bindings = map
-                .required(2)
-                .map_err(|_| ControlError::bad_message("bindings"))?
-                .as_array()
-                .ok_or_else(|| ControlError::bad_message("bindings are not an array"))?
+            let bindings = activation
+                .bindings
                 .iter()
-                .map(|value| {
-                    let binding = StrictMap::new("slot binding", value, &[0, 1, 2, 3])
-                        .map_err(|_| ControlError::bad_message("invalid slot binding"))?;
-                    Ok((
-                        binding.required_u64(0).map_err(|_| ControlError::bad_message("slot"))?,
-                        binding.required_u64(1).map_err(|_| ControlError::bad_message("track"))?,
-                        ChannelGeneration::new(
-                            binding
-                                .required_u64(2)
-                                .map_err(|_| ControlError::bad_message("generation"))?,
-                        ),
-                        binding
-                            .required_u64(3)
-                            .map_err(|_| ControlError::bad_message("required milestone"))?,
-                    ))
+                .map(|binding| {
+                    (
+                        binding.slot,
+                        binding.track_id,
+                        binding.channel_generation,
+                        binding.required_milestone,
+                    )
                 })
-                .collect::<Result<Vec<_>, ControlError>>()?;
-            let identity = surface_identity(session, context_id, surface_id)?;
+                .collect::<Vec<_>>();
+            let identity = surface_identity(session, activation.context_id, activation.surface_id)?;
             let mut overlays = lock(&shared.overlays);
             overlays
                 .validate_activation(&shared.scene, identity, &bindings)
                 .map_err(ControlError::state)?;
             let status = shared
                 .scene
-                .activate_tracks(
-                    identity,
-                    SurfaceRevision::new(
-                        map.required_u64(3).map_err(|_| ControlError::bad_message("revision"))?,
-                    ),
-                    &bindings,
-                )
+                .activate_tracks(identity, activation.expected_surface_revision, &bindings)
                 .map_err(ControlError::state)?;
             overlays.sync_active(&shared.scene, identity);
             drop(overlays);
@@ -3454,12 +3380,12 @@ fn dispatch_control(
             shared.request_frame_wake();
             (
                 messages::TRACK_ACTIVATED,
-                surface_id,
+                activation.surface_id,
                 Envelope::new(
                     request_id,
                     vec![
-                        (0, Value::Unsigned(context_id)),
-                        (1, Value::Unsigned(surface_id)),
+                        (0, Value::Unsigned(activation.context_id)),
+                        (1, Value::Unsigned(activation.surface_id)),
                         (
                             2,
                             Value::Map(
@@ -3478,14 +3404,10 @@ fn dispatch_control(
             )
         },
         messages::BEGIN_TXN => {
-            let map = StrictMap::new("BEGIN_TXN", &value, &[0, 1])
+            let begin = vivid_protocol::scene::BeginTxn::decode(&value)
                 .map_err(|_| ControlError::bad_message("invalid transaction begin"))?;
-            let context = context_identity(
-                session,
-                map.required_u64(0).map_err(|_| ControlError::bad_message("context"))?,
-            )?;
-            let transaction =
-                map.required_u64(1).map_err(|_| ControlError::bad_message("transaction"))?;
+            let context = context_identity(session, begin.context_id)?;
+            let transaction = begin.transaction_id;
             shared.scene.begin_transaction(context, transaction).map_err(ControlError::state)?;
             (messages::OK, record.object_id, Ok(messages::ok(request_id)))
         },
@@ -3508,14 +3430,11 @@ fn dispatch_control(
             let transaction = envelope
                 .transaction_id
                 .ok_or_else(|| ControlError::bad_message("node mutation omits transaction ID"))?;
-            let map = StrictMap::new("DELETE_NODE", &value, &[0, 1])
+            let delete = vivid_protocol::scene::DeleteNode::decode(&value)
                 .map_err(|_| ControlError::bad_message("invalid node deletion"))?;
-            let context = context_identity(
-                session,
-                map.required_u64(0).map_err(|_| ControlError::bad_message("context"))?,
-            )?;
+            let context = context_identity(session, delete.context_id)?;
             let node = context
-                .node(map.required_u64(1).map_err(|_| ControlError::bad_message("node"))?)
+                .node(delete.node_id)
                 .map_err(|_| ControlError::bad_message("node ID is zero"))?;
             shared
                 .scene
@@ -3536,10 +3455,9 @@ fn dispatch_control(
         },
         messages::COMMIT_TXN => {
             let transaction = envelope.transaction_id.unwrap_or(record.object_id);
-            let map = StrictMap::new("COMMIT_TXN", &value, &[0])
+            let commit = vivid_protocol::scene::CommitTxn::decode(&value)
                 .map_err(|_| ControlError::bad_message("invalid transaction commit"))?;
-            if map.required_u64(0).map_err(|_| ControlError::bad_message("presentation mode"))? != 0
-            {
+            if commit.presentation_mode != 0 {
                 return Err(ControlError::unsupported("unsupported presentation mode"));
             }
             let context = shared
@@ -3612,12 +3530,8 @@ fn dispatch_control(
             )
         },
         messages::QUERY_ANCHOR => {
-            let map = StrictMap::new("QUERY_ANCHOR", &value, &[0, 1])
+            let anchor::QueryAnchor { context_id, anchor_id } = anchor::QueryAnchor::decode(&value)
                 .map_err(|_| ControlError::bad_message("invalid anchor query"))?;
-            let context_id =
-                map.required_u64(0).map_err(|_| ControlError::bad_message("anchor context"))?;
-            let anchor_id =
-                map.required_u64(1).map_err(|_| ControlError::bad_message("anchor ID"))?;
             let identity = context_identity(session, context_id)?
                 .anchor(anchor_id)
                 .map_err(|_| ControlError::bad_message("anchor ID is zero"))?;
@@ -3638,34 +3552,16 @@ fn dispatch_control(
             (messages::ANCHOR_STATUS, anchor_id, Envelope::new(request_id, payload).encode())
         },
         messages::WAIT_TRACK => {
-            let map = StrictMap::new("WAIT_TRACK", &value, &[0, 1, 2, 3, 4, 5, 6])
-                .map_err(|_| ControlError::bad_message("invalid WAIT_TRACK schema"))?;
-            let identity = payload_track_identity(session, &value)?;
-            let condition = map
-                .required_u64(3)
-                .map_err(|_| ControlError::bad_message("WAIT_TRACK condition"))?;
-            let condition_value =
-                map.optional_u64(4).map_err(|_| ControlError::bad_message("WAIT_TRACK value"))?;
-            let timeout_us =
-                map.required_u64(5).map_err(|_| ControlError::bad_message("WAIT_TRACK timeout"))?;
-            let generation = ChannelGeneration::new(
-                map.required_u64(6)
-                    .map_err(|_| ControlError::bad_message("WAIT_TRACK generation"))?,
-            );
-            let value_is_valid = match condition {
-                1..=4 => condition_value.is_some(),
-                5..=9 => condition_value.is_none(),
-                _ => false,
-            };
-            if timeout_us == 0
-                || timeout_us > vivid_protocol::MAX_TRACK_WAIT_TIMEOUT_US
-                || generation.get() == 0
-                || !value_is_valid
-            {
-                return Err(ControlError::bad_message(
+            let wait = vivid_protocol::track::WaitTrack::decode(&value).map_err(|_| {
+                ControlError::bad_message(
                     "WAIT_TRACK has an invalid condition, value, generation, or timeout",
-                ));
-            }
+                )
+            })?;
+            let identity = payload_track_identity(session, &value)?;
+            let condition = wait.condition;
+            let condition_value = wait.condition_value;
+            let timeout_us = wait.timeout_us;
+            let generation = wait.channel_generation;
             match shared.scene.evaluate_track_wait(identity, generation, condition, condition_value)
             {
                 TrackWaitEvaluation::Satisfied(satisfied) => (
@@ -3733,11 +3629,9 @@ fn dispatch_control(
             }
         },
         messages::CANCEL_WAIT => {
-            let map = StrictMap::new("CANCEL_WAIT", &value, &[0])
-                .map_err(|_| ControlError::bad_message("invalid CANCEL_WAIT schema"))?;
-            let target = map
-                .required_u64(0)
-                .map_err(|_| ControlError::bad_message("CANCEL_WAIT request ID"))?;
+            let target = vivid_protocol::messages::CancelWait::decode(&value)
+                .map_err(|_| ControlError::bad_message("invalid CANCEL_WAIT schema"))?
+                .request_id;
             cancelled.insert(target);
             (messages::OK, record.object_id, Ok(messages::ok(request_id)))
         },
@@ -3892,16 +3786,12 @@ fn dispatch_control(
                     );
                 },
                 messages::FLUSH => {
-                    let epoch = StrictMap::new("FLUSH", &value, &[0, 1, 2, 3])
+                    let epoch = vivid_protocol::track::Flush::decode(&value)
                         .map_err(|_| {
-                            ControlError::bad_message("invalid FLUSH schema").with_track(identity)
+                            ControlError::bad_message("invalid FLUSH schema or epoch")
+                                .with_track(identity)
                         })?
-                        .required_u64(3)
-                        .ok()
-                        .and_then(|value| u32::try_from(value).ok())
-                        .ok_or_else(|| {
-                            ControlError::bad_message("FLUSH epoch").with_track(identity)
-                        })?;
+                        .epoch;
                     shared
                         .scene
                         .flush_playback(identity, epoch)
@@ -3997,11 +3887,9 @@ fn dispatch_control(
             (messages::OK, record.object_id, Ok(messages::ok(request_id)))
         },
         messages::SET_OBSERVATION => {
-            let map = StrictMap::new("SET_OBSERVATION", &value, &[0])
-                .map_err(|_| ControlError::bad_message("invalid SET_OBSERVATION schema"))?;
-            let mask = map
-                .required_u64(0)
-                .map_err(|_| ControlError::bad_message("SET_OBSERVATION mask"))?;
+            let mask = vivid_protocol::observation::SetObservation::decode(&value)
+                .map_err(|_| ControlError::bad_message("invalid SET_OBSERVATION schema"))?
+                .mask;
             lock(&session.observations)
                 .subscribe(mask)
                 .map_err(|_| ControlError::bad_message("unassigned observation class bits"))?;
@@ -4349,7 +4237,7 @@ fn handle_track_channel(
         )?;
         return Err(io::Error::new(ErrorKind::InvalidData, "stale channel generation"));
     }
-    if !open.verify(session.channel_key.expose()) {
+    if !open.verify(&vivid_protocol::auth::ChannelKey::new(*session.channel_key.expose())) {
         trace_track_channel_rejected(
             shared,
             None,
@@ -4424,10 +4312,12 @@ fn handle_track_channel(
     ];
     let decision = lock(&shared.registry).channel_opens.entry(identity).or_default().open(
         status.state.channel_generation,
-        generation,
-        open.client_nonce,
-        &first.body,
-        acceptance,
+        vivid_protocol::track::ChannelOpenAttempt {
+            generation,
+            nonce: open.client_nonce,
+            complete_open_bytes: &first.body,
+            acceptance,
+        },
     );
     let (acceptance, replayed) = match decision {
         ChannelOpenDecision::Fresh(acceptance) => (acceptance, false),
@@ -4995,9 +4885,11 @@ fn channel_loop(
                         ChannelFailureKind::MediaParse,
                         media::parse_delta_raster_frame(
                             &body,
-                            raster.width,
-                            raster.height,
-                            u32::from(raster.maximum_delta_operations),
+                            vivid_protocol::media::RasterSize {
+                                width: raster.width,
+                                height: raster.height
+                            },
+                            u32::from(raster.maximum_delta_operations)
                         )
                         .map_err(io::Error::from)
                     );
@@ -5422,20 +5314,9 @@ fn channel_loop(
                 let value = Value::Map(envelope.payload);
                 let eos = channel_other!(
                     ChannelFailureKind::MediaParse,
-                    StrictMap::new("CHANNEL_EOS", &value, &[0, 1, 2, 3, 4, 5])
+                    vivid_protocol::track::ChannelEos::decode(&value)
                 );
-                let eos_epoch = eos
-                    .required_u64(4)
-                    .ok()
-                    .and_then(|value| u32::try_from(value).ok())
-                    .ok_or_else(|| {
-                        ChannelFailure::message(
-                            ChannelFailureKind::MediaParse,
-                            ErrorKind::InvalidData,
-                            "invalid CHANNEL_EOS media epoch",
-                            context,
-                        )
-                    })?;
+                let eos_epoch = eos.epoch;
                 context.media(
                     eos_epoch,
                     shared
@@ -5444,10 +5325,10 @@ fn channel_loop(
                         .map_or(0, |status| status.state.last_media_id),
                     0,
                 );
-                if eos.required_u64(0).ok() != Some(identity.surface().context().context_id())
-                    || eos.required_u64(1).ok() != Some(identity.surface().surface_id())
-                    || eos.required_u64(2).ok() != Some(identity.track_id())
-                    || eos.required_u64(3).ok() != Some(generation.get())
+                if eos.context_id != identity.surface().context().context_id()
+                    || eos.surface_id != identity.surface().surface_id()
+                    || eos.track_id != identity.track_id()
+                    || eos.channel_generation != generation
                 {
                     return Err(ChannelFailure::message(
                         ChannelFailureKind::RecordIdentity,
@@ -5456,8 +5337,7 @@ fn channel_loop(
                         context,
                     ));
                 }
-                let last_record_sequence =
-                    channel_other!(ChannelFailureKind::MediaParse, eos.required_u64(5));
+                let last_record_sequence = eos.last_media_sequence;
                 channel_other!(
                     ChannelFailureKind::SceneState,
                     shared.scene.mark_eos(identity, generation, eos_epoch, last_record_sequence,)
@@ -5755,14 +5635,7 @@ fn handle_lane(
             "lane authentication failed",
         ));
     };
-    let expected = auth::lane_tag(
-        session.channel_key.expose(),
-        open.session_id,
-        LaneClass::Interactive as u32,
-        open.lane_generation,
-        &open.client_nonce,
-    );
-    if !auth::verify_tag(&expected, &open.authentication_tag) {
+    if !open.verify(&auth::ChannelKey::new(*session.channel_key.expose())) {
         return Err(send_fatal(
             &writer,
             request_id,
@@ -6021,14 +5894,15 @@ fn serve_lane(
 }
 
 fn surface_ready_payload(status: &SurfaceStatus) -> Vec<(u64, Value)> {
-    surface::surface_ready_payload(
-        status.identity.context().context_id(),
-        status.identity.surface_id(),
-        status.revision,
-        status.generation,
-        status.definition.policy,
-        status.definition.profile_parameters.clone(),
-    )
+    surface::SurfaceReady {
+        context_id: status.identity.context().context_id(),
+        surface_id: status.identity.surface_id(),
+        revision: status.revision,
+        generation: status.generation,
+        policy: status.definition.policy,
+        profile_parameters: status.definition.profile_parameters.clone(),
+    }
+    .payload()
 }
 
 fn surface_status_payload(status: &SurfaceStatus) -> Vec<(u64, Value)> {
@@ -6291,7 +6165,7 @@ impl ControlError {
 
     const fn stale_target() -> Self {
         Self {
-            code: registry::error::STALE_TARGET_GENERATION,
+            code: messages::ERROR_STALE_TARGET_GENERATION,
             message: "stale target generation",
             track: None,
             trace_rejection: true,
@@ -6620,6 +6494,7 @@ impl std::fmt::Debug for VividService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use vivid_protocol::surface::SurfaceDescriptor;
     use vivid_protocol::track::{AudioConfiguration, KindConfiguration};
 
     macro_rules! socket_service {
@@ -8478,7 +8353,10 @@ mod tests {
                 .scene
                 .track_status(identity)
                 .ok_or_else(|| io::Error::new(ErrorKind::NotFound, "track disappeared"))?;
-            (*session.channel_key.expose(), status.configuration)
+            (
+                vivid_protocol::auth::ChannelKey::new(*session.channel_key.expose()),
+                status.configuration,
+            )
         };
         let client_nonce = [0x52; 16];
         let mut open = ChannelOpen {
@@ -8821,7 +8699,7 @@ mod tests {
             .get_ref()
             .and_then(|source| source.downcast_ref::<vivid_sdk::PresenterError>())
             .map(|error| error.code);
-        assert_eq!(code, Some(registry::error::STALE_TARGET_GENERATION));
+        assert_eq!(code, Some(messages::ERROR_STALE_TARGET_GENERATION));
 
         // The rejection is actionable: the current target precedes it, so the producer can re-plan
         // against the target it was just told about rather than waiting for the next resize.
@@ -10082,7 +9960,12 @@ mod tests {
             };
             let key = Secret32::new(*prior_resume_key.expose());
             Self::open(service, authentication, move |hello: &mut Hello, preface: &[u8; 16]| {
-                hello.authenticate_resume(key.expose(), preface).map_err(io::Error::other)
+                hello
+                    .authenticate_resume(
+                        &vivid_protocol::auth::ResumeKey::new(*key.expose()),
+                        preface,
+                    )
+                    .map_err(io::Error::other)
             })
         }
 
@@ -10128,8 +10011,10 @@ mod tests {
             };
             let prk = auth::extract_handshake_prk(
                 &session_secret,
-                &hello.client_nonce,
-                &welcome.server_nonce,
+                &vivid_protocol::auth::HandshakeNonces {
+                    client: hello.client_nonce,
+                    server: welcome.server_nonce,
+                },
                 &[0; 32],
             );
             let (keys, _) = auth::derive_session_keys(
@@ -10143,7 +10028,7 @@ mod tests {
                 sequence: 1,
                 session_id: welcome.session_id,
                 session_tag: welcome.session_tag,
-                resume_key: Secret32::new(*keys.resume_key()),
+                resume_key: Secret32::new(*keys.resume_key().expose()),
             })
         }
 
@@ -10806,13 +10691,14 @@ mod tests {
                 LANE_MAX_RECORD_BODY,
             ))?;
             let nonce = [0x2d_u8; 16];
-            let tag = auth::lane_tag(
-                channel_key.expose(),
+            let mut open = vivid_protocol::messages::LaneOpen {
                 session_id,
-                LaneClass::Interactive as u32,
-                generation,
-                &nonce,
-            );
+                lane_generation: generation,
+                client_nonce: nonce,
+                authentication_tag: [0; 16],
+            };
+            open.sign(&auth::ChannelKey::new(*channel_key.expose()));
+            let tag = open.authentication_tag;
             let body = Envelope::new(
                 1,
                 vec![
