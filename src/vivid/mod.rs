@@ -1498,6 +1498,7 @@ fn handle_connection(
         ConnectionKind::Track => handle_track_channel(&mut reader, shared, pending),
         ConnectionKind::Lane => handle_lane(&mut reader, shared, pending),
         ConnectionKind::FileTransfer => file_drop::handle_connection(&mut reader, shared, pending),
+        _ => Err(io::Error::new(io::ErrorKind::Unsupported, "unsupported Vivid connection kind")),
     }
 }
 
@@ -2208,6 +2209,13 @@ fn establish_root_session(
                 session_id: *session_id,
                 resume_generation: *resume_generation,
             }
+        },
+        _ => {
+            return Err(fail_authentication(
+                &writer,
+                request_id,
+                "authentication kind is not supported",
+            ));
         },
     };
     let target = shared.scene.target().clone();
@@ -4969,7 +4977,7 @@ fn channel_loop(
                         alpha_mode: raster.alpha_mode,
                         rgba: Arc::new(RgbaBuffer::new(channel_io!(
                             ChannelFailureKind::Decode,
-                            media::decode_raster_pixels(parsed)
+                            media::decode_raster_pixels(parsed).map_err(io::Error::from)
                         ))),
                         damage: None,
                     };
@@ -4991,6 +4999,7 @@ fn channel_loop(
                             raster.height,
                             u32::from(raster.maximum_delta_operations),
                         )
+                        .map_err(io::Error::from)
                     );
                     let media_epoch = delta.epoch;
                     let Some(base) = shared.scene.latest_frame(identity) else {
@@ -6470,6 +6479,12 @@ fn apply_raster_delta(base: &Frame, delta: media::ParsedRasterDeltaFrame<'_>) ->
                     width,
                     height,
                 });
+            },
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "unsupported raster delta operation",
+                ));
             },
         }
     }

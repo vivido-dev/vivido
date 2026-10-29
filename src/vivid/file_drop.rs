@@ -390,7 +390,8 @@ impl FileDropManager {
             },
             Some(file_drop::FileDropDestination::ShellCwd) => Some("Copy to remote shell"),
             Some(file_drop::FileDropDestination::DesktopFolder) => Some("Copy to remote desktop"),
-            None => None,
+            // No binding, or a destination this build cannot describe, offers no copy action.
+            _ => None,
         }
     }
 

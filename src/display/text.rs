@@ -327,6 +327,7 @@ impl TextSystem {
                 TextAlignment::Center => Alignment::Center,
                 TextAlignment::End => Alignment::End,
                 TextAlignment::Justify => Alignment::Justify,
+                _ => Alignment::Start,
             },
             AlignmentOptions::default(),
         );

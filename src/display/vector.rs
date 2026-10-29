@@ -137,7 +137,7 @@ pub fn compile_with_layouts(
         match command {
             Command::Save => stack.push(state.clone()),
             Command::Restore => {
-                let previous = stack.pop().ok_or(InvalidScene("unbalanced restore"))?;
+                let previous = stack.pop().ok_or(InvalidScene::new("unbalanced restore"))?;
                 for _ in previous.clips.len()..state.clips.len() {
                     result.scene.pop_layer();
                 }
@@ -149,14 +149,14 @@ pub fn compile_with_layouts(
                 if transform.as_coeffs().iter().any(|v| !v.is_finite() || v.abs() > 1_000_000.0)
                     || transform.determinant().abs() < 1e-12
                 {
-                    return Err(InvalidScene("unbounded or singular accumulated transform"));
+                    return Err(InvalidScene::new("unbounded or singular accumulated transform"));
                 }
                 state.transform = transform;
             },
             Command::Opacity(alpha) => state.opacity = f32::from(*alpha) / 65535.0,
             Command::Clip(path) => {
                 if state.clips.len() >= wire::MAX_STACK_DEPTH {
-                    return Err(InvalidScene("clip nesting limit exceeded"));
+                    return Err(InvalidScene::new("clip nesting limit exceeded"));
                 }
                 let compiled = path_geometry(path);
                 result.scene.push_clip_layer(fill_rule(path), state.transform, &compiled);
@@ -197,7 +197,7 @@ pub fn compile_with_layouts(
                     Command::TextLayout { layout, origin } => {
                         let layout = layouts
                             .get(layout)
-                            .ok_or(InvalidScene("unknown or released text layout"))?;
+                            .ok_or(InvalidScene::new("unknown or released text layout"))?;
                         let transform =
                             state.transform * Affine::translate((origin.x.get(), origin.y.get()));
                         check_bounds(Rect::new(0., 0., layout.width, layout.height), transform)?;
@@ -224,11 +224,13 @@ pub fn compile_with_layouts(
                                 wire::Cap::Butt => Cap::Butt,
                                 wire::Cap::Round => Cap::Round,
                                 wire::Cap::Square => Cap::Square,
+                                _ => Cap::Butt,
                             })
                             .with_join(match style.join {
                                 wire::Join::Miter => Join::Miter,
                                 wire::Join::Bevel => Join::Bevel,
                                 wire::Join::Round => Join::Round,
+                                _ => Join::Miter,
                             })
                             .with_miter_limit(style.miter_limit.get());
                         if !style.dashes.is_empty() {
@@ -298,15 +300,15 @@ pub fn compile_with_layouts(
                     },
                     Command::Image { asset, rect, .. } => {
                         let image =
-                            images.get(asset).ok_or(InvalidScene("unknown retained image"))?;
+                            images.get(asset).ok_or(InvalidScene::new("unknown retained image"))?;
                         if image.width == 0 || image.height == 0 {
-                            return Err(InvalidScene("empty retained image"));
+                            return Err(InvalidScene::new("empty retained image"));
                         }
                         if image.format.size_in_bytes(image.width, image.height)
                             != Some(image.data.len())
                             || image.data.len() > wire::MAX_ASSET_BYTES
                         {
-                            return Err(InvalidScene("invalid retained image bytes"));
+                            return Err(InvalidScene::new("invalid retained image bytes"));
                         }
                         let transform = state.transform
                             * Affine::translate((rect.origin.x.get(), rect.origin.y.get()))
@@ -339,7 +341,7 @@ fn check_bounds(bounds: Rect, transform: Affine) -> Result<(), InvalidScene> {
     ] {
         let p = transform * point;
         if !p.x.is_finite() || !p.y.is_finite() || p.x.abs() > 1e6 || p.y.abs() > 1e6 {
-            return Err(InvalidScene("transformed drawing exceeds coordinate bounds"));
+            return Err(InvalidScene::new("transformed drawing exceeds coordinate bounds"));
         }
     }
     Ok(())
@@ -360,6 +362,8 @@ fn path_geometry(path: &wire::Path) -> BezPath {
             Segment::Quad(a, b) => result.quad_to(point(*a), point(*b)),
             Segment::Cubic(a, b, c) => result.curve_to(point(*a), point(*b), point(*c)),
             Segment::Close => result.close_path(),
+            // A segment kind this build cannot draw is left out.
+            _ => {},
         }
     }
     result
@@ -378,22 +382,24 @@ fn paint(brush: &wire::Brush, images: &BTreeMap<u64, ImageData>) -> Result<Brush
             (Gradient::new_radial(point(*center), radius.get() as f32), stops, *color_space)
         },
         wire::Brush::Image { asset, extend, .. } => {
-            let image = images.get(asset).ok_or(InvalidScene("unknown retained image"))?;
+            let image = images.get(asset).ok_or(InvalidScene::new("unknown retained image"))?;
             if image.width == 0 || image.height == 0 {
-                return Err(InvalidScene("empty retained image"));
+                return Err(InvalidScene::new("empty retained image"));
             }
             if image.format.size_in_bytes(image.width, image.height) != Some(image.data.len())
                 || image.data.len() > wire::MAX_ASSET_BYTES
             {
-                return Err(InvalidScene("invalid retained image bytes"));
+                return Err(InvalidScene::new("invalid retained image bytes"));
             }
             let brush = ImageBrush::new(image.clone()).with_extend(match extend {
                 wire::Extend::Pad => ImageExtend::Pad,
                 wire::Extend::Repeat => ImageExtend::Repeat,
                 wire::Extend::Reflect => ImageExtend::Reflect,
+                _ => ImageExtend::Pad,
             });
             return Ok(Brush::Image(brush));
         },
+        _ => return Err(InvalidScene::new("unsupported brush")),
     };
     let stops: Vec<_> = stops
         .iter()
@@ -406,6 +412,7 @@ fn paint(brush: &wire::Brush, images: &BTreeMap<u64, ImageData>) -> Result<Brush
     Ok(Brush::Gradient(match space {
         wire::ColorSpace::Srgb => gradient,
         wire::ColorSpace::Oklab => gradient.with_interpolation_cs(ColorSpaceTag::Oklab),
+        _ => gradient,
     }))
 }
 

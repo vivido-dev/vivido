@@ -3472,6 +3472,7 @@ impl Processor {
                                 FileResultCode::Cancelled => "cancelled",
                                 FileResultCode::HashMismatch => "hash_mismatch",
                                 FileResultCode::IoError => "io_error",
+                                _ => "unknown",
                             };
                             Some(match outcome.result {
                                 FileResultCode::Committed | FileResultCode::AlreadyCommitted => {
