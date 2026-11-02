@@ -467,9 +467,9 @@ impl EventedReadWrite for Pty {
         }
 
         #[cfg(target_os = "macos")]
-        // Read-ahead helps some producers, but regresses fast escape/image streams with
-        // Kitty's nonblocking writer. Keep it opt-in until it passes both producer paths.
-        if std::env::var_os("VIVIDO_PTY_GATHER").is_some_and(|value| value == "1") {
+        // Read-ahead overlaps PTY reads with parsing. `VIVIDO_PTY_GATHER=0` selects the direct
+        // reader instead, for comparisons and as a fallback.
+        if std::env::var_os("VIVIDO_PTY_GATHER").is_none_or(|value| value != "0") {
             self.draining = false;
             self.gather = Some(super::gather::Gather::new(self.file.try_clone()?)?);
             let gather = self.gather.as_ref().unwrap();

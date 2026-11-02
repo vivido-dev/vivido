@@ -43,6 +43,10 @@ struct State {
 struct Shared {
     state: Mutex<State>,
     space: Condvar,
+    /// Held by the worker across each PTY read and by `reset`, so no read straddles a reset.
+    ///
+    /// Kept apart from `state` so the parser thread never waits behind a read system call.
+    read: Mutex<()>,
 }
 
 pub(super) struct Gather {
@@ -76,6 +80,7 @@ impl Gather {
                 eof: false,
             }),
             space: Condvar::new(),
+            read: Mutex::new(()),
         });
         let owner = shared.clone();
         let worker = std::thread::Builder::new().name("PTY gather".into()).spawn(move || {
@@ -99,11 +104,14 @@ impl Gather {
                 let mut failure = None;
                 loop {
                     let read = {
-                        let state = owner.state.lock().unwrap();
-                        if state.stop || state.generation != generation {
-                            break;
-                        }
                         // Serialize reset with the nonblocking read, never with a poll or parsing.
+                        let _read = owner.read.lock().unwrap();
+                        {
+                            let state = owner.state.lock().unwrap();
+                            if state.stop || state.generation != generation {
+                                break;
+                            }
+                        }
                         file.read(&mut bytes[len..])
                     };
                     match read {
@@ -232,6 +240,8 @@ impl Gather {
     }
 
     pub(super) fn reset(&mut self) {
+        // Wait out an in-flight read: its bytes predate the reset and must be discarded with it.
+        let _read = self.shared.read.lock().unwrap();
         let mut state = self.shared.state.lock().unwrap();
         state.generation = state.generation.checked_add(1).expect("PTY reset generation exhausted");
         while let Some(batch) = state.ready.pop_front() {

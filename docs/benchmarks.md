@@ -68,7 +68,8 @@ or other benchmarks. The production headless GPU renderer uses its existing
 16 ms minimum draw interval; native desktop frame/pane tests are separate.
 
 That stage enabled macOS gathering by default. The standalone regression repair
-below supersedes that choice: gathering now requires `VIVIDO_PTY_GATHER=1`.
+below superseded that choice, and "Overlapped reading by default" (2026-11-02) restores it:
+gathering is the macOS default again, and `VIVIDO_PTY_GATHER=0` selects the direct reader.
 Four reusable 64 KiB buffers bound read-ahead. Small bursts publish
 immediately. Saturated refill gaps receive at most 16 immediate retries; only a
 busy parser permits 1 ms bridge polls, within a 3 ms bridging budget. Both workers
@@ -460,3 +461,117 @@ For deterministic replay use `--driver replay --benchmark /path/to/benchmark`,
 `--before-gather 0|1` and `--after-gather 0|1` only for reader isolation; the default
 uses each build's own default and removes an inherited environment override.
 An unlocked desktop is required for native presentation.
+
+## Plain-text throughput baseline (2026-11-02)
+
+Starting point for the plain-text throughput work. Apple Silicon, macOS, release build of the
+working tree after the vvte fused ASCII scan, the `Term` ASCII row fill, and unbuffered
+synchronized updates.
+
+### In memory
+
+`scripts/ascii-throughput.sh 5 50`, median of five runs, 120×40 alternate screen, 64 KiB feeds:
+
+| Payload | Parser MiB/s | Parser + `Term` MiB/s |
+|---|---:|---:|
+| Kitty "Only ASCII chars" (`ascii.bin`) | 1,157 | **356** |
+| Same, inside a synchronized update (`ascii_sync.bin`) | 1,151 | 352 |
+| Same, LF and TAB removed (`nolf.bin`) | 1,652 | 609 |
+
+### End to end, Kitty's benchmark
+
+`kitten __benchmark__` 0.42.2 inside a headless Vivido at 120×40, 100 repetitions, three
+alternating samples, medians. "Before" is the default direct reader; "after" is the same binary
+with `VIVIDO_PTY_GATHER=1`.
+
+| Mode | Workload | Direct MiB/s | Gather MiB/s | Change |
+|---|---|---:|---:|---:|
+| default | Only ASCII chars | 243.3 | 291.7 | +19.9% |
+| default | Unicode chars | 228.6 | 271.0 | +18.5% |
+| default | CSI codes with few chars | 107.6 | 113.0 | +5.0% |
+| default | Long escape codes | 595.5 | 573.2 | −3.7% |
+| default | Images | 594.2 | 543.0 | **−8.6%** |
+| `--render` | Only ASCII chars | 245.7 | 299.1 | +21.7% |
+| `--render` | Unicode chars | 232.4 | 278.9 | +20.0% |
+| `--render` | CSI codes with few chars | 109.6 | 117.4 | +7.1% |
+| `--render` | Long escape codes | 596.3 | 586.7 | −1.6% |
+| `--render` | Images | 599.8 | 547.4 | **−8.7%** |
+
+Gather also used about 25% more CPU time per run (12.6 s against 10.1 s) and less peak memory.
+In default mode, three gather results were outliers, each in a different sample: ASCII 210.1,
+Unicode 210.5, and long escapes 517.9 MiB/s. All direct-reader samples stayed within ±2% of their median. Images and that
+variance are what Phase A of the plan has to fix before gather can be the default.
+
+Reproduce from `vivido/`, outside any sandbox that blocks Unix sockets:
+
+```sh
+scripts/ascii-throughput.sh 5 50
+cargo build --release --locked
+cp target/release/vivido /tmp/vivido-candidate
+python3 scripts/performance-e2e.py --driver kitten --benchmark "$(command -v kitten)" \
+  --before /tmp/vivido-candidate --after /tmp/vivido-candidate --after-gather 1 \
+  --output NEW_EMPTY_DIR --samples 3 --repetitions 100 --modes sync render \
+  --workloads ascii unicode csi long_escape_codes images
+python3 scripts/performance-summary.py NEW_EMPTY_DIR/results.jsonl
+```
+
+## Overlapped reading by default (2026-11-02)
+
+Phase A of the plain-text throughput plan. The macOS gather worker held the shared state lock
+across each nonblocking PTY `read`, so the parser thread waited behind read system calls: a
+profile of Kitty's Images workload with gathering on showed the parser thread in
+`__psynch_mutexwait` for 1,837 of 2,279 samples, and parsing in 361. Reads now take a separate
+lock that only `reset` also takes, so a client reset still never straddles a read, and the parser
+never waits for one. Afterwards the gather thread spends its time in `read` and the parser waits
+for input: the workload is limited by the PTY. Gathering is now the macOS default;
+`VIVIDO_PTY_GATHER=0` selects the direct reader.
+
+### Kitty's benchmark
+
+Before: the Phase 0 baseline build with the direct reader. After: this build with its default
+reader (gathering). `kitten __benchmark__` 0.42.2, headless 120×40, 100 repetitions, five
+alternating samples, medians.
+
+| Mode | Workload | Before MiB/s | After MiB/s | Change |
+|---|---|---:|---:|---:|
+| default | Only ASCII chars | 241.5 | **290.1** | +20.1% |
+| default | Unicode chars | 226.4 | 271.5 | +19.9% |
+| default | CSI codes with few chars | 105.4 | 112.4 | +6.6% |
+| default | Long escape codes | 590.2 | 572.7 | −3.0% |
+| default | Images | 592.2 | 578.8 | −2.3% |
+| `--render` | Only ASCII chars | 244.3 | **296.6** | +21.4% |
+| `--render` | Unicode chars | 232.7 | 276.3 | +18.7% |
+| `--render` | CSI codes with few chars | 109.3 | 116.8 | +6.9% |
+| `--render` | Long escape codes | 588.8 | 576.9 | −2.0% |
+| `--render` | Images | 589.9 | 581.7 | −1.4% |
+
+No sample fell more than 3.4% below its workload's median (the Phase 0 gather run had samples
+28% below). CPU time per run rose from 10.2 to 11.4 s; peak memory fell. Before the lock change,
+the same comparison gave Images −8.6%.
+
+### Replay benchmark (blocking writer)
+
+`benchmark/throughput` replay of the current-size corpus, 50 repetitions, three alternating
+samples, 100 idle and 100 loaded queries. Before: Phase 0 build, direct reader. After: the lock
+change with gathering.
+
+| Mode | Workload | Before MiB/s | After MiB/s | Change |
+|---|---|---:|---:|---:|
+| default | Only ASCII chars | 166.8 | 250.9 | +50.4% |
+| default | Unicode chars | 179.2 | 302.1 | +68.6% |
+| default | Unique multi-codepoint Unicode cells | 136.5 | 179.8 | +31.7% |
+| default | CSI codes with few chars | 91.9 | 112.1 | +22.0% |
+| default | Long escape codes | 323.5 | 470.8 | +45.5% |
+| default | Images | 187.4 | 472.0 | +151.9% |
+| `--render` | Only ASCII chars | 155.2 | 260.8 | +68.0% |
+| `--render` | Unicode chars | 168.5 | 309.3 | +83.6% |
+| `--render` | Unique multi-codepoint Unicode cells | 135.7 | 186.2 | +37.2% |
+| `--render` | CSI codes with few chars | 90.9 | 114.3 | +25.7% |
+| `--render` | Long escape codes | 316.8 | 464.8 | +46.7% |
+| `--render` | Images | 197.3 | 471.7 | +139.1% |
+
+Query p99: idle 0.050 → 0.051 ms and 0.054 → 0.054 ms; loaded 1.81 → 1.63 ms and
+1.86 → 1.44 ms. CPU time per run fell (6.7 → 5.1 s).
+
+The headless integration tests and the native macOS frame, pane and background-pane tests pass
+with gathering as the default. Linux and Windows readers are unchanged.

@@ -3,6 +3,9 @@
 
 The benchmark runs inside Vivido's PTY. Use --frontend native to include visible
 window presentation; headless uses the production offscreen GPU renderer.
+
+Run it where Unix sockets can be created: a sandboxed shell that denies socket
+creation makes every run end in a benchmark timeout.
 """
 import argparse
 import hashlib
@@ -16,6 +19,12 @@ import shlex
 import subprocess
 import tempfile
 import time
+
+
+def announced_socket(startup):
+    """Return the socket a headless session printed on startup, if it has printed it yet."""
+    match = re.search(r"^VIVIDO_SOCKET=(.+?); export VIVIDO_SOCKET$", startup.read_text(), re.M)
+    return match.group(1) if match else None
 
 
 def run(args, binary, label, mode, sample, output):
@@ -47,13 +56,16 @@ def run(args, binary, label, mode, sample, output):
             command.append("--with-scrollback")
         command.extend(args.workloads)
         child = f"{shlex.join(command)} > {shlex.quote(str(result))} 2>&1; printf '%s' \"$?\" > {shlex.quote(str(status))}"
-        socket = str(runtime / "vivido.sock")
-        launch = ["/usr/bin/time", "-l", "-o", str(usage), binary, "--socket", socket]
+        launch = ["/usr/bin/time", "-l", "-o", str(usage), binary]
         if args.frontend == "headless":
+            # A headless session owns its socket and prints it as `VIVIDO_SOCKET=...` on stdout;
+            # `--socket` does not apply, so the path is read back from the startup output.
+            socket = None
             launch.extend(["--headless", "--foreground", "--session", "performance",
                            "--headless-size", "120x40"])
         else:
-            launch.extend(["--hold", "--config-file", "/dev/null", "-o",
+            socket = str(runtime / "vivido.sock")
+            launch.extend(["--socket", socket, "--hold", "--config-file", "/dev/null", "-o",
                            "window.dimensions.columns=120", "window.dimensions.lines=40"])
             # Let the native window settle before the benchmark's own warmup.
             child = "sleep 1; " + child
@@ -63,7 +75,9 @@ def run(args, binary, label, mode, sample, output):
             try:
                 deadline = time.monotonic() + args.timeout
                 while time.monotonic() < deadline:
-                    if status.exists() and Path(socket).exists():
+                    if socket is None:
+                        socket = announced_socket(startup)
+                    if status.exists() and socket and Path(socket).exists():
                         break
                     if process.poll() is not None:
                         raise RuntimeError(f"{prefix}: process exited: {log.read_text()[-2000:]}")
