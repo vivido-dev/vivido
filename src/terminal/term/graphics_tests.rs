@@ -465,7 +465,8 @@ fn placeholder_text_is_stored_with_its_marks_for_the_renderer_to_decode() {
         .filter(|mark| {
             let mut cell = crate::terminal::term::cell::Cell::from(PLACEHOLDER);
             cell.push_zerowidth(*mark);
-            crate::terminal::graphics::decode_cell(&cell).is_some_and(|code| code.row != 0)
+            let styles = crate::terminal::term::style::StyleTable::default();
+            crate::terminal::graphics::decode_cell(&cell, &styles).is_some_and(|code| code.row != 0)
         })
         .collect();
     assert_eq!(marks.len(), 297);

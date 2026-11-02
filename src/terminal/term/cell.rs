@@ -7,6 +7,7 @@ use smallvec::SmallVec;
 
 use crate::terminal::grid::{self, GridCell};
 use crate::terminal::index::Column;
+use crate::terminal::term::style::{Style, StyleId};
 use crate::terminal::vvte::ansi::{Color, Hyperlink as VteHyperlink, NamedColor};
 
 bitflags! {
@@ -143,7 +144,7 @@ impl<T: Copy> ResetDiscriminant<T> for T {
 
 impl ResetDiscriminant<Color> for Cell {
     fn discriminant(&self) -> Color {
-        self.bg
+        self.style.inline().bg
     }
 }
 
@@ -166,30 +167,53 @@ pub struct CellExtra {
 }
 
 /// Content and attributes of a single cell in the terminal grid.
+///
+/// Colors and styling attributes live in the terminal's style table; the cell holds a
+/// [`StyleId`] for them. Serialization keeps the flat form fixtures use (`c`, `fg`, `bg`, `flags`,
+/// `extra`).
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(from = "SerializedCell", into = "SerializedCell")]
 pub struct Cell {
     /// Character stored in this terminal cell.
     c: char,
-    /// Foreground color.
-    fg: Color,
-    /// Background color.
-    bg: Color,
-    /// Terminal cell or mode flags.
-    flags: Flags,
+    /// Colors and styling attributes.
+    style: StyleId,
+    /// Layout flags; never contains styling.
+    layout: Flags,
     /// Optional extended cell attributes.
     extra: Option<Arc<CellExtra>>,
+}
+
+/// The flat serialized form of a [`Cell`], with its style written out.
+#[derive(Serialize, Deserialize)]
+struct SerializedCell {
+    c: char,
+    fg: Color,
+    bg: Color,
+    flags: Flags,
+    extra: Option<Arc<CellExtra>>,
+}
+
+impl From<SerializedCell> for Cell {
+    fn from(cell: SerializedCell) -> Self {
+        let style = Style { fg: cell.fg, bg: cell.bg, attrs: cell.flags.difference(Flags::LAYOUT) };
+        let layout = cell.flags.intersection(Flags::LAYOUT);
+        Self { c: cell.c, style: StyleId::from_inline(style), layout, extra: cell.extra }
+    }
+}
+
+impl From<Cell> for SerializedCell {
+    fn from(cell: Cell) -> Self {
+        let style = cell.style.inline();
+        let flags = cell.layout.union(style.attrs);
+        Self { c: cell.c, fg: style.fg, bg: style.bg, flags, extra: cell.extra }
+    }
 }
 
 impl Default for Cell {
     #[inline]
     fn default() -> Cell {
-        Cell {
-            c: ' ',
-            bg: Color::Named(NamedColor::Background),
-            fg: Color::Named(NamedColor::Foreground),
-            flags: Flags::empty(),
-            extra: None,
-        }
+        Cell { c: ' ', style: StyleId::default(), layout: Flags::empty(), extra: None }
     }
 }
 
@@ -206,94 +230,47 @@ impl Cell {
         self.c = c;
     }
 
-    /// Foreground color.
+    /// Reference to this cell's colors and styling attributes.
+    ///
+    /// Resolve it with the terminal's [`StyleTable`](super::style::StyleTable).
     #[inline]
-    pub fn fg(&self) -> Color {
-        self.fg
+    pub fn style(&self) -> StyleId {
+        self.style
     }
 
-    /// Replace the foreground color.
+    /// Replace this cell's style reference.
     #[inline]
-    pub fn set_fg(&mut self, color: Color) {
-        self.fg = color;
-    }
-
-    /// Background color.
-    #[inline]
-    pub fn bg(&self) -> Color {
-        self.bg
-    }
-
-    /// Replace the background color.
-    #[inline]
-    pub fn set_bg(&mut self, color: Color) {
-        self.bg = color;
+    pub fn set_style(&mut self, style: StyleId) {
+        self.style = style;
     }
 
     /// Layout flags: line wrap and double-width occupancy.
     ///
-    /// Never contains styling; see [`Cell::attrs`].
+    /// Never contains styling, which lives in the cell's [`Style`].
     #[inline]
     pub fn layout(&self) -> Flags {
-        self.flags.intersection(Flags::LAYOUT)
+        self.layout
     }
 
-    /// Replace the layout flags, keeping the styling attributes.
+    /// Replace the layout flags.
     #[inline]
     pub fn set_layout(&mut self, flags: Flags) {
         debug_assert!(Flags::LAYOUT.contains(flags), "{flags:?} is not layout");
-        self.flags = self.flags.difference(Flags::LAYOUT).union(flags);
+        self.layout = flags;
     }
 
     /// Set the given layout flags.
     #[inline]
     pub fn insert_layout(&mut self, flags: Flags) {
         debug_assert!(Flags::LAYOUT.contains(flags), "{flags:?} is not layout");
-        self.flags.insert(flags);
+        self.layout.insert(flags);
     }
 
     /// Clear the given layout flags.
     #[inline]
     pub fn remove_layout(&mut self, flags: Flags) {
         debug_assert!(Flags::LAYOUT.contains(flags), "{flags:?} is not layout");
-        self.flags.remove(flags);
-    }
-
-    /// Replace both the layout flags and the styling attributes in one store.
-    #[inline]
-    pub fn set_layout_attrs(&mut self, layout: Flags, attrs: Flags) {
-        debug_assert!(Flags::LAYOUT.contains(layout), "{layout:?} is not layout");
-        debug_assert!(!attrs.intersects(Flags::LAYOUT), "{attrs:?} contains layout");
-        self.flags = layout.union(attrs);
-    }
-
-    /// Styling attributes: weight, slant, decorations, inverse and visibility.
-    ///
-    /// Never contains layout; see [`Cell::layout`].
-    #[inline]
-    pub fn attrs(&self) -> Flags {
-        self.flags.difference(Flags::LAYOUT)
-    }
-
-    /// Replace the styling attributes, keeping the layout flags.
-    #[inline]
-    pub fn set_attrs(&mut self, flags: Flags) {
-        debug_assert!(!flags.intersects(Flags::LAYOUT), "{flags:?} contains layout");
-        self.flags = self.flags.intersection(Flags::LAYOUT).union(flags);
-    }
-
-    /// Set the given styling attributes.
-    #[inline]
-    pub fn insert_attrs(&mut self, flags: Flags) {
-        debug_assert!(!flags.intersects(Flags::LAYOUT), "{flags:?} contains layout");
-        self.flags.insert(flags);
-    }
-
-    /// Clear the given styling attributes.
-    #[inline]
-    pub fn remove_attrs(&mut self, flags: Flags) {
-        debug_assert!(!flags.intersects(Flags::LAYOUT), "{flags:?} contains layout");
-        self.flags.remove(flags);
+        self.layout.remove(flags);
     }
 
     /// Whether this cell holds extended attributes.
@@ -358,7 +335,7 @@ impl Cell {
     /// Remove all wide char data from a cell.
     #[inline(never)]
     pub fn clear_wide(&mut self) {
-        self.flags.remove(Flags::WIDE_CHAR);
+        self.layout.remove(Flags::WIDE_CHAR);
         if let Some(extra) = self.extra.as_mut() {
             Arc::make_mut(extra).zerowidth = SmallVec::new();
         }
@@ -415,16 +392,13 @@ impl Cell {
 impl GridCell for Cell {
     #[inline]
     fn is_empty(&self) -> bool {
+        let style = self.style.inline();
         (self.c == ' ' || self.c == '\t')
-            && self.bg == Color::Named(NamedColor::Background)
-            && self.fg == Color::Named(NamedColor::Foreground)
-            && !self.flags.intersects(
-                Flags::INVERSE
-                    | Flags::ALL_UNDERLINES
-                    | Flags::STRIKEOUT
-                    | Flags::WRAPLINE
-                    | Flags::WIDE_CHAR_SPACER
-                    | Flags::LEADING_WIDE_CHAR_SPACER,
+            && style.bg == Color::Named(NamedColor::Background)
+            && style.fg == Color::Named(NamedColor::Foreground)
+            && !style.attrs.intersects(Flags::INVERSE | Flags::ALL_UNDERLINES | Flags::STRIKEOUT)
+            && !self.layout.intersects(
+                Flags::WRAPLINE | Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER,
             )
             && self.extra.as_ref().map(|extra| extra.zerowidth.is_empty()) != Some(false)
             && self.extra.as_ref().is_none_or(|extra| extra.vivid_resize_tracking.is_empty())
@@ -454,9 +428,9 @@ impl GridCell for Cell {
             self.extra = None;
         }
         self.c = ' ';
-        self.fg = Color::Named(NamedColor::Foreground);
-        self.bg = template.bg;
-        self.flags = Flags::empty();
+        self.style =
+            StyleId::from_inline(Style { bg: template.style.inline().bg, ..Style::default() });
+        self.layout = Flags::empty();
     }
 }
 
@@ -471,7 +445,10 @@ impl From<char> for Cell {
 impl From<Color> for Cell {
     #[inline]
     fn from(color: Color) -> Self {
-        Self { bg: color, ..Cell::default() }
+        Self {
+            style: StyleId::from_inline(Style { bg: color, ..Style::default() }),
+            ..Cell::default()
+        }
     }
 }
 
@@ -485,7 +462,7 @@ impl LineLength for grid::Row<Cell> {
     fn line_length(&self) -> Column {
         let mut length = Column(0);
 
-        if self[Column(self.len() - 1)].flags.contains(Flags::WRAPLINE) {
+        if self[Column(self.len() - 1)].layout.contains(Flags::WRAPLINE) {
             return Column(self.len());
         }
 
@@ -566,27 +543,35 @@ mod tests {
     }
 
     #[test]
-    fn layout_and_attributes_change_independently() {
+    fn layout_and_style_change_independently() {
+        let mut table = crate::terminal::term::style::StyleTable::default();
+        let bold = table.intern(Style { attrs: Flags::BOLD, ..Style::default() });
         let mut cell = Cell::default();
-        cell.set_attrs(Flags::BOLD | Flags::UNDERLINE);
+        cell.set_style(bold);
         cell.insert_layout(Flags::WIDE_CHAR);
         assert_eq!(cell.layout(), Flags::WIDE_CHAR);
-        assert_eq!(cell.attrs(), Flags::BOLD | Flags::UNDERLINE);
+        assert_eq!(table.get(cell.style()).attrs, Flags::BOLD);
 
-        cell.set_attrs(Flags::ITALIC);
-        assert_eq!(cell.layout(), Flags::WIDE_CHAR, "replacing attributes keeps layout");
+        cell.set_style(StyleId::default());
+        assert_eq!(cell.layout(), Flags::WIDE_CHAR, "replacing the style keeps layout");
         cell.set_layout(Flags::WRAPLINE);
-        assert_eq!(cell.attrs(), Flags::ITALIC, "replacing layout keeps attributes");
-
-        cell.set_layout_attrs(Flags::WIDE_CHAR_SPACER, Flags::DIM);
-        assert_eq!((cell.layout(), cell.attrs()), (Flags::WIDE_CHAR_SPACER, Flags::DIM));
+        assert_eq!(cell.style(), StyleId::default(), "replacing layout keeps the style");
     }
 
     #[test]
-    #[cfg(debug_assertions)]
-    #[should_panic(expected = "contains layout")]
-    fn a_layout_flag_is_not_an_attribute() {
-        Cell::default().set_attrs(Flags::WRAPLINE);
+    fn serialization_keeps_the_flat_cell_form() {
+        let mut table = crate::terminal::term::style::StyleTable::default();
+        let mut cell = Cell::from('x');
+        cell.set_style(table.intern(Style {
+            fg: Color::Indexed(1),
+            bg: Color::Indexed(2),
+            attrs: Flags::BOLD | Flags::UNDERLINE,
+        }));
+        cell.set_layout(Flags::WIDE_CHAR);
+        let value = serde_json::to_value(&cell).unwrap();
+        assert_eq!(value["flags"], "BOLD | UNDERLINE | WIDE_CHAR");
+        assert_eq!(value["fg"], serde_json::json!({"Indexed": 1}));
+        assert_eq!(serde_json::from_value::<Cell>(value).unwrap(), cell);
     }
 
     #[test]
@@ -600,7 +585,7 @@ mod tests {
     #[test]
     fn line_length_works_with_wrapline() {
         let mut row = Row::<Cell>::new(10);
-        row[Column(9)].flags.insert(super::Flags::WRAPLINE);
+        row[Column(9)].layout.insert(super::Flags::WRAPLINE);
 
         assert_eq!(row.line_length(), Column(10));
     }

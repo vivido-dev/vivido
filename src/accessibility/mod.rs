@@ -212,7 +212,7 @@ impl AccessibilitySnapshot {
                 } else {
                     size.cell_width()
                 };
-                let hidden = cell.attrs().contains(Flags::HIDDEN);
+                let hidden = term.style(cell).attrs.contains(Flags::HIDDEN);
                 push_character(
                     &mut text,
                     &mut characters,
@@ -444,6 +444,7 @@ mod tests {
     use crate::terminal::grid::Scroll;
     use crate::terminal::index::Side;
     use crate::terminal::selection::{Selection, SelectionType};
+    use crate::terminal::term::style::Style;
     use crate::terminal::term::test::TermSize;
 
     #[test]
@@ -474,7 +475,8 @@ mod tests {
         let mut term = term(4, 2);
         term.grid_mut()[Point::new(Line(0), Column(0))].set_c('a');
         term.grid_mut()[Point::new(Line(0), Column(1))].set_c('x');
-        term.grid_mut()[Point::new(Line(0), Column(1))].insert_attrs(Flags::HIDDEN);
+        let hidden = term.styles_mut().intern(Style { attrs: Flags::HIDDEN, ..Style::default() });
+        term.grid_mut()[Point::new(Line(0), Column(1))].set_style(hidden);
         term.grid_mut()[Point::new(Line(0), Column(3))].insert_layout(Flags::WRAPLINE);
         term.grid_mut()[Point::new(Line(1), Column(0))].set_c('b');
 

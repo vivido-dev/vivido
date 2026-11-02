@@ -24,6 +24,7 @@ use crate::terminal::index::{self, Boundary, Column, Direction, Line, Point};
 use crate::terminal::selection::{Selection, SelectionRange, SelectionType};
 use crate::terminal::term::cell::{Cell, Flags, LineLength};
 use crate::terminal::term::color::Colors;
+use crate::terminal::term::style::{Style, StyleTable};
 use crate::terminal::vvte::ansi::{
     self, Attr, CharsetIndex, Color, CursorShape, CursorStyle, Handler, Hyperlink, KeyboardModes,
     KeyboardModesApplyBehavior, NamedColor, NamedMode, NamedPrivateMode, PrivateMode, Rgb,
@@ -38,6 +39,7 @@ pub mod cell;
 pub mod color;
 /// Search types and operations.
 pub mod search;
+pub mod style;
 
 #[cfg(test)]
 mod rep_tests;
@@ -490,6 +492,9 @@ pub struct Term<T> {
     /// primary grid. Otherwise it is the alternate screen buffer.
     inactive_grid: Grid<Cell>,
 
+    /// Styles the cells of both grids refer to.
+    styles: StyleTable,
+
     /// Index into `charsets`, pointing to what ASCII is currently being mapped to.
     active_charset: CharsetIndex,
 
@@ -794,6 +799,7 @@ impl<T> Term<T> {
 
         Term {
             inactive_grid,
+            styles: StyleTable::default(),
             scroll_region,
             event_proxy,
             damage,
@@ -903,7 +909,7 @@ impl<T> Term<T> {
         T: EventListener,
     {
         let status = match request {
-            b"m" => sgr_status(&self.grid.cursor.template),
+            b"m" => sgr_status(self.template_style()),
             b"r" => format!("{};{}r", self.scroll_region.start.0 + 1, self.scroll_region.end.0),
             b"\"p" => "61;1\"p".to_owned(),
             b"\"q" => "0\"q".to_owned(),
@@ -1293,6 +1299,37 @@ impl<T> Term<T> {
     /// Access to the raw grid data structure.
     pub fn grid(&self) -> &Grid<Cell> {
         &self.grid
+    }
+
+    /// The styles this terminal's cells refer to.
+    pub fn styles(&self) -> &StyleTable {
+        &self.styles
+    }
+
+    /// Mutable access to the styles this terminal's cells refer to.
+    pub fn styles_mut(&mut self) -> &mut StyleTable {
+        &mut self.styles
+    }
+
+    /// The colors and styling attributes of `cell`, a cell of this terminal.
+    #[inline]
+    pub fn style(&self, cell: &Cell) -> Style {
+        self.styles.get(cell.style())
+    }
+
+    /// The style new output is written with.
+    #[inline]
+    fn template_style(&self) -> Style {
+        self.styles.get(self.grid.cursor.template.style())
+    }
+
+    /// Change the style new output is written with.
+    #[inline]
+    fn update_template_style(&mut self, update: impl FnOnce(&mut Style)) {
+        let mut style = self.template_style();
+        update(&mut style);
+        let id = self.styles.intern(style);
+        self.grid.cursor.template.set_style(id);
     }
 
     /// Whether `column` is currently configured as a horizontal tab stop.
@@ -1794,9 +1831,7 @@ impl<T> Term<T> {
     #[inline(always)]
     fn write_at_cursor(&mut self, c: char, layout: Flags) {
         let c = self.grid.cursor.charsets[self.active_charset].map(c);
-        let fg = self.grid.cursor.template.fg();
-        let bg = self.grid.cursor.template.bg();
-        let attrs = self.grid.cursor.template.attrs();
+        let style = self.grid.cursor.template.style();
         let extra = self.grid.cursor.template.extra().cloned();
 
         let mut cursor_cell = self.grid.cursor_cell();
@@ -1822,9 +1857,8 @@ impl<T> Term<T> {
         }
 
         cursor_cell.set_c(c);
-        cursor_cell.set_fg(fg);
-        cursor_cell.set_bg(bg);
-        cursor_cell.set_layout_attrs(layout, attrs);
+        cursor_cell.set_style(style);
+        cursor_cell.set_layout(layout);
         cursor_cell.set_extra(extra);
     }
 
@@ -1930,28 +1964,24 @@ impl<T: EventListener> Term<T> {
                 continue;
             }
             let end = point.column + count * width;
-            let template = &self.grid.cursor.template;
-            let (fg, bg, attrs) = (template.fg(), template.bg(), template.attrs());
+            let style = self.grid.cursor.template.style();
             let cells = &mut self.grid[point.line][point.column..end];
             if width == 1 {
                 for (cell, c) in cells.iter_mut().zip(chars.by_ref().take(count)) {
                     cell.set_c(c);
-                    cell.set_fg(fg);
-                    cell.set_bg(bg);
-                    cell.set_layout_attrs(Flags::empty(), attrs);
+                    cell.set_style(style);
+                    cell.set_layout(Flags::empty());
                 }
             } else {
                 for (cells, c) in
                     cells.as_chunks_mut::<2>().0.iter_mut().zip(chars.by_ref().take(count))
                 {
                     cells[0].set_c(c);
-                    cells[0].set_fg(fg);
-                    cells[0].set_bg(bg);
-                    cells[0].set_layout_attrs(Flags::WIDE_CHAR, attrs);
+                    cells[0].set_style(style);
+                    cells[0].set_layout(Flags::WIDE_CHAR);
                     cells[1].set_c(' ');
-                    cells[1].set_fg(fg);
-                    cells[1].set_bg(bg);
-                    cells[1].set_layout_attrs(Flags::WIDE_CHAR_SPACER, attrs);
+                    cells[1].set_style(style);
+                    cells[1].set_layout(Flags::WIDE_CHAR_SPACER);
                 }
             }
             self.grid.cursor.input_needs_wrap = end.0 == columns;
@@ -1975,8 +2005,7 @@ impl<T: EventListener> Term<T> {
             return;
         }
         let special = Flags::WIDE_CHAR | Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER;
-        let template = &self.grid.cursor.template;
-        let (fg, bg, attrs) = (template.fg(), template.bg(), template.attrs());
+        let style = self.grid.cursor.template.style();
         while let Some(&first) = bytes.first() {
             // Scalar input ignores DEL before considering a pending wrap.
             if first.wrapping_sub(0x20) >= 0x5F {
@@ -2004,9 +2033,8 @@ impl<T: EventListener> Term<T> {
             let cells = &mut self.grid[point.line][point.column..point.column + written];
             for (cell, &b) in cells.iter_mut().zip(bytes) {
                 cell.set_c(char::from(b));
-                cell.set_fg(fg);
-                cell.set_bg(bg);
-                cell.set_layout_attrs(Flags::empty(), attrs);
+                cell.set_style(style);
+                cell.set_layout(Flags::empty());
             }
             if written == 0 {
                 self.input(char::from(first));
@@ -2213,7 +2241,7 @@ impl<T: EventListener> Handler for Term<T> {
     #[inline]
     fn insert_blank(&mut self, count: usize) {
         let cursor = &self.grid.cursor;
-        let bg = cursor.template.bg();
+        let bg = self.styles.get(cursor.template.style()).bg;
 
         // Ensure inserting within terminal bounds
         let count = cmp::min(count, self.columns() - cursor.point.column.0);
@@ -2561,7 +2589,7 @@ impl<T: EventListener> Handler for Term<T> {
         let end = cmp::min(start + count, Column(self.columns()));
 
         // Cleared cells have current background color set.
-        let bg = self.grid.cursor.template.bg();
+        let bg = self.template_style().bg;
         let line = cursor.point.line;
         self.damage.damage_line(line.0 as usize, start.0, end.0);
         let row = &mut self.grid[line];
@@ -2574,7 +2602,7 @@ impl<T: EventListener> Handler for Term<T> {
     fn delete_chars(&mut self, count: usize) {
         let columns = self.columns();
         let cursor = &self.grid.cursor;
-        let bg = cursor.template.bg();
+        let bg = self.styles.get(cursor.template.style()).bg;
 
         // Ensure deleting within terminal bounds.
         let count = cmp::min(count, columns);
@@ -2672,7 +2700,7 @@ impl<T: EventListener> Handler for Term<T> {
         trace!("Clearing line: {mode:?}");
 
         let cursor = &self.grid.cursor;
-        let bg = cursor.template.bg();
+        let bg = self.styles.get(cursor.template.style()).bg;
         let point = cursor.point;
 
         let (left, right) = match mode {
@@ -2785,7 +2813,7 @@ impl<T: EventListener> Handler for Term<T> {
     #[inline]
     fn clear_screen(&mut self, mode: ansi::ClearMode) {
         trace!("Clearing screen: {mode:?}");
-        let bg = self.grid.cursor.template.bg();
+        let bg = self.template_style().bg;
 
         let screen_lines = self.screen_lines();
 
@@ -2940,50 +2968,53 @@ impl<T: EventListener> Handler for Term<T> {
     #[inline]
     fn terminal_attribute(&mut self, attr: Attr) {
         trace!("Setting attribute: {attr:?}");
-        let cursor = &mut self.grid.cursor;
+        let attrs = |insert: Flags, remove: Flags| {
+            move |style: &mut Style| {
+                style.attrs.remove(remove);
+                style.attrs.insert(insert);
+            }
+        };
+        let none = Flags::empty();
         match attr {
-            Attr::Foreground(color) => cursor.template.set_fg(color),
-            Attr::Background(color) => cursor.template.set_bg(color),
-            Attr::UnderlineColor(color) => cursor.template.set_underline_color(color),
+            Attr::Foreground(color) => self.update_template_style(|style| style.fg = color),
+            Attr::Background(color) => self.update_template_style(|style| style.bg = color),
+            Attr::UnderlineColor(color) => self.grid.cursor.template.set_underline_color(color),
             Attr::Reset => {
-                cursor.template.set_fg(Color::Named(NamedColor::Foreground));
-                cursor.template.set_bg(Color::Named(NamedColor::Background));
-                cursor.template.set_attrs(Flags::empty());
-                cursor.template.set_underline_color(None);
+                self.update_template_style(|style| *style = Style::default());
+                self.grid.cursor.template.set_underline_color(None);
             },
-            Attr::Reverse => cursor.template.insert_attrs(Flags::INVERSE),
-            Attr::CancelReverse => cursor.template.remove_attrs(Flags::INVERSE),
-            Attr::Bold => cursor.template.insert_attrs(Flags::BOLD),
-            Attr::CancelBold => cursor.template.remove_attrs(Flags::BOLD),
-            Attr::Dim => cursor.template.insert_attrs(Flags::DIM),
-            Attr::CancelBoldDim => cursor.template.remove_attrs(Flags::BOLD | Flags::DIM),
-            Attr::Italic => cursor.template.insert_attrs(Flags::ITALIC),
-            Attr::CancelItalic => cursor.template.remove_attrs(Flags::ITALIC),
+            Attr::Reverse => self.update_template_style(attrs(Flags::INVERSE, none)),
+            Attr::CancelReverse => self.update_template_style(attrs(none, Flags::INVERSE)),
+            Attr::Bold => self.update_template_style(attrs(Flags::BOLD, none)),
+            Attr::CancelBold => self.update_template_style(attrs(none, Flags::BOLD)),
+            Attr::Dim => self.update_template_style(attrs(Flags::DIM, none)),
+            Attr::CancelBoldDim => {
+                self.update_template_style(attrs(none, Flags::BOLD | Flags::DIM));
+            },
+            Attr::Italic => self.update_template_style(attrs(Flags::ITALIC, none)),
+            Attr::CancelItalic => self.update_template_style(attrs(none, Flags::ITALIC)),
             Attr::Underline => {
-                cursor.template.remove_attrs(Flags::ALL_UNDERLINES);
-                cursor.template.insert_attrs(Flags::UNDERLINE);
+                self.update_template_style(attrs(Flags::UNDERLINE, Flags::ALL_UNDERLINES));
             },
             Attr::DoubleUnderline => {
-                cursor.template.remove_attrs(Flags::ALL_UNDERLINES);
-                cursor.template.insert_attrs(Flags::DOUBLE_UNDERLINE);
+                self.update_template_style(attrs(Flags::DOUBLE_UNDERLINE, Flags::ALL_UNDERLINES));
             },
             Attr::Undercurl => {
-                cursor.template.remove_attrs(Flags::ALL_UNDERLINES);
-                cursor.template.insert_attrs(Flags::UNDERCURL);
+                self.update_template_style(attrs(Flags::UNDERCURL, Flags::ALL_UNDERLINES));
             },
             Attr::DottedUnderline => {
-                cursor.template.remove_attrs(Flags::ALL_UNDERLINES);
-                cursor.template.insert_attrs(Flags::DOTTED_UNDERLINE);
+                self.update_template_style(attrs(Flags::DOTTED_UNDERLINE, Flags::ALL_UNDERLINES));
             },
             Attr::DashedUnderline => {
-                cursor.template.remove_attrs(Flags::ALL_UNDERLINES);
-                cursor.template.insert_attrs(Flags::DASHED_UNDERLINE);
+                self.update_template_style(attrs(Flags::DASHED_UNDERLINE, Flags::ALL_UNDERLINES));
             },
-            Attr::CancelUnderline => cursor.template.remove_attrs(Flags::ALL_UNDERLINES),
-            Attr::Hidden => cursor.template.insert_attrs(Flags::HIDDEN),
-            Attr::CancelHidden => cursor.template.remove_attrs(Flags::HIDDEN),
-            Attr::Strike => cursor.template.insert_attrs(Flags::STRIKEOUT),
-            Attr::CancelStrike => cursor.template.remove_attrs(Flags::STRIKEOUT),
+            Attr::CancelUnderline => {
+                self.update_template_style(attrs(none, Flags::ALL_UNDERLINES));
+            },
+            Attr::Hidden => self.update_template_style(attrs(Flags::HIDDEN, none)),
+            Attr::CancelHidden => self.update_template_style(attrs(none, Flags::HIDDEN)),
+            Attr::Strike => self.update_template_style(attrs(Flags::STRIKEOUT, none)),
+            Attr::CancelStrike => self.update_template_style(attrs(none, Flags::STRIKEOUT)),
             _ => {
                 debug!("Term got unhandled attr: {attr:?}");
             },
@@ -3444,15 +3475,15 @@ fn encode_hex(value: &[u8]) -> String {
     encoded
 }
 
-fn sgr_status(cell: &Cell) -> String {
+fn sgr_status(style: Style) -> String {
     let mut params = Vec::new();
-    if cell.attrs().contains(Flags::BOLD) {
+    if style.attrs.contains(Flags::BOLD) {
         params.push("1".to_owned());
     }
-    if cell.attrs().contains(Flags::DIM) {
+    if style.attrs.contains(Flags::DIM) {
         params.push("2".to_owned());
     }
-    if cell.attrs().contains(Flags::ITALIC) {
+    if style.attrs.contains(Flags::ITALIC) {
         params.push("3".to_owned());
     }
     for (flag, value) in [
@@ -3462,22 +3493,22 @@ fn sgr_status(cell: &Cell) -> String {
         (Flags::DOTTED_UNDERLINE, "4:4"),
         (Flags::DASHED_UNDERLINE, "4:5"),
     ] {
-        if cell.attrs().contains(flag) {
+        if style.attrs.contains(flag) {
             params.push(value.to_owned());
             break;
         }
     }
-    if cell.attrs().contains(Flags::INVERSE) {
+    if style.attrs.contains(Flags::INVERSE) {
         params.push("7".to_owned());
     }
-    if cell.attrs().contains(Flags::HIDDEN) {
+    if style.attrs.contains(Flags::HIDDEN) {
         params.push("8".to_owned());
     }
-    if cell.attrs().contains(Flags::STRIKEOUT) {
+    if style.attrs.contains(Flags::STRIKEOUT) {
         params.push("9".to_owned());
     }
-    push_sgr_color(&mut params, cell.fg(), true);
-    push_sgr_color(&mut params, cell.bg(), false);
+    push_sgr_color(&mut params, style.fg, true);
+    push_sgr_color(&mut params, style.bg, false);
     if params.is_empty() {
         params.push("0".to_owned());
     }
@@ -3902,18 +3933,19 @@ mod tests {
         );
 
         let cells = &term.grid()[Line(0)];
-        assert!(cells[Column(0)].attrs().contains(Flags::UNDERCURL));
-        assert!(!cells[Column(0)].attrs().contains(Flags::UNDERLINE));
+        let attrs = |column: usize| term.style(&cells[Column(column)]).attrs;
+        assert!(attrs(0).contains(Flags::UNDERCURL));
+        assert!(!attrs(0).contains(Flags::UNDERLINE));
         assert_eq!(
             cells[Column(0)].underline_color(),
             Some(ansi::Color::Spec(ansi::Rgb { r: 255, g: 0, b: 0 }))
         );
 
-        assert!(cells[Column(1)].attrs().contains(Flags::UNDERLINE));
-        assert!(!cells[Column(1)].attrs().contains(Flags::UNDERCURL));
-        assert!(cells[Column(2)].attrs().contains(Flags::UNDERCURL));
-        assert!(!cells[Column(3)].attrs().intersects(Flags::ALL_UNDERLINES));
-        assert!(!cells[Column(4)].attrs().intersects(Flags::ALL_UNDERLINES));
+        assert!(attrs(1).contains(Flags::UNDERLINE));
+        assert!(!attrs(1).contains(Flags::UNDERCURL));
+        assert!(attrs(2).contains(Flags::UNDERCURL));
+        assert!(!attrs(3).intersects(Flags::ALL_UNDERLINES));
+        assert!(!attrs(4).intersects(Flags::ALL_UNDERLINES));
     }
 
     #[test]

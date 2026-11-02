@@ -10,6 +10,7 @@ use crate::terminal::index::{Column, Line, Point};
 use crate::terminal::selection::SelectionRange;
 use crate::terminal::term::cell::{Cell, Flags, Hyperlink};
 use crate::terminal::term::search::{Match, RegexSearch};
+use crate::terminal::term::style::StyleTable;
 use crate::terminal::term::{self, Term};
 use crate::terminal::vvte::ansi::{Color, CursorShape, NamedColor};
 
@@ -30,6 +31,8 @@ pub(super) struct Snapshot {
     colors: term::color::Colors,
     focused: bool,
     search: Option<HintMatches<'static>>,
+    /// The styles the captured cells refer to.
+    styles: StyleTable,
 }
 
 impl Snapshot {
@@ -59,6 +62,7 @@ impl Snapshot {
             colors: *content.colors,
             focused: term.is_focused,
             search: search.dfas().map(|dfas| HintMatches::visible_regex_matches(term, dfas)),
+            styles: term.styles().clone(),
         }
     }
 }
@@ -284,14 +288,15 @@ pub struct RenderableCellExtra {
 impl RenderableCell {
     fn new(content: &mut RenderableContent<'_>, cell: Indexed<&Cell>) -> Self {
         // Lookup RGB values.
-        let mut fg = Self::compute_fg_rgb(content, cell.fg(), cell.attrs());
-        let mut bg = Self::compute_bg_rgb(content, cell.bg());
+        let style = content.terminal_content.styles.get(cell.style());
+        let mut fg = Self::compute_fg_rgb(content, style.fg, style.attrs);
+        let mut bg = Self::compute_bg_rgb(content, style.bg);
 
-        let mut bg_alpha = if cell.attrs().contains(Flags::INVERSE) {
+        let mut bg_alpha = if style.attrs.contains(Flags::INVERSE) {
             mem::swap(&mut fg, &mut bg);
             1.0
         } else {
-            Self::compute_bg_alpha(content.config, cell.bg())
+            Self::compute_bg_alpha(content.config, style.bg)
         };
 
         let is_selected = content.terminal_content.selection.is_some_and(|selection| {
@@ -306,7 +311,7 @@ impl RenderableCell {
         let viewport_start = Point::new(Line(-(display_offset as i32)), Column(0));
         let colors = &content.config.colors;
         let mut character = cell.c();
-        let mut flags = cell.layout().union(cell.attrs());
+        let mut flags = cell.layout().union(style.attrs);
 
         let num_cols = content.size.columns();
         if let Some((c, is_first)) = content
@@ -332,7 +337,7 @@ impl RenderableCell {
             let config_bg = colors.selection.background;
             Self::compute_cell_rgb(&mut fg, &mut bg, &mut bg_alpha, config_fg, config_bg);
 
-            if fg == bg && !cell.attrs().contains(Flags::HIDDEN) {
+            if fg == bg && !style.attrs.contains(Flags::HIDDEN) {
                 // Reveal inversed text when fg/bg is the same.
                 fg = content.color(NamedColor::Background as usize);
                 bg = content.color(NamedColor::Foreground as usize);

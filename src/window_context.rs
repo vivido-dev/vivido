@@ -2539,9 +2539,10 @@ impl WindowContext {
                 let point = crate::terminal::index::Point::new(line, Column(column));
                 let cell = &grid[point];
                 cell.c().hash(&mut hasher);
-                cell.layout().union(cell.attrs()).bits().hash(&mut hasher);
-                hash_color(Some(cell.fg()), &mut hasher);
-                hash_color(Some(cell.bg()), &mut hasher);
+                let style = terminal.style(cell);
+                cell.layout().union(style.attrs).bits().hash(&mut hasher);
+                hash_color(Some(style.fg), &mut hasher);
+                hash_color(Some(style.bg), &mut hasher);
                 hash_color(cell.underline_color(), &mut hasher);
                 cell.zerowidth().unwrap_or_default().hash(&mut hasher);
                 if let Some(link) = cell.hyperlink() {
@@ -3176,7 +3177,7 @@ impl WindowContext {
             let mut cells = Vec::with_capacity(columns);
             for column in 0..columns {
                 let cell = &grid[line][Column(column)];
-                let style = self.cell_style(cell);
+                let style = self.cell_style(cell, terminal.style(cell));
                 let key = serde_json::to_string(&style).map_err(|error| {
                     IpcError::new("unsupported", format!("style serialization failed: {error}"))
                 })?;
@@ -3249,18 +3250,22 @@ impl WindowContext {
     }
 
     #[cfg(any(unix, windows))]
-    fn cell_style(&self, cell: &crate::terminal::term::cell::Cell) -> Value {
+    fn cell_style(
+        &self,
+        cell: &crate::terminal::term::cell::Cell,
+        style: crate::terminal::term::style::Style,
+    ) -> Value {
         let mut foreground =
-            resolve_color(&self.display.colors, cell.fg(), cell.attrs(), true, &self.config);
+            resolve_color(&self.display.colors, style.fg, style.attrs, true, &self.config);
         let mut background =
-            resolve_color(&self.display.colors, cell.bg(), cell.attrs(), false, &self.config);
-        if cell.attrs().contains(Flags::INVERSE) {
+            resolve_color(&self.display.colors, style.bg, style.attrs, false, &self.config);
+        if style.attrs.contains(Flags::INVERSE) {
             std::mem::swap(&mut foreground, &mut background);
         }
         let underline = cell.underline_color().map(|color| {
-            resolve_color(&self.display.colors, color, cell.attrs(), true, &self.config)
+            resolve_color(&self.display.colors, color, style.attrs, true, &self.config)
         });
-        let background_alpha = if cell.bg() == Color::Named(NamedColor::Background) {
+        let background_alpha = if style.bg == Color::Named(NamedColor::Background) {
             (self.config.window_opacity() * 255.0).round() as u8
         } else {
             255
@@ -3269,7 +3274,7 @@ impl WindowContext {
             "foreground": [foreground.r, foreground.g, foreground.b, 255],
             "background": [background.r, background.g, background.b, background_alpha],
             "underline_color": underline.map(|color| [color.r, color.g, color.b, 255]),
-            "attributes": style_attribute_names(cell.attrs()),
+            "attributes": style_attribute_names(style.attrs),
             "hyperlink": cell.hyperlink().map(|link| json_value!({"id": link.id(), "uri": link.uri()})),
         })
     }
