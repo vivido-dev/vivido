@@ -55,6 +55,17 @@ bitflags! {
     }
 }
 
+impl Flags {
+    /// Flags that describe where a cell sits in the grid rather than how it looks.
+    ///
+    /// They stay with the cell when its style is shared, so grid code (wrapping, reflow, wide
+    /// characters) can read them without the style.
+    pub const LAYOUT: Self = Self::WRAPLINE
+        .union(Self::WIDE_CHAR)
+        .union(Self::WIDE_CHAR_SPACER)
+        .union(Self::LEADING_WIDE_CHAR_SPACER);
+}
+
 /// Counter for hyperlinks without explicit ID.
 static HYPERLINK_ID_SUFFIX: AtomicU32 = AtomicU32::new(0);
 
@@ -219,22 +230,70 @@ impl Cell {
         self.bg = color;
     }
 
-    /// Styling and layout flags.
+    /// Layout flags: line wrap and double-width occupancy.
+    ///
+    /// Never contains styling; see [`Cell::attrs`].
     #[inline]
-    pub fn flags(&self) -> Flags {
-        self.flags
+    pub fn layout(&self) -> Flags {
+        self.flags.intersection(Flags::LAYOUT)
     }
 
-    /// Replace the styling and layout flags.
+    /// Replace the layout flags, keeping the styling attributes.
     #[inline]
-    pub fn set_flags(&mut self, flags: Flags) {
-        self.flags = flags;
+    pub fn set_layout(&mut self, flags: Flags) {
+        debug_assert!(Flags::LAYOUT.contains(flags), "{flags:?} is not layout");
+        self.flags = self.flags.difference(Flags::LAYOUT).union(flags);
     }
 
-    /// Mutably borrow the styling and layout flags.
+    /// Set the given layout flags.
     #[inline]
-    pub fn flags_mut(&mut self) -> &mut Flags {
-        &mut self.flags
+    pub fn insert_layout(&mut self, flags: Flags) {
+        debug_assert!(Flags::LAYOUT.contains(flags), "{flags:?} is not layout");
+        self.flags.insert(flags);
+    }
+
+    /// Clear the given layout flags.
+    #[inline]
+    pub fn remove_layout(&mut self, flags: Flags) {
+        debug_assert!(Flags::LAYOUT.contains(flags), "{flags:?} is not layout");
+        self.flags.remove(flags);
+    }
+
+    /// Replace both the layout flags and the styling attributes in one store.
+    #[inline]
+    pub fn set_layout_attrs(&mut self, layout: Flags, attrs: Flags) {
+        debug_assert!(Flags::LAYOUT.contains(layout), "{layout:?} is not layout");
+        debug_assert!(!attrs.intersects(Flags::LAYOUT), "{attrs:?} contains layout");
+        self.flags = layout.union(attrs);
+    }
+
+    /// Styling attributes: weight, slant, decorations, inverse and visibility.
+    ///
+    /// Never contains layout; see [`Cell::layout`].
+    #[inline]
+    pub fn attrs(&self) -> Flags {
+        self.flags.difference(Flags::LAYOUT)
+    }
+
+    /// Replace the styling attributes, keeping the layout flags.
+    #[inline]
+    pub fn set_attrs(&mut self, flags: Flags) {
+        debug_assert!(!flags.intersects(Flags::LAYOUT), "{flags:?} contains layout");
+        self.flags = self.flags.intersection(Flags::LAYOUT).union(flags);
+    }
+
+    /// Set the given styling attributes.
+    #[inline]
+    pub fn insert_attrs(&mut self, flags: Flags) {
+        debug_assert!(!flags.intersects(Flags::LAYOUT), "{flags:?} contains layout");
+        self.flags.insert(flags);
+    }
+
+    /// Clear the given styling attributes.
+    #[inline]
+    pub fn remove_attrs(&mut self, flags: Flags) {
+        debug_assert!(!flags.intersects(Flags::LAYOUT), "{flags:?} contains layout");
+        self.flags.remove(flags);
     }
 
     /// Whether this cell holds extended attributes.
@@ -372,13 +431,18 @@ impl GridCell for Cell {
     }
 
     #[inline]
-    fn flags(&self) -> &Flags {
-        &self.flags
+    fn layout(&self) -> Flags {
+        Cell::layout(self)
     }
 
     #[inline]
-    fn flags_mut(&mut self) -> &mut Flags {
-        &mut self.flags
+    fn insert_layout(&mut self, flags: Flags) {
+        Cell::insert_layout(self, flags);
+    }
+
+    #[inline]
+    fn remove_layout(&mut self, flags: Flags) {
+        Cell::remove_layout(self, flags);
     }
 
     #[inline]
@@ -499,6 +563,30 @@ mod tests {
         cell.clear_wide();
         assert!(cell.zerowidth().unwrap().is_empty());
         assert_eq!(original.zerowidth().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn layout_and_attributes_change_independently() {
+        let mut cell = Cell::default();
+        cell.set_attrs(Flags::BOLD | Flags::UNDERLINE);
+        cell.insert_layout(Flags::WIDE_CHAR);
+        assert_eq!(cell.layout(), Flags::WIDE_CHAR);
+        assert_eq!(cell.attrs(), Flags::BOLD | Flags::UNDERLINE);
+
+        cell.set_attrs(Flags::ITALIC);
+        assert_eq!(cell.layout(), Flags::WIDE_CHAR, "replacing attributes keeps layout");
+        cell.set_layout(Flags::WRAPLINE);
+        assert_eq!(cell.attrs(), Flags::ITALIC, "replacing layout keeps attributes");
+
+        cell.set_layout_attrs(Flags::WIDE_CHAR_SPACER, Flags::DIM);
+        assert_eq!((cell.layout(), cell.attrs()), (Flags::WIDE_CHAR_SPACER, Flags::DIM));
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "contains layout")]
+    fn a_layout_flag_is_not_an_attribute() {
+        Cell::default().set_attrs(Flags::WRAPLINE);
     }
 
     #[test]

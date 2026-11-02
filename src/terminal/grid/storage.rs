@@ -251,11 +251,15 @@ mod tests {
             *self = *template;
         }
 
-        fn flags(&self) -> &Flags {
+        fn layout(&self) -> Flags {
             unimplemented!();
         }
 
-        fn flags_mut(&mut self) -> &mut Flags {
+        fn insert_layout(&mut self, _flags: Flags) {
+            unimplemented!();
+        }
+
+        fn remove_layout(&mut self, _flags: Flags) {
             unimplemented!();
         }
     }

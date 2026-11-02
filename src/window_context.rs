@@ -2539,7 +2539,7 @@ impl WindowContext {
                 let point = crate::terminal::index::Point::new(line, Column(column));
                 let cell = &grid[point];
                 cell.c().hash(&mut hasher);
-                cell.flags().bits().hash(&mut hasher);
+                cell.layout().union(cell.attrs()).bits().hash(&mut hasher);
                 hash_color(Some(cell.fg()), &mut hasher);
                 hash_color(Some(cell.bg()), &mut hasher);
                 hash_color(cell.underline_color(), &mut hasher);
@@ -2550,7 +2550,7 @@ impl WindowContext {
                 }
                 (point == cursor).hash(&mut hasher);
                 selection.is_some_and(|selection| selection.contains(point)).hash(&mut hasher);
-                cell.flags().contains(Flags::WRAPLINE).hash(&mut hasher);
+                cell.layout().contains(Flags::WRAPLINE).hash(&mut hasher);
             }
             row_hashes.push(hasher.finish());
         }
@@ -3189,11 +3189,11 @@ impl WindowContext {
                         style_id
                     },
                 };
-                let (width, kind) = if cell.flags().contains(Flags::WIDE_CHAR_SPACER) {
+                let (width, kind) = if cell.layout().contains(Flags::WIDE_CHAR_SPACER) {
                     (0, "continuation")
-                } else if cell.flags().contains(Flags::LEADING_WIDE_CHAR_SPACER) {
+                } else if cell.layout().contains(Flags::LEADING_WIDE_CHAR_SPACER) {
                     (0, "leading_wide_spacer")
-                } else if cell.flags().contains(Flags::WIDE_CHAR) {
+                } else if cell.layout().contains(Flags::WIDE_CHAR) {
                     (2, "character")
                 } else {
                     (1, "character")
@@ -3210,7 +3210,7 @@ impl WindowContext {
             let viewport_row = (line.0 >= viewport_start && line.0 <= viewport_end)
                 .then_some(line.0 - viewport_start);
             let wrapped =
-                columns > 0 && grid[line][Column(columns - 1)].flags().contains(Flags::WRAPLINE);
+                columns > 0 && grid[line][Column(columns - 1)].layout().contains(Flags::WRAPLINE);
             rows.push(json_value!({
                 "grid_line": line.0,
                 "viewport_row": viewport_row,
@@ -3251,14 +3251,14 @@ impl WindowContext {
     #[cfg(any(unix, windows))]
     fn cell_style(&self, cell: &crate::terminal::term::cell::Cell) -> Value {
         let mut foreground =
-            resolve_color(&self.display.colors, cell.fg(), cell.flags(), true, &self.config);
+            resolve_color(&self.display.colors, cell.fg(), cell.attrs(), true, &self.config);
         let mut background =
-            resolve_color(&self.display.colors, cell.bg(), cell.flags(), false, &self.config);
-        if cell.flags().contains(Flags::INVERSE) {
+            resolve_color(&self.display.colors, cell.bg(), cell.attrs(), false, &self.config);
+        if cell.attrs().contains(Flags::INVERSE) {
             std::mem::swap(&mut foreground, &mut background);
         }
         let underline = cell.underline_color().map(|color| {
-            resolve_color(&self.display.colors, color, cell.flags(), true, &self.config)
+            resolve_color(&self.display.colors, color, cell.attrs(), true, &self.config)
         });
         let background_alpha = if cell.bg() == Color::Named(NamedColor::Background) {
             (self.config.window_opacity() * 255.0).round() as u8
@@ -3269,7 +3269,7 @@ impl WindowContext {
             "foreground": [foreground.r, foreground.g, foreground.b, 255],
             "background": [background.r, background.g, background.b, background_alpha],
             "underline_color": underline.map(|color| [color.r, color.g, color.b, 255]),
-            "attributes": style_attribute_names(cell.flags()),
+            "attributes": style_attribute_names(cell.attrs()),
             "hyperlink": cell.hyperlink().map(|link| json_value!({"id": link.id(), "uri": link.uri()})),
         })
     }

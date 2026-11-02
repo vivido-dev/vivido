@@ -26,10 +26,14 @@ pub trait GridCell: Sized {
     /// Perform an opinionated cell reset based on a template cell.
     fn reset(&mut self, template: &Self);
 
-    /// Borrow this cell's terminal flags.
-    fn flags(&self) -> &Flags;
-    /// Mutably borrow this cell's terminal flags.
-    fn flags_mut(&mut self) -> &mut Flags;
+    /// Layout flags: line wrap and double-width occupancy, never styling.
+    fn layout(&self) -> Flags;
+
+    /// Set the given layout flags; `flags` must contain only [`Flags::LAYOUT`] bits.
+    fn insert_layout(&mut self, flags: Flags);
+
+    /// Clear the given layout flags; `flags` must contain only [`Flags::LAYOUT`] bits.
+    fn remove_layout(&mut self, flags: Flags);
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]

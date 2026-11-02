@@ -88,7 +88,7 @@ impl SelectionRange {
         }
 
         // Check if a wide char's trailing spacer is selected.
-        indexed.cell.flags().contains(Flags::WIDE_CHAR)
+        indexed.cell.layout().contains(Flags::WIDE_CHAR)
             && self.contains(Point::new(indexed.point.line, indexed.point.column + 1))
     }
 }
