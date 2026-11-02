@@ -16,8 +16,8 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
         T: ResetDiscriminant<D>,
         D: PartialEq,
     {
-        // Use empty template cell for resetting cells due to resize.
-        let template = mem::take(&mut self.cursor.template);
+        // Reset cells uncovered by a resize to the default style, not the current background.
+        let erase = mem::take(&mut self.cursor.erase);
 
         match self.lines.cmp(&lines) {
             Ordering::Less => self.grow_lines(lines),
@@ -31,8 +31,8 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
             Ordering::Equal => (),
         }
 
-        // Restore template cell.
-        self.cursor.template = template;
+        // Restore the erase cell.
+        self.cursor.erase = erase;
     }
 
     /// Add lines to the visible area.

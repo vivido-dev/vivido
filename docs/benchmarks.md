@@ -575,3 +575,21 @@ Query p99: idle 0.050 → 0.051 ms and 0.054 → 0.054 ms; loaded 1.81 → 1.63 
 
 The headless integration tests and the native macOS frame, pane and background-pane tests pass
 with gathering as the default. Linux and Windows readers are unchanged.
+
+## Shared cell styles (2026-11-02)
+
+Phase B step B4 of the plain-text throughput plan: cells hold a 32-bit id into a per-terminal
+style table instead of their colors and attributes. Before: the Phase A build. After: B4. Three
+alternating samples, medians, MiB/s.
+
+| Benchmark | Mode | ASCII | Unicode | CSI | Long escapes | Images |
+|---|---|---|---|---|---|---|
+| Kitty | default | 292.1 → 345.5 | 270.9 → 294.4 | 111.4 → 107.1 | 592.7 → 582.6 | 601.9 → 594.3 |
+| Kitty | `--render` | 297.0 → 357.3 | 278.3 → 306.2 | 115.8 → 111.9 | 588.3 → 588.3 | 593.4 → 589.7 |
+| Replay | default | 253.4 → 291.0 | 300.4 → 324.7 | 111.9 → 107.3 | 478.3 → 458.8 | 465.8 → 460.1 |
+| Replay | `--render` | 261.6 → 302.1 | 308.3 → 336.7 | 116.7 → 112.9 | 471.9 → 469.2 | 481.6 → 480.8 |
+
+Replay's unique multi-codepoint Unicode cells: 169.9 → 181.4 and 183.4 → 188.3. Query p99
+stayed within limits (idle 0.057 → 0.063 ms, loaded 1.65 → 1.32 ms default). The CSI loss is
+the cost of interning on SGR changes; a 4096-slot cache in front of the table answers repeated
+states without hashing.

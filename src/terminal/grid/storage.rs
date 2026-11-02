@@ -60,6 +60,21 @@ impl<T: PartialEq> PartialEq for Storage<T> {
 }
 
 impl<T> Storage<T> {
+    /// Visit every row, including cached rows outside the active region.
+    pub(crate) fn for_each_row_mut(&mut self, f: impl FnMut(&mut Row<T>)) {
+        self.inner.iter_mut().for_each(f);
+    }
+
+    /// Convert every cell of every row, keeping the ring buffer's layout.
+    pub(crate) fn map<U>(&self, mut f: impl FnMut(&T) -> U) -> Storage<U> {
+        Storage {
+            inner: self.inner.iter().map(|row| row.map(&mut f)).collect(),
+            zero: self.zero,
+            visible_lines: self.visible_lines,
+            len: self.len,
+        }
+    }
+
     #[inline]
     pub fn with_capacity(visible_lines: usize, columns: usize) -> Storage<T>
     where

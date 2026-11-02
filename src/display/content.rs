@@ -10,7 +10,7 @@ use crate::terminal::index::{Column, Line, Point};
 use crate::terminal::selection::SelectionRange;
 use crate::terminal::term::cell::{Cell, Flags, Hyperlink};
 use crate::terminal::term::search::{Match, RegexSearch};
-use crate::terminal::term::style::StyleTable;
+use crate::terminal::term::style::Style;
 use crate::terminal::term::{self, Term};
 use crate::terminal::vvte::ansi::{Color, CursorShape, NamedColor};
 
@@ -23,6 +23,9 @@ use crate::event::SearchState;
 /// Minimum contrast between a fixed cursor color and the cell's background.
 pub const MIN_CURSOR_CONTRAST: f64 = 1.5;
 
+/// A captured viewport cell with its style resolved, so it outlives the terminal lock.
+pub(super) type SnapshotCell = (Indexed<Cell>, Style);
+
 /// Owned metadata accompanying a reusable viewport cell snapshot.
 pub(super) struct Snapshot {
     selection: Option<SelectionRange>,
@@ -31,14 +34,12 @@ pub(super) struct Snapshot {
     colors: term::color::Colors,
     focused: bool,
     search: Option<HintMatches<'static>>,
-    /// The styles the captured cells refer to.
-    styles: StyleTable,
 }
 
 impl Snapshot {
     pub(super) fn capture<T: EventListener>(
         term: &Term<T>,
-        cells: &mut Vec<Indexed<Cell>>,
+        cells: &mut Vec<SnapshotCell>,
         refresh: bool,
         search: &mut SearchState,
         hints: &mut HintState,
@@ -46,11 +47,9 @@ impl Snapshot {
         let content = term.renderable_content();
         if refresh || cells.len() != term.screen_lines() * term.columns() {
             cells.clear();
-            cells.extend(
-                content
-                    .display_iter
-                    .map(|cell| Indexed { point: cell.point, cell: cell.cell.clone() }),
-            );
+            cells.extend(content.display_iter.map(|cell| {
+                (Indexed { point: cell.point, cell: cell.cell.clone() }, term.style(cell.cell))
+            }));
         }
         if hints.active() {
             hints.update_matches(term);
@@ -62,7 +61,6 @@ impl Snapshot {
             colors: *content.colors,
             focused: term.is_focused,
             search: search.dfas().map(|dfas| HintMatches::visible_regex_matches(term, dfas)),
-            styles: term.styles().clone(),
         }
     }
 }
@@ -72,7 +70,7 @@ impl Snapshot {
 /// This provides the terminal cursor and an iterator over all non-empty cells.
 pub struct RenderableContent<'a> {
     terminal_content: Snapshot,
-    cells: &'a mut Vec<Indexed<Cell>>,
+    cells: &'a mut Vec<SnapshotCell>,
     cell_index: usize,
     cursor: RenderableCursor,
     cursor_shape: CursorShape,
@@ -229,9 +227,10 @@ impl Iterator for RenderableContent<'_> {
         loop {
             let slot = self.cells.get_mut(self.cell_index)?;
             self.cell_index += 1;
-            let cell = Indexed { point: slot.point, cell: slot.cell.clone() };
+            let (cell, style) =
+                (Indexed { point: slot.0.point, cell: slot.0.cell.clone() }, slot.1);
             let mut cell =
-                RenderableCell::new(self, Indexed { point: cell.point, cell: &cell.cell });
+                RenderableCell::new(self, Indexed { point: cell.point, cell: &cell.cell }, style);
 
             if self.cursor_point == cell.point {
                 // Store the cursor which should be rendered.
@@ -286,9 +285,8 @@ pub struct RenderableCellExtra {
 }
 
 impl RenderableCell {
-    fn new(content: &mut RenderableContent<'_>, cell: Indexed<&Cell>) -> Self {
+    fn new(content: &mut RenderableContent<'_>, cell: Indexed<&Cell>, style: Style) -> Self {
         // Lookup RGB values.
-        let style = content.terminal_content.styles.get(cell.style());
         let mut fg = Self::compute_fg_rgb(content, style.fg, style.attrs);
         let mut bg = Self::compute_bg_rgb(content, style.bg);
 
@@ -671,13 +669,13 @@ mod snapshot_tests {
         term.input('z');
         term.goto(0, 0);
         term.input('x');
-        assert_eq!(cells[0].c(), 'a');
-        assert_eq!(cells[0].zerowidth(), Some(['\u{301}'].as_slice()));
+        assert_eq!(cells[0].0.c(), 'a');
+        assert_eq!(cells[0].0.zerowidth(), Some(['\u{301}'].as_slice()));
         assert_eq!(snapshot.cursor, cursor);
         Snapshot::capture(&term, &mut cells, false, &mut search, &mut hints);
-        assert_eq!(cells[0].c(), 'a', "an undamaged viewport reuses its owned cells");
+        assert_eq!(cells[0].0.c(), 'a', "an undamaged viewport reuses its owned cells");
         Snapshot::capture(&term, &mut cells, true, &mut search, &mut hints);
-        assert_eq!(cells[0].c(), 'x');
+        assert_eq!(cells[0].0.c(), 'x');
         assert_eq!(cells.capacity(), capacity);
     }
 }

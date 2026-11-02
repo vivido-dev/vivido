@@ -1326,10 +1326,37 @@ impl<T> Term<T> {
     /// Change the style new output is written with.
     #[inline]
     fn update_template_style(&mut self, update: impl FnOnce(&mut Style)) {
-        let mut style = self.template_style();
+        let previous = self.template_style();
+        let mut style = previous;
         update(&mut style);
+        if style == previous {
+            return;
+        }
         let id = self.styles.intern(style);
         self.grid.cursor.template.set_style(id);
+        if style.bg != previous.bg {
+            let erase = self.styles.intern(Style { bg: style.bg, ..Style::default() });
+            self.grid.cursor.erase.set_style(erase);
+        }
+        if self.styles.needs_sweep() {
+            self.sweep_styles();
+        }
+    }
+
+    /// Drop styles no cell refers to any more and renumber the rest.
+    ///
+    /// Walks every cell of both screens, scrollback and cached rows included, and every cursor
+    /// that can write or erase them. Runs only once the table has doubled since the last sweep.
+    fn sweep_styles(&mut self) {
+        let mut marks = self.styles.marks();
+        for grid in [&mut self.grid, &mut self.inactive_grid] {
+            grid.for_each_cell_mut(|cell| marks.mark(cell.style()));
+        }
+        let remap = self.styles.compact(marks);
+        for grid in [&mut self.grid, &mut self.inactive_grid] {
+            grid.for_each_cell_mut(|cell| cell.set_style(remap.get(cell.style())));
+        }
+        debug!("Style sweep kept {} styles", self.styles.len());
     }
 
     /// Whether `column` is currently configured as a horizontal tab stop.
@@ -2241,7 +2268,7 @@ impl<T: EventListener> Handler for Term<T> {
     #[inline]
     fn insert_blank(&mut self, count: usize) {
         let cursor = &self.grid.cursor;
-        let bg = self.styles.get(cursor.template.style()).bg;
+        let erase = cursor.erase.clone();
 
         // Ensure inserting within terminal bounds
         let count = cmp::min(count, self.columns() - cursor.point.column.0);
@@ -2262,7 +2289,7 @@ impl<T: EventListener> Handler for Term<T> {
         // Cells were just moved out toward the end of the line;
         // fill in between source and dest with blanks.
         for cell in &mut row[source.0..destination] {
-            *cell = bg.into();
+            *cell = erase.clone();
         }
     }
 
@@ -2589,12 +2616,12 @@ impl<T: EventListener> Handler for Term<T> {
         let end = cmp::min(start + count, Column(self.columns()));
 
         // Cleared cells have current background color set.
-        let bg = self.template_style().bg;
+        let erase = self.grid.cursor.erase.clone();
         let line = cursor.point.line;
         self.damage.damage_line(line.0 as usize, start.0, end.0);
         let row = &mut self.grid[line];
         for cell in &mut row[start..end] {
-            *cell = bg.into();
+            *cell = erase.clone();
         }
     }
 
@@ -2602,7 +2629,7 @@ impl<T: EventListener> Handler for Term<T> {
     fn delete_chars(&mut self, count: usize) {
         let columns = self.columns();
         let cursor = &self.grid.cursor;
-        let bg = self.styles.get(cursor.template.style()).bg;
+        let erase = cursor.erase.clone();
 
         // Ensure deleting within terminal bounds.
         let count = cmp::min(count, columns);
@@ -2623,7 +2650,7 @@ impl<T: EventListener> Handler for Term<T> {
         // 1 cell.
         let end = columns - count;
         for cell in &mut row[end..] {
-            *cell = bg.into();
+            *cell = erase.clone();
         }
     }
 
@@ -2700,7 +2727,7 @@ impl<T: EventListener> Handler for Term<T> {
         trace!("Clearing line: {mode:?}");
 
         let cursor = &self.grid.cursor;
-        let bg = self.styles.get(cursor.template.style()).bg;
+        let erase = cursor.erase.clone();
         let point = cursor.point;
 
         let (left, right) = match mode {
@@ -2714,7 +2741,7 @@ impl<T: EventListener> Handler for Term<T> {
 
         let row = &mut self.grid[point.line];
         for cell in &mut row[left..right] {
-            *cell = bg.into();
+            *cell = erase.clone();
         }
 
         let range = self.grid.cursor.point.line..=self.grid.cursor.point.line;
@@ -2813,7 +2840,7 @@ impl<T: EventListener> Handler for Term<T> {
     #[inline]
     fn clear_screen(&mut self, mode: ansi::ClearMode) {
         trace!("Clearing screen: {mode:?}");
-        let bg = self.template_style().bg;
+        let erase = self.grid.cursor.erase.clone();
 
         let screen_lines = self.screen_lines();
 
@@ -2838,7 +2865,7 @@ impl<T: EventListener> Handler for Term<T> {
                 // Clear up to the current column in the current line.
                 let end = cmp::min(cursor.column + 1, Column(self.columns()));
                 for cell in &mut self.grid[cursor.line][..end] {
-                    *cell = bg.into();
+                    *cell = erase.clone();
                 }
 
                 let range = Line(0)..=cursor.line;
@@ -2847,7 +2874,7 @@ impl<T: EventListener> Handler for Term<T> {
             ansi::ClearMode::Below => {
                 let cursor = self.grid.cursor.point;
                 for cell in &mut self.grid[cursor.line][cursor.column..] {
-                    *cell = bg.into();
+                    *cell = erase.clone();
                 }
 
                 if (cursor.line.0 as usize) < screen_lines - 1 {
@@ -3922,6 +3949,50 @@ mod tests {
     }
 
     #[test]
+    fn erased_cells_keep_only_the_background_of_the_current_style() {
+        let mut term = Term::new(Config::default(), &TermSize::new(4, 2), VoidListener);
+        let mut parser: ansi::Processor = ansi::Processor::new();
+        parser.advance(&mut term, b"\x1b[1;4;31;44mab\x1b[H\x1b[K\r\n\x1b[@");
+
+        let erased = Style { bg: Color::Named(NamedColor::Blue), ..Style::default() };
+        assert_eq!(term.style(&term.grid()[Line(0)][Column(0)]), erased, "erase in line");
+        assert_eq!(term.style(&term.grid()[Line(1)][Column(0)]), erased, "insert blank");
+        assert_eq!(term.template_style().attrs, Flags::BOLD | Flags::UNDERLINE);
+    }
+
+    #[test]
+    fn a_style_sweep_reclaims_unused_styles_and_keeps_every_screen_intact() {
+        let size = TermSize::new(8, 2);
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+        let mut parser: ansi::Processor = ansi::Processor::new();
+        // A styled cell that scrolls into history, and one that stays on the primary screen.
+        parser.advance(&mut term, b"\x1b[38;5;200mh\r\n\r\n\x1b[48;5;100mp");
+        parser.advance(&mut term, b"\x1b[?1049h\x1b[38;5;33m\x1b[1;2Ha");
+
+        // Churn through many more styles than the sweep floor on the alternate screen.
+        for i in 0..20_000_u32 {
+            let [_, r, g, b] = i.to_be_bytes();
+            let sgr = format!("\x1b[38;2;{r};{g};{b}m\x1b[Hx");
+            parser.advance(&mut term, sgr.as_bytes());
+        }
+        assert!(term.styles().len() < 8192, "{} styles kept", term.styles().len());
+
+        let last = Color::Spec(Rgb { r: 0, g: 0x4e, b: 0x1f });
+        assert_eq!(term.style(&term.grid()[Line(0)][Column(0)]).fg, last);
+        assert_eq!(term.style(&term.grid()[Line(0)][Column(1)]).fg, Color::Indexed(33));
+        // The cursor template survived the sweep with the style last selected.
+        assert_eq!(term.template_style().fg, last);
+
+        parser.advance(&mut term, b"\x1b[?1049l");
+        let history = Line(-1);
+        assert_eq!(term.style(&term.grid()[history][Column(0)]).fg, Color::Indexed(200));
+        assert_eq!(term.style(&term.grid()[Line(1)][Column(0)]).bg, Color::Indexed(100));
+        // The cursor saved before the switch was remapped too.
+        let saved = Style { fg: Color::Indexed(200), bg: Color::Indexed(100), ..Style::default() };
+        assert_eq!(term.template_style(), saved);
+    }
+
+    #[test]
     fn sgr_undercurl_is_distinct_and_cancellable() {
         let size = TermSize::new(5, 1);
         let mut term = Term::new(Config::default(), &size, VoidListener);
@@ -4447,9 +4518,12 @@ mod tests {
     #[test]
     #[cfg(feature = "serde")]
     fn grid_serde() {
-        let grid: Grid<Cell> = Grid::new(24, 80, 0);
+        use crate::terminal::term::cell::SerializedCell;
+
+        let styles = StyleTable::default();
+        let grid = Grid::<Cell>::new(24, 80, 0).map(|cell| SerializedCell::new(cell, &styles));
         let serialized = serde_json::to_string(&grid).expect("ser");
-        let deserialized = serde_json::from_str::<Grid<Cell>>(&serialized).expect("de");
+        let deserialized = serde_json::from_str::<Grid<SerializedCell>>(&serialized).expect("de");
 
         assert_eq!(deserialized, grid);
     }

@@ -189,6 +189,19 @@ impl<T> Row<T> {
     }
 }
 
+impl<T> Row<T> {
+    /// Visit every stored cell, including any kept beyond the current width, without marking
+    /// cells occupied.
+    pub(crate) fn for_each_stored_mut(&mut self, f: impl FnMut(&mut T)) {
+        self.inner.iter_mut().for_each(f);
+    }
+
+    /// Convert every stored cell, keeping occupancy.
+    pub(crate) fn map<U>(&self, f: impl FnMut(&T) -> U) -> Row<U> {
+        Row { inner: self.inner.iter().map(f).collect(), occ: self.occ }
+    }
+}
+
 impl<'a, T> IntoIterator for &'a Row<T> {
     type IntoIter = slice::Iter<'a, T>;
     type Item = &'a T;

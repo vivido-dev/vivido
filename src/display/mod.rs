@@ -415,7 +415,7 @@ pub struct Display {
     cached_scene_frames: u64,
     #[cfg(feature = "perf")]
     perf_last_frame: Option<Instant>,
-    snapshot_cells: Vec<crate::terminal::grid::Indexed<crate::terminal::term::cell::Cell>>,
+    snapshot_cells: Vec<content::SnapshotCell>,
     text_system: TextSystem,
     meter: Meter,
 }

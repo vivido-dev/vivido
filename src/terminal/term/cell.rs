@@ -7,8 +7,8 @@ use smallvec::SmallVec;
 
 use crate::terminal::grid::{self, GridCell};
 use crate::terminal::index::Column;
-use crate::terminal::term::style::{Style, StyleId};
-use crate::terminal::vvte::ansi::{Color, Hyperlink as VteHyperlink, NamedColor};
+use crate::terminal::term::style::{StyleId, StyleTable};
+use crate::terminal::vvte::ansi::{Color, Hyperlink as VteHyperlink};
 
 bitflags! {
     /// Styling and grid-occupancy flags attached to a terminal cell.
@@ -142,9 +142,9 @@ impl<T: Copy> ResetDiscriminant<T> for T {
     }
 }
 
-impl ResetDiscriminant<Color> for Cell {
-    fn discriminant(&self) -> Color {
-        self.style.inline().bg
+impl ResetDiscriminant<StyleId> for Cell {
+    fn discriminant(&self) -> StyleId {
+        self.style
     }
 }
 
@@ -168,11 +168,9 @@ pub struct CellExtra {
 
 /// Content and attributes of a single cell in the terminal grid.
 ///
-/// Colors and styling attributes live in the terminal's style table; the cell holds a
-/// [`StyleId`] for them. Serialization keeps the flat form fixtures use (`c`, `fg`, `bg`, `flags`,
-/// `extra`).
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(from = "SerializedCell", into = "SerializedCell")]
+/// Colors and styling attributes live in the terminal's [`StyleTable`]; the cell holds a
+/// [`StyleId`] for them. [`SerializedCell`] is its self-contained form.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Cell {
     /// Character stored in this terminal cell.
     c: char,
@@ -184,9 +182,11 @@ pub struct Cell {
     extra: Option<Arc<CellExtra>>,
 }
 
-/// The flat serialized form of a [`Cell`], with its style written out.
-#[derive(Serialize, Deserialize)]
-struct SerializedCell {
+/// A cell with its style written out, independent of any style table.
+///
+/// This is the form reference fixtures and diagnostic grid dumps store.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SerializedCell {
     c: char,
     fg: Color,
     bg: Color,
@@ -194,19 +194,18 @@ struct SerializedCell {
     extra: Option<Arc<CellExtra>>,
 }
 
-impl From<SerializedCell> for Cell {
-    fn from(cell: SerializedCell) -> Self {
-        let style = Style { fg: cell.fg, bg: cell.bg, attrs: cell.flags.difference(Flags::LAYOUT) };
-        let layout = cell.flags.intersection(Flags::LAYOUT);
-        Self { c: cell.c, style: StyleId::from_inline(style), layout, extra: cell.extra }
+impl SerializedCell {
+    /// Write out `cell`, whose style `styles` holds.
+    pub fn new(cell: &Cell, styles: &StyleTable) -> Self {
+        let style = styles.get(cell.style);
+        let flags = cell.layout.union(style.attrs);
+        Self { c: cell.c, fg: style.fg, bg: style.bg, flags, extra: cell.extra.clone() }
     }
 }
 
-impl From<Cell> for SerializedCell {
-    fn from(cell: Cell) -> Self {
-        let style = cell.style.inline();
-        let flags = cell.layout.union(style.attrs);
-        Self { c: cell.c, fg: style.fg, bg: style.bg, flags, extra: cell.extra }
+impl Default for SerializedCell {
+    fn default() -> Self {
+        Self::new(&Cell::default(), &StyleTable::default())
     }
 }
 
@@ -392,11 +391,8 @@ impl Cell {
 impl GridCell for Cell {
     #[inline]
     fn is_empty(&self) -> bool {
-        let style = self.style.inline();
         (self.c == ' ' || self.c == '\t')
-            && style.bg == Color::Named(NamedColor::Background)
-            && style.fg == Color::Named(NamedColor::Foreground)
-            && !style.attrs.intersects(Flags::INVERSE | Flags::ALL_UNDERLINES | Flags::STRIKEOUT)
+            && !self.style.shows_on_blank()
             && !self.layout.intersects(
                 Flags::WRAPLINE | Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER,
             )
@@ -428,8 +424,7 @@ impl GridCell for Cell {
             self.extra = None;
         }
         self.c = ' ';
-        self.style =
-            StyleId::from_inline(Style { bg: template.style.inline().bg, ..Style::default() });
+        self.style = template.style;
         self.layout = Flags::empty();
     }
 }
@@ -439,16 +434,6 @@ impl From<char> for Cell {
     #[inline]
     fn from(c: char) -> Self {
         Self { c, ..Cell::default() }
-    }
-}
-
-impl From<Color> for Cell {
-    #[inline]
-    fn from(color: Color) -> Self {
-        Self {
-            style: StyleId::from_inline(Style { bg: color, ..Style::default() }),
-            ..Cell::default()
-        }
     }
 }
 
@@ -482,6 +467,8 @@ impl LineLength for grid::Row<Cell> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::terminal::term::style::Style;
 
     use std::mem;
 
@@ -532,11 +519,13 @@ mod tests {
         assert!(cell.extra.as_ref().unwrap().zerowidth.spilled());
         assert_eq!(original.zerowidth().unwrap(), ['\u{301}'; 4]);
         assert_eq!(cell.zerowidth().unwrap().len(), 132);
-        let value = serde_json::to_value(&cell).unwrap();
+        let serialized =
+            SerializedCell::new(&cell, &crate::terminal::term::style::StyleTable::default());
+        let value = serde_json::to_value(&serialized).unwrap();
         let suffix: Vec<char> =
             serde_json::from_value(value["extra"]["zerowidth"].clone()).unwrap();
         assert_eq!(suffix, cell.zerowidth().unwrap());
-        assert_eq!(serde_json::from_value::<Cell>(value).unwrap(), cell);
+        assert_eq!(serde_json::from_value::<SerializedCell>(value).unwrap(), serialized);
         cell.clear_wide();
         assert!(cell.zerowidth().unwrap().is_empty());
         assert_eq!(original.zerowidth().unwrap().len(), 4);
@@ -568,10 +557,11 @@ mod tests {
             attrs: Flags::BOLD | Flags::UNDERLINE,
         }));
         cell.set_layout(Flags::WIDE_CHAR);
-        let value = serde_json::to_value(&cell).unwrap();
+        let serialized = SerializedCell::new(&cell, &table);
+        let value = serde_json::to_value(&serialized).unwrap();
         assert_eq!(value["flags"], "BOLD | UNDERLINE | WIDE_CHAR");
         assert_eq!(value["fg"], serde_json::json!({"Indexed": 1}));
-        assert_eq!(serde_json::from_value::<Cell>(value).unwrap(), cell);
+        assert_eq!(serde_json::from_value::<SerializedCell>(value).unwrap(), serialized);
     }
 
     #[test]

@@ -3440,9 +3440,15 @@ impl WindowContext {
     /// Panics if terminal snapshot serialization or writing the reference files fails.
     pub fn write_ref_test_results(&self) {
         // Dump grid state.
-        let mut grid = self.terminal.lock().grid().clone();
-        grid.initialize_all();
-        grid.truncate();
+        let grid = {
+            let terminal = self.terminal.lock();
+            let mut grid = terminal.grid().clone();
+            grid.initialize_all();
+            grid.truncate();
+            grid.map(|cell| {
+                crate::terminal::term::cell::SerializedCell::new(cell, terminal.styles())
+            })
+        };
 
         let serialized_grid = json::to_string(&grid).expect("serialize grid");
 
