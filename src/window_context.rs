@@ -843,6 +843,12 @@ impl WindowContext {
 
         // Redraw the window.
         let terminal = self.terminal.lock();
+        // A synchronized update is still being written, so keep the last frame on screen. Its
+        // end, or its deadline, wakes the window from the PTY reader, and the damage stays queued
+        // for that draw. Staying dirty would only retry this lock on every UI event until then.
+        if terminal.mode().contains(TermMode::SYNC_UPDATE) {
+            return false;
+        }
         let presented = self.display.draw(
             terminal,
             scheduler,
@@ -2520,7 +2526,9 @@ impl WindowContext {
         rows.hash(&mut metadata);
         columns.hash(&mut metadata);
         display_offset.hash(&mut metadata);
-        (terminal.mode().bits() & !TermMode::URGENCY_HINTS.bits()).hash(&mut metadata);
+        // Neither mode changes what is on screen.
+        let unseen = TermMode::URGENCY_HINTS | TermMode::SYNC_UPDATE;
+        (terminal.mode().bits() & !unseen.bits()).hash(&mut metadata);
         let metadata = metadata.finish();
 
         let mut row_hashes = Vec::with_capacity(rows);

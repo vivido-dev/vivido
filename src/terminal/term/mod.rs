@@ -270,6 +270,8 @@ bitflags! {
         const REPORT_ALL_KEYS_AS_ESC  = 1 << 21;
         /// Include associated text in keyboard reports.
         const REPORT_ASSOCIATED_TEXT  = 1 << 22;
+        /// A synchronized update (DECSET 2026) is pending: the screen must not be presented.
+        const SYNC_UPDATE             = 1 << 23;
         /// All mouse-reporting modes.
         const MOUSE_MODE              = Self::MOUSE_REPORT_CLICK.bits() | Self::MOUSE_MOTION.bits() | Self::MOUSE_DRAG.bits();
         /// All supported extended keyboard-protocol flags.
@@ -1957,6 +1959,67 @@ impl<T: EventListener> Term<T> {
         }
     }
 
+    /// Write an ASCII run row by row with one fused check-and-store pass per row segment.
+    ///
+    /// Only printable bytes written over plain cells take the fill; DEL, controls, and cells
+    /// that own wide-character or extra state fall back to scalar input one byte at a time.
+    fn write_ascii_run(&mut self, mut bytes: &[u8]) {
+        if self.grid.cursor.charsets[self.active_charset] != StandardCharset::Ascii
+            || self.mode.contains(TermMode::INSERT)
+            || !self.mode.contains(TermMode::LINE_WRAP)
+            || self.grid.cursor.template.extra.is_some()
+        {
+            for &b in bytes {
+                self.input(char::from(b));
+            }
+            return;
+        }
+        let special = Flags::WIDE_CHAR | Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER;
+        let template = &self.grid.cursor.template;
+        let (fg, bg, flags) = (template.fg, template.bg, template.flags);
+        while let Some(&first) = bytes.first() {
+            // Scalar input ignores DEL before considering a pending wrap.
+            if first.wrapping_sub(0x20) >= 0x5F {
+                self.input(char::from(first));
+                bytes = &bytes[1..];
+                continue;
+            }
+            if self.grid.cursor.input_needs_wrap {
+                self.wrapline();
+            }
+            let point = self.grid.cursor.point;
+            let columns = self.columns();
+            let count = (columns - point.column.0).min(bytes.len());
+            // Find the writable prefix through a shared borrow first: a mutable range borrow
+            // marks the whole range occupied, which must cover only cells actually written.
+            let written = self.grid[point.line][point.column..point.column + count]
+                .iter()
+                .zip(bytes)
+                .take_while(|(cell, b)| {
+                    b.wrapping_sub(0x20) < 0x5F
+                        && cell.extra.is_none()
+                        && !cell.flags.intersects(special)
+                })
+                .count();
+            let cells = &mut self.grid[point.line][point.column..point.column + written];
+            for (cell, &b) in cells.iter_mut().zip(bytes) {
+                cell.c = char::from(b);
+                cell.fg = fg;
+                cell.bg = bg;
+                cell.flags = flags;
+            }
+            if written == 0 {
+                self.input(char::from(first));
+                bytes = &bytes[1..];
+                continue;
+            }
+            let end = point.column.0 + written;
+            self.grid.cursor.input_needs_wrap = end == columns;
+            self.grid.cursor.point.column = Column(end.min(columns - 1));
+            bytes = &bytes[written..];
+        }
+    }
+
     /// Restore host input/display semantics after an application failed to tear them down.
     ///
     /// Unlike RIS, this preserves the primary grid and its scrollback so recovery does not erase
@@ -2012,6 +2075,8 @@ impl<T: EventListener> Handler for Term<T> {
         // amortize row-span setup, and is common immediately before REP.
         if text.len() == 1 {
             self.input(char::from(text.as_bytes()[0]));
+        } else if text.is_ascii() {
+            self.write_ascii_run(text.as_bytes());
         } else {
             self.write_run::<_, false>(text.chars(), None);
         }
@@ -2994,7 +3059,7 @@ impl<T: EventListener> Handler for Term<T> {
                 style.blinking = true;
                 self.event_proxy.send_event(Event::CursorBlinkingChange);
             },
-            NamedPrivateMode::SyncUpdate => (),
+            NamedPrivateMode::SyncUpdate => self.mode.insert(TermMode::SYNC_UPDATE),
         }
     }
 
@@ -3047,7 +3112,7 @@ impl<T: EventListener> Handler for Term<T> {
                 style.blinking = false;
                 self.event_proxy.send_event(Event::CursorBlinkingChange);
             },
-            NamedPrivateMode::SyncUpdate => (),
+            NamedPrivateMode::SyncUpdate => self.mode.remove(TermMode::SYNC_UPDATE),
         }
     }
 
@@ -3090,7 +3155,7 @@ impl<T: EventListener> Handler for Term<T> {
                 NamedPrivateMode::BracketedPaste => {
                     self.mode.contains(TermMode::BRACKETED_PASTE).into()
                 },
-                NamedPrivateMode::SyncUpdate => ModeState::Reset,
+                NamedPrivateMode::SyncUpdate => self.mode.contains(TermMode::SYNC_UPDATE).into(),
                 NamedPrivateMode::ColumnMode => ModeState::NotSupported,
             },
             PrivateMode::Unknown(1016) => self.mode.contains(TermMode::SGR_PIXEL_MOUSE).into(),
@@ -5315,6 +5380,31 @@ mod tests {
                 "\x1b[?1016;1$y".to_owned(),
                 "\x1b[?1016;2$y".to_owned(),
             ]
+        );
+    }
+
+    /// The PTY reader parses synchronized updates as they arrive, so `Term` itself must know when
+    /// one is pending: the renderer reads this mode to keep the half-drawn screen off the display.
+    #[test]
+    fn a_synchronized_update_is_tracked_and_reported() {
+        let size = TermSize::new(25, 80);
+        let listener = PtyWriteListener::default();
+        let replies = listener.0.clone();
+        let mut term = Term::new(Config::default(), &size, listener);
+        let mut parser: ansi::Processor = ansi::Processor::with_unbuffered_sync();
+
+        parser.advance(&mut term, b"\x1b[?2026hdrawn\x1b[?2026$p");
+        assert!(term.mode().contains(TermMode::SYNC_UPDATE));
+        assert_eq!(term.grid()[Line(0)][Column(0)].c, 'd', "the update is not held back");
+        parser.advance(&mut term, b"\x1b[?2026l\x1b[?2026$p");
+        assert!(!term.mode().contains(TermMode::SYNC_UPDATE));
+
+        parser.advance(&mut term, b"\x1b[?2026h\x1bc");
+        assert!(!term.mode().contains(TermMode::SYNC_UPDATE), "RIS ends it on screen");
+
+        assert_eq!(
+            *replies.lock().unwrap(),
+            vec!["\x1b[?2026;1$y".to_owned(), "\x1b[?2026;2$y".to_owned()]
         );
     }
 }

@@ -26,7 +26,7 @@ use crate::terminal::graphics::QueuedJob;
 use crate::terminal::sync::FairMutex;
 use crate::terminal::term::Term;
 use crate::terminal::{thread, tty};
-use vvte::ansi;
+use vvte::ansi::{self, Timeout as _};
 
 use crate::client_fault::{self, ClientFault, ClientFaultClass};
 
@@ -274,7 +274,6 @@ where
             // The complete APC is still passed to VTE, which keeps it zero-width and invisible.
             #[cfg(feature = "perf")]
             crate::performance::PARSE_BYTES.record(unprocessed as u64);
-            let synchronized = state.parser.sync_bytes_count() != 0;
             processed += state.advance(
                 &mut **terminal,
                 &buf[..unprocessed],
@@ -286,15 +285,11 @@ where
                 self.event_proxy.send_event(Event::PtyOutput { start, end });
             }
             unprocessed = 0;
+            state.end_overdue_sync(&mut **terminal);
 
             let (quiet_bytes, changed) = terminal.take_graphics_activity();
             graphics_changed |= changed;
-            // The count is exact only when every byte it covers arrived in this call. A
-            // synchronized update replays input from earlier calls, so then it is not used and
-            // the wakeup below falls back to treating everything as visible.
-            if !synchronized && state.parser.sync_bytes_count() == 0 {
-                quiet += quiet_bytes;
-            }
+            quiet += quiet_bytes;
 
             if terminal.has_graphics_jobs() {
                 let jobs = terminal.take_graphics_jobs();
@@ -330,7 +325,7 @@ where
         #[cfg(feature = "perf")]
         drop(hold);
         self.pty.read_idle();
-        if wakeup_needed(processed, state.parser.sync_bytes_count(), quiet, graphics_changed) {
+        if wakeup_needed(processed, state.synchronized(), quiet, graphics_changed) {
             self.event_proxy.send_event(Event::Wakeup);
         }
 
@@ -427,8 +422,9 @@ where
 
                 // Handle synchronized update timeout.
                 if events.is_empty() && self.rx.peek().is_none() {
-                    state.parser.stop_sync(&mut *self.terminal.lock());
-                    self.event_proxy.send_event(Event::Wakeup);
+                    if state.end_overdue_sync(&mut *self.terminal.lock()) {
+                        self.event_proxy.send_event(Event::Wakeup);
+                    }
                     continue;
                 }
 
@@ -835,25 +831,28 @@ mod terminal_reply_tests {
 ///
 /// Whether a PTY read left the UI anything new to draw.
 ///
-/// Of the `processed` bytes, `synchronized` are held back by a synchronized update and `quiet`
-/// were image data that has not yet added up to an image. A read made of nothing else changed
-/// nothing on screen, and waking the UI for it would redraw an identical frame; at the megabytes
-/// per second an image transfer runs at, that is a redraw per display refresh for nothing.
+/// Nothing is drawn while a synchronized update is still `synchronized`: the update's end wakes
+/// the UI instead. Of the `processed` bytes, `quiet` were image data that has not yet added up to
+/// an image. A read made of nothing else changed nothing on screen, and waking the UI for it would
+/// redraw an identical frame; at the megabytes per second an image transfer runs at, that is a
+/// redraw per display refresh for nothing.
 fn wakeup_needed(
     processed: usize,
-    synchronized: usize,
+    synchronized: bool,
     quiet: usize,
     graphics_changed: bool,
 ) -> bool {
-    processed > 0 && (graphics_changed || synchronized.saturating_add(quiet) < processed)
+    processed > 0 && !synchronized && (graphics_changed || quiet < processed)
 }
 
 /// Contains list of items to write, current write state, etc. Anything that
 /// would otherwise be mutated on the `EventLoop` goes here.
-#[derive(Default)]
 pub struct State {
     write_list: VecDeque<PendingInput>,
     writing: Option<Writing>,
+    /// Dispatches synchronized updates as they arrive; `Term` and the read loop keep them from
+    /// being presented. Holding them instead would parse each repaint in one burst after it
+    /// ends, while nothing reads the PTY.
     parser: ansi::Processor,
     osc_notifications: OscNotificationParser,
     vivid_markers: VividMarkerScanner,
@@ -861,7 +860,39 @@ pub struct State {
     output_range: Option<(u64, u64)>,
 }
 
+impl Default for State {
+    fn default() -> Self {
+        Self {
+            write_list: VecDeque::new(),
+            writing: None,
+            parser: ansi::Processor::with_unbuffered_sync(),
+            osc_notifications: OscNotificationParser::default(),
+            vivid_markers: VividMarkerScanner::default(),
+            #[cfg(any(unix, windows))]
+            output_range: None,
+        }
+    }
+}
+
 impl State {
+    /// Whether a synchronized update is pending, so the screen must not be presented yet.
+    fn synchronized(&self) -> bool {
+        self.parser.sync_timeout().pending_timeout()
+    }
+
+    /// End a synchronized update whose deadline has passed.
+    ///
+    /// Returns whether one ended. A program that keeps writing never lets the poll time out, so
+    /// the read loop checks here as well as when the poll does.
+    fn end_overdue_sync<T: EventListener>(&mut self, terminal: &mut Term<T>) -> bool {
+        let deadline = self.parser.sync_timeout().sync_timeout();
+        if deadline.is_none_or(|deadline| deadline > Instant::now()) {
+            return false;
+        }
+        self.parser.stop_sync(terminal);
+        true
+    }
+
     /// Exercise the complete input pipeline in presenter integration tests.
     #[cfg(test)]
     pub(crate) fn advance_test_chunks<T: EventListener>(
@@ -884,7 +915,7 @@ impl State {
     fn reset_client_state(&mut self) {
         self.write_list.clear();
         self.writing = None;
-        self.parser = Default::default();
+        self.parser = ansi::Processor::with_unbuffered_sync();
         self.osc_notifications = Default::default();
         self.vivid_markers = Default::default();
         #[cfg(any(unix, windows))]
@@ -1336,10 +1367,12 @@ mod graphics_tests {
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD;
 
+    use std::time::Duration;
+
     use super::*;
     use crate::terminal::event::VoidListener;
-    use crate::terminal::term::Config;
     use crate::terminal::term::test::TermSize;
+    use crate::terminal::term::{Config, TermMode};
 
     fn pipeline() -> (Term<VoidListener>, State, Arc<Mutex<Transcript>>) {
         let term = Term::new(Config::default(), &TermSize::new(80, 24), VoidListener);
@@ -1352,13 +1385,9 @@ mod graphics_tests {
         (term, state, transcript): &mut (Term<VoidListener>, State, Arc<Mutex<Transcript>>),
         bytes: &[u8],
     ) -> (usize, usize, bool) {
-        let synchronized = state.parser.sync_bytes_count() != 0;
         let processed = state.advance(term, bytes, transcript);
-        let (mut quiet, changed) = term.take_graphics_activity();
-        if synchronized || state.parser.sync_bytes_count() != 0 {
-            quiet = 0;
-        }
-        let wake = wakeup_needed(processed, state.parser.sync_bytes_count(), quiet, changed);
+        let (quiet, changed) = term.take_graphics_activity();
+        let wake = wakeup_needed(processed, state.synchronized(), quiet, changed);
         (processed, quiet, wake)
     }
 
@@ -1421,22 +1450,38 @@ mod graphics_tests {
     }
 
     #[test]
-    fn a_synchronized_update_falls_back_to_the_plain_rule() {
+    fn a_synchronized_update_runs_in_order_and_wakes_the_ui_when_it_ends() {
         let mut pipeline = pipeline();
         let [first, second, last] = frame();
-        let mut held = b"\x1b[?2026h".to_vec();
-        held.extend_from_slice(&first);
-        read(&mut pipeline, &held);
-        assert!(pipeline.0.graphics().store().is_empty(), "the update holds the command back");
+        let mut started = b"\x1b[?2026hvisible".to_vec();
+        started.extend_from_slice(&first);
+        let (_, _, wake) = read(&mut pipeline, &started);
+        assert!(!wake, "nothing is presented while the update is pending");
+        assert!(pipeline.0.mode().contains(TermMode::SYNC_UPDATE));
         let (_, quiet, wake) = read(&mut pipeline, &second);
-        assert_eq!(quiet, 0, "held bytes never reached the graphics state");
-        assert!(!wake, "everything in this read is held by the update");
-        let mut released = last.clone();
-        released.extend_from_slice(b"\x1b[?2026l");
-        let (_, quiet, wake) = read(&mut pipeline, &released);
-        assert_eq!(quiet, 0, "replayed bytes are not counted against this read");
-        assert!(wake);
+        assert_eq!(quiet, second.len(), "the command runs as it arrives");
+        assert!(!wake);
+        let mut ended = last.clone();
+        ended.extend_from_slice(b"\x1b[?2026l");
+        let (_, _, wake) = read(&mut pipeline, &ended);
+        assert!(wake, "the update's end shows everything it drew");
+        assert!(!pipeline.0.mode().contains(TermMode::SYNC_UPDATE));
         assert_eq!(pipeline.0.graphics().store().placements().len(), 1);
+    }
+
+    #[test]
+    fn an_overdue_synchronized_update_ends_even_while_output_continues() {
+        let mut pipeline = pipeline();
+        read(&mut pipeline, b"\x1b[?2026h");
+        let (term, state, _) = &mut pipeline;
+        assert!(!state.end_overdue_sync(term), "its deadline is 150 ms away");
+        assert!(state.synchronized());
+
+        std::thread::sleep(Duration::from_millis(160));
+        assert!(state.end_overdue_sync(term));
+        assert!(!state.synchronized());
+        assert!(!term.mode().contains(TermMode::SYNC_UPDATE));
+        assert!(read(&mut pipeline, b"more").2, "output after it is presented again");
     }
 
     /// Image data would otherwise flush every line of real output out of the 1 MiB transcript,
@@ -1464,15 +1509,14 @@ mod graphics_tests {
 
     #[test]
     fn the_wakeup_rule_itself() {
-        assert!(!wakeup_needed(0, 0, 0, false));
-        assert!(!wakeup_needed(0, 0, 0, true), "nothing was read");
-        assert!(wakeup_needed(10, 0, 0, false));
-        assert!(!wakeup_needed(10, 10, 0, false));
-        assert!(!wakeup_needed(10, 0, 10, false));
-        assert!(!wakeup_needed(10, 4, 6, false));
-        assert!(wakeup_needed(10, 4, 5, false));
-        assert!(wakeup_needed(10, 0, 10, true));
-        assert!(!wakeup_needed(10, usize::MAX, usize::MAX, false), "no overflow");
+        assert!(!wakeup_needed(0, false, 0, false));
+        assert!(!wakeup_needed(0, false, 0, true), "nothing was read");
+        assert!(wakeup_needed(10, false, 0, false));
+        assert!(!wakeup_needed(10, true, 0, false), "the update's end wakes the UI instead");
+        assert!(!wakeup_needed(10, true, 0, true));
+        assert!(!wakeup_needed(10, false, 10, false));
+        assert!(wakeup_needed(10, false, 9, false));
+        assert!(wakeup_needed(10, false, 10, true));
     }
 
     /// The sequence the read loop goes through for a compressed image: take the decode out,
