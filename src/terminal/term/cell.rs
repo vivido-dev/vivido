@@ -92,6 +92,11 @@ impl Hyperlink {
     pub fn uri(&self) -> &str {
         &self.inner.uri
     }
+
+    /// Whether `other` is this very hyperlink, not just an equal one; never hashes the URI.
+    pub(crate) fn same(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
 }
 
 impl From<VteHyperlink> for Hyperlink {
@@ -157,8 +162,6 @@ impl ResetDiscriminant<StyleId> for Cell {
 pub struct CellExtra {
     // Four suffixes fit without a second allocation; longer graphemes spill without truncation.
     zerowidth: SmallVec<[char; 4]>,
-    underline_color: Option<Color>,
-    hyperlink: Option<Hyperlink>,
     /// Temporary indices used to carry authenticated Vivid anchors through grid resize/reflow.
     ///
     /// These never survive a resize operation and are not part of serialized terminal state.
@@ -191,7 +194,15 @@ pub struct SerializedCell {
     fg: Color,
     bg: Color,
     flags: Flags,
-    extra: Option<Arc<CellExtra>>,
+    extra: Option<SerializedExtra>,
+}
+
+/// The rarely set parts of a [`SerializedCell`], present when any of them is.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct SerializedExtra {
+    zerowidth: SmallVec<[char; 4]>,
+    underline_color: Option<Color>,
+    hyperlink: Option<Hyperlink>,
 }
 
 impl SerializedCell {
@@ -199,7 +210,14 @@ impl SerializedCell {
     pub fn new(cell: &Cell, styles: &StyleTable) -> Self {
         let style = styles.get(cell.style);
         let flags = cell.layout.union(style.attrs);
-        Self { c: cell.c, fg: style.fg, bg: style.bg, flags, extra: cell.extra.clone() }
+        let extra =
+            (cell.extra.is_some() || style.underline_color.is_some() || style.hyperlink.is_some())
+                .then(|| SerializedExtra {
+                    zerowidth: cell.zerowidth().map(SmallVec::from_slice).unwrap_or_default(),
+                    underline_color: style.underline_color,
+                    hyperlink: style.hyperlink.clone(),
+                });
+        Self { c: cell.c, fg: style.fg, bg: style.bg, flags, extra }
     }
 }
 
@@ -278,16 +296,10 @@ impl Cell {
         self.extra.is_some()
     }
 
-    /// Borrow the shared extended attributes, if any.
+    /// Drop the combining characters and resize tracking of the character this cell held.
     #[inline]
-    pub(crate) fn extra(&self) -> Option<&Arc<CellExtra>> {
-        self.extra.as_ref()
-    }
-
-    /// Replace the shared extended attributes.
-    #[inline]
-    pub(crate) fn set_extra(&mut self, extra: Option<Arc<CellExtra>>) {
-        self.extra = extra;
+    pub(crate) fn clear_extra(&mut self) {
+        self.extra = None;
     }
 
     /// Zerowidth characters stored in this cell.
@@ -322,10 +334,7 @@ impl Cell {
         };
         let extra = Arc::make_mut(extra);
         let tracking = std::mem::take(&mut extra.vivid_resize_tracking);
-        if extra.zerowidth.is_empty()
-            && extra.underline_color.is_none()
-            && extra.hyperlink.is_none()
-        {
+        if extra.zerowidth.is_empty() {
             self.extra = None;
         }
         tracking
@@ -339,52 +348,6 @@ impl Cell {
             Arc::make_mut(extra).zerowidth = SmallVec::new();
         }
         self.c = ' ';
-    }
-
-    /// Set underline color on the cell.
-    pub fn set_underline_color(&mut self, color: Option<Color>) {
-        // If we reset color and we don't have zerowidth we should drop extra storage.
-        if color.is_none()
-            && self.extra.as_ref().is_none_or(|extra| {
-                extra.zerowidth.is_empty()
-                    && extra.hyperlink.is_none()
-                    && extra.vivid_resize_tracking.is_empty()
-            })
-        {
-            self.extra = None;
-        } else {
-            let extra = self.extra.get_or_insert_with(Default::default);
-            Arc::make_mut(extra).underline_color = color;
-        }
-    }
-
-    /// Underline color stored in this cell.
-    #[inline]
-    pub fn underline_color(&self) -> Option<Color> {
-        self.extra.as_ref()?.underline_color
-    }
-
-    /// Set hyperlink.
-    pub fn set_hyperlink(&mut self, hyperlink: Option<Hyperlink>) {
-        let should_drop = hyperlink.is_none()
-            && self.extra.as_ref().is_none_or(|extra| {
-                extra.zerowidth.is_empty()
-                    && extra.underline_color.is_none()
-                    && extra.vivid_resize_tracking.is_empty()
-            });
-
-        if should_drop {
-            self.extra = None;
-        } else {
-            let extra = self.extra.get_or_insert_with(Default::default);
-            Arc::make_mut(extra).hyperlink = hyperlink;
-        }
-    }
-
-    /// Hyperlink stored in this cell.
-    #[inline]
-    pub fn hyperlink(&self) -> Option<Hyperlink> {
-        self.extra.as_ref()?.hyperlink.clone()
     }
 }
 
@@ -489,17 +452,12 @@ mod tests {
         cell.push_zerowidth('\u{301}');
         let original = cell.clone();
         cell.push_zerowidth('\u{302}');
-        cell.set_underline_color(Some(Color::Indexed(3)));
         cell.push_vivid_resize_tracking(7);
 
         assert_eq!(original.zerowidth(), Some(['\u{301}'].as_slice()));
-        assert_eq!(original.underline_color(), None);
         assert!(original.extra.as_ref().unwrap().vivid_resize_tracking.is_empty());
         assert_eq!(cell.zerowidth(), Some(['\u{301}', '\u{302}'].as_slice()));
-        assert_eq!(cell.underline_color(), Some(Color::Indexed(3)));
         assert_eq!(cell.take_vivid_resize_tracking(), [7]);
-        cell.set_underline_color(None);
-        cell.set_hyperlink(None);
         assert_eq!(cell.zerowidth(), Some(['\u{301}', '\u{302}'].as_slice()));
     }
 
@@ -555,6 +513,7 @@ mod tests {
             fg: Color::Indexed(1),
             bg: Color::Indexed(2),
             attrs: Flags::BOLD | Flags::UNDERLINE,
+            ..Style::default()
         }));
         cell.set_layout(Flags::WIDE_CHAR);
         let serialized = SerializedCell::new(&cell, &table);

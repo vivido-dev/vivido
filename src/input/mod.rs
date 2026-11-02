@@ -1301,7 +1301,10 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
     fn cursor_state(&mut self) -> CursorIcon {
         let display_offset = self.ctx.terminal().grid().display_offset();
         let point = self.ctx.mouse().point(&self.ctx.size_info(), display_offset);
-        let hyperlink = self.ctx.terminal().grid()[point].hyperlink();
+        let hyperlink = {
+            let terminal = self.ctx.terminal();
+            terminal.hyperlink(&terminal.grid()[point])
+        };
 
         // Function to check if mouse is on top of a hint.
         let hint_highlighted = |hint: &HintMatch| hint.should_highlight(point, hyperlink.as_ref());

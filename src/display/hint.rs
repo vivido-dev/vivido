@@ -162,7 +162,7 @@ impl HintState {
             }
 
             // Hyperlinks take precedence over regex matches.
-            let hyperlink = term.grid()[*bounds.start()].hyperlink();
+            let hyperlink = term.hyperlink(&term.grid()[*bounds.start()]);
             Some(HintMatch { bounds, hyperlink, hint })
         } else {
             // Store character to preserve the selection.
@@ -345,7 +345,7 @@ pub fn visible_unique_hyperlinks_iter<T>(term: &Term<T>) -> impl Iterator<Item =
     iter::from_fn(move || {
         // Find the start of the next unique hyperlink.
         let (cell, hyperlink) = display_iter.find_map(|cell| {
-            let hyperlink = cell.hyperlink()?;
+            let hyperlink = term.hyperlink(&cell)?;
             (!unique_hyperlinks.contains(&hyperlink)).then(|| {
                 unique_hyperlinks.insert(hyperlink.clone());
                 (cell, hyperlink)
@@ -359,7 +359,7 @@ pub fn visible_unique_hyperlinks_iter<T>(term: &Term<T>) -> impl Iterator<Item =
         while let Some(next_cell) = display_iter.peek() {
             // Cell at display iter doesn't match, yield the hyperlink and start over with
             // `find_map`.
-            if next_cell.hyperlink().as_ref() != Some(&hyperlink) {
+            if term.hyperlink(next_cell).as_ref() != Some(&hyperlink) {
                 break;
             }
 
@@ -430,13 +430,13 @@ pub fn highlighted_at<T>(
 ///
 /// This will only return contiguous cells, even if another hyperlink with the same ID exists.
 fn hyperlink_at<T>(term: &Term<T>, point: Point) -> Option<(Hyperlink, Match)> {
-    let hyperlink = term.grid()[point].hyperlink()?;
+    let hyperlink = term.hyperlink(&term.grid()[point])?;
 
     let grid = term.grid();
 
     let mut match_end = point;
     for cell in grid.iter_from(point) {
-        if cell.hyperlink().is_some_and(|link| link == hyperlink) {
+        if term.hyperlink(&cell).is_some_and(|link| link == hyperlink) {
             match_end = cell.point;
         } else {
             break;
@@ -446,7 +446,7 @@ fn hyperlink_at<T>(term: &Term<T>, point: Point) -> Option<(Hyperlink, Match)> {
     let mut match_start = point;
     let mut iter = grid.iter_from(point);
     while let Some(cell) = iter.prev() {
-        if cell.hyperlink().is_some_and(|link| link == hyperlink) {
+        if term.hyperlink(&cell).is_some_and(|link| link == hyperlink) {
             match_start = cell.point;
         } else {
             break;

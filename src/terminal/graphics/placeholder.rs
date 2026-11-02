@@ -367,7 +367,7 @@ pub(crate) fn decode_cell(cell: &Cell, styles: &StyleTable) -> Option<CellCode> 
     let mark = |index: usize| marks.get(index).map_or(0, |mark| diacritic_number(*mark));
     Some(CellCode {
         id_low: color_number(styles.get(cell.style()).fg),
-        placement: cell.underline_color().map_or(0, color_number),
+        placement: styles.get(cell.style()).underline_color.map_or(0, color_number),
         row: mark(0),
         col: mark(1),
         id_high: mark(2),

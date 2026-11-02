@@ -1313,13 +1313,19 @@ impl<T> Term<T> {
 
     /// The colors and styling attributes of `cell`, a cell of this terminal.
     #[inline]
-    pub fn style(&self, cell: &Cell) -> Style {
+    pub fn style(&self, cell: &Cell) -> &Style {
         self.styles.get(cell.style())
+    }
+
+    /// The OSC 8 hyperlink of `cell`, a cell of this terminal.
+    #[inline]
+    pub fn hyperlink(&self, cell: &Cell) -> Option<crate::terminal::term::cell::Hyperlink> {
+        self.style(cell).hyperlink.clone()
     }
 
     /// The style new output is written with.
     #[inline]
-    fn template_style(&self) -> Style {
+    fn template_style(&self) -> &Style {
         self.styles.get(self.grid.cursor.template.style())
     }
 
@@ -1327,15 +1333,17 @@ impl<T> Term<T> {
     #[inline]
     fn update_template_style(&mut self, update: impl FnOnce(&mut Style)) {
         let previous = self.template_style();
-        let mut style = previous;
+        let mut style = previous.clone();
         update(&mut style);
-        if style == previous {
+        if style == *previous {
             return;
         }
+        let new_background = style.bg != previous.bg;
+        let bg = style.bg;
         let id = self.styles.intern(style);
         self.grid.cursor.template.set_style(id);
-        if style.bg != previous.bg {
-            let erase = self.styles.intern(Style { bg: style.bg, ..Style::default() });
+        if new_background {
+            let erase = self.styles.intern(Style { bg, ..Style::default() });
             self.grid.cursor.erase.set_style(erase);
         }
         if self.styles.needs_sweep() {
@@ -1859,7 +1867,6 @@ impl<T> Term<T> {
     fn write_at_cursor(&mut self, c: char, layout: Flags) {
         let c = self.grid.cursor.charsets[self.active_charset].map(c);
         let style = self.grid.cursor.template.style();
-        let extra = self.grid.cursor.template.extra().cloned();
 
         let mut cursor_cell = self.grid.cursor_cell();
 
@@ -1886,7 +1893,7 @@ impl<T> Term<T> {
         cursor_cell.set_c(c);
         cursor_cell.set_style(style);
         cursor_cell.set_layout(layout);
-        cursor_cell.set_extra(extra);
+        cursor_cell.clear_extra();
     }
 
     #[inline]
@@ -1924,7 +1931,6 @@ impl<T: EventListener> Term<T> {
         if self.grid.cursor.charsets[self.active_charset] != StandardCharset::Ascii
             || self.mode.contains(TermMode::INSERT)
             || !self.mode.contains(TermMode::LINE_WRAP)
-            || self.grid.cursor.template.has_extra()
         {
             for c in chars {
                 self.input(c);
@@ -2024,7 +2030,6 @@ impl<T: EventListener> Term<T> {
         if self.grid.cursor.charsets[self.active_charset] != StandardCharset::Ascii
             || self.mode.contains(TermMode::INSERT)
             || !self.mode.contains(TermMode::LINE_WRAP)
-            || self.grid.cursor.template.has_extra()
         {
             for &b in bytes {
                 self.input(char::from(b));
@@ -2988,7 +2993,8 @@ impl<T: EventListener> Handler for Term<T> {
     #[inline]
     fn set_hyperlink(&mut self, hyperlink: Option<Hyperlink>) {
         trace!("Setting hyperlink: {hyperlink:?}");
-        self.grid.cursor.template.set_hyperlink(hyperlink.map(|e| e.into()));
+        let hyperlink = hyperlink.map(Into::into);
+        self.update_template_style(|style| style.hyperlink = hyperlink);
     }
 
     /// Set a terminal attribute.
@@ -3005,11 +3011,13 @@ impl<T: EventListener> Handler for Term<T> {
         match attr {
             Attr::Foreground(color) => self.update_template_style(|style| style.fg = color),
             Attr::Background(color) => self.update_template_style(|style| style.bg = color),
-            Attr::UnderlineColor(color) => self.grid.cursor.template.set_underline_color(color),
-            Attr::Reset => {
-                self.update_template_style(|style| *style = Style::default());
-                self.grid.cursor.template.set_underline_color(None);
+            Attr::UnderlineColor(color) => {
+                self.update_template_style(|style| style.underline_color = color);
             },
+            // SGR resets leave the OSC 8 hyperlink in place.
+            Attr::Reset => self.update_template_style(|style| {
+                *style = Style { hyperlink: style.hyperlink.take(), ..Style::default() };
+            }),
             Attr::Reverse => self.update_template_style(attrs(Flags::INVERSE, none)),
             Attr::CancelReverse => self.update_template_style(attrs(none, Flags::INVERSE)),
             Attr::Bold => self.update_template_style(attrs(Flags::BOLD, none)),
@@ -3502,7 +3510,7 @@ fn encode_hex(value: &[u8]) -> String {
     encoded
 }
 
-fn sgr_status(style: Style) -> String {
+fn sgr_status(style: &Style) -> String {
     let mut params = Vec::new();
     if style.attrs.contains(Flags::BOLD) {
         params.push("1".to_owned());
@@ -3949,14 +3957,32 @@ mod tests {
     }
 
     #[test]
+    fn sgr_reset_keeps_the_hyperlink_and_clears_the_underline_color() {
+        let mut term = Term::new(Config::default(), &TermSize::new(8, 1), VoidListener);
+        let mut parser: ansi::Processor = ansi::Processor::new();
+        parser
+            .advance(&mut term, b"\x1b]8;;https://a\x1b\\\x1b[4;58;5;3mab\x1b[mcd\x1b]8;;\x1b\\ef");
+
+        let style = |column: usize| term.style(&term.grid()[Line(0)][Column(column)]);
+        let uri = |column: usize| style(column).hyperlink.as_ref().map(|link| link.uri());
+        assert_eq!((uri(0), uri(1)), (Some("https://a"), Some("https://a")));
+        assert_eq!(style(1).underline_color, Some(Color::Indexed(3)));
+        assert_eq!((uri(2), uri(3)), (Some("https://a"), Some("https://a")), "SGR 0 keeps it");
+        assert_eq!(style(2).underline_color, None);
+        assert_eq!(style(2).attrs, Flags::empty());
+        assert_eq!((uri(4), uri(5)), (None, None), "OSC 8 with no URI ends it");
+        assert_eq!(style(0).hyperlink, style(3).hyperlink, "one link spans the run");
+    }
+
+    #[test]
     fn erased_cells_keep_only_the_background_of_the_current_style() {
         let mut term = Term::new(Config::default(), &TermSize::new(4, 2), VoidListener);
         let mut parser: ansi::Processor = ansi::Processor::new();
         parser.advance(&mut term, b"\x1b[1;4;31;44mab\x1b[H\x1b[K\r\n\x1b[@");
 
         let erased = Style { bg: Color::Named(NamedColor::Blue), ..Style::default() };
-        assert_eq!(term.style(&term.grid()[Line(0)][Column(0)]), erased, "erase in line");
-        assert_eq!(term.style(&term.grid()[Line(1)][Column(0)]), erased, "insert blank");
+        assert_eq!(term.style(&term.grid()[Line(0)][Column(0)]), &erased, "erase in line");
+        assert_eq!(term.style(&term.grid()[Line(1)][Column(0)]), &erased, "insert blank");
         assert_eq!(term.template_style().attrs, Flags::BOLD | Flags::UNDERLINE);
     }
 
@@ -3989,7 +4015,7 @@ mod tests {
         assert_eq!(term.style(&term.grid()[Line(1)][Column(0)]).bg, Color::Indexed(100));
         // The cursor saved before the switch was remapped too.
         let saved = Style { fg: Color::Indexed(200), bg: Color::Indexed(100), ..Style::default() };
-        assert_eq!(term.template_style(), saved);
+        assert_eq!(term.template_style(), &saved);
     }
 
     #[test]
@@ -4008,7 +4034,7 @@ mod tests {
         assert!(attrs(0).contains(Flags::UNDERCURL));
         assert!(!attrs(0).contains(Flags::UNDERLINE));
         assert_eq!(
-            cells[Column(0)].underline_color(),
+            term.style(&cells[Column(0)]).underline_color,
             Some(ansi::Color::Spec(ansi::Rgb { r: 255, g: 0, b: 0 }))
         );
 

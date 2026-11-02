@@ -9,12 +9,16 @@
 //! compacts around them (see [`StyleTable::needs_sweep`]).
 
 use std::collections::HashMap;
+use std::mem;
 
-use crate::terminal::term::cell::Flags;
+use crate::terminal::term::cell::{Flags, Hyperlink};
 use crate::terminal::vvte::ansi::{Color, NamedColor};
 
-/// Colors and styling attributes shared by every cell drawn with the same SGR state.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Colors, styling attributes and link shared by every cell drawn with the same state.
+///
+/// Everything but the hyperlink comes from SGR; the hyperlink is OSC 8 state, which SGR resets
+/// leave alone.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Style {
     /// Foreground color.
     pub fg: Color,
@@ -22,6 +26,10 @@ pub struct Style {
     pub bg: Color,
     /// Styling attributes; never contains [`Flags::LAYOUT`] bits.
     pub attrs: Flags,
+    /// Underline color, when it differs from the foreground.
+    pub underline_color: Option<Color>,
+    /// OSC 8 hyperlink.
+    pub hyperlink: Option<Hyperlink>,
 }
 
 impl Default for Style {
@@ -31,6 +39,8 @@ impl Default for Style {
             fg: Color::Named(NamedColor::Foreground),
             bg: Color::Named(NamedColor::Background),
             attrs: Flags::empty(),
+            underline_color: None,
+            hyperlink: None,
         }
     }
 }
@@ -45,18 +55,29 @@ impl Style {
             || self.attrs.intersects(Flags::INVERSE | Flags::ALL_UNDERLINES | Flags::STRIKEOUT)
     }
 
-    /// A hashable encoding of this style for interning.
-    fn key(&self) -> StyleKey {
-        StyleKey { fg: color_key(self.fg), bg: color_key(self.bg), attrs: self.attrs.bits() }
+    /// A hashable encoding of this style for interning, given its hyperlink's number.
+    fn key(&self, link: u32) -> StyleKey {
+        StyleKey {
+            fg: color_key(self.fg),
+            bg: color_key(self.bg),
+            attrs: self.attrs.bits(),
+            underline: self.underline_color.map_or(0, color_key),
+            link,
+        }
     }
 }
 
 /// [`Style`]'s identity as plain integers; vvte's `Color` does not implement `Hash`.
+///
+/// `underline` is zero without an underline color; `link` is zero without a hyperlink and
+/// otherwise the table's number for it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 struct StyleKey {
     fg: u32,
     bg: u32,
     attrs: u16,
+    underline: u32,
+    link: u32,
 }
 
 impl StyleKey {
@@ -66,7 +87,9 @@ impl StyleKey {
     fn slot(&self) -> usize {
         let mixed = self.fg.wrapping_mul(0x9E37_79B1)
             ^ self.bg.wrapping_mul(0x85EB_CA77)
-            ^ u32::from(self.attrs).wrapping_mul(0xC2B2_AE3D);
+            ^ u32::from(self.attrs).wrapping_mul(0xC2B2_AE3D)
+            ^ self.underline.wrapping_mul(0x27D4_EB2F)
+            ^ self.link.wrapping_mul(0x1656_67B1);
         (mixed >> (32 - CACHE_BITS)) as usize
     }
 }
@@ -136,22 +159,28 @@ pub struct StyleTable {
     ids: HashMap<StyleKey, StyleId>,
     /// Recent lookups by [`StyleKey::slot`]; every entry is valid for the current numbering.
     cache: Box<[(StyleKey, StyleId); 1 << CACHE_BITS]>,
+    /// Numbers for the hyperlinks of the styles held, from one; renumbered by each sweep.
+    links: HashMap<Hyperlink, u32>,
+    /// The hyperlink numbered last, checked by identity before hashing its URI.
+    last_link: Option<(Hyperlink, u32)>,
     /// Entries still in use after the last sweep; the next sweep waits until the table doubles.
     live: usize,
 }
 
 /// A cache whose every slot holds the default style, which is valid in every table.
 fn empty_cache() -> Box<[(StyleKey, StyleId); 1 << CACHE_BITS]> {
-    Box::new([(Style::default().key(), StyleId::default()); 1 << CACHE_BITS])
+    Box::new([(Style::default().key(0), StyleId::default()); 1 << CACHE_BITS])
 }
 
 impl Default for StyleTable {
     fn default() -> Self {
         let style = Style::default();
         Self {
+            ids: HashMap::from([(style.key(0), StyleId::default())]),
             styles: vec![style],
-            ids: HashMap::from([(style.key(), StyleId::default())]),
             cache: empty_cache(),
+            links: HashMap::new(),
+            last_link: None,
             live: 1,
         }
     }
@@ -164,8 +193,22 @@ impl StyleTable {
     ///
     /// Panics if `id` was issued by another table, or before a sweep that remapped it.
     #[inline]
-    pub fn get(&self, id: StyleId) -> Style {
-        self.styles[id.index()]
+    pub fn get(&self, id: StyleId) -> &Style {
+        &self.styles[id.index()]
+    }
+
+    /// This table's number for `link`, assigning the next one if it has none.
+    fn link_number(&mut self, link: Option<&Hyperlink>) -> u32 {
+        let Some(link) = link else { return 0 };
+        if let Some((last, number)) = &self.last_link
+            && last.same(link)
+        {
+            return *number;
+        }
+        let next = u32::try_from(self.links.len() + 1).unwrap_or(u32::MAX);
+        let number = *self.links.entry(link.clone()).or_insert(next);
+        self.last_link = Some((link.clone(), number));
+        number
     }
 
     /// An id for `style`, adding it to the table if needed.
@@ -175,7 +218,8 @@ impl StyleTable {
     /// needs over two billion distinct styles on screen and in scrollback at once.
     pub fn intern(&mut self, style: Style) -> StyleId {
         debug_assert!(!style.attrs.intersects(Flags::LAYOUT), "{:?} contains layout", style.attrs);
-        let key = style.key();
+        let link = self.link_number(style.hyperlink.as_ref());
+        let key = style.key(link);
         let slot = key.slot();
         let (cached, id) = self.cache[slot];
         if cached == key {
@@ -229,19 +273,21 @@ impl StyleTable {
     pub fn compact(&mut self, marks: StyleMarks) -> StyleRemap {
         let mut remap = Vec::with_capacity(self.styles.len());
         let mut styles = Vec::with_capacity(marks.used.iter().filter(|used| **used).count());
-        for (style, used) in self.styles.iter().zip(&marks.used) {
+        for (style, used) in mem::take(&mut self.styles).into_iter().zip(&marks.used) {
             if *used {
-                remap.push(StyleId::new(styles.len(), style));
-                styles.push(*style);
+                remap.push(StyleId::new(styles.len(), &style));
+                styles.push(style);
             } else {
                 remap.push(StyleId::default());
             }
         }
-        self.ids = styles
-            .iter()
-            .enumerate()
-            .map(|(index, style)| (style.key(), StyleId::new(index, style)))
-            .collect();
+        self.links.clear();
+        self.last_link = None;
+        self.ids = HashMap::with_capacity(styles.len());
+        for (index, style) in styles.iter().enumerate() {
+            let link = self.link_number(style.hyperlink.as_ref());
+            self.ids.insert(style.key(link), StyleId::new(index, style));
+        }
         self.cache = empty_cache();
         self.live = styles.len();
         self.styles = styles;
@@ -291,9 +337,9 @@ mod tests {
     fn an_interned_style_reads_back_unchanged() {
         let mut table = StyleTable::default();
         let style = Style { fg: Color::Indexed(3), attrs: Flags::BOLD, ..Style::default() };
-        let id = table.intern(style);
-        assert_eq!(table.get(id), style);
-        assert_eq!(table.get(StyleId::default()), Style::default());
+        let id = table.intern(style.clone());
+        assert_eq!(table.get(id), &style);
+        assert_eq!(table.get(StyleId::default()), &Style::default());
         assert_eq!(table.intern(Style::default()), StyleId::default());
     }
 
@@ -333,12 +379,12 @@ mod tests {
         let remap = table.compact(marks);
 
         assert_eq!(table.len(), 3, "the default style always survives");
-        assert_eq!(table.get(remap.get(ids[3])), colored(4));
-        assert_eq!(table.get(remap.get(ids[7])), colored(8));
+        assert_eq!(table.get(remap.get(ids[3])), &colored(4));
+        assert_eq!(table.get(remap.get(ids[7])), &colored(8));
         assert_eq!(remap.get(StyleId::default()), StyleId::default());
         assert_eq!(table.intern(colored(8)), remap.get(ids[7]), "survivors are found again");
         let fresh = table.intern(colored(1));
-        assert_eq!(table.get(fresh), colored(1), "a dropped style can be added again");
+        assert_eq!(table.get(fresh), &colored(1), "a dropped style can be added again");
     }
 
     #[test]

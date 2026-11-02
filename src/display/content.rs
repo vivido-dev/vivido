@@ -48,7 +48,10 @@ impl Snapshot {
         if refresh || cells.len() != term.screen_lines() * term.columns() {
             cells.clear();
             cells.extend(content.display_iter.map(|cell| {
-                (Indexed { point: cell.point, cell: cell.cell.clone() }, term.style(cell.cell))
+                (
+                    Indexed { point: cell.point, cell: cell.cell.clone() },
+                    term.style(cell.cell).clone(),
+                )
             }));
         }
         if hints.active() {
@@ -228,7 +231,7 @@ impl Iterator for RenderableContent<'_> {
             let slot = self.cells.get_mut(self.cell_index)?;
             self.cell_index += 1;
             let (cell, style) =
-                (Indexed { point: slot.0.point, cell: slot.0.cell.clone() }, slot.1);
+                (Indexed { point: slot.0.point, cell: slot.0.cell.clone() }, slot.1.clone());
             let mut cell =
                 RenderableCell::new(self, Indexed { point: cell.point, cell: &cell.cell }, style);
 
@@ -360,8 +363,8 @@ impl RenderableCell {
         let cell_point = cell.point;
         let point = term::point_to_viewport(display_offset, cell_point).unwrap();
 
-        let underline = cell
-            .underline_color()
+        let underline = style
+            .underline_color
             .map_or(fg, |underline| Self::compute_fg_rgb(content, underline, flags));
 
         // A placeholder cell stands for part of an image; its character and the combining marks
@@ -371,7 +374,7 @@ impl RenderableCell {
             character = ' ';
         }
         let zerowidth = cell.zerowidth().filter(|_| !placeholder);
-        let hyperlink = cell.hyperlink();
+        let hyperlink = style.hyperlink.clone();
 
         let extra = (zerowidth.is_some() || hyperlink.is_some()).then(|| {
             Box::new(RenderableCellExtra {
