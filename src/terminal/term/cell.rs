@@ -158,15 +158,15 @@ pub struct CellExtra {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Cell {
     /// Character stored in this terminal cell.
-    pub c: char,
+    c: char,
     /// Foreground color.
-    pub fg: Color,
+    fg: Color,
     /// Background color.
-    pub bg: Color,
+    bg: Color,
     /// Terminal cell or mode flags.
-    pub flags: Flags,
+    flags: Flags,
     /// Optional extended cell attributes.
-    pub extra: Option<Arc<CellExtra>>,
+    extra: Option<Arc<CellExtra>>,
 }
 
 impl Default for Cell {
@@ -183,6 +183,78 @@ impl Default for Cell {
 }
 
 impl Cell {
+    /// Character stored in this cell.
+    #[inline]
+    pub fn c(&self) -> char {
+        self.c
+    }
+
+    /// Replace the character stored in this cell.
+    #[inline]
+    pub fn set_c(&mut self, c: char) {
+        self.c = c;
+    }
+
+    /// Foreground color.
+    #[inline]
+    pub fn fg(&self) -> Color {
+        self.fg
+    }
+
+    /// Replace the foreground color.
+    #[inline]
+    pub fn set_fg(&mut self, color: Color) {
+        self.fg = color;
+    }
+
+    /// Background color.
+    #[inline]
+    pub fn bg(&self) -> Color {
+        self.bg
+    }
+
+    /// Replace the background color.
+    #[inline]
+    pub fn set_bg(&mut self, color: Color) {
+        self.bg = color;
+    }
+
+    /// Styling and layout flags.
+    #[inline]
+    pub fn flags(&self) -> Flags {
+        self.flags
+    }
+
+    /// Replace the styling and layout flags.
+    #[inline]
+    pub fn set_flags(&mut self, flags: Flags) {
+        self.flags = flags;
+    }
+
+    /// Mutably borrow the styling and layout flags.
+    #[inline]
+    pub fn flags_mut(&mut self) -> &mut Flags {
+        &mut self.flags
+    }
+
+    /// Whether this cell holds extended attributes.
+    #[inline]
+    pub fn has_extra(&self) -> bool {
+        self.extra.is_some()
+    }
+
+    /// Borrow the shared extended attributes, if any.
+    #[inline]
+    pub(crate) fn extra(&self) -> Option<&Arc<CellExtra>> {
+        self.extra.as_ref()
+    }
+
+    /// Replace the shared extended attributes.
+    #[inline]
+    pub(crate) fn set_extra(&mut self, extra: Option<Arc<CellExtra>>) {
+        self.extra = extra;
+    }
+
     /// Zerowidth characters stored in this cell.
     #[inline]
     pub fn zerowidth(&self) -> Option<&[char]> {
@@ -321,6 +393,14 @@ impl GridCell for Cell {
         self.fg = Color::Named(NamedColor::Foreground);
         self.bg = template.bg;
         self.flags = Flags::empty();
+    }
+}
+
+impl From<char> for Cell {
+    /// A cell holding `c` with default colors and no flags.
+    #[inline]
+    fn from(c: char) -> Self {
+        Self { c, ..Cell::default() }
     }
 }
 

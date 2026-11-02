@@ -500,7 +500,7 @@ impl<'a, T> HintPostProcessor<'a, T> {
     fn hint_post_processing(&self, regex_match: &Match) -> Option<Match> {
         let mut iter = self.term.grid().iter_from(*regex_match.start());
 
-        let mut c = iter.cell().c;
+        let mut c = iter.cell().c();
 
         // Truncate uneven number of brackets.
         let end = *regex_match.end();
@@ -534,7 +534,7 @@ impl<'a, T> HintPostProcessor<'a, T> {
             }
 
             match iter.next() {
-                Some(indexed) => c = indexed.cell.c,
+                Some(indexed) => c = indexed.cell.c(),
                 None => break,
             }
         }
@@ -547,7 +547,7 @@ impl<'a, T> HintPostProcessor<'a, T> {
             }
 
             match iter.prev() {
-                Some(indexed) => c = indexed.cell.c,
+                Some(indexed) => c = indexed.cell.c(),
                 None => break,
             }
         }

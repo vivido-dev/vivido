@@ -284,14 +284,14 @@ pub struct RenderableCellExtra {
 impl RenderableCell {
     fn new(content: &mut RenderableContent<'_>, cell: Indexed<&Cell>) -> Self {
         // Lookup RGB values.
-        let mut fg = Self::compute_fg_rgb(content, cell.fg, cell.flags);
-        let mut bg = Self::compute_bg_rgb(content, cell.bg);
+        let mut fg = Self::compute_fg_rgb(content, cell.fg(), cell.flags());
+        let mut bg = Self::compute_bg_rgb(content, cell.bg());
 
-        let mut bg_alpha = if cell.flags.contains(Flags::INVERSE) {
+        let mut bg_alpha = if cell.flags().contains(Flags::INVERSE) {
             mem::swap(&mut fg, &mut bg);
             1.0
         } else {
-            Self::compute_bg_alpha(content.config, cell.bg)
+            Self::compute_bg_alpha(content.config, cell.bg())
         };
 
         let is_selected = content.terminal_content.selection.is_some_and(|selection| {
@@ -305,8 +305,8 @@ impl RenderableCell {
         let display_offset = content.terminal_content.display_offset;
         let viewport_start = Point::new(Line(-(display_offset as i32)), Column(0));
         let colors = &content.config.colors;
-        let mut character = cell.c;
-        let mut flags = cell.flags;
+        let mut character = cell.c();
+        let mut flags = cell.flags();
 
         let num_cols = content.size.columns();
         if let Some((c, is_first)) = content
@@ -332,7 +332,7 @@ impl RenderableCell {
             let config_bg = colors.selection.background;
             Self::compute_cell_rgb(&mut fg, &mut bg, &mut bg_alpha, config_fg, config_bg);
 
-            if fg == bg && !cell.flags.contains(Flags::HIDDEN) {
+            if fg == bg && !cell.flags().contains(Flags::HIDDEN) {
                 // Reveal inversed text when fg/bg is the same.
                 fg = content.color(NamedColor::Background as usize);
                 bg = content.color(NamedColor::Foreground as usize);
@@ -666,13 +666,13 @@ mod snapshot_tests {
         term.input('z');
         term.goto(0, 0);
         term.input('x');
-        assert_eq!(cells[0].c, 'a');
+        assert_eq!(cells[0].c(), 'a');
         assert_eq!(cells[0].zerowidth(), Some(['\u{301}'].as_slice()));
         assert_eq!(snapshot.cursor, cursor);
         Snapshot::capture(&term, &mut cells, false, &mut search, &mut hints);
-        assert_eq!(cells[0].c, 'a', "an undamaged viewport reuses its owned cells");
+        assert_eq!(cells[0].c(), 'a', "an undamaged viewport reuses its owned cells");
         Snapshot::capture(&term, &mut cells, true, &mut search, &mut hints);
-        assert_eq!(cells[0].c, 'x');
+        assert_eq!(cells[0].c(), 'x');
         assert_eq!(cells.capacity(), capacity);
     }
 }

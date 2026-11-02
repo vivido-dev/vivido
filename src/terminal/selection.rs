@@ -9,7 +9,7 @@ use std::cmp::min;
 use std::mem;
 use std::ops::{Bound, Range, RangeBounds};
 
-use crate::terminal::grid::{Dimensions, GridCell, Indexed};
+use crate::terminal::grid::{Dimensions, Indexed};
 use crate::terminal::index::{Boundary, Column, Line, Point, Side};
 use crate::terminal::term::Term;
 use crate::terminal::term::cell::{Cell, Flags};

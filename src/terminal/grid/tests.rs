@@ -406,11 +406,11 @@ fn size_hint_matches_count<T>(iter: impl Iterator<Item = T>) {
 
 // https://github.com/rust-lang/rust-clippy/pull/6375
 fn cell(c: char) -> Cell {
-    Cell { c, ..Cell::default() }
+    Cell::from(c)
 }
 
 fn wrap_cell(c: char) -> Cell {
     let mut cell = cell(c);
-    cell.flags.insert(Flags::WRAPLINE);
+    cell.flags_mut().insert(Flags::WRAPLINE);
     cell
 }

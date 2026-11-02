@@ -359,13 +359,13 @@ pub(crate) struct CellCode {
 
 /// Decode `cell` if it is a placeholder.
 pub(crate) fn decode_cell(cell: &Cell) -> Option<CellCode> {
-    if cell.c != PLACEHOLDER {
+    if cell.c() != PLACEHOLDER {
         return None;
     }
     let marks = cell.zerowidth().unwrap_or_default();
     let mark = |index: usize| marks.get(index).map_or(0, |mark| diacritic_number(*mark));
     Some(CellCode {
-        id_low: color_number(cell.fg),
+        id_low: color_number(cell.fg()),
         placement: cell.underline_color().map_or(0, color_number),
         row: mark(0),
         col: mark(1),
@@ -535,22 +535,22 @@ mod tests {
 
     #[test]
     fn a_cell_is_decoded_from_its_colors_and_marks() {
-        let mut cell =
-            Cell { c: PLACEHOLDER, fg: Color::Spec(Rgb { r: 1, g: 2, b: 3 }), ..Cell::default() };
+        let mut cell = Cell::from(PLACEHOLDER);
+        cell.set_fg(Color::Spec(Rgb { r: 1, g: 2, b: 3 }));
         assert_eq!(decode_cell(&cell), code(0x010203, 0, 0, 0));
         for mark in ['\u{030D}', '\u{0305}', '\u{030E}', '\u{0305}'] {
             cell.push_zerowidth(mark);
         }
         assert_eq!(decode_cell(&cell), code(0x010203, 2, 1, 3), "a fourth mark means nothing");
 
-        cell.fg = Color::Indexed(42);
+        cell.set_fg(Color::Indexed(42));
         assert_eq!(decode_cell(&cell).unwrap().id_low, 42);
-        cell.fg = Color::Named(NamedColor::Red);
+        cell.set_fg(Color::Named(NamedColor::Red));
         assert_eq!(decode_cell(&cell).unwrap().id_low, 1);
-        cell.fg = Color::Named(NamedColor::Foreground);
+        cell.set_fg(Color::Named(NamedColor::Foreground));
         assert_eq!(decode_cell(&cell).unwrap().id_low, 0, "the default color names no image");
 
-        cell.c = 'x';
+        cell.set_c('x');
         assert_eq!(decode_cell(&cell), None);
     }
 

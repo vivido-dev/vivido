@@ -89,7 +89,7 @@ fn burst_tail_is_parsed_before_would_block_eof_or_error() {
             assert_eq!(observed, input);
             let terminal = worker.terminal.lock();
             for (column, c) in "last".chars().enumerate() {
-                assert_eq!(terminal.grid()[Line(0)][Column(column)].c, c);
+                assert_eq!(terminal.grid()[Line(0)][Column(column)].c(), c);
             }
         }
     }
@@ -152,7 +152,7 @@ fn coalesced_osc_tail_is_dispatched_before_eof_or_read_error() {
         assert!(!state.osc_notifications.has_pending_osc());
         let terminal = worker.terminal.lock();
         for (column, c) in "done".chars().enumerate() {
-            assert_eq!(terminal.grid()[Line(0)][Column(column)].c, c);
+            assert_eq!(terminal.grid()[Line(0)][Column(column)].c(), c);
         }
     }
 }

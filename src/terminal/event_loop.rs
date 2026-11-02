@@ -769,11 +769,11 @@ mod terminal_reply_tests {
             failed = Term::new(Config::default(), &size, VoidListener);
             assert!(!failed_state.needs_write());
             failed_state.advance_test_chunks(&mut failed, [b"fresh"]);
-            assert_eq!(failed.grid()[Line(0)][Column(0)].c, 'f');
-            assert_eq!(surviving.grid()[Line(0)][Column(0)].c, 'o');
-            assert_eq!(surviving.grid()[Line(0)][Column(4)].c, 'r');
+            assert_eq!(failed.grid()[Line(0)][Column(0)].c(), 'f');
+            assert_eq!(surviving.grid()[Line(0)][Column(0)].c(), 'o');
+            assert_eq!(surviving.grid()[Line(0)][Column(4)].c(), 'r');
             surviving_state.advance_test_chunks(&mut surviving, [b"!"]);
-            assert_eq!(surviving.grid()[Line(0)][Column(5)].c, '!');
+            assert_eq!(surviving.grid()[Line(0)][Column(5)].c(), '!');
         }
     }
 
