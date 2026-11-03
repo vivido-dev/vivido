@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::terminal::index::{Column, Line, Point};
 use crate::terminal::term::cell::{Flags, ResetDiscriminant};
+use crate::terminal::term::extra::ExtraId;
 use crate::terminal::vvte::ansi::{CharsetIndex, StandardCharset};
 
 pub mod resize;
@@ -34,6 +35,14 @@ pub trait GridCell: Sized {
 
     /// Clear the given layout flags; `flags` must contain only [`Flags::LAYOUT`] bits.
     fn remove_layout(&mut self, flags: Flags);
+
+    /// The cell's reference into its row's [`RowExtras`](crate::terminal::term::extra::RowExtras).
+    fn extra(&self) -> ExtraId {
+        ExtraId::NONE
+    }
+
+    /// Point the cell at another entry of its row's extra content.
+    fn set_extra(&mut self, _extra: ExtraId) {}
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -450,10 +459,50 @@ impl<T> Grid<T> {
         }
     }
 
-    /// A grid of the same shape with every stored cell converted by `f`.
+    /// Number of cells [`Grid::for_each_cell_mut`] visits in the grid's rows, approximately.
+    ///
+    /// Counts every stored row at the current width; rows keeping cells beyond it add a few more.
+    pub fn stored_cells(&self) -> usize {
+        self.raw.stored_rows().saturating_mul(self.columns)
+    }
+
+    /// This grid with every stored cell, cursor cells included, converted by `f`.
+    ///
+    /// Everything else, rows' extra content and occupancy among it, carries over unchanged.
+    pub fn map_owned<U>(self, mut f: impl FnMut(&T) -> U) -> Grid<U> {
+        let mut cursor = |cursor: Cursor<T>| Cursor {
+            point: cursor.point,
+            template: f(&cursor.template),
+            erase: f(&cursor.erase),
+            charsets: cursor.charsets,
+            input_needs_wrap: cursor.input_needs_wrap,
+        };
+        let (current, saved) = (cursor(self.cursor), cursor(self.saved_cursor));
+        Grid {
+            cursor: current,
+            saved_cursor: saved,
+            raw: self.raw.map_owned(f),
+            columns: self.columns,
+            lines: self.lines,
+            display_offset: self.display_offset,
+            max_scroll_limit: self.max_scroll_limit,
+        }
+    }
+
+    /// Whether any row holds combining characters or resize tracking.
+    pub fn has_extras(&self) -> bool
+    where
+        T: GridCell,
+    {
+        let mut found = false;
+        self.raw.for_each_row(|row| found |= !row.extras().is_empty());
+        found
+    }
+
+    /// A grid of the same shape with every stored cell, and the row holding it, converted by `f`.
     ///
     /// Cursors start out at their defaults.
-    pub fn map<U: Default>(&self, f: impl FnMut(&T) -> U) -> Grid<U> {
+    pub fn map<U: Default>(&self, f: impl FnMut(&Row<T>, &T) -> U) -> Grid<U> {
         Grid {
             cursor: Cursor::default(),
             saved_cursor: Cursor::default(),

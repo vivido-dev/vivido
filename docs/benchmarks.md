@@ -593,3 +593,20 @@ Replay's unique multi-codepoint Unicode cells: 169.9 → 181.4 and 183.4 → 188
 stayed within limits (idle 0.057 → 0.063 ms, loaded 1.65 → 1.32 ms default). The CSI loss is
 the cost of interning on SGR changes; a 4096-slot cache in front of the table answers repeated
 states without hashing.
+
+## Packed eight-byte cells (2026-11-02)
+
+Phase B steps B5 (second half) and B6 of the plain-text throughput plan: combining characters
+live with their row, and a cell is one `u64`. Before: the B4 build. After: B6. Three alternating
+samples, medians, MiB/s.
+
+| Benchmark | Mode | ASCII | Unicode | CSI | Long escapes | Images |
+|---|---|---|---|---|---|---|
+| Kitty | default | 345.0 → 419.2 | 295.9 → 315.8 | 108.4 → 131.7 | 575.0 → 576.8 | 580.3 → 590.4 |
+| Kitty | `--render` | 358.2 → 430.3 | 306.8 → 325.2 | 112.6 → 138.1 | 569.2 → 571.2 | 586.7 → 578.4 |
+| Replay | default | 292.3 → 350.5 | 324.6 → 330.8 | 108.0 → 132.6 | 475.5 → 476.0 | 494.4 → 487.8 |
+| Replay | `--render` | 308.4 → 358.2 | 336.2 → 340.0 | 113.2 → 138.2 | 478.9 → 477.2 | 484.7 → 487.0 |
+
+Replay's unique multi-codepoint Unicode cells: 181.4 → 219.8 and 192.7 → 229.9. Query p99: idle
+0.064 → 0.056 ms, loaded 1.17 → 0.71 ms (default). Peak memory fell (replay 115 → 93 MB). In
+memory, ASCII is 527 MiB/s (`scripts/ascii-throughput.sh`), against 356 at the Phase 0 baseline.

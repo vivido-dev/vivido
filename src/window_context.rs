@@ -2544,7 +2544,7 @@ impl WindowContext {
                 hash_color(Some(style.fg), &mut hasher);
                 hash_color(Some(style.bg), &mut hasher);
                 hash_color(style.underline_color, &mut hasher);
-                cell.zerowidth().unwrap_or_default().hash(&mut hasher);
+                grid[point.line].zerowidth(cell).unwrap_or_default().hash(&mut hasher);
                 if let Some(link) = &style.hyperlink {
                     link.id().hash(&mut hasher);
                     link.uri().hash(&mut hasher);
@@ -3200,7 +3200,7 @@ impl WindowContext {
                     (1, "character")
                 };
                 let mut text = if width == 0 { String::new() } else { cell.c().to_string() };
-                text.extend(cell.zerowidth().into_iter().flatten());
+                text.extend(grid[line].zerowidth(cell).into_iter().flatten());
                 cells.push(json_value!({
                     "text": text,
                     "width": width,
@@ -3441,9 +3441,7 @@ impl WindowContext {
             let mut grid = terminal.grid().clone();
             grid.initialize_all();
             grid.truncate();
-            grid.map(|cell| {
-                crate::terminal::term::cell::SerializedCell::new(cell, terminal.styles())
-            })
+            grid.map(|row, cell| terminal.serialized_cell(row, cell))
         };
 
         let serialized_grid = json::to_string(&grid).expect("serialize grid");

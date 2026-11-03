@@ -223,7 +223,7 @@ impl AccessibilitySnapshot {
                     &mut scalar_offset,
                     &mut utf16_offset,
                 );
-                for mark in cell.zerowidth().into_iter().flatten() {
+                for mark in row.zerowidth(cell).into_iter().flatten() {
                     push_character(
                         &mut text,
                         &mut characters,
@@ -493,7 +493,7 @@ mod tests {
         let cell = &mut term.grid_mut()[Point::new(Line(0), Column(0))];
         cell.set_c('🦇');
         cell.insert_layout(Flags::WIDE_CHAR);
-        cell.push_zerowidth('\u{301}');
+        term.push_zerowidths(Point::new(Line(0), Column(0)), std::iter::once('\u{301}'));
         term.grid_mut()[Point::new(Line(0), Column(1))].insert_layout(Flags::WIDE_CHAR_SPACER);
         term.grid_mut().cursor.point = Point::new(Line(0), Column(1));
 

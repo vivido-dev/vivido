@@ -3,6 +3,8 @@ use std::num::NonZeroU32;
 use std::ops::Deref;
 use std::{cmp, mem};
 
+use smallvec::SmallVec;
+
 use crate::terminal::event::EventListener;
 use crate::terminal::graphics::PLACEHOLDER;
 use crate::terminal::grid::{Dimensions, Indexed};
@@ -24,7 +26,12 @@ use crate::event::SearchState;
 pub const MIN_CURSOR_CONTRAST: f64 = 1.5;
 
 /// A captured viewport cell with its style resolved, so it outlives the terminal lock.
-pub(super) type SnapshotCell = (Indexed<Cell>, Style);
+pub(super) struct SnapshotCell {
+    cell: Indexed<Cell>,
+    style: Style,
+    /// The cell's combining characters, kept only when it has some.
+    zerowidth: Option<SmallVec<[char; 4]>>,
+}
 
 /// Owned metadata accompanying a reusable viewport cell snapshot.
 pub(super) struct Snapshot {
@@ -47,11 +54,10 @@ impl Snapshot {
         let content = term.renderable_content();
         if refresh || cells.len() != term.screen_lines() * term.columns() {
             cells.clear();
-            cells.extend(content.display_iter.map(|cell| {
-                (
-                    Indexed { point: cell.point, cell: cell.cell.clone() },
-                    term.style(cell.cell).clone(),
-                )
+            cells.extend(content.display_iter.map(|cell| SnapshotCell {
+                cell: Indexed { point: cell.point, cell: cell.cell.clone() },
+                style: term.style(cell.cell).clone(),
+                zerowidth: term.zerowidth(cell.point).map(SmallVec::from_slice),
             }));
         }
         if hints.active() {
@@ -230,10 +236,15 @@ impl Iterator for RenderableContent<'_> {
         loop {
             let slot = self.cells.get_mut(self.cell_index)?;
             self.cell_index += 1;
-            let (cell, style) =
-                (Indexed { point: slot.0.point, cell: slot.0.cell.clone() }, slot.1.clone());
-            let mut cell =
-                RenderableCell::new(self, Indexed { point: cell.point, cell: &cell.cell }, style);
+            let cell = Indexed { point: slot.cell.point, cell: slot.cell.cell.clone() };
+            let (style, zerowidth) = (slot.style.clone(), slot.zerowidth.clone());
+            let zerowidth = zerowidth.as_deref();
+            let mut cell = RenderableCell::new(
+                self,
+                Indexed { point: cell.point, cell: &cell.cell },
+                style,
+                zerowidth,
+            );
 
             if self.cursor_point == cell.point {
                 // Store the cursor which should be rendered.
@@ -288,7 +299,12 @@ pub struct RenderableCellExtra {
 }
 
 impl RenderableCell {
-    fn new(content: &mut RenderableContent<'_>, cell: Indexed<&Cell>, style: Style) -> Self {
+    fn new(
+        content: &mut RenderableContent<'_>,
+        cell: Indexed<&Cell>,
+        style: Style,
+        zerowidth: Option<&[char]>,
+    ) -> Self {
         // Lookup RGB values.
         let mut fg = Self::compute_fg_rgb(content, style.fg, style.attrs);
         let mut bg = Self::compute_bg_rgb(content, style.bg);
@@ -373,7 +389,7 @@ impl RenderableCell {
         if placeholder {
             character = ' ';
         }
-        let zerowidth = cell.zerowidth().filter(|_| !placeholder);
+        let zerowidth = zerowidth.filter(|_| !placeholder);
         let hyperlink = style.hyperlink.clone();
 
         let extra = (zerowidth.is_some() || hyperlink.is_some()).then(|| {
@@ -672,13 +688,13 @@ mod snapshot_tests {
         term.input('z');
         term.goto(0, 0);
         term.input('x');
-        assert_eq!(cells[0].0.c(), 'a');
-        assert_eq!(cells[0].0.zerowidth(), Some(['\u{301}'].as_slice()));
+        assert_eq!(cells[0].cell.c(), 'a');
+        assert_eq!(cells[0].zerowidth.as_deref(), Some(['\u{301}'].as_slice()));
         assert_eq!(snapshot.cursor, cursor);
         Snapshot::capture(&term, &mut cells, false, &mut search, &mut hints);
-        assert_eq!(cells[0].0.c(), 'a', "an undamaged viewport reuses its owned cells");
+        assert_eq!(cells[0].cell.c(), 'a', "an undamaged viewport reuses its owned cells");
         Snapshot::capture(&term, &mut cells, true, &mut search, &mut hints);
-        assert_eq!(cells[0].0.c(), 'x');
+        assert_eq!(cells[0].cell.c(), 'x');
         assert_eq!(cells.capacity(), capacity);
     }
 }

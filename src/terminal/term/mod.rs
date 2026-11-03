@@ -2,7 +2,7 @@
 
 use std::ops::{Index, IndexMut, Range};
 use std::sync::Arc;
-use std::{cmp, mem, slice, str};
+use std::{cmp, iter, mem, slice, str};
 
 use serde::{Deserialize, Serialize};
 
@@ -19,10 +19,10 @@ use crate::terminal::graphics::{
     CellPixels, Cursor as GraphicsCursor, FinishedJob, KittyGraphics, QueuedJob,
     Scroll as GraphicsScroll,
 };
-use crate::terminal::grid::{Dimensions, Grid, GridIterator, Scroll};
+use crate::terminal::grid::{Dimensions, Grid, GridIterator, Row, Scroll};
 use crate::terminal::index::{self, Boundary, Column, Direction, Line, Point};
 use crate::terminal::selection::{Selection, SelectionRange, SelectionType};
-use crate::terminal::term::cell::{Cell, Flags, LineLength};
+use crate::terminal::term::cell::{Cell, Flags, LineLength, UnpackedCell};
 use crate::terminal::term::color::Colors;
 use crate::terminal::term::style::{Style, StyleTable};
 use crate::terminal::vvte::ansi::{
@@ -37,6 +37,7 @@ use crate::terminal::vvte::ansi::cursor_icon::CursorIcon;
 pub mod cell;
 /// Color types and operations.
 pub mod color;
+pub mod extra;
 /// Search types and operations.
 pub mod search;
 pub mod style;
@@ -1256,7 +1257,7 @@ impl<T> Term<T> {
                 text.push(cell.c());
 
                 // Push zero-width characters.
-                for c in cell.zerowidth().into_iter().flatten() {
+                for c in grid_line.zerowidth(cell).into_iter().flatten() {
                     text.push(*c);
                 }
                 spans.push(RowTextSpan {
@@ -1317,6 +1318,31 @@ impl<T> Term<T> {
         self.styles.get(cell.style())
     }
 
+    /// The combining characters drawn over the cell at `point`, if any.
+    #[inline]
+    pub fn zerowidth(&self, point: Point) -> Option<&[char]> {
+        let row = &self.grid[point.line];
+        row.zerowidth(&row[point.column])
+    }
+
+    /// `cell`, a cell of `row` in this terminal, with its style and extra content written out.
+    pub fn serialized_cell(
+        &self,
+        row: &Row<Cell>,
+        cell: &Cell,
+    ) -> crate::terminal::term::cell::SerializedCell {
+        crate::terminal::term::cell::SerializedCell::new(cell, &self.styles, row.extras())
+    }
+
+    /// Append combining characters to the cell at `point`.
+    ///
+    /// Kept out of line: combining characters are rare, and inlining the table update into the
+    /// print loops slowed every other character down.
+    #[inline(never)]
+    pub(crate) fn push_zerowidths(&mut self, point: Point, chars: impl Iterator<Item = char>) {
+        self.grid[point.line].update_extra(point.column, |extra| extra.zerowidth.extend(chars));
+    }
+
     /// The OSC 8 hyperlink of `cell`, a cell of this terminal.
     #[inline]
     pub fn hyperlink(&self, cell: &Cell) -> Option<crate::terminal::term::cell::Hyperlink> {
@@ -1346,15 +1372,22 @@ impl<T> Term<T> {
             let erase = self.styles.intern(Style { bg, ..Style::default() });
             self.grid.cursor.erase.set_style(erase);
         }
-        if self.styles.needs_sweep() {
+        if self.styles.needs_sweep(self.stored_cells()) {
             self.sweep_styles();
         }
+    }
+
+    /// Number of cells a sweep visits: every stored row of both grids.
+    fn stored_cells(&self) -> usize {
+        self.grid.stored_cells().saturating_add(self.inactive_grid.stored_cells())
     }
 
     /// Drop styles no cell refers to any more and renumber the rest.
     ///
     /// Walks every cell of both screens, scrollback and cached rows included, and every cursor
-    /// that can write or erase them. Runs only once the table has doubled since the last sweep.
+    /// that can write or erase them. Runs only once the table has grown enough since the last
+    /// sweep; see [`StyleTable::needs_sweep`].
+    #[cold]
     fn sweep_styles(&mut self) {
         let mut marks = self.styles.marks();
         for grid in [&mut self.grid, &mut self.inactive_grid] {
@@ -1405,8 +1438,8 @@ impl<T> Term<T> {
         delta = cmp::min(cmp::max(delta, min_delta), history_size as i32);
 
         let is_alt = self.mode.contains(TermMode::ALT_SCREEN);
-        self.grid.resize(!is_alt, num_lines, num_cols);
-        self.inactive_grid.resize(is_alt, num_lines, num_cols);
+        resize_grid(&mut self.grid, !is_alt, num_lines, num_cols);
+        resize_grid(&mut self.inactive_grid, is_alt, num_lines, num_cols);
 
         // Invalidate selection and tabs only when necessary.
         if old_cols != num_cols {
@@ -1468,7 +1501,8 @@ impl<T> Term<T> {
                 *position = None;
                 continue;
             }
-            grid[point.point].push_vivid_resize_tracking(index);
+            grid[point.point.line]
+                .update_extra(point.point.column, |extra| extra.vivid_resize_tracking.push(index));
         }
 
         self.resize(size);
@@ -1499,7 +1533,14 @@ impl<T> Term<T> {
             let occupied = grid[line].occupied_len();
             for column in 0..occupied {
                 let point = Point::new(line, Column(column));
-                for index in grid[point].take_vivid_resize_tracking() {
+                let row = &mut grid[line];
+                let Some(extra) = row.extras().get(row[point.column].extra()) else { continue };
+                if extra.vivid_resize_tracking.is_empty() {
+                    continue;
+                }
+                let tracking = extra.vivid_resize_tracking.clone();
+                row.update_extra(point.column, |extra| extra.vivid_resize_tracking.clear());
+                for index in tracking {
                     if let Some(position) = positions.get_mut(index) {
                         *position = Some(ResizePoint { point, alternate });
                     }
@@ -1890,10 +1931,7 @@ impl<T> Term<T> {
             cursor_cell = self.grid.cursor_cell();
         }
 
-        cursor_cell.set_c(c);
-        cursor_cell.set_style(style);
-        cursor_cell.set_layout(layout);
-        cursor_cell.clear_extra();
+        cursor_cell.write(c, style, layout);
     }
 
     #[inline]
@@ -1937,7 +1975,6 @@ impl<T: EventListener> Term<T> {
             }
             return;
         }
-        let special = Flags::WIDE_CHAR | Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER;
         while let Some(c) = chars.clone().next() {
             let width = if ASCII_REPEAT {
                 Some(1)
@@ -1955,7 +1992,7 @@ impl<T: EventListener> Term<T> {
                 if self.grid[point].layout().contains(Flags::WIDE_CHAR_SPACER) {
                     point.column.0 = point.column.saturating_sub(1);
                 }
-                self.grid[point].push_zerowidths(chars.by_ref().take(count));
+                self.push_zerowidths(point, chars.by_ref().take(count));
                 continue;
             }
             let width = match width {
@@ -1988,7 +2025,7 @@ impl<T: EventListener> Term<T> {
             };
             let simple = self.grid[point.line][point.column..point.column + count * width]
                 .iter()
-                .take_while(|cell| !cell.has_extra() && !cell.layout().intersects(special))
+                .take_while(|cell| cell.is_simple())
                 .count();
             let count = count.min(simple / width);
             if count == 0 {
@@ -2001,20 +2038,14 @@ impl<T: EventListener> Term<T> {
             let cells = &mut self.grid[point.line][point.column..end];
             if width == 1 {
                 for (cell, c) in cells.iter_mut().zip(chars.by_ref().take(count)) {
-                    cell.set_c(c);
-                    cell.set_style(style);
-                    cell.set_layout(Flags::empty());
+                    cell.write(c, style, Flags::empty());
                 }
             } else {
                 for (cells, c) in
                     cells.as_chunks_mut::<2>().0.iter_mut().zip(chars.by_ref().take(count))
                 {
-                    cells[0].set_c(c);
-                    cells[0].set_style(style);
-                    cells[0].set_layout(Flags::WIDE_CHAR);
-                    cells[1].set_c(' ');
-                    cells[1].set_style(style);
-                    cells[1].set_layout(Flags::WIDE_CHAR_SPACER);
+                    cells[0].write(c, style, Flags::WIDE_CHAR);
+                    cells[1].write(' ', style, Flags::WIDE_CHAR_SPACER);
                 }
             }
             self.grid.cursor.input_needs_wrap = end.0 == columns;
@@ -2036,7 +2067,6 @@ impl<T: EventListener> Term<T> {
             }
             return;
         }
-        let special = Flags::WIDE_CHAR | Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER;
         let style = self.grid.cursor.template.style();
         while let Some(&first) = bytes.first() {
             // Scalar input ignores DEL before considering a pending wrap.
@@ -2051,23 +2081,14 @@ impl<T: EventListener> Term<T> {
             let point = self.grid.cursor.point;
             let columns = self.columns();
             let count = (columns - point.column.0).min(bytes.len());
-            // Find the writable prefix through a shared borrow first: a mutable range borrow
-            // marks the whole range occupied, which must cover only cells actually written.
-            let written = self.grid[point.line][point.column..point.column + count]
-                .iter()
-                .zip(bytes)
-                .take_while(|(cell, b)| {
-                    b.wrapping_sub(0x20) < 0x5F
-                        && !cell.has_extra()
-                        && !cell.layout().intersects(special)
-                })
-                .count();
-            let cells = &mut self.grid[point.line][point.column..point.column + written];
-            for (cell, &b) in cells.iter_mut().zip(bytes) {
-                cell.set_c(char::from(b));
-                cell.set_style(style);
-                cell.set_layout(Flags::empty());
-            }
+            let written = self.grid[point.line].write_while(point.column, count, |i, cell| {
+                let b = bytes[i];
+                let accept = b.wrapping_sub(0x20) < 0x5F && cell.is_simple();
+                if accept {
+                    cell.write(char::from(b), style, Flags::empty());
+                }
+                accept
+            });
             if written == 0 {
                 self.input(char::from(first));
                 bytes = &bytes[1..];
@@ -2173,7 +2194,7 @@ impl<T: EventListener> Handler for Term<T> {
                 column.0 = column.saturating_sub(1);
             }
 
-            self.grid[line][column].push_zerowidth(c);
+            self.push_zerowidths(Point::new(line, column), iter::once(c));
             return;
         }
 
@@ -3510,6 +3531,22 @@ fn encode_hex(value: &[u8]) -> String {
     encoded
 }
 
+/// Resize `grid`, reflowing it if `reflow`.
+///
+/// Reflow moves cells between rows, and the rows' combining characters travel in one list while it
+/// does, numbered beyond what a packed cell holds. A grid with any is resized as
+/// [`UnpackedCell`]s and packed again afterwards; one without, the usual case, directly.
+fn resize_grid(grid: &mut Grid<Cell>, reflow: bool, lines: usize, columns: usize) {
+    if !grid.has_extras() {
+        grid.resize(reflow, lines, columns);
+        return;
+    }
+    let packed = mem::replace(grid, Grid::new(1, 1, 0));
+    let mut unpacked = packed.map_owned(|cell| UnpackedCell::from(cell));
+    unpacked.resize(reflow, lines, columns);
+    *grid = unpacked.map_owned(|cell| Cell::from(cell));
+}
+
 fn sgr_status(style: &Style) -> String {
     let mut params = Vec::new();
     if style.attrs.contains(Flags::BOLD) {
@@ -3954,6 +3991,60 @@ mod tests {
         parser.advance(&mut term, b"\n\n\n\n\n\x1b[?1049h");
 
         assert_eq!(*events.lock().unwrap(), ["scroll(0..3, 3)", "swap(true)"]);
+    }
+
+    #[test]
+    fn combining_characters_follow_their_cells_through_reflow() {
+        let mut term = Term::new(Config::default(), &TermSize::new(4, 3), VoidListener);
+        let mut parser: ansi::Processor = ansi::Processor::new();
+        parser.advance(&mut term, "ab\u{301}cd\u{302}e\u{303}f".as_bytes());
+        let text = |term: &Term<VoidListener>| {
+            let grid = term.grid();
+            let mut text = String::new();
+            for line in grid.topmost_line().0..=grid.bottommost_line().0 {
+                let row = &grid[Line(line)];
+                for column in 0..grid.columns() {
+                    let cell = &row[Column(column)];
+                    if cell.c() != ' ' {
+                        text.push(cell.c());
+                        text.extend(row.zerowidth(cell).into_iter().flatten());
+                    }
+                }
+            }
+            text
+        };
+        let written = "ab\u{301}cd\u{302}e\u{303}f";
+        assert_eq!(text(&term), written);
+
+        // Narrower moves `d̂` and `ẽ` to rows that never held them; wider pulls them back.
+        term.resize(TermSize::new(3, 3));
+        assert_eq!(text(&term), written);
+        term.resize(TermSize::new(2, 3));
+        assert_eq!(text(&term), written);
+        term.resize(TermSize::new(8, 3));
+        assert_eq!(text(&term), written);
+        let row = &term.grid()[Line(0)];
+        assert!(row.extras().len() <= 3, "entries moved, not copied");
+    }
+
+    #[test]
+    fn a_row_redrawn_in_place_keeps_its_combining_entries_bounded() {
+        let mut term = Term::new(Config::default(), &TermSize::new(4, 1), VoidListener);
+        let mut parser: ansi::Processor = ansi::Processor::new();
+        parser.advance(&mut term, "\x1b[1;2Hx\u{301}".as_bytes());
+        for first in 0x300..0x346_u32 {
+            for second in 0x300..0x346_u32 {
+                let [first, second] = [first, second].map(|mark| char::from_u32(mark).unwrap());
+                parser.advance(&mut term, format!("\x1b[1;1He{first}{second}").as_bytes());
+            }
+        }
+        // 4,900 overwrites; the row compacts once dead entries reach twice its width (eight
+        // columns at least).
+        let entries = term.grid()[Line(0)].extras().len();
+        assert!(entries <= 17, "{entries} entries kept");
+        let at = |column| term.zerowidth(Point::new(Line(0), Column(column)));
+        assert_eq!(at(0), Some(['\u{345}', '\u{345}'].as_slice()));
+        assert_eq!(at(1), Some(['\u{301}'].as_slice()));
     }
 
     #[test]
@@ -4547,7 +4638,8 @@ mod tests {
         use crate::terminal::term::cell::SerializedCell;
 
         let styles = StyleTable::default();
-        let grid = Grid::<Cell>::new(24, 80, 0).map(|cell| SerializedCell::new(cell, &styles));
+        let grid = Grid::<Cell>::new(24, 80, 0)
+            .map(|row, cell| SerializedCell::new(cell, &styles, row.extras()));
         let serialized = serde_json::to_string(&grid).expect("ser");
         let deserialized = serde_json::from_str::<Grid<SerializedCell>>(&serialized).expect("de");
 

@@ -19,6 +19,10 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
         // Reset cells uncovered by a resize to the default style, not the current background.
         let erase = mem::take(&mut self.cursor.erase);
 
+        // Cells move between rows below; their extra content travels in one list meanwhile.
+        let mut gathered = Vec::new();
+        self.raw.for_each_row_mut(|row| row.export_extras(&mut gathered));
+
         match self.lines.cmp(&lines) {
             Ordering::Less => self.grow_lines(lines),
             Ordering::Greater => self.shrink_lines(lines),
@@ -33,6 +37,8 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
 
         // Restore the erase cell.
         self.cursor.erase = erase;
+
+        self.raw.for_each_row_mut(|row| row.import_extras(&mut gathered));
     }
 
     /// Add lines to the visible area.

@@ -15,6 +15,7 @@
 
 use super::store::CellPixels;
 use crate::terminal::term::cell::Cell;
+use crate::terminal::term::extra::RowExtras;
 use crate::terminal::term::style::StyleTable;
 use crate::terminal::vvte::ansi::Color;
 
@@ -358,12 +359,16 @@ pub(crate) struct CellCode {
     pub id_high: u32,
 }
 
-/// Decode `cell`, whose style `styles` holds, if it is a placeholder.
-pub(crate) fn decode_cell(cell: &Cell, styles: &StyleTable) -> Option<CellCode> {
+/// Decode `cell`, whose style and marks `styles` and `extras` hold, if it is a placeholder.
+pub(crate) fn decode_cell(
+    cell: &Cell,
+    styles: &StyleTable,
+    extras: &RowExtras,
+) -> Option<CellCode> {
     if cell.c() != PLACEHOLDER {
         return None;
     }
-    let marks = cell.zerowidth().unwrap_or_default();
+    let marks = extras.zerowidth(cell.extra()).unwrap_or_default();
     let mark = |index: usize| marks.get(index).map_or(0, |mark| diacritic_number(*mark));
     Some(CellCode {
         id_low: color_number(styles.get(cell.style()).fg),
@@ -505,6 +510,7 @@ pub(crate) fn slice(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::terminal::grid::GridCell;
     use crate::terminal::term::style::Style;
     use crate::terminal::vvte::ansi::{NamedColor, Rgb};
 
@@ -538,28 +544,30 @@ mod tests {
     #[test]
     fn a_cell_is_decoded_from_its_colors_and_marks() {
         let mut styles = StyleTable::default();
+        let mut extras = RowExtras::default();
         let mut cell = Cell::from(PLACEHOLDER);
-        let mut with_fg = |cell: &mut Cell, fg| {
+        let mut with_fg = |cell: &mut Cell, fg, marks: &[char]| {
             cell.set_style(styles.intern(Style { fg, ..Style::default() }));
-            decode_cell(cell, &styles)
+            cell.set_extra(
+                extras.update(cell.extra(), |extra| extra.zerowidth.extend_from_slice(marks)),
+            );
+            decode_cell(cell, &styles, &extras)
         };
         assert_eq!(
-            with_fg(&mut cell, Color::Spec(Rgb { r: 1, g: 2, b: 3 })),
+            with_fg(&mut cell, Color::Spec(Rgb { r: 1, g: 2, b: 3 }), &[]),
             code(0x010203, 0, 0, 0)
         );
-        for mark in ['\u{030D}', '\u{0305}', '\u{030E}', '\u{0305}'] {
-            cell.push_zerowidth(mark);
-        }
-        let decoded = with_fg(&mut cell, Color::Spec(Rgb { r: 1, g: 2, b: 3 }));
+        let marks = ['\u{030D}', '\u{0305}', '\u{030E}', '\u{0305}'];
+        let decoded = with_fg(&mut cell, Color::Spec(Rgb { r: 1, g: 2, b: 3 }), &marks);
         assert_eq!(decoded, code(0x010203, 2, 1, 3), "a fourth mark means nothing");
 
-        assert_eq!(with_fg(&mut cell, Color::Indexed(42)).unwrap().id_low, 42);
-        assert_eq!(with_fg(&mut cell, Color::Named(NamedColor::Red)).unwrap().id_low, 1);
-        let decoded = with_fg(&mut cell, Color::Named(NamedColor::Foreground));
+        assert_eq!(with_fg(&mut cell, Color::Indexed(42), &[]).unwrap().id_low, 42);
+        assert_eq!(with_fg(&mut cell, Color::Named(NamedColor::Red), &[]).unwrap().id_low, 1);
+        let decoded = with_fg(&mut cell, Color::Named(NamedColor::Foreground), &[]);
         assert_eq!(decoded.unwrap().id_low, 0, "the default color names no image");
 
         cell.set_c('x');
-        assert_eq!(decode_cell(&cell, &StyleTable::default()), None);
+        assert_eq!(decode_cell(&cell, &StyleTable::default(), &RowExtras::default()), None);
     }
 
     #[test]

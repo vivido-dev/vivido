@@ -116,8 +116,14 @@ impl StyleId {
     /// Bit set when a blank cell in this style is visible.
     const SHOWS_ON_BLANK: u32 = 1 << 31;
 
-    /// Number of distinct entries an id can address.
-    const CAPACITY: usize = Self::SHOWS_ON_BLANK as usize;
+    /// Number of distinct entries an id can address: what fits the packed cell's 24 bits.
+    const CAPACITY: usize = 1 << Self::PACKED_INDEX_BITS;
+
+    /// Index bits in a packed cell; [`StyleId::PACKED_BITS`] adds the blank bit above them.
+    const PACKED_INDEX_BITS: u32 = 24;
+
+    /// Bits this id takes in a packed cell.
+    pub(crate) const PACKED_BITS: u32 = Self::PACKED_INDEX_BITS + 1;
 
     fn new(index: usize, style: &Style) -> Self {
         debug_assert!(index < Self::CAPACITY);
@@ -136,6 +142,21 @@ impl StyleId {
     #[inline]
     pub fn shows_on_blank(self) -> bool {
         self.0 & Self::SHOWS_ON_BLANK != 0
+    }
+
+    /// This id in [`StyleId::PACKED_BITS`] bits: the index, then the blank bit.
+    #[inline]
+    pub(crate) fn packed(self) -> u64 {
+        let blank = u64::from(self.shows_on_blank()) << Self::PACKED_INDEX_BITS;
+        self.index() as u64 | blank
+    }
+
+    /// The id [`StyleId::packed`] produced `bits` from; higher bits are ignored.
+    #[inline]
+    pub(crate) fn from_packed(bits: u64) -> Self {
+        let index = (bits & ((1 << Self::PACKED_INDEX_BITS) - 1)) as u32;
+        let blank = bits >> Self::PACKED_INDEX_BITS & 1 != 0;
+        Self(index | if blank { Self::SHOWS_ON_BLANK } else { 0 })
     }
 }
 
@@ -256,8 +277,12 @@ impl StyleTable {
     }
 
     /// Whether enough styles were added since the last sweep to make another worthwhile.
-    pub fn needs_sweep(&self) -> bool {
-        self.styles.len() > SWEEP_FLOOR.max(self.live.saturating_mul(2))
+    ///
+    /// A sweep visits all `cells` the terminal stores, so it waits until the table has doubled
+    /// since the last one and holds at least a quarter as many entries as there are cells. That
+    /// keeps a sweep's cost to a few cell visits per style added, whatever the scrollback size.
+    pub fn needs_sweep(&self, cells: usize) -> bool {
+        self.styles.len() > SWEEP_FLOOR.max(self.live.saturating_mul(2)).max(cells / 4)
     }
 
     /// Start a sweep: the returned marks record which ids are still in use.
@@ -397,9 +422,10 @@ mod tests {
                 ..Style::default()
             });
         }
-        assert!(table.needs_sweep());
+        assert!(table.needs_sweep(0));
+        assert!(!table.needs_sweep(10 * SWEEP_FLOOR), "a large grid defers it");
         let marks = table.marks();
         table.compact(marks);
-        assert!(!table.needs_sweep());
+        assert!(!table.needs_sweep(0));
     }
 }

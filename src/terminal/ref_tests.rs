@@ -119,7 +119,7 @@ fn ref_test(dir: &Path) {
     let mut term_grid = terminal.grid().clone();
     term_grid.initialize_all();
     term_grid.truncate();
-    let term_grid = term_grid.map(|cell| SerializedCell::new(cell, terminal.styles()));
+    let term_grid = term_grid.map(|row, cell| terminal.serialized_cell(row, cell));
 
     if grid != term_grid {
         for i in 0..grid.total_lines() {

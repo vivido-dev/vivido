@@ -1,5 +1,6 @@
 use super::test::TermSize;
 use super::*;
+use crate::terminal::grid::Cursor;
 use crate::terminal::index::Side;
 use std::sync::Mutex;
 
@@ -21,15 +22,30 @@ fn terminal(columns: usize, lines: usize, setup: &[u8]) -> Term<Events> {
 }
 
 fn assert_same(actual: &Term<Events>, expected: &Term<Events>) {
+    // Cells are compared resolved: equal content may be interned under different ids when the
+    // two paths add combining characters in different steps.
+    let resolve = |term: &Term<Events>, grid: &Grid<Cell>| {
+        // Storage's test equality requires removing spare scrollback allocation first.
+        let mut grid = grid.clone();
+        grid.truncate();
+        grid.map(|row, cell| term.serialized_cell(row, cell))
+    };
+    let cursor = |term: &Term<Events>, cursor: &Cursor<Cell>| {
+        let (template, erase) = (&cursor.template, &cursor.erase);
+        // Cursor cells never hold extra content, so an empty row resolves them.
+        let row = Row::default();
+        let cells = (term.serialized_cell(&row, template), term.serialized_cell(&row, erase));
+        (cursor.point, cursor.charsets, cursor.input_needs_wrap, cells)
+    };
     for (a, b) in [(&actual.grid, &expected.grid), (&actual.inactive_grid, &expected.inactive_grid)]
     {
-        // Storage's test equality requires removing spare scrollback allocation first.
-        let (mut a_contents, mut b_contents) = (a.clone(), b.clone());
-        a_contents.truncate();
-        b_contents.truncate();
-        assert_eq!(a_contents, b_contents, "grid contents/history/display offset");
-        assert_eq!(a.cursor, b.cursor);
-        assert_eq!(a.saved_cursor, b.saved_cursor);
+        assert_eq!(
+            resolve(actual, a),
+            resolve(expected, b),
+            "grid contents/history/display offset"
+        );
+        assert_eq!(cursor(actual, &a.cursor), cursor(expected, &b.cursor));
+        assert_eq!(cursor(actual, &a.saved_cursor), cursor(expected, &b.saved_cursor));
         for line in a.topmost_line().0..=a.bottommost_line().0 {
             assert_eq!(a[Line(line)].occupied_len(), b[Line(line)].occupied_len(), "row {line}");
         }
@@ -96,7 +112,8 @@ fn repeat_preserves_wide_cleanup_and_resize_tracking() {
         let mut actual = terminal(5, 3, "abc界界ab\x1b[H".as_bytes());
         let mut expected = terminal(5, 3, "abc界界ab\x1b[H".as_bytes());
         for term in [&mut actual, &mut expected] {
-            term.grid[Line(0)][Column(column)].push_vivid_resize_tracking(7);
+            term.grid[Line(0)]
+                .update_extra(Column(column), |extra| extra.vivid_resize_tracking.push(7));
             term.goto(0, column);
         }
         actual.repeat_char('x', 25);
