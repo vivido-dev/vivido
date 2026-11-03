@@ -1,6 +1,6 @@
 # Vivido
 
-**A cross-platform GPU terminal for developers and AI agents.**
+**A fast cross-platform GPU terminal for developers and AI agents.**
 
 Vivido is a GPU-rendered terminal emulator for macOS, Windows, and Linux. In addition to text, it
 can display images, video, and audio inside the terminal window, and it provides an automation API
