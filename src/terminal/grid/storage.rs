@@ -27,6 +27,7 @@ const MAX_CACHE_SIZE: usize = 256;
 /// [`Deref`]: std::ops::Deref
 /// [`zero`]: #structfield.zero
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(bound(deserialize = "T: Deserialize<'de> + Default"))]
 pub struct Storage<T> {
     inner: Vec<Row<T>>,
 
@@ -76,7 +77,10 @@ impl<T> Storage<T> {
     }
 
     /// Convert every cell of every row in place of this storage, keeping its layout.
-    pub(crate) fn map_owned<U>(self, mut f: impl FnMut(&T) -> U) -> Storage<U> {
+    pub(crate) fn map_owned<U: Default>(self, mut f: impl FnMut(&T) -> U) -> Storage<U>
+    where
+        T: Clone,
+    {
         Storage {
             inner: self.inner.into_iter().map(|row| row.map_owned(&mut f)).collect(),
             zero: self.zero,
@@ -86,7 +90,7 @@ impl<T> Storage<T> {
     }
 
     /// Convert every cell of every row, keeping the ring buffer's layout.
-    pub(crate) fn map<U>(&self, mut f: impl FnMut(&Row<T>, &T) -> U) -> Storage<U> {
+    pub(crate) fn map<U: Default>(&self, mut f: impl FnMut(&Row<T>, &T) -> U) -> Storage<U> {
         Storage {
             inner: self.inner.iter().map(|row| row.map(&mut f)).collect(),
             zero: self.zero,

@@ -2081,8 +2081,10 @@ impl<T: EventListener> Term<T> {
             let point = self.grid.cursor.point;
             let columns = self.columns();
             let count = (columns - point.column.0).min(bytes.len());
-            let written = self.grid[point.line]
-                .write_prefix(point.column, count, |cells| cell::fill_ascii(cells, bytes, style));
+            let written =
+                self.grid[point.line].write_prefix(point.column, count, |cells, fresh| {
+                    cell::fill_ascii(cells, fresh, bytes, style)
+                });
             if written == 0 {
                 self.input(char::from(first));
                 bytes = &bytes[1..];
