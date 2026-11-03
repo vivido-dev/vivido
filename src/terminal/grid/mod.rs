@@ -20,7 +20,7 @@ pub use self::row::Row;
 use self::storage::Storage;
 
 /// Cell operations required by terminal grid storage and scrolling.
-pub trait GridCell: Sized + Clone {
+pub trait GridCell: Sized {
     /// Check if the cell contains any content.
     fn is_empty(&self) -> bool;
 
@@ -390,7 +390,7 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
     }
 }
 
-impl<T: Clone> Grid<T> {
+impl<T> Grid<T> {
     /// Reset a visible region within the grid.
     pub fn reset_region<D, R: RangeBounds<Line>>(&mut self, bounds: R)
     where
@@ -469,7 +469,7 @@ impl<T: Clone> Grid<T> {
     /// This grid with every stored cell, cursor cells included, converted by `f`.
     ///
     /// Everything else, rows' extra content and occupancy among it, carries over unchanged.
-    pub fn map_owned<U: Default>(self, mut f: impl FnMut(&T) -> U) -> Grid<U> {
+    pub fn map_owned<U>(self, mut f: impl FnMut(&T) -> U) -> Grid<U> {
         let mut cursor = |cursor: Cursor<T>| Cursor {
             point: cursor.point,
             template: f(&cursor.template),
@@ -584,7 +584,7 @@ impl<T> Index<Point> for Grid<T> {
     }
 }
 
-impl<T: Clone> IndexMut<Point> for Grid<T> {
+impl<T> IndexMut<Point> for Grid<T> {
     #[inline]
     fn index_mut(&mut self, point: Point) -> &mut T {
         &mut self[point.line][point.column]

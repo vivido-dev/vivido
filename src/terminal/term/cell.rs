@@ -438,11 +438,10 @@ impl From<char> for Cell {
 /// Write printable ASCII `bytes` over `cells` in `style`, stopping at the first byte or cell that
 /// needs the general path; returns how many were written.
 ///
-/// The first `fresh` cells read as blank whatever they hold (a lazily reset row's stale cells),
-/// so they are taken without being looked at. Works eight cells at a time while every byte is
-/// printable and every cell is plain, so the common case compiles to wide loads and stores; the
-/// first group with an exception finishes one cell at a time.
-pub(crate) fn fill_ascii(cells: &mut [Cell], fresh: usize, bytes: &[u8], style: StyleId) -> usize {
+/// Works eight cells at a time while every byte is printable and every cell is plain, so the
+/// common case compiles to wide loads and stores; the first group with an exception finishes one
+/// cell at a time.
+pub(crate) fn fill_ascii(cells: &mut [Cell], bytes: &[u8], style: StyleId) -> usize {
     let len = cells.len().min(bytes.len());
     let (cells, bytes) = (&mut cells[..len], &bytes[..len]);
     let mut blank = Cell::default();
@@ -452,9 +451,8 @@ pub(crate) fn fill_ascii(cells: &mut [Cell], fresh: usize, bytes: &[u8], style: 
     let mut written = 0;
     let (cell_groups, _) = cells.as_chunks_mut::<8>();
     let (byte_groups, _) = bytes.as_chunks::<8>();
-    for (index, (group, chars)) in cell_groups.iter_mut().zip(byte_groups).enumerate() {
-        let clear = (index + 1) * 8 <= fresh
-            || group.iter().fold(true, |clear, cell| clear & cell.is_simple());
+    for (group, chars) in cell_groups.iter_mut().zip(byte_groups) {
+        let clear = group.iter().fold(true, |clear, cell| clear & cell.is_simple());
         if !clear || !chars.iter().fold(true, |ok, &b| ok & printable(b)) {
             break;
         }
@@ -464,7 +462,7 @@ pub(crate) fn fill_ascii(cells: &mut [Cell], fresh: usize, bytes: &[u8], style: 
         written += 8;
     }
     for (cell, &b) in cells[written..].iter_mut().zip(&bytes[written..]) {
-        if !printable(b) || (written >= fresh && !cell.is_simple()) {
+        if !printable(b) || !cell.is_simple() {
             break;
         }
         cell.0 = base | u64::from(b);
@@ -637,18 +635,18 @@ mod tests {
             let mut cells = vec![Cell::default(); bytes.len()];
             let mut input = bytes.to_vec();
             input[stop] = b'\n';
-            assert_eq!(fill_ascii(&mut cells, 0, &input, StyleId::default()), stop);
+            assert_eq!(fill_ascii(&mut cells, &input, StyleId::default()), stop);
             assert!(cells[..stop].iter().zip(bytes).all(|(cell, &b)| cell.c() == char::from(b)));
             assert!(cells[stop..].iter().all(|cell| cell.c() == ' '), "nothing past the stop");
 
             // A wide-character spacer at `stop`.
             let mut cells = vec![Cell::default(); bytes.len()];
             cells[stop].insert_layout(Flags::WIDE_CHAR_SPACER);
-            assert_eq!(fill_ascii(&mut cells, 0, bytes, StyleId::default()), stop);
+            assert_eq!(fill_ascii(&mut cells, bytes, StyleId::default()), stop);
             assert!(cells[stop].has_layout(Flags::WIDE_CHAR_SPACER), "the stop cell is untouched");
         }
         let mut cells = vec![Cell::default(); 5];
-        assert_eq!(fill_ascii(&mut cells, 0, bytes, StyleId::default()), 5, "bounded by the cells");
+        assert_eq!(fill_ascii(&mut cells, bytes, StyleId::default()), 5, "bounded by the cells");
     }
 
     #[test]
