@@ -625,3 +625,24 @@ Before: the B6 build. After: Phase C. Three alternating samples, medians, MiB/s.
 
 Replay's unique multi-codepoint Unicode cells: 216.7 → 248.4 and 231.3 → 261.4. Query p99
 unchanged (loaded 0.72 ms). In memory (`scripts/ascii-throughput.sh`), ASCII is 668 MiB/s.
+
+## Build benchmark binaries with one codegen unit (2026-11-02)
+
+Vivido's release profile uses thin LTO with the default sixteen codegen units. Which unit the hot
+print path lands in, and so what LTO inlines into it, depends on unrelated code, and the app binary
+and the `terminal_stream` example are linked separately, so they can differ. Measured on the lazy
+row-clear experiment: a change that measured the same in memory
+appeared to cost Kitty's Unicode workload 19% end to end (367 → 298 MiB/s); built with one codegen
+unit, the two binaries measured 341 and 339. The Phase C Unicode figures above (370) include such a
+favourable split.
+
+So compare binaries built with one codegen unit, each in its own target directory so normal
+release builds are not rebuilt:
+
+```sh
+CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1 CARGO_TARGET_DIR=target/bench-cgu1 \
+    cargo build --release --locked
+```
+
+`scripts/ascii-throughput.sh` does this for the in-memory benchmark. Shipping builds keep sixteen
+units; one unit is slower to build and measured no faster (Kitty ASCII 519 against 526 MiB/s).

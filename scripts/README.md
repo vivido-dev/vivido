@@ -36,6 +36,11 @@ that payload; the shell script calls it for you.
 ./ascii-throughput.sh [SAMPLES] [ITERATIONS]
 ```
 
+Build the binaries you compare with one codegen unit, each in its own target
+directory, for example
+`CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1 CARGO_TARGET_DIR=target/bench-cgu1 cargo build --release --locked`.
+With the default sixteen units, unrelated edits can move results by 15–20%.
+
 `performance-e2e.py` runs a real Vivido process with a benchmark inside its PTY,
 alternating two builds, and `performance-summary.py` turns the results into a
 per-workload comparison. It needs Unix sockets, so run it outside any sandbox

@@ -12,7 +12,11 @@ samples=${1:-5}
 iterations=${2:-50}
 cd "$(dirname "$0")/.."
 
-cargo build --release --locked --example terminal_stream >&2
+# One codegen unit, in its own target directory: with the default sixteen, unrelated edits move
+# hot code between units and swing results by 15-20%. See docs/benchmarks.md.
+target=target/bench-cgu1
+CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1 CARGO_TARGET_DIR=$target \
+    cargo build --release --locked --example terminal_stream >&2
 payloads=$(mktemp -d "${TMPDIR:-/tmp}/vivido-ascii.XXXXXX")
 trap 'rm -r "$payloads"' EXIT
 python3 -I scripts/kitty-ascii-payload.py "$payloads" >&2
@@ -24,7 +28,7 @@ median() {
 for payload in ascii ascii_sync nolf; do
     for mode in parser terminal; do
         rate=$(i=0; while [ "$i" -lt "$samples" ]; do
-            target/release/examples/terminal_stream "$mode" "$payloads/$payload.bin" "$iterations" | cut -d, -f5
+            "$target/release/examples/terminal_stream" "$mode" "$payloads/$payload.bin" "$iterations" | cut -d, -f5
             i=$((i + 1))
         done | median)
         printf '%-10s %-8s %10s MiB/s\n' "$payload" "$mode" "$rate"
