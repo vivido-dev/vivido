@@ -22,6 +22,16 @@ compatibility spelling; required configuration and snapshot serialization works 
 `test-util` adds isolated filesystem/clock and update-result controllers. Native watchers,
 HTTP, and worker threads remain the default implementation.
 
+## Publishing
+
+Publish local path dependencies before Vivido. In particular, Vivido requires `vvte` 0.15.2 or
+later for its APC and cell-size callbacks. Cargo removes dependency paths from the published
+manifest, so a successful local build does not verify the registry version. From `vvte/`, run
+`cargo publish --dry-run` and publish that release first; then run `cargo publish --dry-run`
+from `vivido/` to verify the packaged crate against crates.io dependencies.
+
+## Lint policy
+
 The compiler lint policy covers the guideline compiler set, public docs, and public Debug.
 Clippy denies unsafe operations without adjacent proofs and lint allowances without reasons.
 Tracked `expect` attributes name the lint and explain why it is needed. Cross-platform or

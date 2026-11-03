@@ -25,6 +25,11 @@ text, so you can look at a plot or screenshot without copying the file somewhere
 SSH, the bundled `vvssh` forwards the same media from remote hosts and supports drag-and-drop file
 transfer.
 
+Tools written for the [Kitty graphics protocol](docs/vt-sequences.md#kitty-graphics-notes) work as
+well: still images from `kitten icat`, `timg`, `chafa`, and `yazi` appear inline, scroll with the
+text, and pass through tmux by Unicode placeholders. Image data must arrive over the terminal
+itself — file, temp-file, and shared-memory transmission stay unsupported.
+
 ### Windows
 
 Vivido runs natively on Windows using DirectX 12 and ConPTY, with the same rendering, inline media,

@@ -390,7 +390,8 @@ impl FileDropManager {
             },
             Some(file_drop::FileDropDestination::ShellCwd) => Some("Copy to remote shell"),
             Some(file_drop::FileDropDestination::DesktopFolder) => Some("Copy to remote desktop"),
-            None => None,
+            // No binding, or a destination this build cannot describe, offers no copy action.
+            _ => None,
         }
     }
 
@@ -1168,7 +1169,7 @@ pub(super) fn handle_connection(
 ) -> io::Result<()> {
     let writer = reader.writer(ConnectionKind::FileTransfer)?;
     let first = reader.read_record(ConnectionKind::FileTransfer)?;
-    if first.record_type != registry::record::FILE_TRANSFER_OPEN || first.sequence != 1 {
+    if first.record_type != messages::FILE_TRANSFER_OPEN || first.sequence != 1 {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "expected FILE_TRANSFER_OPEN"));
     }
     let open = FileTransferOpen::decode(&first.body)?;
@@ -1195,7 +1196,7 @@ pub(super) fn handle_connection(
         reader.set_record_idle_timeout(std::time::Duration::from_micros(idle_timeout))?;
         reader.set_maximum(64 * 1024)?;
         writer.write_record(
-            registry::record::FILE_TRANSFER_ACCEPTED,
+            messages::FILE_TRANSFER_ACCEPTED,
             open.transfer_id,
             &FileTransferAccepted {
                 transfer_id: open.transfer_id,
@@ -1259,7 +1260,7 @@ fn authenticate_open(
             "file-drop-v1 was not negotiated",
         ));
     }
-    if !open.verify(session.channel_key.expose()) {
+    if !open.verify(&vivid_protocol::auth::ChannelKey::new(*session.channel_key.expose())) {
         return Err(reject_open(
             writer,
             open.transfer_id,
@@ -1322,7 +1323,7 @@ fn stream_source(
         source.ensure_generation(open.transfer_generation)?;
         let prefix = file_drop::file_data_prefix(offset, remaining)?;
         writer.write_record_parts(
-            registry::record::FILE_DATA,
+            messages::FILE_DATA,
             open.transfer_id,
             &[&prefix, &buffer[..remaining]],
         )?;
@@ -1344,7 +1345,7 @@ fn stream_source(
     };
     let sha256 = finish.sha256;
     source.ensure_generation(open.transfer_generation)?;
-    writer.write_record(registry::record::FILE_FINISH, open.transfer_id, &finish.encode()?)?;
+    writer.write_record(messages::FILE_FINISH, open.transfer_id, &finish.encode()?)?;
     loop {
         source.ensure_generation(open.transfer_generation)?;
         let record = reader.read_record(ConnectionKind::FileTransfer)?;
@@ -1352,7 +1353,7 @@ fn stream_source(
             return Err(io::Error::new(io::ErrorKind::InvalidData, "file result object mismatch"));
         }
         match record.record_type {
-            registry::record::FILE_RESULT => {
+            messages::FILE_RESULT => {
                 let result = FileResult::decode(&record.body)?;
                 if result.transfer_id != open.transfer_id
                     || result.transfer_generation != open.transfer_generation
@@ -1366,11 +1367,11 @@ fn stream_source(
                 }
                 return Ok((result, sha256));
             },
-            registry::record::MAX_FILE_DATA => {
+            messages::MAX_FILE_DATA => {
                 let maximum = MaximumFileData::decode(&record.body)?;
                 validate_credit_identity(maximum, open)?;
             },
-            registry::record::FILE_TRANSFER_ABORT => {
+            messages::FILE_TRANSFER_ABORT => {
                 return Err(io::Error::new(
                     io::ErrorKind::ConnectionAborted,
                     "file transfer aborted",
@@ -1399,7 +1400,7 @@ fn read_credit(
         return Err(io::Error::new(io::ErrorKind::InvalidData, "file credit object mismatch"));
     }
     match record.record_type {
-        registry::record::MAX_FILE_DATA => {
+        messages::MAX_FILE_DATA => {
             let maximum = MaximumFileData::decode(&record.body)?;
             validate_credit_identity(maximum, open)?;
             if maximum.maximum_body_bytes < *maximum_body
@@ -1416,7 +1417,7 @@ fn read_credit(
             *maximum_records = maximum.maximum_records;
             Ok(())
         },
-        registry::record::FILE_TRANSFER_ABORT => {
+        messages::FILE_TRANSFER_ABORT => {
             Err(io::Error::new(io::ErrorKind::ConnectionAborted, "file transfer aborted"))
         },
         _ => Err(io::Error::new(io::ErrorKind::InvalidData, "expected MAX_FILE_DATA")),

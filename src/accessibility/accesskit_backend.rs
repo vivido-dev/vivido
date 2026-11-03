@@ -270,7 +270,9 @@ fn build_tree(snapshot: &AccessibilitySnapshot, target: VividTarget) -> TreeUpda
                 accessible.set_max_numeric_value(maximum.get());
             }
             for action in &node.actions {
-                accessible.add_action(overlay_action(*action));
+                if let Some(action) = overlay_action(*action) {
+                    accessible.add_action(action);
+                }
             }
             // A leaf is not expandable, and saying so stops a screen reader offering to expand it.
             if node.children.is_empty() {
@@ -318,22 +320,25 @@ fn overlay_role(role: vivid_protocol::overlay::SemanticRole) -> Role {
         Semantic::Dialog => Role::Dialog,
         Semantic::Tab => Role::Tab,
         Semantic::Separator => Role::Splitter,
+        _ => Role::GenericContainer,
     }
 }
 
-fn overlay_action(action: vivid_protocol::overlay::AccessibleAction) -> Action {
+fn overlay_action(action: vivid_protocol::overlay::AccessibleAction) -> Option<Action> {
     use vivid_protocol::overlay::AccessibleAction as Accessible;
     match action {
         // Activation arrives as a click, so a node that asks to be activatable advertises one.
         // Every variant has a target here: the set was trimmed to what a toolkit can honor
         // rather than carrying an action a host would have to silently ignore.
-        Accessible::Default => Action::Click,
-        Accessible::Focus => Action::Focus,
-        Accessible::Click => Action::Click,
-        Accessible::Increment => Action::Increment,
-        Accessible::Decrement => Action::Decrement,
-        Accessible::Expand => Action::Expand,
-        Accessible::Collapse => Action::Collapse,
+        Accessible::Default => Some(Action::Click),
+        Accessible::Focus => Some(Action::Focus),
+        Accessible::Click => Some(Action::Click),
+        Accessible::Increment => Some(Action::Increment),
+        Accessible::Decrement => Some(Action::Decrement),
+        Accessible::Expand => Some(Action::Expand),
+        Accessible::Collapse => Some(Action::Collapse),
+        // An action this build cannot honor is not advertised.
+        _ => None,
     }
 }
 

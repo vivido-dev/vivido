@@ -1,5 +1,6 @@
 use super::test::TermSize;
 use super::*;
+use crate::terminal::grid::Cursor;
 use crate::terminal::index::Side;
 use std::sync::Mutex;
 
@@ -21,15 +22,30 @@ fn terminal(columns: usize, lines: usize, setup: &[u8]) -> Term<Events> {
 }
 
 fn assert_same(actual: &Term<Events>, expected: &Term<Events>) {
+    // Cells are compared resolved: equal content may be interned under different ids when the
+    // two paths add combining characters in different steps.
+    let resolve = |term: &Term<Events>, grid: &Grid<Cell>| {
+        // Storage's test equality requires removing spare scrollback allocation first.
+        let mut grid = grid.clone();
+        grid.truncate();
+        grid.map(|row, cell| term.serialized_cell(row, cell))
+    };
+    let cursor = |term: &Term<Events>, cursor: &Cursor<Cell>| {
+        let (template, erase) = (&cursor.template, &cursor.erase);
+        // Cursor cells never hold extra content, so an empty row resolves them.
+        let row = Row::default();
+        let cells = (term.serialized_cell(&row, template), term.serialized_cell(&row, erase));
+        (cursor.point, cursor.charsets, cursor.input_needs_wrap, cells)
+    };
     for (a, b) in [(&actual.grid, &expected.grid), (&actual.inactive_grid, &expected.inactive_grid)]
     {
-        // Storage's test equality requires removing spare scrollback allocation first.
-        let (mut a_contents, mut b_contents) = (a.clone(), b.clone());
-        a_contents.truncate();
-        b_contents.truncate();
-        assert_eq!(a_contents, b_contents, "grid contents/history/display offset");
-        assert_eq!(a.cursor, b.cursor);
-        assert_eq!(a.saved_cursor, b.saved_cursor);
+        assert_eq!(
+            resolve(actual, a),
+            resolve(expected, b),
+            "grid contents/history/display offset"
+        );
+        assert_eq!(cursor(actual, &a.cursor), cursor(expected, &b.cursor));
+        assert_eq!(cursor(actual, &a.saved_cursor), cursor(expected, &b.saved_cursor));
         for line in a.topmost_line().0..=a.bottommost_line().0 {
             assert_eq!(a[Line(line)].occupied_len(), b[Line(line)].occupied_len(), "row {line}");
         }
@@ -65,8 +81,9 @@ fn repeat_matches_scalar_cells_cursor_history_damage_and_events() {
     ];
     for (columns, lines) in [(2, 1), (5, 4), (80, 24), (120, 40)] {
         for setup in setups {
-            for c in ['a', ' ', '~', 'q', '界', '\u{301}', '\u{7f}'] {
-                for count in [0, 1, 2, 7, 100] {
+            for c in ['a', ' ', '~', 'q', '界', '😀', '\u{301}', '\u{7f}'] {
+                // Counts on both sides of the 256-byte chunks REP prints from.
+                for count in [0, 1, 2, 7, 100, 256, 257, 600] {
                     let mut actual = terminal(columns, lines, setup);
                     let mut expected = terminal(columns, lines, setup);
                     for term in [&mut actual, &mut expected] {
@@ -96,7 +113,8 @@ fn repeat_preserves_wide_cleanup_and_resize_tracking() {
         let mut actual = terminal(5, 3, "abc界界ab\x1b[H".as_bytes());
         let mut expected = terminal(5, 3, "abc界界ab\x1b[H".as_bytes());
         for term in [&mut actual, &mut expected] {
-            term.grid[Line(0)][Column(column)].push_vivid_resize_tracking(7);
+            term.grid[Line(0)]
+                .update_extra(Column(column), |extra| extra.vivid_resize_tracking.push(7));
             term.goto(0, column);
         }
         actual.repeat_char('x', 25);
@@ -134,6 +152,10 @@ fn rep_stream_matches_expansion_at_every_read_boundary() {
     let cases = [
         ("a", "\x1b[b\x1b[0b\x1b[2b", "aaaa"),
         ("a", "\x1b[100b", ""),
+        // The escape-heavy benchmark repeatedly changes SGR, positions the cursor,
+        // prints one byte, then expands it with REP.
+        ("\x1b[38:5:24;48:2:125:136:147m\x1b[39m\x1b[10`a", "\x1b[100b", ""),
+        ("\x1b[58;5;44;2m\x1b[2Ka", "\x1b[100b", ""),
         ("界", "\x1b[3b", "界界界"),
         ("e\u{301}", "\x1b[3b", "\u{301}\u{301}\u{301}"),
         ("\x1b(0q", "\x1b[3b", "qqq"),
@@ -179,4 +201,90 @@ fn maximum_rep_count_matches_scalar() {
     actual.flush_grid_scroll();
     expected.flush_grid_scroll();
     assert_same(&actual, &expected);
+}
+
+#[test]
+fn printable_runs_match_scalar_at_every_character_boundary() {
+    let setups: &[&[u8]] = &[
+        b"",
+        b"\x1b[?1049h",
+        b"\x1b[?7l",
+        b"\x1b[4h",
+        b"\x1b(0",
+        b"\x1b[1;31;44m",
+        b"\x1b[58;5;44m",
+        b"\x1b]8;id=batch;https://example.invalid\x1b\\",
+        "界e\u{301}界abc\x1b[H".as_bytes(),
+        b"\x1b[2;3r\x1b[3;5H",
+        // Rows that scroll back in at the bottom still hold wide characters, combining marks and
+        // another background when a wrapping run recycles them, on both screens.
+        "\x1b[?1049h界界界界\r\n界e\u{301}界\r\na\u{301}界\r\n界\x1b[44m\x1b[K\x1b[99;1H"
+            .as_bytes(),
+        "界界界界\r\n界e\u{301}界\r\na\u{301}界\r\n\x1b[41m\x1b[2J\x1b[m界\x1b[99;1H".as_bytes(),
+    ];
+    for (columns, lines) in [(2, 1), (5, 4), (7, 3), (80, 24)] {
+        for setup in setups {
+            for text in [
+                "hello world abcdefghijklmnopqrstuvwxyz",
+                "界你好界abc界",
+                "a\u{301}\u{302}\u{303}界\u{301}e",
+                "😀\u{200d}😀x\u{fe0f}🇺🇸",
+                "abc\u{7f}xyz",
+                // Kitty's "Unicode chars" mix: ideographs, full-width punctuation, quotes,
+                // emoji, Latin-1 and combining marks.
+                "旦海司：扒裝，位「才波」‘’😀—§ÀÁ ū̀n̂o᷵H̨a̠界",
+            ] {
+                for split in text.char_indices().map(|(i, _)| i).chain(std::iter::once(text.len()))
+                {
+                    let mut actual = terminal(columns, lines, setup);
+                    let mut expected = terminal(columns, lines, setup);
+                    for part in [&text[..split], &text[split..]] {
+                        actual.input_str(part);
+                        for c in part.chars() {
+                            expected.input(c);
+                        }
+                        actual.flush_grid_scroll();
+                        expected.flush_grid_scroll();
+                        assert_same(&actual, &expected);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "release-mode timing; run alone with --nocapture"]
+fn benchmark_printable_runs() {
+    use std::hint::black_box;
+    use std::time::Instant;
+    for (name, unit) in [
+        ("ascii", "abcdefghijklmnopqrstuvwxyz "),
+        ("unicode", "你好世界αΩ😀abc"),
+        ("combining", "a\u{301}\u{302}\u{303}"),
+    ] {
+        let text = unit.repeat(16_384);
+        for sample in 0..5 {
+            for batch in if sample % 2 == 0 { [false, true] } else { [true, false] } {
+                let mut term = terminal(120, 40, b"\x1b[?1049h");
+                let start = Instant::now();
+                for _ in 0..20 {
+                    if batch {
+                        term.input_str(black_box(&text));
+                    } else {
+                        for c in black_box(&text).chars() {
+                            term.input(c);
+                        }
+                    }
+                    term.flush_grid_scroll();
+                }
+                let elapsed = start.elapsed().as_secs_f64();
+                black_box(&term);
+                println!(
+                    "{name},{sample},{batch},{:.3}",
+                    text.len() as f64 * 20. / elapsed / 1048576.
+                );
+            }
+        }
+    }
 }

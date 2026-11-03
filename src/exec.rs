@@ -256,13 +256,16 @@ mod tests {
 
     #[test]
     fn exec_kills_at_the_deadline() {
-        // `timeout.exe` refuses redirected stdin, so sleep with PowerShell instead.
+        // Use a cmd built-in so this works with null stdin and without PowerShell on PATH.
+        // Keeping the work in the shell also avoids a child retaining the output pipes.
         #[cfg(windows)]
-        let sleep = "powershell -noprofile -command Start-Sleep -Seconds 30";
+        let command = "for /L %i in (1,1,2147483647) do @rem";
         #[cfg(not(windows))]
-        let sleep = "sleep 30";
-        let outcome = run_exec_command(sleep, None, Duration::from_millis(300));
-        assert!(outcome.timed_out);
+        let command = "exec sleep 30";
+        let outcome = run_exec_command(command, None, Duration::from_millis(300));
+        assert_eq!(outcome.spawn_error, None);
+        assert!(outcome.timed_out, "command exited before its deadline: {outcome:?}");
+        assert!(!outcome.truncated, "shell retained its output pipes: {outcome:?}");
         assert!(outcome.duration_ms >= 300);
         assert!(outcome.duration_ms < 30_000);
     }

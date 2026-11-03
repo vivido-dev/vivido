@@ -3,10 +3,13 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use bitflags::bitflags;
 use serde::{Deserialize, Serialize};
+use smallvec::SmallVec;
 
 use crate::terminal::grid::{self, GridCell};
 use crate::terminal::index::Column;
-use crate::terminal::vvte::ansi::{Color, Hyperlink as VteHyperlink, NamedColor};
+use crate::terminal::term::extra::{ExtraId, RowExtras};
+use crate::terminal::term::style::{StyleId, StyleTable};
+use crate::terminal::vvte::ansi::{Color, Hyperlink as VteHyperlink};
 
 bitflags! {
     /// Styling and grid-occupancy flags attached to a terminal cell.
@@ -54,6 +57,17 @@ bitflags! {
     }
 }
 
+impl Flags {
+    /// Flags that describe where a cell sits in the grid rather than how it looks.
+    ///
+    /// They stay with the cell when its style is shared, so grid code (wrapping, reflow, wide
+    /// characters) can read them without the style.
+    pub const LAYOUT: Self = Self::WRAPLINE
+        .union(Self::WIDE_CHAR)
+        .union(Self::WIDE_CHAR_SPACER)
+        .union(Self::LEADING_WIDE_CHAR_SPACER);
+}
+
 /// Counter for hyperlinks without explicit ID.
 static HYPERLINK_ID_SUFFIX: AtomicU32 = AtomicU32::new(0);
 
@@ -78,6 +92,11 @@ impl Hyperlink {
     /// Borrow the OSC 8 hyperlink destination URI.
     pub fn uri(&self) -> &str {
         &self.inner.uri
+    }
+
+    /// Whether `other` is this very hyperlink, not just an equal one; never hashes the URI.
+    pub(crate) fn same(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
     }
 }
 
@@ -129,197 +148,501 @@ impl<T: Copy> ResetDiscriminant<T> for T {
     }
 }
 
-impl ResetDiscriminant<Color> for Cell {
-    fn discriminant(&self) -> Color {
-        self.bg
+impl ResetDiscriminant<StyleId> for Cell {
+    fn discriminant(&self) -> StyleId {
+        self.style()
     }
 }
 
-/// Dynamically allocated cell content.
+/// Content and attributes of a single cell in the terminal grid, packed into eight bytes.
 ///
-/// This storage is reserved for cell attributes which are rarely set. This allows reducing the
-/// allocation required ahead of time for every cell, with some additional overhead when the extra
-/// storage is actually required.
-#[derive(Default, Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
-pub struct CellExtra {
-    zerowidth: Vec<char>,
-    underline_color: Option<Color>,
-    hyperlink: Option<Hyperlink>,
-    /// Temporary indices used to carry authenticated Vivid anchors through grid resize/reflow.
+/// Colors and styling attributes live in the terminal's [`StyleTable`] and combining characters in
+/// the row's [`RowExtras`]; the cell holds an id for each. [`SerializedCell`] is its
+/// self-contained form.
+///
+/// ```text
+/// bits  0..21  character
+/// bits 21..25  layout: WRAPLINE, WIDE_CHAR, WIDE_CHAR_SPACER, LEADING_WIDE_CHAR_SPACER
+/// bits 25..50  style id (index and blank bit, `StyleId::packed`)
+/// bits 50..64  extra id (row entry number and combining bit, `ExtraId::packed`)
+/// ```
+///
+/// Eight bytes halve the memory a scroll clears and a print writes compared with an unpacked
+/// cell, which is most of the time spent on plain text.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Cell(u64);
+
+// The packed fields fill the eight bytes exactly.
+const _: () = assert!(Cell::EXTRA_SHIFT + ExtraId::PACKED_BITS == u64::BITS);
+
+/// Layout flags in the order of their packed bits.
+const LAYOUT_ORDER: [Flags; 4] =
+    [Flags::WRAPLINE, Flags::WIDE_CHAR, Flags::WIDE_CHAR_SPACER, Flags::LEADING_WIDE_CHAR_SPACER];
+
+impl Cell {
+    const CHAR_BITS: u32 = 21;
+    const LAYOUT_SHIFT: u32 = Self::CHAR_BITS;
+    const STYLE_SHIFT: u32 = Self::LAYOUT_SHIFT + LAYOUT_ORDER.len() as u32;
+    const EXTRA_SHIFT: u32 = Self::STYLE_SHIFT + StyleId::PACKED_BITS;
+    const CHAR_MASK: u64 = (1 << Self::CHAR_BITS) - 1;
+    const LAYOUT_MASK: u64 = ((1 << LAYOUT_ORDER.len()) - 1) << Self::LAYOUT_SHIFT;
+    const STYLE_MASK: u64 = ((1 << StyleId::PACKED_BITS) - 1) << Self::STYLE_SHIFT;
+    const EXTRA_MASK: u64 = !0 << Self::EXTRA_SHIFT;
+
+    /// Layout flags as packed bits, in place.
+    #[inline]
+    fn layout_bits(flags: Flags) -> u64 {
+        debug_assert!(Flags::LAYOUT.contains(flags), "{flags:?} is not layout");
+        let mut bits = 0;
+        for (bit, flag) in LAYOUT_ORDER.iter().enumerate() {
+            if flags.contains(*flag) {
+                bits |= 1 << (Self::LAYOUT_SHIFT + bit as u32);
+            }
+        }
+        bits
+    }
+
+    /// Character stored in this cell.
+    #[inline]
+    pub fn c(&self) -> char {
+        // Only `char`s are ever stored, so the fallback is unreachable.
+        char::from_u32((self.0 & Self::CHAR_MASK) as u32).unwrap_or(' ')
+    }
+
+    /// Replace the character stored in this cell.
+    #[inline]
+    pub fn set_c(&mut self, c: char) {
+        self.0 = self.0 & !Self::CHAR_MASK | u64::from(c);
+    }
+
+    /// Reference to this cell's colors and styling attributes.
     ///
-    /// These never survive a resize operation and are not part of serialized terminal state.
-    #[serde(skip)]
-    vivid_resize_tracking: Vec<usize>,
+    /// Resolve it with the terminal's [`StyleTable`].
+    #[inline]
+    pub fn style(&self) -> StyleId {
+        StyleId::from_packed(self.0 >> Self::STYLE_SHIFT)
+    }
+
+    /// Replace this cell's style reference.
+    #[inline]
+    pub fn set_style(&mut self, style: StyleId) {
+        self.0 = self.0 & !Self::STYLE_MASK | style.packed() << Self::STYLE_SHIFT;
+    }
+
+    /// Layout flags: line wrap and double-width occupancy.
+    ///
+    /// Never contains styling, which lives in the cell's style.
+    #[inline]
+    pub fn layout(&self) -> Flags {
+        let mut flags = Flags::empty();
+        for (bit, flag) in LAYOUT_ORDER.iter().enumerate() {
+            if self.0 & 1 << (Self::LAYOUT_SHIFT + bit as u32) != 0 {
+                flags |= *flag;
+            }
+        }
+        flags
+    }
+
+    /// Replace the layout flags.
+    #[inline]
+    pub fn set_layout(&mut self, flags: Flags) {
+        self.0 = self.0 & !Self::LAYOUT_MASK | Self::layout_bits(flags);
+    }
+
+    /// Set the given layout flags.
+    #[inline]
+    pub fn insert_layout(&mut self, flags: Flags) {
+        self.0 |= Self::layout_bits(flags);
+    }
+
+    /// Clear the given layout flags.
+    #[inline]
+    pub fn remove_layout(&mut self, flags: Flags) {
+        self.0 &= !Self::layout_bits(flags);
+    }
+
+    /// Whether any of the given layout flags is set; one mask test.
+    #[inline]
+    pub fn has_layout(&self, flags: Flags) -> bool {
+        self.0 & Self::layout_bits(flags) != 0
+    }
+
+    /// Whether a print may overwrite this cell outright: no extra content to drop and not part of
+    /// a double-width character to clean up. One mask test.
+    #[inline]
+    pub(crate) fn is_simple(&self) -> bool {
+        const WIDE: Flags =
+            Flags::WIDE_CHAR.union(Flags::WIDE_CHAR_SPACER).union(Flags::LEADING_WIDE_CHAR_SPACER);
+        self.0 & (Self::EXTRA_MASK | Self::layout_bits(WIDE)) == 0
+    }
+
+    /// Whether this cell holds combining characters or resize tracking.
+    #[inline]
+    pub fn has_extra(&self) -> bool {
+        self.0 & Self::EXTRA_MASK != 0
+    }
+
+    /// Reference to this cell's combining characters and resize tracking.
+    ///
+    /// Resolve it with the [`RowExtras`] of the row holding the cell.
+    #[inline]
+    pub fn extra(&self) -> ExtraId {
+        ExtraId::from_packed(self.0 >> Self::EXTRA_SHIFT)
+    }
+
+    /// Point this cell at another entry of its row's extra content.
+    ///
+    /// An entry number a packed cell cannot hold drops the content instead; rows compact well
+    /// before that, so it takes a row over 8,000 columns wide full of combining characters.
+    #[inline]
+    fn set_extra_id(&mut self, extra: ExtraId) {
+        let bits = extra.packed().unwrap_or_else(|| {
+            log::warn!("Row has too many combining-character entries; dropping one");
+            0
+        });
+        self.0 = self.0 & !Self::EXTRA_MASK | bits << Self::EXTRA_SHIFT;
+    }
+
+    /// Replace the whole cell with `c` in `style` and `layout`, and no extra content.
+    #[inline]
+    pub(crate) fn write(&mut self, c: char, style: StyleId, layout: Flags) {
+        self.0 = u64::from(c) | Self::layout_bits(layout) | style.packed() << Self::STYLE_SHIFT;
+    }
+
+    /// Remove all wide char data from a cell.
+    ///
+    /// Resize tracking goes too; it only exists while a resize is in progress, never during writes.
+    #[inline(never)]
+    pub fn clear_wide(&mut self) {
+        self.remove_layout(Flags::WIDE_CHAR);
+        self.0 &= !Self::EXTRA_MASK;
+        self.set_c(' ');
+    }
 }
 
-/// Content and attributes of a single cell in the terminal grid.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct Cell {
-    /// Character stored in this terminal cell.
-    pub c: char,
-    /// Foreground color.
-    pub fg: Color,
-    /// Background color.
-    pub bg: Color,
-    /// Terminal cell or mode flags.
-    pub flags: Flags,
-    /// Optional extended cell attributes.
-    pub extra: Option<Arc<CellExtra>>,
+impl std::fmt::Debug for Cell {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Cell")
+            .field("c", &self.c())
+            .field("style", &self.style())
+            .field("layout", &self.layout())
+            .field("extra", &self.extra())
+            .finish()
+    }
+}
+
+/// A cell with its style written out, independent of any style table.
+///
+/// This is the form reference fixtures and diagnostic grid dumps store.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SerializedCell {
+    c: char,
+    fg: Color,
+    bg: Color,
+    flags: Flags,
+    extra: Option<SerializedExtra>,
+}
+
+/// The rarely set parts of a [`SerializedCell`], present when any of them is.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct SerializedExtra {
+    zerowidth: SmallVec<[char; 4]>,
+    underline_color: Option<Color>,
+    hyperlink: Option<Hyperlink>,
+}
+
+impl SerializedCell {
+    /// Write out `cell`, whose style `styles` holds and whose extra content its row's `extras`.
+    pub fn new(cell: &Cell, styles: &StyleTable, extras: &RowExtras) -> Self {
+        let style = styles.get(cell.style());
+        let flags = cell.layout().union(style.attrs);
+        let extra =
+            (cell.has_extra() || style.underline_color.is_some() || style.hyperlink.is_some())
+                .then(|| SerializedExtra {
+                    zerowidth: extras
+                        .get(cell.extra())
+                        .map(|extra| extra.zerowidth.clone())
+                        .unwrap_or_default(),
+                    underline_color: style.underline_color,
+                    hyperlink: style.hyperlink.clone(),
+                });
+        Self { c: cell.c(), fg: style.fg, bg: style.bg, flags, extra }
+    }
+}
+
+impl Default for SerializedCell {
+    fn default() -> Self {
+        Self::new(&Cell::default(), &StyleTable::default(), &RowExtras::default())
+    }
 }
 
 impl Default for Cell {
     #[inline]
     fn default() -> Cell {
-        Cell {
-            c: ' ',
-            bg: Color::Named(NamedColor::Background),
-            fg: Color::Named(NamedColor::Foreground),
-            flags: Flags::empty(),
-            extra: None,
-        }
-    }
-}
-
-impl Cell {
-    /// Zerowidth characters stored in this cell.
-    #[inline]
-    pub fn zerowidth(&self) -> Option<&[char]> {
-        self.extra.as_ref().map(|extra| extra.zerowidth.as_slice())
-    }
-
-    /// Write a new zerowidth character to this cell.
-    #[inline]
-    pub fn push_zerowidth(&mut self, character: char) {
-        let extra = self.extra.get_or_insert_with(Default::default);
-        Arc::make_mut(extra).zerowidth.push(character);
-    }
-
-    /// Attach a temporary Vivid anchor index before terminal resize/reflow.
-    pub(crate) fn push_vivid_resize_tracking(&mut self, index: usize) {
-        let extra = self.extra.get_or_insert_with(Default::default);
-        Arc::make_mut(extra).vivid_resize_tracking.push(index);
-    }
-
-    /// Remove and return temporary Vivid anchor indices after terminal resize/reflow.
-    pub(crate) fn take_vivid_resize_tracking(&mut self) -> Vec<usize> {
-        let Some(extra) = self.extra.as_mut() else {
-            return Vec::new();
-        };
-        let extra = Arc::make_mut(extra);
-        let tracking = std::mem::take(&mut extra.vivid_resize_tracking);
-        if extra.zerowidth.is_empty()
-            && extra.underline_color.is_none()
-            && extra.hyperlink.is_none()
-        {
-            self.extra = None;
-        }
-        tracking
-    }
-
-    /// Remove all wide char data from a cell.
-    #[inline(never)]
-    pub fn clear_wide(&mut self) {
-        self.flags.remove(Flags::WIDE_CHAR);
-        if let Some(extra) = self.extra.as_mut() {
-            Arc::make_mut(extra).zerowidth = Vec::new();
-        }
-        self.c = ' ';
-    }
-
-    /// Set underline color on the cell.
-    pub fn set_underline_color(&mut self, color: Option<Color>) {
-        // If we reset color and we don't have zerowidth we should drop extra storage.
-        if color.is_none()
-            && self.extra.as_ref().is_none_or(|extra| {
-                extra.zerowidth.is_empty()
-                    && extra.hyperlink.is_none()
-                    && extra.vivid_resize_tracking.is_empty()
-            })
-        {
-            self.extra = None;
-        } else {
-            let extra = self.extra.get_or_insert_with(Default::default);
-            Arc::make_mut(extra).underline_color = color;
-        }
-    }
-
-    /// Underline color stored in this cell.
-    #[inline]
-    pub fn underline_color(&self) -> Option<Color> {
-        self.extra.as_ref()?.underline_color
-    }
-
-    /// Set hyperlink.
-    pub fn set_hyperlink(&mut self, hyperlink: Option<Hyperlink>) {
-        let should_drop = hyperlink.is_none()
-            && self.extra.as_ref().is_none_or(|extra| {
-                extra.zerowidth.is_empty()
-                    && extra.underline_color.is_none()
-                    && extra.vivid_resize_tracking.is_empty()
-            });
-
-        if should_drop {
-            self.extra = None;
-        } else {
-            let extra = self.extra.get_or_insert_with(Default::default);
-            Arc::make_mut(extra).hyperlink = hyperlink;
-        }
-    }
-
-    /// Hyperlink stored in this cell.
-    #[inline]
-    pub fn hyperlink(&self) -> Option<Hyperlink> {
-        self.extra.as_ref()?.hyperlink.clone()
+        Cell(u64::from(' '))
     }
 }
 
 impl GridCell for Cell {
     #[inline]
     fn is_empty(&self) -> bool {
-        (self.c == ' ' || self.c == '\t')
-            && self.bg == Color::Named(NamedColor::Background)
-            && self.fg == Color::Named(NamedColor::Foreground)
-            && !self.flags.intersects(
-                Flags::INVERSE
-                    | Flags::ALL_UNDERLINES
-                    | Flags::STRIKEOUT
-                    | Flags::WRAPLINE
-                    | Flags::WIDE_CHAR_SPACER
-                    | Flags::LEADING_WIDE_CHAR_SPACER,
+        let c = self.c();
+        (c == ' ' || c == '\t')
+            && !self.style().shows_on_blank()
+            && !self.has_layout(
+                Flags::WRAPLINE | Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER,
             )
-            && self.extra.as_ref().map(|extra| extra.zerowidth.is_empty()) != Some(false)
-            && self.extra.as_ref().is_none_or(|extra| extra.vivid_resize_tracking.is_empty())
+            && !self.has_extra()
     }
 
     #[inline]
-    fn flags(&self) -> &Flags {
-        &self.flags
+    fn layout(&self) -> Flags {
+        Cell::layout(self)
     }
 
     #[inline]
-    fn flags_mut(&mut self) -> &mut Flags {
-        &mut self.flags
+    fn insert_layout(&mut self, flags: Flags) {
+        Cell::insert_layout(self, flags);
+    }
+
+    #[inline]
+    fn remove_layout(&mut self, flags: Flags) {
+        Cell::remove_layout(self, flags);
+    }
+
+    #[inline]
+    fn extra(&self) -> ExtraId {
+        Cell::extra(self)
+    }
+
+    #[inline]
+    fn set_extra(&mut self, extra: ExtraId) {
+        self.set_extra_id(extra);
     }
 
     #[inline]
     fn reset(&mut self, template: &Self) {
-        // `extra` is the only field that owns an allocation, and it is unset for all but a handful
-        // of cells. Releasing it under its own branch leaves the rest of the reset a straight-line
-        // store, so clearing a scrolled-in row does not run drop glue over every cell.
-        if self.extra.is_some() {
-            self.extra = None;
-        }
-        self.c = ' ';
-        self.fg = Color::Named(NamedColor::Foreground);
-        self.bg = template.bg;
-        self.flags = Flags::empty();
+        // A blank cell keeps only the template's style, so this is one store per cell.
+        self.0 = u64::from(' ') | template.0 & Self::STYLE_MASK;
     }
 }
 
-impl From<Color> for Cell {
+impl From<char> for Cell {
+    /// A cell holding `c` with default colors and no flags.
     #[inline]
-    fn from(color: Color) -> Self {
-        Self { bg: color, ..Cell::default() }
+    fn from(c: char) -> Self {
+        Cell(u64::from(c))
+    }
+}
+
+/// Write printable ASCII `bytes` over `cells` in `style`, stopping at the first byte or cell that
+/// needs the general path; returns how many were written.
+///
+/// Works eight cells at a time while every byte is printable and every cell is plain, so the
+/// common case compiles to wide loads and stores; the first group with an exception finishes one
+/// cell at a time.
+///
+/// With `FRESH`, the cells' old content is ignored: the caller resets every cell not written, as
+/// [`Row::reset_with_prefix`](crate::terminal::grid::Row::reset_with_prefix) does.
+pub(crate) fn fill_ascii<const FRESH: bool>(
+    cells: &mut [Cell],
+    bytes: &[u8],
+    style: StyleId,
+) -> usize {
+    let len = cells.len().min(bytes.len());
+    let (cells, bytes) = (&mut cells[..len], &bytes[..len]);
+    let mut blank = Cell::default();
+    blank.write('\0', style, Flags::empty());
+    let base = blank.0;
+    let printable = |b: u8| b.wrapping_sub(0x20) < 0x5F;
+    let mut written = 0;
+    let (cell_groups, _) = cells.as_chunks_mut::<8>();
+    let (byte_groups, _) = bytes.as_chunks::<8>();
+    for (group, chars) in cell_groups.iter_mut().zip(byte_groups) {
+        let clear = FRESH || group.iter().fold(true, |clear, cell| clear & cell.is_simple());
+        if !clear || !chars.iter().fold(true, |ok, &b| ok & printable(b)) {
+            break;
+        }
+        for (cell, &b) in group.iter_mut().zip(chars) {
+            cell.0 = base | u64::from(b);
+        }
+        written += 8;
+    }
+    for (cell, &b) in cells[written..].iter_mut().zip(&bytes[written..]) {
+        if !printable(b) || !(FRESH || cell.is_simple()) {
+            break;
+        }
+        cell.0 = base | u64::from(b);
+        written += 1;
+    }
+    written
+}
+
+/// Display width of `c`: `unicode-width`'s answer, with the ranges that dominate real text
+/// answered without the table.
+///
+/// Printable ASCII is one cell and the CJK Unified Ideographs block two; a test checks both
+/// against `unicode-width` exhaustively, so the shortcut never disagrees with the scalar path.
+#[inline]
+pub(crate) fn char_width(c: char) -> Option<usize> {
+    match u32::from(c) {
+        0x20..=0x7E => Some(1),
+        0x4E00..=0x9FFF => Some(2),
+        _ => unicode_width::UnicodeWidthChar::width(c),
+    }
+}
+
+/// Write characters from `chars` that are `width` cells wide over `cells` in `style`, stopping at
+/// the first character of another width or the first cell that needs the general path; returns
+/// how many cells were written. A character not taken is left in `chars`.
+///
+/// One pass: each character is decoded and measured once, and each cell checked and written once.
+#[inline]
+pub(crate) fn fill_chars<const FRESH: bool>(
+    cells: &mut [Cell],
+    chars: &mut std::str::Chars<'_>,
+    width: usize,
+    style: StyleId,
+) -> usize {
+    debug_assert!(width == 1 || width == 2);
+    let mut written = 0;
+    while written + width <= cells.len() {
+        if width == 2 {
+            written += fill_ideographs::<FRESH>(&mut cells[written..], chars, style);
+            if written + width > cells.len() {
+                break;
+            }
+        }
+        let rest = chars.clone();
+        let Some(c) = chars.next() else { break };
+        let fits = char_width(c) == Some(width)
+            && (FRESH
+                || cells[written].is_simple() && (width == 1 || cells[written + 1].is_simple()));
+        if !fits {
+            *chars = rest;
+            break;
+        }
+        if width == 1 {
+            cells[written].write(c, style, Flags::empty());
+        } else {
+            cells[written].write(c, style, Flags::WIDE_CHAR);
+            cells[written + 1].write(' ', style, Flags::WIDE_CHAR_SPACER);
+        }
+        written += width;
+    }
+    written
+}
+
+/// Write a run of CJK Unified Ideographs (U+4E00..=U+9FFF) from `chars` as wide cell pairs over
+/// plain `cells`; returns how many cells were written and leaves the rest in `chars`.
+///
+/// Decodes the three-byte sequences straight from the text's bytes: CJK output is mostly these
+/// ideographs, and going through `Chars` and the width table for each one dominated printing it.
+#[inline]
+fn fill_ideographs<const FRESH: bool>(
+    cells: &mut [Cell],
+    chars: &mut std::str::Chars<'_>,
+    style: StyleId,
+) -> usize {
+    let text = chars.as_str();
+    let bytes = text.as_bytes();
+    let (mut read, mut written) = (0, 0);
+    while written + 2 <= cells.len() && read + 3 <= bytes.len() {
+        let [lead, second, third] = [bytes[read], bytes[read + 1], bytes[read + 2]];
+        // `text` is valid UTF-8, so a three-byte lead is followed by two continuation bytes.
+        let code =
+            u32::from(lead & 0x0F) << 12 | u32::from(second & 0x3F) << 6 | u32::from(third & 0x3F);
+        if lead & 0xF0 != 0xE0
+            || !(0x4E00..=0x9FFF).contains(&code)
+            || !(FRESH || cells[written].is_simple() && cells[written + 1].is_simple())
+        {
+            break;
+        }
+        // In range, so a valid scalar value.
+        let c = char::from_u32(code).unwrap_or(' ');
+        cells[written].write(c, style, Flags::WIDE_CHAR);
+        cells[written + 1].write(' ', style, Flags::WIDE_CHAR_SPACER);
+        read += 3;
+        written += 2;
+    }
+    if read > 0 {
+        *chars = text[read..].chars();
+    }
+    written
+}
+
+/// A [`Cell`] with each part in its own field, for resize.
+///
+/// Resize gathers every row's combining characters into one list while it moves cells between
+/// rows, and that list can hold more entries than a packed cell can number. Grids are converted to
+/// this form for the resize and back afterwards, when each row again holds only its own entries.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct UnpackedCell {
+    c: char,
+    style: StyleId,
+    extra: ExtraId,
+    layout: Flags,
+}
+
+impl Default for UnpackedCell {
+    fn default() -> Self {
+        Self::from(&Cell::default())
+    }
+}
+
+impl From<&Cell> for UnpackedCell {
+    fn from(cell: &Cell) -> Self {
+        Self { c: cell.c(), style: cell.style(), extra: cell.extra(), layout: cell.layout() }
+    }
+}
+
+impl From<&UnpackedCell> for Cell {
+    fn from(cell: &UnpackedCell) -> Self {
+        let mut packed = Cell::default();
+        packed.write(cell.c, cell.style, cell.layout);
+        packed.set_extra_id(cell.extra);
+        packed
+    }
+}
+
+impl ResetDiscriminant<StyleId> for UnpackedCell {
+    fn discriminant(&self) -> StyleId {
+        self.style
+    }
+}
+
+impl GridCell for UnpackedCell {
+    fn is_empty(&self) -> bool {
+        (self.c == ' ' || self.c == '\t')
+            && !self.style.shows_on_blank()
+            && !self.layout.intersects(
+                Flags::WRAPLINE | Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER,
+            )
+            && self.extra == ExtraId::NONE
+    }
+
+    fn layout(&self) -> Flags {
+        self.layout
+    }
+
+    fn insert_layout(&mut self, flags: Flags) {
+        self.layout.insert(flags);
+    }
+
+    fn remove_layout(&mut self, flags: Flags) {
+        self.layout.remove(flags);
+    }
+
+    fn extra(&self) -> ExtraId {
+        self.extra
+    }
+
+    fn set_extra(&mut self, extra: ExtraId) {
+        self.extra = extra;
+    }
+
+    fn reset(&mut self, template: &Self) {
+        *self = Self { c: ' ', style: template.style, ..Self::default() };
     }
 }
 
@@ -333,14 +656,12 @@ impl LineLength for grid::Row<Cell> {
     fn line_length(&self) -> Column {
         let mut length = Column(0);
 
-        if self[Column(self.len() - 1)].flags.contains(Flags::WRAPLINE) {
+        if self[Column(self.len() - 1)].has_layout(Flags::WRAPLINE) {
             return Column(self.len());
         }
 
         for (index, cell) in self[..].iter().rev().enumerate() {
-            if cell.c != ' '
-                || cell.extra.as_ref().map(|extra| extra.zerowidth.is_empty()) == Some(false)
-            {
+            if cell.c() != ' ' || cell.extra().has_zerowidth() {
                 length = Column(self.len() - index);
                 break;
             }
@@ -354,43 +675,195 @@ impl LineLength for grid::Row<Cell> {
 mod tests {
     use super::*;
 
+    use crate::terminal::term::style::Style;
+
     use std::mem;
 
     use crate::terminal::grid::Row;
 
     #[test]
     fn cell_size_is_below_cap() {
-        // Expected cell size on 64-bit architectures.
-        const EXPECTED_CELL_SIZE: usize = 24;
+        // Character, layout flags, style id and extra-content id, packed.
+        const EXPECTED_CELL_SIZE: usize = 8;
 
         // Ensure that cell size isn't growing by accident.
         assert!(mem::size_of::<Cell>() <= EXPECTED_CELL_SIZE);
     }
 
+    #[cfg(target_pointer_width = "64")]
     #[test]
-    fn extra_updates_preserve_shared_cell_contents() {
-        let mut cell = Cell::default();
-        cell.push_zerowidth('\u{301}');
-        let original = cell.clone();
-        cell.push_zerowidth('\u{302}');
-        cell.set_underline_color(Some(Color::Indexed(3)));
-        cell.push_vivid_resize_tracking(7);
+    fn inline_suffixes_preserve_the_previous_storage_layout_size() {
+        assert_eq!(mem::size_of::<SmallVec<[char; 4]>>(), mem::size_of::<Vec<char>>());
+    }
 
-        assert_eq!(original.zerowidth(), Some(['\u{301}'].as_slice()));
-        assert_eq!(original.underline_color(), None);
-        assert!(original.extra.as_ref().unwrap().vivid_resize_tracking.is_empty());
-        assert_eq!(cell.zerowidth(), Some(['\u{301}', '\u{302}'].as_slice()));
-        assert_eq!(cell.underline_color(), Some(Color::Indexed(3)));
-        assert_eq!(cell.take_vivid_resize_tracking(), [7]);
-        cell.set_underline_color(None);
-        cell.set_hyperlink(None);
-        assert_eq!(cell.zerowidth(), Some(['\u{301}', '\u{302}'].as_slice()));
+    #[test]
+    fn every_field_packs_and_unpacks_independently() {
+        let mut styles = crate::terminal::term::style::StyleTable::default();
+        let inverse = styles.intern(Style { attrs: Flags::INVERSE, ..Style::default() });
+        let mut extras = RowExtras::default();
+        let marks = extras.update(ExtraId::NONE, |extra| extra.zerowidth.push('\u{301}'));
+
+        for c in ['\0', ' ', 'x', '界', '\u{10FFFF}'] {
+            for layout in [Flags::empty(), Flags::LAYOUT, Flags::WIDE_CHAR_SPACER] {
+                for style in [StyleId::default(), inverse] {
+                    let mut cell = Cell::default();
+                    cell.write(c, style, layout);
+                    GridCell::set_extra(&mut cell, marks);
+                    assert_eq!(
+                        (cell.c(), cell.layout(), cell.style(), cell.extra()),
+                        (c, layout, style, marks)
+                    );
+                    assert!(cell.style().shows_on_blank() == (style == inverse));
+                    assert_eq!(Cell::from(&UnpackedCell::from(&cell)), cell);
+
+                    cell.set_c('y');
+                    cell.set_style(StyleId::default());
+                    assert_eq!((cell.layout(), cell.extra()), (layout, marks), "{c:?}");
+                    cell.set_layout(Flags::WRAPLINE);
+                    assert_eq!((cell.c(), cell.extra()), ('y', marks));
+                }
+            }
+        }
+        assert_eq!(std::mem::size_of::<Cell>(), 8);
+    }
+
+    #[test]
+    fn the_ascii_fill_stops_at_the_first_byte_or_cell_it_cannot_take() {
+        let bytes = b"abcdefghijklmnopqrstuvwxyz";
+        for stop in 0..bytes.len() {
+            // A control byte at `stop`.
+            let mut cells = vec![Cell::default(); bytes.len()];
+            let mut input = bytes.to_vec();
+            input[stop] = b'\n';
+            assert_eq!(fill_ascii::<false>(&mut cells, &input, StyleId::default()), stop);
+            assert!(cells[..stop].iter().zip(bytes).all(|(cell, &b)| cell.c() == char::from(b)));
+            assert!(cells[stop..].iter().all(|cell| cell.c() == ' '), "nothing past the stop");
+
+            // A wide-character spacer at `stop`.
+            let mut cells = vec![Cell::default(); bytes.len()];
+            cells[stop].insert_layout(Flags::WIDE_CHAR_SPACER);
+            assert_eq!(fill_ascii::<false>(&mut cells, bytes, StyleId::default()), stop);
+            assert!(cells[stop].has_layout(Flags::WIDE_CHAR_SPACER), "the stop cell is untouched");
+        }
+        let mut cells = vec![Cell::default(); 5];
+        assert_eq!(
+            fill_ascii::<false>(&mut cells, bytes, StyleId::default()),
+            5,
+            "bounded by the cells"
+        );
+    }
+
+    #[test]
+    fn resetting_while_writing_equals_resetting_then_writing() {
+        let mut table = StyleTable::default();
+        let red = table.intern(Style { attrs: Flags::BOLD, ..Style::default() });
+        let blue = table.intern(Style { attrs: Flags::ITALIC, ..Style::default() });
+        let erase_templates = [Cell::default(), {
+            let mut cell = Cell::default();
+            cell.set_style(blue);
+            cell
+        }];
+        // Old rows: empty, plain text, wide pairs, and a tail in another style.
+        let old_rows = |columns: usize| -> Vec<Row<Cell>> {
+            let mut rows = vec![Row::new(columns)];
+            let mut text = Row::new(columns);
+            text.write_prefix(Column(0), columns - 2, |cells| {
+                fill_ascii::<false>(cells, &[b'x'; 64], red)
+            });
+            rows.push(text);
+            let mut wide = Row::new(columns);
+            let mut chars = "界界界界界界界界".chars();
+            wide.write_prefix(Column(0), columns, |cells| {
+                fill_chars::<false>(cells, &mut chars, 2, red)
+            });
+            rows.push(wide);
+            let mut styled = Row::new(columns);
+            styled.reset(&erase_templates[1]);
+            rows.push(styled);
+            rows
+        };
+        for columns in [3, 8, 13] {
+            for erase in &erase_templates {
+                for old in old_rows(columns) {
+                    for len in 0..=columns {
+                        let bytes = vec![b'a'; len];
+                        let mut expected = old.clone();
+                        expected.reset(erase);
+                        let expected_written = expected.write_prefix(Column(0), len, |cells| {
+                            fill_ascii::<false>(cells, &bytes, red)
+                        });
+                        let mut actual = old.clone();
+                        let written = actual.reset_with_prefix(erase, len, |cells| {
+                            fill_ascii::<true>(cells, &bytes, red)
+                        });
+                        assert_eq!(written, expected_written);
+                        assert_eq!(actual[..], expected[..], "{columns} {len}");
+                        assert_eq!(actual.occupied_len(), expected.occupied_len());
+
+                        let mut chars = "界界界界界界界".chars();
+                        let mut expected = old.clone();
+                        expected.reset(erase);
+                        let expected_written = expected.write_prefix(Column(0), len, |cells| {
+                            fill_chars::<false>(cells, &mut chars, 2, red)
+                        });
+                        let mut chars = "界界界界界界界".chars();
+                        let mut actual = old.clone();
+                        let written = actual.reset_with_prefix(erase, len, |cells| {
+                            fill_chars::<true>(cells, &mut chars, 2, red)
+                        });
+                        assert_eq!(written, expected_written);
+                        assert_eq!(actual[..], expected[..], "wide {columns} {len}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_width_shortcut_agrees_with_unicode_width_for_every_character() {
+        for c in (0..=0x10FFFF).filter_map(char::from_u32) {
+            assert_eq!(char_width(c), unicode_width::UnicodeWidthChar::width(c), "{c:?}");
+        }
+    }
+
+    #[test]
+    fn layout_and_style_change_independently() {
+        let mut table = crate::terminal::term::style::StyleTable::default();
+        let bold = table.intern(Style { attrs: Flags::BOLD, ..Style::default() });
+        let mut cell = Cell::default();
+        cell.set_style(bold);
+        cell.insert_layout(Flags::WIDE_CHAR);
+        assert_eq!(cell.layout(), Flags::WIDE_CHAR);
+        assert_eq!(table.get(cell.style()).attrs, Flags::BOLD);
+
+        cell.set_style(StyleId::default());
+        assert_eq!(cell.layout(), Flags::WIDE_CHAR, "replacing the style keeps layout");
+        cell.set_layout(Flags::WRAPLINE);
+        assert_eq!(cell.style(), StyleId::default(), "replacing layout keeps the style");
+    }
+
+    #[test]
+    fn serialization_keeps_the_flat_cell_form() {
+        let mut table = crate::terminal::term::style::StyleTable::default();
+        let mut cell = Cell::from('x');
+        cell.set_style(table.intern(Style {
+            fg: Color::Indexed(1),
+            bg: Color::Indexed(2),
+            attrs: Flags::BOLD | Flags::UNDERLINE,
+            ..Style::default()
+        }));
+        cell.set_layout(Flags::WIDE_CHAR);
+        let serialized = SerializedCell::new(&cell, &table, &RowExtras::default());
+        let value = serde_json::to_value(&serialized).unwrap();
+        assert_eq!(value["flags"], "BOLD | UNDERLINE | WIDE_CHAR");
+        assert_eq!(value["fg"], serde_json::json!({"Indexed": 1}));
+        assert_eq!(serde_json::from_value::<SerializedCell>(value).unwrap(), serialized);
     }
 
     #[test]
     fn line_length_works() {
         let mut row = Row::<Cell>::new(10);
-        row[Column(5)].c = 'a';
+        row[Column(5)].set_c('a');
 
         assert_eq!(row.line_length(), Column(6));
     }
@@ -398,7 +871,7 @@ mod tests {
     #[test]
     fn line_length_works_with_wrapline() {
         let mut row = Row::<Cell>::new(10);
-        row[Column(9)].flags.insert(super::Flags::WRAPLINE);
+        row[Column(9)].insert_layout(super::Flags::WRAPLINE);
 
         assert_eq!(row.line_length(), Column(10));
     }

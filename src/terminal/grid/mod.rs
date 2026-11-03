@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::terminal::index::{Column, Line, Point};
 use crate::terminal::term::cell::{Flags, ResetDiscriminant};
+use crate::terminal::term::extra::ExtraId;
 use crate::terminal::vvte::ansi::{CharsetIndex, StandardCharset};
 
 pub mod resize;
@@ -26,10 +27,22 @@ pub trait GridCell: Sized {
     /// Perform an opinionated cell reset based on a template cell.
     fn reset(&mut self, template: &Self);
 
-    /// Borrow this cell's terminal flags.
-    fn flags(&self) -> &Flags;
-    /// Mutably borrow this cell's terminal flags.
-    fn flags_mut(&mut self) -> &mut Flags;
+    /// Layout flags: line wrap and double-width occupancy, never styling.
+    fn layout(&self) -> Flags;
+
+    /// Set the given layout flags; `flags` must contain only [`Flags::LAYOUT`] bits.
+    fn insert_layout(&mut self, flags: Flags);
+
+    /// Clear the given layout flags; `flags` must contain only [`Flags::LAYOUT`] bits.
+    fn remove_layout(&mut self, flags: Flags);
+
+    /// The cell's reference into its row's [`RowExtras`](crate::terminal::term::extra::RowExtras).
+    fn extra(&self) -> ExtraId {
+        ExtraId::NONE
+    }
+
+    /// Point the cell at another entry of its row's extra content.
+    fn set_extra(&mut self, _extra: ExtraId) {}
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -40,6 +53,12 @@ pub struct Cursor<T> {
 
     /// Template cell when using this cursor.
     pub template: T,
+
+    /// Blank cell that erased and scrolled-in cells are reset to.
+    ///
+    /// It carries the template's background and nothing else of its style. The terminal keeps it
+    /// in step with the template, so grid code can clear cells without resolving styles.
+    pub erase: T,
 
     /// Currently configured graphic character sets.
     pub charsets: Charsets,
@@ -208,7 +227,7 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
         // When rotating the entire region, just reset everything.
         if region.end - region.start <= positions {
             for i in (region.start.0..region.end.0).map(Line::from) {
-                self.raw[i].reset(&self.cursor.template);
+                self.raw[i].reset(&self.cursor.erase);
             }
 
             return;
@@ -237,7 +256,7 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
 
             // Ensure all new lines are fully cleared.
             for i in (0..positions).map(Line::from) {
-                self.raw[i].reset(&self.cursor.template);
+                self.raw[i].reset(&self.cursor.erase);
             }
 
             // Swap the fixed lines at the top back into position.
@@ -253,7 +272,7 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
 
             let range = region.start.0..(region.start + positions).0;
             for line in range.rev().map(Line::from) {
-                self.raw[line].reset(&self.cursor.template);
+                self.raw[line].reset(&self.cursor.erase);
             }
         }
     }
@@ -266,10 +285,33 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
         T: ResetDiscriminant<D>,
         D: PartialEq,
     {
+        self.scroll_up_resetting(region, positions, positions);
+    }
+
+    /// Scroll `region` up one line like [`Grid::scroll_up`], but leave the line entering at the
+    /// bottom with its old cells. The caller must reset it before anything else reads the grid,
+    /// typically with [`Row::reset_with_prefix`] while writing text over it.
+    pub(crate) fn scroll_up_unreset<D>(&mut self, region: &Range<Line>)
+    where
+        T: ResetDiscriminant<D>,
+        D: PartialEq,
+    {
+        self.scroll_up_resetting(region, 1, 0);
+    }
+
+    /// Scroll `region` up by `positions` and reset the top `reset` of the lines entering at the
+    /// bottom.
+    fn scroll_up_resetting<D>(&mut self, region: &Range<Line>, positions: usize, reset: usize)
+    where
+        T: ResetDiscriminant<D>,
+        D: PartialEq,
+    {
+        let unreset = positions - reset;
+
         // When rotating the entire region with fixed lines at the top, just reset everything.
         if region.end - region.start <= positions && region.start != 0 {
-            for i in (region.start.0..region.end.0).map(Line::from) {
-                self.raw[i].reset(&self.cursor.template);
+            for i in (region.start.0..region.end.0 - unreset as i32).map(Line::from) {
+                self.raw[i].reset(&self.cursor.erase);
             }
 
             return;
@@ -313,8 +355,8 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
         }
 
         // Ensure all new lines are fully cleared.
-        for i in (region.end.0 - positions as i32..region.end.0).map(Line::from) {
-            self.raw[i].reset(&self.cursor.template);
+        for i in (region.end.0 - positions as i32..region.end.0 - unreset as i32).map(Line::from) {
+            self.raw[i].reset(&self.cursor.erase);
         }
     }
 
@@ -345,7 +387,7 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
 
         // Reset rotated lines.
         for line in (0..(self.lines - positions)).map(Line::from) {
-            self.raw[line].reset(&self.cursor.template);
+            self.raw[line].reset(&self.cursor.erase);
         }
 
         positions
@@ -366,7 +408,7 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
         // Reset all visible lines.
         let range = self.topmost_line().0..(self.screen_lines() as i32);
         for line in range.map(Line::from) {
-            self.raw[line].reset(&self.cursor.template);
+            self.raw[line].reset(&self.cursor.erase);
         }
     }
 }
@@ -394,7 +436,7 @@ impl<T> Grid<T> {
         debug_assert!(end <= self.screen_lines() as i32);
 
         for line in (start.0..end.0).map(Line::from) {
-            self.raw[line].reset(&self.cursor.template);
+            self.raw[line].reset(&self.cursor.erase);
         }
     }
 
@@ -426,6 +468,73 @@ impl<T> Grid<T> {
     #[inline]
     pub fn truncate(&mut self) {
         self.raw.truncate();
+    }
+
+    /// Visit every cell the grid stores, and its cursors' template and erase cells.
+    ///
+    /// This includes scrollback, cached rows outside the active region and cells kept beyond the
+    /// current width, and does not mark anything occupied or damaged.
+    pub fn for_each_cell_mut(&mut self, mut f: impl FnMut(&mut T)) {
+        self.raw.for_each_row_mut(|row| row.for_each_stored_mut(&mut f));
+        for cursor in [&mut self.cursor, &mut self.saved_cursor] {
+            f(&mut cursor.template);
+            f(&mut cursor.erase);
+        }
+    }
+
+    /// Number of cells [`Grid::for_each_cell_mut`] visits in the grid's rows, approximately.
+    ///
+    /// Counts every stored row at the current width; rows keeping cells beyond it add a few more.
+    pub fn stored_cells(&self) -> usize {
+        self.raw.stored_rows().saturating_mul(self.columns)
+    }
+
+    /// This grid with every stored cell, cursor cells included, converted by `f`.
+    ///
+    /// Everything else, rows' extra content and occupancy among it, carries over unchanged.
+    pub fn map_owned<U>(self, mut f: impl FnMut(&T) -> U) -> Grid<U> {
+        let mut cursor = |cursor: Cursor<T>| Cursor {
+            point: cursor.point,
+            template: f(&cursor.template),
+            erase: f(&cursor.erase),
+            charsets: cursor.charsets,
+            input_needs_wrap: cursor.input_needs_wrap,
+        };
+        let (current, saved) = (cursor(self.cursor), cursor(self.saved_cursor));
+        Grid {
+            cursor: current,
+            saved_cursor: saved,
+            raw: self.raw.map_owned(f),
+            columns: self.columns,
+            lines: self.lines,
+            display_offset: self.display_offset,
+            max_scroll_limit: self.max_scroll_limit,
+        }
+    }
+
+    /// Whether any row holds combining characters or resize tracking.
+    pub fn has_extras(&self) -> bool
+    where
+        T: GridCell,
+    {
+        let mut found = false;
+        self.raw.for_each_row(|row| found |= !row.extras().is_empty());
+        found
+    }
+
+    /// A grid of the same shape with every stored cell, and the row holding it, converted by `f`.
+    ///
+    /// Cursors start out at their defaults.
+    pub fn map<U: Default>(&self, f: impl FnMut(&Row<T>, &T) -> U) -> Grid<U> {
+        Grid {
+            cursor: Cursor::default(),
+            saved_cursor: Cursor::default(),
+            raw: self.raw.map(f),
+            columns: self.columns,
+            lines: self.lines,
+            display_offset: self.display_offset,
+            max_scroll_limit: self.max_scroll_limit,
+        }
     }
 
     /// Iterate over all cells in the grid starting at a specific point.

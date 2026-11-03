@@ -1,0 +1,45 @@
+{
+  "arguments": {
+    "before": "/private/tmp/vivido-accepted",
+    "after": "/private/tmp/vivido-fixed",
+    "benchmark": "/Applications/kitty.app/Contents/MacOS/kitten",
+    "output": "/private/tmp/vivido-final-native-regressed",
+    "corpus": null,
+    "driver": "kitten",
+    "after_gather": "default",
+    "before_gather": "default",
+    "frontend": "native",
+    "samples": 5,
+    "repetitions": 200,
+    "latency_samples": 100,
+    "timeout": 600,
+    "modes": [
+      "sync",
+      "render"
+    ],
+    "workloads": [
+      "ascii",
+      "unicode",
+      "csi",
+      "long_escape_codes",
+      "images"
+    ]
+  },
+  "platform": "macOS-27.0.1-arm64-arm-64bit-Mach-O",
+  "binaries": {
+    "before": {
+      "bytes": 28351560,
+      "sha256": "3763fe1c9aaca7c9eff3f9edea9783d926073f3d46e5523f39e290bfc3af9a79"
+    },
+    "after": {
+      "bytes": 28382600,
+      "sha256": "12e615420e4cb8410a033a97e33fc2fc0e78d06c2b30ce6addc65a00fdb976cc"
+    },
+    "benchmark": {
+      "bytes": 44595776,
+      "sha256": "c25944a988e1aa75c5a3e6e5478718e8794578d166c58115ebf9f0dca71b2425"
+    }
+  },
+  "corpus": {},
+  "benchmark_version": "kitten 0.42.2 created by Kovid Goyal"
+}

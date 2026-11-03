@@ -302,8 +302,8 @@ impl<T> Term<T> {
 
         let mut cell = iter.cell();
         self.skip_fullwidth(&mut iter, &mut cell, regex.direction);
-        let mut c = cell.c;
-        let mut last_wrapped = iter.cell().flags.contains(Flags::WRAPLINE);
+        let mut c = cell.c();
+        let mut last_wrapped = iter.cell().layout().contains(Flags::WRAPLINE);
 
         let mut point = iter.point();
         let mut last_point = point;
@@ -405,8 +405,8 @@ impl<T> Term<T> {
 
             self.skip_fullwidth(&mut iter, &mut cell, regex.direction);
 
-            c = cell.c;
-            let wrapped = iter.cell().flags.contains(Flags::WRAPLINE);
+            c = cell.c();
+            let wrapped = iter.cell().layout().contains(Flags::WRAPLINE);
 
             last_point = mem::replace(&mut point, iter.point());
 
@@ -447,24 +447,24 @@ impl<T> Term<T> {
             // In the alternate screen buffer there might not be a wide char spacer after a wide
             // char, so we only advance the iterator when the wide char is not in the last column.
             Direction::Right
-                if cell.flags.contains(Flags::WIDE_CHAR)
+                if cell.layout().contains(Flags::WIDE_CHAR)
                     && iter.point().column < self.last_column() =>
             {
                 iter.next();
             },
-            Direction::Right if cell.flags.contains(Flags::LEADING_WIDE_CHAR_SPACER) => {
+            Direction::Right if cell.layout().contains(Flags::LEADING_WIDE_CHAR_SPACER) => {
                 if let Some(Indexed { cell: new_cell, .. }) = iter.next() {
                     *cell = new_cell;
                 }
                 iter.next();
             },
-            Direction::Left if cell.flags.contains(Flags::WIDE_CHAR_SPACER) => {
+            Direction::Left if cell.layout().contains(Flags::WIDE_CHAR_SPACER) => {
                 if let Some(Indexed { cell: new_cell, .. }) = iter.prev() {
                     *cell = new_cell;
                 }
 
                 let prev = iter.point().sub(self, Boundary::Grid, 1);
-                if self.grid[prev].flags.contains(Flags::LEADING_WIDE_CHAR_SPACER) {
+                if self.grid[prev].layout().contains(Flags::LEADING_WIDE_CHAR_SPACER) {
                     iter.prev();
                 }
             },
@@ -478,7 +478,7 @@ impl<T> Term<T> {
         let point = self.semantic_search_point(point);
         let escape_chars = self.config.semantic_escape_chars.as_str();
 
-        if escape_chars.contains(self.grid[point].c) {
+        if escape_chars.contains(self.grid[point].c()) {
             return point;
         }
 
@@ -488,7 +488,7 @@ impl<T> Term<T> {
                 let wide_spacer = Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER;
                 self.grid
                     .iter_from(point)
-                    .find(|cell| !cell.flags.intersects(wide_spacer))
+                    .find(|cell| !cell.layout().intersects(wide_spacer))
                     .map_or(point, |cell| cell.point)
             },
             Err(point) => point,
@@ -501,7 +501,7 @@ impl<T> Term<T> {
         let point = self.semantic_search_point(point);
         let escape_chars = self.config.semantic_escape_chars.as_str();
 
-        if escape_chars.contains(self.grid[point].c) {
+        if escape_chars.contains(self.grid[point].c()) {
             return point;
         }
 
@@ -513,7 +513,7 @@ impl<T> Term<T> {
 
     /// Resolve spacer cells to the fullwidth character they represent.
     fn semantic_search_point(&self, point: Point) -> Point {
-        let flags = self.grid[point].flags;
+        let flags = self.grid[point].layout();
 
         if flags.contains(Flags::WIDE_CHAR_SPACER) {
             point.sub(self, Boundary::Grid, 1)
@@ -533,13 +533,13 @@ impl<T> Term<T> {
         let wide_spacer = Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER;
 
         while let Some(cell) = iter.prev() {
-            if cell.point.column == last_column && !cell.flags.contains(Flags::WRAPLINE) {
+            if cell.point.column == last_column && !cell.layout().contains(Flags::WRAPLINE) {
                 break;
             }
 
             point = cell.point;
 
-            if !cell.flags.intersects(wide_spacer) && needles.contains(cell.c) {
+            if !cell.layout().intersects(wide_spacer) && needles.contains(cell.c()) {
                 return Ok(point);
             }
         }
@@ -554,18 +554,18 @@ impl<T> Term<T> {
         let wide_spacer = Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER;
         let last_column = self.columns() - 1;
 
-        if point.column == last_column && !self.grid[point].flags.contains(Flags::WRAPLINE) {
+        if point.column == last_column && !self.grid[point].layout().contains(Flags::WRAPLINE) {
             return Err(point);
         }
 
         for cell in self.grid.iter_from(point) {
             point = cell.point;
 
-            if !cell.flags.intersects(wide_spacer) && needles.contains(cell.c) {
+            if !cell.layout().intersects(wide_spacer) && needles.contains(cell.c()) {
                 return Ok(point);
             }
 
-            if point.column == last_column && !cell.flags.contains(Flags::WRAPLINE) {
+            if point.column == last_column && !cell.layout().contains(Flags::WRAPLINE) {
                 break;
             }
         }
@@ -576,7 +576,7 @@ impl<T> Term<T> {
     /// Find the beginning of the current line across linewraps.
     pub fn line_search_left(&self, mut point: Point) -> Point {
         while point.line > self.topmost_line()
-            && self.grid[point.line - 1i32][self.last_column()].flags.contains(Flags::WRAPLINE)
+            && self.grid[point.line - 1i32][self.last_column()].layout().contains(Flags::WRAPLINE)
         {
             point.line -= 1;
         }
@@ -589,7 +589,7 @@ impl<T> Term<T> {
     /// Find the end of the current line across linewraps.
     pub fn line_search_right(&self, mut point: Point) -> Point {
         while point.line + 1 < self.screen_lines()
-            && self.grid[point.line][self.last_column()].flags.contains(Flags::WRAPLINE)
+            && self.grid[point.line][self.last_column()].layout().contains(Flags::WRAPLINE)
         {
             point.line += 1;
         }
@@ -1036,7 +1036,7 @@ mod tests {
             xxx \n\
             🦇xx\
         ");
-        term.grid[Line(0)][Column(3)].flags.insert(Flags::LEADING_WIDE_CHAR_SPACER);
+        term.grid[Line(0)][Column(3)].insert_layout(Flags::LEADING_WIDE_CHAR_SPACER);
 
         let mut regex = RegexSearch::new("🦇x").unwrap();
         let start = Point::new(Line(0), Column(0));
@@ -1071,9 +1071,9 @@ mod tests {
     fn wide_without_spacer() {
         let size = TermSize::new(2, 2);
         let mut term = Term::new(Config::default(), &size, ());
-        term.grid[Line(0)][Column(0)].c = 'x';
-        term.grid[Line(0)][Column(1)].c = '字';
-        term.grid[Line(0)][Column(1)].flags = Flags::WIDE_CHAR;
+        term.grid[Line(0)][Column(0)].set_c('x');
+        term.grid[Line(0)][Column(1)].set_c('字');
+        term.grid[Line(0)][Column(1)].set_layout(Flags::WIDE_CHAR);
 
         let mut regex = RegexSearch::new("test").unwrap();
 
@@ -1205,7 +1205,7 @@ mod tests {
     #[test]
     fn no_spacer_fullwidth_linewrap() {
         let mut term = mock_term("abY\nxab");
-        term.grid_mut()[Line(0)][Column(2)].c = '🦇';
+        term.grid_mut()[Line(0)][Column(2)].set_c('🦇');
 
         let mut regex = RegexSearch::new("🦇x").unwrap();
         let start = Point::new(Line(0), Column(0));

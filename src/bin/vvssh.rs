@@ -569,6 +569,11 @@ fn build_posix_ssh_arguments(
     let mut arguments = vec![
         OsString::from("-tt"),
         OsString::from("-o"),
+        // Match the media lanes: idle terminal/control traffic must keep its own TCP flow alive.
+        OsString::from("ServerAliveInterval=15"),
+        OsString::from("-o"),
+        OsString::from("ServerAliveCountMax=3"),
+        OsString::from("-o"),
         OsString::from("ExitOnForwardFailure=yes"),
         OsString::from("-o"),
         OsString::from("StreamLocalBindMask=0177"),
@@ -664,6 +669,11 @@ fn build_windows_ssh_arguments(
     let remote_forward = format!("127.0.0.1:{control_port}:{local_target}");
     let mut arguments = vec![
         OsString::from("-tt"),
+        OsString::from("-o"),
+        // Keep an idle shell alive independently of the separate media connections.
+        OsString::from("ServerAliveInterval=15"),
+        OsString::from("-o"),
+        OsString::from("ServerAliveCountMax=3"),
         OsString::from("-o"),
         OsString::from("ExitOnForwardFailure=yes"),
         OsString::from("-R"),
@@ -980,11 +990,13 @@ mod tests {
             arguments
                 .contains(&"/tmp/vivido-vivid-42-99.sock:/private/tmp/vivido/endpoint.sock".into())
         );
-        assert_eq!(&arguments[9..12], &["-p", "2222", "user@host"]);
-        assert!(arguments[12].contains(&built.secret_path));
-        assert!(arguments[12].contains("VIVID_ROOT_SECRET"));
-        assert!(arguments[12].contains("VIVID_ENDPOINT_CONTROL"));
-        assert!(!arguments[12].contains("VIVID_ANCHOR_TRANSPORT"));
+        let command_index = arguments.len() - 1;
+        assert_eq!(&arguments[command_index - 3..command_index], &["-p", "2222", "user@host"]);
+        let command = &arguments[command_index];
+        assert!(command.contains(&built.secret_path));
+        assert!(command.contains("VIVID_ROOT_SECRET"));
+        assert!(command.contains("VIVID_ENDPOINT_CONTROL"));
+        assert!(!command.contains("VIVID_ANCHOR_TRANSPORT"));
         assert!(!arguments.iter().any(|argument| argument.contains("0123abcd")));
     }
 
@@ -1006,6 +1018,33 @@ mod tests {
         assert!(arguments.last().unwrap().contains("VIVID_REMOTE=1"));
         #[cfg(windows)]
         assert!(arguments.last().unwrap().contains("VIVID_ANCHOR_TRANSPORT=conpty"));
+    }
+
+    #[test]
+    fn idle_interactive_connections_have_keepalives_in_every_transport_mode() {
+        for platform in [RemotePlatform::Posix, RemotePlatform::Windows] {
+            for separate_media in [false, true] {
+                let built = build_ssh_arguments(
+                    invocation(&["home"], &[]),
+                    "tcp:127.0.0.1:1234",
+                    1,
+                    2,
+                    separate_media,
+                    false,
+                    platform,
+                )
+                .unwrap();
+                let destination = built.interactive.iter().position(|arg| arg == "home").unwrap();
+                for setting in ["ServerAliveInterval=15", "ServerAliveCountMax=3"] {
+                    assert!(
+                        built.interactive[..destination]
+                            .windows(2)
+                            .any(|pair| pair[0] == "-o" && pair[1] == setting),
+                        "missing {setting} for {platform:?} (separate media: {separate_media})",
+                    );
+                }
+            }
+        }
     }
 
     #[test]

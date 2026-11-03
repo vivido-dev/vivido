@@ -1,0 +1,96 @@
+[
+  {
+    "mode": "sync",
+    "samples": 2,
+    "workloads": {
+      "Only ASCII chars": {
+        "before": 126.55000000000001,
+        "after": 162.2,
+        "change_percent": 28.170683524298678,
+        "passes": true
+      },
+      "Unicode chars": {
+        "before": 176.6,
+        "after": 196.39999999999998,
+        "change_percent": 11.211778029445064,
+        "passes": true
+      },
+      "CSI codes with few chars": {
+        "before": 92.4,
+        "after": 69.6,
+        "change_percent": -24.675324675324685,
+        "passes": false
+      },
+      "Long escape codes": {
+        "before": 548.6500000000001,
+        "after": 500.4,
+        "change_percent": -8.794313314499247,
+        "passes": false
+      },
+      "Images": {
+        "before": 543.55,
+        "after": 506.7,
+        "change_percent": -6.7795051053260895,
+        "passes": false
+      }
+    },
+    "query_p99_ms": {},
+    "costs": {
+      "before": {
+        "cpu_seconds": 13.225000000000001,
+        "peak_rss_bytes": 185032704.0
+      },
+      "after": {
+        "cpu_seconds": 15.254999999999999,
+        "peak_rss_bytes": 180109312.0
+      }
+    }
+  },
+  {
+    "mode": "render",
+    "samples": 2,
+    "workloads": {
+      "Only ASCII chars": {
+        "before": 139.64999999999998,
+        "after": 197.25,
+        "change_percent": 41.24597207303977,
+        "passes": true
+      },
+      "Unicode chars": {
+        "before": 201.75,
+        "after": 259.25,
+        "change_percent": 28.500619578686504,
+        "passes": true
+      },
+      "CSI codes with few chars": {
+        "before": 103.3,
+        "after": 74.85,
+        "change_percent": -27.541142303969025,
+        "passes": false
+      },
+      "Long escape codes": {
+        "before": 620.6,
+        "after": 527.5999999999999,
+        "change_percent": -14.985497905252998,
+        "passes": false
+      },
+      "Images": {
+        "before": 572.75,
+        "after": 544.7,
+        "change_percent": -4.897424705368825,
+        "passes": true
+      }
+    },
+    "query_p99_ms": {},
+    "costs": {
+      "before": {
+        "cpu_seconds": 11.765,
+        "peak_rss_bytes": 185663488.0
+      },
+      "after": {
+        "cpu_seconds": 14.129999999999999,
+        "peak_rss_bytes": 165478400.0
+      }
+    }
+  }
+]

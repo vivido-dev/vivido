@@ -413,6 +413,9 @@ pub struct Display {
     kitty_frame: kitty::KittyFrame,
     text_scene_builds: u64,
     cached_scene_frames: u64,
+    #[cfg(feature = "perf")]
+    perf_last_frame: Option<Instant>,
+    snapshot_cells: Vec<content::SnapshotCell>,
     text_system: TextSystem,
     meter: Meter,
 }
@@ -608,6 +611,9 @@ impl Display {
             kitty_frame: kitty::KittyFrame::default(),
             text_scene_builds: 0,
             cached_scene_frames: 0,
+            #[cfg(feature = "perf")]
+            perf_last_frame: None,
+            snapshot_cells: Vec::new(),
             text_system,
             meter: Default::default(),
         })
@@ -769,6 +775,10 @@ impl Display {
         config: &UiConfig,
         search_state: &mut SearchState,
     ) -> bool {
+        #[cfg(feature = "perf")]
+        let _frame = crate::performance::Timer::new(&crate::performance::FRAME);
+        #[cfg(feature = "perf")]
+        let snapshot_time = crate::performance::Timer::new(&crate::performance::SNAPSHOT);
         if self.renderer_unavailable {
             return false;
         }
@@ -809,6 +819,21 @@ impl Display {
         let grid_changed = !self.damage_tracker.frame().is_empty();
         let kitty_changed =
             self.kitty_frame.update(&terminal, &size_info, early_display_offset, grid_changed);
+        let screen_cells = terminal.grid().screen_lines() * terminal.grid().columns();
+        let cursor_point = terminal.grid().cursor.point;
+        let total_lines = terminal.grid().total_lines();
+        let app_cursor_icon = terminal.mouse_cursor_icon();
+        let mouse_reporting = terminal.mode().intersects(TermMode::MOUSE_MODE);
+        let snapshot = content::Snapshot::capture(
+            &terminal,
+            &mut self.snapshot_cells,
+            grid_changed,
+            search_state,
+            &mut self.hint_state,
+        );
+        drop(terminal);
+        #[cfg(feature = "perf")]
+        drop(snapshot_time);
         let prepared_media =
             self.scene_renderer.prepare_media(&size_info, early_display_offset, &self.kitty_frame);
         let media_generation = prepared_media.as_ref().map_or(0, |media| media.image_generation);
@@ -831,7 +856,6 @@ impl Display {
             && self.drawn_progress == progress_visual;
         if can_reuse_scene {
             self.cached_scene_frames = self.cached_scene_frames.saturating_add(1);
-            drop(terminal);
             self.window.pre_present_notify();
             let result = {
                 let scene = self.cached_scene.as_ref().expect("cached scene checked above");
@@ -848,6 +872,8 @@ impl Display {
                 },
             };
             if presented {
+                #[cfg(feature = "perf")]
+                crate::performance::presented(&mut self.perf_last_frame);
                 self.window.did_present();
             }
             self.vivid_frame_requested = false;
@@ -856,8 +882,7 @@ impl Display {
             return presented;
         }
 
-        let mut content = RenderableContent::new(config, self, &terminal, search_state);
-        let screen_cells = terminal.grid().screen_lines() * terminal.grid().columns();
+        let mut content = RenderableContent::from_snapshot(config, self, snapshot, search_state);
         let mut grid_cells = Vec::with_capacity(screen_cells);
         for cell in &mut content {
             grid_cells.push(cell);
@@ -869,14 +894,7 @@ impl Display {
         let display_offset = content.display_offset();
         let cursor = content.cursor();
 
-        let cursor_point = terminal.grid().cursor.point;
-        let total_lines = terminal.grid().total_lines();
         let metrics = self.text_system.metrics();
-
-        let app_cursor_icon = terminal.mouse_cursor_icon();
-        let mouse_reporting = terminal.mode().intersects(TermMode::MOUSE_MODE);
-
-        drop(terminal);
 
         self.validate_hint_highlights(display_offset, app_cursor_icon, mouse_reporting);
 
@@ -1127,6 +1145,8 @@ impl Display {
             },
         };
         if presented {
+            #[cfg(feature = "perf")]
+            crate::performance::presented(&mut self.perf_last_frame);
             self.window.did_present();
         }
 
@@ -1306,7 +1326,7 @@ impl Display {
                     .hint(false)
                     .transform(transform)
                     .font_size(font_size)
-                    .normalized_coords(run.normalized_coords())
+                    .normalized_coords(bytemuck::cast_slice(run.normalized_coords()))
                     .draw(
                         Fill::NonZero,
                         glyph_run.glyphs().map(|glyph| scene_glyph_from_layout(&mut x, y, glyph)),
@@ -1362,8 +1382,8 @@ impl Display {
                     } else {
                         cluster_x
                     };
+                    let style_index = usize::from(cluster.style_index());
                     for glyph in cluster.glyphs() {
-                        let style_index = glyph.style_index as usize;
                         glyphs_by_style[style_index]
                             .push(scene_glyph_from_layout(&mut x, baseline, glyph));
                     }
@@ -1380,7 +1400,7 @@ impl Display {
                         .hint(false)
                         .transform(transform)
                         .font_size(shaped_run.font_size())
-                        .normalized_coords(shaped_run.normalized_coords())
+                        .normalized_coords(bytemuck::cast_slice(shaped_run.normalized_coords()))
                         .draw(Fill::NonZero, glyphs.into_iter());
                 }
             }
@@ -2555,7 +2575,7 @@ mod tests {
     #[test]
     fn scene_glyphs_use_baseline_relative_y_coordinates() {
         let mut cursor_x = 10.0;
-        let glyph = parley::layout::Glyph { id: 42, style_index: 0, x: 1.5, y: 2.0, advance: 8.0 };
+        let glyph = parley::layout::Glyph { id: 42, x: 1.5, y: 2.0, advance: 8.0 };
 
         let positioned = scene_glyph_from_layout(&mut cursor_x, 20.0, glyph);
 
@@ -2563,6 +2583,49 @@ mod tests {
         assert_eq!(positioned.x, 11.5);
         assert_eq!(positioned.y, 18.0);
         assert_eq!(cursor_x, 18.0);
+    }
+
+    #[test]
+    fn terminal_glyphs_preserve_cluster_colors_and_grid_positions() {
+        let mut text = super::TextSystem::new(crate::config::font::Font::default());
+        let colors = [Rgb::new(255, 0, 0), Rgb::new(0, 255, 0)];
+        for content in ["ab", "بب"] {
+            let cells = content
+                .chars()
+                .enumerate()
+                .map(|(column, character)| RenderableCell {
+                    fg: colors[column],
+                    ..renderable_cell(0, column, character)
+                })
+                .collect::<Vec<_>>();
+            let run = terminal_shaping_run(&cells);
+            let layout = text.shape_terminal_run(run.text, &run.styles, true);
+            let mut scene = vello::Scene::new();
+            let size = super::SizeInfo::new(100.0, 40.0, 20.0, 40.0, 0.0, 0.0, false);
+
+            super::Display::paint_terminal_run_layout(
+                &mut scene,
+                &layout,
+                &run.cells,
+                text.metrics(),
+                size,
+                0,
+                0,
+            );
+
+            let encoding = scene.encoding();
+            let glyph_runs = &encoding.resources.glyph_runs;
+            assert_eq!(glyph_runs.len(), 2, "each color must have its own glyph run");
+            let expected_x = if layout.is_rtl() { [20.0, 0.0] } else { [0.0, 20.0] };
+            let mut expected_colors = vello::Scene::new();
+            for ((run, color), x) in glyph_runs.iter().zip(colors).zip(expected_x) {
+                let glyphs = &encoding.resources.glyphs[run.glyphs.clone()];
+                assert_eq!(glyphs.len(), 1);
+                assert_eq!(glyphs[0].x, x);
+                expected_colors.encoding_mut().encode_brush(super::color_from_rgb(color), 1.0);
+            }
+            assert_eq!(encoding.draw_data, expected_colors.encoding().draw_data);
+        }
     }
 
     #[test]

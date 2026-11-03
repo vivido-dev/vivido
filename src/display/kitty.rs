@@ -196,8 +196,9 @@ impl KittyFrame {
                 continue;
             }
             let row = &grid[line];
-            let cells =
-                (0..grid.columns()).map(|column| graphics::decode_cell(&row[Column(column)]));
+            let cells = (0..grid.columns()).map(|column| {
+                graphics::decode_cell(&row[Column(column)], term.styles(), row.extras())
+            });
             graphics::runs(cells, |run| {
                 let Some((image, placement)) = store.virtual_placement(run.image, run.placement)
                 else {

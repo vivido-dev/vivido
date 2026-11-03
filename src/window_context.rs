@@ -843,6 +843,12 @@ impl WindowContext {
 
         // Redraw the window.
         let terminal = self.terminal.lock();
+        // A synchronized update is still being written, so keep the last frame on screen. Its
+        // end, or its deadline, wakes the window from the PTY reader, and the damage stays queued
+        // for that draw. Staying dirty would only retry this lock on every UI event until then.
+        if terminal.mode().contains(TermMode::SYNC_UPDATE) {
+            return false;
+        }
         let presented = self.display.draw(
             terminal,
             scheduler,
@@ -850,6 +856,10 @@ impl WindowContext {
             &self.config,
             &mut self.search_state,
         );
+
+        // A just-revealed native pane can still have an unavailable swapchain. Keep its update
+        // pending for the frame timer instead of waiting for more PTY output or keyboard input.
+        self.dirty |= !presented;
 
         // Request immediate re-draw if the visual bell, scrollbar, or progress animation is not
         // done yet. This must run after the draw: the scrollbar wakes inside it, when the
@@ -958,8 +968,8 @@ impl WindowContext {
         match event {
             WinitEvent::AboutToWait
             | WinitEvent::WindowEvent { event: WindowEvent::RedrawRequested, .. } => {
-                // Skip further event handling with no staged updates.
-                if self.event_queue.is_empty() {
+                // Display updates can be queued directly without a staged input event.
+                if self.event_queue.is_empty() && !self.display.pending_update.dirty {
                     return;
                 }
 
@@ -2516,7 +2526,9 @@ impl WindowContext {
         rows.hash(&mut metadata);
         columns.hash(&mut metadata);
         display_offset.hash(&mut metadata);
-        (terminal.mode().bits() & !TermMode::URGENCY_HINTS.bits()).hash(&mut metadata);
+        // Neither mode changes what is on screen.
+        let unseen = TermMode::URGENCY_HINTS | TermMode::SYNC_UPDATE;
+        (terminal.mode().bits() & !unseen.bits()).hash(&mut metadata);
         let metadata = metadata.finish();
 
         let mut row_hashes = Vec::with_capacity(rows);
@@ -2526,19 +2538,20 @@ impl WindowContext {
             for column in 0..columns {
                 let point = crate::terminal::index::Point::new(line, Column(column));
                 let cell = &grid[point];
-                cell.c.hash(&mut hasher);
-                cell.flags.bits().hash(&mut hasher);
-                hash_color(Some(cell.fg), &mut hasher);
-                hash_color(Some(cell.bg), &mut hasher);
-                hash_color(cell.underline_color(), &mut hasher);
-                cell.zerowidth().unwrap_or_default().hash(&mut hasher);
-                if let Some(link) = cell.hyperlink() {
+                cell.c().hash(&mut hasher);
+                let style = terminal.style(cell);
+                cell.layout().union(style.attrs).bits().hash(&mut hasher);
+                hash_color(Some(style.fg), &mut hasher);
+                hash_color(Some(style.bg), &mut hasher);
+                hash_color(style.underline_color, &mut hasher);
+                grid[point.line].zerowidth(cell).unwrap_or_default().hash(&mut hasher);
+                if let Some(link) = &style.hyperlink {
                     link.id().hash(&mut hasher);
                     link.uri().hash(&mut hasher);
                 }
                 (point == cursor).hash(&mut hasher);
                 selection.is_some_and(|selection| selection.contains(point)).hash(&mut hasher);
-                cell.flags.contains(Flags::WRAPLINE).hash(&mut hasher);
+                cell.layout().contains(Flags::WRAPLINE).hash(&mut hasher);
             }
             row_hashes.push(hasher.finish());
         }
@@ -3164,7 +3177,7 @@ impl WindowContext {
             let mut cells = Vec::with_capacity(columns);
             for column in 0..columns {
                 let cell = &grid[line][Column(column)];
-                let style = self.cell_style(cell);
+                let style = self.cell_style(terminal.style(cell));
                 let key = serde_json::to_string(&style).map_err(|error| {
                     IpcError::new("unsupported", format!("style serialization failed: {error}"))
                 })?;
@@ -3177,17 +3190,17 @@ impl WindowContext {
                         style_id
                     },
                 };
-                let (width, kind) = if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                let (width, kind) = if cell.layout().contains(Flags::WIDE_CHAR_SPACER) {
                     (0, "continuation")
-                } else if cell.flags.contains(Flags::LEADING_WIDE_CHAR_SPACER) {
+                } else if cell.layout().contains(Flags::LEADING_WIDE_CHAR_SPACER) {
                     (0, "leading_wide_spacer")
-                } else if cell.flags.contains(Flags::WIDE_CHAR) {
+                } else if cell.layout().contains(Flags::WIDE_CHAR) {
                     (2, "character")
                 } else {
                     (1, "character")
                 };
-                let mut text = if width == 0 { String::new() } else { cell.c.to_string() };
-                text.extend(cell.zerowidth().into_iter().flatten());
+                let mut text = if width == 0 { String::new() } else { cell.c().to_string() };
+                text.extend(grid[line].zerowidth(cell).into_iter().flatten());
                 cells.push(json_value!({
                     "text": text,
                     "width": width,
@@ -3198,7 +3211,7 @@ impl WindowContext {
             let viewport_row = (line.0 >= viewport_start && line.0 <= viewport_end)
                 .then_some(line.0 - viewport_start);
             let wrapped =
-                columns > 0 && grid[line][Column(columns - 1)].flags.contains(Flags::WRAPLINE);
+                columns > 0 && grid[line][Column(columns - 1)].layout().contains(Flags::WRAPLINE);
             rows.push(json_value!({
                 "grid_line": line.0,
                 "viewport_row": viewport_row,
@@ -3237,18 +3250,18 @@ impl WindowContext {
     }
 
     #[cfg(any(unix, windows))]
-    fn cell_style(&self, cell: &crate::terminal::term::cell::Cell) -> Value {
+    fn cell_style(&self, style: &crate::terminal::term::style::Style) -> Value {
         let mut foreground =
-            resolve_color(&self.display.colors, cell.fg, cell.flags, true, &self.config);
+            resolve_color(&self.display.colors, style.fg, style.attrs, true, &self.config);
         let mut background =
-            resolve_color(&self.display.colors, cell.bg, cell.flags, false, &self.config);
-        if cell.flags.contains(Flags::INVERSE) {
+            resolve_color(&self.display.colors, style.bg, style.attrs, false, &self.config);
+        if style.attrs.contains(Flags::INVERSE) {
             std::mem::swap(&mut foreground, &mut background);
         }
-        let underline = cell.underline_color().map(|color| {
-            resolve_color(&self.display.colors, color, cell.flags, true, &self.config)
+        let underline = style.underline_color.map(|color| {
+            resolve_color(&self.display.colors, color, style.attrs, true, &self.config)
         });
-        let background_alpha = if cell.bg == Color::Named(NamedColor::Background) {
+        let background_alpha = if style.bg == Color::Named(NamedColor::Background) {
             (self.config.window_opacity() * 255.0).round() as u8
         } else {
             255
@@ -3257,8 +3270,8 @@ impl WindowContext {
             "foreground": [foreground.r, foreground.g, foreground.b, 255],
             "background": [background.r, background.g, background.b, background_alpha],
             "underline_color": underline.map(|color| [color.r, color.g, color.b, 255]),
-            "attributes": style_attribute_names(cell.flags),
-            "hyperlink": cell.hyperlink().map(|link| json_value!({"id": link.id(), "uri": link.uri()})),
+            "attributes": style_attribute_names(style.attrs),
+            "hyperlink": style.hyperlink.as_ref().map(|link| json_value!({"id": link.id(), "uri": link.uri()})),
         })
     }
 
@@ -3423,9 +3436,13 @@ impl WindowContext {
     /// Panics if terminal snapshot serialization or writing the reference files fails.
     pub fn write_ref_test_results(&self) {
         // Dump grid state.
-        let mut grid = self.terminal.lock().grid().clone();
-        grid.initialize_all();
-        grid.truncate();
+        let grid = {
+            let terminal = self.terminal.lock();
+            let mut grid = terminal.grid().clone();
+            grid.initialize_all();
+            grid.truncate();
+            grid.map(|row, cell| terminal.serialized_cell(row, cell))
+        };
 
         let serialized_grid = json::to_string(&grid).expect("serialize grid");
 

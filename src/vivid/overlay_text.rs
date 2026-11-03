@@ -87,7 +87,7 @@ pub(in crate::vivid) fn measure_batch(
                             measured.width.get(),
                             measured.height.get(),
                         )
-                        .map_err(|e| e.0)?,
+                        .map_err(|e| e.reason())?,
                     ))
                 } else {
                     None

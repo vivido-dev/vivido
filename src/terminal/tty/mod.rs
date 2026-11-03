@@ -14,6 +14,8 @@ use log::warn;
 use polling::{Event, PollMode, Poller};
 use tempfile::TempDir;
 
+#[cfg(target_os = "macos")]
+mod gather;
 #[cfg(not(windows))]
 pub mod shell_integration;
 #[cfg(not(windows))]
@@ -126,6 +128,13 @@ pub trait EventedReadWrite {
     ///
     /// Returns an I/O error if the poller cannot remove this resource.
     fn deregister(&mut self, _: &Arc<Poller>) -> io::Result<()>;
+
+    /// Discard buffered read-ahead when resetting client state.
+    fn reset_read(&mut self) {}
+    /// Stop read-ahead before draining a child that has exited.
+    fn finish_read(&mut self) {}
+    /// Notify read-ahead that a parsing batch has released the terminal.
+    fn read_idle(&mut self) {}
 
     /// Borrow the readable side of the PTY transport.
     fn reader(&mut self) -> &mut Self::Reader;

@@ -1,4 +1,4 @@
-//! Two native hosted panes must consume output while hidden and present after a focus-free reveal.
+//! Hosted panes must present output that finished while their tab was hidden, without input.
 //! Run with `cargo test --test macos_background_panes -- --ignored` on a macOS desktop.
 
 #[cfg(not(target_os = "macos"))]
@@ -30,9 +30,10 @@ fn main() {
     use winit::window::{Window, WindowId};
 
     fn native(window: &Window) -> objc2::rc::Retained<NSWindow> {
-        let RawWindowHandle::AppKit(handle) = window.window_handle().unwrap().as_raw() else {
-            panic!()
-        };
+        native_handle(window.window_handle().unwrap().as_raw())
+    }
+    fn native_handle(raw: RawWindowHandle) -> objc2::rc::Retained<NSWindow> {
+        let RawWindowHandle::AppKit(handle) = raw else { panic!() };
         // SAFETY: these test windows are live on the event-loop thread.
         unsafe { handle.ns_view.cast::<NSView>().as_ref() }.window().unwrap()
     }
@@ -67,7 +68,7 @@ fn main() {
                     program: "/bin/sh".into(),
                     args: vec![
                         "-c".into(),
-                        "i=0; while :; do echo output-$i; i=$((i+1)); sleep 0.1; done".into(),
+                        "echo building; sleep 5; echo finished; exec sleep 90".into(),
                     ],
                 });
                 let id = self
@@ -103,8 +104,9 @@ fn main() {
             }
             let proxy = self.wakeups.take().unwrap();
             std::thread::spawn(move || {
-                for _ in 0..3 {
-                    std::thread::sleep(Duration::from_secs(4));
+                // Stay hidden past the runtime's delayed GPU-resource release as well.
+                for seconds in [4, 8, 4] {
+                    std::thread::sleep(Duration::from_secs(seconds));
                     proxy.send_event(Event::new(EventType::HostWakeup, None)).unwrap();
                 }
             });
@@ -139,7 +141,14 @@ fn main() {
                             assert!(*frames > 0, "pane never presented its startup frame");
                             assert!(*bytes > 0, "pane produced no output");
                         }
-                        native(self.host.as_ref().unwrap()).orderOut(None);
+                        // Vivida detaches and unmaps inactive tabs, while the host stays visible.
+                        for id in &self.panes {
+                            let pane = self.processor.window_mut(*id).unwrap();
+                            let child =
+                                native_handle(pane.display.window.raw_window_handle().unwrap());
+                            native(self.host.as_ref().unwrap()).removeChildWindow(&child);
+                            pane.set_automation_visible(false);
+                        }
                         app.deactivate();
                     },
                     1 => {
@@ -149,12 +158,15 @@ fn main() {
                         }
                         native(self.host.as_ref().unwrap()).orderFrontRegardless();
                         for id in &self.panes {
-                            self.processor
-                                .window(*id)
-                                .unwrap()
-                                .display
-                                .window
-                                .order_front_without_focus();
+                            let pane = self.processor.window_mut(*id).unwrap();
+                            let child =
+                                native_handle(pane.display.window.raw_window_handle().unwrap());
+                            // SAFETY: the host and pane remain live on the main thread.
+                            unsafe {
+                                native(self.host.as_ref().unwrap())
+                                    .addChildWindow_ordered(&child, NSWindowOrderingMode::Above);
+                            }
+                            pane.set_automation_visible(true);
                         }
                     },
                     2 => {
@@ -164,11 +176,11 @@ fn main() {
                         {
                             assert!(
                                 *frames > *previous_frame,
-                                "unfocused pane stopped presenting frames"
+                                "completed hidden-tab output was not presented on reveal"
                             );
-                            assert!(
-                                *bytes > *previous_bytes,
-                                "unfocused PTY stopped consuming output"
+                            assert_eq!(
+                                bytes, previous_bytes,
+                                "output must finish before reveal so it cannot trigger a redraw"
                             );
                         }
                         event_loop.exit();

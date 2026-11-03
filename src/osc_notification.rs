@@ -162,6 +162,14 @@ pub(crate) struct OscNotificationParser {
 }
 
 impl OscNotificationParser {
+    /// Whether the capture scanner is awaiting an OSC terminator.
+    ///
+    /// This is only a read-coalescing hint; it never controls terminal dispatch.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn has_pending_osc(&self) -> bool {
+        matches!(self.capture.state, CaptureState::Osc { .. })
+    }
+
     pub(crate) fn advance(&mut self, bytes: &[u8]) -> Vec<OscMessage> {
         let mut messages = Vec::new();
         let mut rest = bytes;

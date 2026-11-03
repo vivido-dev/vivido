@@ -70,7 +70,7 @@ impl Screen {
     /// Text of one grid line, without trailing blanks.
     fn text(&self, line: i32) -> String {
         let row = &self.term.grid()[Line(line)];
-        let text: String = (0..self.term.columns()).map(|column| row[Column(column)].c).collect();
+        let text: String = (0..self.term.columns()).map(|column| row[Column(column)].c()).collect();
         text.trim_end().to_owned()
     }
 }
@@ -463,18 +463,22 @@ fn placeholder_text_is_stored_with_its_marks_for_the_renderer_to_decode() {
     let marks: Vec<char> = (0x0300..=0x1D244_u32)
         .filter_map(char::from_u32)
         .filter(|mark| {
-            let mut cell =
-                crate::terminal::term::cell::Cell { c: PLACEHOLDER, ..Default::default() };
-            cell.push_zerowidth(*mark);
-            crate::terminal::graphics::decode_cell(&cell).is_some_and(|code| code.row != 0)
+            use crate::terminal::grid::GridCell;
+            let mut extras = crate::terminal::term::extra::RowExtras::default();
+            let mut cell = crate::terminal::term::cell::Cell::from(PLACEHOLDER);
+            cell.set_extra(extras.update(cell.extra(), |extra| extra.zerowidth.push(*mark)));
+            let styles = crate::terminal::term::style::StyleTable::default();
+            crate::terminal::graphics::decode_cell(&cell, &styles, &extras)
+                .is_some_and(|code| code.row != 0)
         })
         .collect();
     assert_eq!(marks.len(), 297);
     for (index, mark) in marks.iter().enumerate() {
         screen.feed(format!("\x1b[1;1H\x1b[2K{PLACEHOLDER}{mark}"));
         let cell = &screen.term.grid()[Line(0)][Column(0)];
-        assert_eq!(cell.c, PLACEHOLDER);
-        assert_eq!(cell.zerowidth(), Some(&[*mark][..]), "mark {index} U+{:04X}", *mark as u32);
+        assert_eq!(cell.c(), PLACEHOLDER);
+        let marks = screen.term.zerowidth(Point::new(Line(0), Column(0)));
+        assert_eq!(marks, Some(&[*mark][..]), "mark {index} U+{:04X}", *mark as u32);
         assert_eq!(screen.cursor(), (0, 1), "the placeholder is one cell wide");
     }
 }

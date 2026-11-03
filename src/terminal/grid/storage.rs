@@ -60,6 +60,41 @@ impl<T: PartialEq> PartialEq for Storage<T> {
 }
 
 impl<T> Storage<T> {
+    /// Number of rows held, including cached rows outside the active region.
+    pub(crate) fn stored_rows(&self) -> usize {
+        self.inner.len()
+    }
+
+    /// Visit every row by reference, including cached rows outside the active region.
+    pub(crate) fn for_each_row(&self, f: impl FnMut(&Row<T>)) {
+        self.inner.iter().for_each(f);
+    }
+
+    /// Visit every row, including cached rows outside the active region.
+    pub(crate) fn for_each_row_mut(&mut self, f: impl FnMut(&mut Row<T>)) {
+        self.inner.iter_mut().for_each(f);
+    }
+
+    /// Convert every cell of every row in place of this storage, keeping its layout.
+    pub(crate) fn map_owned<U>(self, mut f: impl FnMut(&T) -> U) -> Storage<U> {
+        Storage {
+            inner: self.inner.into_iter().map(|row| row.map_owned(&mut f)).collect(),
+            zero: self.zero,
+            visible_lines: self.visible_lines,
+            len: self.len,
+        }
+    }
+
+    /// Convert every cell of every row, keeping the ring buffer's layout.
+    pub(crate) fn map<U>(&self, mut f: impl FnMut(&Row<T>, &T) -> U) -> Storage<U> {
+        Storage {
+            inner: self.inner.iter().map(|row| row.map(&mut f)).collect(),
+            zero: self.zero,
+            visible_lines: self.visible_lines,
+            len: self.len,
+        }
+    }
+
     #[inline]
     pub fn with_capacity(visible_lines: usize, columns: usize) -> Storage<T>
     where
@@ -151,8 +186,14 @@ impl<T> Storage<T> {
     pub fn rotate(&mut self, count: isize) {
         debug_assert!(count.unsigned_abs() <= self.inner.len());
 
+        // `zero` is below one length and `count` within one, so the sum stays below three lengths
+        // and at most two subtractions replace the division a remainder costs on every scroll.
         let len = self.inner.len();
-        self.zero = (self.zero as isize + count + len as isize) as usize % len;
+        let mut zero = (self.zero as isize + count + len as isize) as usize;
+        while zero >= len {
+            zero -= len;
+        }
+        self.zero = zero;
     }
 
     /// Rotate all existing lines down in history.
@@ -251,11 +292,15 @@ mod tests {
             *self = *template;
         }
 
-        fn flags(&self) -> &Flags {
+        fn layout(&self) -> Flags {
             unimplemented!();
         }
 
-        fn flags_mut(&mut self) -> &mut Flags {
+        fn insert_layout(&mut self, _flags: Flags) {
+            unimplemented!();
+        }
+
+        fn remove_layout(&mut self, _flags: Flags) {
             unimplemented!();
         }
     }

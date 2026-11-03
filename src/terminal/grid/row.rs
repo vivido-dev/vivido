@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::terminal::grid::GridCell;
 use crate::terminal::index::Column;
 use crate::terminal::term::cell::ResetDiscriminant;
+use crate::terminal::term::extra::{CellExtra, ExtraId, RowExtras};
 
 /// A row in the grid.
 #[derive(Default, Clone, Debug, Serialize, Deserialize)]
@@ -20,6 +21,12 @@ pub struct Row<T> {
     /// This is the upper bound on the number of elements in the row, which have been modified
     /// since the last reset. All cells after this point are guaranteed to be equal.
     pub(crate) occ: usize,
+
+    /// Combining characters and resize tracking of this row's cells.
+    ///
+    /// Not serialized: serialized grids carry each cell's content written out.
+    #[serde(skip)]
+    extras: RowExtras,
 }
 
 impl<T: PartialEq> PartialEq for Row<T> {
@@ -41,7 +48,7 @@ impl<T: Default> Row<T> {
         let mut inner: Vec<T> = Vec::with_capacity(columns);
         inner.resize_with(columns, T::default);
 
-        Row { inner, occ: 0 }
+        Row { inner, occ: 0, extras: RowExtras::default() }
     }
 
     /// Backing capacity, in cells. Only used to assert that narrowing reclaims it.
@@ -110,7 +117,46 @@ impl<T: Default> Row<T> {
             item.reset(template);
         }
 
+        // Cells past `occ` were already reset, so no cell refers to the extra content now.
+        self.extras.clear();
         self.occ = 0;
+    }
+
+    /// Reset the row to `template` and let `write` fill a prefix of its first `len` cells, storing
+    /// each cell once: `write` runs over the old cells, and only the cells it did not write are
+    /// reset afterwards. Returns how many cells `write` wrote.
+    ///
+    /// The result equals [`Row::reset`] followed by [`Row::write_prefix`] from column 0, provided
+    /// `write` stops at any cell that would need cleanup before being overwritten (as the
+    /// `fill_*` functions do): it may then write fewer cells, never different ones.
+    #[inline]
+    pub(crate) fn reset_with_prefix<D>(
+        &mut self,
+        template: &T,
+        len: usize,
+        write: impl FnOnce(&mut [T]) -> usize,
+    ) -> usize
+    where
+        T: ResetDiscriminant<D> + GridCell,
+        D: PartialEq,
+    {
+        // Decided before `write` can overwrite the last cell.
+        let row_len = self.inner.len();
+        let end = if self.inner[row_len - 1].discriminant() == template.discriminant() {
+            self.occ
+        } else {
+            row_len
+        };
+        let written = write(&mut self.inner[..len]);
+        debug_assert!(written <= len);
+        if written < end {
+            for item in &mut self.inner[written..end] {
+                item.reset(template);
+            }
+        }
+        self.extras.clear();
+        self.occ = written;
+        written
     }
 }
 
@@ -118,7 +164,7 @@ impl<T> Row<T> {
     #[inline]
     /// Create a row from cells and an occupied-prefix length.
     pub fn from_vec(vec: Vec<T>, occ: usize) -> Row<T> {
-        Row { inner: vec, occ }
+        Row { inner: vec, occ, extras: RowExtras::default() }
     }
 
     /// Whether this row has no backing cells.
@@ -186,6 +232,98 @@ impl<T> Row<T> {
         let mut split = self.inner.split_off(at);
         std::mem::swap(&mut split, &mut self.inner);
         split
+    }
+}
+
+impl<T> Row<T> {
+    /// Visit every stored cell, including any kept beyond the current width, without marking
+    /// cells occupied.
+    pub(crate) fn for_each_stored_mut(&mut self, f: impl FnMut(&mut T)) {
+        self.inner.iter_mut().for_each(f);
+    }
+
+    /// Convert every stored cell, keeping occupancy.
+    pub(crate) fn map<U>(&self, mut f: impl FnMut(&Self, &T) -> U) -> Row<U> {
+        let inner = self.inner.iter().map(|cell| f(self, cell)).collect();
+        Row { inner, occ: self.occ, extras: RowExtras::default() }
+    }
+}
+
+impl<T> Row<T> {
+    /// Let `write` fill a prefix of the `len` cells from `start`, and mark only that prefix
+    /// occupied; `write` returns how many cells it wrote.
+    #[inline]
+    pub(crate) fn write_prefix(
+        &mut self,
+        start: Column,
+        len: usize,
+        write: impl FnOnce(&mut [T]) -> usize,
+    ) -> usize {
+        let written = write(&mut self.inner[start.0..start.0 + len]);
+        debug_assert!(written <= len);
+        if written > 0 {
+            self.occ = max(self.occ, start.0 + written);
+        }
+        written
+    }
+
+    /// The same row with every stored cell converted by `f`, keeping its extra content.
+    pub(crate) fn map_owned<U>(self, f: impl FnMut(&T) -> U) -> Row<U> {
+        Row { inner: self.inner.iter().map(f).collect(), occ: self.occ, extras: self.extras }
+    }
+}
+
+impl<T: GridCell> Row<T> {
+    /// The extra content this row's cells refer to.
+    #[inline]
+    pub fn extras(&self) -> &RowExtras {
+        &self.extras
+    }
+
+    /// The combining characters drawn over `cell`, a cell of this row, if any.
+    #[inline]
+    pub fn zerowidth(&self, cell: &T) -> Option<&[char]> {
+        self.extras.zerowidth(cell.extra())
+    }
+
+    /// Point the cell at `column` at its extra content with `update` applied.
+    ///
+    /// Compacts the row's entries when dead ones, left by overwrites, reach twice its width, so a
+    /// row redrawn in place keeps its memory bounded.
+    pub(crate) fn update_extra(&mut self, column: Column, update: impl FnOnce(&mut CellExtra)) {
+        let id = self.extras.update(self.inner[column.0].extra(), update);
+        self[column].set_extra(id);
+        // Twice the width, but never beyond what a packed cell can number.
+        let limit = self.inner.len().max(8).saturating_mul(2).min(ExtraId::PACKED_CAPACITY - 1);
+        if self.extras.len() > limit {
+            let remap = self.extras.compact(self.inner.iter().map(GridCell::extra));
+            for cell in &mut self.inner {
+                cell.set_extra(RowExtras::remapped(&remap, cell.extra()));
+            }
+        }
+    }
+
+    /// Move every cell's extra content into `gathered`, pointing the cells at it there.
+    ///
+    /// Used while resize moves cells between rows; [`Row::import_extras`] reverses it.
+    pub(crate) fn export_extras(&mut self, gathered: &mut Vec<CellExtra>) {
+        if self.extras.is_empty() {
+            return;
+        }
+        for cell in &mut self.inner {
+            cell.set_extra(self.extras.export(cell.extra(), gathered));
+        }
+        self.extras.clear();
+    }
+
+    /// Take the extra content this row's cells point at in `gathered` back into the row.
+    pub(crate) fn import_extras(&mut self, gathered: &mut [CellExtra]) {
+        for (column, cell) in self.inner.iter_mut().enumerate() {
+            if cell.extra() != ExtraId::NONE {
+                cell.set_extra(self.extras.import(cell.extra(), gathered));
+                self.occ = self.occ.max(column + 1);
+            }
+        }
     }
 }
 

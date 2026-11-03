@@ -18,6 +18,8 @@ Vivido 通过 [wgpu](https://github.com/gfx-rs/wgpu) 在 GPU 上渲染文本，�
 
 图像、编码视频、音频和摄像头画面可以与文本一起显示在终端窗口内，这样你无需先把文件复制到别处，就能直接查看图表或截图。通过 SSH 连接时，内置的 `vvssh` 可以从远程主机转发同样的媒体，并支持拖放式文件传输。
 
+为 Kitty graphics 协议编写的工具同样可用：`kitten icat`、`timg`、`chafa`、`yazi` 输出的静态图片会内嵌显示，随文本一起滚动，并通过 Unicode 占位符透过 tmux 显示。图像数据必须经由终端本身传输——不支持文件、临时文件和共享内存传输方式。
+
 ### Windows
 
 Vivido 在 Windows 上原生运行，使用 DirectX 12 和 ConPTY，具备与 macOS 和 Linux 上相同的渲染、内联媒体和自动化功能。PowerShell 和每个已安装的 WSL 发行版都会作为标签页打开在同一个窗口中，WSL shell 会自动获得 `TERM=vivido` 和真彩色支持。`vivido msg` 和无头会话通过仅限所有者访问的命名管道工作。签名安装程序会为你配置好 PowerShell 7、带有 Ubuntu 的 WSL 以及 PATH。参见 [在 Windows 上使用 Vivido](docs/windows.md)。

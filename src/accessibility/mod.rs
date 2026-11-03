@@ -144,7 +144,7 @@ impl AccessibilitySnapshot {
             bottom,
         );
         let mut cursor = grid.cursor.point;
-        if grid[cursor].flags.contains(Flags::WIDE_CHAR_SPACER) && cursor.column.0 > 0 {
+        if grid[cursor].layout().contains(Flags::WIDE_CHAR_SPACER) && cursor.column.0 > 0 {
             cursor.column -= 1;
         }
         let selection = term.selection.as_ref().and_then(|selection| selection.to_range(term));
@@ -184,7 +184,7 @@ impl AccessibilitySnapshot {
                 column_offsets[column_index] = scalar_offset;
 
                 if tab_mode {
-                    if term.is_tab_stop(column) || cell.c != ' ' {
+                    if term.is_tab_stop(column) || cell.c() != ' ' {
                         tab_mode = false;
                     } else {
                         column_offsets[column_index + 1] = scalar_offset;
@@ -192,36 +192,38 @@ impl AccessibilitySnapshot {
                     }
                 }
 
-                if cell.flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+                if cell
+                    .layout()
+                    .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
                 {
                     column_offsets[column_index + 1] = scalar_offset;
                     continue;
                 }
 
-                if cell.c == '\t' {
+                if cell.c() == '\t' {
                     tab_mode = true;
                 }
 
-                let cell_width = if cell.flags.contains(Flags::WIDE_CHAR) {
+                let cell_width = if cell.layout().contains(Flags::WIDE_CHAR) {
                     size.cell_width() * 2.0
-                } else if cell.c == '\t' {
+                } else if cell.c() == '\t' {
                     let next_stop = ((column_index / 8) + 1) * 8;
                     size.cell_width() * cmp::max(1, next_stop.saturating_sub(column_index)) as f32
                 } else {
                     size.cell_width()
                 };
-                let hidden = cell.flags.contains(Flags::HIDDEN);
+                let hidden = term.style(cell).attrs.contains(Flags::HIDDEN);
                 push_character(
                     &mut text,
                     &mut characters,
-                    if hidden { ' ' } else { cell.c },
+                    if hidden { ' ' } else { cell.c() },
                     column_index,
                     size.padding_x() + column_index as f32 * size.cell_width(),
                     cell_width,
                     &mut scalar_offset,
                     &mut utf16_offset,
                 );
-                for mark in cell.zerowidth().into_iter().flatten() {
+                for mark in row.zerowidth(cell).into_iter().flatten() {
                     push_character(
                         &mut text,
                         &mut characters,
@@ -235,7 +237,8 @@ impl AccessibilitySnapshot {
                 }
                 column_offsets[column_index + 1] = scalar_offset;
             }
-            let hard_break = !row.last().is_some_and(|cell| cell.flags.contains(Flags::WRAPLINE));
+            let hard_break =
+                !row.last().is_some_and(|cell| cell.layout().contains(Flags::WRAPLINE));
             if hard_break {
                 push_character(
                     &mut text,
@@ -441,6 +444,7 @@ mod tests {
     use crate::terminal::grid::Scroll;
     use crate::terminal::index::Side;
     use crate::terminal::selection::{Selection, SelectionType};
+    use crate::terminal::term::style::Style;
     use crate::terminal::term::test::TermSize;
 
     #[test]
@@ -469,11 +473,12 @@ mod tests {
     #[test]
     fn joins_soft_wraps_and_redacts_hidden_text() {
         let mut term = term(4, 2);
-        term.grid_mut()[Point::new(Line(0), Column(0))].c = 'a';
-        term.grid_mut()[Point::new(Line(0), Column(1))].c = 'x';
-        term.grid_mut()[Point::new(Line(0), Column(1))].flags.insert(Flags::HIDDEN);
-        term.grid_mut()[Point::new(Line(0), Column(3))].flags.insert(Flags::WRAPLINE);
-        term.grid_mut()[Point::new(Line(1), Column(0))].c = 'b';
+        term.grid_mut()[Point::new(Line(0), Column(0))].set_c('a');
+        term.grid_mut()[Point::new(Line(0), Column(1))].set_c('x');
+        let hidden = term.styles_mut().intern(Style { attrs: Flags::HIDDEN, ..Style::default() });
+        term.grid_mut()[Point::new(Line(0), Column(1))].set_style(hidden);
+        term.grid_mut()[Point::new(Line(0), Column(3))].insert_layout(Flags::WRAPLINE);
+        term.grid_mut()[Point::new(Line(1), Column(0))].set_c('b');
 
         let snapshot = AccessibilitySnapshot::new(&term, size(4, 2), "test");
         assert_eq!(snapshot.text, "a   b\n");
@@ -486,10 +491,10 @@ mod tests {
     fn keeps_scalar_and_utf16_offsets_distinct() {
         let mut term = term(4, 1);
         let cell = &mut term.grid_mut()[Point::new(Line(0), Column(0))];
-        cell.c = '🦇';
-        cell.flags.insert(Flags::WIDE_CHAR);
-        cell.push_zerowidth('\u{301}');
-        term.grid_mut()[Point::new(Line(0), Column(1))].flags.insert(Flags::WIDE_CHAR_SPACER);
+        cell.set_c('🦇');
+        cell.insert_layout(Flags::WIDE_CHAR);
+        term.push_zerowidths(Point::new(Line(0), Column(0)), std::iter::once('\u{301}'));
+        term.grid_mut()[Point::new(Line(0), Column(1))].insert_layout(Flags::WIDE_CHAR_SPACER);
         term.grid_mut().cursor.point = Point::new(Line(0), Column(1));
 
         let snapshot = AccessibilitySnapshot::new(&term, size(4, 1), "test");
@@ -505,8 +510,8 @@ mod tests {
     #[test]
     fn visible_range_tracks_scrollback_viewport() {
         let mut term = term(3, 2);
-        term.grid_mut()[Point::new(Line(0), Column(0))].c = 'a';
-        term.grid_mut()[Point::new(Line(1), Column(0))].c = 'b';
+        term.grid_mut()[Point::new(Line(0), Column(0))].set_c('a');
+        term.grid_mut()[Point::new(Line(1), Column(0))].set_c('b');
         term.grid_mut().scroll_up(&(Line(0)..Line(2)), 1);
 
         let latest = AccessibilitySnapshot::new(&term, size(3, 2), "test");
@@ -526,7 +531,7 @@ mod tests {
         let mut term = term(3, 2);
         for (line, text) in ["abc", "def"].into_iter().enumerate() {
             for (column, character) in text.chars().enumerate() {
-                term.grid_mut()[Point::new(Line(line as i32), Column(column))].c = character;
+                term.grid_mut()[Point::new(Line(line as i32), Column(column))].set_c(character);
             }
         }
         let mut selection =
@@ -569,7 +574,7 @@ mod tests {
         // `line.range.scalar.end` is one further along whenever the line hard-breaks.
         let mut term = term(8, 2);
         for (column, character) in "ab".chars().enumerate() {
-            term.grid_mut()[Point::new(Line(0), Column(column))].c = character;
+            term.grid_mut()[Point::new(Line(0), Column(column))].set_c(character);
         }
         let snapshot = AccessibilitySnapshot::new(&term, size(8, 2), "test");
         let line = &snapshot.lines[0];
@@ -603,8 +608,8 @@ mod tests {
     #[test]
     fn tabs_keep_one_character_with_expanded_geometry() {
         let mut term = term(10, 1);
-        term.grid_mut()[Point::new(Line(0), Column(0))].c = '\t';
-        term.grid_mut()[Point::new(Line(0), Column(8))].c = 'x';
+        term.grid_mut()[Point::new(Line(0), Column(0))].set_c('\t');
+        term.grid_mut()[Point::new(Line(0), Column(8))].set_c('x');
         let snapshot = AccessibilitySnapshot::new(&term, size(10, 1), "test");
         assert_eq!(snapshot.text, "\tx\n");
         assert_eq!(snapshot.lines[0].characters[0].width, 80.0);
@@ -614,9 +619,9 @@ mod tests {
     #[test]
     fn alternate_screen_replaces_the_accessible_document() {
         let mut term = term(3, 1);
-        term.grid_mut()[Point::new(Line(0), Column(0))].c = 'p';
+        term.grid_mut()[Point::new(Line(0), Column(0))].set_c('p');
         term.swap_alt();
-        term.grid_mut()[Point::new(Line(0), Column(0))].c = 'a';
+        term.grid_mut()[Point::new(Line(0), Column(0))].set_c('a');
         let alternate = AccessibilitySnapshot::new(&term, size(3, 1), "test");
         assert_eq!(alternate.text, "a\n");
 
@@ -629,7 +634,7 @@ mod tests {
     fn linear_selection_is_one_exact_range() {
         let mut term = term(4, 1);
         for (column, character) in "abcd".chars().enumerate() {
-            term.grid_mut()[Point::new(Line(0), Column(column))].c = character;
+            term.grid_mut()[Point::new(Line(0), Column(column))].set_c(character);
         }
         let mut selection =
             Selection::new(SelectionType::Simple, Point::new(Line(0), Column(1)), Side::Left);

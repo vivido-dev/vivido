@@ -1,0 +1,8 @@
+{
+  "vivido_base_commit": "7eb31aa8ddd464eae4c26e2c1cab718eb16f89fa",
+  "vvte_base_commit": "c4b3f66b28991dc6e989699dca333b9373ff45ce",
+  "cpu": "Apple M4",
+  "memory_bytes": 34359738368,
+  "rust": "1.98.1",
+  "baseline": "Working tree at the start of the continuation; includes printable-run/parser changes, excludes pipeline, snapshots and SmallVec."
+}

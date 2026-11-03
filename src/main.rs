@@ -41,10 +41,17 @@ use vivido::config::window::Decorations;
 use vivido::event::{Event, EventSink, Processor};
 
 // The allocator belongs to the executable; embedding hosts retain their own allocator.
+#[cfg(not(feature = "perf"))]
 #[global_allocator]
 static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+#[cfg(feature = "perf")]
+#[global_allocator]
+static PERF_ALLOCATOR: vivido::performance::Allocator = vivido::performance::Allocator;
+
 fn main() -> Result<(), Box<dyn Error>> {
+    #[cfg(feature = "perf")]
+    let _performance_report = vivido::performance::Report;
     #[cfg(windows)]
     panic::attach_handler();
 

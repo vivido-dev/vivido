@@ -1,0 +1,74 @@
+{
+  "arguments": {
+    "before": "/private/tmp/vivido-original-7eb31aa",
+    "after": "/private/tmp/vivido-fixed",
+    "benchmark": "/private/tmp/vivido-benchmark-final",
+    "output": "/private/tmp/vivido-final-replay-original",
+    "corpus": "/private/tmp/vivido-original-all",
+    "driver": "replay",
+    "after_gather": "default",
+    "before_gather": "default",
+    "frontend": "native",
+    "samples": 5,
+    "repetitions": 50,
+    "latency_samples": 100,
+    "timeout": 600,
+    "modes": [
+      "sync",
+      "render"
+    ],
+    "workloads": [
+      "ascii",
+      "unicode",
+      "unique_unicode",
+      "csi",
+      "long_escape_codes",
+      "images"
+    ]
+  },
+  "platform": "macOS-27.0.1-arm64-arm-64bit-Mach-O",
+  "binaries": {
+    "before": {
+      "bytes": 28288952,
+      "sha256": "a51880299e63e02fd381ad039f8d92ee9d27e38028d5202e1293d1cbdd066732"
+    },
+    "after": {
+      "bytes": 28382600,
+      "sha256": "12e615420e4cb8410a033a97e33fc2fc0e78d06c2b30ce6addc65a00fdb976cc"
+    },
+    "benchmark": {
+      "bytes": 3050978,
+      "sha256": "3c223c779d4a6da8b02792c8ee48c60dcb73d2b8a18afe63602ae58eb1ddeda9"
+    }
+  },
+  "corpus": {
+    "111a4d2e2ef3e4223aef706c955ee3a90cd3bcbccf999208b7411d99156b5dfb.bin": {
+      "bytes": 12279,
+      "sha256": "e2ca07aafd9d79f00fb8a212d187ebf576b59b083b3c069e1724f48ccaef8a6c"
+    },
+    "58759b295feccc9e7056f24787ba0906e82b504ae0d3f44f8204371364c81611.bin": {
+      "bytes": 1885184,
+      "sha256": "8ffec1ff48ccdd0bf76094c1d3d5469893d4987756b6869a446fa17e67b1c5ab"
+    },
+    "67d5aa91ef605eda214e9304d4ace616dd223f01c5c1d2ab84c496b951059eb5.bin": {
+      "bytes": 1048611,
+      "sha256": "cdd38fb417708f718a370eb4cdc5afacc08b69c562f2f99589d6b22862ceda2c"
+    },
+    "92a03c5b8d8bef37009ba39c4e811b7fbc6e0b5ee5fb098d25b809987cd2f5fa.bin": {
+      "bytes": 8221696,
+      "sha256": "f87a0af5cf9e5a1aecd7beadc438ba787b8bf1dbba739076933ccfbc8400ee30"
+    },
+    "ac90f64492758008fd68c3d9b60aee29d8ed89c4fe44cf6a17e18deb46a219f6.bin": {
+      "bytes": 1835008,
+      "sha256": "e24ca5bf1ab1c7eca80a124b666a220bef9fd8bc6a30247f8288827b60d6f516"
+    },
+    "be7e2f20129365c2899b2c11bfc465541e61b1858f45bf0248cf99b9271bc707.bin": {
+      "bytes": 5593188,
+      "sha256": "e4730d103d7884549c931d3a4ec19ca31fc25e1ee8a126b310a9ec3bddb5e664"
+    },
+    "c628fbdfb3dc4f7c567f021ec7152814b3610ad181f2cbf9465d16f5b06c1297.bin": {
+      "bytes": 2097165,
+      "sha256": "aa2f84ce7a3d5a4011f2d44dca2c31c7b2f4eb6e077499243dbb3bdef817b3c8"
+    }
+  }
+}

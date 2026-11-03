@@ -1,0 +1,44 @@
+[
+  {
+    "mode": "sync",
+    "samples": 5,
+    "workloads": {
+      "Unicode chars": {
+        "before": 171.4,
+        "after": 153.9,
+        "change_percent": -10.210035005834307,
+        "passes": false
+      },
+      "Unique multi-codepoint Unicode cells": {
+        "before": 119.6,
+        "after": 111.6,
+        "change_percent": -6.688963210702337,
+        "passes": false
+      }
+    },
+    "query_p99_ms": {
+      "idle": {
+        "before": 0.07025,
+        "after": 0.064125,
+        "limit_ms": 1.07025,
+        "passes": true
+      },
+      "loaded": {
+        "before": 1.9035,
+        "after": 1.7665,
+        "limit_ms": 2.9035,
+        "passes": true
+      }
+    },
+    "costs": {
+      "before": {
+        "cpu_seconds": 4.220000000000001,
+        "peak_rss_bytes": 142819328
+      },
+      "after": {
+        "cpu_seconds": 5.07,
+        "peak_rss_bytes": 141393920
+      }
+    }
+  }
+]

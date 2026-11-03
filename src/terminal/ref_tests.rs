@@ -9,7 +9,7 @@ use std::path::Path;
 use crate::terminal::event::{Event, EventListener};
 use crate::terminal::grid::{Dimensions, Grid};
 use crate::terminal::index::{Column, Line};
-use crate::terminal::term::cell::Cell;
+use crate::terminal::term::cell::SerializedCell;
 use crate::terminal::term::test::TermSize;
 use crate::terminal::term::{Config, Term};
 use crate::terminal::vvte::ansi;
@@ -104,7 +104,7 @@ fn ref_test(dir: &Path) {
     let serialized_cfg = fs::read_to_string(dir.join("config.json")).unwrap();
 
     let size: TermSize = json::from_str(&serialized_size).unwrap();
-    let grid: Grid<Cell> = json::from_str(&serialized_grid).unwrap();
+    let grid: Grid<SerializedCell> = json::from_str(&serialized_grid).unwrap();
     let ref_config: RefConfig = json::from_str(&serialized_cfg).unwrap();
 
     let options =
@@ -119,6 +119,7 @@ fn ref_test(dir: &Path) {
     let mut term_grid = terminal.grid().clone();
     term_grid.initialize_all();
     term_grid.truncate();
+    let term_grid = term_grid.map(|row, cell| terminal.serialized_cell(row, cell));
 
     if grid != term_grid {
         for i in 0..grid.total_lines() {

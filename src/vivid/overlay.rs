@@ -110,6 +110,7 @@ pub(crate) fn cursor_icon(shape: vivid_protocol::vector::CursorShape) -> CursorI
         Shape::ResizeDownRight => CursorIcon::SeResize,
         Shape::ResizeLeftRight => CursorIcon::EwResize,
         Shape::ResizeUpDown => CursorIcon::NsResize,
+        _ => CursorIcon::Default,
     }
 }
 
@@ -238,8 +239,8 @@ impl Host {
             return Err("invalid overlay display scale");
         }
         let viewport = Viewport {
-            width: Scalar::new(width / scale).map_err(|e| e.0)?,
-            height: Scalar::new(height / scale).map_err(|e| e.0)?,
+            width: Scalar::new(width / scale).map_err(|e| e.reason())?,
+            height: Scalar::new(height / scale).map_err(|e| e.reason())?,
             scale_numerator: (scale * 1_000_000.).round() as u32,
             scale_denominator: 1_000_000,
         };
@@ -884,7 +885,7 @@ impl VectorWorker {
         use vivid_protocol::vector::{Frame, ImageAsset, Limits};
         let length = u32::try_from(body.len()).map_err(|_| "vector record exceeds u32")?;
         if record_type == messages::VECTOR_ASSET {
-            let asset = ImageAsset::decode(body).map_err(|e| e.0)?;
+            let asset = ImageAsset::decode(body).map_err(|e| e.reason())?;
             if asset.id <= self.last_asset {
                 return Err("retained image IDs must increase within a channel generation");
             }
@@ -926,7 +927,8 @@ impl VectorWorker {
                 },
             );
         } else if record_type == messages::VECTOR_ASSET_RELEASE {
-            let release = vivid_protocol::vector::AssetRelease::decode(body).map_err(|e| e.0)?;
+            let release =
+                vivid_protocol::vector::AssetRelease::decode(body).map_err(|e| e.reason())?;
             if !self.images.contains_key(&release.id) {
                 return Err("retained image is absent or released");
             }
@@ -935,8 +937,8 @@ impl VectorWorker {
             self.tokens.remove(&release.id);
             lock(&shared.overlays).assets.retain(|_, (token, _)| token.strong_count() != 0);
         } else {
-            let frame = Frame::decode(body).map_err(|e| e.0)?;
-            frame.canvas.validate_with_limits(&Limits::default()).map_err(|e| e.0)?;
+            let frame = Frame::decode(body).map_err(|e| e.reason())?;
+            frame.canvas.validate_with_limits(&Limits::default()).map_err(|e| e.reason())?;
             let status = shared.scene.track_status(identity).ok_or("vector track is absent")?;
             let KindConfiguration::VectorScene(config) = status.configuration.kind else {
                 return Err("vector frame used a non-vector track");
@@ -999,7 +1001,7 @@ impl VectorWorker {
                 &self.images,
                 &layouts,
             )
-            .map_err(|e| e.0)?;
+            .map_err(|e| e.reason())?;
             let ids: HashSet<_> = frame
                 .canvas
                 .commands()
@@ -1152,7 +1154,7 @@ pub(super) fn dispatch(
                     request.expected_revision,
                     request.options.clone(),
                 )
-                .map_err(|e| ControlError::state(e.0))?;
+                .map_err(|e| ControlError::state(e.reason()))?;
             host.surfaces.insert(identity);
             (
                 messages::OVERLAY_WINDOW_READY,
@@ -1169,7 +1171,7 @@ pub(super) fn dispatch(
                 .viewport
                 .ok_or_else(|| ControlError::bad_state("overlay viewport is unavailable"))?;
             host.apply_action(session.identity, action, viewport)
-                .map_err(|e| ControlError::state(e.0))?;
+                .map_err(|e| ControlError::state(e.reason()))?;
             (messages::OK, vec![])
         },
         messages::SET_OVERLAY_CLIPBOARD => {
@@ -1275,7 +1277,7 @@ pub(super) fn lane_record(
                 }
                 if capture.capture {
                     let position = host.pointer_position.unwrap_or_default();
-                    host.windows.capture_pointer(id, position).map_err(|e| e.0)?;
+                    host.windows.capture_pointer(id, position).map_err(|e| e.reason())?;
                 } else {
                     host.windows.release_pointer(id);
                 }

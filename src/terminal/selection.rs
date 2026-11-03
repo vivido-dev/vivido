@@ -9,7 +9,7 @@ use std::cmp::min;
 use std::mem;
 use std::ops::{Bound, Range, RangeBounds};
 
-use crate::terminal::grid::{Dimensions, GridCell, Indexed};
+use crate::terminal::grid::{Dimensions, Indexed};
 use crate::terminal::index::{Boundary, Column, Line, Point, Side};
 use crate::terminal::term::Term;
 use crate::terminal::term::cell::{Cell, Flags};
@@ -88,7 +88,7 @@ impl SelectionRange {
         }
 
         // Check if a wide char's trailing spacer is selected.
-        indexed.cell.flags().contains(Flags::WIDE_CHAR)
+        indexed.cell.layout().contains(Flags::WIDE_CHAR)
             && self.contains(Point::new(indexed.point.line, indexed.point.column + 1))
     }
 }
