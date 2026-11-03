@@ -2053,6 +2053,63 @@ impl<T: EventListener> Term<T> {
         }
     }
 
+    /// Write decoded text row by row: each character is decoded and measured once, and each row
+    /// segment of same-width characters is filled in one pass.
+    ///
+    /// Combining characters attach to the previous cell; anything the fill declines (a width
+    /// change at the row's end, a cell that needs cleanup, controls, a pending wrap) goes through
+    /// [`Term::input`], so the result is identical to printing character by character.
+    fn write_text_run(&mut self, text: &str) {
+        if self.grid.cursor.charsets[self.active_charset] != StandardCharset::Ascii
+            || self.mode.contains(TermMode::INSERT)
+            || !self.mode.contains(TermMode::LINE_WRAP)
+        {
+            for c in text.chars() {
+                self.input(c);
+            }
+            return;
+        }
+        let style = self.grid.cursor.template.style();
+        let mut chars = text.chars();
+        while let Some(c) = chars.clone().next() {
+            match cell::char_width(c) {
+                Some(0) => {
+                    let count =
+                        chars.clone().take_while(|c| cell::char_width(*c) == Some(0)).count();
+                    let mut point = self.grid.cursor.point;
+                    if !self.grid.cursor.input_needs_wrap {
+                        point.column.0 = point.column.saturating_sub(1);
+                    }
+                    if self.grid[point].layout().contains(Flags::WIDE_CHAR_SPACER) {
+                        point.column.0 = point.column.saturating_sub(1);
+                    }
+                    self.push_zerowidths(point, chars.by_ref().take(count));
+                },
+                Some(width @ (1 | 2)) if !self.grid.cursor.input_needs_wrap => {
+                    let point = self.grid.cursor.point;
+                    let columns = self.columns();
+                    let available = columns - point.column.0;
+                    let written =
+                        self.grid[point.line].write_prefix(point.column, available, |cells| {
+                            cell::fill_chars(cells, &mut chars, width, style)
+                        });
+                    if written == 0 {
+                        chars.next();
+                        self.input(c);
+                        continue;
+                    }
+                    let end = point.column.0 + written;
+                    self.grid.cursor.input_needs_wrap = end == columns;
+                    self.grid.cursor.point.column = Column(end.min(columns - 1));
+                },
+                _ => {
+                    chars.next();
+                    self.input(c);
+                },
+            }
+        }
+    }
+
     /// Write an ASCII run row by row with one fused check-and-store pass per row segment.
     ///
     /// Only printable bytes written over plain cells take the fill; DEL, controls, and cells
@@ -2153,7 +2210,7 @@ impl<T: EventListener> Handler for Term<T> {
         } else if text.is_ascii() {
             self.write_ascii_run(text.as_bytes());
         } else {
-            self.write_run::<_, false>(text.chars(), None);
+            self.write_text_run(text);
         }
     }
 

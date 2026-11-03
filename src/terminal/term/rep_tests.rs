@@ -216,7 +216,7 @@ fn printable_runs_match_scalar_at_every_character_boundary() {
         "界e\u{301}界abc\x1b[H".as_bytes(),
         b"\x1b[2;3r\x1b[3;5H",
     ];
-    for (columns, lines) in [(2, 1), (5, 4), (80, 24)] {
+    for (columns, lines) in [(2, 1), (5, 4), (7, 3), (80, 24)] {
         for setup in setups {
             for text in [
                 "hello world abcdefghijklmnopqrstuvwxyz",
@@ -224,6 +224,9 @@ fn printable_runs_match_scalar_at_every_character_boundary() {
                 "a\u{301}\u{302}\u{303}界\u{301}e",
                 "😀\u{200d}😀x\u{fe0f}🇺🇸",
                 "abc\u{7f}xyz",
+                // Kitty's "Unicode chars" mix: ideographs, full-width punctuation, quotes,
+                // emoji, Latin-1 and combining marks.
+                "旦海司：扒裝，位「才波」‘’😀—§ÀÁ ū̀n̂o᷵H̨a̠界",
             ] {
                 for split in text.char_indices().map(|(i, _)| i).chain(std::iter::once(text.len()))
                 {

@@ -471,6 +471,96 @@ pub(crate) fn fill_ascii(cells: &mut [Cell], bytes: &[u8], style: StyleId) -> us
     written
 }
 
+/// Display width of `c`: `unicode-width`'s answer, with the ranges that dominate real text
+/// answered without the table.
+///
+/// Printable ASCII is one cell and the CJK Unified Ideographs block two; a test checks both
+/// against `unicode-width` exhaustively, so the shortcut never disagrees with the scalar path.
+#[inline]
+pub(crate) fn char_width(c: char) -> Option<usize> {
+    match u32::from(c) {
+        0x20..=0x7E => Some(1),
+        0x4E00..=0x9FFF => Some(2),
+        _ => unicode_width::UnicodeWidthChar::width(c),
+    }
+}
+
+/// Write characters from `chars` that are `width` cells wide over `cells` in `style`, stopping at
+/// the first character of another width or the first cell that needs the general path; returns
+/// how many cells were written. A character not taken is left in `chars`.
+///
+/// One pass: each character is decoded and measured once, and each cell checked and written once.
+#[inline]
+pub(crate) fn fill_chars(
+    cells: &mut [Cell],
+    chars: &mut std::str::Chars<'_>,
+    width: usize,
+    style: StyleId,
+) -> usize {
+    debug_assert!(width == 1 || width == 2);
+    let mut written = 0;
+    while written + width <= cells.len() {
+        if width == 2 {
+            written += fill_ideographs(&mut cells[written..], chars, style);
+            if written + width > cells.len() {
+                break;
+            }
+        }
+        let rest = chars.clone();
+        let Some(c) = chars.next() else { break };
+        let fits = char_width(c) == Some(width)
+            && cells[written].is_simple()
+            && (width == 1 || cells[written + 1].is_simple());
+        if !fits {
+            *chars = rest;
+            break;
+        }
+        if width == 1 {
+            cells[written].write(c, style, Flags::empty());
+        } else {
+            cells[written].write(c, style, Flags::WIDE_CHAR);
+            cells[written + 1].write(' ', style, Flags::WIDE_CHAR_SPACER);
+        }
+        written += width;
+    }
+    written
+}
+
+/// Write a run of CJK Unified Ideographs (U+4E00..=U+9FFF) from `chars` as wide cell pairs over
+/// plain `cells`; returns how many cells were written and leaves the rest in `chars`.
+///
+/// Decodes the three-byte sequences straight from the text's bytes: CJK output is mostly these
+/// ideographs, and going through `Chars` and the width table for each one dominated printing it.
+#[inline]
+fn fill_ideographs(cells: &mut [Cell], chars: &mut std::str::Chars<'_>, style: StyleId) -> usize {
+    let text = chars.as_str();
+    let bytes = text.as_bytes();
+    let (mut read, mut written) = (0, 0);
+    while written + 2 <= cells.len() && read + 3 <= bytes.len() {
+        let [lead, second, third] = [bytes[read], bytes[read + 1], bytes[read + 2]];
+        // `text` is valid UTF-8, so a three-byte lead is followed by two continuation bytes.
+        let code =
+            u32::from(lead & 0x0F) << 12 | u32::from(second & 0x3F) << 6 | u32::from(third & 0x3F);
+        if lead & 0xF0 != 0xE0
+            || !(0x4E00..=0x9FFF).contains(&code)
+            || !cells[written].is_simple()
+            || !cells[written + 1].is_simple()
+        {
+            break;
+        }
+        // In range, so a valid scalar value.
+        let c = char::from_u32(code).unwrap_or(' ');
+        cells[written].write(c, style, Flags::WIDE_CHAR);
+        cells[written + 1].write(' ', style, Flags::WIDE_CHAR_SPACER);
+        read += 3;
+        written += 2;
+    }
+    if read > 0 {
+        *chars = text[read..].chars();
+    }
+    written
+}
+
 /// A [`Cell`] with each part in its own field, for resize.
 ///
 /// Resize gathers every row's combining characters into one list while it moves cells between
@@ -647,6 +737,13 @@ mod tests {
         }
         let mut cells = vec![Cell::default(); 5];
         assert_eq!(fill_ascii(&mut cells, bytes, StyleId::default()), 5, "bounded by the cells");
+    }
+
+    #[test]
+    fn the_width_shortcut_agrees_with_unicode_width_for_every_character() {
+        for c in (0..=0x10FFFF).filter_map(char::from_u32) {
+            assert_eq!(char_width(c), unicode_width::UnicodeWidthChar::width(c), "{c:?}");
+        }
     }
 
     #[test]
