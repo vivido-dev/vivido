@@ -213,24 +213,17 @@ impl<T> Row<T> {
 }
 
 impl<T> Row<T> {
-    /// Hand cells from `start` to `write` until it declines one or `len` cells are written.
-    ///
-    /// Returns how many it accepted; only those are marked occupied. Checking and writing in one
-    /// pass keeps a print from walking the same cells twice.
+    /// Let `write` fill a prefix of the `len` cells from `start`, and mark only that prefix
+    /// occupied; `write` returns how many cells it wrote.
     #[inline]
-    pub(crate) fn write_while(
+    pub(crate) fn write_prefix(
         &mut self,
         start: Column,
         len: usize,
-        mut write: impl FnMut(usize, &mut T) -> bool,
+        write: impl FnOnce(&mut [T]) -> usize,
     ) -> usize {
-        let mut written = 0;
-        for cell in &mut self.inner[start.0..start.0 + len] {
-            if !write(written, cell) {
-                break;
-            }
-            written += 1;
-        }
+        let written = write(&mut self.inner[start.0..start.0 + len]);
+        debug_assert!(written <= len);
         if written > 0 {
             self.occ = max(self.occ, start.0 + written);
         }

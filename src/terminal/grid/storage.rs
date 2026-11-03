@@ -186,8 +186,14 @@ impl<T> Storage<T> {
     pub fn rotate(&mut self, count: isize) {
         debug_assert!(count.unsigned_abs() <= self.inner.len());
 
+        // `zero` is below one length and `count` within one, so the sum stays below three lengths
+        // and at most two subtractions replace the division a remainder costs on every scroll.
         let len = self.inner.len();
-        self.zero = (self.zero as isize + count + len as isize) as usize % len;
+        let mut zero = (self.zero as isize + count + len as isize) as usize;
+        while zero >= len {
+            zero -= len;
+        }
+        self.zero = zero;
     }
 
     /// Rotate all existing lines down in history.

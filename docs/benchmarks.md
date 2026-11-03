@@ -610,3 +610,18 @@ samples, medians, MiB/s.
 Replay's unique multi-codepoint Unicode cells: 181.4 → 219.8 and 192.7 → 229.9. Query p99: idle
 0.064 → 0.056 ms, loaded 1.17 → 0.71 ms (default). Peak memory fell (replay 115 → 93 MB). In
 memory, ASCII is 527 MiB/s (`scripts/ascii-throughput.sh`), against 356 at the Phase 0 baseline.
+
+## Phase C: faster plain-text fill and scan (2026-11-02)
+
+Eight-wide ASCII cell fill, word-at-a-time printable scan in vvte, division-free row rotation.
+Before: the B6 build. After: Phase C. Three alternating samples, medians, MiB/s.
+
+| Benchmark | Mode | ASCII | Unicode | CSI | Long escapes | Images |
+|---|---|---|---|---|---|---|
+| Kitty | default | 420.7 → 526.1 | 306.9 → 370.1 | 131.7 → 134.0 | 577.6 → 579.9 | 581.6 → 586.7 |
+| Kitty | `--render` | 436.6 → 547.3 | 325.6 → 380.0 | 138.5 → 139.8 | 575.9 → 578.0 | 596.2 → 582.5 |
+| Replay | default | 370.2 → 391.7 | 331.8 → 395.6 | 132.7 → 134.0 | 477.5 → 472.3 | 489.5 → 484.7 |
+| Replay | `--render` | 378.8 → 387.3 | 341.1 → 408.8 | 138.0 → 139.9 | 481.6 → 480.4 | 491.4 → 489.4 |
+
+Replay's unique multi-codepoint Unicode cells: 216.7 → 248.4 and 231.3 → 261.4. Query p99
+unchanged (loaded 0.72 ms). In memory (`scripts/ascii-throughput.sh`), ASCII is 668 MiB/s.
