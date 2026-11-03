@@ -1621,7 +1621,17 @@ impl<T> Term<T> {
     /// Text moves up; clear at top
     /// Expects origin to be in scroll range.
     #[inline]
-    fn scroll_up_relative(&mut self, origin: Line, mut lines: usize)
+    fn scroll_up_relative(&mut self, origin: Line, lines: usize)
+    where
+        T: EventListener,
+    {
+        self.scroll_up_relative_resetting(origin, lines, true);
+    }
+
+    /// Scroll up like [`Term::scroll_up_relative`]; with `reset` false, a one-line scroll leaves
+    /// the line entering at the bottom uncleared (see [`Grid::scroll_up_unreset`]) and returns
+    /// true. A region too small to scroll returns false.
+    fn scroll_up_relative_resetting(&mut self, origin: Line, mut lines: usize, reset: bool) -> bool
     where
         T: EventListener,
     {
@@ -1634,7 +1644,12 @@ impl<T> Term<T> {
         // Scroll selection.
         self.selection = self.selection.take().and_then(|s| s.rotate(self, &region, lines as i32));
 
-        self.grid.scroll_up(&region, lines);
+        let unreset = !reset && lines == 1;
+        if unreset {
+            self.grid.scroll_up_unreset(&region);
+        } else {
+            self.grid.scroll_up(&region, lines);
+        }
 
         if lines > 0 {
             let (end, history_size) = (self.scroll_region.end.0, self.history_size());
@@ -1642,6 +1657,7 @@ impl<T> Term<T> {
         }
 
         self.mark_fully_damaged();
+        unreset
     }
 
     fn deccolm(&mut self)
@@ -1883,15 +1899,29 @@ impl<T> Term<T> {
     where
         T: EventListener,
     {
+        self.wrapline_recycling(false);
+    }
+
+    /// Wrap like [`Term::wrapline`]. With `recycle`, a wrap that scrolls the region leaves the
+    /// cursor's new line uncleared and returns true; the caller must then write it with
+    /// [`Row::reset_with_prefix`] before anything else reads the grid.
+    fn wrapline_recycling(&mut self, recycle: bool) -> bool
+    where
+        T: EventListener,
+    {
         if !self.mode.contains(TermMode::LINE_WRAP) {
-            return;
+            return false;
         }
 
         trace!("Wrapping input");
 
         self.grid.cursor_cell().insert_layout(Flags::WRAPLINE);
 
-        if self.grid.cursor.point.line + 1 >= self.scroll_region.end {
+        let mut recycled = false;
+        if recycle && self.grid.cursor.point.line + 1 == self.scroll_region.end {
+            let origin = self.scroll_region.start;
+            recycled = self.scroll_up_relative_resetting(origin, 1, false);
+        } else if self.grid.cursor.point.line + 1 >= self.scroll_region.end {
             self.linefeed();
         } else {
             self.damage_cursor();
@@ -1901,6 +1931,7 @@ impl<T> Term<T> {
         self.grid.cursor.point.column = Column(0);
         self.grid.cursor.input_needs_wrap = false;
         self.damage_cursor();
+        recycled
     }
 
     /// Write `c` to the cell at the cursor position with the given layout flags.
@@ -2085,14 +2116,24 @@ impl<T: EventListener> Term<T> {
                     }
                     self.push_zerowidths(point, chars.by_ref().take(count));
                 },
-                Some(width @ (1 | 2)) if !self.grid.cursor.input_needs_wrap => {
+                Some(width @ (1 | 2)) => {
+                    // Wrapping first is what `input` would do with this character; a wrap that
+                    // scrolls hands back the new bottom line uncleared for the fill to reset.
+                    let recycled =
+                        self.grid.cursor.input_needs_wrap && self.wrapline_recycling(true);
                     let point = self.grid.cursor.point;
                     let columns = self.columns();
                     let available = columns - point.column.0;
-                    let written =
+                    let written = if recycled {
+                        let erase = self.grid.cursor.erase.clone();
+                        self.grid[point.line].reset_with_prefix(&erase, available, |cells| {
+                            cell::fill_chars::<true>(cells, &mut chars, width, style)
+                        })
+                    } else {
                         self.grid[point.line].write_prefix(point.column, available, |cells| {
-                            cell::fill_chars(cells, &mut chars, width, style)
-                        });
+                            cell::fill_chars::<false>(cells, &mut chars, width, style)
+                        })
+                    };
                     if written == 0 {
                         chars.next();
                         self.input(c);
@@ -2132,14 +2173,22 @@ impl<T: EventListener> Term<T> {
                 bytes = &bytes[1..];
                 continue;
             }
-            if self.grid.cursor.input_needs_wrap {
-                self.wrapline();
-            }
+            // A wrap that scrolls hands back the new bottom line uncleared, and the fill below
+            // resets it while writing, so each of its cells is stored once.
+            let recycled = self.grid.cursor.input_needs_wrap && self.wrapline_recycling(true);
             let point = self.grid.cursor.point;
             let columns = self.columns();
             let count = (columns - point.column.0).min(bytes.len());
-            let written = self.grid[point.line]
-                .write_prefix(point.column, count, |cells| cell::fill_ascii(cells, bytes, style));
+            let written = if recycled {
+                let erase = self.grid.cursor.erase.clone();
+                self.grid[point.line].reset_with_prefix(&erase, count, |cells| {
+                    cell::fill_ascii::<true>(cells, bytes, style)
+                })
+            } else {
+                self.grid[point.line].write_prefix(point.column, count, |cells| {
+                    cell::fill_ascii::<false>(cells, bytes, style)
+                })
+            };
             if written == 0 {
                 self.input(char::from(first));
                 bytes = &bytes[1..];

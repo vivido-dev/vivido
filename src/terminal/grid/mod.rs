@@ -285,9 +285,32 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
         T: ResetDiscriminant<D>,
         D: PartialEq,
     {
+        self.scroll_up_resetting(region, positions, positions);
+    }
+
+    /// Scroll `region` up one line like [`Grid::scroll_up`], but leave the line entering at the
+    /// bottom with its old cells. The caller must reset it before anything else reads the grid,
+    /// typically with [`Row::reset_with_prefix`] while writing text over it.
+    pub(crate) fn scroll_up_unreset<D>(&mut self, region: &Range<Line>)
+    where
+        T: ResetDiscriminant<D>,
+        D: PartialEq,
+    {
+        self.scroll_up_resetting(region, 1, 0);
+    }
+
+    /// Scroll `region` up by `positions` and reset the top `reset` of the lines entering at the
+    /// bottom.
+    fn scroll_up_resetting<D>(&mut self, region: &Range<Line>, positions: usize, reset: usize)
+    where
+        T: ResetDiscriminant<D>,
+        D: PartialEq,
+    {
+        let unreset = positions - reset;
+
         // When rotating the entire region with fixed lines at the top, just reset everything.
         if region.end - region.start <= positions && region.start != 0 {
-            for i in (region.start.0..region.end.0).map(Line::from) {
+            for i in (region.start.0..region.end.0 - unreset as i32).map(Line::from) {
                 self.raw[i].reset(&self.cursor.erase);
             }
 
@@ -332,7 +355,7 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
         }
 
         // Ensure all new lines are fully cleared.
-        for i in (region.end.0 - positions as i32..region.end.0).map(Line::from) {
+        for i in (region.end.0 - positions as i32..region.end.0 - unreset as i32).map(Line::from) {
             self.raw[i].reset(&self.cursor.erase);
         }
     }

@@ -441,7 +441,14 @@ impl From<char> for Cell {
 /// Works eight cells at a time while every byte is printable and every cell is plain, so the
 /// common case compiles to wide loads and stores; the first group with an exception finishes one
 /// cell at a time.
-pub(crate) fn fill_ascii(cells: &mut [Cell], bytes: &[u8], style: StyleId) -> usize {
+///
+/// With `FRESH`, the cells' old content is ignored: the caller resets every cell not written, as
+/// [`Row::reset_with_prefix`](crate::terminal::grid::Row::reset_with_prefix) does.
+pub(crate) fn fill_ascii<const FRESH: bool>(
+    cells: &mut [Cell],
+    bytes: &[u8],
+    style: StyleId,
+) -> usize {
     let len = cells.len().min(bytes.len());
     let (cells, bytes) = (&mut cells[..len], &bytes[..len]);
     let mut blank = Cell::default();
@@ -452,7 +459,7 @@ pub(crate) fn fill_ascii(cells: &mut [Cell], bytes: &[u8], style: StyleId) -> us
     let (cell_groups, _) = cells.as_chunks_mut::<8>();
     let (byte_groups, _) = bytes.as_chunks::<8>();
     for (group, chars) in cell_groups.iter_mut().zip(byte_groups) {
-        let clear = group.iter().fold(true, |clear, cell| clear & cell.is_simple());
+        let clear = FRESH || group.iter().fold(true, |clear, cell| clear & cell.is_simple());
         if !clear || !chars.iter().fold(true, |ok, &b| ok & printable(b)) {
             break;
         }
@@ -462,7 +469,7 @@ pub(crate) fn fill_ascii(cells: &mut [Cell], bytes: &[u8], style: StyleId) -> us
         written += 8;
     }
     for (cell, &b) in cells[written..].iter_mut().zip(&bytes[written..]) {
-        if !printable(b) || !cell.is_simple() {
+        if !printable(b) || !(FRESH || cell.is_simple()) {
             break;
         }
         cell.0 = base | u64::from(b);
@@ -491,7 +498,7 @@ pub(crate) fn char_width(c: char) -> Option<usize> {
 ///
 /// One pass: each character is decoded and measured once, and each cell checked and written once.
 #[inline]
-pub(crate) fn fill_chars(
+pub(crate) fn fill_chars<const FRESH: bool>(
     cells: &mut [Cell],
     chars: &mut std::str::Chars<'_>,
     width: usize,
@@ -501,7 +508,7 @@ pub(crate) fn fill_chars(
     let mut written = 0;
     while written + width <= cells.len() {
         if width == 2 {
-            written += fill_ideographs(&mut cells[written..], chars, style);
+            written += fill_ideographs::<FRESH>(&mut cells[written..], chars, style);
             if written + width > cells.len() {
                 break;
             }
@@ -509,8 +516,8 @@ pub(crate) fn fill_chars(
         let rest = chars.clone();
         let Some(c) = chars.next() else { break };
         let fits = char_width(c) == Some(width)
-            && cells[written].is_simple()
-            && (width == 1 || cells[written + 1].is_simple());
+            && (FRESH
+                || cells[written].is_simple() && (width == 1 || cells[written + 1].is_simple()));
         if !fits {
             *chars = rest;
             break;
@@ -532,7 +539,11 @@ pub(crate) fn fill_chars(
 /// Decodes the three-byte sequences straight from the text's bytes: CJK output is mostly these
 /// ideographs, and going through `Chars` and the width table for each one dominated printing it.
 #[inline]
-fn fill_ideographs(cells: &mut [Cell], chars: &mut std::str::Chars<'_>, style: StyleId) -> usize {
+fn fill_ideographs<const FRESH: bool>(
+    cells: &mut [Cell],
+    chars: &mut std::str::Chars<'_>,
+    style: StyleId,
+) -> usize {
     let text = chars.as_str();
     let bytes = text.as_bytes();
     let (mut read, mut written) = (0, 0);
@@ -543,8 +554,7 @@ fn fill_ideographs(cells: &mut [Cell], chars: &mut std::str::Chars<'_>, style: S
             u32::from(lead & 0x0F) << 12 | u32::from(second & 0x3F) << 6 | u32::from(third & 0x3F);
         if lead & 0xF0 != 0xE0
             || !(0x4E00..=0x9FFF).contains(&code)
-            || !cells[written].is_simple()
-            || !cells[written + 1].is_simple()
+            || !(FRESH || cells[written].is_simple() && cells[written + 1].is_simple())
         {
             break;
         }
@@ -725,18 +735,88 @@ mod tests {
             let mut cells = vec![Cell::default(); bytes.len()];
             let mut input = bytes.to_vec();
             input[stop] = b'\n';
-            assert_eq!(fill_ascii(&mut cells, &input, StyleId::default()), stop);
+            assert_eq!(fill_ascii::<false>(&mut cells, &input, StyleId::default()), stop);
             assert!(cells[..stop].iter().zip(bytes).all(|(cell, &b)| cell.c() == char::from(b)));
             assert!(cells[stop..].iter().all(|cell| cell.c() == ' '), "nothing past the stop");
 
             // A wide-character spacer at `stop`.
             let mut cells = vec![Cell::default(); bytes.len()];
             cells[stop].insert_layout(Flags::WIDE_CHAR_SPACER);
-            assert_eq!(fill_ascii(&mut cells, bytes, StyleId::default()), stop);
+            assert_eq!(fill_ascii::<false>(&mut cells, bytes, StyleId::default()), stop);
             assert!(cells[stop].has_layout(Flags::WIDE_CHAR_SPACER), "the stop cell is untouched");
         }
         let mut cells = vec![Cell::default(); 5];
-        assert_eq!(fill_ascii(&mut cells, bytes, StyleId::default()), 5, "bounded by the cells");
+        assert_eq!(
+            fill_ascii::<false>(&mut cells, bytes, StyleId::default()),
+            5,
+            "bounded by the cells"
+        );
+    }
+
+    #[test]
+    fn resetting_while_writing_equals_resetting_then_writing() {
+        let mut table = StyleTable::default();
+        let red = table.intern(Style { attrs: Flags::BOLD, ..Style::default() });
+        let blue = table.intern(Style { attrs: Flags::ITALIC, ..Style::default() });
+        let erase_templates = [Cell::default(), {
+            let mut cell = Cell::default();
+            cell.set_style(blue);
+            cell
+        }];
+        // Old rows: empty, plain text, wide pairs, and a tail in another style.
+        let old_rows = |columns: usize| -> Vec<Row<Cell>> {
+            let mut rows = vec![Row::new(columns)];
+            let mut text = Row::new(columns);
+            text.write_prefix(Column(0), columns - 2, |cells| {
+                fill_ascii::<false>(cells, &[b'x'; 64], red)
+            });
+            rows.push(text);
+            let mut wide = Row::new(columns);
+            let mut chars = "界界界界界界界界".chars();
+            wide.write_prefix(Column(0), columns, |cells| {
+                fill_chars::<false>(cells, &mut chars, 2, red)
+            });
+            rows.push(wide);
+            let mut styled = Row::new(columns);
+            styled.reset(&erase_templates[1]);
+            rows.push(styled);
+            rows
+        };
+        for columns in [3, 8, 13] {
+            for erase in &erase_templates {
+                for old in old_rows(columns) {
+                    for len in 0..=columns {
+                        let bytes = vec![b'a'; len];
+                        let mut expected = old.clone();
+                        expected.reset(erase);
+                        let expected_written = expected.write_prefix(Column(0), len, |cells| {
+                            fill_ascii::<false>(cells, &bytes, red)
+                        });
+                        let mut actual = old.clone();
+                        let written = actual.reset_with_prefix(erase, len, |cells| {
+                            fill_ascii::<true>(cells, &bytes, red)
+                        });
+                        assert_eq!(written, expected_written);
+                        assert_eq!(actual[..], expected[..], "{columns} {len}");
+                        assert_eq!(actual.occupied_len(), expected.occupied_len());
+
+                        let mut chars = "界界界界界界界".chars();
+                        let mut expected = old.clone();
+                        expected.reset(erase);
+                        let expected_written = expected.write_prefix(Column(0), len, |cells| {
+                            fill_chars::<false>(cells, &mut chars, 2, red)
+                        });
+                        let mut chars = "界界界界界界界".chars();
+                        let mut actual = old.clone();
+                        let written = actual.reset_with_prefix(erase, len, |cells| {
+                            fill_chars::<true>(cells, &mut chars, 2, red)
+                        });
+                        assert_eq!(written, expected_written);
+                        assert_eq!(actual[..], expected[..], "wide {columns} {len}");
+                    }
+                }
+            }
+        }
     }
 
     #[test]

@@ -215,6 +215,11 @@ fn printable_runs_match_scalar_at_every_character_boundary() {
         b"\x1b]8;id=batch;https://example.invalid\x1b\\",
         "界e\u{301}界abc\x1b[H".as_bytes(),
         b"\x1b[2;3r\x1b[3;5H",
+        // Rows that scroll back in at the bottom still hold wide characters, combining marks and
+        // another background when a wrapping run recycles them, on both screens.
+        "\x1b[?1049h界界界界\r\n界e\u{301}界\r\na\u{301}界\r\n界\x1b[44m\x1b[K\x1b[99;1H"
+            .as_bytes(),
+        "界界界界\r\n界e\u{301}界\r\na\u{301}界\r\n\x1b[41m\x1b[2J\x1b[m界\x1b[99;1H".as_bytes(),
     ];
     for (columns, lines) in [(2, 1), (5, 4), (7, 3), (80, 24)] {
         for setup in setups {

@@ -121,6 +121,43 @@ impl<T: Default> Row<T> {
         self.extras.clear();
         self.occ = 0;
     }
+
+    /// Reset the row to `template` and let `write` fill a prefix of its first `len` cells, storing
+    /// each cell once: `write` runs over the old cells, and only the cells it did not write are
+    /// reset afterwards. Returns how many cells `write` wrote.
+    ///
+    /// The result equals [`Row::reset`] followed by [`Row::write_prefix`] from column 0, provided
+    /// `write` stops at any cell that would need cleanup before being overwritten (as the
+    /// `fill_*` functions do): it may then write fewer cells, never different ones.
+    #[inline]
+    pub(crate) fn reset_with_prefix<D>(
+        &mut self,
+        template: &T,
+        len: usize,
+        write: impl FnOnce(&mut [T]) -> usize,
+    ) -> usize
+    where
+        T: ResetDiscriminant<D> + GridCell,
+        D: PartialEq,
+    {
+        // Decided before `write` can overwrite the last cell.
+        let row_len = self.inner.len();
+        let end = if self.inner[row_len - 1].discriminant() == template.discriminant() {
+            self.occ
+        } else {
+            row_len
+        };
+        let written = write(&mut self.inner[..len]);
+        debug_assert!(written <= len);
+        if written < end {
+            for item in &mut self.inner[written..end] {
+                item.reset(template);
+            }
+        }
+        self.extras.clear();
+        self.occ = written;
+        written
+    }
 }
 
 impl<T> Row<T> {
