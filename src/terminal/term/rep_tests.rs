@@ -81,8 +81,9 @@ fn repeat_matches_scalar_cells_cursor_history_damage_and_events() {
     ];
     for (columns, lines) in [(2, 1), (5, 4), (80, 24), (120, 40)] {
         for setup in setups {
-            for c in ['a', ' ', '~', 'q', '界', '\u{301}', '\u{7f}'] {
-                for count in [0, 1, 2, 7, 100] {
+            for c in ['a', ' ', '~', 'q', '界', '😀', '\u{301}', '\u{7f}'] {
+                // Counts on both sides of the 256-byte chunks REP prints from.
+                for count in [0, 1, 2, 7, 100, 256, 257, 600] {
                     let mut actual = terminal(columns, lines, setup);
                     let mut expected = terminal(columns, lines, setup);
                     for term in [&mut actual, &mut expected] {

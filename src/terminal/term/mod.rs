@@ -101,27 +101,28 @@ enum DcsChunk<'a> {
 impl DcsScanner {
     /// Split PTY bytes into terminal data and the DCS requests handled here.
     ///
-    /// Ground, body, and discard runs advance with `memchr` instead of one byte at a time. Ordinary
-    /// output never leaves the ground state, so a whole read is forwarded as a single borrowed
-    /// slice rather than being rebuilt byte by byte into a fresh allocation.
+    /// Ground, body, and discard runs advance with `memchr` instead of one byte at a time. In the
+    /// ground state only `ESC P` matters, so everything up to it (other escape sequences
+    /// included) is forwarded as one borrowed slice: splitting at every ESC handed the parser a
+    /// few bytes per call and kept it off its bulk paths.
     fn push<F>(&mut self, mut bytes: &[u8], emit: &mut F)
     where
         F: FnMut(DcsChunk<'_>),
     {
         while !bytes.is_empty() {
             match self.state {
-                DcsState::Ground => match memchr(0x1b, bytes) {
-                    Some(index) => {
-                        if index > 0 {
-                            emit(DcsChunk::Bytes(&bytes[..index]));
-                        }
-                        self.state = DcsState::Escape;
-                        bytes = &bytes[index + 1..];
-                    },
-                    None => {
-                        emit(DcsChunk::Bytes(bytes));
-                        return;
-                    },
+                DcsState::Ground => {
+                    // A DCS starts at `ESC P`; a trailing ESC may start one in the next read.
+                    let (end, next) = match memchr::memmem::find(bytes, b"\x1bP") {
+                        Some(index) => (index, DcsState::Escape),
+                        None if bytes.last() == Some(&0x1b) => (bytes.len() - 1, DcsState::Escape),
+                        None => (bytes.len(), DcsState::Ground),
+                    };
+                    if end > 0 {
+                        emit(DcsChunk::Bytes(&bytes[..end]));
+                    }
+                    self.state = next;
+                    bytes = bytes.get(end + 1..).unwrap_or_default();
                 },
                 DcsState::Escape => {
                     let byte = bytes[0];
@@ -550,6 +551,10 @@ pub struct Term<T> {
     /// Grid scroll accumulated since the last delivery. See [`PendingGridScroll`].
     pending_grid_scroll: Option<PendingGridScroll>,
 
+    /// The style an SGR sequence is building, applied to the template when it ends; `None`
+    /// outside one. See [`Term::update_template_style`].
+    pending_style: Option<Style>,
+
     /// Kitty graphics images and placements of both screens.
     graphics: KittyGraphics,
 }
@@ -821,6 +826,7 @@ impl<T> Term<T> {
             mode: Default::default(),
             dcs_scanner: Default::default(),
             pending_grid_scroll: None,
+            pending_style: None,
             graphics,
         }
     }
@@ -1356,8 +1362,15 @@ impl<T> Term<T> {
     }
 
     /// Change the style new output is written with.
+    ///
+    /// Inside an SGR sequence the change goes to the sequence's working style, which
+    /// [`Handler::finish_attributes`] resolves once.
     #[inline]
     fn update_template_style(&mut self, update: impl FnOnce(&mut Style)) {
+        if let Some(style) = &mut self.pending_style {
+            update(style);
+            return;
+        }
         let previous = self.template_style();
         let mut style = previous.clone();
         update(&mut style);
@@ -1988,102 +2001,6 @@ impl<T> Term<T> {
 }
 
 impl<T: EventListener> Term<T> {
-    /// Write simple row spans, returning exceptional cells to scalar input.
-    // A fixed width for ASCII REP keeps the shared row fill as cheap as a narrow-cell loop.
-    fn write_run<I, const ASCII_REPEAT: bool>(
-        &mut self,
-        mut chars: I,
-        repeated_width: Option<usize>,
-    ) where
-        I: Iterator<Item = char> + Clone,
-    {
-        if self.grid.cursor.charsets[self.active_charset] != StandardCharset::Ascii
-            || self.mode.contains(TermMode::INSERT)
-            || !self.mode.contains(TermMode::LINE_WRAP)
-        {
-            for c in chars {
-                self.input(c);
-            }
-            return;
-        }
-        while let Some(c) = chars.clone().next() {
-            let width = if ASCII_REPEAT {
-                Some(1)
-            } else {
-                repeated_width.or_else(|| {
-                    if c.is_ascii() && !c.is_ascii_control() { Some(1) } else { c.width() }
-                })
-            };
-            if width == Some(0) {
-                let count = chars.clone().take_while(|c| c.width() == Some(0)).count();
-                let mut point = self.grid.cursor.point;
-                if !self.grid.cursor.input_needs_wrap {
-                    point.column.0 = point.column.saturating_sub(1);
-                }
-                if self.grid[point].layout().contains(Flags::WIDE_CHAR_SPACER) {
-                    point.column.0 = point.column.saturating_sub(1);
-                }
-                self.push_zerowidths(point, chars.by_ref().take(count));
-                continue;
-            }
-            let width = match width {
-                Some(width @ (1 | 2)) if !self.grid.cursor.input_needs_wrap => width,
-                _ => {
-                    chars.next();
-                    self.input(c);
-                    continue;
-                },
-            };
-            let point = self.grid.cursor.point;
-            let columns = self.columns();
-            let available = columns - point.column.0;
-            // REP already knows every character's width and its iterator's exact length.
-            // Walking that iterator to rediscover the run costs as much as filling it.
-            let count = if ASCII_REPEAT || repeated_width.is_some() {
-                chars.size_hint().0.min(available / width)
-            } else {
-                chars
-                    .clone()
-                    .take(available / width)
-                    .take_while(|c| {
-                        if c.is_ascii() && !c.is_ascii_control() {
-                            width == 1
-                        } else {
-                            c.width() == Some(width)
-                        }
-                    })
-                    .count()
-            };
-            let simple = self.grid[point.line][point.column..point.column + count * width]
-                .iter()
-                .take_while(|cell| cell.is_simple())
-                .count();
-            let count = count.min(simple / width);
-            if count == 0 {
-                chars.next();
-                self.input(c);
-                continue;
-            }
-            let end = point.column + count * width;
-            let style = self.grid.cursor.template.style();
-            let cells = &mut self.grid[point.line][point.column..end];
-            if width == 1 {
-                for (cell, c) in cells.iter_mut().zip(chars.by_ref().take(count)) {
-                    cell.write(c, style, Flags::empty());
-                }
-            } else {
-                for (cells, c) in
-                    cells.as_chunks_mut::<2>().0.iter_mut().zip(chars.by_ref().take(count))
-                {
-                    cells[0].write(c, style, Flags::WIDE_CHAR);
-                    cells[1].write(' ', style, Flags::WIDE_CHAR_SPACER);
-                }
-            }
-            self.grid.cursor.input_needs_wrap = end.0 == columns;
-            self.grid.cursor.point.column = Column(end.0.min(columns - 1));
-        }
-    }
-
     /// Write decoded text row by row: each character is decoded and measured once, and each row
     /// segment of same-width characters is filled in one pass.
     ///
@@ -2264,10 +2181,32 @@ impl<T: EventListener> Handler for Term<T> {
     }
 
     fn repeat_char(&mut self, c: char, count: usize) {
+        // Repeating a character is printing it `count` times, so it takes the run writers, from
+        // a buffer of the character repeated.
+        const CHUNK: usize = 256;
         if (' '..='~').contains(&c) {
-            self.write_run::<_, true>(std::iter::repeat_n(c, count), Some(1));
-        } else {
-            self.write_run::<_, false>(std::iter::repeat_n(c, count), c.width());
+            let chunk = [c as u8; CHUNK];
+            let mut left = count;
+            while left > 0 {
+                let len = left.min(CHUNK);
+                self.write_ascii_run(&chunk[..len]);
+                left -= len;
+            }
+            return;
+        }
+        let len = c.len_utf8();
+        let per_chunk = CHUNK / len;
+        let mut buffer = [0; CHUNK];
+        for slot in buffer.chunks_exact_mut(len).take(count.min(per_chunk)) {
+            c.encode_utf8(slot);
+        }
+        let mut left = count;
+        while left > 0 {
+            let chars = left.min(per_chunk);
+            // The buffer holds whole encodings of `c`, so any prefix of them is valid UTF-8.
+            let text = str::from_utf8(&buffer[..chars * len]).unwrap_or_default();
+            self.input_str(text);
+            left -= chars;
         }
     }
 
@@ -3116,6 +3055,18 @@ impl<T: EventListener> Handler for Term<T> {
         trace!("Setting hyperlink: {hyperlink:?}");
         let hyperlink = hyperlink.map(Into::into);
         self.update_template_style(|style| style.hyperlink = hyperlink);
+    }
+
+    #[inline]
+    fn start_attributes(&mut self) {
+        self.pending_style = Some(self.template_style().clone());
+    }
+
+    #[inline]
+    fn finish_attributes(&mut self) {
+        if let Some(style) = self.pending_style.take() {
+            self.update_template_style(|template| *template = style);
+        }
     }
 
     /// Set a terminal attribute.
@@ -5590,6 +5541,43 @@ mod tests {
         parser.advance(&mut term, b"\x1b[=c");
 
         assert_eq!(*replies.lock().unwrap(), vec!["\x1bP!|00000000\x1b\\".to_owned()]);
+    }
+
+    #[test]
+    fn one_sgr_sequence_equals_one_sequence_per_attribute() {
+        // Each case is a list of attribute groups; one sequence carries them all, the other
+        // sends each group as its own sequence, which applies attributes one at a time.
+        let cases: &[&[&str]] = &[
+            &["1", "2", "3", "4:3", "31"],
+            &["38:5:24", "48:2:125:136:147"],
+            &["58;5;44", "2"],
+            &["44", "0", "1"],
+            &["1", "22", "39", "49"],
+            &["7", "27", "48;5;200", "0"],
+        ];
+        let prefixes: &[&str] = &["", "\x1b[1;41m", "\x1b]8;id=x;https://example.invalid\x1b\\"];
+        for prefix in prefixes {
+            for groups in cases {
+                let run = |input: String| {
+                    let size = TermSize::new(20, 4);
+                    let mut term = Term::new(Config::default(), &size, VoidListener);
+                    let mut parser: ansi::Processor = ansi::Processor::new();
+                    parser.advance(&mut term, format!("{prefix}{input}x\x1b[K").as_bytes());
+                    let erase = term.grid.cursor.erase.style();
+                    let written = term.grid[Line(0)][Column(0)].style();
+                    let cleared = term.grid[Line(0)][Column(5)].style();
+                    (
+                        term.template_style().clone(),
+                        term.styles.get(erase).clone(),
+                        term.styles.get(written).clone(),
+                        term.styles.get(cleared).clone(),
+                    )
+                };
+                let together = run(format!("\x1b[{}m", groups.join(";")));
+                let apart = run(groups.iter().map(|group| format!("\x1b[{group}m")).collect());
+                assert_eq!(together, apart, "{prefix:?} {groups:?}");
+            }
+        }
     }
 
     #[test]
