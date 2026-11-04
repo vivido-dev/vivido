@@ -918,6 +918,19 @@ impl<T> Term<T> {
         let status = match request {
             b"m" => sgr_status(self.template_style()),
             b"r" => format!("{};{}r", self.scroll_region.start.0 + 1, self.scroll_region.end.0),
+            b" q" => {
+                // Vim probes DECSCUSR during startup. Report the actual style rather than an
+                // unsupported-status reply, which Vim can treat as editing commands.
+                let style = self.cursor_style();
+                // DECSCUSR uses even codes for steady cursors and the preceding odd code for blink.
+                let steady = match style.shape {
+                    // Hollow and hidden are host styles without a DECSCUSR encoding.
+                    CursorShape::Block | CursorShape::HollowBlock | CursorShape::Hidden => 2,
+                    CursorShape::Underline => 4,
+                    CursorShape::Beam => 6,
+                };
+                format!("{} q", steady - u8::from(style.blinking))
+            },
             b"\"p" => "61;1\"p".to_owned(),
             b"\"q" => "0\"q".to_owned(),
             _ => {
@@ -5601,6 +5614,49 @@ mod tests {
                 "\x1bP0$r\x1b\\".to_owned(),
             ]
         );
+    }
+
+    #[test]
+    fn vim_cursor_style_probe_reports_current_style_at_every_read_boundary() {
+        let styles = [
+            (CursorShape::Block, 2),
+            (CursorShape::Underline, 4),
+            (CursorShape::Beam, 6),
+            (CursorShape::HollowBlock, 2),
+            (CursorShape::Hidden, 2),
+        ];
+        for (shape, steady) in styles {
+            for blinking in [false, true] {
+                let config = Config {
+                    default_cursor_style: CursorStyle { shape, blinking },
+                    ..Config::default()
+                };
+                // Include Vim's following blink-mode query to pin reply order as well.
+                let input = b"\x1bP$q q\x1b\\\x1b[?12$p";
+                for split in 0..=input.len() {
+                    let listener = PtyWriteListener::default();
+                    let replies = listener.0.clone();
+                    let mut term = Term::new(config.clone(), &TermSize::new(80, 24), listener);
+                    let mut parser = ansi::Processor::new();
+                    term.advance(&mut parser, &input[..split]);
+                    term.advance(&mut parser, &input[split..]);
+                    let code = steady - u8::from(blinking);
+                    let mode = if blinking { 1 } else { 2 };
+                    assert_eq!(
+                        *replies.lock().unwrap(),
+                        [format!("\x1bP1$r{code} q\x1b\\"), format!("\x1b[?12;{mode}$y")],
+                        "{shape:?} blinking={blinking} split={split}"
+                    );
+                    // Explicit DECSCUSR and DECSET/DECRST 12 must override the default.
+                    replies.lock().unwrap().clear();
+                    term.advance(&mut parser, b"\x1b[5 q\x1b[?12l\x1bP$q q\x1b\\");
+                    assert_eq!(*replies.lock().unwrap(), ["\x1bP1$r6 q\x1b\\"]);
+                    replies.lock().unwrap().clear();
+                    term.advance(&mut parser, b"\x1b[0 q\x1bP$q q\x1b\\");
+                    assert_eq!(*replies.lock().unwrap(), [format!("\x1bP1$r{code} q\x1b\\")]);
+                }
+            }
+        }
     }
 
     #[test]

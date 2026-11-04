@@ -229,7 +229,7 @@ not fit at end-of-line get a leading spacer cell when DECAWM is on.
 
 | Name | Sequence | Status | Notes |
 |---|---|---|---|
-| DECRQSS | `DCS $ q … ST` | ✅ | Intercepts before `vte`. Reports `m` (full SGR status), `r` (DECSTBM), `"p` (`61;1`), `"q` (`0`); anything else gets the error reply `DCS 0 $ r ST`. Bodies bounded to 4 KiB, then resynchronized. |
+| DECRQSS | `DCS $ q … ST` | ✅ | Intercepts before `vte`. Reports `m` (full SGR status), `r` (DECSTBM), `SP q` (current DECSCUSR shape and blink, codes 1–6), `"p` (`61;1`), `"q` (`0`); anything else gets the error reply `DCS 0 $ r ST`. Host-only hollow/hidden cursor shapes report block. Bodies bounded to 4 KiB, then resynchronized. |
 | XTGETTCAP | `DCS + q … ST` | ✅ | Reports `TN=xterm-vivido`, `Co=256`, `RGB=8`, `Tc`. |
 | XTSETTCAP | `DCS + p … ST` | ⚠️ | Parsed and hex-validated, then ignored — applications cannot change the identity. |
 | Sixel | `DCS … q … ST` | ⚠️ | Consumed cleanly (never rendered as garbage); no decoder. |
