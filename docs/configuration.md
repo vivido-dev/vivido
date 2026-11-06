@@ -211,6 +211,32 @@ style = "Bold"
 Colors are hex strings such as `"#1e1e2e"`. Cursor, selection, search, and hint fields also accept
 the special values `"CellForeground"` and `"CellBackground"` to mirror the cell under them.
 
+### Light theme
+
+The bundled [Daylight theme](themes/daylight.toml) uses a warm off-white background, dark text,
+readable ANSI colors, and matching selection, search, hint, and footer colors. It also requests
+light window decorations.
+
+Preview it from the Vivido repository directory:
+
+```sh
+vivido --config-file docs/themes/daylight.toml
+```
+
+To use it with your existing settings, copy `docs/themes/daylight.toml` to
+`~/.config/vivido/themes/daylight.toml` (create the `themes` directory if needed). Add it to the
+`import` array in your `vivido.toml`'s existing `[general]` section, or create that section:
+
+```toml
+[general]
+import = ["themes/daylight.toml"]
+```
+
+Keep your other imports, placing Daylight after other themes. Colors and window settings in
+`vivido.toml` override the imported theme, so remove any local overrides you want Daylight to
+control. Imports are relative to `vivido.toml`, including on Windows. With live reload enabled,
+saving the config applies the theme to running windows.
+
 ### Primary
 
 ```toml

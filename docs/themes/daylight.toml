@@ -1,0 +1,67 @@
+# Daylight — a light Vivido theme with a warm paper background and dark ink.
+# Preview: vivido --config-file /path/to/daylight.toml
+# To keep your other settings, import this file from [general] in vivido.toml.
+# See ../configuration.md#light-theme for installation instructions.
+
+[window]
+decorations_theme_variant = "Light"
+
+[colors.primary]
+background = "#faf8f5"
+foreground = "#26323d"
+bright_foreground = "#18232e"
+dim_foreground = "#68717b"
+
+[colors.cursor]
+text = "CellBackground"
+cursor = "CellForeground"
+
+[colors.selection]
+text = "#18232e"
+background = "#cddff2"
+
+# Keep ANSI black and white usable as explicit backgrounds, too.
+[colors.normal]
+black = "#26323d"
+red = "#b42335"
+green = "#246b3a"
+yellow = "#8a5a00"
+blue = "#2457a7"
+magenta = "#8142a0"
+cyan = "#166b78"
+white = "#dedbd6"
+
+# Bright chromatic colors stay dark enough to read on the paper background.
+[colors.bright]
+black = "#5b6570"
+red = "#c12b3d"
+green = "#287a42"
+yellow = "#986600"
+blue = "#2d63ba"
+magenta = "#9250ad"
+cyan = "#197b89"
+white = "#ffffff"
+
+[colors.search.matches]
+foreground = "#26323d"
+background = "#f1dfac"
+
+[colors.search.focused_match]
+foreground = "#18232e"
+background = "#e8b86d"
+
+[colors.hints.start]
+foreground = "#faf8f5"
+background = "#2457a7"
+
+[colors.hints.end]
+foreground = "#18232e"
+background = "#cddff2"
+
+[colors.line_indicator]
+foreground = "#26323d"
+background = "#e9e5df"
+
+[colors.footer_bar]
+foreground = "#26323d"
+background = "#e9e5df"

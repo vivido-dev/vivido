@@ -77,6 +77,9 @@ cargo install vivido
 
 See [INSTALL.md](INSTALL.md). If you just want the highlight tour, see [Features](docs/features.md).
 
+For a light appearance, try the bundled [Daylight theme](docs/configuration.md#light-theme).
+The [configuration guide](docs/configuration.md) covers colors, fonts, and other settings.
+
 **Give your next coding agent a terminal it can actually use.** Point it at `vivido msg` and let it
 work.
 
