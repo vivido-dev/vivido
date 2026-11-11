@@ -134,9 +134,11 @@ impl AccessibilitySnapshot {
     }
 
     pub(crate) fn new<T>(term: &Term<T>, size: SizeInfo, title: &str) -> Self {
+        Self::capture(term, size, title, term.grid().topmost_line(), term.grid().bottommost_line())
+    }
+
+    fn capture<T>(term: &Term<T>, size: SizeInfo, title: &str, top: Line, bottom: Line) -> Self {
         let grid = term.grid();
-        let top = grid.topmost_line();
-        let bottom = grid.bottommost_line();
         let display_offset = i32::try_from(grid.display_offset()).unwrap_or(i32::MAX);
         let visible_top = Line(-display_offset);
         let visible_bottom = cmp::min(
@@ -150,7 +152,7 @@ impl AccessibilitySnapshot {
         let selection = term.selection.as_ref().and_then(|selection| selection.to_range(term));
 
         let mut text = String::new();
-        let mut lines = Vec::with_capacity(grid.total_lines());
+        let mut lines = Vec::with_capacity((bottom.0 - top.0 + 1) as usize);
         let mut scalar_offset = 0usize;
         let mut utf16_offset = 0usize;
 
@@ -300,6 +302,153 @@ impl AccessibilitySnapshot {
         let end = utf16_to_byte(&self.text, range.end);
         self.text.get(start..end).unwrap_or_default().to_owned()
     }
+}
+
+/// Captures a bounded explicit automation range using the native visible-text rules.
+pub(crate) fn visible_text<T>(
+    term: &Term<T>,
+    size: SizeInfo,
+    start: usize,
+    count: usize,
+) -> Result<Vec<String>, vivid_sdk::accessible_text::InvalidDocument> {
+    use vivid_sdk::accessible_text::InvalidDocument;
+    // Bound both scanning and transient character geometry before making a snapshot.
+    const MAX_ROWS: usize = 32;
+    const MAX_CELLS: usize = 4096;
+    const MAX_BYTES: usize = 16 * 1024;
+    let grid = term.grid();
+    let end = start
+        .checked_add(count)
+        .filter(|end| *end <= grid.screen_lines())
+        .ok_or(InvalidDocument)?;
+    if count == 0
+        || count > MAX_ROWS
+        || grid.columns() == 0
+        || grid.columns().checked_mul(count).is_none_or(|n| n > MAX_CELLS)
+        || ![size.width(), size.height(), size.cell_height()]
+            .iter()
+            .all(|n| n.is_finite() && *n > 0.)
+    {
+        return Err(InvalidDocument);
+    }
+    let offset = i32::try_from(grid.display_offset()).map_err(|_| InvalidDocument)?;
+    let first = Line(-offset) + i32::try_from(start).map_err(|_| InvalidDocument)?;
+    let last = Line(-offset) + i32::try_from(end - 1).map_err(|_| InvalidDocument)?;
+    if first < grid.topmost_line() || last > grid.bottommost_line() {
+        return Err(InvalidDocument);
+    }
+    let mut bytes = count;
+    for raw_line in first.0..=last.0 {
+        let row = &grid[Line(raw_line)];
+        for column in 0..grid.columns() {
+            let cell = &row[Column(column)];
+            let hidden = term.style(cell).attrs.contains(Flags::HIDDEN);
+            bytes = bytes
+                .checked_add(if hidden { 1 } else { cell.c().len_utf8() })
+                .filter(|n| *n <= MAX_BYTES)
+                .ok_or(InvalidDocument)?;
+            for mark in row.zerowidth(cell).unwrap_or_default() {
+                bytes = bytes
+                    .checked_add(if hidden { 1 } else { mark.len_utf8() })
+                    .filter(|n| *n <= MAX_BYTES)
+                    .ok_or(InvalidDocument)?;
+            }
+        }
+    }
+    let snapshot = AccessibilitySnapshot::capture(term, size, "", first, last);
+    Ok(snapshot.lines.iter().map(|line| snapshot.text[line.bytes.clone()].to_owned()).collect())
+}
+
+/// Captures only visible rows after validating aggregate allocation bounds.
+pub(crate) fn visible_document<T>(
+    term: &Term<T>,
+    size: SizeInfo,
+    title: &str,
+    focused: bool,
+) -> Result<vivid_sdk::accessible_text::Document, vivid_sdk::accessible_text::InvalidDocument> {
+    use vivid_sdk::accessible_text::{
+        Builder, InvalidDocument, MAX_CHARACTERS, MAX_LABEL_BYTES, MAX_LINES, MAX_TEXT_BYTES,
+        Selection,
+    };
+    let grid = term.grid();
+    let rows = grid.screen_lines();
+    let columns = grid.columns();
+    if rows == 0
+        || rows > MAX_LINES
+        || title.len() > MAX_LABEL_BYTES
+        || rows
+            .checked_mul(columns)
+            .and_then(|n| n.checked_add(rows))
+            .is_none_or(|n| n > MAX_CHARACTERS)
+        || ![size.width(), size.height(), size.cell_height()]
+            .iter()
+            .all(|n| n.is_finite() && *n > 0.)
+    {
+        return Err(InvalidDocument);
+    }
+    let offset = i32::try_from(grid.display_offset()).map_err(|_| InvalidDocument)?;
+    let first = cmp::max(grid.topmost_line(), Line(-offset));
+    let last = cmp::min(
+        grid.bottommost_line(),
+        first + i32::try_from(rows).map_err(|_| InvalidDocument)? - 1,
+    );
+    let mut characters = rows;
+    let mut bytes = rows;
+    // Validate before the shared native capture allocates row/character storage.
+    for raw_line in first.0..=last.0 {
+        let row = &grid[Line(raw_line)];
+        for column in 0..columns {
+            let cell = &row[Column(column)];
+            let marks = row.zerowidth(cell).unwrap_or_default();
+            characters = characters
+                .checked_add(1)
+                .and_then(|n| n.checked_add(marks.len()))
+                .filter(|n| *n <= MAX_CHARACTERS)
+                .ok_or(InvalidDocument)?;
+            let hidden = term.style(cell).attrs.contains(Flags::HIDDEN);
+            bytes = bytes
+                .checked_add(if hidden { 1 } else { cell.c().len_utf8() })
+                .filter(|n| *n <= MAX_TEXT_BYTES)
+                .ok_or(InvalidDocument)?;
+            for mark in marks {
+                bytes = bytes
+                    .checked_add(if hidden { 1 } else { mark.len_utf8() })
+                    .filter(|n| *n <= MAX_TEXT_BYTES)
+                    .ok_or(InvalidDocument)?;
+            }
+        }
+    }
+    let snapshot = AccessibilitySnapshot::capture(term, size, title, first, last);
+    let mut builder = Builder::new(title)?;
+    for (index, line) in snapshot.lines.iter().enumerate() {
+        let y = (line.y / snapshot.height).clamp(0., 1.);
+        let height = (snapshot.cell_height / snapshot.height).min(1. - y);
+        builder.push_line(
+            index as u64,
+            [0., y, 1., height],
+            line.characters.iter().map(|character| {
+                let value = snapshot.text
+                    [character.bytes.start as usize..character.bytes.end as usize]
+                    .chars()
+                    .next()
+                    .unwrap_or(' ');
+                let x = character.x / snapshot.width;
+                let width = (character.width / snapshot.width).min(1. - x);
+                (value, x, width)
+            }),
+        )?;
+    }
+    let selected = snapshot.selection.as_ref().map(|range| range.scalar.clone()).or_else(|| {
+        let cursor = grid.cursor.point.line;
+        (cursor >= first && cursor <= last).then(|| snapshot.cursor.scalar.clone())
+    });
+    let selection = selected.and_then(|range| {
+        Some(Selection {
+            anchor: builder.position_at(range.start)?,
+            focus: builder.position_at(range.end)?,
+        })
+    });
+    builder.finish(selection, focused)
 }
 
 fn selection_row_end(selection: SelectionRange, line: Line, columns: usize) -> usize {
@@ -485,6 +634,94 @@ mod tests {
         assert!(!snapshot.text.contains('x'));
         assert!(!snapshot.lines[0].hard_break);
         assert!(snapshot.lines[1].hard_break);
+    }
+
+    #[test]
+    fn hosted_document_keeps_wide_combining_selection_and_hidden_cells_bounded() {
+        let mut term = term(4, 1);
+        let point = Point::new(Line(0), Column(0));
+        term.grid_mut()[point].set_c('🦇');
+        term.grid_mut()[point].insert_layout(Flags::WIDE_CHAR);
+        term.push_zerowidths(point, std::iter::once('\u{301}'));
+        term.grid_mut()[Point::new(Line(0), Column(1))].insert_layout(Flags::WIDE_CHAR_SPACER);
+        let hidden = term.styles_mut().intern(Style { attrs: Flags::HIDDEN, ..Style::default() });
+        term.grid_mut()[Point::new(Line(0), Column(2))].set_c('x');
+        term.grid_mut()[Point::new(Line(0), Column(2))].set_style(hidden);
+        let mut selection = Selection::new(SelectionType::Simple, point, Side::Left);
+        selection.update(Point::new(Line(0), Column(2)), Side::Right);
+        term.selection = Some(selection);
+        let doc = visible_document(&term, size(4, 1), "terminal", true).unwrap();
+        assert_eq!(doc.lines()[0].text(), "🦇\u{301} \n");
+        assert_eq!(doc.lines()[0].character_lengths(), &[4, 2, 1, 1]);
+        assert_eq!(doc.lines()[0].character_widths(), &[0.5, 0., 0.25, 0.]);
+        assert_eq!(doc.selection().unwrap().focus.character, 3);
+        assert!(doc.is_focused());
+        assert!(!format!("{doc:?}").contains("terminal"));
+    }
+
+    #[test]
+    fn hosted_visible_text_ranges_preserve_unicode_masking_and_bounded_work() {
+        let mut terminal = term(4, 2);
+        let point = Point::new(Line(0), Column(0));
+        terminal.grid_mut()[point].set_c('🦇');
+        terminal.grid_mut()[point].insert_layout(Flags::WIDE_CHAR);
+        terminal.push_zerowidths(point, std::iter::once('\u{301}'));
+        terminal.grid_mut()[Point::new(Line(0), Column(1))].insert_layout(Flags::WIDE_CHAR_SPACER);
+        let hidden =
+            terminal.styles_mut().intern(Style { attrs: Flags::HIDDEN, ..Style::default() });
+        terminal.grid_mut()[Point::new(Line(0), Column(2))].set_c('x');
+        terminal.grid_mut()[Point::new(Line(0), Column(2))].set_style(hidden);
+        terminal.grid_mut()[Point::new(Line(1), Column(0))].set_c('b');
+        assert_eq!(visible_text(&terminal, size(4, 2), 0, 1).unwrap(), ["🦇\u{301} \n"]);
+        assert_eq!(visible_text(&terminal, size(4, 2), 1, 1).unwrap(), ["b\n"]);
+        for (start, count) in [(0, 0), (usize::MAX, 2), (1, 2), (2, 1)] {
+            assert!(visible_text(&terminal, size(4, 2), start, count).is_err());
+        }
+        let excessive = term(129, 32);
+        assert!(visible_text(&excessive, size(129, 32), 0, 32).is_err());
+    }
+
+    #[test]
+    fn hosted_document_copies_the_viewport_instead_of_retained_history() {
+        let mut term = term(4, 2);
+        for (line, text) in ["past", "live"].into_iter().enumerate() {
+            for (column, c) in text.chars().enumerate() {
+                term.grid_mut()[Point::new(Line(line as i32), Column(column))].set_c(c);
+            }
+        }
+        term.grid_mut().scroll_up(&(Line(0)..Line(2)), 1);
+        let current = visible_document(&term, size(4, 2), "terminal", false).unwrap();
+        assert_eq!(current.lines().len(), 2);
+        assert!(!current.lines().iter().any(|line| line.text().contains("past")));
+        term.grid_mut().scroll_display(Scroll::Top);
+        let history = visible_document(&term, size(4, 2), "terminal", false).unwrap();
+        assert_eq!(history.lines().len(), 2);
+        assert!(history.lines()[0].text().contains("past"));
+        assert!(!history.is_focused());
+    }
+
+    #[test]
+    fn hosted_document_rejects_excess_viewports_and_labels_before_capture() {
+        let oversized = term(2, vivid_sdk::accessible_text::MAX_LINES + 1);
+        assert!(
+            visible_document(
+                &oversized,
+                size(2, vivid_sdk::accessible_text::MAX_LINES + 1),
+                "terminal",
+                false
+            )
+            .is_err()
+        );
+        let term = term(4, 1);
+        assert!(
+            visible_document(
+                &term,
+                size(4, 1),
+                &"x".repeat(vivid_sdk::accessible_text::MAX_LABEL_BYTES + 1),
+                false
+            )
+            .is_err()
+        );
     }
 
     #[test]

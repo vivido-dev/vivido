@@ -873,6 +873,38 @@ impl VectorWorker {
         }
     }
 
+    // Compilation and quota-token retention share one owner-local namespace.
+    fn compile_canvas(
+        &mut self,
+        canvas: &vivid_protocol::vector::Canvas,
+        layouts: &BTreeMap<u64, Arc<crate::display::vector::text_layout::MeasuredLayout>>,
+    ) -> Result<CompiledScene, &'static str> {
+        use vivid_protocol::vector::{Brush, Command};
+        let mut compiled = crate::display::vector::compile_with_layouts(
+            canvas,
+            &mut self.text,
+            &self.images,
+            layouts,
+        )
+        .map_err(|error| error.reason())?;
+        let ids: HashSet<_> = canvas
+            .commands()
+            .iter()
+            .filter_map(|command| match command {
+                Command::Image { asset, .. }
+                | Command::Fill(_, Brush::Image { asset, .. })
+                | Command::Stroke(_, Brush::Image { asset, .. }, _)
+                | Command::StyledStroke(_, Brush::Image { asset, .. }, _) => Some(*asset),
+                _ => None,
+            })
+            .collect();
+        for id in ids {
+            let token = self.tokens.get(&id).cloned().ok_or("retained image is absent")?;
+            compiled.retain_resource(token).map_err(|error| error.reason())?;
+        }
+        Ok(compiled)
+    }
+
     pub fn process(
         &mut self,
         shared: &ServiceShared,
@@ -995,28 +1027,7 @@ impl VectorWorker {
                 }
                 layouts
             };
-            let mut compiled = crate::display::vector::compile_with_layouts(
-                &frame.canvas,
-                &mut self.text,
-                &self.images,
-                &layouts,
-            )
-            .map_err(|e| e.reason())?;
-            let ids: HashSet<_> = frame
-                .canvas
-                .commands()
-                .iter()
-                .filter_map(|c| match c {
-                    vivid_protocol::vector::Command::Image { asset, .. } => Some(*asset),
-                    _ => None,
-                })
-                .collect();
-            compiled.retained.extend(
-                ids.iter()
-                    .map(|id| self.tokens.get(id).cloned().ok_or("retained image is absent"))
-                    .collect::<Result<Vec<_>, _>>()?,
-            );
-            let compiled = Arc::new(compiled);
+            let compiled = Arc::new(self.compile_canvas(&frame.canvas, &layouts)?);
             let mut host = lock(&shared.overlays);
             if !host.surfaces.contains(&identity.surface()) {
                 return Err("vector surface has no overlay window");
@@ -1848,7 +1859,8 @@ mod tests {
             let mut compiled =
                 compile(&vivid_protocol::vector::Canvas::new(), &mut text, &BTreeMap::new())
                     .unwrap();
-            compiled.retained.push(token); // Namespace release leaves only the scene's reference.
+            // Namespace release leaves only the scene's charged reference.
+            compiled.retain_resource(token).unwrap();
             let submission = Submission {
                 address: WindowAddress { context_id: 1, surface_id: 1, generation: 1 },
                 track_id: 2,
@@ -1942,7 +1954,7 @@ mod tests {
             )
             .unwrap();
         let compiled = compile(&canvas, &mut text, &BTreeMap::new()).unwrap();
-        assert!(compiled.retained.is_empty());
+        assert_eq!(compiled.retained_resource_count(), 0);
         // Hit geometry is unchanged by paint commands: no regions were declared, so the whole
         // window rectangle remains the input area.
         assert_eq!(
@@ -1976,6 +1988,62 @@ mod tests {
             })
             .unwrap();
         compile(&inset_canvas, &mut text, &BTreeMap::new()).unwrap();
+    }
+
+    #[test]
+    fn image_brushes_keep_each_owners_charge_after_namespace_release() {
+        use vivid_protocol::vector::{Brush, Canvas, Extend, Path, StrokeStyle};
+        let mut host = Host::default();
+        let mut scenes = Vec::new();
+        for serial in 1..=2 {
+            let owner = SessionIdentity::new(PresenterInstanceId([1; 16]), serial).unwrap();
+            let track = owner.context(1).unwrap().surface(1).unwrap().track(1).unwrap();
+            let mut worker = VectorWorker::new(Default::default());
+            let token = Arc::new(());
+            let charge = Arc::downgrade(&token);
+            host.assets.insert((track, ChannelGeneration::ONE, 1), (charge.clone(), 16));
+            worker.tokens.insert(1, token);
+            worker.images.insert(
+                1,
+                ImageData {
+                    data: Blob::from(vec![255; 16]),
+                    width: 2,
+                    height: 2,
+                    format: ImageFormat::Rgba8,
+                    alpha_type: ImageAlphaType::Alpha,
+                },
+            );
+            let brush = Brush::Image { asset: 1, transform: None, extend: Extend::Repeat };
+            let path = Path::rectangle(Rect::new(0., 0., 10., 10.).unwrap()).unwrap();
+            let mut canvas = Canvas::new();
+            // There is no direct Image command: every reference comes from a brush.
+            canvas.fill(path.clone(), brush.clone()).unwrap();
+            canvas.stroke(path.clone(), brush.clone(), 1.).unwrap();
+            canvas.stroke_styled(path, brush, StrokeStyle::default()).unwrap();
+            let compiled = worker.compile_canvas(&canvas, &BTreeMap::new()).unwrap();
+            assert_eq!(compiled.retained_resource_count(), 1);
+            worker.tokens.clear();
+            worker.images.clear();
+            assert!(charge.upgrade().is_some());
+            scenes.push((compiled, charge));
+        }
+        host.assets.retain(|_, (token, _)| token.strong_count() != 0);
+        assert_eq!(host.assets.len(), 2);
+        let (first, first_charge) = scenes.remove(0);
+        drop(first);
+        assert!(first_charge.upgrade().is_none());
+        host.assets.retain(|_, (token, _)| token.strong_count() != 0);
+        assert_eq!(host.assets.len(), 1);
+        assert_eq!(
+            host.assets.keys().next().unwrap().0.surface().context().session().session_id(),
+            2
+        );
+        assert!(scenes[0].1.upgrade().is_some());
+        let (second, second_charge) = scenes.remove(0);
+        drop(second);
+        assert!(second_charge.upgrade().is_none());
+        host.assets.retain(|_, (token, _)| token.strong_count() != 0);
+        assert!(host.assets.is_empty());
     }
 
     #[test]

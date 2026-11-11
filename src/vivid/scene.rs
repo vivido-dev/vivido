@@ -1,11 +1,12 @@
 //! Owner-scoped Vivid 1.5 surface, track, and retained-scene state.
 
+// Rust guideline compliant 2026-10-07
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::ops::Deref;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, Weak};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
+#[cfg(test)]
 use vivid_protocol::cbor::Value;
 use vivid_protocol::identity::{
     AnchorIdentity, ContextIdentity, NodeIdentity, SessionIdentity, SurfaceIdentity, TrackIdentity,
@@ -62,51 +63,7 @@ pub struct RasterDamageRect {
     pub height: u32,
 }
 
-/// Retained RGBA pixels with optional bounded return to their decoder's free-buffer pool.
-#[derive(Debug)]
-pub struct RgbaBuffer {
-    bytes: Option<Vec<u8>>,
-    decoder_pool: Option<Weak<Mutex<Vec<Vec<u8>>>>>,
-}
-
-impl RgbaBuffer {
-    pub fn new(bytes: Vec<u8>) -> Self {
-        Self { bytes: Some(bytes), decoder_pool: None }
-    }
-
-    pub(crate) fn pooled(bytes: Vec<u8>, decoder_pool: Weak<Mutex<Vec<Vec<u8>>>>) -> Self {
-        Self { bytes: Some(bytes), decoder_pool: Some(decoder_pool) }
-    }
-}
-
-impl Deref for RgbaBuffer {
-    type Target = [u8];
-
-    fn deref(&self) -> &Self::Target {
-        self.bytes.as_deref().unwrap_or_default()
-    }
-}
-
-impl AsRef<[u8]> for RgbaBuffer {
-    fn as_ref(&self) -> &[u8] {
-        self
-    }
-}
-
-impl Drop for RgbaBuffer {
-    fn drop(&mut self) {
-        let Some(pool) = self.decoder_pool.as_ref().and_then(Weak::upgrade) else {
-            return;
-        };
-        let Some(bytes) = self.bytes.take() else {
-            return;
-        };
-        let mut free = pool.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        if free.len() < 2 {
-            free.push(bytes);
-        }
-    }
-}
+pub use vivid_sdk::video::RgbaBuffer;
 
 #[derive(Debug, Clone)]
 pub struct Frame {
@@ -192,13 +149,6 @@ pub struct TrackMetrics {
 pub struct SceneNodeStatus {
     pub identity: NodeIdentity,
     pub node: SceneNode,
-}
-
-#[derive(Debug, Clone)]
-/// Bounded revision summaries plus their aggregate, for `SESSION_STATUS`.
-pub struct SessionRevisionSummary {
-    pub session_revision: u64,
-    pub entries: Vec<Value>,
 }
 
 pub struct SceneStatus {
@@ -353,6 +303,7 @@ struct RetainedPoster {
 
 #[derive(Debug, Clone)]
 struct SessionScene {
+    status_revision: vivid_protocol::session_status::Revision,
     revision: SceneRevision,
     target_generation: TargetGeneration,
     nodes: BTreeMap<NodeIdentity, SceneNode>,
@@ -508,6 +459,7 @@ impl SharedScene {
         state.scenes.insert(
             session,
             SessionScene {
+                status_revision: Default::default(),
                 revision: SceneRevision::ZERO,
                 target_generation,
                 nodes: BTreeMap::new(),
@@ -1929,66 +1881,137 @@ impl SharedScene {
         Ok(revision)
     }
 
-    /// Bounded per-object revision summaries for `SESSION_STATUS` key 6.
+    /// Captures owner-scoped reconciliation metadata under one scene lock.
     ///
-    /// Core §10 makes this a producer's reconciliation root after resume: it compares context,
-    /// surface, track, and active-slot revisions against what it retained.
-    pub fn session_revision_summary(
+    /// # Errors
+    /// Returns an error for an absent session or exhausted status revision.
+    pub fn session_status(
         &self,
         session: SessionIdentity,
-        maximum: usize,
-    ) -> SessionRevisionSummary {
-        let state = self.lock();
-        let mut entries = Vec::new();
-        let mut session_revision = 0_u64;
+        mut contexts: Vec<vivid_protocol::session_status::Summary>,
+        resume_generation: u64,
+        input_disabled: bool,
+    ) -> Result<vivid_protocol::session_status::Page, &'static str> {
+        use vivid_protocol::session_status::{Kind, Page, Summary};
+        let mut state = self.lock();
+        let mut usage = [0_u64; 3];
         for (identity, surface) in &state.surfaces {
-            if identity.context().session() != session || entries.len() >= maximum {
+            if identity.context().session() != session {
                 continue;
             }
-            session_revision = session_revision.saturating_add(surface.revision.get());
-            let tracks = state
-                .tracks
-                .iter()
-                .filter(|(key, _)| key.surface() == *identity)
-                .map(|(key, track)| {
-                    Value::Map(vec![
-                        (0, Value::Unsigned(key.track_id())),
-                        (1, Value::Unsigned(track.state.revision.get())),
-                        (2, Value::Unsigned(track.state.channel_generation.get())),
-                    ])
-                })
-                .collect::<Vec<_>>();
-            entries.push(Value::Map(vec![
-                (0, Value::Unsigned(identity.context().context_id())),
-                (1, Value::Unsigned(identity.surface_id())),
-                (2, Value::Unsigned(surface.revision.get())),
-                (3, Value::Unsigned(surface.generation.get())),
-                (4, Value::Unsigned(surface.lifecycle)),
-                (5, Value::Array(tracks)),
-            ]));
+            usage[0] += 1;
+            contexts.push(Summary {
+                kind: Kind::Surface,
+                context_id: identity.context().context_id(),
+                surface_id: identity.surface_id(),
+                object_id: 0,
+                revision: surface.revision.get(),
+                generation: surface.generation.get(),
+                state: surface.lifecycle,
+                detail: 0,
+            });
+            for (slot, track) in &surface.active_slots {
+                contexts.push(Summary {
+                    kind: Kind::Slot,
+                    context_id: identity.context().context_id(),
+                    surface_id: identity.surface_id(),
+                    object_id: *slot,
+                    revision: surface.revision.get(),
+                    generation: surface.generation.get(),
+                    state: 0,
+                    detail: *track,
+                });
+            }
         }
-        SessionRevisionSummary { session_revision, entries }
+        for (identity, track) in &state.tracks {
+            if identity.surface().context().session() != session {
+                continue;
+            }
+            usage[1] += 1;
+            contexts.push(Summary {
+                kind: Kind::Track,
+                context_id: identity.surface().context().context_id(),
+                surface_id: identity.surface().surface_id(),
+                object_id: identity.track_id(),
+                revision: track.state.revision.get(),
+                generation: track.state.channel_generation.get(),
+                state: track.lifecycle,
+                detail: track.state.milestones,
+            });
+        }
+        contexts.sort_unstable();
+        let scene = state.scenes.get_mut(&session).ok_or("session scene is absent")?;
+        usage[2] = u64::try_from(scene.nodes.len()).map_err(|_| "scene node count overflow")?;
+        let mut page = Page {
+            session_revision: scene.status_revision.get(),
+            scene_revision: scene.revision.get(),
+            target_generation: scene.target_generation.get(),
+            establishment_state: 1,
+            resume_generation,
+            input_disabled,
+            entries: contexts,
+            cursor: None,
+            usage,
+        };
+        page.session_revision = scene
+            .status_revision
+            .observe(&page)
+            .map_err(|_| "session status revision exhausted")?;
+        Ok(page)
+    }
+
+    /// Returns the retained session's reconciliation revision.
+    pub fn status_revision(&self, session: SessionIdentity) -> Option<u64> {
+        self.lock().scenes.get(&session).map(|scene| scene.status_revision.get())
+    }
+    /// Checks revision capacity before accepting a control mutation.
+    ///
+    /// # Errors
+    /// Returns an error for an absent session or exhausted status revision.
+    pub fn check_status_revision(&self, session: SessionIdentity) -> Result<(), &'static str> {
+        self.lock()
+            .scenes
+            .get(&session)
+            .ok_or("session scene is absent")?
+            .status_revision
+            .check_advance()
+            .map_err(|_| "session status revision exhausted")
+    }
+    /// Advances the revision after a successful control mutation.
+    ///
+    /// # Errors
+    /// Returns an error for an absent session or exhausted status revision.
+    pub fn advance_status_revision(&self, session: SessionIdentity) -> Result<(), &'static str> {
+        self.lock()
+            .scenes
+            .get_mut(&session)
+            .ok_or("session scene is absent")?
+            .status_revision
+            .advance()
+            .map_err(|_| "session status revision exhausted")
+    }
+    /// Restores a confirmed welcome revision without moving backward.
+    ///
+    /// # Errors
+    /// Returns an error for an absent session, zero or older revision.
+    pub fn restore_status_revision(
+        &self,
+        session: SessionIdentity,
+        value: u64,
+    ) -> Result<(), &'static str> {
+        let mut state = self.lock();
+        let scene = state.scenes.get_mut(&session).ok_or("session scene is absent")?;
+        if value < scene.status_revision.get() {
+            return Err("session status revision moved backward");
+        }
+        scene.status_revision = vivid_protocol::session_status::Revision::new(value)
+            .map_err(|_| "invalid session status revision")?;
+        Ok(())
     }
 
     /// The session's current scene revision.
     pub fn scene_revision(&self, session: SessionIdentity) -> u64 {
         self.lock().scenes.get(&session).map(|scene| scene.revision.get()).unwrap_or(0)
-    }
-
-    /// Aggregate resource use for `SESSION_STATUS` key 8.
-    pub fn resource_usage(&self, session: SessionIdentity) -> Value {
-        let state = self.lock();
-        let surfaces =
-            state.surfaces.keys().filter(|key| key.context().session() == session).count() as u64;
-        let tracks =
-            state.tracks.keys().filter(|key| key.surface().context().session() == session).count()
-                as u64;
-        let nodes = state.scenes.get(&session).map(|scene| scene.nodes.len() as u64).unwrap_or(0);
-        Value::Map(vec![
-            (0, Value::Unsigned(surfaces)),
-            (1, Value::Unsigned(tracks)),
-            (2, Value::Unsigned(nodes)),
-        ])
     }
 
     pub fn scene_status(&self, session: SessionIdentity, maximum_nodes: usize) -> SceneStatus {
@@ -2480,17 +2503,6 @@ mod tests {
             policy: 0,
             profile_parameters: vec![],
         }
-    }
-
-    #[test]
-    fn rgba_buffers_return_to_a_bounded_decoder_pool() {
-        let pool = Arc::new(Mutex::new(Vec::new()));
-        for value in 0..3 {
-            drop(RgbaBuffer::pooled(vec![value; 16], Arc::downgrade(&pool)));
-        }
-        let free = pool.lock().unwrap();
-        assert_eq!(free.len(), 2, "a decoder retains at most two free frames");
-        assert!(free.iter().all(|buffer| buffer.len() == 16));
     }
 
     #[test]

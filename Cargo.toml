@@ -75,7 +75,6 @@ percent-encoding = "2.3"
 notify = "8.2"
 notify-rust = { version = "4.18.0", features = ["preview-macos-un"] }
 parking_lot = "0.13"
-parley = { version = "0.12", features = ["bytemuck"] }
 polling = "3.11.0"
 pollster = "1.0"
 regex-automata = "0.4"
@@ -100,7 +99,7 @@ vvte = { version = "0.15.3", path = "../vvte", default-features = false, feature
   "serde",
 ] }
 zeroize = "1.8.1"
-vivid_sdk = { version = "1.5", path = "../vivid_sdk" }
+vivid_sdk = { version = "1.5", path = "../vivid_sdk", features = ["accessible-text", "vector-gpu", "local-control", "video-decode", "audio-decode", "audio-output"] }
 vello = { version = "0.11", default-features = false, features = ["wgpu"] }
 winit = { version = "0.30", default-features = false, features = [
   "rwh_06",
@@ -112,6 +111,7 @@ mimalloc = { version = "0.1", default-features = false }
 pkg-config = "0.3"
 
 [dev-dependencies]
+vivid_sdk = { version = "1.5", path = "../vivid_sdk", features = ["audio-output-testing"] }
 accesskit = "0.25"
 accesskit_consumer = "0.39"
 accesskit_winit = { version = "0.34", default-features = false, features = [
@@ -124,7 +124,6 @@ xdg = "3.0.0"
 
 [target.'cfg(any(target_os = "macos", target_os = "linux", windows))'.dependencies]
 cpal = "0.18"
-ringbuf = "0.6"
 
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1.0.0", default-features = false, features = ["std"] }
@@ -251,6 +250,8 @@ wgpu = { version = "30.0", default-features = false, features = [
 embed-resource = "3.0.2"
 
 [features]
+# Experimental worker-side GPU frame export; no GUI dependency is enabled.
+gpu-sharing = ["vivid_sdk/gpu-share"]
 # Opt-in counters and allocator instrumentation; absent from normal builds.
 perf = []
 # Deterministic service controls for embedding tests; never enabled by default.

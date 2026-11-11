@@ -3,10 +3,9 @@ use super::*;
 use vivid_protocol::overlay::wire::text::styled::{
     BatchMeasured, MAX_RETAINED_LAYOUTS, MeasureBatch, ReleaseLayouts,
 };
-use vivid_protocol::overlay::wire::text::{
-    EditorGeometry, MAX_TEXT_GEOMETRY, MeasureText, TextGeometry, TextMeasurement,
-};
+use vivid_protocol::overlay::wire::text::{EditorGeometry, MeasureText, TextMeasurement};
 use vivid_protocol::vector::{Rect, Text};
+use vivid_sdk::vector_renderer::parley;
 
 pub(in crate::vivid) fn measure_batch(
     shared: &Arc<ServiceShared>,
@@ -53,46 +52,13 @@ pub(in crate::vivid) fn measure_batch(
             let mut system = TextSystem::new(font);
             let mut results = Vec::with_capacity(request.texts.len());
             for text in &request.texts {
-                let prepared = system.prepare_styled(text);
-                let layout = &prepared.layout;
-                let source = prepared.text.text();
-                let mut measured = layout_geometry(
-                    layout,
-                    &source,
-                    text.max_lines.map_or(usize::MAX, usize::from),
-                )?;
-                if let Some(cut) = prepared.truncated_at {
-                    measured.clusters.retain(|g| g.end as usize > prepared.prefix_bytes);
-                    for geometry in measured.lines.iter_mut().chain(&mut measured.clusters) {
-                        geometry.start = (geometry.start as usize)
-                            .saturating_sub(prepared.prefix_bytes)
-                            .min(cut) as u32;
-                        geometry.end = (geometry.end as usize)
-                            .saturating_sub(prepared.prefix_bytes)
-                            .min(cut) as u32;
-                    }
-                    measured.truncated_at = Some(cut as u32);
-                    measured
-                        .validate_text(&text.text())
-                        .map_err(|_| "invalid ellipsis source mapping")?;
-                }
-                if let Some(width) = text.max_width {
-                    measured.width = width;
-                }
-                let painted = if request.retain {
-                    Some(Arc::new(
-                        crate::display::vector::text_layout::paint(
-                            layout,
-                            &prepared.text,
-                            measured.width.get(),
-                            measured.height.get(),
-                        )
-                        .map_err(|e| e.reason())?,
-                    ))
-                } else {
-                    None
-                };
-                results.push((measured, painted));
+                let (measured, painted) = vivid_sdk::vector_renderer::text::measure_styled(
+                    &mut system,
+                    text,
+                    request.retain,
+                )
+                .map_err(|error| error.reason())?;
+                results.push((measured, painted.map(Arc::new)));
             }
             Ok::<_, &'static str>(results)
         }))
@@ -359,59 +325,8 @@ fn layout_geometry<B: parley::Brush>(
     source: &str,
     max_lines: usize,
 ) -> Result<TextMeasurement, &'static str> {
-    let scalar = |v: f32| Scalar::new(f64::from(v)).map_err(|_| "text geometry out of range");
-    let mut result = TextMeasurement {
-        truncated_at: None,
-        width: Scalar::ZERO,
-        height: Scalar::ZERO,
-        lines: Vec::new(),
-        clusters: Vec::new(),
-    };
-    for line in layout.lines().take(max_lines) {
-        if result.lines.len() >= MAX_TEXT_GEOMETRY {
-            return Err("too many text lines");
-        }
-        let m = line.metrics();
-        let range = line.text_range();
-        let geometry = TextGeometry {
-            start: range.start as u32,
-            end: range.end.min(source.len()) as u32,
-            x: scalar(m.offset)?,
-            y: scalar(m.block_min_coord)?,
-            width: if source.is_empty() { Scalar::ZERO } else { scalar(m.advance)? },
-            height: scalar(m.block_max_coord - m.block_min_coord)?,
-            baseline: scalar(m.baseline)?,
-            rtl: false,
-        };
-        result.lines.push(geometry.clone());
-        result.width = result.width.max(if source.is_empty() {
-            Scalar::ZERO
-        } else {
-            scalar(m.offset + m.advance)?
-        });
-        result.height = scalar(m.block_max_coord)?;
-        let mut x = m.offset;
-        for run in line.runs() {
-            for cluster in run.visual_clusters() {
-                if result.clusters.len() >= MAX_TEXT_GEOMETRY {
-                    return Err("too many text clusters");
-                }
-                let range = cluster.text_range();
-                result.clusters.push(TextGeometry {
-                    start: range.start as u32,
-                    end: range.end as u32,
-                    x: scalar(x)?,
-                    width: scalar(cluster.advance())?,
-                    baseline: Scalar::ZERO,
-                    rtl: cluster.is_rtl(),
-                    ..geometry.clone()
-                });
-                x += cluster.advance();
-            }
-        }
-    }
-    result.validate_text(source).map_err(|_| "invalid text ranges")?;
-    Ok(result)
+    vivid_sdk::vector_renderer::text::layout_geometry(layout, source, max_lines)
+        .map_err(|error| error.reason())
 }
 
 #[cfg(test)]

@@ -373,8 +373,10 @@ impl WindowContext {
     /// The program still running in this terminal, if closing it would stop more than an idle
     /// shell; `None` at a prompt or once the process has exited.
     ///
-    /// On Unix the terminal's foreground process group answers exactly: anything but the shell's
-    /// own group is a running program. Windows has no foreground group, so a direct child of the
+    /// On Unix a distinct foreground process group identifies a running child. The original
+    /// group also counts when its executable is not a recognized shell, or shell integration
+    /// reports an in-process command. Unknown process identity is treated conservatively.
+    /// Windows has no foreground group, so a direct child of the
     /// shell counts as running, unless OSC 133 shell integration reports the shell at its prompt;
     /// integration also catches commands a shell runs in-process.
     #[cfg(any(unix, windows))]
@@ -387,10 +389,36 @@ impl WindowContext {
         {
             // SAFETY: `master_fd` is this terminal's live PTY master.
             let foreground = unsafe { libc::tcgetpgrp(self.master_fd) };
-            (foreground > 0 && foreground as u32 != self.shell_pid).then(|| {
-                foreground_executable_basename(foreground)
-                    .unwrap_or_else(|| String::from("a program"))
-            })
+            if foreground <= 0 {
+                return Some(String::from("a program"));
+            }
+            let executable = foreground_executable_basename(foreground);
+            if foreground as u32 != self.shell_pid {
+                return Some(executable.unwrap_or_else(|| String::from("a program")));
+            }
+            if self.automation.shell.command_running {
+                return Some(String::from("a command"));
+            }
+            // A directly launched editor/tool can keep the original process group. Recognize
+            // idle shells by executable identity, never by their possibly sensitive arguments.
+            let idle_shell = executable.as_deref().is_some_and(|name| {
+                matches!(
+                    name,
+                    "sh" | "bash"
+                        | "zsh"
+                        | "dash"
+                        | "ksh"
+                        | "fish"
+                        | "csh"
+                        | "tcsh"
+                        | "nu"
+                        | "nushell"
+                        | "elvish"
+                        | "xonsh"
+                        | "pwsh"
+                )
+            });
+            (!idle_shell).then(|| executable.unwrap_or_else(|| String::from("a program")))
         }
 
         #[cfg(windows)]
@@ -1182,6 +1210,56 @@ impl WindowContext {
         snapshot
     }
 
+    /// Captures bounded read-only visible terminal text for an embedding host.
+    ///
+    /// Call on the processor worker only while assistive technology is active.
+    /// Retained scrollback and Vivid overlay semantics are not copied. Hidden
+    /// cells are masked, and character geometry is normalized to terminal pixels.
+    ///
+    /// # Errors
+    /// Rejects excess rows, cells, text or labels and invalid geometry before copying.
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    pub fn host_accessible_text(
+        &self,
+    ) -> Result<vivid_sdk::accessible_text::Document, vivid_sdk::accessible_text::InvalidDocument>
+    {
+        let terminal = self.terminal.lock();
+        crate::accessibility::visible_document(
+            &terminal,
+            self.display.size_info,
+            self.display.window.title(),
+            terminal_accessibility_focused(
+                terminal.is_focused,
+                self.vivid_service.overlay_focused(),
+            ),
+        )
+    }
+
+    /// Captures explicitly requested visible rows for an embedding host's automation service.
+    ///
+    /// Call on the processor worker after host authorization. This does not activate
+    /// accessibility. Ranges are relative to the displayed viewport, limited to
+    /// 32 rows, 4,096 cells and 16 KiB before copying. Hidden cells are masked;
+    /// wide spacers and combining characters use the native copy rules. Physical
+    /// hard line breaks remain in the returned strings. No title or undisplayed
+    /// scrollback is copied.
+    ///
+    /// # Errors
+    /// Rejects invalid ranges, geometry or excess work before snapshot allocation.
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    pub fn host_visible_text(
+        &self,
+        start: usize,
+        count: usize,
+    ) -> Result<Vec<String>, vivid_sdk::accessible_text::InvalidDocument> {
+        crate::accessibility::visible_text(
+            &self.terminal.lock(),
+            self.display.size_info,
+            start,
+            count,
+        )
+    }
+
     /// Current terminal content size in physical pixels.
     #[cfg(any(target_os = "linux", windows))]
     pub(crate) fn terminal_content_size(&self) -> winit::dpi::PhysicalSize<u32> {
@@ -1356,10 +1434,55 @@ impl WindowContext {
         clipboard: &mut Clipboard,
         scheduler: &mut Scheduler,
     ) -> Vec<u8> {
-        if !ui_paste_needs_action_context(
-            self.search_state.regex().is_some(),
-            self.vivid_service.overlay_focused(),
-        ) {
+        self.paste_input(
+            text,
+            false,
+            #[cfg(target_os = "macos")]
+            event_loop,
+            event_proxy,
+            clipboard,
+            scheduler,
+        )
+    }
+
+    #[cfg(any(unix, windows))]
+    pub(crate) fn ui_clipboard_paste(
+        &mut self,
+        text: &str,
+        #[cfg(target_os = "macos")] event_loop: Option<&ActiveEventLoop>,
+        event_proxy: &EventSink,
+        clipboard: &mut Clipboard,
+        scheduler: &mut Scheduler,
+    ) -> Vec<u8> {
+        let bytes = self.paste_input(
+            text,
+            true,
+            #[cfg(target_os = "macos")]
+            event_loop,
+            event_proxy,
+            clipboard,
+            scheduler,
+        );
+        self.redraw_if_dirty();
+        bytes
+    }
+
+    #[cfg(any(unix, windows))]
+    fn paste_input(
+        &mut self,
+        text: &str,
+        clipboard_origin: bool,
+        #[cfg(target_os = "macos")] event_loop: Option<&ActiveEventLoop>,
+        event_proxy: &EventSink,
+        clipboard: &mut Clipboard,
+        scheduler: &mut Scheduler,
+    ) -> Vec<u8> {
+        if !clipboard_origin
+            && !ui_paste_needs_action_context(
+                self.search_state.regex().is_some(),
+                self.vivid_service.overlay_focused(),
+            )
+        {
             return self.application_paste(text);
         }
 
@@ -1393,7 +1516,11 @@ impl WindowContext {
                 scheduler,
             };
             let mut processor = input::Processor::new(context);
-            input::ActionContext::paste(&mut processor.ctx, text, true);
+            if clipboard_origin {
+                input::ActionContext::paste_clipboard_text(&mut processor.ctx, text);
+            } else {
+                input::ActionContext::paste(&mut processor.ctx, text, true);
+            }
         }
         notifier.into_bytes()
     }
@@ -1542,6 +1669,69 @@ impl WindowContext {
         self.client_health = ClientHealth::Healthy;
         self.display.progress.clear();
         self.dirty = true;
+    }
+
+    /// Updates display scale for a host-owned terminal without a native window event.
+    ///
+    /// # Errors
+    /// Returns an error for nonfinite scales or scales outside 1/16 through 16.
+    #[cfg(any(unix, windows))]
+    pub fn set_host_scale_factor(&mut self, scale: f64) -> Result<(), IpcError> {
+        if !scale.is_finite() || !(1.0 / 16.0..=16.0).contains(&scale) {
+            return Err(IpcError::new("invalid_params", "invalid host display scale"));
+        }
+        let previous = self.display.window.scale_factor;
+        if previous == scale {
+            return Ok(());
+        }
+        if !previous.is_finite() || previous <= 0.0 {
+            return Err(IpcError::new("invalid_params", "invalid previous display scale"));
+        }
+        self.display.font_size =
+            crate::display::rescale_font_size(self.display.font_size, previous, scale);
+        self.display.window.scale_factor = scale;
+        self.display
+            .pending_update
+            .set_font(self.config.font.clone().with_size(self.display.font_size));
+        self.dirty = true;
+        self.display.window.request_redraw();
+        Ok(())
+    }
+
+    /// Returns the sequence of the last presented frame for host damage tracking.
+    #[cfg(any(unix, windows))]
+    pub fn presented_frame_sequence(&self) -> u64 {
+        self.automation.frame_sequence
+    }
+
+    /// Returns the active terminal or overlay IME rectangle in physical pane pixels.
+    ///
+    /// Hosts translate this cached editor rectangle into their window coordinates.
+    /// It becomes available when the renderer positions the active input method.
+    pub fn host_ime_cursor_area(
+        &self,
+    ) -> Option<(winit::dpi::PhysicalPosition<f64>, winit::dpi::PhysicalSize<f64>)> {
+        self.display.window.ime_area().map(|(_, position, size)| (position, size))
+    }
+
+    /// Flush staged native events before directly routed host input.
+    #[cfg(any(unix, windows))]
+    pub(crate) fn flush_host_input(
+        &mut self,
+        event_proxy: &EventSink,
+        clipboard: &mut Clipboard,
+        scheduler: &mut Scheduler,
+    ) {
+        // Host keys and direct paste bypass the native event queue. Earlier pointer/modifier
+        // events must run first, just as they do before a native keyboard event.
+        self.handle_event(
+            #[cfg(target_os = "macos")]
+            None,
+            event_proxy,
+            clipboard,
+            scheduler,
+            WinitEvent::AboutToWait,
+        );
     }
 
     /// Process a neutral key through Vivido's normal UI input processor.

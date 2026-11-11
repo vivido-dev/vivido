@@ -6,6 +6,7 @@ use std::{array, env};
 
 use ahash::AHashSet;
 use hashbrown::Equivalent;
+use vivid_sdk::vector_renderer::parley;
 type AHashMap<K, V> = hashbrown::HashMap<K, V, ahash::RandomState>;
 use parley::fontique::{FallbackKey, FamilyId, Language, ScriptExt};
 use parley::layout::PositionedLayoutItem;
@@ -315,6 +316,8 @@ impl TextSystem {
         let width = text.max_width.map(|w| w.get() as f32);
         if !text.wrap && width.is_some() {
             let mut breaker = layout.break_lines();
+            breaker.state_mut().set_layout_max_advance(f32::MAX);
+            breaker.state_mut().set_line_max_advance(f32::MAX);
             while breaker.break_next().is_some() {
                 breaker.set_prior_line_width(width.unwrap_or(f32::MAX));
             }
@@ -1181,6 +1184,7 @@ impl std::fmt::Debug for TextSystem {
 mod tests {
     use std::borrow::Cow;
     use std::sync::Arc;
+    use vivid_sdk::vector_renderer::parley;
 
     use crate::terminal::index::Point;
     use crate::terminal::term::cell::Flags;
@@ -1526,6 +1530,42 @@ mod tests {
                     entry.codepoint as u32,
                 );
             }
+        }
+    }
+
+    #[test]
+    fn emoji_base_glyph_survives_a_combining_mark_when_a_native_font_covers_it() {
+        let mut text = TextSystem::new(Font::default());
+        let families =
+            text.font_cx.collection.family_names().map(str::to_owned).collect::<Vec<_>>();
+        let covering = families.iter().find(|name| {
+            text.font_cx
+                .collection
+                .family_id(name)
+                .is_some_and(|id| text.family_supports_text(id, "🦇"))
+        });
+        let Some(covering) = covering else {
+            eprintln!("no installed font covers the emoji fixture");
+            return;
+        };
+        for source in ["🦇", "🦇\u{301}"] {
+            let layout = text.shape_string(source, false, false).unwrap();
+            let glyphs = layout
+                .lines()
+                .flat_map(|line| line.items())
+                .filter_map(|item| match item {
+                    PositionedLayoutItem::GlyphRun(run) => {
+                        Some(run.glyphs().map(|g| g.id).collect::<Vec<_>>())
+                    },
+                    _ => None,
+                })
+                .flatten()
+                .collect::<Vec<_>>();
+            assert!(
+                glyphs.first().is_some_and(|id| *id != 0),
+                "emoji base missing for {source:?}: glyphs={glyphs:?}, selected={:?}, covering={covering}",
+                selected_family_name(&mut text, source)
+            );
         }
     }
 

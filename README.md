@@ -12,6 +12,13 @@ that lets AI agents drive, read, and observe its windows.
 
 ## For developers
 
+Embedding hosts can supply bounded text clipboard services and route native
+clipboard paste through Vivido's existing policies. See [host integration](docs/embedding.md).
+
+Portable overlay compilation, shaped-text painting and the cached GPU overlay target
+use `vivid_sdk::vector_renderer`. Terminal font selection and authenticated overlay
+lifecycle remain in Vivido.
+
 ### Performance
 
 Vivido renders text on the GPU through [wgpu](https://github.com/gfx-rs/wgpu), using Metal on

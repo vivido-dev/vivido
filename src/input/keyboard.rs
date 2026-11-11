@@ -1086,6 +1086,15 @@ fn palette_command(key: &Key, text: &str, mods: ModifiersState, toggles: bool) -
     }
 }
 
+/// Validates a bounded hosted key name without delivering input or changing state.
+///
+/// Uses the same logical-key parser as native UI automation. Literal control
+/// characters are excluded; use their named key forms instead.
+/// The 128-byte ceiling matches the embedding input queue's key-name bound.
+pub fn is_supported_host_key(key: &str) -> bool {
+    key.len() <= 128 && !key.chars().any(char::is_control) && ipc_logical_key(key).is_ok()
+}
+
 pub fn encode_ipc_key_event(
     key: &str,
     modifiers: &[String],
@@ -1456,6 +1465,17 @@ mod ipc_tests {
 
     use super::{PaletteCommand, encode_ipc_key_event, ipc_hid_usage, palette_command};
     use crate::terminal::term::TermMode;
+
+    #[test]
+    fn hosted_key_validation_reuses_native_names_without_accepting_raw_controls() {
+        for key in ["enter", "ArrowUp", "keypad7", "F24", "a", "🦇"] {
+            assert!(super::is_supported_host_key(key), "{key}");
+        }
+        for key in ["", "not-a-key", "\n", "\0"] {
+            assert!(!super::is_supported_host_key(key));
+        }
+        assert!(!super::is_supported_host_key(&"a".repeat(129)));
+    }
 
     fn encode_ipc_key(
         key: &str,

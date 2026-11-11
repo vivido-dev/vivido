@@ -705,6 +705,11 @@ impl Window {
         self.mouse_visible
     }
 
+    /// Returns the pointer shape requested by native, embedded, or headless rendering.
+    pub fn mouse_cursor(&self) -> CursorIcon {
+        self.current_mouse_cursor
+    }
+
     #[cfg(not(any(target_os = "macos", windows)))]
     /// Build Wayland window attributes with the configured application identity and decorations.
     pub fn get_platform_window(

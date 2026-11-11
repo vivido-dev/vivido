@@ -12,6 +12,7 @@ use unicode_width::UnicodeWidthChar;
 use vello::kurbo::{Affine, RoundedRect};
 use vello::peniko::{Color, Fill};
 use vello::{Glyph, Scene};
+use vivid_sdk::vector_renderer::parley;
 use winit::dpi::PhysicalSize;
 use winit::keyboard::ModifiersState;
 use winit::window::CursorIcon;
@@ -481,6 +482,63 @@ impl Display {
             return Err(ScreenshotError::NoPresentedFrame);
         }
         self.scene_renderer.begin_screenshot()
+    }
+
+    /// Exports an immutable GPU frame without mapping its pixels to CPU memory.
+    ///
+    /// # Errors
+    /// Returns an error for unavailable rendering, pool capacity or GPU failure.
+    #[cfg(all(feature = "gpu-sharing", target_os = "macos"))]
+    pub fn shared_frame(
+        &self,
+        pool: &vivid_sdk::gpu_share::Pool,
+    ) -> Result<std::sync::Arc<vivid_sdk::gpu_share::Frame>, ScreenshotError> {
+        if self.renderer_unavailable {
+            return Err(ScreenshotError::NoPresentedFrame);
+        }
+        self.scene_renderer.shared_frame(pool)
+    }
+
+    /// Destroys the renderer's logical device for native recovery checks.
+    ///
+    /// Available only with explicit test utilities and GPU sharing on macOS.
+    /// Returns whether real WGPU loss notification was observed within five seconds.
+    /// Call on the native worker; this does not simulate physical GPU removal.
+    #[cfg(all(feature = "test-util", feature = "gpu-sharing", target_os = "macos"))]
+    pub fn destroy_gpu_device_for_test(&self) -> bool {
+        self.scene_renderer.destroy_gpu_device_for_test()
+    }
+
+    /// Starts a GPU export without waiting for completion.
+    ///
+    /// Returns `None` while producer or aggregate capacity is full.
+    ///
+    /// # Errors
+    /// Returns an error for unavailable rendering or GPU failure.
+    #[cfg(all(feature = "gpu-sharing", target_os = "macos"))]
+    pub fn begin_shared_frame(
+        &self,
+        pool: &vivid_sdk::gpu_share::Pool,
+    ) -> Result<Option<renderer::SharedFrame>, ScreenshotError> {
+        if self.renderer_unavailable {
+            return Err(ScreenshotError::NoPresentedFrame);
+        }
+        self.scene_renderer.begin_shared_frame(pool)
+    }
+
+    /// Polls a GPU export while preserving the native event pump.
+    ///
+    /// # Errors
+    /// Returns an error for unavailable rendering or a failed/expired export.
+    #[cfg(all(feature = "gpu-sharing", target_os = "macos"))]
+    pub fn poll_shared_frame(
+        &self,
+        pending: &mut renderer::SharedFrame,
+    ) -> Result<Option<std::sync::Arc<vivid_sdk::gpu_share::Frame>>, ScreenshotError> {
+        if self.renderer_unavailable {
+            return Err(ScreenshotError::NoPresentedFrame);
+        }
+        self.scene_renderer.poll_shared_frame(pending)
     }
 
     #[cfg(any(unix, windows))]
@@ -2406,6 +2464,7 @@ mod tests {
     use crate::terminal::grid::Dimensions as _;
     use crate::terminal::index::{Column, Point};
     use crate::terminal::term::cell::Flags;
+    use vivid_sdk::vector_renderer::parley;
     use winit::dpi::PhysicalSize;
     use winit::window::CursorIcon;
 

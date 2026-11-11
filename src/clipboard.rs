@@ -33,7 +33,31 @@ pub struct Clipboard {
     clipboard: Box<dyn ClipboardProvider>,
     selection: Option<Box<dyn ClipboardProvider>>,
     media: MediaClipboard,
+    host: Option<Box<dyn HostClipboard>>,
 }
+
+/// Supplies text clipboard services from an embedding host.
+///
+/// Calls run on the processor's thread. A host must bridge native operations to
+/// its platform thread, bound request latency and text sizes, and revoke stale
+/// operations on focus loss or shutdown. Errors must not contain clipboard text.
+pub trait HostClipboard: std::fmt::Debug + 'static {
+    /// Whether the host exposes a separate primary selection.
+    fn has_selection(&self) -> bool;
+    /// Reads text from the requested clipboard buffer.
+    ///
+    /// # Errors
+    /// Returns an error when permission, capacity, or platform access is unavailable.
+    fn load(&mut self, target: ClipboardType) -> std::io::Result<String>;
+    /// Queues text for the requested clipboard buffer.
+    ///
+    /// # Errors
+    /// Returns an error when permission, capacity, or platform access is unavailable.
+    fn store(&mut self, target: ClipboardType, text: String) -> std::io::Result<()>;
+}
+
+// Keep hosted transfers bounded before invoking host code or using a read as terminal input.
+const MAX_HOST_TEXT_BYTES: usize = 1024 * 1024;
 
 /// Lazily opened media clipboard.
 ///
@@ -126,6 +150,7 @@ impl Clipboard {
                     clipboard: Box::new(clipboard),
                     selection: Some(Box::new(selection)),
                     media: MediaClipboard::Unopened,
+                    host: None,
                 }
             },
             // copypasta has no X11 backend, so arboard carries text and the primary selection.
@@ -161,6 +186,7 @@ impl Clipboard {
                 .ok()
                 .map(|adapter| Box::new(adapter) as Box<dyn ClipboardProvider>),
             media: MediaClipboard::Unopened,
+            host: None,
         }
     }
 
@@ -172,7 +198,12 @@ impl Clipboard {
             clipboard: Box::new(NopClipboardContext::new().unwrap()),
             selection: None,
             media: MediaClipboard::Unavailable,
+            host: None,
         }
+    }
+
+    pub(crate) fn hosted(host: Box<dyn HostClipboard>) -> Self {
+        Self { host: Some(host), ..Self::new_nop() }
     }
 }
 
@@ -184,6 +215,7 @@ impl Default for Clipboard {
                 clipboard: Box::new(clipboard),
                 selection: None,
                 media: MediaClipboard::Unopened,
+                host: None,
             },
             Err(err) => {
                 warn!("Unable to open the system clipboard; text clipboard stays disabled: {err}");
@@ -200,10 +232,27 @@ impl Clipboard {
     /// Whether this platform has a primary selection. Without one, loading the selection reads
     /// the clipboard instead and storing to it does nothing.
     pub fn has_selection(&self) -> bool {
+        if let Some(host) = &self.host {
+            return host.has_selection();
+        }
         self.selection.is_some()
     }
 
     pub fn store(&mut self, ty: ClipboardType, text: impl Into<String>) {
+        if let Some(host) = &mut self.host {
+            if ty == ClipboardType::Selection && !host.has_selection() {
+                return;
+            }
+            let text = text.into();
+            if text.len() > MAX_HOST_TEXT_BYTES {
+                warn!("Hosted clipboard write exceeds limit");
+                return;
+            }
+            if host.store(ty, text).is_err() {
+                warn!("Hosted clipboard write unavailable");
+            }
+            return;
+        }
         let clipboard = match (ty, &mut self.selection) {
             (ClipboardType::Selection, Some(provider)) => provider,
             (ClipboardType::Selection, None) => return,
@@ -215,7 +264,21 @@ impl Clipboard {
         });
     }
 
-    pub fn load(&mut self, ty: ClipboardType) -> String {
+    pub fn load(&mut self, ty: ClipboardType) -> Option<String> {
+        if let Some(host) = &mut self.host {
+            let target = if ty == ClipboardType::Selection && !host.has_selection() {
+                ClipboardType::Clipboard
+            } else {
+                ty
+            };
+            return match host.load(target) {
+                Ok(text) if text.len() <= MAX_HOST_TEXT_BYTES => Some(text),
+                Ok(_) | Err(_) => {
+                    debug!("Hosted clipboard read unavailable or exceeds limit");
+                    None
+                },
+            };
+        }
         let clipboard = match (ty, &mut self.selection) {
             (ClipboardType::Selection, Some(provider)) => provider,
             _ => &mut self.clipboard,
@@ -224,9 +287,9 @@ impl Clipboard {
         match clipboard.get_contents() {
             Err(err) => {
                 debug!("Unable to load text from clipboard: {err}");
-                String::new()
+                None
             },
-            Ok(text) => text,
+            Ok(text) => Some(text),
         }
     }
 

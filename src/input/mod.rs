@@ -313,14 +313,16 @@ impl<T: EventListener> Execute<T> for Action {
             Action::CopySelection => ctx.copy_selection(ClipboardType::Selection),
             Action::ClearSelection => ctx.clear_selection(),
             Action::Paste if !ctx.paste_clipboard_media() => {
-                let text = ctx.clipboard_mut().load(ClipboardType::Clipboard);
-                ctx.paste_clipboard_text(&text);
+                if let Some(text) = ctx.clipboard_mut().load(ClipboardType::Clipboard) {
+                    ctx.paste_clipboard_text(&text);
+                }
             },
             // Clipboard media took the paste and routed it to a file-drop binding.
             Action::Paste => {},
             Action::PasteSelection => {
-                let text = ctx.clipboard_mut().load(ClipboardType::Selection);
-                ctx.paste_clipboard_text(&text);
+                if let Some(text) = ctx.clipboard_mut().load(ClipboardType::Selection) {
+                    ctx.paste_clipboard_text(&text);
+                }
             },
             #[cfg(any(target_os = "linux", windows))]
             Action::ToggleFullscreen if ctx.window().is_hosted() => {

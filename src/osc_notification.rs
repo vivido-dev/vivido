@@ -14,7 +14,7 @@ use memchr::{memchr, memchr2};
 
 use crate::event::{EventProxy, EventType};
 use crate::terminal::event::Notify;
-use crate::terminal::vvte::{self, Perform};
+use crate::terminal::vvte::Perform;
 
 const MAX_OSC_BYTES: usize = 8 * 1024;
 const MAX_PLAIN_PAYLOAD_BYTES: usize = 2 * 1024;

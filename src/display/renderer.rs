@@ -94,6 +94,45 @@ impl std::fmt::Display for ScreenshotError {
 #[cfg(any(unix, windows, test))]
 impl std::error::Error for ScreenshotError {}
 
+/// A GPU export tied to its original renderer's health.
+#[cfg(all(feature = "gpu-sharing", target_os = "macos"))]
+pub struct SharedFrame {
+    pending: vivid_sdk::gpu_share::Pending,
+    health: GpuHealth,
+}
+#[cfg(all(feature = "gpu-sharing", target_os = "macos"))]
+impl std::fmt::Debug for SharedFrame {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SharedFrame").finish_non_exhaustive()
+    }
+}
+#[cfg(all(feature = "gpu-sharing", target_os = "macos"))]
+impl SharedFrame {
+    /// Polls its original GPU device and health without waiting for completion.
+    ///
+    /// # Errors
+    /// Returns an error for a failed, consumed or expired export.
+    pub fn poll(&mut self) -> Result<Option<Arc<vivid_sdk::gpu_share::Frame>>, ScreenshotError> {
+        self.health.check().map_err(|error| ScreenshotError::Readback(error.to_string()))?;
+        let frame =
+            self.pending.poll().map_err(|error| ScreenshotError::Readback(error.to_string()))?;
+        self.health.check().map_err(|error| ScreenshotError::Readback(error.to_string()))?;
+        Ok(frame)
+    }
+    /// Retires submitted work during native worker teardown.
+    ///
+    /// This waits only on the worker and never grants display authority.
+    ///
+    /// # Errors
+    /// Returns an error for failed/expired work or failed producer health.
+    pub fn wait(self) -> Result<Arc<vivid_sdk::gpu_share::Frame>, ScreenshotError> {
+        let frame =
+            self.pending.wait().map_err(|error| ScreenshotError::Readback(error.to_string()))?;
+        self.health.check().map_err(|error| ScreenshotError::Readback(error.to_string()))?;
+        Ok(frame)
+    }
+}
+
 /// Asynchronous GPU screenshot readback.
 #[cfg(any(unix, windows))]
 pub struct ScreenshotReadback {
@@ -885,6 +924,84 @@ impl SceneRenderer {
         self.has_rendered_frame
     }
 
+    /// Copies the last frame into an immutable shareable GPU allocation.
+    ///
+    /// Call on the native worker; this waits for GPU completion without reading
+    /// pixels to CPU memory. The pool remains charged through consumer retirement.
+    ///
+    /// # Errors
+    /// Returns an error for absent frames, invalid geometry, capacity or GPU failure.
+    #[cfg(all(feature = "gpu-sharing", target_os = "macos"))]
+    pub fn shared_frame(
+        &self,
+        pool: &vivid_sdk::gpu_share::Pool,
+    ) -> Result<Arc<vivid_sdk::gpu_share::Frame>, ScreenshotError> {
+        if !self.has_rendered_frame {
+            return Err(ScreenshotError::NoPresentedFrame);
+        }
+        self.gpu_health.check().map_err(|error| ScreenshotError::Readback(error.to_string()))?;
+        let frame = pool
+            .copy(&self.device, &self.queue, &self.render_target)
+            .map_err(|error| ScreenshotError::Readback(error.to_string()))?;
+        self.gpu_health.check().map_err(|error| ScreenshotError::Readback(error.to_string()))?;
+        Ok(frame)
+    }
+
+    /// Destroys this logical GPU device for bounded native recovery checks.
+    ///
+    /// This developer-only hook exercises real WGPU loss notification for all
+    /// renderers sharing this logical device. Independent devices are unaffected.
+    /// It does not simulate physical device removal.
+    /// Call only on the native renderer worker. Returns whether loss was observed.
+    #[cfg(all(feature = "test-util", feature = "gpu-sharing", target_os = "macos"))]
+    pub fn destroy_gpu_device_for_test(&self) -> bool {
+        self.device.destroy();
+        let _ = self.device.poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: Some(std::time::Duration::from_secs(5)),
+        });
+        self.gpu_health.failed()
+    }
+
+    /// Starts GPU export while allowing the native event pump to continue.
+    ///
+    /// Returns `None` while producer or aggregate capacity is full.
+    ///
+    /// # Errors
+    /// Returns an error for absent frames or GPU failure.
+    #[cfg(all(feature = "gpu-sharing", target_os = "macos"))]
+    pub fn begin_shared_frame(
+        &self,
+        pool: &vivid_sdk::gpu_share::Pool,
+    ) -> Result<Option<SharedFrame>, ScreenshotError> {
+        if !self.has_rendered_frame {
+            return Err(ScreenshotError::NoPresentedFrame);
+        }
+        self.gpu_health.check().map_err(|error| ScreenshotError::Readback(error.to_string()))?;
+        let pending = match pool.begin_copy(&self.device, &self.queue, &self.render_target) {
+            Ok(pending) => pending,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
+            Err(error) => return Err(ScreenshotError::Readback(error.to_string())),
+        };
+        self.gpu_health.check().map_err(|error| ScreenshotError::Readback(error.to_string()))?;
+        Ok(Some(SharedFrame { pending, health: self.gpu_health.clone() }))
+    }
+
+    /// Polls an exported frame without waiting for GPU completion.
+    ///
+    /// # Errors
+    /// Returns an error for failed rendering or a failed/expired export operation.
+    #[cfg(all(feature = "gpu-sharing", target_os = "macos"))]
+    pub fn poll_shared_frame(
+        &self,
+        pending: &mut SharedFrame,
+    ) -> Result<Option<Arc<vivid_sdk::gpu_share::Frame>>, ScreenshotError> {
+        if !Arc::ptr_eq(&self.gpu_health.0, &pending.health.0) {
+            return Err(ScreenshotError::Readback("GPU export renderer was replaced".into()));
+        }
+        pending.poll()
+    }
+
     /// Start asynchronously reading the last rendered frame.
     #[cfg(any(unix, windows))]
     ///
@@ -1644,6 +1761,39 @@ mod tests {
         assert!(!renderer.gpu_failed());
     }
 
+    #[cfg(all(feature = "test-util", feature = "gpu-sharing", target_os = "macos"))]
+    #[test]
+    #[ignore = "requires native Metal; run explicitly with gpu-sharing,test-util"]
+    fn gpu_exports_reject_a_destroyed_device_and_a_rebuilt_renderer_exports_again() {
+        let _gpu = gpu_lock();
+        shutdown_window_render_context();
+        let size = PhysicalSize::new(32, 16);
+        let mut renderer =
+            SceneRenderer::new(RenderSource::Offscreen, size, false).expect("native renderer");
+        renderer.render(&Scene::new(), Color::BLACK).expect("first frame");
+        let pool = vivid_sdk::gpu_share::Pool::new(2).unwrap();
+        let first = renderer.shared_frame(&pool).expect("first export");
+        let serial = first.id();
+        let mut pending = renderer.begin_shared_frame(&pool).unwrap().unwrap();
+        assert!(renderer.destroy_gpu_device_for_test());
+        assert!(renderer.poll_shared_frame(&mut pending).is_err());
+        assert!(pending.poll().is_err());
+        assert!(pending.wait().is_err());
+        assert!(renderer.shared_frame(&pool).is_err());
+        pool.clear_cache();
+        assert_eq!((pool.retained(), pool.allocated()), (1, 1));
+        drop(first);
+        assert_eq!((pool.retained(), pool.allocated()), (0, 0));
+        renderer.rebuild(RenderSource::Offscreen, size, false).expect("rebuild renderer");
+        renderer.render(&Scene::new(), Color::BLACK).expect("recovered frame");
+        let recovered = renderer.shared_frame(&pool).expect("recovered export");
+        assert!(recovered.id() > serial);
+        drop(recovered);
+        pool.clear_cache();
+        assert_eq!((pool.retained(), pool.allocated()), (0, 0));
+        shutdown_window_render_context();
+    }
+
     #[test]
     fn a_failed_shared_device_is_replaced_once_for_all_recovering_windows() {
         let _gpu = gpu_lock();
@@ -2259,6 +2409,223 @@ mod tests {
         let mut moved = Scene::new();
         moved.append(&compiled.scene, Some(kurbo::Affine::scale(0.5)));
         assert!(renderer.render(&moved, Color::from_rgb8(255, 255, 255)).unwrap());
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    #[ignore = "requires a real GPU or software Vulkan; run explicitly for shared SDK composition"]
+    fn sdk_overlay_compositor_renders_caches_and_retires_only_the_selected_owner() {
+        use std::{
+            collections::BTreeMap,
+            sync::Arc,
+            time::{Duration, Instant},
+        };
+        use vivid_protocol::{
+            identity::{PresenterInstanceId, SessionIdentity},
+            overlay::wire::{Submission, WindowAddress},
+            vector::{Brush, Canvas, Color as WireColor, Path, Rect},
+        };
+        use vivid_sdk::vector_renderer::{
+            self,
+            compositor::{Compositor, Drawing},
+        };
+
+        let _gpu = gpu_lock();
+        let mut renderer =
+            SceneRenderer::new(RenderSource::Offscreen, PhysicalSize::new(32, 16), true)
+                .expect("shared SDK composition requires a working GPU adapter");
+        let mut text = crate::display::text::TextSystem::new(crate::config::font::Font::default());
+        let mut drawings = Vec::new();
+        for (owner, x, width, color) in [(1, 0., 16., 0xff0000ff), (2, 24., 8., 0x0000ffff)] {
+            let mut canvas = Canvas::new();
+            // Content overflows its window; composition must clip that overflow.
+            canvas
+                .fill(
+                    Path::rectangle(Rect::new(0., 0., 24., 16.).unwrap()).unwrap(),
+                    Brush::Solid(WireColor(color)),
+                )
+                .unwrap();
+            let compiled = vector_renderer::compile(&canvas, &mut text, &BTreeMap::new()).unwrap();
+            drawings.push(Drawing {
+                window: SessionIdentity::new(PresenterInstanceId([1; 16]), owner)
+                    .unwrap()
+                    .context(1)
+                    .unwrap()
+                    .surface(1)
+                    .unwrap(),
+                window_revision: 1,
+                bounds: Rect::new(x, 0., width, 16.).unwrap(),
+                scale: 1.,
+                compiled: Arc::new(compiled),
+                submission: Submission {
+                    address: WindowAddress { context_id: 1, surface_id: 1, generation: 1 },
+                    track_id: 1,
+                    channel_generation: 1,
+                    epoch: 1,
+                    revision: 1,
+                },
+            });
+        }
+        let mut cache = Compositor::default();
+        let (image, changed) = cache
+            .render(
+                &renderer.device,
+                &renderer.queue,
+                &mut renderer.renderer.borrow_mut(),
+                &drawings,
+                32,
+                16,
+            )
+            .unwrap();
+        assert!(changed);
+        let capture = |renderer: &mut SceneRenderer, image: vello::peniko::ImageData| {
+            let mut scene = Scene::new();
+            scene.draw_image(&image, kurbo::Affine::IDENTITY);
+            renderer.render(&scene, Color::WHITE).unwrap();
+            let readback = renderer.begin_screenshot().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                if let Some(pixels) = renderer.poll_screenshot(&readback).unwrap() {
+                    break pixels;
+                }
+                assert!(Instant::now() < deadline, "shared SDK composition readback timed out");
+                std::thread::yield_now();
+            }
+        };
+        let pixels = capture(&mut renderer, image.unwrap());
+        let pixel = |pixels: &super::ScreenshotPixels, x: usize| {
+            let offset = 8 * pixels.padded_bytes_per_row as usize + x * 4;
+            pixels.bytes[offset..offset + 4].to_vec()
+        };
+        assert_eq!(pixel(&pixels, 8), [255, 0, 0, 255]);
+        assert_eq!(pixel(&pixels, 20), [255, 255, 255, 255]);
+        assert_eq!(pixel(&pixels, 28), [0, 0, 255, 255]);
+        assert!(
+            !cache
+                .render(
+                    &renderer.device,
+                    &renderer.queue,
+                    &mut renderer.renderer.borrow_mut(),
+                    &drawings,
+                    32,
+                    16
+                )
+                .unwrap()
+                .1
+        );
+        assert_eq!(cache.metrics().render_passes, 1);
+        assert_eq!(cache.metrics().skipped_passes, 1);
+        drawings.remove(0);
+        let (image, changed) = cache
+            .render(
+                &renderer.device,
+                &renderer.queue,
+                &mut renderer.renderer.borrow_mut(),
+                &drawings,
+                32,
+                16,
+            )
+            .unwrap();
+        assert!(changed);
+        let pixels = capture(&mut renderer, image.unwrap());
+        assert_eq!(pixel(&pixels, 8), [255, 255, 255, 255]);
+        assert_eq!(pixel(&pixels, 20), [255, 255, 255, 255]);
+        assert_eq!(pixel(&pixels, 28), [0, 0, 255, 255]);
+        let generation = cache.generation();
+        assert!(
+            cache
+                .render(
+                    &renderer.device,
+                    &renderer.queue,
+                    &mut renderer.renderer.borrow_mut(),
+                    &drawings,
+                    64,
+                    32
+                )
+                .unwrap()
+                .1
+        );
+        assert_eq!(cache.metrics().target_allocations, 2);
+        assert!(cache.generation() > generation);
+        let metrics = cache.metrics();
+        drawings[0].scale = f64::NAN;
+        assert!(
+            cache
+                .render(
+                    &renderer.device,
+                    &renderer.queue,
+                    &mut renderer.renderer.borrow_mut(),
+                    &drawings,
+                    64,
+                    32
+                )
+                .is_err()
+        );
+        assert_eq!(cache.metrics(), metrics);
+        cache.clear(&mut renderer.renderer.borrow_mut());
+
+        // Independent SDK font services produce drawable retained glyphs without
+        // a terminal TextSystem. The compiled scene owns those font resources.
+        use vivid_protocol::overlay::wire::text::styled::{StyledText, TextStyle};
+        let mut native_fonts = vector_renderer::text::FontSystem::new("").unwrap();
+        let paragraph = StyledText::new(
+            "Wi",
+            TextStyle {
+                size: vivid_protocol::vector::Scalar::new(12.).unwrap(),
+                color: WireColor(0x000000ff),
+                ..TextStyle::default()
+            },
+        );
+        let (_, painted) =
+            vector_renderer::text::measure_styled(&mut native_fonts, &paragraph, true).unwrap();
+        let layouts = BTreeMap::from([(1, Arc::new(painted.unwrap()))]);
+        let mut canvas = Canvas::new();
+        canvas
+            .push(vivid_protocol::vector::Command::TextLayout {
+                layout: 1,
+                origin: vivid_protocol::vector::Point::new(0., 0.).unwrap(),
+            })
+            .unwrap();
+        let compiled = vector_renderer::compile_with_layouts(
+            &canvas,
+            &mut native_fonts,
+            &BTreeMap::new(),
+            &layouts,
+        )
+        .unwrap();
+        assert_eq!(compiled.retained_resource_count(), 1);
+        drop(layouts);
+        drop(native_fonts);
+        drawings[0].compiled = Arc::new(compiled);
+        drawings[0].scale = 1.;
+        drawings[0].bounds = Rect::new(4., 0., 24., 16.).unwrap();
+        drawings[0].submission.revision = 2;
+        let (image, changed) = cache
+            .render(
+                &renderer.device,
+                &renderer.queue,
+                &mut renderer.renderer.borrow_mut(),
+                &drawings,
+                32,
+                16,
+            )
+            .unwrap();
+        assert!(changed);
+        let pixels = capture(&mut renderer, image.unwrap());
+        let mut ink = 0;
+        for y in 0..16 {
+            for x in 0..32 {
+                let offset = y * pixels.padded_bytes_per_row as usize + x * 4;
+                let pixel = &pixels.bytes[offset..offset + 4];
+                if !(4..28).contains(&x) {
+                    assert_eq!(pixel, [255, 255, 255, 255]);
+                } else if pixel[0] < 240 {
+                    ink += 1;
+                }
+            }
+        }
+        assert!(ink > 10, "native SDK glyphs must produce visible pixels");
+        cache.clear(&mut renderer.renderer.borrow_mut());
     }
 
     #[cfg(any(unix, windows))]

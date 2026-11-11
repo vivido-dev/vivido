@@ -4,7 +4,6 @@ mod actor;
 mod audio;
 mod clock;
 mod decoder;
-mod ffmpeg;
 pub(crate) mod file_drop;
 pub(crate) mod hid;
 mod lane;
@@ -12,6 +11,7 @@ mod lease;
 mod mic;
 pub(crate) mod overlay;
 pub mod scene;
+mod session_status;
 pub mod target;
 pub(crate) mod trace;
 mod transport;
@@ -140,7 +140,6 @@ const LINKED_AUDIO_RECHECK: Duration = Duration::from_millis(20);
 const MINIMUM_LINKED_AUDIO_WAIT: Duration = Duration::from_millis(1);
 pub(crate) const MAX_SCENE_NODES: usize = 256;
 const MAX_LEASES: usize = 32;
-const MAX_STATUS_ENTRIES: usize = 64;
 /// Core §4.3 caps a lane control body at 64 KiB.
 const LANE_MAX_RECORD_BODY: u32 = 64 * 1024;
 /// `SURFACE_CHANGED` changed-field bits, core §10.
@@ -159,6 +158,7 @@ const NEED_KEYFRAME_DECODER_RESET: u64 = 2;
 const NEED_FULL_FRAME_NO_BASE: u64 = 1;
 
 struct SessionRuntime {
+    resume_generation: u64,
     control_body_limit: u32,
     identity: SessionIdentity,
     root_context: ContextIdentity,
@@ -2397,8 +2397,10 @@ fn establish_root_session(
             },
             activation_attempt_status: 0,
         },
-        session_revision: 1,
-        scene_revision: 0,
+        session_revision: shared.scene.status_revision(identity).map_or(Ok(1), |value| {
+            value.checked_add(1).ok_or_else(|| io::Error::other("session revision exhausted"))
+        })?,
+        scene_revision: shared.scene.scene_revision(identity),
         resource_contract: contract.clone(),
         establishment_state: match &principal {
             Principal::Resume { .. } => 1,
@@ -2537,6 +2539,7 @@ fn establish_root_session(
             .map_err(|_| io::Error::other("lease WELCOME commitment failed"))?;
     }
     let runtime = Arc::new(SessionRuntime {
+        resume_generation: welcome.resume_generation,
         control_body_limit: welcome
             .maximum_control_body
             .min(vivid_protocol::CONTROL_MAX_RECORD_BODY),
@@ -2575,6 +2578,10 @@ fn establish_root_session(
             .register_session(identity, TargetGeneration::new(target.generation()))
             .map_err(io::Error::other)?;
     }
+    shared
+        .scene
+        .restore_status_revision(identity, welcome.session_revision)
+        .map_err(io::Error::other)?;
     registry.insert_session(runtime.clone());
     for (issuer_session, lease_id, payload) in resumed_announcements {
         if let Some(issuer) = registry.sessions.get(&issuer_session)
@@ -2668,6 +2675,9 @@ fn dispatch_control(
     }
     let request_id = envelope.request_id;
     let value = Value::Map(envelope.payload.clone());
+    if session_status::mutation(record.record_type) {
+        shared.scene.check_status_revision(session.identity).map_err(ControlError::state)?;
+    }
     let reply = match record.record_type {
         messages::MEASURE_OVERLAY_TEXT => {
             overlay::text::measure(shared, session, record, request_id, &value)?;
@@ -2690,35 +2700,15 @@ fn dispatch_control(
         },
         messages::PING => (messages::PONG, 0, Envelope::new(request_id, envelope.payload).encode()),
         messages::GOODBYE => (messages::OK, 0, Ok(messages::ok(request_id))),
-        messages::QUERY_SESSION => {
-            // Core §10's schema, which is what a producer reconciles against after resume. The
-            // previous payload described the session's identity rather than its revisions, so it
-            // could not serve that purpose at all.
-            let summaries =
-                shared.scene.session_revision_summary(session.identity, MAX_STATUS_ENTRIES);
-            let scene_revision = shared.scene.scene_revision(session.identity);
-            (
-                messages::SESSION_STATUS,
-                0,
-                Envelope::new(
-                    request_id,
-                    vec![
-                        (0, Value::Unsigned(summaries.session_revision)),
-                        (1, Value::Unsigned(scene_revision)),
-                        (2, Value::Unsigned(shared.scene.target().generation())),
-                        // Establishment state: active. Vivido does not suspend a session yet, so
-                        // it is never `suspended` here.
-                        (3, Value::Unsigned(1)),
-                        (4, Value::Unsigned(session.lease.map(|_| 0).unwrap_or(0))),
-                        // Input is disabled until `desktop-input-v1` lands.
-                        (5, Value::Bool(true)),
-                        (6, Value::Array(summaries.entries)),
-                        (8, shared.scene.resource_usage(session.identity)),
-                    ],
-                )
-                .encode(),
+        messages::QUERY_SESSION => (
+            messages::SESSION_STATUS,
+            0,
+            Envelope::new(
+                request_id,
+                session_status::query(shared, session, record.object_id, request_id, &value)?,
             )
-        },
+            .encode(),
+        ),
         messages::SET_FILE_DROP_BINDING => {
             if !session.supports(registry::FILE_DROP) {
                 return Err(ControlError::unsupported("file-drop-v1 was not negotiated"));
@@ -3712,6 +3702,12 @@ fn dispatch_control(
                         )
                         .with_track(identity));
                     }
+                    if let Some(output) = &output {
+                        output.validate_play(start, minimum).map_err(|_| {
+                            ControlError::bad_state("audio PLAY exceeds output capacity")
+                                .with_track(identity)
+                        })?;
+                    }
                     shared
                         .scene
                         .configure_playback(identity, start, synchronized)
@@ -3720,7 +3716,10 @@ fn dispatch_control(
                         if synchronized {
                             output.pause();
                         }
-                        output.configure_play(start, minimum);
+                        output.configure_play(start, minimum).map_err(|_| {
+                            ControlError::bad_state("audio PLAY exceeds output capacity")
+                                .with_track(identity)
+                        })?;
                         if !synchronized {
                             output.start();
                         }
@@ -3907,6 +3906,9 @@ fn dispatch_control(
     let body = reply.2.map_err(|_| {
         ControlError::bad_message("reply encoding failed").without_rejection_trace()
     })?;
+    if session_status::mutation(record.record_type) {
+        shared.scene.advance_status_revision(session.identity).map_err(ControlError::state)?;
+    }
     Ok(Some((reply.0, reply.1, body)))
 }
 
@@ -4733,8 +4735,14 @@ fn channel_loop(
                 },
             };
             output.set_gain(status.audio_gain);
-            let decoder =
-                channel_io!(ChannelFailureKind::Decode, output.decoder(audio_configuration));
+            let decoder = channel_io!(
+                ChannelFailureKind::Decode,
+                audio::AudioDecoder::new(
+                    audio_configuration,
+                    output.format().sample_rate,
+                    output.format().channels
+                )
+            );
             if configuration.mode == vivid_protocol::track::TrackMode::Live {
                 output.configure_live(configuration.target_latency_us);
                 output.start();
@@ -8303,10 +8311,12 @@ mod tests {
         session.flush(&track, 1).unwrap();
         let replacement = session.open_track_channel(&track).unwrap();
         let target_pts_us = 7_000_000;
+        let seek_started = Instant::now();
         session.play(&track, target_pts_us, 0, 1_000_000).unwrap();
         // The producer freezes the clock it just published: the target is where the replacement
         // timeline starts, not permission to start running it before linked audio is restored.
         session.pause(&track).unwrap();
+        let seek_elapsed_us = i64::try_from(seek_started.elapsed().as_micros()).unwrap();
 
         let owner =
             SessionIdentity::new(service.shared.presenter, session.info().session_id).unwrap();
@@ -8331,8 +8341,8 @@ mod tests {
             "a frozen seek clock must not run before activation issues PLAY"
         );
         assert!(
-            (frozen - target_pts_us) < 1_000,
-            "the frozen clock holds the exact seek target, not {frozen}"
+            frozen >= target_pts_us && frozen - target_pts_us <= seek_elapsed_us,
+            "the frozen clock {frozen} exceeded its PLAY/PAUSE interval {seek_elapsed_us}"
         );
         replacement.close().unwrap();
         session.close().unwrap();
@@ -9895,7 +9905,82 @@ mod tests {
         let Some(Value::Array(entries)) = field(6) else {
             panic!("SESSION_STATUS must carry bounded object summaries")
         };
-        assert_eq!(entries.len(), 1, "the one surface this session owns");
+        assert_eq!(entries.len(), 2, "the root context and one surface this session owns");
+    }
+
+    #[test]
+    fn session_status_pagination_preserves_peer_ids_and_rejects_deleted_recreated_snapshots() {
+        use vivid_protocol::session_status::{Kind, Query};
+        let service =
+            socket_service!(VividService::start_with_wake(test_geometry(), Arc::new(|_| {})));
+        let mut first = connect(&service);
+        let mut second = connect(&service);
+        let definition = SurfaceDefinition {
+            context_id: first.info().root_context_id,
+            surface_id: 1,
+            semantic_profile: registry::TERMINAL_CONTENT.into(),
+            coordinate_model: CoordinateModel::TerminalContentCells,
+            logical_width: 2,
+            logical_height: 2,
+            scale_numerator: 1,
+            scale_denominator: 1,
+            rotation: 0,
+            descriptor: SurfaceDescriptor {
+                role: SurfaceRole::Figure,
+                title: "status pages".into(),
+                semantic_content_revision: 1,
+                semantic_availability: 0,
+                locator_hint: String::new(),
+            },
+            policy: 0,
+            profile_parameters: vec![],
+        };
+        let mut handles = Vec::new();
+        for producer in [&mut first, &mut second] {
+            let mut owned = Vec::new();
+            for id in 1..=3 {
+                let mut definition = definition.clone();
+                definition.context_id = producer.info().root_context_id;
+                definition.surface_id = id;
+                owned.push(
+                    producer.create_surface(definition, &RequestMetadata::default()).unwrap(),
+                );
+            }
+            handles.push(owned);
+        }
+        let query = Query { maximum_entries: 1, ..Default::default() };
+        let initial = first.query_session_page(&query).unwrap();
+        let continuation = Query { cursor: initial.cursor.clone(), ..query.clone() };
+        let error = second.query_session_page(&continuation).unwrap_err();
+        assert_eq!(
+            error.get_ref().unwrap().downcast_ref::<vivid_sdk::PresenterError>().unwrap().code,
+            messages::ERROR_PRECONDITION_FAILED
+        );
+        let mut changed = handles[1][0].definition().unwrap();
+        changed.descriptor.title = "peer changed".into();
+        changed.descriptor.semantic_content_revision += 1;
+        second.update_surface(&handles[1][0], changed, &RequestMetadata::default()).unwrap();
+        let mut page = initial.clone();
+        let mut entries = page.entries.clone();
+        while let Some(cursor) = page.cursor.take() {
+            page =
+                first.query_session_page(&Query { cursor: Some(cursor), ..query.clone() }).unwrap();
+            assert_eq!(page.session_revision, initial.session_revision);
+            entries.extend(page.entries.iter().copied());
+        }
+        assert_eq!(entries.len(), 4);
+        assert_eq!(entries[0].kind, Kind::Context);
+        assert_eq!(
+            entries[1..].iter().map(|entry| entry.surface_id).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        first.destroy_surface(&handles[0][0], &RequestMetadata::default()).unwrap();
+        first.create_surface(definition, &RequestMetadata::default()).unwrap();
+        first.query_session_page(&continuation).unwrap_err();
+        let fresh = first.query_session_page(&Default::default()).unwrap();
+        assert!(fresh.session_revision > initial.session_revision);
+        assert_eq!(fresh.usage, [3, 0, 0]);
+        assert_eq!(second.query_session_page(&Default::default()).unwrap().usage, [3, 0, 0]);
     }
 
     fn resumable_definition(
@@ -10471,7 +10556,13 @@ mod tests {
             RawClient::resume(&service, context_id, 11, child_session, 0, &resume_key).unwrap();
         assert_eq!(resumed.session_id, child_session, "the logical session survives the loss");
         assert_ne!(resumed.session_tag, tag, "resume derives fresh key material");
-        assert!(resumed.query_session().is_ok(), "the resumed session serves control traffic");
+        let status = vivid_protocol::session_status::Page::decode(
+            0,
+            &Value::Map(resumed.query_session().unwrap()),
+        )
+        .unwrap();
+        assert_eq!(status.resume_generation, 1);
+        assert!(status.input_disabled);
     }
 
     #[test]

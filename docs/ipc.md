@@ -1,5 +1,10 @@
 # Vivido agent automation IPC
 
+Native sockets and named pipes are supplied by `vivid_sdk::local_control`, shared
+with compositor management. Vivido retains its version-2 framing, methods,
+discovery, limits and terminal policy; the shared transport owns peer validation,
+native deadlines and cancellation.
+
 Vivido exposes an owner-only automation service on Linux, macOS, and Windows. It is intended for
 agents, test runners, and local programs which need to control and observe both Vivido and terminal
 applications running inside it. The service is available from windowed instances and from

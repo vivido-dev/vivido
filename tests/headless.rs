@@ -669,6 +669,20 @@ fn running_program_distinguishes_an_idle_shell_from_a_running_child() {
     wait_for(&|value| value.is_null(), "the shell never returned to idle after the child exited");
 }
 
+/// A direct executable keeps the original PTY group but must still require close consent.
+#[cfg(unix)]
+#[test]
+#[ignore = "spawns processes and needs a wgpu adapter"]
+fn running_program_includes_a_direct_executable_in_the_original_process_group() {
+    let session = Session::start("direct-program", &["/bin/cat".into()]);
+    wait_for_inspect(
+        &session,
+        "/running_program",
+        &|value| value.as_str() == Some("cat"),
+        "direct program was treated as an idle shell",
+    );
+}
+
 /// OSC 9;4 draws a bar in the headless renderer — the path Vivida's embedded panes render
 /// through — reports it in `inspect`, and clears it on removal.
 #[test]

@@ -2429,6 +2429,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "objc2-core-video"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d425caf1df73233f29fd8a5c3e5edbc30d2d4307870f802d18f00d83dc5141a6"
+dependencies = [
+ "bitflags 2.13.1",
+ "objc2 0.6.5",
+ "objc2-core-foundation",
+ "objc2-core-graphics",
+ "objc2-io-surface",
+ "objc2-metal 0.3.2",
+]
+
+[[package]]
 name = "objc2-encode"
 version = "4.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2730,8 +2744,6 @@ dependencies = [
 [[package]]
 name = "parley"
 version = "0.12.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "61bd0c0c1737f0b3d3726dc06b225083af213b61913e4fbae1670613a106c6ce"
 dependencies = [
  "fontique",
  "hashbrown 0.17.1",
@@ -4035,6 +4047,44 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
+name = "vivid_audio"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "pkg-config",
+ "vivid_protocol",
+ "vivid_video",
+]
+
+[[package]]
+name = "vivid_audio_output"
+version = "0.1.0"
+dependencies = [
+ "cpal",
+ "ringbuf",
+ "vivid_protocol",
+]
+
+[[package]]
+name = "vivid_gpu_share"
+version = "0.1.0"
+dependencies = [
+ "objc2 0.6.5",
+ "objc2-core-foundation",
+ "objc2-core-video",
+ "objc2-metal 0.3.2",
+ "wgpu",
+]
+
+[[package]]
+name = "vivid_local_control"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "vivid_protocol"
 version = "1.5.12"
 dependencies = [
@@ -4052,9 +4102,29 @@ dependencies = [
 name = "vivid_sdk"
 version = "1.5.12"
 dependencies = [
+ "bytemuck",
  "getrandom 0.4.3",
+ "parley",
+ "unicode-segmentation",
+ "vello",
+ "vivid_audio",
+ "vivid_audio_output",
+ "vivid_gpu_share",
+ "vivid_local_control",
  "vivid_protocol",
+ "vivid_video",
+ "wgpu",
  "zeroize",
+]
+
+[[package]]
+name = "vivid_video"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "log",
+ "pkg-config",
+ "vivid_protocol",
 ]
 
 [[package]]
@@ -4099,14 +4169,12 @@ dependencies = [
  "objc2-core-foundation",
  "objc2-foundation 0.3.2",
  "parking_lot 0.13.0",
- "parley",
  "percent-encoding",
  "piper",
  "pkg-config",
  "polling",
  "pollster",
  "regex-automata",
- "ringbuf",
  "rpassword",
  "rustix 1.1.4",
  "rustix-openpty",

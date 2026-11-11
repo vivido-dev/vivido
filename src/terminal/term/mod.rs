@@ -3906,7 +3906,6 @@ mod tests {
     use crate::terminal::event::VoidListener;
     use crate::terminal::index::Side;
     use crate::terminal::term::test::{TermSize, mock_term};
-    use crate::terminal::vvte::ansi::{self};
 
     #[cfg(windows)]
     #[derive(Clone, Default)]

@@ -4000,6 +4000,112 @@ impl Processor {
         );
     }
 
+    /// Installs host text-clipboard services before creating terminal panes.
+    ///
+    /// Existing copy, paste, selection, and OSC clipboard policies remain authoritative.
+    /// Hosted media clipboard access is unavailable until supplied by a separate adapter.
+    ///
+    /// # Errors
+    /// Returns an error if any pane has already been created.
+    pub fn set_host_clipboard(
+        &mut self,
+        host: Box<dyn crate::clipboard::HostClipboard>,
+    ) -> Result<(), IpcError> {
+        if !self.windows.is_empty() {
+            return Err(IpcError::new(
+                "invalid_state",
+                "host clipboard must be installed before panes",
+            ));
+        }
+        self.clipboard = Clipboard::hosted(host);
+        Ok(())
+    }
+
+    /// Routes a host key through terminal bindings and writes encoded application input.
+    ///
+    /// The host must deliver keys only to its active pane. No native event loop is required.
+    ///
+    /// # Errors
+    /// Returns an error for an unknown pane, invalid key/modifiers, or a closed PTY.
+    #[cfg(any(unix, windows))]
+    pub fn host_key_input(
+        &mut self,
+        window_id: WindowId,
+        key: &str,
+        mods: &[String],
+        repeated: bool,
+    ) -> Result<(), IpcError> {
+        // One Unicode scalar or a short named key, plus the four supported modifiers.
+        if key.len() > 128 || mods.len() > 4 || mods.iter().any(|modifier| modifier.len() > 8) {
+            return Err(IpcError::new("invalid_params", "host key exceeds input limits"));
+        }
+        let window = self
+            .windows
+            .get_mut(&window_id)
+            .ok_or_else(|| IpcError::new("window_not_found", "host pane is missing"))?;
+        let params = crate::cli::IpcKey {
+            key: key.to_owned(),
+            mods: mods.to_vec(),
+            repeat: 1,
+            route: crate::cli::IpcInputRoute::Ui,
+            target: crate::cli::IpcTarget { window_id: Some(window.ipc_window_id()) },
+            report: false,
+        };
+        window.flush_host_input(&self.proxy, &mut self.clipboard, &mut self.scheduler);
+        let bytes = window.ui_key(
+            &params,
+            repeated,
+            #[cfg(target_os = "macos")]
+            None,
+            &self.proxy,
+            &mut self.clipboard,
+            &mut self.scheduler,
+        )?;
+        if !bytes.is_empty() {
+            window
+                .write_automation_bytes(bytes)
+                .map_err(|_| IpcError::new("pty_closed", "host input could not reach the PTY"))?;
+        }
+        Ok(())
+    }
+
+    /// Routes host-supplied clipboard text through native paste protection and UI state.
+    ///
+    /// The host must deliver text only to the active pane. Unlike IME commits,
+    /// clipboard text retains unsafe-paste confirmation and bracketed-paste policy.
+    ///
+    /// # Errors
+    /// Returns an error for excess text, an unknown pane, or a closed PTY.
+    #[cfg(any(unix, windows))]
+    pub fn host_clipboard_paste(
+        &mut self,
+        window_id: WindowId,
+        text: &str,
+    ) -> Result<(), IpcError> {
+        if text.len() > 1024 * 1024 {
+            return Err(IpcError::new("invalid_params", "host clipboard paste exceeds 1 MiB"));
+        }
+        let window = self
+            .windows
+            .get_mut(&window_id)
+            .ok_or_else(|| IpcError::new("window_not_found", "host pane is missing"))?;
+        window.flush_host_input(&self.proxy, &mut self.clipboard, &mut self.scheduler);
+        let bytes = window.ui_clipboard_paste(
+            text,
+            #[cfg(target_os = "macos")]
+            None,
+            &self.proxy,
+            &mut self.clipboard,
+            &mut self.scheduler,
+        );
+        if !bytes.is_empty() {
+            window
+                .write_automation_bytes(bytes)
+                .map_err(|_| IpcError::new("pty_closed", "host paste could not reach the PTY"))?;
+        }
+        Ok(())
+    }
+
     /// Resize an embedded terminal and immediately update its grid and render target.
     pub fn resize_embedded_window(&mut self, window_id: WindowId, size: PhysicalSize<u32>) {
         let Some(window) = self.windows.get_mut(&window_id) else {
@@ -6775,12 +6881,16 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                     {
                         match self.ctx.config.terminal.osc52.0.read {
                             ClipboardAccess::Allow => {
-                                let text = self.ctx.clipboard.load(clipboard);
+                                let Some(text) = self.ctx.clipboard.load(clipboard) else {
+                                    return;
+                                };
                                 self.ctx.write_to_pty(reply(&text).into_bytes())
                             },
                             // The prompt shows, and an answer sends, the text as it is now.
                             ClipboardAccess::Ask => {
-                                let text = self.ctx.clipboard.load(clipboard);
+                                let Some(text) = self.ctx.clipboard.load(clipboard) else {
+                                    return;
+                                };
                                 // Without a primary selection that load read the clipboard, so
                                 // the prompt names the clipboard.
                                 let clipboard = if self.ctx.clipboard.has_selection() {
