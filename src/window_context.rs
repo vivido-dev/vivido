@@ -860,7 +860,12 @@ impl WindowContext {
         self.display.window.requested_redraw = false;
         self.vivid_service.flush_display_change(self.vivid_resize_settled.take());
 
-        if self.occluded {
+        // Explicit native unmapping need not emit Occluded before a queued redraw.
+        // Keep damage and original overlay receipts pending until the window is visible.
+        if self.occluded
+            || self.display.window.is_visible() == Some(false)
+            || self.display.window.is_minimized()
+        {
             return false;
         }
 
@@ -887,7 +892,15 @@ impl WindowContext {
 
         // A just-revealed native pane can still have an unavailable swapchain. Keep its update
         // pending for the frame timer instead of waiting for more PTY output or keyboard input.
-        self.dirty |= !presented;
+        self.dirty |= !presented || self.display.needs_overlay_frame();
+        #[cfg(all(feature = "test-util", target_os = "macos"))]
+        if presented && let Some(revision) = self.display.take_overlay_stream_input_for_check() {
+            // Ordered after this real native draw, through normal host input.
+            self.vivid_service.overlay_keyboard(
+                vivid_protocol::overlay::Event::Text(format!("window stream Ω {revision}")),
+                false,
+            );
+        }
 
         // Request immediate re-draw if the visual bell, scrollbar, or progress animation is not
         // done yet. This must run after the draw: the scrollbar wakes inside it, when the
@@ -2671,6 +2684,10 @@ impl WindowContext {
             self.display.window.set_visible(visible);
         }
 
+        if !visible {
+            self.vivid_service.overlay_focus(false);
+        }
+
         // A window an external layout owner just revealed is on screen now, but an automation show
         // carries no focus, resize, or occlusion event to mark it dirty — and `draw` suppresses a
         // frame entirely while the window is still flagged occluded (it was created behind the
@@ -2971,6 +2988,10 @@ impl WindowContext {
             },
         });
         // Set apart because the literal above is at the macro's recursion limit.
+        #[cfg(all(feature = "test-util", target_os = "macos"))]
+        {
+            inspect["overlay_stream_check"] = self.display.overlay_stream_for_check();
+        }
         inspect["clipboard_prompt"] = clipboard_prompt.into();
         inspect["shell_integration"] =
             self.shell_integration.map(tty::IntegratedShell::name).into();

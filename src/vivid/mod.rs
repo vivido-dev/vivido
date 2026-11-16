@@ -3,6 +3,7 @@
 mod actor;
 mod audio;
 mod clock;
+mod connections;
 mod decoder;
 pub(crate) mod file_drop;
 pub(crate) mod hid;
@@ -10,6 +11,7 @@ mod lane;
 mod lease;
 mod mic;
 pub(crate) mod overlay;
+mod resume_wait;
 pub mod scene;
 mod session_status;
 pub mod target;
@@ -28,7 +30,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -178,6 +180,9 @@ struct SessionRuntime {
     actor_ingress: Mutex<Option<mpsc::SyncSender<ActorMessage>>>,
     /// Shutdown handle for the session's control reader, retained for host-owned recovery.
     control_shutdown: Mutex<Option<ReadShutdown>>,
+    connections: Arc<connections::Connections>,
+    #[cfg(test)]
+    retirement_gate: Mutex<Option<Arc<AtomicBool>>>,
     contexts: Mutex<HashMap<u64, ContextState>>,
     seen_anchors: Mutex<HashSet<(u64, u64)>>,
     /// The lease this session was activated from, if it is a leased child rather than a root.
@@ -284,6 +289,9 @@ struct ServiceShared {
     /// Validated clipboard writes awaiting the UI thread, which owns the real clipboard.
     overlay_clipboard: Mutex<BTreeMap<SessionIdentity, String>>,
     registry: Mutex<Registry>,
+    retired: Condvar,
+    #[cfg(test)]
+    waiting_resumes: AtomicUsize,
     audio_outputs: Mutex<HashMap<TrackIdentity, Arc<AudioOutput>>>,
     next_session: AtomicU64,
     active_connections: AtomicUsize,
@@ -336,9 +344,18 @@ struct SessionCleanup {
 impl Drop for SessionCleanup {
     fn drop(&mut self) {
         *lock(&self.session.actor_ingress) = None;
+        self.session.connections.close();
         self.egress.close();
         self.egress.join();
+        #[cfg(test)]
+        if let Some(gate) = lock(&self.session.retirement_gate).take() {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !gate.load(Ordering::Acquire) && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(1));
+            }
+        }
         finish_session(&self.shared, &self.session, self.clean_goodbye.load(Ordering::Acquire));
+        self.shared.retired.notify_all();
     }
 }
 
@@ -390,8 +407,27 @@ impl Drop for LaneCleanup {
             .as_ref()
             .is_some_and(|state| state.generation() == self.generation);
         if owns_lane {
-            let surfaces =
-                lock(&self.shared.overlays).lane_lost(self.session.identity, self.generation);
+            // A resumed runtime may reuse lane generation one. Keep its publication
+            // serialized with the runtime check, not merely the logical owner ID.
+            let surfaces = {
+                let mut registry = lock(&self.shared.registry);
+                let current = registry.sessions.get(&self.session.identity.session_id());
+                if current.is_some_and(|current| Arc::ptr_eq(current, &self.session)) {
+                    let retain_metadata = self.session.lease.is_some_and(|key| {
+                        registry
+                            .leases
+                            .get_mut(&key)
+                            .is_some_and(|lease| lease.suspends_on_unclean_loss())
+                    });
+                    lock(&self.shared.overlays).lane_lost(
+                        self.session.identity,
+                        self.generation,
+                        retain_metadata,
+                    )
+                } else {
+                    Vec::new()
+                }
+            };
             for surface in surfaces {
                 let _ = self.shared.scene.destroy_surface(surface);
             }
@@ -584,6 +620,9 @@ impl VividService {
             overlays: scene.overlays().clone(),
             overlay_clipboard: Mutex::new(BTreeMap::new()),
             registry: Mutex::new(Registry::default()),
+            retired: Condvar::new(),
+            #[cfg(test)]
+            waiting_resumes: AtomicUsize::new(0),
             audio_outputs: Mutex::new(HashMap::new()),
             next_session: AtomicU64::new(1),
             active_connections: AtomicUsize::new(0),
@@ -1510,6 +1549,7 @@ fn handle_control(
     let first = reader.read_record(ConnectionKind::Control)?;
     let (hello_request, hello) = Hello::decode(&first.body)?;
     writer.set_maximum(hello.maximum_control_body.min(vivid_protocol::CONTROL_MAX_RECORD_BODY))?;
+    resume_wait::retire(shared, &hello, preface, reader.handshake_deadline()?)?;
     // Install the bounded egress before publishing the session. The registry lock held during
     // establishment keeps outside announcements behind WELCOME, and once it is released every
     // visible session is already able to queue them.
@@ -1937,6 +1977,7 @@ fn suspend_lease(
     // Security §7.1: input goes first, before any state is released.
     revoke_input(session, grant_reason::SUSPENSION);
     shared.scene.suspend_session(session.identity);
+    lock(&shared.overlays).suspend_owner(session.identity);
     stop_session_audio(shared, session.identity);
     let issuer = lock(&shared.registry).sessions.get(&key.0.session_id()).cloned();
     if let Some(issuer) = issuer {
@@ -2016,7 +2057,12 @@ fn revoke_lease(
         lock(&shared.overlays).remove_owner(child);
         shared.scene.remove_session(child);
     }
-    drop(child_runtime);
+    if let Some(runtime) = child_runtime {
+        if let Some(shutdown) = lock(&runtime.control_shutdown).as_ref() {
+            shutdown.stop();
+        }
+        runtime.connections.close();
+    }
 
     if let Ok(body) = Envelope::new(0, payload).encode() {
         issuer.post_control(messages::SESSION_LEASE_CHANGED, key.2, body);
@@ -2026,11 +2072,6 @@ fn revoke_lease(
 }
 
 fn finish_session(shared: &Arc<ServiceShared>, session: &Arc<SessionRuntime>, clean: bool) {
-    // Overlay windows never become retained terminal posters, even for clean or leased exits.
-    let overlays = lock(&shared.overlays).remove_owner(session.identity);
-    for surface in overlays {
-        let _ = shared.scene.destroy_surface(surface);
-    }
     // Preserve the exact establishment outcome until the first request or its deadline.
     if !clean && let Some(key) = session.lease {
         let mut registry = lock(&shared.registry);
@@ -2060,6 +2101,12 @@ fn finish_session(shared: &Arc<ServiceShared>, session: &Arc<SessionRuntime>, cl
             let reason = if clean { reason::CLEAN_CLOSE } else { reason::UNCLEAN_LOSS };
             revoke_lease(shared, &issuer, key, reason);
         }
+    }
+    // Final exits remove overlay windows; policy-one suspension above retains
+    // their metadata while revoking input and connection-scoped media.
+    let overlays = lock(&shared.overlays).remove_owner(session.identity);
+    for surface in overlays {
+        let _ = shared.scene.destroy_surface(surface);
     }
     lock(&shared.file_drops).remove_session(session.identity);
     lock(&shared.registry).remove_session(session.identity.session_id());
@@ -2552,6 +2599,9 @@ fn establish_root_session(
         egress: Mutex::new(Some(egress)),
         actor_ingress: Mutex::new(None),
         control_shutdown: Mutex::new(None),
+        connections: Arc::new(connections::Connections::default()),
+        #[cfg(test)]
+        retirement_gate: Mutex::new(None),
         contexts: Mutex::new(HashMap::from([(
             root_context.context_id(),
             ContextState::root(identity, root_context.context_id(), classes, contract)
@@ -4262,6 +4312,8 @@ fn handle_track_channel(
         )?;
         return Err(io::Error::new(ErrorKind::PermissionDenied, "channel authentication failed"));
     }
+    let _connection = session.connections.register(reader.shutdown_handle()?)?;
+    let transport_admission = session.connections.admit()?;
     // The channel tag is proved, so this connection is a media channel that may then wait on its
     // producer for as long as the track lives.
     if let Err(error) = pending.authenticated(reader) {
@@ -4297,6 +4349,7 @@ fn handle_track_channel(
         )
         .encode()?;
         writer.write_record(messages::CHANNEL_ACCEPTED, open.track_id, &body)?;
+        drop(transport_admission);
         let result = mic::serve(reader, &writer, shared, identity, generation);
         attachment.detach();
         return result;
@@ -4441,6 +4494,7 @@ fn handle_track_channel(
             "replayed": replayed,
         }),
     );
+    drop(transport_admission);
     let result = reader
         .set_maximum(status.configuration.maximum_record_body)
         .map_err(|error| {
@@ -4450,14 +4504,14 @@ fn handle_track_channel(
                 ChannelRecordContext::default(),
             )
         })
-        .and_then(|()| channel_loop(reader, &writer, shared, identity, generation));
+        .and_then(|()| channel_loop(reader, &writer, shared, &session, identity, generation));
     attachment.detach();
     let clean = result.is_ok();
     let context = match &result {
         Ok(context) => *context,
         Err(failure) => failure.context,
     };
-    let lost_status = if result.is_err() {
+    let lost_status = if result.is_err() && !session.connections.stopped() {
         shared.scene.lose_track(identity, generation).ok().flatten()
     } else {
         None
@@ -4687,6 +4741,7 @@ fn channel_loop(
     reader: &mut Reader,
     writer: &Writer,
     shared: &Arc<ServiceShared>,
+    session: &Arc<SessionRuntime>,
     identity: TrackIdentity,
     generation: ChannelGeneration,
 ) -> Result<ChannelRecordContext, ChannelFailure> {
@@ -4770,8 +4825,12 @@ fn channel_loop(
     // reads into one buffer for the life of the connection instead of allocating per record — on
     // the path that carries every video packet, every raster frame and every audio packet.
     let mut body = Vec::new();
-    let mut vector = matches!(configuration.kind, KindConfiguration::VectorScene(_))
-        .then(|| overlay::VectorWorker::new(lock(&shared.overlays).font()));
+    let mut vector = matches!(configuration.kind, KindConfiguration::VectorScene(_)).then(|| {
+        // Font discovery can be slow on a cold worker. Release the host lock
+        // before construction so unrelated input renewals and controls proceed.
+        let font = lock(&shared.overlays).font();
+        overlay::VectorWorker::new(font)
+    });
     loop {
         let mut recovery_unit = false;
         let header = match reader.read_record_into(ConnectionKind::Track, &mut body) {
@@ -4802,6 +4861,7 @@ fn channel_loop(
                 channel_io!(
                     ChannelFailureKind::RateLimit,
                     pace_ingress(
+                        &session.connections,
                         &mut byte_bucket,
                         &mut record_bucket,
                         &mut last_rate_update,
@@ -4830,6 +4890,10 @@ fn channel_loop(
                         context,
                     ));
                 };
+                let _admission = channel_io!(
+                    ChannelFailureKind::MediaAdmission,
+                    session.connections.admit_media()
+                );
                 channel_other!(
                     ChannelFailureKind::MediaAdmission,
                     worker.process(
@@ -5496,12 +5560,16 @@ fn shapes_ingress(configuration: &TrackConfiguration) -> bool {
 }
 
 fn pace_ingress(
+    connections: &connections::Connections,
     byte_bucket: &mut TokenBucket,
     record_bucket: &mut TokenBucket,
     last_update: &mut Instant,
     body_bytes: u64,
 ) -> io::Result<()> {
     loop {
+        if connections.stopped() {
+            return Err(io::Error::new(ErrorKind::ConnectionAborted, "session is retiring"));
+        }
         let now = Instant::now();
         let elapsed = now.saturating_duration_since(*last_update);
         *last_update = now;
@@ -5651,6 +5719,8 @@ fn handle_lane(
             "lane authentication failed",
         ));
     }
+    let _connection = session.connections.register(reader.shutdown_handle()?)?;
+    let transport_admission = session.connections.admit()?;
     // The lane tag is proved. An interactive lane is quiet by nature — it carries input the
     // presenter sends when the user acts — so it must not be deadlined from here.
     pending.authenticated(reader)?;
@@ -5716,6 +5786,7 @@ fn handle_lane(
         session.wake_actor();
     }
 
+    drop(transport_admission);
     let outcome = serve_lane(reader, &writer, &session, shared);
     drop(cleanup);
     outcome
@@ -5837,6 +5908,7 @@ fn serve_lane(
             Err(error) if error.kind() == ErrorKind::UnexpectedEof => return Ok(()),
             Err(error) => return Err(error),
         };
+        let _admission = session.connections.admit()?;
         let overlay = session.supports(registry::OVERLAY_INPUT);
         let legal = if overlay {
             matches!(
@@ -6540,6 +6612,28 @@ mod tests {
         vivid_sdk::Session::connect(test_config(service)).unwrap()
     }
 
+    mod overlay_refusal;
+    mod overlay_resume;
+    mod runtime;
+
+    fn completed_overlay_image(
+        renderer: &mut crate::display::renderer::SceneRenderer,
+        size: &SizeInfo,
+        previous: Option<u64>,
+    ) -> (vello::peniko::ImageData, u64) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(media) = renderer.prepare_media(size, 0, &Default::default())
+                && previous != Some(media.image_generation)
+                && let Some(image) = media.overlay
+            {
+                return (image, media.image_generation);
+            }
+            assert!(Instant::now() < deadline, "checked overlay image did not complete");
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
     #[test]
     fn native_overlay_windows_present_move_receive_input_and_cleanup_independently() {
         let _gpu = crate::display::renderer::gpu_test_lock();
@@ -6603,6 +6697,11 @@ mod tests {
         let receipt = window.submit(text_scene.clone()).unwrap();
         assert_eq!(receipt.wait(Duration::ZERO).unwrap(), None);
         neighbor.present(canvas.clone()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while lock(&service.shared.overlays).drawing(&service.scene).len() != 2 {
+            assert!(Instant::now() < deadline, "both overlay scenes must reach the receiver");
+            thread::sleep(Duration::from_millis(1));
+        }
         {
             use crate::display::renderer::SceneRenderer;
             use crate::display::window::RenderSource;
@@ -6615,11 +6714,11 @@ mod tests {
             ) {
                 renderer.set_vivid_scene(service.scene());
                 let size = SizeInfo::new(800., 600., 10., 25., 0., 0., false);
-                let media = renderer.prepare_media(&size, 0, &Default::default()).unwrap();
+                let (image, generation) = completed_overlay_image(&mut renderer, &size, None);
                 assert_eq!(renderer.overlay_metrics().render_passes, 1);
                 assert_eq!(renderer.overlay_metrics().target_allocations, 1);
                 let mut composed = vello::Scene::new();
-                composed.draw_image(media.overlay.as_ref().unwrap(), Affine::IDENTITY);
+                composed.draw_image(&image, Affine::IDENTITY);
                 assert!(renderer.render(&composed, VelloColor::from_rgb8(0, 255, 0)).unwrap());
                 assert_eq!(
                     receipt.wait(Duration::from_secs(2)).unwrap(),
@@ -6646,17 +6745,19 @@ mod tests {
                     "unchanged overlays reuse their GPU target"
                 );
                 assert_eq!(renderer.overlay_metrics().skipped_passes, 1);
-                let generation = media.image_generation;
                 let compiled = lock(&service.shared.overlays).compiled_scene_count();
                 window.set_bounds(Rect::new(20., 20., 100., 80.).unwrap()).unwrap();
-                let moved = renderer.prepare_media(&size, 0, &Default::default()).unwrap();
-                assert!(moved.changed);
+                let (moved, moved_generation) =
+                    completed_overlay_image(&mut renderer, &size, Some(generation));
                 assert_eq!(renderer.overlay_metrics().render_passes, 2);
                 assert_eq!(lock(&service.shared.overlays).compiled_scene_count(), compiled);
-                assert_eq!(
-                    moved.image_generation, generation,
-                    "movement preserves the texture used by cached terminal scenes"
+                assert_ne!(
+                    moved_generation, generation,
+                    "immutable replacement invalidates cached terminal scenes"
                 );
+                let mut composed = vello::Scene::new();
+                composed.draw_image(&moved, Affine::IDENTITY);
+                assert!(renderer.render(&composed, VelloColor::from_rgb8(0, 255, 0)).unwrap());
             } else {
                 // Everything below needs a presented overlay to hit, focus, and dismiss.
                 eprintln!("overlay GPU readback unavailable: no usable adapter; skipping");
@@ -6826,9 +6927,9 @@ mod tests {
         .expect("overlay performance measurement requires a Vello adapter");
         renderer.set_vivid_scene(service.scene());
         let size = SizeInfo::new(800., 600., 10., 25., 0., 0., false);
-        let prepared = renderer.prepare_media(&size, 0, &Default::default()).unwrap();
+        let (image, mut generation) = completed_overlay_image(&mut renderer, &size, None);
         let mut scene = vello::Scene::new();
-        scene.draw_image(prepared.overlay.as_ref().unwrap(), vello::kurbo::Affine::IDENTITY);
+        scene.draw_image(&image, vello::kurbo::Affine::IDENTITY);
         renderer.render(&scene, vello::peniko::Color::BLACK).unwrap();
         let compiled = lock(&service.shared.overlays).compiled_scene_count();
 
@@ -6839,7 +6940,11 @@ mod tests {
             let y = 20. + f64::from((frame % 120) as u16);
             let started = Instant::now();
             window.set_bounds(Rect::new(x, y, 240., 160.).unwrap()).unwrap();
-            assert!(renderer.prepare_media(&size, 0, &Default::default()).unwrap().changed);
+            let (image, next) = completed_overlay_image(&mut renderer, &size, Some(generation));
+            generation = next;
+            let mut scene = vello::Scene::new();
+            scene.draw_image(&image, vello::kurbo::Affine::IDENTITY);
+            assert!(renderer.render(&scene, vello::peniko::Color::BLACK).unwrap());
             samples.push(started.elapsed());
         }
         samples.sort_unstable();
@@ -6927,7 +7032,7 @@ mod tests {
             "VIVID_OVERLAY_TEST_PYTHON",
             &["vivid_sdk/.venv/bin/python".into(), "vivid_sdk/.venv/Scripts/python.exe".into()],
         );
-        let node = std::env::var_os("VIVID_OVERLAY_TEST_NODE").unwrap_or_else(|| "node".into());
+        let node = runtime::node();
         // The Lua fixture loads the module `vivid_sdk/lua/build.sh` stages, for whichever Lua
         // it was built for; LuaJIT is that script's default.
         let lua = std::env::var_os("VIVID_OVERLAY_TEST_LUA").unwrap_or_else(|| {
@@ -6983,15 +7088,10 @@ mod tests {
             }
             // Read actual Vello pixels while the child holds its scene until the release marker.
             renderer.set_vivid_scene(service.scene());
-            let media = renderer
-                .prepare_media(
-                    &SizeInfo::new(800., 600., 10., 25., 0., 0., false),
-                    0,
-                    &Default::default(),
-                )
-                .unwrap();
+            let size = SizeInfo::new(800., 600., 10., 25., 0., 0., false);
+            let (image, generation) = completed_overlay_image(&mut renderer, &size, None);
             let mut scene = vello::Scene::new();
-            scene.draw_image(media.overlay.as_ref().unwrap(), vello::kurbo::Affine::IDENTITY);
+            scene.draw_image(&image, vello::kurbo::Affine::IDENTITY);
             renderer.render(&scene, vello::peniko::Color::TRANSPARENT).unwrap();
             let screenshot = renderer.begin_screenshot().unwrap();
             let pixels = loop {
@@ -7042,18 +7142,10 @@ mod tests {
                         .iter()
                         .any(|d| d.revision == 3)
                 {
-                    let media = renderer
-                        .prepare_media(
-                            &SizeInfo::new(800., 600., 10., 25., 0., 0., false),
-                            0,
-                            &Default::default(),
-                        )
-                        .unwrap();
+                    let (image, _) =
+                        completed_overlay_image(&mut renderer, &size, Some(generation));
                     let mut scene = vello::Scene::new();
-                    scene.draw_image(
-                        media.overlay.as_ref().unwrap(),
-                        vello::kurbo::Affine::IDENTITY,
-                    );
+                    scene.draw_image(&image, vello::kurbo::Affine::IDENTITY);
                     assert!(renderer.render(&scene, vello::peniko::Color::TRANSPARENT).unwrap());
                     replacement_rendered = true;
                 }

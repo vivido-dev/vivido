@@ -15,9 +15,13 @@ that lets AI agents drive, read, and observe its windows.
 Embedding hosts can supply bounded text clipboard services and route native
 clipboard paste through Vivido's existing policies. See [host integration](docs/embedding.md).
 
-Portable overlay compilation, shaped-text painting and the cached GPU overlay target
-use `vivid_sdk::vector_renderer`. Terminal font selection and authenticated overlay
-lifecycle remain in Vivido.
+Portable overlay compilation, shaped-text painting and checked immutable GPU overlay
+exports use `vivid_sdk::vector_renderer`. A bounded worker keeps pending overlay GPU
+work independent of terminal rendering; final composition admits only its actual
+imported image. Terminal font selection and authenticated overlay lifecycle remain
+in Vivido. Fresh peer imports can advance during bounded private diagnosis; the
+SDK's checked shader loading protects arena-overflow handling. See
+[overlay frame reservations](docs/embedding.md#overlay-frame-reservations).
 
 ### Performance
 

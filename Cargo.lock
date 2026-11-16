@@ -4017,8 +4017,6 @@ dependencies = [
 [[package]]
 name = "vello_encoding"
 version = "0.11.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b1fb9548d2b46b0f79137b5b1d208ecbd76d432f74e7a2ba838615d117f11532"
 dependencies = [
  "bytemuck",
  "guillotiere",
@@ -4086,7 +4084,7 @@ dependencies = [
 
 [[package]]
 name = "vivid_protocol"
-version = "1.5.12"
+version = "1.5.13"
 dependencies = [
  "base64",
  "hmac",
@@ -4100,7 +4098,7 @@ dependencies = [
 
 [[package]]
 name = "vivid_sdk"
-version = "1.5.12"
+version = "1.5.13"
 dependencies = [
  "bytemuck",
  "getrandom 0.4.3",
@@ -4112,9 +4110,26 @@ dependencies = [
  "vivid_gpu_share",
  "vivid_local_control",
  "vivid_protocol",
+ "vivid_vello_backend",
  "vivid_video",
  "wgpu",
  "zeroize",
+]
+
+[[package]]
+name = "vivid_vello_backend"
+version = "0.11.0-vivid.1"
+dependencies = [
+ "bytemuck",
+ "futures-intrusive",
+ "log",
+ "peniko",
+ "static_assertions",
+ "thiserror 2.0.18",
+ "vello",
+ "vello_encoding",
+ "vello_shaders",
+ "wgpu",
 ]
 
 [[package]]

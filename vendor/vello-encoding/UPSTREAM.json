@@ -1,0 +1,92 @@
+{
+  "upstream_crate": "vello_encoding",
+  "version": "0.11.0",
+  "registry_checksum": "b1fb9548d2b46b0f79137b5b1d208ecbd76d432f74e7a2ba838615d117f11532",
+  "changed_upstream_files": [
+    "src/image_cache.rs",
+    "src/resolve.rs"
+  ],
+  "change": "On atlas pressure, reclaim recent residency absent from the complete incoming scene, while protecting all current image IDs including images resolved later. Keep dirty override uploads, atlas dimensions and ordinary cache reuse unchanged.",
+  "upstream_files": [
+    {
+      "path": "Cargo.toml",
+      "sha256": "62a12f7485bae20543faff96fb7dce53047fc833e3be4209df4d0c778d9fe00c"
+    },
+    {
+      "path": "LICENSE-APACHE",
+      "sha256": "a6cba85bc92e0cff7a450b1d873c0eaa2e9fc96bf472df0247a26bec77bf3ff9"
+    },
+    {
+      "path": "LICENSE-MIT",
+      "sha256": "adf157330f722fe7cfd5964a2a6974eff851b718228c6735724a11706e6f4dec"
+    },
+    {
+      "path": "README.md",
+      "sha256": "013801b523e3fd66c6711ae96e68e00ed7656a9c0d00fa666aac49bf33004034"
+    },
+    {
+      "path": "src/binning.rs",
+      "sha256": "54582a5d6ec47132e5175dbba38146444044a76d004d7fa985a8e7569e3f2ffa"
+    },
+    {
+      "path": "src/clip.rs",
+      "sha256": "3302a87d35e423bcc34a796c0f524f08d913151009884c62b80a9d502ae9ad9b"
+    },
+    {
+      "path": "src/config.rs",
+      "sha256": "463c2b62c490fc3d574d45d49faf4b884183fa5851d680f1abd7122613ddcefc"
+    },
+    {
+      "path": "src/draw.rs",
+      "sha256": "0b2d4ccdce8862aa78b66141ab9065b76bbd4a0c0a7b47c56af304cee42830be"
+    },
+    {
+      "path": "src/encoding.rs",
+      "sha256": "04d4f80c9555153b86c870a1445cd267cfa1e704abfd96c6ac0e5a743b259317"
+    },
+    {
+      "path": "src/estimate.rs",
+      "sha256": "4d273f51dd921149d2910dead3760d065b68fae76914cc14abdfc9fbf7cb7ac1"
+    },
+    {
+      "path": "src/glyph.rs",
+      "sha256": "b76534d2e11431fa9dc60a9b92eb40548f71f2c303c2b811322fa8a10b3b1271"
+    },
+    {
+      "path": "src/glyph_cache.rs",
+      "sha256": "a064500663e36ddfe674b55bbd2ed9757ff9ed8c031ceef442895313b2585976"
+    },
+    {
+      "path": "src/image_cache.rs",
+      "sha256": "4a6e4cd2e63e5515e609130427ae30ff709ea0e1fd67d4ceb03bdf45a5aef395"
+    },
+    {
+      "path": "src/lib.rs",
+      "sha256": "bedec800e8405bc36afe801a28c8819953151079f00a6d2c8b7ce3d0791d78ee"
+    },
+    {
+      "path": "src/mask.rs",
+      "sha256": "50fd4c2c3f5c71f25a9c634511e5c9a048c0c5b5c24f035dba170c8538eaa091"
+    },
+    {
+      "path": "src/math.rs",
+      "sha256": "59d65cad5505858a13b5eb11251d31166119cf5ae1bc1cc3514009523344014f"
+    },
+    {
+      "path": "src/monoid.rs",
+      "sha256": "d08220ab67288ad9e7fd85900151ddf6105978cd0772942bf85f6001221023e9"
+    },
+    {
+      "path": "src/path.rs",
+      "sha256": "ea94b3018a243f29e6954f4669a247dcea2d2fbaac23b9f376d00ad9cab78c49"
+    },
+    {
+      "path": "src/ramp_cache.rs",
+      "sha256": "4a6e94385f0478f974d8520078182bfa68312a956dd35091f6a8967a7964efde"
+    },
+    {
+      "path": "src/resolve.rs",
+      "sha256": "e7a7f28c28051c90b6ad9afdec9c8432fb7e4bd8311917297ad3c7ff0996aede"
+    }
+  ]
+}

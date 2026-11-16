@@ -425,6 +425,20 @@ const INITIAL_RENDERER_RETRY: Duration = Duration::from_millis(100);
 const MAX_RENDERER_RETRY: Duration = Duration::from_secs(5);
 
 impl Display {
+    #[cfg(all(feature = "test-util", target_os = "macos"))]
+    pub(crate) fn take_overlay_stream_input_for_check(&self) -> Option<u64> {
+        self.scene_renderer.take_overlay_stream_input_for_check()
+    }
+
+    #[cfg(all(feature = "test-util", target_os = "macos"))]
+    pub(crate) fn overlay_stream_for_check(&self) -> serde_json::Value {
+        self.scene_renderer.overlay_stream_for_check()
+    }
+
+    pub(crate) fn needs_overlay_frame(&self) -> bool {
+        self.scene_renderer.needs_overlay_frame()
+    }
+
     pub(crate) fn mark_vivid_frame(&mut self) {
         self.vivid_frame_requested = true;
     }
@@ -899,7 +913,7 @@ impl Display {
         let mic_label =
             self.vivid_scene.as_ref().map(|s| s.microphone().label()).unwrap_or_default();
         let can_reuse_scene = mic_label == self.cached_microphone_label
-            && (self.vivid_frame_requested || kitty_changed)
+            && (self.vivid_frame_requested || kitty_changed || self.scene_renderer.needs_overlay_frame())
             && self.cached_scene.is_some()
             && self.cached_media_generation == media_generation
             && self.damage_tracker.frame().is_empty()

@@ -606,6 +606,11 @@ impl Window {
     pub fn order_front_without_focus(&self) {
         let Some(window) = self.ns_window() else { return };
 
+        // Ordering a miniaturized window does not remove it from the Dock.
+        // Restore its native mapping before applying the host's stacking policy.
+        if window.isMiniaturized() {
+            window.deminiaturize(None);
+        }
         if let Some(parent) = window.parentWindow() {
             // A pane belongs above its host, even when the host is behind another app.
             // `orderFrontRegardless` raises it above that app on every layout refresh.
@@ -832,11 +837,17 @@ impl Window {
         true
     }
 
-    /// Whether the native resize currently being dispatched represents a minimized window.
-    #[cfg(windows)]
+    /// Whether the native window is currently minimized.
     pub(crate) fn is_minimized(&self) -> bool {
-        let Some(RawWindowHandle::Win32(handle)) = self.raw_window_handle() else { return false };
-        super::windows_live_move::is_minimized(handle.hwnd.get() as *mut std::ffi::c_void)
+        #[cfg(windows)]
+        {
+            let Some(RawWindowHandle::Win32(handle)) = self.raw_window_handle() else {
+                return false;
+            };
+            super::windows_live_move::is_minimized(handle.hwnd.get() as *mut std::ffi::c_void)
+        }
+        #[cfg(not(windows))]
+        self.backend.winit().and_then(|window| window.is_minimized()).unwrap_or(false)
     }
 
     /// Set whether the windowing system may resize the window through user interaction.

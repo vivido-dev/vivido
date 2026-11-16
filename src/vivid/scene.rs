@@ -334,7 +334,46 @@ struct State {
     render_cache: Option<Arc<Vec<RenderItem>>>,
 }
 
+/// A short scene-lock lease; never retained across GPU work or native presentation.
+pub(super) struct OverlayAdmission<'a> {
+    _state: std::sync::MutexGuard<'a, State>,
+}
+
 impl State {
+    fn overlay_binding(
+        &self,
+        identity: SurfaceIdentity,
+        submission: vivid_protocol::overlay::wire::Submission,
+    ) -> Option<TargetGeneration> {
+        if submission.address.context_id != identity.context().context_id()
+            || submission.address.surface_id != identity.surface_id()
+        {
+            return None;
+        }
+        let owner = identity.context().session();
+        if self.detached_sessions.contains(&owner) {
+            return None;
+        }
+        let surface = self.surfaces.get(&identity)?;
+        if surface.lifecycle != 1
+            || surface.generation.get() != submission.address.generation
+            || surface.active_slots.get(&vivid_sdk::SLOT_VECTOR) != Some(&submission.track_id)
+        {
+            return None;
+        }
+        let track = self.tracks.get(&identity.track(submission.track_id).ok()?)?;
+        if track.lifecycle != 1
+            || track.state.lost
+            || track.state.milestones & (MILESTONE_CHANNEL_ACCEPTED | MILESTONE_CHANNEL_DETACHED)
+                != MILESTONE_CHANNEL_ACCEPTED
+            || track.state.channel_generation.get() != submission.channel_generation
+            || track.state.media_epoch != submission.epoch
+        {
+            return None;
+        }
+        Some(self.scenes.get(&owner)?.target_generation)
+    }
+
     fn invalidate_topology(&mut self) {
         self.topology_revision = self.topology_revision.wrapping_add(1);
         self.render_cache = None;
@@ -1087,6 +1126,34 @@ impl SharedScene {
             .and_then(|track| track.playback.map(PlaybackClock::current_pts_us))
     }
 
+    /// Checks one complete overlay binding under the scene lock.
+    pub(super) fn overlay_binding(
+        &self,
+        identity: SurfaceIdentity,
+        submission: vivid_protocol::overlay::wire::Submission,
+    ) -> Option<TargetGeneration> {
+        self.lock().overlay_binding(identity, submission)
+    }
+
+    /// Holds source authority stable through final overlay receipt publication.
+    pub(super) fn admit_overlay(
+        &self,
+        target_generation: u64,
+        bindings: impl IntoIterator<
+            Item = (SurfaceIdentity, vivid_protocol::overlay::wire::Submission, TargetGeneration),
+        >,
+    ) -> Option<OverlayAdmission<'_>> {
+        let state = self.lock();
+        if self.target().generation() != target_generation
+            || !bindings.into_iter().all(|(surface, submission, target)| {
+                state.overlay_binding(surface, submission) == Some(target)
+            })
+        {
+            return None;
+        }
+        Some(OverlayAdmission { _state: state })
+    }
+
     pub fn active_track(
         &self,
         surface_identity: SurfaceIdentity,
@@ -1250,6 +1317,7 @@ impl SharedScene {
         let track = state.tracks.get_mut(&identity).ok_or("track does not exist")?;
         if track.state.channel_generation != generation
             || track.lifecycle != 1
+            || track.state.milestones & MILESTONE_CHANNEL_DETACHED != 0
             || !matches!(track.configuration.kind, KindConfiguration::VectorScene(_))
             || sequence <= track.last_media_record_sequence
             || sequence <= 1
@@ -1284,7 +1352,10 @@ impl SharedScene {
         }
         let mut state = self.lock();
         let track = state.tracks.get_mut(&identity).ok_or("track does not exist")?;
-        if track.state.channel_generation != generation || track.lifecycle != 1 {
+        if track.state.channel_generation != generation
+            || track.lifecycle != 1
+            || track.state.milestones & MILESTONE_CHANNEL_DETACHED != 0
+        {
             return Err("stale channel generation");
         }
         track
@@ -1327,7 +1398,10 @@ impl SharedScene {
         let frame = Arc::new(frame);
         let replacing = {
             let track = state.tracks.get_mut(&identity).ok_or("track does not exist")?;
-            if track.state.channel_generation != generation || track.lifecycle != 1 {
+            if track.state.channel_generation != generation
+                || track.lifecycle != 1
+                || track.state.milestones & MILESTONE_CHANNEL_DETACHED != 0
+            {
                 return Err("stale channel generation");
             }
             track.last_decoded_pts_us = Some(frame.pts_us);
@@ -1404,7 +1478,10 @@ impl SharedScene {
     ) -> Result<(), &'static str> {
         let mut state = self.lock();
         let track = state.tracks.get_mut(&identity).ok_or("track does not exist")?;
-        if track.state.channel_generation != generation || track.lifecycle != 1 {
+        if track.state.channel_generation != generation
+            || track.lifecycle != 1
+            || track.state.milestones & MILESTONE_CHANNEL_DETACHED != 0
+        {
             return Err("stale channel generation");
         }
         if track.state.milestones & MILESTONE_OUTPUT_READY == 0 {
@@ -1653,6 +1730,9 @@ impl SharedScene {
         let mut state = self.lock();
         loop {
             let track = state.tracks.get(&identity).ok_or("track does not exist")?;
+            if track.state.milestones & MILESTONE_CHANNEL_DETACHED != 0 {
+                return Err("track channel is detached");
+            }
             if track.configuration.mode != TrackMode::Timed
                 || track.frame.is_none()
                 || pts_us == i64::MIN

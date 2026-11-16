@@ -63,6 +63,13 @@ incremental adoption policy, not a declaration of complete guideline compliance.
 
 ## Native platforms and dependencies
 
+Ignored tests need native GPU, PTY and private socket access; run them outside a
+sandbox that denies those resources. The overlay binding test uses the first
+Node executable on `PATH` that successfully runs `--version`, so an installation
+with missing shared libraries cannot shadow a working later installation. Set
+`VIVID_OVERLAY_TEST_NODE` to select a specific runtime; explicit selections are
+used directly and their errors remain visible.
+
 Root workflows verify macOS, Windows, and Linux. The standalone
 `windows/setup-helper/Cargo.toml` workspace has its own fmt/test/Clippy steps in Windows CI.
 Its tiny, transient installer launcher retains the system allocator to avoid adding a native

@@ -141,6 +141,11 @@ impl Reader {
         Ok(())
     }
 
+    /// The original absolute acceptance deadline, never extended by resume waiting.
+    pub fn handshake_deadline(&self) -> io::Result<Instant> {
+        self.handshake_deadline.ok_or_else(|| io::Error::other("handshake already completed"))
+    }
+
     /// Shorten the handshake deadline so a test does not have to wait the production ten seconds.
     #[cfg(test)]
     pub fn set_handshake_deadline(&mut self, within: Duration) {

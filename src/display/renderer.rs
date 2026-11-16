@@ -1,3 +1,6 @@
+#[cfg(all(feature = "test-util", target_os = "macos"))]
+mod overlay_stream_check;
+
 use std::cell::RefCell;
 use std::rc::{Rc, Weak};
 #[cfg(any(unix, windows))]
@@ -220,6 +223,8 @@ pub struct SceneRenderer {
     has_rendered_frame: bool,
     /// Whether the window-sized GPU memory has been handed back while the window is hidden.
     hidden_released: bool,
+    #[cfg(all(feature = "test-util", target_os = "macos"))]
+    stream_check: RefCell<Option<overlay_stream_check::Probe>>,
 }
 
 #[cfg(windows)]
@@ -570,6 +575,16 @@ impl SceneRenderer {
             create_render_target(&device, target_size.width, target_size.height);
         gpu_health.check()?;
 
+        let overlay_health = gpu_health.clone();
+        let overlays = super::overlay::OverlayRenderer::new(
+            vivid_sdk::vector_renderer::compositor::texture::SharedDevice::new(
+                &device,
+                &queue,
+                move || overlay_health.failed(),
+            ),
+            &device,
+            &queue,
+        );
         Ok(Self {
             context,
             _offscreen_context: offscreen_context,
@@ -583,7 +598,7 @@ impl SceneRenderer {
             valid_target,
             max_surface_dimension,
             media,
-            overlays: Default::default(),
+            overlays,
             corners: None,
             corner_radius: 0.0,
             render_target,
@@ -591,6 +606,8 @@ impl SceneRenderer {
             target_size,
             has_rendered_frame: false,
             hidden_released: false,
+            #[cfg(all(feature = "test-util", target_os = "macos"))]
+            stream_check: RefCell::new(overlay_stream_check::Probe::from_env()),
         })
     }
 
@@ -626,7 +643,11 @@ impl SceneRenderer {
         }
         self.media.clear_sources();
         self.has_rendered_frame = false;
-        *self = Self::new(source, size, transparent)?;
+        let pool = self.overlays.pool();
+        self.overlays.clear(&mut self.renderer.borrow_mut());
+        let mut replacement = Self::new(source, size, transparent)?;
+        replacement.overlays.set_pool(pool);
+        *self = replacement;
         Ok(())
     }
 
@@ -741,6 +762,49 @@ impl SceneRenderer {
         self.overlays.metrics()
     }
 
+    #[cfg(test)]
+    pub(crate) fn overlay_diagnosing_for_test(&self) -> bool {
+        self.overlays.diagnosing_for_test()
+    }
+    #[cfg(test)]
+    pub(crate) fn overlay_diagnostic_stream_for_test(&self) -> (u64, u64) {
+        self.overlays.diagnostic_stream_for_test()
+    }
+
+    /// Requests actual logical-device loss without waiting on pending GPU work.
+    #[cfg(test)]
+    pub(crate) fn lose_overlay_device_for_test(&self) {
+        self.device.destroy();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hold_overlay_for_test(&self, hold: bool) {
+        self.overlays.hold_for_test(hold);
+    }
+    #[cfg(test)]
+    pub(crate) fn overlay_held_for_test(&self) -> bool {
+        self.overlays.held_for_test()
+    }
+    #[cfg(test)]
+    pub(crate) fn expire_completed_overlay_for_test(&self, expire: bool) {
+        self.overlays.expire_completed_for_test(expire);
+    }
+    #[cfg(test)]
+    pub(crate) fn overlay_pool_for_test(
+        &self,
+    ) -> vivid_sdk::vector_renderer::compositor::texture::TexturePool {
+        self.overlays.pool()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn overlay_allocations_for_test(&self) -> usize {
+        self.overlays.allocations_for_test()
+    }
+
+    pub(crate) fn needs_overlay_frame(&self) -> bool {
+        self.overlays.needs_frame()
+    }
+
     /// Prepare media resources needed by the next terminal frame.
     pub fn prepare_media(
         &mut self,
@@ -754,20 +818,14 @@ impl SceneRenderer {
         let mut renderer = self.renderer.borrow_mut();
         let media =
             self.media.draw(&self.device, &self.queue, &mut renderer, size, display_offset, kitty);
-        let (overlay, changed) = match self.overlays.draw(
-            &self.device,
-            &self.queue,
-            &mut renderer,
-            size.width() as u32,
-            size.height() as u32,
-        ) {
-            Ok(result) => result,
-            Err(error) => {
-                log::warn!("overlay rendering failed: {error}");
-                self.overlays.finish(false);
-                return media;
-            },
-        };
+        let (overlay, changed) =
+            match self.overlays.draw(&mut renderer, size.width() as u32, size.height() as u32) {
+                Ok(result) => result,
+                Err(error) => {
+                    log::warn!("overlay rendering failed: {error}");
+                    return media;
+                },
+            };
         if media.is_none() && overlay.is_none() {
             return None;
         }
@@ -908,7 +966,11 @@ impl SceneRenderer {
 
         self.gpu_health.check()?;
         self.has_rendered_frame = true;
-        self.overlays.finish(true);
+        self.overlays.finish_frame(scene, &mut self.renderer.borrow_mut());
+        #[cfg(all(feature = "test-util", target_os = "macos"))]
+        if self.surface.is_some() {
+            self.record_overlay_stream_for_check();
+        }
         Ok(true)
     }
 
@@ -2427,7 +2489,10 @@ mod tests {
         };
         use vivid_sdk::vector_renderer::{
             self,
-            compositor::{Compositor, Drawing},
+            compositor::{
+                Drawing,
+                texture::{Completed, SharedDevice, Texture, TexturePool, TextureRenderer},
+            },
         };
 
         let _gpu = gpu_lock();
@@ -2466,33 +2531,59 @@ mod tests {
                 },
             });
         }
-        let mut cache = Compositor::default();
-        let (image, changed) = cache
-            .render(
-                &renderer.device,
-                &renderer.queue,
-                &mut renderer.renderer.borrow_mut(),
-                &drawings,
-                32,
-                16,
-            )
-            .unwrap();
-        assert!(changed);
-        let capture = |renderer: &mut SceneRenderer, image: vello::peniko::ImageData| {
+        fn compose(
+            gpu: &mut TextureRenderer,
+            drawings: &[Drawing],
+            width: u32,
+            height: u32,
+        ) -> Completed {
+            let job = gpu.start(drawings, &[], width, height).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                if let Some(completed) = gpu.poll().unwrap() {
+                    assert_eq!(completed.job, job);
+                    return completed;
+                }
+                assert!(Instant::now() < deadline, "checked SDK composition timed out");
+                std::thread::yield_now();
+            }
+        }
+        fn retire(renderer: &SceneRenderer, pool: &TexturePool) {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while pool.reserved() != 0 {
+                renderer.device.poll(wgpu::PollType::Poll).unwrap();
+                assert!(Instant::now() < deadline, "SDK texture charge failed to retire");
+                std::thread::yield_now();
+            }
+        }
+        let health = renderer.gpu_health.clone();
+        let shared = SharedDevice::new(&renderer.device, &renderer.queue, move || health.failed());
+        let pool = TexturePool::default();
+        let mut gpu = TextureRenderer::new(&shared, &pool).unwrap();
+        let capture = |renderer: &mut SceneRenderer, texture: &Texture| {
+            let import = texture.register(&mut renderer.renderer.borrow_mut());
             let mut scene = Scene::new();
-            scene.draw_image(&image, kurbo::Affine::IDENTITY);
+            scene.draw_image(import.image().unwrap(), kurbo::Affine::IDENTITY);
             renderer.render(&scene, Color::WHITE).unwrap();
             let readback = renderer.begin_screenshot().unwrap();
             let deadline = Instant::now() + Duration::from_secs(10);
-            loop {
+            let pixels = loop {
                 if let Some(pixels) = renderer.poll_screenshot(&readback).unwrap() {
                     break pixels;
                 }
                 assert!(Instant::now() < deadline, "shared SDK composition readback timed out");
                 std::thread::yield_now();
-            }
+            };
+            assert!(import.unregister(&mut renderer.renderer.borrow_mut()));
+            pixels
         };
-        let pixels = capture(&mut renderer, image.unwrap());
+        let completed = compose(&mut gpu, &drawings, 32, 16);
+        assert!(completed.redrawn);
+        assert_eq!(completed.texture.dimensions(), (32, 16));
+        let first_job = completed.job.clone();
+        let pixels = capture(&mut renderer, &completed.texture);
+        drop(completed);
+        retire(&renderer, &pool);
         let pixel = |pixels: &super::ScreenshotPixels, x: usize| {
             let offset = 8 * pixels.padded_bytes_per_row as usize + x * 4;
             pixels.bytes[offset..offset + 4].to_vec()
@@ -2500,69 +2591,35 @@ mod tests {
         assert_eq!(pixel(&pixels, 8), [255, 0, 0, 255]);
         assert_eq!(pixel(&pixels, 20), [255, 255, 255, 255]);
         assert_eq!(pixel(&pixels, 28), [0, 0, 255, 255]);
-        assert!(
-            !cache
-                .render(
-                    &renderer.device,
-                    &renderer.queue,
-                    &mut renderer.renderer.borrow_mut(),
-                    &drawings,
-                    32,
-                    16
-                )
-                .unwrap()
-                .1
-        );
-        assert_eq!(cache.metrics().render_passes, 1);
-        assert_eq!(cache.metrics().skipped_passes, 1);
+        let completed = compose(&mut gpu, &drawings, 32, 16);
+        assert!(!completed.redrawn);
+        assert_ne!(completed.job, first_job);
+        assert_eq!(gpu.metrics().render_passes, 1);
+        assert_eq!(gpu.metrics().skipped_passes, 1);
+        drop(completed);
+        retire(&renderer, &pool);
         drawings.remove(0);
-        let (image, changed) = cache
-            .render(
-                &renderer.device,
-                &renderer.queue,
-                &mut renderer.renderer.borrow_mut(),
-                &drawings,
-                32,
-                16,
-            )
-            .unwrap();
-        assert!(changed);
-        let pixels = capture(&mut renderer, image.unwrap());
+        let completed = compose(&mut gpu, &drawings, 32, 16);
+        assert!(completed.redrawn);
+        let pixels = capture(&mut renderer, &completed.texture);
         assert_eq!(pixel(&pixels, 8), [255, 255, 255, 255]);
         assert_eq!(pixel(&pixels, 20), [255, 255, 255, 255]);
         assert_eq!(pixel(&pixels, 28), [0, 0, 255, 255]);
-        let generation = cache.generation();
-        assert!(
-            cache
-                .render(
-                    &renderer.device,
-                    &renderer.queue,
-                    &mut renderer.renderer.borrow_mut(),
-                    &drawings,
-                    64,
-                    32
-                )
-                .unwrap()
-                .1
-        );
-        assert_eq!(cache.metrics().target_allocations, 2);
-        assert!(cache.generation() > generation);
-        let metrics = cache.metrics();
+        drop(completed);
+        retire(&renderer, &pool);
+        let completed = compose(&mut gpu, &drawings, 64, 32);
+        assert!(completed.redrawn);
+        assert_eq!(completed.texture.dimensions(), (64, 32));
+        assert_ne!(completed.job, first_job);
+        assert_eq!(gpu.metrics().target_allocations, 2);
+        drop(completed);
+        retire(&renderer, &pool);
+        let metrics = gpu.metrics();
         drawings[0].scale = f64::NAN;
-        assert!(
-            cache
-                .render(
-                    &renderer.device,
-                    &renderer.queue,
-                    &mut renderer.renderer.borrow_mut(),
-                    &drawings,
-                    64,
-                    32
-                )
-                .is_err()
-        );
-        assert_eq!(cache.metrics(), metrics);
-        cache.clear(&mut renderer.renderer.borrow_mut());
+        assert!(gpu.start(&drawings, &[], 64, 32).is_err());
+        assert_eq!(gpu.metrics(), metrics);
+        assert!(!gpu.is_busy());
+        assert_eq!(pool.reserved(), 0);
 
         // Independent SDK font services produce drawable retained glyphs without
         // a terminal TextSystem. The compiled scene owns those font resources.
@@ -2600,18 +2657,9 @@ mod tests {
         drawings[0].scale = 1.;
         drawings[0].bounds = Rect::new(4., 0., 24., 16.).unwrap();
         drawings[0].submission.revision = 2;
-        let (image, changed) = cache
-            .render(
-                &renderer.device,
-                &renderer.queue,
-                &mut renderer.renderer.borrow_mut(),
-                &drawings,
-                32,
-                16,
-            )
-            .unwrap();
-        assert!(changed);
-        let pixels = capture(&mut renderer, image.unwrap());
+        let completed = compose(&mut gpu, &drawings, 32, 16);
+        assert!(completed.redrawn);
+        let pixels = capture(&mut renderer, &completed.texture);
         let mut ink = 0;
         for y in 0..16 {
             for x in 0..32 {
@@ -2625,7 +2673,8 @@ mod tests {
             }
         }
         assert!(ink > 10, "native SDK glyphs must produce visible pixels");
-        cache.clear(&mut renderer.renderer.borrow_mut());
+        drop(completed);
+        retire(&renderer, &pool);
     }
 
     #[cfg(any(unix, windows))]

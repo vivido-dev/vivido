@@ -27,6 +27,9 @@ use crate::display::vector::compile;
 #[path = "overlay_text.rs"]
 pub(super) mod text;
 
+mod snapshot;
+pub(crate) use snapshot::Snapshot;
+
 /// Assistive-technology actions awaiting their producer's lane, per owning session: the window
 /// they name and the encoded event body, in the order they were asked for.
 ///
@@ -63,7 +66,9 @@ pub(crate) struct Host {
     outcomes: HashMap<SessionIdentity, VecDeque<SubmissionOutcome>>,
     overflow: HashSet<SessionIdentity>,
     displayed: HashMap<SurfaceIdentity, Drawing>,
-    inflight: HashMap<SurfaceIdentity, Drawing>,
+    reserved: Vec<Arc<Snapshot>>,
+    admitted: Weak<Snapshot>,
+    reservation_guards: HashMap<TrackIdentity, Arc<()>>,
     viewport_revision: u64,
     viewport_dirty: HashSet<SessionIdentity>,
     /// The environment a producer sees, and the revision it last changed at.
@@ -74,6 +79,8 @@ pub(crate) struct Host {
     refresh_interval_us: Option<u64>,
     pub(super) actors: HashMap<SessionIdentity, Weak<SessionRuntime>>,
     lanes: HashMap<SessionIdentity, (u64, Instant)>,
+    suspended_input: HashSet<SessionIdentity>,
+    awaiting_fresh_input: HashSet<SurfaceIdentity>,
     font: crate::config::font::Font,
     compiled_scenes: u64,
     presented_scenes: u64,
@@ -301,9 +308,9 @@ impl Host {
         for (owner, submission) in pending {
             self.resolve(owner, submission, PresentationOutcome::Superseded);
         }
+        self.reservation_guards.retain(|track, _| track.surface() != identity);
         self.displayed.remove(&identity);
         self.semantics.remove(&identity);
-        self.inflight.remove(&identity);
         self.active.remove(&identity);
         self.submissions.retain(|id, _| id.surface() != identity);
         self.scenes.retain(|id, _| id.surface() != identity);
@@ -317,6 +324,7 @@ impl Host {
         }
         self.retire_presentation(identity);
         self.accepted.remove(&identity);
+        self.awaiting_fresh_input.remove(&identity);
         self.windows.close(identity, DismissReason::Closed);
         self.surfaces.remove(&identity);
     }
@@ -335,7 +343,81 @@ impl Host {
         }
     }
 
+    /// Retains leased window metadata while discarding connection-scoped media and input.
+    pub(super) fn suspend_owner(&mut self, owner: SessionIdentity) {
+        if self.windows.has_owner(owner) {
+            let _ = self.windows.set_owner_input(owner, false);
+            self.suspended_input.insert(owner);
+        }
+        self.awaiting_fresh_input.extend(
+            self.windows
+                .stacked()
+                .filter(|w| w.identity.context().session() == owner)
+                .map(|w| w.identity),
+        );
+        self.layouts.retain(|(surface, _), _| surface.context().session() != owner);
+        self.text_jobs.remove(&owner);
+        if self.editor.is_some_and(|(id, _)| id.context().session() == owner) {
+            self.editor = None;
+        }
+        if self.last_gesture.is_some_and(|(id, _)| id.context().session() == owner) {
+            self.last_gesture = None;
+        }
+        self.accessibility.remove(&owner);
+        self.semantics.retain(|id, _| id.context().session() != owner);
+        self.scenes.retain(|id, _| id.surface().context().session() != owner);
+        self.submissions.retain(|id, _| id.surface().context().session() != owner);
+        self.active.retain(|id, _| id.context().session() != owner);
+        self.displayed.retain(|id, _| id.context().session() != owner);
+        self.reservation_guards.retain(|id, _| id.surface().context().session() != owner);
+        self.pending.retain(|(id, _)| *id != owner);
+        self.outcomes.remove(&owner);
+        self.viewport_dirty.remove(&owner);
+        self.environment_dirty.remove(&owner);
+        self.actors.remove(&owner);
+        self.lanes.remove(&owner);
+        self.assets.retain(|_, (token, _)| token.strong_count() != 0);
+        // Keep surfaces/windows and the accepted revision floor for reconciliation.
+    }
+
+    fn restore_suspended_input(&mut self) {
+        // A hidden retained window may become visible after another window has
+        // recovered. Revoke this owner's input until every visible window is fresh.
+        self.awaiting_fresh_input.retain(|surface| !self.displayed.contains_key(surface));
+        let stale: HashSet<_> = self
+            .windows
+            .visible()
+            .filter(|w| self.awaiting_fresh_input.contains(&w.identity))
+            .map(|w| w.identity.context().session())
+            .collect();
+        for owner in &stale {
+            let _ = self.windows.set_owner_input(*owner, false);
+            self.suspended_input.insert(*owner);
+        }
+        let owners: Vec<_> = self.suspended_input.iter().copied().collect();
+        for owner in owners {
+            if stale.contains(&owner)
+                || !self.lanes.get(&owner).is_some_and(|(_, deadline)| Instant::now() < *deadline)
+                || !self.displayed.keys().any(|surface| surface.context().session() == owner)
+            {
+                continue;
+            }
+            if self.windows.take_overflow(owner) {
+                self.overflow.insert(owner);
+            }
+            if !self.overflow.contains(&owner) && self.windows.set_owner_input(owner, true).is_ok()
+            {
+                self.suspended_input.remove(&owner);
+            }
+            if let Some(actor) = self.actors.get(&owner).and_then(Weak::upgrade) {
+                actor.wake_actor();
+            }
+        }
+    }
+
     pub fn remove_owner(&mut self, owner: SessionIdentity) -> Vec<SurfaceIdentity> {
+        self.suspended_input.remove(&owner);
+        self.awaiting_fresh_input.retain(|surface| surface.context().session() != owner);
         self.layouts.retain(|(surface, _), _| surface.context().session() != owner);
         if self.editor.is_some_and(|(id, _)| id.context().session() == owner) {
             self.editor = None;
@@ -349,7 +431,7 @@ impl Host {
         self.active.retain(|id, _| id.context().session() != owner);
         self.accepted.retain(|id, _| id.context().session() != owner);
         self.displayed.retain(|id, _| id.context().session() != owner);
-        self.inflight.retain(|id, _| id.context().session() != owner);
+        self.reservation_guards.retain(|id, _| id.surface().context().session() != owner);
         self.assets.retain(|_, (token, _)| token.strong_count() != 0);
         self.pending.retain(|(id, _)| *id != owner);
         self.outcomes.remove(&owner);
@@ -361,6 +443,9 @@ impl Host {
     }
 
     pub(super) fn lane_open(&mut self, owner: SessionIdentity, generation: u64) {
+        if self.lanes.get(&owner).is_some_and(|(live, _)| *live != generation) {
+            self.suspend_owner(owner);
+        }
         self.lanes.insert(owner, (generation, Instant::now() + Duration::from_secs(5)));
         self.viewport_dirty.insert(owner);
         self.environment_dirty.insert(owner);
@@ -370,9 +455,15 @@ impl Host {
         &mut self,
         owner: SessionIdentity,
         generation: u64,
+        retain_metadata: bool,
     ) -> Vec<SurfaceIdentity> {
         if self.lanes.get(&owner).is_some_and(|(live, _)| *live == generation) {
-            self.remove_owner(owner)
+            if retain_metadata {
+                self.suspend_owner(owner);
+                Vec::new()
+            } else {
+                self.remove_owner(owner)
+            }
         } else {
             Vec::new()
         }
@@ -489,6 +580,7 @@ impl Host {
         action: vivid_protocol::overlay::wire::Action,
         viewport: Viewport,
     ) -> Result<Option<u64>, vivid_protocol::vector::InvalidScene> {
+        self.restore_suspended_input();
         let result = self.windows.apply_action(owner, action, viewport);
         if result.is_ok() {
             self.refresh_hover();
@@ -591,6 +683,7 @@ impl Host {
 
     /// Re-evaluate hover after the scene under the pointer changed.
     pub(super) fn refresh_hover(&mut self) {
+        self.restore_suspended_input();
         let Some(point) = self.pointer_position else {
             return;
         };
@@ -654,6 +747,7 @@ impl Host {
     }
 
     pub fn remove_track(&mut self, identity: TrackIdentity) {
+        self.reservation_guards.remove(&identity);
         self.scenes.remove(&identity);
         if let Some(submission) = self.submissions.remove(&identity) {
             self.supersede(identity.surface().context().session(), submission);
@@ -743,66 +837,6 @@ impl Host {
                 actor.wake_actor();
             }
         }
-    }
-
-    fn supersede(&mut self, owner: SessionIdentity, submission: Submission) {
-        if !self
-            .inflight
-            .values()
-            .any(|d| d.window.context().session() == owner && d.submission == submission)
-        {
-            self.resolve(owner, submission, PresentationOutcome::Superseded);
-        }
-    }
-
-    /// Reserve the exact snapshot being composed. A newer candidate cannot retire it mid-render.
-    pub fn prepare(&mut self, scene: &SharedScene) -> Vec<Drawing> {
-        let drawings = self.drawing(scene);
-        self.inflight = drawings.iter().map(|d| (d.window, d.clone())).collect();
-        drawings
-    }
-
-    /// Called only after successful final composition, or to abandon an unpresented snapshot.
-    pub fn finish(&mut self, presented: bool) {
-        let inflight = std::mem::take(&mut self.inflight);
-        for (surface, drawing) in inflight {
-            if presented
-                && self
-                    .windows
-                    .get(surface)
-                    .is_some_and(|w| w.generation == drawing.submission.address.generation)
-            {
-                if self.windows.get(surface).is_some_and(|w| w.scene_revision < drawing.revision) {
-                    let _ = self.windows.publish_scene(
-                        surface,
-                        drawing.submission.address.generation,
-                        drawing.revision,
-                    );
-                }
-                self.resolve(
-                    surface.context().session(),
-                    drawing.submission,
-                    PresentationOutcome::Presented,
-                );
-                self.displayed.insert(surface, drawing.clone());
-            }
-            if !self
-                .submissions
-                .iter()
-                .any(|(id, s)| id.surface() == surface && *s == drawing.submission)
-            {
-                self.resolve(
-                    surface.context().session(),
-                    drawing.submission,
-                    PresentationOutcome::Superseded,
-                );
-            }
-        }
-        self.assets.retain(|_, (token, _)| token.strong_count() != 0);
-        // The scene under the pointer has just been replaced, so the region it names may differ
-        // from the one the producer last saw.
-        self.refresh_hover();
-        self.retire_stale_semantics();
     }
 
     /// Scene revisions are window-scoped, including across track replacement. Validate before
@@ -1062,11 +1096,7 @@ impl VectorWorker {
                 epoch: frame.epoch,
                 revision: frame.revision,
             };
-            if shared.scene.active_track(identity.surface(), vivid_sdk::SLOT_VECTOR)
-                == Some(identity)
-            {
-                host.validate_revision(identity.surface(), frame.revision)?;
-            }
+            host.validate_revision(identity.surface(), frame.revision)?;
             shared.scene.admit_media(
                 identity,
                 generation,
@@ -1836,90 +1866,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn outcomes_hold_inflight_scenes_and_assets_across_replacement_and_owner_cleanup() {
-        let mut host = Host::default();
-        host.update_viewport(800., 600., 2.).unwrap();
-        let mut text = TextSystem::new(Default::default());
-        let mut owners = Vec::new();
-        for serial in [1, 2] {
-            let owner = SessionIdentity::new(PresenterInstanceId([1; 16]), serial).unwrap();
-            let surface = owner.context(1).unwrap().surface(1).unwrap();
-            let bounds = Rect::new(0., 0., 10., 10.).unwrap();
-            host.windows
-                .create(surface, 1, WindowOptions::new(bounds, WindowMode::Floating))
-                .unwrap();
-            host.surfaces.insert(surface);
-            host.lane_open(owner, 1);
-            let token = Arc::new(());
-            host.assets.insert(
-                (surface.track(2).unwrap(), ChannelGeneration::ONE, 1),
-                (Arc::downgrade(&token), 4),
-            );
-            let mut compiled =
-                compile(&vivid_protocol::vector::Canvas::new(), &mut text, &BTreeMap::new())
-                    .unwrap();
-            // Namespace release leaves only the scene's charged reference.
-            compiled.retain_resource(token).unwrap();
-            let submission = Submission {
-                address: WindowAddress { context_id: 1, surface_id: 1, generation: 1 },
-                track_id: 2,
-                channel_generation: 1,
-                epoch: 1,
-                revision: 1,
-            };
-            host.pending.insert((owner, submission));
-            host.active.insert(surface, submission);
-            host.inflight.insert(
-                surface,
-                Drawing {
-                    window: surface,
-                    window_revision: 1,
-                    revision: 1,
-                    bounds,
-                    scale: 2.,
-                    compiled: Arc::new(compiled),
-                    submission,
-                },
-            );
-            host.supersede(owner, submission);
-            assert!(
-                host.pending.contains(&(owner, submission)),
-                "composition owns this submission"
-            );
-            owners.push((owner, surface, submission));
-        }
-        let (first, surface, old) = owners[0];
-        let replacement = Submission { track_id: 3, revision: 2, ..old };
-        host.pending.insert((first, replacement));
-        host.active.insert(surface, replacement);
-        host.finish(true);
-        assert_eq!(host.windows.get(surface).unwrap().scene_revision, 1);
-        assert_eq!(host.outcomes[&first].front().unwrap().outcome, PresentationOutcome::Presented);
-        assert_eq!(host.assets.len(), 2, "displayed images stay charged after namespace release");
-        let mut failed = host.displayed[&surface].clone();
-        failed.submission = replacement;
-        failed.revision = 2;
-        host.inflight.insert(surface, failed);
-        host.finish(false);
-        assert_eq!(
-            host.windows.get(surface).unwrap().scene_revision,
-            1,
-            "failed composition cannot publish hits"
-        );
-        host.remove_track(surface.track(3).unwrap());
-        host.remove_surface(surface);
-        assert_eq!(host.outcomes[&first].back().unwrap().outcome, PresentationOutcome::Superseded);
-        let (second, other, _) = owners[1];
-        assert_eq!(host.displayed[&other].revision, 1);
-        assert_eq!(host.assets.len(), 1);
-        assert!(host.lanes.contains_key(&second));
-        host.update_viewport(1000., 600., 2.).unwrap();
-        assert_eq!(host.viewport_revision, 2);
-        assert!(host.viewport_dirty.contains(&second));
-        host.remove_owner(first);
-        assert_eq!(host.outcomes[&second].len(), 1);
-    }
     #[test]
     fn paint_commands_compile_into_the_cached_scene() {
         let mut text = TextSystem::new(Default::default());

@@ -4,6 +4,8 @@ version = "0.5.6"
 authors = ["Wensheng Wang <wenshengwang@gmail.com>"]
 license = "Apache-2.0"
 description = "A fast cross-platform terminal emulator with protocol-neutral media hooks"
+keywords = ["terminal", "gpu", "vivid", "media", "embedding"]
+categories = ["command-line-utilities", "gui"]
 readme = "README.md"
 homepage = "https://vivido.dev"
 repository = "https://github.com/vivido-dev/vivido"
@@ -29,6 +31,11 @@ path = "src/main.rs"
 [[bin]]
 name = "vvssh"
 path = "src/bin/vvssh.rs"
+
+[[example]]
+name = "native_overlay_lease_producer"
+path = "tests/fixtures/native_overlay_lease_producer.rs"
+required-features = ["test-util"]
 
 [[test]]
 name = "macos_tabs"
@@ -99,7 +106,7 @@ vvte = { version = "0.15.3", path = "../vvte", default-features = false, feature
   "serde",
 ] }
 zeroize = "1.8.1"
-vivid_sdk = { version = "1.5", path = "../vivid_sdk", features = ["accessible-text", "vector-gpu", "local-control", "video-decode", "audio-decode", "audio-output"] }
+vivid_sdk = { version = "1.5", path = "../vivid_sdk", features = ["accessible-text", "vector-texture", "local-control", "video-decode", "audio-decode", "audio-output"] }
 vello = { version = "0.11", default-features = false, features = ["wgpu"] }
 winit = { version = "0.30", default-features = false, features = [
   "rwh_06",
@@ -277,6 +284,11 @@ vello-bump-probe = ["vello/debug_layers"]
 
 [workspace]
 resolver = "2"
+members = ["vendor/vello-encoding"]
+
+[patch.crates-io]
+# Reclaim unused previous-frame atlas residency before omitting fresh immutable images.
+vello_encoding = { path = "vendor/vello-encoding" }
 
 [profile.release]
 lto = "thin"
