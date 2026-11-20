@@ -1,7 +1,7 @@
 {
   "upstream_crate": "vello_encoding",
-  "version": "0.11.0",
-  "registry_checksum": "b1fb9548d2b46b0f79137b5b1d208ecbd76d432f74e7a2ba838615d117f11532",
+  "version": "0.12.0",
+  "registry_checksum": "eca1013292b6e92b218ccf93b90b940dda36c87d1aba6b8f6e7d5f7839c45268",
   "changed_upstream_files": [
     "src/image_cache.rs",
     "src/resolve.rs"
@@ -10,7 +10,7 @@
   "upstream_files": [
     {
       "path": "Cargo.toml",
-      "sha256": "62a12f7485bae20543faff96fb7dce53047fc833e3be4209df4d0c778d9fe00c"
+      "sha256": "0e70c36c2a14c170c88e9720da9326eedb53fb08827ef4a208ca371368fdf882"
     },
     {
       "path": "LICENSE-APACHE",
@@ -38,11 +38,11 @@
     },
     {
       "path": "src/draw.rs",
-      "sha256": "0b2d4ccdce8862aa78b66141ab9065b76bbd4a0c0a7b47c56af304cee42830be"
+      "sha256": "5cf01ffbbc604a4fbcb0a95b9d1bfb44df85bf987dfe1125777c2fa5551bb710"
     },
     {
       "path": "src/encoding.rs",
-      "sha256": "04d4f80c9555153b86c870a1445cd267cfa1e704abfd96c6ac0e5a743b259317"
+      "sha256": "8a16f6385a152684ce171fd1231c2e8537b3bc5d259b88898edc36b771207dbe"
     },
     {
       "path": "src/estimate.rs",

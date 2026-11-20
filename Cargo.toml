@@ -1,6 +1,6 @@
 [package]
 name = "vivido"
-version = "0.5.6"
+version = "0.5.7"
 authors = ["Wensheng Wang <wenshengwang@gmail.com>"]
 license = "Apache-2.0"
 description = "A fast cross-platform terminal emulator with protocol-neutral media hooks"
@@ -106,8 +106,15 @@ vvte = { version = "0.15.3", path = "../vvte", default-features = false, feature
   "serde",
 ] }
 zeroize = "1.8.1"
-vivid_sdk = { version = "1.5", path = "../vivid_sdk", features = ["accessible-text", "vector-texture", "local-control", "video-decode", "audio-decode", "audio-output"] }
-vello = { version = "0.11", default-features = false, features = ["wgpu"] }
+vivid_sdk = { version = "1.5", path = "../vivid_sdk", features = [
+  "accessible-text",
+  "vector-texture",
+  "local-control",
+  "video-decode",
+  "audio-decode",
+  "audio-output",
+] }
+vello = { version = "0.12", default-features = false, features = ["wgpu"] }
 winit = { version = "0.30", default-features = false, features = [
   "rwh_06",
   "serde",
@@ -118,7 +125,9 @@ mimalloc = { version = "0.1", default-features = false }
 pkg-config = "0.3"
 
 [dev-dependencies]
-vivid_sdk = { version = "1.5", path = "../vivid_sdk", features = ["audio-output-testing"] }
+vivid_sdk = { version = "1.5", path = "../vivid_sdk", features = [
+  "audio-output-testing",
+] }
 accesskit = "0.25"
 accesskit_consumer = "0.39"
 accesskit_winit = { version = "0.34", default-features = false, features = [

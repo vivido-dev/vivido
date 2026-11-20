@@ -1,6 +1,6 @@
 # Vivido image-atlas replacement patch
 
-This is pinned `vello_encoding` 0.11.0, selected only by Vivido's workspace Cargo
+This is pinned `vello_encoding` 0.12.0, selected only by Vivido's workspace Cargo
 patch. `UPSTREAM.json` records original source hashes and the registry checksum.
 Original licenses and the upstream README are retained.
 
