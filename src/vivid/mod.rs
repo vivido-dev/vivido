@@ -762,9 +762,20 @@ impl VividService {
     /// The application semantic tree this window should expose, if an overlay published one for
     /// the scene it is currently showing.
     pub(crate) fn overlay_semantics(&self) -> Option<crate::accessibility::OverlaySemantics> {
-        let overlays = lock(&self.shared.overlays);
-        let (window, semantics) = overlays.windows_with_semantics().into_iter().next()?;
-        Some(crate::accessibility::OverlaySemantics { window, nodes: semantics.nodes.clone() })
+        self.host_overlay_semantics().into_iter().next()
+    }
+
+    pub(crate) fn host_overlay_semantics(&self) -> Vec<crate::accessibility::OverlaySemantics> {
+        lock(&self.shared.overlays).semantic_snapshots()
+    }
+
+    pub(crate) fn invoke_semantic_action(
+        &self,
+        tree: &crate::accessibility::OverlaySemantics,
+        node: u64,
+        action: AccessibleAction,
+    ) -> bool {
+        lock(&self.shared.overlays).invoke_semantic_action(tree, node, action)
     }
 
     /// A handle an accessibility adapter can use to deliver a request to the application.
@@ -1338,13 +1349,10 @@ impl AccessibilityActions {
         not(any(target_os = "linux", target_os = "windows")),
         allow(dead_code, reason = "transport helpers are used only on Linux and Windows")
     )]
-    pub(crate) fn callback(
-        &self,
-    ) -> Arc<dyn Fn(vivid_protocol::identity::SurfaceIdentity, u64, AccessibleAction) + Send + Sync>
-    {
+    pub(crate) fn callback(&self) -> crate::accessibility::OverlayActionCallback {
         let shared = Arc::clone(&self.shared);
         Arc::new(move |window, node, action| {
-            lock(&shared.overlays).queue_accessibility(window, node, action);
+            lock(&shared.overlays).invoke_semantic_action(window, node, action);
         })
     }
 }
@@ -2676,6 +2684,7 @@ fn dispatch_control(
         | messages::MEASURE_OVERLAY_TEXT_BATCH
         | messages::RELEASE_OVERLAY_TEXT_LAYOUTS
         | messages::SET_OVERLAY_EDITOR
+        | messages::SET_OVERLAY_SEMANTICS
         | messages::PROBE_TRACK_CONFIG
         | messages::CREATE_TRACK
         | messages::DESTROY_TRACK
@@ -2745,7 +2754,10 @@ fn dispatch_control(
             overlay::text::set_editor(shared, session, record, &value)?;
             (messages::OK, record.object_id, Ok(messages::ok(request_id)))
         },
-        messages::SET_OVERLAY_WINDOW | messages::OVERLAY_ACTION | messages::QUERY_OVERLAY => {
+        messages::SET_OVERLAY_WINDOW
+        | messages::OVERLAY_ACTION
+        | messages::QUERY_OVERLAY
+        | messages::SET_OVERLAY_SEMANTICS => {
             overlay::dispatch(shared, session, record, request_id, &value)?
         },
         messages::PING => (messages::PONG, 0, Envelope::new(request_id, envelope.payload).encode()),

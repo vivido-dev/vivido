@@ -28,7 +28,11 @@ Install a `Box<dyn HostClipboard>` with `Processor::set_host_clipboard` before
 creating any windows. The provider supplies text reads/writes and reports whether
 primary selection exists. Vivido limits hosted text to 1 MiB. Without primary
 selection, selection reads fall back to the ordinary clipboard and selection
-writes do nothing. Hosted media/file clipboard access is unavailable.
+writes do nothing. For a user-initiated paste, `load_media` can return validated
+local paths or a bounded PNG. Its default delegates to the host’s `load_files`.
+Vivido names each pasted image and offers it to the pane’s current file-drop receiver.
+A successful transfer can paste the committed path. With no receiver, ordinary
+text paste remains available.
 
 Provider calls run on the processor's worker. The provider must bridge native
 operations to the platform thread, bound waiting and queued resources, and cancel
@@ -90,7 +94,7 @@ requests after focus or pointer input changes.
 
 `WindowContext::host_accessible_text` returns a validated read-only SDK document
 of the current terminal viewport, with Unicode scalars, hidden-cell masking,
-character geometry, caret and wholly visible linear selection. Call it on the
+character geometry, caret, wholly visible linear selection and the visible rows of a rectangular selection. Call it on the
 processor worker only when the containing platform accessibility adapter is active
 and the pane is visible. The capture preflights aggregate rows, cells, combining
 marks, UTF-8 bytes and geometry before allocating the document. Oversized viewports
@@ -100,7 +104,7 @@ adds no GUI dependencies to Vivido.
 Hosts must retire snapshots on hide, stop and owner/focus generation changes,
 scope synthetic row identities by the containing view, and let their own modal
 and workspace policy arbitrate accessible focus actions. This snapshot does not
-copy retained history, represent block selections or expose Vivid semantic overlay
+copy retained history or expose Vivid semantic overlay
 trees/actions. It does not replace standalone native accessibility adapters or
 alter the presenter's negotiated wire profiles. When a Vivid overlay has focus,
 the underlying terminal document does not claim accessible focus.
@@ -144,9 +148,10 @@ cargo test --test compositor_host -- --ignored
 Terminal and SDK overlay shaping use the same pinned Parley fallback correction.
 Complete cluster coverage remains preferred; otherwise a font covering the base
 character wins over a font covering only its marks. This preserves an emoji base
-when an unsupported accent would otherwise select the primary Latin font. It
-does not synthesize marks from a second font. Native font selection and shaping
-run on the processor worker and retain the existing bounded layout caches.
+when an unsupported accent would otherwise select the primary Latin font. Vivido can paint missing combining marks from additional faces over the
+original terminal cell. Marks that share a fallback face are shaped together.
+The hosted terminal preserves the grid advance even when script itemization
+splits a marked pictograph across runs. Native font selection and shaping run on the processor worker and retain the existing bounded layout caches.
 
 ## Overlay frame reservations
 

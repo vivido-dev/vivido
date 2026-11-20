@@ -831,13 +831,26 @@ impl Processor {
         events: &mpsc::Receiver<Event>,
         headless: &HeadlessLoop,
     ) -> bool {
+        self.pump_headless_with_max_wait(events, headless, Duration::MAX)
+    }
+
+    /// Pump one iteration, limiting the event wait when an embedder has pending work.
+    ///
+    /// Native events still wake the loop immediately. The limit applies only to the
+    /// blocking receive, leaving event dispatch, draw pacing and shutdown unchanged.
+    pub fn pump_headless_with_max_wait(
+        &mut self,
+        events: &mpsc::Receiver<Event>,
+        headless: &HeadlessLoop,
+        max_wait: Duration,
+    ) -> bool {
         let handle = LoopHandle::Headless(headless);
         if headless.exiting() {
             return false;
         }
         // Block until the scheduler's next deadline, then drain everything already queued so
         // a burst of PTY output costs one pass rather than one pass per event.
-        match events.recv_timeout(self.headless_wait()) {
+        match events.recv_timeout(self.headless_wait().min(max_wait)) {
             Ok(event) => self.on_user_event(handle, event),
             Err(mpsc::RecvTimeoutError::Timeout) => (),
             // Every sender is gone, so nothing can wake this loop again.
@@ -4021,6 +4034,27 @@ impl Processor {
         Ok(())
     }
 
+    /// Scrolls the focused terminal viewport by one page for an assistive client.
+    ///
+    /// Uses native history navigation independently of application key and mouse bindings.
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    pub fn host_scroll_history(&mut self, window_id: WindowId, up: bool) {
+        let Some(window) = self.windows.get_mut(&window_id) else { return };
+        window.flush_host_input(&self.proxy, &mut self.clipboard, &mut self.scheduler);
+        if window.host_text_focused() {
+            let scroll = if up { Scroll::PageUp } else { Scroll::PageDown };
+            window.handle_event(
+                #[cfg(target_os = "macos")]
+                None,
+                &self.proxy,
+                &mut self.clipboard,
+                &mut self.scheduler,
+                Event::new(EventType::Scroll(scroll), window_id).into(),
+            );
+            window.flush_host_input(&self.proxy, &mut self.clipboard, &mut self.scheduler);
+        }
+    }
+
     /// Routes a host key through terminal bindings and writes encoded application input.
     ///
     /// The host must deliver keys only to its active pane. No native event loop is required.
@@ -5752,7 +5786,8 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
                 self.message_buffer_changed();
                 true
             },
-            ClipboardMedia::Image { name, png } => {
+            ClipboardMedia::Image(png) => {
+                let name = crate::clipboard::pasted_image_name();
                 match self.vivid_service.handle_pasted_bytes(name, png) {
                     // Without a binding there is nothing to copy the pixels to, so the paste falls
                     // back to whatever text the clipboard also carries.

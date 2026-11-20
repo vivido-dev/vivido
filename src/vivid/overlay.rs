@@ -34,7 +34,14 @@ pub(crate) use snapshot::Snapshot;
 /// they name and the encoded event body, in the order they were asked for.
 ///
 /// Queued rather than posted because the asker is not the actor that owns the lane writer.
-type PendingAccessibility = HashMap<SessionIdentity, VecDeque<(u64, Vec<(u64, Value)>)>>;
+type PendingAccessibility =
+    HashMap<SessionIdentity, VecDeque<(SurfaceIdentity, Vec<(u64, Value)>)>>;
+
+struct PublishedSemantics {
+    first_node: u64,
+    submission: Submission,
+    tree: Arc<Semantics>,
+}
 
 #[derive(Default)]
 pub(crate) struct Host {
@@ -50,7 +57,8 @@ pub(crate) struct Host {
     pointer_position: Option<vivid_protocol::vector::Point>,
     accessibility: PendingAccessibility,
     /// Each window's semantic tree and the published scene revision it describes.
-    semantics: BTreeMap<SurfaceIdentity, Semantics>,
+    semantics: BTreeMap<SurfaceIdentity, PublishedSemantics>,
+    next_semantic_node: u64,
     /// The window a key press or pointer press was last delivered to, and when. A clipboard
     /// write must be caused by the user, so this is what authorizes one.
     last_gesture: Option<(SurfaceIdentity, Instant)>,
@@ -310,7 +318,7 @@ impl Host {
         }
         self.reservation_guards.retain(|track, _| track.surface() != identity);
         self.displayed.remove(&identity);
-        self.semantics.remove(&identity);
+        self.retire_semantics(identity);
         self.active.remove(&identity);
         self.submissions.retain(|id, _| id.surface() != identity);
         self.scenes.retain(|id, _| id.surface() != identity);
@@ -439,6 +447,8 @@ impl Host {
         self.viewport_dirty.remove(&owner);
         self.actors.remove(&owner);
         self.lanes.remove(&owner);
+        self.accessibility.remove(&owner);
+        self.semantics.retain(|id, _| id.context().session() != owner);
         ids
     }
 
@@ -474,7 +484,9 @@ impl Host {
         if matches!(event, vivid_protocol::overlay::Event::Key { down: true, .. }) {
             self.last_gesture = self.windows.focus().map(|id| (id, Instant::now()));
         }
+        let previous = self.windows.focus();
         let consumed = self.windows.keyboard(event, escape);
+        self.retire_lost_focus(previous);
         self.editor_rect();
         consumed
     }
@@ -506,6 +518,8 @@ impl Host {
     pub(super) fn set_pane_focus(&mut self, focused: bool) {
         if !focused {
             self.editor = None;
+            self.accessibility.clear();
+            self.semantics.clear();
         }
         self.windows.set_pane_focus(focused);
     }
@@ -529,6 +543,7 @@ impl Host {
         let clicks = self.count_clicks(point, button);
         let pressure = pressure.and_then(|p| Scalar::new(p).ok());
         let drawings: Vec<_> = self.displayed.values().cloned().collect();
+        let previous = self.windows.focus();
         let consumed = self.windows.pointer(
             PointerReport { position: point, button, modifiers, clicks, pressure },
             |id, point| {
@@ -540,6 +555,7 @@ impl Host {
             // press that reached no window clears any gesture a producer might otherwise bank.
             self.last_gesture = self.windows.hovered_window().map(|id| (id, Instant::now()));
         }
+        self.retire_lost_focus(previous);
         self.editor_rect();
         consumed
     }
@@ -561,6 +577,7 @@ impl Host {
         expected_revision: u64,
         options: vivid_protocol::overlay::WindowOptions,
     ) -> Result<u64, vivid_protocol::vector::InvalidScene> {
+        let previous = self.windows.focus();
         let result = if expected_revision == 0 {
             self.windows.create(identity, generation, options).map(|()| 1)
         } else {
@@ -568,6 +585,8 @@ impl Host {
             self.windows.update(identity, generation, expected_revision, options)
         };
         if result.is_ok() {
+            self.retire_lost_focus(previous);
+            self.retire_hidden_semantics();
             self.refresh_hover();
         }
         result
@@ -581,8 +600,11 @@ impl Host {
         viewport: Viewport,
     ) -> Result<Option<u64>, vivid_protocol::vector::InvalidScene> {
         self.restore_suspended_input();
+        let previous = self.windows.focus();
         let result = self.windows.apply_action(owner, action, viewport);
         if result.is_ok() {
+            self.retire_lost_focus(previous);
+            self.retire_hidden_semantics();
             self.refresh_hover();
         }
         result
@@ -595,11 +617,25 @@ impl Host {
         id: SurfaceIdentity,
         semantics: Semantics,
     ) -> Result<(), &'static str> {
-        let presented = self.displayed.get(&id).map_or(0, |drawing| drawing.revision);
-        if semantics.scene_revision != presented {
-            return Err("semantics must describe the currently published scene");
+        if !self.windows.visible().any(|w| w.identity == id) {
+            return Err("semantics require a visible window");
         }
-        self.semantics.insert(id, semantics);
+        let submission = self
+            .displayed
+            .get(&id)
+            .filter(|drawing| drawing.revision == semantics.scene_revision)
+            .ok_or("semantics must describe the currently published scene")?
+            .submission;
+        // Reserve distinct platform IDs even for identical replacement trees.
+        let first = self.next_semantic_node.max(1 << 32);
+        self.next_semantic_node = first
+            .checked_add(semantics.nodes.len() as u64)
+            .ok_or("overlay accessibility node IDs exhausted")?;
+        self.retire_semantics(id);
+        self.semantics.insert(
+            id,
+            PublishedSemantics { first_node: first, submission, tree: Arc::new(semantics) },
+        );
         Ok(())
     }
 
@@ -607,15 +643,7 @@ impl Host {
     ///
     /// It arrives as an ordinary input event on the producer's own lane, naming the application's
     /// node ID, so a producer routes it the way it routes anything else the host tells it.
-    ///
-    /// Only the AccessKit adapters can deliver an action, so nothing calls this on macOS, where
-    /// the AppKit adapter builds its own tree. It is kept compiled and type-checked there rather
-    /// than configured away.
-    #[cfg_attr(
-        not(any(target_os = "linux", target_os = "windows")),
-        allow(dead_code, reason = "transport helpers are used only on Linux and Windows")
-    )]
-    pub(super) fn queue_accessibility(
+    fn queue_accessibility(
         &mut self,
         window: SurfaceIdentity,
         node: u64,
@@ -627,8 +655,13 @@ impl Host {
         // An adapter builds its tree from what was published, so a node the live tree no longer
         // names is one the user is not looking at: the scene was replaced while the asker held
         // the old tree.
-        if !self.semantics.get(&window).is_some_and(|tree| tree.nodes.iter().any(|n| n.id == node))
-        {
+        if !self.semantics.get(&window).is_some_and(|published| {
+            published
+                .tree
+                .nodes
+                .iter()
+                .any(|n| n.id == node && !n.disabled && n.actions.contains(&action))
+        }) {
             return false;
         }
         let event = vivid_protocol::overlay::wire::InputEvent {
@@ -637,7 +670,6 @@ impl Host {
                 surface_id: window.surface_id(),
                 generation: current.generation,
             },
-            // An action is not tied to one scene, so it carries the window's published revision.
             scene_revision: self.displayed.get(&window).map_or(0, |drawing| drawing.revision),
             event: Event::Accessibility { node, action },
         };
@@ -651,7 +683,7 @@ impl Host {
         if queue.len() >= vivid_protocol::overlay::MAX_PENDING_EVENTS {
             return false;
         }
-        queue.push_back((window.surface_id(), payload));
+        queue.push_back((window, payload));
         if let Some(actor) = self.actors.get(&owner).and_then(Weak::upgrade) {
             actor.wake_actor();
         }
@@ -659,8 +691,72 @@ impl Host {
     }
 
     /// Every window that has a live semantic tree, in a stable order.
+    #[cfg(test)]
     pub(super) fn windows_with_semantics(&self) -> Vec<(SurfaceIdentity, &Semantics)> {
-        self.semantics.iter().map(|(id, semantics)| (*id, semantics)).collect()
+        self.semantics.iter().map(|(id, semantics)| (*id, semantics.tree.as_ref())).collect()
+    }
+
+    pub(super) fn semantic_snapshots(&self) -> Vec<crate::accessibility::OverlaySemantics> {
+        self.windows
+            .visible()
+            .filter_map(|window| {
+                let published = self.semantics.get(&window.identity)?;
+                let drawing = self.displayed.get(&window.identity)?;
+                Some(crate::accessibility::OverlaySemantics {
+                    window: window.identity,
+                    first_node: published.first_node,
+                    tree: Arc::clone(&published.tree),
+                    bounds: drawing.bounds,
+                    scale: drawing.scale,
+                })
+            })
+            .collect()
+    }
+
+    pub(super) fn invoke_semantic_action(
+        &mut self,
+        snapshot: &crate::accessibility::OverlaySemantics,
+        node: u64,
+        action: AccessibleAction,
+    ) -> bool {
+        let window = snapshot.window;
+        self.windows.input_eligible(window)
+            && self
+                .lanes
+                .get(&window.context().session())
+                .is_some_and(|(_, end)| Instant::now() < *end)
+            && self
+                .semantics
+                .get(&window)
+                .is_some_and(|published| Arc::ptr_eq(&published.tree, &snapshot.tree))
+            && self.queue_accessibility(window, node, action)
+    }
+
+    fn retire_lost_focus(&mut self, previous: Option<SurfaceIdentity>) {
+        if let Some(previous) = previous
+            && self.windows.focus() != Some(previous)
+        {
+            self.retire_semantics(previous);
+        }
+    }
+
+    fn retire_hidden_semantics(&mut self) {
+        if self.semantics.is_empty() {
+            return;
+        }
+        let visible: HashSet<_> = self.windows.visible().map(|window| window.identity).collect();
+        let hidden: Vec<_> =
+            self.semantics.keys().copied().filter(|id| !visible.contains(id)).collect();
+        for window in hidden {
+            self.retire_semantics(window);
+        }
+    }
+
+    fn retire_semantics(&mut self, window: SurfaceIdentity) {
+        self.semantics.remove(&window);
+        if let Some(actions) = self.accessibility.get_mut(&window.context().session()) {
+            actions.retain(|(target, _)| *target != window);
+        }
     }
 
     /// Drop semantics that no longer describe what is displayed. Called where a scene publishes,
@@ -670,14 +766,15 @@ impl Host {
             .semantics
             .iter()
             .filter(|(id, semantics)| {
-                self.displayed
-                    .get(id)
-                    .is_none_or(|drawing| drawing.revision != semantics.scene_revision)
+                self.displayed.get(id).is_none_or(|drawing| {
+                    drawing.submission != semantics.submission
+                        || drawing.revision != semantics.tree.scene_revision
+                })
             })
             .map(|(id, _)| *id)
             .collect();
         for id in stale {
-            self.semantics.remove(&id);
+            self.retire_semantics(id);
         }
     }
 
@@ -1387,13 +1484,16 @@ pub(super) fn service_input(shared: &ServiceShared, session: &SessionRuntime) {
             .and_then(|p| Envelope::new(0, p).encode())
             .map_or(true, |body| !session.post_lane(messages::OVERLAY_VIEWPORT_CHANGED, 0, body));
     }
-    if !failed && let Some(actions) = host.accessibility.get_mut(&session.identity) {
-        while let Some((surface_id, payload)) = actions.pop_front() {
+    if !failed && let Some(mut actions) = host.accessibility.remove(&session.identity) {
+        while let Some((window, payload)) = actions.pop_front() {
+            if !host.windows.input_eligible(window) {
+                continue;
+            }
             let body = match Envelope::new(0, payload).encode() {
                 Ok(body) => body,
                 Err(_) => break,
             };
-            if !session.post_lane(messages::OVERLAY_INPUT_EVENT, surface_id, body) {
+            if !session.post_lane(messages::OVERLAY_INPUT_EVENT, window.surface_id(), body) {
                 failed = true;
                 break;
             }
@@ -2073,7 +2173,7 @@ mod tests {
                 set: None,
                 toggled: None,
                 disabled: false,
-                actions: Vec::new(),
+                actions: vec![AccessibleAction::Click],
                 children: Vec::new(),
             }],
         }
@@ -2096,6 +2196,10 @@ mod tests {
         host.set_semantics(second_window, describing(22)).unwrap();
         assert_eq!(host.windows_with_semantics().len(), 2);
 
+        assert!(!host.queue_accessibility(first_window, 11, AccessibleAction::Focus));
+        assert!(host.queue_accessibility(first_window, 11, AccessibleAction::Click));
+        assert!(host.queue_accessibility(second_window, 22, AccessibleAction::Click));
+
         // The first owner publishes a new scene. Its own tree described the old one, so it is
         // retired; the other owner's tree still describes what its window is showing.
         host.displayed.get_mut(&first_window).unwrap().revision = 2;
@@ -2108,7 +2212,7 @@ mod tests {
         // An action is delivered only for a node the live tree names: the first owner's retired
         // node is refused rather than sent, since it is no longer on screen.
         assert!(!host.queue_accessibility(first_window, 11, AccessibleAction::Click));
-        assert!(host.queue_accessibility(second_window, 22, AccessibleAction::Click));
+        assert!(host.accessibility[&first].is_empty());
         let queued = &host.accessibility[&second];
         assert_eq!(queued.len(), 1);
         let sent = vivid_protocol::overlay::wire::InputEvent {
@@ -2131,5 +2235,30 @@ mod tests {
             host.windows_with_semantics().iter().map(|(_, tree)| tree.nodes[0].id).collect();
         ids.sort_unstable();
         assert_eq!(ids, vec![22, 33]);
+
+        host.lane_open(second, 1);
+        let captured =
+            host.semantic_snapshots().into_iter().find(|s| s.window == second_window).unwrap();
+        assert!(host.invoke_semantic_action(&captured, 22, AccessibleAction::Click));
+        host.set_semantics(second_window, describing(22)).unwrap();
+        let replacement =
+            host.semantic_snapshots().into_iter().find(|s| s.window == second_window).unwrap();
+        assert_ne!(replacement.first_node, captured.first_node);
+        assert!(!host.invoke_semantic_action(&captured, 22, AccessibleAction::Click));
+        assert!(host.invoke_semantic_action(&replacement, 22, AccessibleAction::Click));
+
+        // A new track incarnation may present the same numeric revision.
+        host.displayed.get_mut(&second_window).unwrap().submission.channel_generation += 1;
+        host.retire_stale_semantics();
+        assert!(!host.invoke_semantic_action(&replacement, 22, AccessibleAction::Click));
+        assert!(host.accessibility[&second].is_empty());
+        assert!(host.semantics.contains_key(&first_window));
+
+        // A complete tree replacement may reuse a node ID on the same scene.
+        let mut disabled = describing(22);
+        disabled.nodes[0].disabled = true;
+        host.set_semantics(second_window, disabled).unwrap();
+        assert!(host.accessibility[&second].is_empty());
+        assert!(!host.queue_accessibility(second_window, 22, AccessibleAction::Click));
     }
 }

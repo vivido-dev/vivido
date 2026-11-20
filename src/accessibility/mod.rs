@@ -106,9 +106,39 @@ pub(crate) struct AccessibilitySnapshot {
 /// The identity travels with the tree because a node ID is only unique within one application's
 /// tree, so an action naming node 7 needs to know whose node 7 it is.
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct OverlaySemantics {
-    pub window: vivid_protocol::identity::SurfaceIdentity,
-    pub nodes: Vec<vivid_protocol::overlay::SemanticNode>,
+pub struct OverlaySemantics {
+    pub(crate) window: vivid_protocol::identity::SurfaceIdentity,
+    pub(crate) first_node: u64,
+    pub(crate) tree: std::sync::Arc<vivid_protocol::overlay::Semantics>,
+    pub(crate) bounds: vivid_protocol::vector::Rect,
+    pub(crate) scale: f64,
+}
+
+pub(crate) type OverlayActionCallback = std::sync::Arc<
+    dyn Fn(&OverlaySemantics, u64, vivid_protocol::overlay::AccessibleAction) + Send + Sync,
+>;
+
+impl OverlaySemantics {
+    /// The complete tree in window-local logical pixels.
+    pub fn tree(&self) -> &vivid_protocol::overlay::Semantics {
+        &self.tree
+    }
+
+    /// First host-assigned node ID. Each subsequent node occupies the next ID.
+    /// IDs are unique for the lifetime of the originating terminal host.
+    pub fn first_node(&self) -> u64 {
+        self.first_node
+    }
+
+    /// Presented overlay placement in terminal-local logical pixels.
+    pub fn bounds(&self) -> vivid_protocol::vector::Rect {
+        self.bounds
+    }
+
+    /// Physical terminal pixels per overlay logical pixel.
+    pub fn scale(&self) -> f64 {
+        self.scale
+    }
 }
 
 impl AccessibilitySnapshot {
@@ -420,10 +450,34 @@ pub(crate) fn visible_document<T>(
     }
     let snapshot = AccessibilitySnapshot::capture(term, size, title, first, last);
     let mut builder = Builder::new(title)?;
+    let block = term
+        .selection
+        .as_ref()
+        .filter(|s| s.ty == crate::terminal::selection::SelectionType::Block)
+        .and_then(|s| s.to_range(term));
     for (index, line) in snapshot.lines.iter().enumerate() {
         let y = (line.y / snapshot.height).clamp(0., 1.);
         let height = (snapshot.cell_height / snapshot.height).min(1. - y);
-        builder.push_line(
+        let selected_characters =
+            block.filter(|s| (s.start.line.0..=s.end.line.0).contains(&line.grid_line)).map(|s| {
+                let offset = |col| {
+                    line.column_offsets.get(col).copied().unwrap_or_else(|| line_content_end(line))
+                        - line.range.scalar.start
+                };
+                let mut start = s.start.column.0;
+                // Selecting the trailing cell includes the full glyph and its combining marks,
+                // matching the terminal's rectangular copy behavior.
+                if start > 0
+                    && start < columns
+                    && grid[Line(line.grid_line)][Column(start)]
+                        .layout()
+                        .contains(Flags::WIDE_CHAR_SPACER)
+                {
+                    start -= 1;
+                }
+                offset(start)..offset(s.end.column.0.saturating_add(1))
+            });
+        builder.push_line_with_selection(
             index as u64,
             [0., y, 1., height],
             line.characters.iter().map(|character| {
@@ -436,11 +490,13 @@ pub(crate) fn visible_document<T>(
                 let width = (character.width / snapshot.width).min(1. - x);
                 (value, x, width)
             }),
+            selected_characters,
         )?;
     }
     let selected = snapshot.selection.as_ref().map(|range| range.scalar.clone()).or_else(|| {
         let cursor = grid.cursor.point.line;
-        (cursor >= first && cursor <= last).then(|| snapshot.cursor.scalar.clone())
+        (block.is_none() && cursor >= first && cursor <= last)
+            .then(|| snapshot.cursor.scalar.clone())
     });
     let selection = selected.and_then(|range| {
         Some(Selection {
@@ -531,10 +587,12 @@ fn selection_ranges(
     let Some(selection) = selection else { return (None, Vec::new()) };
     if selection.is_block {
         let mut ranges = Vec::new();
-        for raw_line in selection.start.line.0..=selection.end.line.0 {
-            let start = Point::new(Line(raw_line), selection.start.column);
-            let end = Point::new(Line(raw_line), selection.end.column);
-            if let Some(range) = grid_range(lines, start, end) {
+        for line in lines.iter().filter(|line| {
+            (selection.start.line.0..=selection.end.line.0).contains(&line.grid_line)
+        }) {
+            let start = Point::new(Line(line.grid_line), selection.start.column);
+            let end = Point::new(Line(line.grid_line), selection.end.column);
+            if let Some(range) = grid_range(std::slice::from_ref(line), start, end) {
                 ranges.push(range);
             }
         }
@@ -657,6 +715,13 @@ mod tests {
         assert_eq!(doc.selection().unwrap().focus.character, 3);
         assert!(doc.is_focused());
         assert!(!format!("{doc:?}").contains("terminal"));
+        let mut block =
+            Selection::new(SelectionType::Block, Point::new(Line(0), Column(1)), Side::Left);
+        block.update(Point::new(Line(0), Column(2)), Side::Right);
+        term.selection = Some(block);
+        let doc = visible_document(&term, size(4, 1), "terminal", true).unwrap();
+        assert_eq!(doc.lines()[0].selected_characters(), Some(0..3));
+        assert!(doc.selection().is_none());
     }
 
     #[test]
@@ -781,6 +846,10 @@ mod tests {
         assert_eq!(snapshot.block_selection.len(), 2);
         assert_eq!(snapshot.block_selection[0].scalar, 0..2);
         assert_eq!(snapshot.block_selection[1].scalar, 4..6);
+        let document = visible_document(&term, size(3, 2), "test", true).unwrap();
+        assert!(document.selection().is_none());
+        assert_eq!(document.lines()[0].selected_characters(), Some(0..2));
+        assert_eq!(document.lines()[1].selected_characters(), Some(0..2));
     }
 
     #[test]

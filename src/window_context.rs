@@ -435,6 +435,37 @@ impl WindowContext {
         }
     }
 
+    /// Checks whether closing this hosted terminal needs running-work confirmation.
+    ///
+    /// On macOS a shell back at its prompt can still own background jobs. Query
+    /// one child PID on the terminal worker. Any child or query error warrants
+    /// confirmation. Detached jobs that have left the shell are outside its scope.
+    #[cfg(any(unix, windows))]
+    pub fn has_work_at_close(&self) -> bool {
+        if self.automation.exit_status.is_some() {
+            return false;
+        }
+        if self.running_program().is_some() {
+            return true;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let Ok(parent) = libc::pid_t::try_from(self.shell_pid) else { return true };
+            let mut child: libc::pid_t = 0;
+            // SAFETY: child is a writable, aligned PID slot of the supplied byte size.
+            let children = unsafe {
+                libc::proc_listchildpids(
+                    parent,
+                    std::ptr::from_mut(&mut child).cast(),
+                    std::mem::size_of::<libc::pid_t>() as libc::c_int,
+                )
+            };
+            children != 0
+        }
+        #[cfg(not(target_os = "macos"))]
+        false
+    }
+
     /// Close this terminal even when its configured hold policy is enabled.
     pub fn request_close(&mut self) {
         self.display.window.hold = false;
@@ -1223,6 +1254,21 @@ impl WindowContext {
         snapshot
     }
 
+    /// Captures the immutable semantic trees of visible, presented overlays in stacking order.
+    pub fn host_overlay_semantics(&self) -> Vec<crate::OverlaySemantics> {
+        self.vivid_service.host_overlay_semantics()
+    }
+
+    /// Delivers an advertised action while its original tree and owner input lane are live.
+    pub fn host_overlay_action(
+        &self,
+        tree: &crate::OverlaySemantics,
+        node: u64,
+        action: vivid_protocol::overlay::AccessibleAction,
+    ) -> bool {
+        self.vivid_service.invoke_semantic_action(tree, node, action)
+    }
+
     /// Captures bounded read-only visible terminal text for an embedding host.
     ///
     /// Call on the processor worker only while assistive technology is active.
@@ -1245,6 +1291,15 @@ impl WindowContext {
                 terminal.is_focused,
                 self.vivid_service.overlay_focused(),
             ),
+        )
+    }
+
+    /// Returns whether the terminal owns native text focus for history navigation.
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    pub(crate) fn host_text_focused(&self) -> bool {
+        terminal_accessibility_focused(
+            self.terminal.lock().is_focused,
+            self.vivid_service.overlay_focused(),
         )
     }
 

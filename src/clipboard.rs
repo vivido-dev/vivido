@@ -21,12 +21,21 @@ use copypasta::wayland_clipboard;
 const MAXIMUM_CLIPBOARD_IMAGE_BYTES: usize = 512 * 1024 * 1024;
 
 /// Non-text clipboard content that can be copied to a file-drop binding instead of pasted.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum ClipboardMedia {
     /// Paths a file manager placed on the clipboard as `text/uri-list`.
     Files(Vec<PathBuf>),
     /// Raw pixels re-encoded as PNG, under a presenter-chosen name.
-    Image { name: String, png: Vec<u8> },
+    Image(Vec<u8>),
+}
+
+impl std::fmt::Debug for ClipboardMedia {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Files(paths) => f.debug_struct("Files").field("count", &paths.len()).finish(),
+            Self::Image(png) => f.debug_struct("Image").field("bytes", &png.len()).finish(),
+        }
+    }
 }
 
 pub struct Clipboard {
@@ -36,7 +45,7 @@ pub struct Clipboard {
     host: Option<Box<dyn HostClipboard>>,
 }
 
-/// Supplies text clipboard services from an embedding host.
+/// Supplies clipboard services from an embedding host.
 ///
 /// Calls run on the processor's thread. A host must bridge native operations to
 /// its platform thread, bound request latency and text sizes, and revoke stale
@@ -49,6 +58,22 @@ pub trait HostClipboard: std::fmt::Debug + 'static {
     /// # Errors
     /// Returns an error when permission, capacity, or platform access is unavailable.
     fn load(&mut self, target: ClipboardType) -> std::io::Result<String>;
+    /// Reads a bounded list of local paths for a user-initiated media paste.
+    /// A text-only host returns an empty list. Implementations must validate
+    /// the entire list before returning it and never read the files here.
+    ///
+    /// # Errors
+    /// Returns an error for unavailable, oversized or malformed file offers.
+    fn load_files(&mut self) -> std::io::Result<Vec<PathBuf>> {
+        Ok(Vec::new())
+    }
+    /// Reads one explicitly requested media offer. File-only providers reuse their path service.
+    ///
+    /// # Errors
+    /// Returns a service error when the offer is invalid, stale or inaccessible.
+    fn load_media(&mut self) -> std::io::Result<Option<ClipboardMedia>> {
+        self.load_files().map(|paths| (!paths.is_empty()).then_some(ClipboardMedia::Files(paths)))
+    }
     /// Queues text for the requested clipboard buffer.
     ///
     /// # Errors
@@ -299,6 +324,14 @@ impl Clipboard {
     /// thumbnail. The paths are the better answer because they carry the real filename. `None`
     /// means the caller should fall back to an ordinary text paste.
     pub fn load_media(&mut self) -> Option<ClipboardMedia> {
+        if let Some(host) = &mut self.host {
+            return host.load_media().ok().flatten().filter(|offer| match offer {
+                ClipboardMedia::Files(paths) => !paths.is_empty(),
+                ClipboardMedia::Image(png) => {
+                    !png.is_empty() && png.len() <= MAXIMUM_CLIPBOARD_IMAGE_BYTES
+                },
+            });
+        }
         let clipboard = self.media.provider()?;
         match clipboard.get().file_list() {
             Ok(paths) if !paths.is_empty() => return Some(ClipboardMedia::Files(paths)),
@@ -307,7 +340,7 @@ impl Clipboard {
         }
         match clipboard.get().image() {
             Ok(image) => match encode_png(&image) {
-                Ok(png) => Some(ClipboardMedia::Image { name: pasted_image_name(), png }),
+                Ok(png) => Some(ClipboardMedia::Image(png)),
                 Err(err) => {
                     warn!("Unable to encode the pasted image: {err}");
                     None
@@ -345,7 +378,7 @@ fn encode_png(image: &arboard::ImageData<'_>) -> Result<Vec<u8>, String> {
 }
 
 /// Name a pasted image. The receiver resolves collisions, so this only needs to be plausible.
-fn pasted_image_name() -> String {
+pub(crate) fn pasted_image_name() -> String {
     let seconds =
         SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |elapsed| elapsed.as_secs());
     format!("pasted-image-{seconds}.png")

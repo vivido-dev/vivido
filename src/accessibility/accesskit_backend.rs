@@ -6,7 +6,6 @@ use accesskit::{
     Rect, Role, TextPosition, TextSelection, Toggled, TreeId, TreeInfo, TreeUpdate,
 };
 use accesskit_winit::Adapter;
-use vivid_protocol::overlay::AccessibleAction;
 use winit::event::WindowEvent;
 use winit::event_loop::ActiveEventLoop;
 use winit::window::Window;
@@ -17,8 +16,6 @@ use crate::cli::VividTarget;
 const WINDOW_ID: NodeId = NodeId(1);
 const TERMINAL_ID: NodeId = NodeId(2);
 const FIRST_LINE_ID: u64 = 16;
-/// Application semantic nodes start well above any line index a terminal could reach.
-const FIRST_OVERLAY_ID: u64 = 1 << 32;
 
 struct Activation {
     latest: Arc<Mutex<TreeUpdate>>,
@@ -40,15 +37,11 @@ struct ForwardingActions {
     /// The tree the last update published, so a platform node ID can be mapped back to the
     /// application's own node ID and the window that published it.
     latest: Arc<Mutex<Option<OverlaySemantics>>>,
-    invoke:
-        Arc<dyn Fn(vivid_protocol::identity::SurfaceIdentity, u64, AccessibleAction) + Send + Sync>,
+    invoke: super::OverlayActionCallback,
 }
 
 impl ActionHandler for ForwardingActions {
     fn do_action(&mut self, request: ActionRequest) {
-        let Some(action) = accessible_action(request.action) else {
-            return;
-        };
         let Ok(latest) = self.latest.lock() else {
             return;
         };
@@ -58,33 +51,22 @@ impl ActionHandler for ForwardingActions {
         let Some(index) = request
             .target_node
             .0
-            .checked_sub(FIRST_OVERLAY_ID)
+            .checked_sub(semantics.first_node)
             .and_then(|index| usize::try_from(index).ok())
         else {
             // A request for the window or terminal node is the host's own, not an application's.
             return;
         };
-        let Some(node) = semantics.nodes.get(index) else {
+        let Some(node) = semantics.tree.nodes.get(index) else {
             return;
         };
-        (self.invoke)(semantics.window, node.id, action);
+        if !node.disabled
+            && let Some(action) =
+                node.actions.iter().find(|a| overlay_action(**a) == Some(request.action))
+        {
+            (self.invoke)(semantics, node.id, *action);
+        }
     }
-}
-
-/// AccessKit's action onto the protocol's closed set. An action the profile does not offer is
-/// dropped rather than guessed at.
-fn accessible_action(action: Action) -> Option<AccessibleAction> {
-    Some(match action {
-        // Activation arrives as a click for a button and as a focus request for most else; both
-        // mean the node's own default action to the application that asked for one.
-        Action::Click => AccessibleAction::Default,
-        Action::Focus => AccessibleAction::Focus,
-        Action::Increment => AccessibleAction::Increment,
-        Action::Decrement => AccessibleAction::Decrement,
-        Action::Expand => AccessibleAction::Expand,
-        Action::Collapse => AccessibleAction::Collapse,
-        _ => return None,
-    })
 }
 
 struct Deactivation {
@@ -113,9 +95,7 @@ impl AccessibilityState {
         window: &Window,
         target: VividTarget,
         snapshot: AccessibilitySnapshot,
-        invoke: Arc<
-            dyn Fn(vivid_protocol::identity::SurfaceIdentity, u64, AccessibleAction) + Send + Sync,
-        >,
+        invoke: super::OverlayActionCallback,
     ) -> Self {
         let initial = build_tree(&snapshot, target);
         let latest = Arc::new(Mutex::new(initial));
@@ -233,9 +213,10 @@ fn build_tree(snapshot: &AccessibilitySnapshot, target: VividTarget) -> TreeUpda
     // alongside the terminal rather than instead of it.
     if let Some(semantics) = &snapshot.semantics {
         let mut children = root.children().to_vec();
-        children.extend((0..semantics.nodes.len()).map(overlay_id));
+        let overlay_id = |index: usize| NodeId(semantics.first_node + index as u64);
+        children.push(overlay_id(0));
         root.set_children(children);
-        for (index, node) in semantics.nodes.iter().enumerate() {
+        for (index, node) in semantics.tree.nodes.iter().enumerate() {
             let mut accessible = Node::new(overlay_role(node.role));
             if !node.label.is_empty() {
                 accessible.set_label(node.label.clone());
@@ -288,11 +269,6 @@ fn build_tree(snapshot: &AccessibilitySnapshot, target: VividTarget) -> TreeUpda
 
     nodes.push((WINDOW_ID, root));
     TreeUpdate { nodes, tree: Some(TreeInfo::new(WINDOW_ID)), tree_id: TreeId::ROOT, focus }
-}
-
-/// Application node IDs live above the terminal's line IDs so the two spaces cannot collide.
-fn overlay_id(index: usize) -> NodeId {
-    NodeId(FIRST_OVERLAY_ID.saturating_add(u64::try_from(index).unwrap_or(u64::MAX)))
 }
 
 /// The protocol's closed role set onto AccessKit's. Every role has a target, so a producer's

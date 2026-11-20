@@ -5,6 +5,7 @@ use vivid_protocol::overlay::wire::text::styled::{
 };
 use vivid_protocol::overlay::wire::text::{EditorGeometry, MeasureText, TextMeasurement};
 use vivid_protocol::vector::{Rect, Text};
+#[cfg(test)]
 use vivid_sdk::vector_renderer::parley;
 
 pub(in crate::vivid) fn measure_batch(
@@ -310,16 +311,10 @@ pub(super) fn measure_text(
     system: &mut TextSystem,
     text: &Text,
 ) -> Result<TextMeasurement, &'static str> {
-    let layout = system.shape_overlay(text);
-    let mut measured = layout_geometry(&layout, &text.text, usize::MAX)?;
-    measured.width =
-        Scalar::new(if text.text.is_empty() { 0. } else { f64::from(layout.full_width()) })
-            .map_err(|_| "text extent out of range")?;
-    measured.height =
-        Scalar::new(f64::from(layout.height())).map_err(|_| "text extent out of range")?;
-    Ok(measured)
+    vivid_sdk::vector_renderer::text::measure_plain(system, text).map_err(|error| error.reason())
 }
 
+#[cfg(test)]
 fn layout_geometry<B: parley::Brush>(
     layout: &parley::Layout<B>,
     source: &str,

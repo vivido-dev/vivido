@@ -55,6 +55,8 @@ use crate::scheduler::{Scheduler, TimerId, Topic};
 use crate::string::{ShortenDirection, StrShortener};
 use crate::vivid::VividService;
 
+#[cfg(all(target_os = "macos", feature = "test-util"))]
+mod animation_profile;
 /// Color types and operations.
 pub mod color;
 /// Content types and operations.
@@ -896,6 +898,8 @@ impl Display {
         let total_lines = terminal.grid().total_lines();
         let app_cursor_icon = terminal.mouse_cursor_icon();
         let mouse_reporting = terminal.mode().intersects(TermMode::MOUSE_MODE);
+        #[cfg(all(target_os = "macos", feature = "test-util"))]
+        let marker = animation_profile::sample(&terminal);
         let snapshot = content::Snapshot::capture(
             &terminal,
             &mut self.snapshot_cells,
@@ -946,6 +950,8 @@ impl Display {
             if presented {
                 #[cfg(feature = "perf")]
                 crate::performance::presented(&mut self.perf_last_frame);
+                #[cfg(all(target_os = "macos", feature = "test-util"))]
+                animation_profile::submitted(marker);
                 self.window.did_present();
             }
             self.vivid_frame_requested = false;
@@ -1219,6 +1225,8 @@ impl Display {
         if presented {
             #[cfg(feature = "perf")]
             crate::performance::presented(&mut self.perf_last_frame);
+            #[cfg(all(target_os = "macos", feature = "test-util"))]
+            animation_profile::submitted(marker);
             self.window.did_present();
         }
 
@@ -1329,6 +1337,15 @@ impl Display {
         size: SizeInfo,
         cell: &crate::display::content::RenderableCell,
     ) {
+        if cell
+            .extra
+            .as_ref()
+            .and_then(|extra| extra.zerowidth.as_ref())
+            .is_some_and(|z| !z.is_empty())
+        {
+            Self::paint_terminal_run(scene, text_system, size, std::slice::from_ref(cell));
+            return;
+        }
         let Some(layout) = text_system.shape_cell(cell) else {
             return;
         };
@@ -1353,16 +1370,9 @@ impl Display {
             return;
         };
         let run = terminal_shaping_run(cells);
-        let layout = text_system.shape_terminal_run(run.text, &run.styles, text_system.ligatures());
-        Self::paint_terminal_run_layout(
-            scene,
-            &layout,
-            &run.cells,
-            text_system.metrics(),
-            size,
-            first.point.line,
-            run.origin_column,
-        );
+        let layout =
+            text_system.shape_terminal_run(&run.text, &run.styles, text_system.ligatures());
+        Self::paint_terminal_run_layout(scene, &layout, &run, text_system, size, first.point.line);
     }
 
     fn paint_layout(
@@ -1416,29 +1426,65 @@ impl Display {
     fn paint_terminal_run_layout(
         scene: &mut Scene,
         layout: &parley::Layout<Rgb>,
-        cells: &[TerminalShapingCell],
-        metrics: TextMetrics,
+        source: &TerminalShapingRun,
+        text: &mut TextSystem,
         size: SizeInfo,
-        line: usize,
-        column: usize,
+        row: usize,
     ) {
+        let metrics = text.metrics();
+        let column = source.origin_column;
         let transform = Affine::translate((
             (size.padding_x() + column as f32 * size.cell_width() + metrics.glyph_offset_x) as f64,
-            (size.padding_y() + line as f32 * size.cell_height() + metrics.glyph_offset_y) as f64,
+            (size.padding_y() + row as f32 * size.cell_height() + metrics.glyph_offset_y) as f64,
         ));
         for line in layout.lines() {
             let baseline = line.metrics().baseline;
-            let mut visual_x = 0.0;
+            let mut visual_column = 0;
+            let mut isolated = std::collections::HashSet::new();
             for shaped_run in line.runs() {
                 let mut pending_rtl_ligature_x = None;
+                let mut fallback_marks = Vec::new();
                 let mut glyphs_by_style = vec![Vec::new(); layout.styles().len()];
                 for cluster in shaped_run.visual_clusters() {
-                    let Some(cell) = terminal_cell_for_byte(cells, cluster.text_range().start)
+                    let Some(cell) =
+                        terminal_cell_for_byte(&source.cells, cluster.text_range().start)
                     else {
                         continue;
                     };
-                    let cluster_x = visual_x;
-                    visual_x += cell.width as f32 * size.cell_width();
+                    if isolated.contains(&cell.text.start) {
+                        continue;
+                    }
+                    let cluster_x = visual_column as f32 * size.cell_width();
+                    let column = visual_column;
+                    visual_column += cell.width;
+
+                    // Script itemization can split one grid cell into several runs.
+                    // An isolated shape that recovers its complete grapheme owns
+                    // this cell's single advance, including later run fragments.
+                    let range = cluster.text_range();
+                    if !cell.hidden
+                        && range.end <= cell.text.end
+                        && range != cell.text
+                        && !cluster.is_ligature_continuation()
+                        && !cluster.is_ligature_start()
+                        && let Some(single) = source.isolated_emoji_marks(cell, column)
+                    {
+                        let layout =
+                            text.shape_terminal_run(&single.text, &single.styles, text.ligatures());
+                        if layout
+                            .lines()
+                            .flat_map(|l| l.runs())
+                            .flat_map(|r| r.visual_clusters())
+                            .map(|c| c.text_range())
+                            .eq(std::iter::once(0..single.text.len()))
+                        {
+                            Self::paint_terminal_run_layout(
+                                scene, &layout, &single, text, size, row,
+                            );
+                            isolated.insert(cell.text.start);
+                            continue;
+                        }
+                    }
 
                     if cluster.is_ligature_continuation() {
                         pending_rtl_ligature_x.get_or_insert(cluster_x);
@@ -1455,7 +1501,33 @@ impl Display {
                         cluster_x
                     };
                     let style_index = usize::from(cluster.style_index());
-                    for glyph in cluster.glyphs() {
+                    // Repair only missing glyphs of one complete cell. Keep the base and
+                    // all contextual glyphs produced by the original row shaper.
+                    let range = cluster.text_range();
+                    let mut repaired = false;
+                    if range == cell.text && range.len() > 1 {
+                        let missing = cluster.glyphs().filter(|g| g.id == 0).count();
+                        if missing > 0 {
+                            let flags = source.styles
+                                [source.styles.partition_point(|s| s.range.end <= range.start)]
+                            .flags;
+                            if let Some(marks) = text.fallback_marks(
+                                &source.text[range],
+                                shaped_run.font(),
+                                flags,
+                                missing,
+                            ) {
+                                fallback_marks.push((
+                                    marks,
+                                    x,
+                                    cell.width as f32 * size.cell_width(),
+                                    style_index,
+                                ));
+                                repaired = true;
+                            }
+                        }
+                    }
+                    for glyph in cluster.glyphs().filter(|glyph| !repaired || glyph.id != 0) {
                         glyphs_by_style[style_index]
                             .push(scene_glyph_from_layout(&mut x, baseline, glyph));
                     }
@@ -1474,6 +1546,17 @@ impl Display {
                         .font_size(shaped_run.font_size())
                         .normalized_coords(bytemuck::cast_slice(shaped_run.normalized_coords()))
                         .draw(Fill::NonZero, glyphs.into_iter());
+                }
+                for (marks, x, width, style) in fallback_marks {
+                    for mark in marks {
+                        mark.paint(
+                            scene,
+                            transform,
+                            x + width / 2.0,
+                            baseline,
+                            color_from_rgb(layout.styles()[style].brush),
+                        );
+                    }
                 }
             }
         }
@@ -2261,6 +2344,49 @@ fn text_cell_width(text: &str) -> usize {
     text.chars().map(char_cell_width).sum()
 }
 
+impl TerminalShapingRun {
+    fn isolated_emoji_marks(
+        &self,
+        cell: &TerminalShapingCell,
+        visual_column: usize,
+    ) -> Option<Self> {
+        use icu_properties::props::{ExtendedPictographic, GeneralCategory};
+        use icu_properties::{CodePointMapData, CodePointSetData};
+
+        if self.cells.len() == 1 {
+            return None;
+        }
+        let value = &self.text[cell.text.clone()];
+        let mut chars = value.chars();
+        if !CodePointSetData::new::<ExtendedPictographic>().contains(chars.next()?)
+            || chars.as_str().is_empty()
+            || !chars.all(|ch| {
+                matches!(
+                    CodePointMapData::<GeneralCategory>::new().get(ch),
+                    GeneralCategory::NonspacingMark | GeneralCategory::EnclosingMark
+                )
+            })
+        {
+            return None;
+        }
+        let style = &self.styles[self.styles.partition_point(|s| s.range.end <= cell.text.start)];
+        Some(Self {
+            origin_column: self.origin_column + visual_column,
+            text: value.to_owned(),
+            styles: vec![TerminalTextStyle {
+                range: 0..value.len(),
+                flags: style.flags,
+                color: style.color,
+            }],
+            cells: vec![TerminalShapingCell {
+                text: 0..value.len(),
+                width: cell.width,
+                hidden: false,
+            }],
+        })
+    }
+}
+
 fn terminal_shaping_run(cells: &[RenderableCell]) -> TerminalShapingRun {
     let first = cells.first().expect("terminal shaping runs are non-empty");
     let mut run = TerminalShapingRun {
@@ -2672,18 +2798,12 @@ mod tests {
                 })
                 .collect::<Vec<_>>();
             let run = terminal_shaping_run(&cells);
-            let layout = text.shape_terminal_run(run.text, &run.styles, true);
+            let layout = text.shape_terminal_run(&run.text, &run.styles, true);
             let mut scene = vello::Scene::new();
             let size = super::SizeInfo::new(100.0, 40.0, 20.0, 40.0, 0.0, 0.0, false);
 
             super::Display::paint_terminal_run_layout(
-                &mut scene,
-                &layout,
-                &run.cells,
-                text.metrics(),
-                size,
-                0,
-                0,
+                &mut scene, &layout, &run, &mut text, size, 0,
             );
 
             let encoding = scene.encoding();
@@ -2841,6 +2961,71 @@ mod tests {
         let run = terminal_shaping_run(&cells[1..3]);
         assert_eq!(run.origin_column, 3);
         assert_eq!(run.text, "مر");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn terminal_paints_missing_emoji_marks_in_the_original_cell() {
+        let mut text = super::TextSystem::new(crate::config::font::Font::default());
+        let size = super::SizeInfo::new(200.0, 60.0, 20.0, 40.0, 0.0, 0.0, false);
+        for marks in [
+            vec!['\u{301}'],
+            vec!['\u{301}', '\u{302}'],
+            vec!['\u{fe0f}', '\u{301}'],
+            vec!['\u{301}', '\u{93c}'],
+        ] {
+            let mut base = renderable_cell(0, 0, '🦇');
+            base.flags.insert(Flags::WIDE_CHAR);
+            base.extra = Some(Box::new(crate::display::content::RenderableCellExtra {
+                zerowidth: Some(marks.clone()),
+                hyperlink: None,
+            }));
+            let mut cursor = vello::Scene::new();
+            super::Display::paint_cell_text(&mut cursor, &mut text, size, &base);
+            let mut row = vello::Scene::new();
+            super::Display::paint_terminal_run(
+                &mut row,
+                &mut text,
+                size,
+                &[base, renderable_cell(0, 2, 'X')],
+            );
+            assert!(
+                row.encoding().resources.glyphs.iter().any(|g| g.x == 40.0),
+                "following X shifted"
+            );
+            for scene in [cursor, row] {
+                let resources = &scene.encoding().resources;
+                assert!(!resources.glyphs.is_empty());
+                assert!(
+                    resources.glyphs.iter().all(|g| g.id != 0),
+                    "missing glyph in painted scene: {:?}",
+                    resources.glyphs
+                );
+                if marks.contains(&'\u{93c}') {
+                    // The acute and Devanagari nukta need separate secondary faces
+                    // on macOS. Check both are actually painted over the emoji.
+                    let faces: Vec<_> = resources
+                        .glyph_runs
+                        .iter()
+                        .filter(|run| {
+                            resources.glyphs[run.glyphs.clone()]
+                                .iter()
+                                .any(|g| g.x > 0. && g.x < 40.)
+                        })
+                        .map(|run| &run.font)
+                        .collect();
+                    assert!(faces.iter().any(|face| Some(face) != faces.first()));
+                }
+                // Vello encodes the color emoji separately. The accents must still
+                // contribute ink-bearing glyphs inside the first two grid columns.
+                assert!(
+                    resources.glyphs.iter().filter(|g| g.x > 0.0 && g.x < 40.0).count()
+                        >= marks.iter().filter(|ch| **ch != '\u{fe0f}').count(),
+                    "{:?}",
+                    resources.glyphs
+                );
+            }
+        }
     }
 
     #[test]

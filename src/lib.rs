@@ -76,12 +76,13 @@ pub mod update;
 mod vivid;
 pub mod window_context;
 
+pub use crate::accessibility::OverlaySemantics;
 #[cfg(any(target_os = "macos", windows))]
 pub use crate::cli::ParentWindowHandle;
 pub use crate::cli::WindowOptions;
 pub use crate::client_fault::{ClientFault, ClientFaultClass, ClientHealth};
 #[doc(inline)]
-pub use crate::clipboard::HostClipboard;
+pub use crate::clipboard::{ClipboardMedia, HostClipboard};
 pub use crate::display::window::Window;
 pub use crate::event::{Event, EventSink, EventType, HeadlessLoop, LoopHandle, Processor};
 #[doc(inline)]

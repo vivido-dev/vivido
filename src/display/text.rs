@@ -26,6 +26,8 @@ use crate::config::font::Font;
 use crate::display::color::Rgb;
 use crate::display::content::RenderableCell;
 
+#[path = "terminal_marks.rs"]
+mod terminal_marks;
 #[path = "typography.rs"]
 mod typography;
 
@@ -382,11 +384,11 @@ impl TextSystem {
     /// see the neighboring cells they require.
     pub(crate) fn shape_terminal_run(
         &mut self,
-        text: String,
+        text: &str,
         styles: &[TerminalTextStyle],
         ligatures: bool,
     ) -> Arc<Layout<Rgb>> {
-        self.ensure_fontique_fallbacks(&text);
+        self.ensure_fontique_fallbacks(text);
 
         let mut inline_styles =
             [TerminalStyleKey { end: 0, variant: FontVariant::Normal, color: (0, 0, 0) }; 16];
@@ -413,19 +415,15 @@ impl TextSystem {
         let query_spans: &[TerminalStyleKey] = heap_styles.as_deref().unwrap_or(stack_slice);
         let font_size_bits = self.font.size().as_px().to_bits();
         let query_key =
-            TerminalLayoutKeyRef { text: &text, spans: query_spans, ligatures, font_size_bits };
+            TerminalLayoutKeyRef { text, spans: query_spans, ligatures, font_size_bits };
         if let Some(layout) = self.cached_terminal_layout(&query_key) {
             return layout;
         }
 
         let style_keys: Box<[TerminalStyleKey]> = query_spans.into();
-        let key = TerminalLayoutKey {
-            text: text.clone().into_boxed_str(),
-            spans: style_keys,
-            ligatures,
-            font_size_bits,
-        };
-        self.build_and_cache_terminal_layout(key, &text, styles, ligatures)
+        let key =
+            TerminalLayoutKey { text: text.into(), spans: style_keys, ligatures, font_size_bits };
+        self.build_and_cache_terminal_layout(key, text, styles, ligatures)
     }
 
     #[cfg(test)]
@@ -1264,8 +1262,8 @@ mod tests {
 
         // The query goes through the borrowed inline-span key, so a hit proves the
         // `Equivalent` lookup matches the owned `TerminalLayoutKey` built on the miss.
-        let first = text.shape_terminal_run(content.to_owned(), &styles, true);
-        let second = text.shape_terminal_run(content.to_owned(), &styles, true);
+        let first = text.shape_terminal_run(content, &styles, true);
+        let second = text.shape_terminal_run(content, &styles, true);
 
         assert!(Arc::ptr_eq(&first, &second));
         assert_eq!(text.terminal_cache_len(), 1);
@@ -1290,8 +1288,8 @@ mod tests {
             color: Rgb::new(255, 255, 255),
         });
 
-        let first = text.shape_terminal_run(content.to_owned(), &styles, true);
-        let second = text.shape_terminal_run(content.to_owned(), &styles, true);
+        let first = text.shape_terminal_run(content, &styles, true);
+        let second = text.shape_terminal_run(content, &styles, true);
 
         assert!(Arc::ptr_eq(&first, &second));
         assert_eq!(text.terminal_cache_len(), 1);
@@ -1314,7 +1312,7 @@ mod tests {
             },
         ];
 
-        let layout = text.shape_terminal_run(content.to_owned(), &styles, true);
+        let layout = text.shape_terminal_run(content, &styles, true);
         let isolated = text.shape_character('ب', false, false);
         let isolated_glyph = isolated
             .lines()
@@ -1353,7 +1351,7 @@ mod tests {
             color: Rgb::new(255, 255, 255),
         }];
 
-        let layout = text.shape_terminal_run(content.to_owned(), &styles, true);
+        let layout = text.shape_terminal_run(content, &styles, true);
         let line = layout.lines().next().expect("mixed-direction line");
         let rtl_clusters = line
             .runs()
