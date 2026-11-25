@@ -154,6 +154,25 @@ fn binary() -> PathBuf {
     path.join(format!("vivido{}", env::consts::EXE_SUFFIX))
 }
 
+#[cfg(windows)]
+fn external_binary(variable: &str, name: &str) -> PathBuf {
+    if let Some(path) = env::var_os(variable) {
+        return PathBuf::from(path);
+    }
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let executable = format!("{name}.exe");
+    [
+        root.join("..").join(name).join("target/debug").join(&executable),
+        root.join("..").join(name).join("target/release").join(&executable),
+        root.join("target/overlay-test-tools/bin").join(&executable),
+    ]
+    .into_iter()
+    .filter_map(|path| Some((path.metadata().ok()?.modified().ok()?, path)))
+    .max()
+    .map(|(_, path)| path)
+    .unwrap_or_else(|| panic!("set {variable} to a built {executable}, or build the sibling project"))
+}
+
 #[cfg(unix)]
 fn set_private(path: &Path) {
     use std::os::unix::fs::PermissionsExt;
@@ -919,9 +938,9 @@ fn test_runner_executes_a_plan_and_tears_down() {
 /// Verify a real Kitty producer through ConPTY, the parser, and the GPU compositor.
 #[cfg(windows)]
 #[test]
-#[ignore = "requires KITIM_BINARY, real processes, and a wgpu adapter"]
+#[ignore = "requires built kitim, real processes, and a wgpu adapter"]
 fn kitim_image_is_rendered_through_windows_conpty() {
-    let kitim = env::var("KITIM_BINARY").expect("set KITIM_BINARY to a built kitim.exe");
+    let kitim = external_binary("KITIM_BINARY", "kitim");
     let fixture = tempfile::tempdir().unwrap();
     let supplied_image = env::var_os("KITIM_TEST_IMAGE");
     let image = supplied_image.as_ref().map(PathBuf::from).unwrap_or_else(|| {
@@ -938,7 +957,7 @@ fn kitim_image_is_rendered_through_windows_conpty() {
         format!(
             "while (-not (Test-Path -LiteralPath '{}')) {{ Start-Sleep -Milliseconds 10 }}; & '{}' '{}'; Write-Output 'KITIM-IMAGE-DONE'; Start-Sleep -Seconds 300",
             trigger.display().to_string().replace('\'', "''"),
-            kitim.replace('\'', "''"),
+            kitim.to_string_lossy().replace('\'', "''"),
             image.display().to_string().replace('\'', "''")
         ),
     ];
@@ -983,11 +1002,11 @@ fn vivid_raster_apps_work_through_windows_conpty() {
     image::RgbaImage::from_pixel(200, 200, image::Rgba([255, 0, 0, 255])).save(&image).unwrap();
     let document = fixture.path().join("compat.md");
     fs::write(&document, "# Compatibility\n\n![Red square](red.png)\n").unwrap();
-    for (variable, name, input, key, text) in [
-        ("VVRD_BINARY", "vvrd-compat", &document, "i", ""),
-        ("VVPAINT_BINARY", "vvpaint-compat", &image, "b", "Brush"),
+    for (variable, program_name, name, input, key, text) in [
+        ("VVRD_BINARY", "vvrd", "vvrd-compat", &document, "i", ""),
+        ("VVPAINT_BINARY", "vvpaint", "vvpaint-compat", &image, "b", "Brush"),
     ] {
-        let executable = env::var(variable).unwrap_or_else(|_| panic!("set {variable}"));
+        let executable = external_binary(variable, program_name);
         let program = vec![
             "powershell.exe".into(),
             "-NoProfile".into(),
@@ -995,7 +1014,7 @@ fn vivid_raster_apps_work_through_windows_conpty() {
             "-Command".into(),
             format!(
                 "& '{}' '{}'; Write-Output 'VIVID-APP-DONE'; Start-Sleep -Seconds 300",
-                executable.replace('\'', "''"),
+                executable.to_string_lossy().replace('\'', "''"),
                 input.display().to_string().replace('\'', "''"),
             ),
         ];

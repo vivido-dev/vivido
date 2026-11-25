@@ -405,7 +405,7 @@ impl Host {
         let owners: Vec<_> = self.suspended_input.iter().copied().collect();
         for owner in owners {
             if stale.contains(&owner)
-                || !self.lanes.get(&owner).is_some_and(|(_, deadline)| Instant::now() < *deadline)
+                || self.lanes.get(&owner).is_none_or(|(_, deadline)| Instant::now() >= *deadline)
                 || !self.displayed.keys().any(|surface| surface.context().session() == owner)
             {
                 continue;

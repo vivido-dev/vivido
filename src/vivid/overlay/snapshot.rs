@@ -174,7 +174,7 @@ impl Host {
         let Some(current) = self.windows.get(window) else { return false };
         if !snapshot.windows.contains(&(window, current.generation, current.revision))
             || current.scene_revision >= drawing.revision
-            || !self.lanes.get(&owner).is_some_and(|(_, until)| std::time::Instant::now() < *until)
+            || self.lanes.get(&owner).is_none_or(|(_, until)| std::time::Instant::now() >= *until)
             || !self.reservation_guards.get(track).is_some_and(|g| Arc::ptr_eq(g, guard))
             || self.active.get(&window) != Some(&drawing.submission)
             || self.accepted.get(&window).is_some_and(|r| *r > drawing.revision)
@@ -254,10 +254,10 @@ impl Host {
         let mut drawings = Vec::with_capacity(candidates.len());
         let mut bindings = Vec::with_capacity(candidates.len());
         for drawing in candidates {
-            if !self
+            if self
                 .lanes
                 .get(&drawing.window.context().session())
-                .is_some_and(|(_, deadline)| std::time::Instant::now() < *deadline)
+                .is_none_or(|(_, deadline)| std::time::Instant::now() >= *deadline)
             {
                 continue;
             }

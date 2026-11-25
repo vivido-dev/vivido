@@ -293,10 +293,15 @@ mod windows_process_playback {
             .unwrap();
             std::fs::write(
                 &config,
-                "[general]\nshell = 'powershell.exe'\n[session]\nauto_snapshot = false\n",
+                // The layout command starts PowerShell with -NoProfile below.
+                // An outer PowerShell would load the user's profile first and
+                // could block or mutate this otherwise isolated fixture.
+                "[general]\nshell = 'cmd.exe'\n[session]\nauto_snapshot = false\n",
             )
             .unwrap();
-            let command = format!("powershell.exe -NoProfile -File \"{}\"", script.display());
+            // Resolve the script from the pane's isolated working directory so
+            // its path does not need quoting through both cmd and PowerShell.
+            let command = "powershell.exe -NoProfile -File playback.ps1";
             let idle_tab = if second_tab {
                 "[[tabs]]\nname = 'idle'\n[tabs.layout]\npane = 'idle'\n"
             } else {
@@ -305,8 +310,9 @@ mod windows_process_playback {
             std::fs::write(
                 &layout,
                 format!(
-                    "[[tabs]]\nname = 'playback'\n[tabs.layout]\npane = 'video'\ncommand = {}\n{idle_tab}",
-                    serde_json::to_string(&command).unwrap()
+                    "[[tabs]]\nname = 'playback'\n[tabs.layout]\npane = 'video'\ncommand = {}\ncwd = {}\n{idle_tab}",
+                    serde_json::to_string(command).unwrap(),
+                    serde_json::to_string(&directory.path().to_string_lossy()).unwrap()
                 ),
             )
             .unwrap();
@@ -326,6 +332,7 @@ mod windows_process_playback {
                 escape_args: true,
                 env: std::collections::HashMap::from([
                     ("VIVID_ENDPOINT_CONTROL".into(), service.control_endpoint().into()),
+                    ("VIVID_ENDPOINT_INTERACTIVE".into(), service.control_endpoint().into()),
                     ("VIVID_ENDPOINT_REALTIME".into(), service.control_endpoint().into()),
                     ("VIVID_ENDPOINT_BULK".into(), service.control_endpoint().into()),
                     ("VIVID_ROOT_SECRET".into(), service.root_secret().into()),
@@ -366,12 +373,14 @@ mod windows_process_playback {
                 if count == 0 {
                     break;
                 }
+                let new_start = self.tail.len();
                 self.tail.extend_from_slice(&bytes[..count]);
+                let cursor_reports = cursor_position_requests(&self.tail, new_start);
                 if self.tail.len() > 8192 {
                     self.tail.drain(..self.tail.len() - 8192);
                 }
                 // ConPTY asks its host for the cursor position during startup.
-                if bytes[..count].windows(4).any(|w| w == b"\x1b[6n") {
+                for _ in 0..cursor_reports {
                     self.key(b"\x1b[1;1R");
                 }
             }
@@ -387,7 +396,7 @@ mod windows_process_playback {
                 self.drain();
                 assert!(
                     Instant::now() < deadline,
-                    "{label}; tracks={:?}; terminal={}",
+                    "{label}; tracks={:?}; trace={:?}; terminal={}",
                     service
                         .scene
                         .track_keys()
@@ -399,11 +408,37 @@ mod windows_process_playback {
                             s.state.milestones
                         )))
                         .collect::<Vec<_>>(),
+                    service.automation_trace(
+                        trace::TraceSelection::Tail, 32, trace::TraceFilter::default()
+                    ).events,
                     String::from_utf8_lossy(&self.tail)
                 );
                 thread::sleep(Duration::from_millis(5));
             }
         }
+    }
+
+    fn cursor_position_requests(tail: &[u8], new_start: usize) -> usize {
+        // Include the preceding three bytes so a query split across ConPTY reads
+        // still receives exactly one answer, and count repeated queries separately.
+        tail[new_start.saturating_sub(3)..].windows(4).filter(|w| *w == b"\x1b[6n").count()
+    }
+
+    #[test]
+    fn cursor_reports_survive_every_read_split() {
+        let bytes = b"before\x1b[6n\x1b[6nafter";
+        for split in 0..=bytes.len() {
+            assert_eq!(
+                cursor_position_requests(&bytes[..split], 0)
+                    + cursor_position_requests(bytes, split),
+                2,
+                "split at {split}"
+            );
+        }
+        let bytewise: usize = (0..bytes.len())
+            .map(|index| cursor_position_requests(&bytes[..=index], index))
+            .sum();
+        assert_eq!(bytewise, 2);
     }
     impl Drop for TestMux {
         fn drop(&mut self) {

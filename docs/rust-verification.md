@@ -22,6 +22,64 @@ compatibility spelling; required configuration and snapshot serialization works 
 `test-util` adds isolated filesystem/clock and update-result controllers. Native watchers,
 HTTP, and worker threads remain the default implementation.
 
+## Ignored native tests on Windows
+
+`cargo test -- --ignored --test-threads=1` includes GPU, default-audio-device,
+language-binding and ConPTY playback acceptance. Run it on a desktop with those
+devices available. The sibling SDK bindings and player/mux executables must be
+built from the current checkout; Cargo does not rebuild these external fixtures.
+A stale Python extension can fail import with a missing SDK constant even when
+Vivido itself builds successfully.
+
+From PowerShell in `vivido/`, refresh the prerequisites:
+
+```powershell
+cargo build --manifest-path ../vivi/Cargo.toml --bin vivi
+cargo build --manifest-path ../vvmux/Cargo.toml --bin vvmux
+Push-Location ../vivid_sdk
+# Requires the SDK's existing virtualenv with maturin and installed npm dependencies.
+./.venv/Scripts/maturin.exe develop
+npm.cmd run build:debug
+Pop-Location
+```
+
+The Lua fixture also needs LuaJIT and a matching current SDK module. Set
+`VIVID_OVERLAY_TEST_LUA` to its executable, or stage `luajit.exe` and `lua51.dll`
+in `vivido/target/overlay-test-tools/`. To build LuaJIT locally, clone the official
+`https://github.com/LuaJIT/LuaJIT.git` into
+`target/overlay-test-tools/LuaJIT`, then run `src/msvcbuild.bat` from its `src`
+directory in an x64 MSVC developer command prompt. Copy the resulting interpreter
+and DLL to `target/overlay-test-tools/`. Build and stage the SDK module:
+
+```powershell
+$env:LUA_LIB = (Resolve-Path target/overlay-test-tools/LuaJIT/src).Path
+$env:LUA_LIB_NAME = 'lua51'
+cargo build --manifest-path ../vivid_sdk/lua-bindings/Cargo.toml
+Copy-Item ../vivid_sdk/lua-bindings/target/debug/vivid_sdk_lua.dll ../vivid_sdk/lua/vivid_sdk.dll
+```
+
+Use `VIVI_TEST_BIN` and `VVMUX_TEST_BIN` for other executable locations, and
+`VIVI_TEST_MEDIA` for a sufficiently long AV1/Opus fixture instead of the default
+`../medias/under_attack.webm`. `VIVID_OVERLAY_TEST_PYTHON` selects another Python
+environment with the current native extension installed.
+
+The Windows headless app checks also use built `vvrd` and `vvpaint` siblings
+(or `VVRD_BINARY` and `VVPAINT_BINARY`). The Kitty compatibility check requires
+`KITIM_BINARY`, a built `kitim` sibling, or
+`target/overlay-test-tools/bin/kitim.exe`. These are real external applications,
+not replaced by synthetic producers when unavailable.
+
+The overlay movement measurement reports p50, p95 and maximum elapsed time in
+every build. Its rendering, compilation-reuse and allocation assertions always
+apply. A frame-time budget is hardware/build-specific and must be selected
+explicitly; for the original 60 Hz performance gate on a calibrated machine:
+
+```powershell
+$env:VIVIDO_OVERLAY_FRAME_BUDGET_US = '16667'
+cargo test --release overlay_window_movement_performance_measurement -- --ignored --test-threads=1 --nocapture
+Remove-Item Env:VIVIDO_OVERLAY_FRAME_BUDGET_US
+```
+
 ## Publishing
 
 Publish local path dependencies before Vivido. In particular, Vivido requires `vvte` 0.15.2 or
