@@ -23,14 +23,30 @@ mod stream;
 fn canvas(count: usize, color: u32) -> Canvas {
     let mut canvas = Canvas::new();
     for _ in 0..count {
-        canvas
-            .fill(
-                Path::rectangle(Rect::new(0., 0., 1024., 1024.).unwrap()).unwrap(),
-                Brush::Solid(Color(color)),
-            )
-            .unwrap();
+        canvas.fill(path(count), Brush::Solid(Color(color))).unwrap();
     }
     canvas
+}
+
+/// One full-window square, or a hostile layer for a `count`-layer stack.
+///
+/// A hostile layer spans the full 1024² window, so binning and tile allocation
+/// still overflow and force the checked subdivision to its 64-attempt limit.
+/// It is only a one-unit sliver along the diagonal, though, so each successful
+/// sub-tile costs little fine rasterization, and it encodes in few bytes. Full-coverage layers made the
+/// ~32 successful sub-tiles exceed the 10-second job deadline on slower GPUs,
+/// which ended the job as a timeout instead of a work refusal.
+fn path(count: usize) -> Path {
+    if count == 1 {
+        return Path::rectangle(Rect::new(0., 0., 1024., 1024.).unwrap()).unwrap();
+    }
+    Path::builder()
+        .move_to(0., 0.)
+        .line_to(1024., 1024.)
+        .line_to(1024., 1023.)
+        .close()
+        .build()
+        .unwrap()
 }
 
 fn accepted(window: &OverlayWindow, revision: u64) {

@@ -501,19 +501,16 @@ fn render_inner(
         if diagnostic_poll {
             thread::sleep(POLL * 5);
         } else {
-            // Wake on native completion instead of adding a full timer interval
-            // after it. This worker-only wait remains bounded by one poll slice;
-            // timeout means the job is still pending, not a source/device fault.
-            match gpu
-                .device
-                .poll(wgpu::PollType::Wait { submission_index: None, timeout: Some(POLL) })
-            {
-                Ok(_) | Err(wgpu::PollError::Timeout) => (),
-                Err(error) => {
-                    renderer.cancel();
-                    return Err(io::Error::other(error));
-                },
+            // Poll, then sleep one slice. A timed `PollType::Wait` is unsafe on
+            // this shared device: wgpu-core 30 snapshots the fence before
+            // retiring submissions, so a concurrent poll from another thread can
+            // retire the awaited submission first and trip its internal
+            // "queue is empty" assertion, panicking this worker.
+            if let Err(error) = gpu.device.poll(wgpu::PollType::Poll) {
+                renderer.cancel();
+                return Err(io::Error::other(error));
             }
+            thread::sleep(POLL);
         }
     }
 }

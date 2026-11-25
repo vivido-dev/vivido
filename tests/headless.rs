@@ -170,7 +170,9 @@ fn external_binary(variable: &str, name: &str) -> PathBuf {
     .filter_map(|path| Some((path.metadata().ok()?.modified().ok()?, path)))
     .max()
     .map(|(_, path)| path)
-    .unwrap_or_else(|| panic!("set {variable} to a built {executable}, or build the sibling project"))
+    .unwrap_or_else(|| {
+        panic!("set {variable} to a built {executable}, or build the sibling project")
+    })
 }
 
 #[cfg(unix)]
@@ -527,6 +529,14 @@ fn wait_for_inspect(
     }
 }
 
+/// Wait until no message is up.
+///
+/// On a software adapter the session warns that frames will be slow. That warning dismisses
+/// itself after the default five-second timeout, and until then it occupies the message bar.
+fn wait_for_startup_warning(session: &Session) {
+    wait_for_inspect(session, "/message", &|value| value.is_null(), "a message stayed up");
+}
+
 /// Ctrl+C interrupts the program the shell is running.
 ///
 /// On Windows the headless daemon is started in a new process group, which ignores Ctrl+C and
@@ -576,7 +586,7 @@ fn command_palette_filters_runs_and_closes() {
 
     session.msg(&["wait", "text", "STATUS-42", "--timeout", "10s"]);
     assert!(inspect()["command_palette"].is_null(), "the palette starts closed");
-    assert!(inspect()["message"].is_null(), "no message is up yet");
+    wait_for_startup_warning(&session);
     let frame = inspect()["window"]["sequences"]["frame"].as_u64().expect("frame sequence");
 
     key("p", Some(open));
@@ -716,6 +726,8 @@ fn osc_progress_draws_a_bar_and_clears_it() {
     };
 
     session.msg(&["wait", "text", "PROGRESS-SET", "--timeout", "10s"]);
+    // The band check samples the background at the bottom edge, where a message bar would sit.
+    wait_for_startup_warning(&session);
     let state = inspect();
     assert_eq!(state["progress"], serde_json::json!({"state": "normal", "percent": 100}));
 
