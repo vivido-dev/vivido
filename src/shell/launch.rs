@@ -4,13 +4,35 @@
 //! start. Keeping the two apart means a future source of entries — configured profiles, remote
 //! targets — is added here alone.
 
+use std::path::PathBuf;
+
+use crate::cli::TerminalOptions;
 use crate::config::ui_config::Program;
+
+/// Shell and optional starting directory selected from the tab menu.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TabProgram {
+    /// Executable and arguments for the new tab.
+    pub program: Program,
+    /// Native starting directory, or `None` to inherit the tab's directory.
+    pub working_directory: Option<PathBuf>,
+}
+
+impl TabProgram {
+    /// Apply the menu selection to the new tab's inherited options.
+    pub fn apply_to(&self, options: &mut TerminalOptions) {
+        options.set_command(&self.program);
+        if let Some(directory) = &self.working_directory {
+            options.working_directory = Some(directory.clone());
+        }
+    }
+}
 
 /// What choosing a launch menu entry does.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LaunchAction {
     /// Open a tab; `None` runs the configured shell, as a plain `+` click does.
-    NewTab(Option<Program>),
+    NewTab(Option<TabProgram>),
     /// Open another top-level Vivido window.
     NewWindow,
 }
@@ -48,28 +70,26 @@ pub fn entries() -> Vec<LaunchEntry> {
 /// spawn, so callers build this once and keep the result rather than rebuilding it per menu open.
 #[cfg(windows)]
 pub fn entries() -> Vec<LaunchEntry> {
-    let mut entries = vec![powershell_entry()];
+    let mut entries = vec![powershell_entry(executable_on_path("pwsh.exe"), std::env::home_dir())];
     entries.extend(wsl_entries());
     entries
 }
 
 /// PowerShell 7 when it is installed, otherwise the Windows PowerShell which ships with the OS.
-///
-/// `powershell.exe` is also Vivido's default Windows shell, so the fallback row launches exactly
-/// what a plain `+` click would.
-#[cfg(windows)]
-fn powershell_entry() -> LaunchEntry {
-    if executable_on_path("pwsh.exe") {
-        LaunchEntry::new(
-            "PowerShell",
-            LaunchAction::NewTab(Some(Program::Just("pwsh.exe".to_owned()))),
-        )
+#[cfg(any(windows, test))]
+fn powershell_entry(has_pwsh: bool, home: Option<PathBuf>) -> LaunchEntry {
+    let (label, executable) = if has_pwsh {
+        ("PowerShell", "pwsh.exe")
     } else {
-        LaunchEntry::new(
-            "Windows PowerShell",
-            LaunchAction::NewTab(Some(Program::Just("powershell.exe".to_owned()))),
-        )
-    }
+        ("Windows PowerShell", "powershell.exe")
+    };
+    LaunchEntry::new(
+        label,
+        LaunchAction::NewTab(Some(TabProgram {
+            program: Program::Just(executable.to_owned()),
+            working_directory: home,
+        })),
+    )
 }
 
 #[cfg(windows)]
@@ -85,23 +105,28 @@ fn wsl_entries() -> Vec<LaunchEntry> {
     let distributions = parse_wsl_distributions(&output);
     if distributions.is_empty() {
         // WSL answered but named nothing; the default distribution is still launchable.
-        return vec![LaunchEntry::new(
-            "WSL",
-            LaunchAction::NewTab(Some(Program::Just("wsl.exe".to_owned()))),
-        )];
+        return vec![wsl_entry(None)];
     }
-    distributions
-        .into_iter()
-        .map(|distribution| {
-            LaunchEntry::new(
-                format!("WSL: {distribution}"),
-                LaunchAction::NewTab(Some(Program::WithArgs {
-                    program: "wsl.exe".to_owned(),
-                    args: vec!["-d".to_owned(), distribution],
-                })),
-            )
-        })
-        .collect()
+    distributions.into_iter().map(|distribution| wsl_entry(Some(distribution))).collect()
+}
+
+#[cfg(any(windows, test))]
+fn wsl_entry(distribution: Option<String>) -> LaunchEntry {
+    let mut args = vec!["--cd".to_owned(), "~".to_owned()];
+    let label = if let Some(distribution) = distribution {
+        let label = format!("WSL: {distribution}");
+        args.extend(["-d".to_owned(), distribution]);
+        label
+    } else {
+        "WSL".to_owned()
+    };
+    LaunchEntry::new(
+        label,
+        LaunchAction::NewTab(Some(TabProgram {
+            program: Program::WithArgs { program: "wsl.exe".to_owned(), args },
+            working_directory: None,
+        })),
+    )
 }
 
 #[cfg(windows)]
@@ -177,6 +202,43 @@ mod tests {
     fn empty_or_blank_listings_name_no_distribution() {
         assert!(parse_wsl_distributions(b"").is_empty());
         assert!(parse_wsl_distributions(&utf16le("\r\n \r\n")).is_empty());
+    }
+
+    #[test]
+    fn powershell_menu_starts_both_editions_in_the_windows_home() {
+        let home = PathBuf::from(r"C:\Users\Demo User");
+        for (has_pwsh, executable) in [(true, "pwsh.exe"), (false, "powershell.exe")] {
+            let entry = powershell_entry(has_pwsh, Some(home.clone()));
+            let LaunchAction::NewTab(Some(selection)) = entry.action else {
+                panic!("expected a PowerShell tab");
+            };
+            let mut options = TerminalOptions::default();
+            options.working_directory = Some(PathBuf::from(r"C:\Program Files\Vivido"));
+            selection.apply_to(&mut options);
+            assert_eq!(options.working_directory.as_ref(), Some(&home));
+            let program = options.command().unwrap();
+            assert_eq!(program.program(), executable);
+            assert!(program.args().is_empty());
+        }
+    }
+
+    #[test]
+    fn wsl_menu_opens_the_selected_distributions_home() {
+        for (distribution, label, args) in [
+            (None, "WSL", vec!["--cd", "~"]),
+            (Some("My Ubuntu"), "WSL: My Ubuntu", vec!["--cd", "~", "-d", "My Ubuntu"]),
+        ] {
+            let entry = wsl_entry(distribution.map(str::to_owned));
+            assert_eq!(entry.label, label);
+            let LaunchAction::NewTab(Some(selection)) = entry.action else {
+                panic!("expected a WSL tab");
+            };
+            let mut options = TerminalOptions::default();
+            selection.apply_to(&mut options);
+            let program = options.command().unwrap();
+            assert_eq!(program.program(), "wsl.exe");
+            assert_eq!(program.args(), args.as_slice());
+        }
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]

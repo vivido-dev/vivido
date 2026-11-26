@@ -5,6 +5,9 @@ edition = "2024"
 rust-version = "1.88"
 publish = false
 
+[dependencies]
+tempfile = { version = "3.27", default-features = false }
+
 [profile.release]
 lto = "thin"
 strip = "symbols"

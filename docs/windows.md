@@ -31,11 +31,13 @@ in the shell they launch:
 | Shortcut | Command | Shell |
 |---|---|---|
 | **Vivido PowerShell** | `vivido.exe -e pwsh.exe` | PowerShell 7 |
-| **Vivido WSL** | `vivido.exe -e wsl.exe` | The default WSL distribution (Ubuntu after a consumer install) |
+| **Vivido WSL** | `vivido.exe -e wsl.exe --cd ~` | The default WSL distribution (Ubuntu after a consumer install) |
 
 Plain `vivido.exe` with no `-e` uses `[terminal] shell` from the configuration file, which the
 installer sets to `pwsh.exe`. Inside any window, the tab `˅` menu offers `PowerShell` and one
 `WSL: <distribution>` row per installed distribution, so both kinds of shell can live in one window.
+Choosing PowerShell starts the shell in your Windows user profile. Choosing a WSL entry starts
+the shell in the Linux user's home directory for that distribution.
 Vivido probes for those shells once per session: a distribution installed while Vivido is running
 appears the next time Vivido starts.
 
@@ -139,7 +141,10 @@ Inside WSL you need a Linux build of `vvssh`; see
 Vivido exports its per-window Vivid discovery values into WSL through `WSLENV`, so a Linux build of
 `vivi` (or another Vivid producer) running in WSL can display images, video, and audio in the native
 Windows Vivido window. Install that Linux build as described in
-[Vivido tools inside WSL](#vivido-tools-inside-wsl). Keep in mind:
+[Vivido tools inside WSL](#vivido-tools-inside-wsl). If playback reports
+`Connection refused (os error 111)`, see [troubleshooting WSL media connections](WSL.md).
+
+Keep in mind:
 
 - The values are exported one way (`/u`): Windows to WSL only. Do not add `VIVID_ROOT_SECRET` to
   `WSLENV` yourself without `/u`, or add it to a shell profile; it would then leak to every Windows
@@ -181,15 +186,14 @@ The config file is yours: repair, upgrade, and uninstall never overwrite or dele
 
 - The default font is `Consolas`. Set `[font] normal.family` to use a different installed font.
 - Right-click pastes the clipboard when the running application is not capturing the mouse.
-- To make WSL the default for plain `vivido.exe`, set:
+- To make WSL the default for plain `vivido.exe` and start new shells in the Linux home directory, set:
 
   ```toml
   [terminal]
-  shell = "wsl.exe"
+  shell = { program = "wsl.exe", args = ["--cd", "~"] }
   ```
 
-  Pass arguments with the `{ program, args }` form, for example
-  `shell = { program = "wsl.exe", args = ["-d", "Debian"] }` for a specific distribution.
+  To select a specific distribution, use `args = ["-d", "Debian", "--cd", "~"]`.
 - Vivido exports `SHELL` with the program it actually launched, so nested tools such as `vvmux`
   reopen the same shell instead of falling back to `cmd.exe`.
 - For interactive PowerShell, Vivido adds a prompt hook at launch that reports the current

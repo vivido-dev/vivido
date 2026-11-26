@@ -328,7 +328,7 @@ impl TabbedApplication {
                 // Without a program the entry is the plain `+` click, which keeps whatever the
                 // active tab was started with.
                 if let Some(program) = program {
-                    options.terminal_options.set_command(program);
+                    program.apply_to(&mut options.terminal_options);
                 }
                 if let Err(error) = self.create_tab(event_loop, options) {
                     log::error!("could not create tab: {error}");

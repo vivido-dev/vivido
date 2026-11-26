@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::{self, Command, Stdio};
 
 const DEFAULT_CONFIG: &str = include_str!("../../default-vivido.toml");
+const DEFAULT_WSL_CONFIG: &str = "[wsl2]\r\nnetworkingMode=mirrored\r\n";
 
 fn main() {
     let command = env::args_os().nth(1).unwrap_or_default();
@@ -47,6 +48,7 @@ fn initialize_config_at(user_profile: &Path) -> io::Result<()> {
     let config_path = config_dir.join("vivido.toml");
 
     reject_reparse_point(user_profile)?;
+    initialize_wsl_config(user_profile)?;
     if dot_config_path.exists() {
         reject_reparse_point(&dot_config_root)?;
         reject_reparse_point(&dot_config_dir)?;
@@ -66,6 +68,22 @@ fn initialize_config_at(user_profile: &Path) -> io::Result<()> {
     let mut destination = OpenOptions::new().write(true).create_new(true).open(config_path)?;
     destination.write_all(DEFAULT_CONFIG.as_bytes())?;
     destination.sync_all()
+}
+
+fn initialize_wsl_config(user_profile: &Path) -> io::Result<()> {
+    let path = user_profile.join(".wslconfig");
+    if path.try_exists()? {
+        return Ok(());
+    }
+    // Publish the completed file in one step so an interrupted install can be retried.
+    let mut pending = tempfile::NamedTempFile::new_in(user_profile)?;
+    pending.write_all(DEFAULT_WSL_CONFIG.as_bytes())?;
+    pending.as_file().sync_all()?;
+    match pending.persist_noclobber(path) {
+        Ok(_) => Ok(()),
+        Err(error) if error.error.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+        Err(error) => Err(error.error),
+    }
 }
 
 fn ensure_no_vvmux_sessions() -> io::Result<()> {
@@ -237,8 +255,12 @@ mod tests {
         let profile = root.join("profile");
         fs::create_dir_all(profile.join("vivido")).unwrap();
         fs::write(profile.join("vivido/vivido.toml"), "existing = true\n").unwrap();
+        let wsl_config = profile.join(".wslconfig");
+        let custom_wsl = b"# user settings\r\n[wsl2]\r\nnetworkingMode=nat\r\nmemory=4GB\r\n";
+        fs::write(&wsl_config, custom_wsl).unwrap();
 
         initialize_config_at(&profile).unwrap();
+        assert_eq!(fs::read(wsl_config).unwrap(), custom_wsl);
         assert_eq!(
             fs::read_to_string(profile.join("vivido/vivido.toml")).unwrap(),
             "existing = true\n"
@@ -257,6 +279,7 @@ mod tests {
         initialize_config_at(&profile).unwrap();
         assert_eq!(fs::read_to_string(dot_config).unwrap(), "existing = true\n");
         assert!(!profile.join("vivido/vivido.toml").exists());
+        assert_eq!(fs::read_to_string(profile.join(".wslconfig")).unwrap(), DEFAULT_WSL_CONFIG);
         fs::remove_dir_all(root).unwrap();
     }
 

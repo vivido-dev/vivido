@@ -88,7 +88,7 @@ mod launch;
 #[cfg(windows)]
 mod touch;
 pub use close::{CloseConfirmation, confirm_close};
-pub use launch::{LaunchAction, LaunchEntry, entries as launch_entries};
+pub use launch::{LaunchAction, LaunchEntry, TabProgram, entries as launch_entries};
 #[cfg(windows)]
 pub use touch::touch_click_events;
 #[cfg(any(target_os = "linux", windows))]
