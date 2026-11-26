@@ -6388,39 +6388,14 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
             for c in text.chars() {
                 self.search_input(c);
             }
-        } else if bracketed && self.terminal().mode().contains(TermMode::BRACKETED_PASTE) {
-            self.on_terminal_input_start();
-
-            self.write_to_pty(&b"\x1b[200~"[..]);
-
-            // Write filtered escape sequences.
-            //
-            // We remove `\x1b` to ensure it's impossible for the pasted text to write the bracketed
-            // paste end escape `\x1b[201~` and `\x03` since some shells incorrectly terminate
-            // bracketed paste when they receive it.
-            let filtered = text.replace(['\x1b', '\x03'], "");
-            self.write_to_pty(filtered.into_bytes());
-
-            self.write_to_pty(&b"\x1b[201~"[..]);
         } else {
             self.on_terminal_input_start();
-
             let payload = if bracketed {
-                // In non-bracketed (ie: normal) mode, terminal applications cannot distinguish
-                // pasted data from keystrokes.
-                //
-                // In theory, we should construct the keystrokes needed to produce the data we are
-                // pasting... since that's neither practical nor sensible (and probably an
-                // impossible task to solve in a general way), we'll just replace line breaks
-                // (windows and unix style) with a single carriage return (\r, which is what the
-                // Enter key produces).
-                text.replace("\r\n", "\r").replace('\n', "\r").into_bytes()
+                input::encode_paste(text, self.terminal.mode().contains(TermMode::BRACKETED_PASTE))
             } else {
-                // When we explicitly disable bracketed paste don't manipulate with the input,
-                // so we pass user input as is.
-                text.to_owned().into_bytes()
+                // Single-character IME commits are literal input.
+                text.as_bytes().to_vec()
             };
-
             self.write_to_pty(payload);
         }
     }

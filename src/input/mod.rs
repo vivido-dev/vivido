@@ -66,6 +66,39 @@ pub(crate) const CLICK_THRESHOLD: Duration = Duration::from_millis(400);
 const SELECTION_CLIPBOARDS: [ClipboardType; 2] =
     [ClipboardType::Selection, ClipboardType::Clipboard];
 
+/// Encode clipboard or automation text for the application running on the PTY.
+pub(crate) fn encode_paste(text: &str, bracketed: bool) -> Vec<u8> {
+    const START: &[u8] = b"\x1b[200~";
+    const END: &[u8] = b"\x1b[201~";
+
+    let framing = if bracketed { START.len() + END.len() } else { 0 };
+    let mut bytes = Vec::with_capacity(text.len() + framing);
+    if bracketed {
+        bytes.extend_from_slice(START);
+    }
+
+    // Bracketed paste carries text. Plain paste emulates the Enter key (CR).
+    let newline = if bracketed { b'\n' } else { b'\r' };
+    let mut input = text.bytes().peekable();
+    while let Some(byte) = input.next() {
+        match byte {
+            b'\r' => {
+                input.next_if_eq(&b'\n');
+                bytes.push(newline);
+            },
+            b'\n' => bytes.push(newline),
+            // ESC could close the paste frame, and some shells end a paste on Ctrl-C.
+            0x1b | 0x03 if bracketed => {},
+            _ => bytes.push(byte),
+        }
+    }
+
+    if bracketed {
+        bytes.extend_from_slice(END);
+    }
+    bytes
+}
+
 fn next_click_state(mouse: &Mouse, button: MouseButton, point: Point, now: Instant) -> ClickState {
     let elapsed = now.saturating_duration_since(mouse.last_click_timestamp);
     let same_target = mouse.last_click_button == button && mouse.last_click_point == Some(point);
@@ -1365,6 +1398,21 @@ mod tests {
     use crate::config::Binding;
     use crate::terminal::index::Line;
     const KEY: Key<&'static str> = Key::Character("0");
+
+    #[test]
+    fn paste_preserves_each_logical_line_break() {
+        for text in ["α\n\nβ\n", "α\r\n\r\nβ\r\n", "α\r\rβ\r", "α\r\n\nβ\r"] {
+            assert_eq!(encode_paste(text, true), "\x1b[200~α\n\nβ\n\x1b[201~".as_bytes());
+            assert_eq!(encode_paste(text, false), "α\r\rβ\r".as_bytes());
+        }
+    }
+
+    #[test]
+    fn paste_filters_escape_and_ctrl_c_only_inside_brackets() {
+        let text = "one\x1b[201~\x03two";
+        assert_eq!(encode_paste(text, true), b"\x1b[200~one[201~two\x1b[201~");
+        assert_eq!(encode_paste(text, false), text.as_bytes());
+    }
 
     #[test]
     fn click_state_detects_same_cell_double_click() {

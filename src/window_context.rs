@@ -1480,16 +1480,7 @@ impl WindowContext {
     #[cfg(any(unix, windows))]
     pub fn application_paste(&self, text: &str) -> Vec<u8> {
         let bracketed = self.terminal.lock().mode().contains(TermMode::BRACKETED_PASTE);
-        if bracketed {
-            let filtered = text.replace(['\x1b', '\x03'], "");
-            let mut bytes = Vec::with_capacity(filtered.len() + 12);
-            bytes.extend_from_slice(b"\x1b[200~");
-            bytes.extend_from_slice(filtered.as_bytes());
-            bytes.extend_from_slice(b"\x1b[201~");
-            bytes
-        } else {
-            text.replace("\r\n", "\r").replace('\n', "\r").into_bytes()
-        }
+        input::encode_paste(text, bracketed)
     }
 
     /// Process paste through search/UI state, returning tagged PTY bytes when it reaches the app.
