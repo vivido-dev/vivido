@@ -3,13 +3,21 @@
 // Rust guideline compliant 2026-10-07
 use super::*;
 
+/// Physical edge of the stream tests' overlay, at scale 4 over the 1024² logical layout.
+///
+/// Every peer import renders the whole overlay, and the tests need eight imports inside the
+/// hostile probe's 10-second diagnosis bound. One 4096² checked tile keeps imports fast enough
+/// on slow adapters, while the hostile stack still overflows down to sub-tiles and exhausts the
+/// 64-attempt limit. The single-refusal tests keep the multi-tile 8192² overlay.
+const VIEWPORT: f32 = 4096.;
+
 #[test]
 #[ignore = "requires native GPU and sockets; eight authenticated peer images during private diagnosis"]
 fn authenticated_peer_stream_advances_during_private_hostile_work_diagnosis() {
     let _gpu = crate::display::renderer::gpu_test_lock();
     let service =
         VividService::start_with_wake(test_geometry(), std::sync::Arc::new(|_| {})).unwrap();
-    service.update_overlay_viewport(8192., 8192., 8.);
+    service.update_overlay_viewport(VIEWPORT.into(), VIEWPORT.into(), 4.);
     let peer = OverlaySession::connect(test_config(&service)).unwrap();
     let neighbor = peer
         .create_window(OverlayWindowOptions::new(
@@ -43,7 +51,7 @@ fn authenticated_peer_stream_advances_during_private_hostile_work_diagnosis() {
     let mut renderer =
         SceneRenderer::new(RenderSource::Offscreen, PhysicalSize::new(64, 64), true).unwrap();
     renderer.set_vivid_scene(service.scene());
-    let size = SizeInfo::new(8192., 8192., 1., 1., 0., 0., false);
+    let size = SizeInfo::new(VIEWPORT, VIEWPORT, 1., 1., 0., 0., false);
     let (image, mut generation) = completed_overlay_image(&mut renderer, &size, None);
     present(&mut renderer, &image);
     let image = pixels(&renderer);

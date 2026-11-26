@@ -8008,6 +8008,13 @@ mod tests {
     #[test]
     #[ignore = "requires the machine's default audio output device"]
     fn vvdoom_float_pcm_reaches_the_live_presenter_audio_clock() {
+        // WSL exposes no ALSA sound card, so there is no default output device to drive.
+        let wsl = std::fs::read_to_string("/proc/sys/kernel/osrelease")
+            .is_ok_and(|release| release.to_ascii_lowercase().contains("microsoft"));
+        if wsl {
+            eprintln!("skipping: WSL has no default audio output device");
+            return;
+        }
         let service =
             socket_service!(VividService::start_with_wake(test_geometry(), Arc::new(|_| {})));
         let mut session = connect(&service);

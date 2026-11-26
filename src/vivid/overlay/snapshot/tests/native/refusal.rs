@@ -47,9 +47,9 @@ pub(super) fn path(count: usize) -> Path {
 
 pub(super) fn present(renderer: &mut SceneRenderer, image: &vello::peniko::ImageData) {
     let mut frame = Scene::new();
-    // The checked overlay is 8192². A 64² primary readback proves its imported
-    // pixels without allocating a second large physical window/readback target.
-    frame.draw_image(image, Affine::scale(1. / 128.));
+    // The checked overlay is 4096² or 8192². A 64² primary readback proves its
+    // imported pixels without allocating a second large window/readback target.
+    frame.draw_image(image, Affine::scale(64. / f64::from(image.width)));
     assert!(renderer.render(&frame, Color::WHITE).unwrap());
 }
 

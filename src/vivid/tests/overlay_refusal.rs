@@ -56,9 +56,9 @@ fn accepted(window: &OverlayWindow, revision: u64) {
 
 fn present(renderer: &mut SceneRenderer, image: &vello::peniko::ImageData) {
     let mut frame = Scene::new();
-    // Render the real 8192² checked export into a small primary target. This
-    // exercises actual import/sampling without a second large window/readback.
-    frame.draw_image(image, Affine::scale(1. / 128.));
+    // Render the real 4096² or 8192² checked export into a small primary target.
+    // This exercises actual import/sampling without a second large window/readback.
+    frame.draw_image(image, Affine::scale(64. / f64::from(image.width)));
     assert!(renderer.render(&frame, GpuColor::WHITE).unwrap());
 }
 

@@ -158,10 +158,18 @@ fn renew(
     host.lane_open(peer.context().session(), 1);
 }
 
+/// Physical edge of the stream tests' overlay, at scale 4 over the 1024² logical layout.
+///
+/// Every peer import renders the whole overlay, and the tests need eight imports inside the
+/// hostile probe's 10-second diagnosis bound. One 4096² checked tile keeps imports fast enough
+/// on slow adapters, while the hostile stack still overflows down to sub-tiles and exhausts the
+/// 64-attempt limit. The single-refusal tests keep the multi-tile 8192² overlay.
+const VIEWPORT: f32 = 4096.;
+
 fn setup() -> (Fixture, SceneRenderer, SizeInfo, vello::peniko::ImageData, u64) {
     let mut f = Fixture::new();
     let [first, peer] = f.surfaces;
-    f.host.update_viewport(8192., 8192., 8.).unwrap();
+    f.host.update_viewport(VIEWPORT.into(), VIEWPORT.into(), 4.).unwrap();
     for (surface, bounds) in [
         (first, Rect::new(0., 0., 960., 1024.).unwrap()),
         (peer, Rect::new(960., 0., 64., 64.).unwrap()),
@@ -172,7 +180,7 @@ fn setup() -> (Fixture, SceneRenderer, SizeInfo, vello::peniko::ImageData, u64) 
     candidate(&mut f, 1, 2, 1, 0x0000ffff);
     let scene = f.scene.clone();
     *scene.overlays().lock().unwrap() = std::mem::take(&mut f.host);
-    let size = SizeInfo::new(8192., 8192., 1., 1., 0., 0., false);
+    let size = SizeInfo::new(VIEWPORT, VIEWPORT, 1., 1., 0., 0., false);
     let mut renderer =
         SceneRenderer::new(RenderSource::Offscreen, PhysicalSize::new(64, 64), true).unwrap();
     renderer.set_vivid_scene(scene.clone());
