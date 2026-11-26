@@ -15,7 +15,7 @@ On Debian or Ubuntu:
 sudo apt update
 sudo apt install build-essential cmake git pkg-config ncurses-bin scdoc \
   libasound2-dev libfontconfig1-dev libfreetype6-dev \
-  libwayland-dev libxkbcommon-dev \
+  libwayland-dev libxkbcommon-dev luajit libasound2-plugins \
   libavcodec-dev libavdevice-dev libavutil-dev libswscale-dev libswresample-dev \
   libvulkan1 mesa-vulkan-drivers
 ```

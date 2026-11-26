@@ -145,13 +145,9 @@ fn base_command(runtime: &Path) -> Command {
 }
 
 fn binary() -> PathBuf {
-    // The integration test binary lives next to the executables cargo built for this profile.
-    let mut path = env::current_exe().expect("test binary path");
-    path.pop();
-    if path.ends_with("deps") {
-        path.pop();
-    }
-    path.join(format!("vivido{}", env::consts::EXE_SUFFIX))
+    // Cargo names the built executable directly; the test binary's own location depends on the
+    // build-directory layout and is not a reliable guide to it.
+    PathBuf::from(env!("CARGO_BIN_EXE_vivido"))
 }
 
 #[cfg(windows)]
